@@ -1,0 +1,737 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import regex as re
+import requests
+import uvloop
+from PIL import Image as PIL_Image
+from pkg_resources import resource_filename
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+from vllm import LLM, SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.openai.api_server import (
+    build_async_engine_client_from_engine_args,
+)
+from vllm.inputs.data import TokensPrompt
+from vllm.utils.async_utils import merge_async_iterators
+from vllm.v1.engine.async_llm import AsyncLLM
+
+
+def get_sample_multi_modal_llama_inputs():
+    """
+    Prepare 4 sample multi-modal prompts for Llama3.2-11B
+    """
+    MLLAMA_IMAGE_TOKEN = "<|image|>"
+    IMG_PATH = Path(resource_filename("llama_models", "scripts/resources/"))
+    relative_img_paths = [None, "pasta.jpeg", "ocr_image.jpeg", "clutter.jpeg"]
+    questions = [
+        "Write a haiku.",
+        "What is for dinner?",
+        "What is the full text of this image? Do OCR",
+        "What objects are in this image?",
+    ]
+    inputs = []
+    for relative_img_path, question in zip(relative_img_paths, questions):
+        if relative_img_path is not None:
+            with open(IMG_PATH / relative_img_path, "rb") as f:
+                img = PIL_Image.open(f).convert("RGB")
+            prompt = f"{MLLAMA_IMAGE_TOKEN}{question}"
+            inputs.append({"prompt": prompt, "multi_modal_data": {"image": img}})
+        else:
+            inputs.append({"prompt": question})
+    return inputs
+
+
+def get_sample_multi_modal_inputs(model: str, multi_image: bool):
+    """
+    Build sample multi-modal inputs for vision-language models.
+    Currently supports Qwen2.5-VL, Qwen3-VL, Gemma-3, and Mistral 3.1.
+
+    Args:
+        model (str): Hugging Face model identifier
+
+    Returns:
+        list[dict]: A list of input dicts ready for model.generate
+    """
+    text_prompts = []
+    imgs = []
+
+    text_prompts_content = [
+        [{"type": "text", "text": "Count to 20."}],
+        [{"type": "text", "text": "What is the capital of France?"}],
+        [{"type": "text", "text": "Describe the band Oasis in 300 words."}],
+        [{"type": "text", "text": "Write a haiku about an orange."}],
+    ]
+
+    single_image_prompts_content = [
+        [
+            {"type": "text", "text": "Describe this image."},
+            {
+                "type": "image",
+                "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+            },
+        ],
+        [
+            {"type": "text", "text": "Is there a cat?"},
+            {
+                "type": "image",
+                "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+            },
+        ],
+        [
+            {"type": "text", "text": "Describe this image."},
+            {
+                "type": "image",
+                "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.jpeg",
+            },
+        ],
+    ]
+
+    multi_image_prompts_content = [
+        [
+            {"type": "text", "text": "Compare these images."},
+            {
+                "type": "image",
+                "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.jpeg",
+            },
+            {
+                "type": "image",
+                "image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/cats.png",
+            },
+        ],
+    ]
+
+    content = []
+    if "Qwen2.5-VL" in model or "Qwen3-VL" in model:
+        # [INFO] Qwen-VL currently does not support a mixture of
+        # text-image and text-only inputs
+        content += single_image_prompts_content
+    elif "Mistral" in model:
+        # [INFO] Mistral-Small-3.1 does not support multi-image inputs
+        content += text_prompts_content + single_image_prompts_content
+    else:
+        content += text_prompts_content + single_image_prompts_content
+        if multi_image:
+            content += multi_image_prompts_content
+
+    prompts = []
+    for c in content:
+        prompts.append([{"role": "user", "content": c}])
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    for prompt in prompts:
+        chat_prompt = tokenizer.apply_chat_template(
+            prompt,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        image_inputs = None
+        if "Qwen2.5-VL" in model or "Qwen3-VL" in model:
+            assert not multi_image, (
+                "Multi-image inputs not supported yet for Qwen2.5-VL or Qwen3-VL"
+            )
+            # Lazy import only when needed
+            try:
+                from qwen_vl_utils import process_vision_info
+            except ModuleNotFoundError as err:
+                raise ModuleNotFoundError(
+                    "`qwen-vl-utils` is required for Qwen2.5-VL or Qwen3-VL models. "
+                    "Install it with: pip install qwen-vl-utils"
+                ) from err
+
+            image_inputs, video_inputs = process_vision_info(prompt)
+            assert video_inputs is None, "Video inputs not supported yet"
+            image_inputs = image_inputs if image_inputs else None
+        elif "gemma-3" in model or "Mistral" in model:
+            image_inputs = [
+                ctnt["image"]
+                for entry in prompt
+                for ctnt in entry["content"]
+                if ctnt["type"] == "image"
+            ]
+            image_inputs = [
+                PIL_Image.open(requests.get(image_url, stream=True).raw)
+                if image_url is not None
+                else None
+                for image_url in image_inputs
+            ]
+        else:
+            raise NotImplementedError(
+                f"Multi-modal preprocessing not implemented for model: {model}"
+            )
+
+        imgs.append(image_inputs)
+        text_prompts.append(chat_prompt)
+
+    # Pack inputs
+    inputs = []
+    for img, text_prompt in zip(imgs, text_prompts):
+        entry = {"prompt": text_prompt}
+        if img and all(item is not None for item in img):
+            entry["multi_modal_data"] = {"image": img}
+        inputs.append(entry)
+
+    return inputs
+
+
+def create_non_uniform_sampling_params(num_prompts, max_tokens, ignore_eos):
+    """Create a list of non-uniform sampling params varying top_k, top_p,
+    temperature."""
+    sampling_params_list = []
+    for i in range(num_prompts):
+        # Vary top_k, top_p, and temperature only
+        sp = SamplingParams(
+            max_tokens=max_tokens,
+            ignore_eos=ignore_eos,
+            top_k=5 + (i % 5) * 2,  # Vary top_k: 5, 7, 9, 11, 13
+            top_p=0.7 + (i % 3) * 0.1,  # Vary top_p: 0.7, 0.8, 0.9
+            temperature=0.2 + (i % 4) * 0.2,  # Vary temperature: 0.2, 0.4, 0.6, 0.8
+        )
+        sampling_params_list.append(sp)
+    return sampling_params_list
+
+
+def run_seq_len_tests(engine_kw_args, sampling_params):
+    """
+    Test generation of a few simple counting prompts
+    with arbitrary increasing sequence lengths
+    """
+
+    model = engine_kw_args["model"]
+    is_instruct = "Instruct" in model
+    count_sizes = [10, 100, 2000, 16000, 40000]
+
+    if is_instruct:
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    prompts = []
+    for size in count_sizes:
+        prompt = "Continue this counting sequence (with no explanation): " + " ".join(
+            str(i) for i in range(1, size + 1)
+        )
+        if is_instruct:
+            prompt = {"role": "user", "content": prompt}
+            prompt = tokenizer.apply_chat_template(
+                [prompt], tokenize=False, add_generation_prompt=True
+            )
+        prompts.append(prompt)
+
+    llm = LLM(**engine_kw_args)
+
+    # Run generation one prompt at a time
+    for i in range(len(count_sizes)):
+        generate_tokens(llm, [prompts[i]], sampling_params, print_output=True)
+
+
+def run_inference(
+    model,
+    prompts_json,
+    max_tokens=128,
+    max_seqs_in_batch=32,
+    num_repeat_prompts=2,
+    measure_perf=False,
+    perf_prompt_len=None,
+    greedy_sampling=False,  # Use greedy decoding instead of top-k/p
+    async_engine=False,
+    multi_modal=False,
+    multi_image=False,
+    mm_processor_kwargs=None,
+    test_increasing_seq_lens=False,
+    plugin_config=None,
+    max_model_len=None,
+    max_num_batched_tokens=None,
+    data_parallel_size=1,
+    block_size=64,
+    enable_prefix_caching=False,
+    non_uniform_sampling=False,
+):
+    if multi_modal:
+        supported_models = [
+            "Llama-3.2",
+            "Qwen2.5-VL",
+            "Qwen3-VL",
+            "gemma",
+            "Mistral",
+        ]
+        assert any(name in model for name in supported_models), (
+            "The multi-modal inference test "
+            f"currently only supports {supported_models} models"
+        )
+
+    # Validate non_uniform_sampling is not used with incompatible options
+    if non_uniform_sampling:
+        assert not greedy_sampling, (
+            "non_uniform_sampling cannot be used with greedy_sampling option"
+        )
+        assert not test_increasing_seq_lens, (
+            "non_uniform_sampling cannot be used with test_increasing_seq_lens option"
+        )
+        assert not measure_perf, (
+            "non_uniform_sampling cannot be used with measure_perf option"
+        )
+
+    assert not measure_perf, (
+        "The measure_perf option is deprecated and should no longer be used. "
+        "Measure perf instead with the vllm bench serve tool."
+    )
+
+    # LLM args
+    engine_kw_args = {
+        "model": model,
+        "block_size": block_size,
+        "max_num_seqs": max_seqs_in_batch,
+        "max_model_len": max_model_len,
+        "disable_log_stats": False,
+        "max_num_batched_tokens": max_num_batched_tokens,
+        # TODO: Remove measure_perf option as log_global_stats was removed.
+        # "log_global_stats": measure_perf,
+        "data_parallel_size": data_parallel_size,
+        "enable_prefix_caching": enable_prefix_caching,
+    }
+
+    try:
+        if plugin_config:
+            parsed_plugin_config = json.loads(plugin_config)
+            if not isinstance(parsed_plugin_config, dict):
+                raise ValueError("plugin_config must be a JSON object")
+            engine_kw_args["plugin_config"] = parsed_plugin_config
+    except json.JSONDecodeError as err:
+        raise ValueError(f"Invalid JSON string for plugin_config: {err}") from err
+
+    try:
+        if mm_processor_kwargs:
+            engine_kw_args["mm_processor_kwargs"] = json.loads(mm_processor_kwargs)
+    except json.JSONDecodeError as err:
+        raise ValueError(f"Invalid JSON string for mm_processor_kwargs: {err}") from err
+
+    # Generation args
+    ignore_eos = measure_perf
+
+    if greedy_sampling:
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens, ignore_eos=ignore_eos, temperature=0.0
+        )
+    else:
+        if non_uniform_sampling:
+            # Non-uniform sampling params will be created after prompts are loaded
+            sampling_params = None
+        else:
+            sampling_params = SamplingParams(
+                max_tokens=max_tokens,
+                ignore_eos=ignore_eos,
+                top_k=10,
+                top_p=0.9,
+                temperature=1.0,
+            )
+
+    if test_increasing_seq_lens:
+        assert not measure_perf, (
+            "measure_perf option not supported with test_increasing_seq_lens"
+        )
+        assert not async_engine, (
+            "async_engine option not supported with test_increasing_seq_lens"
+        )
+        print("Ignoring prompts json for sequence length testing")
+        run_seq_len_tests(engine_kw_args, sampling_params)
+        return
+
+    # Prepare inputs
+    if not measure_perf:
+        if not multi_modal:
+            # Load prompts from a JSON file
+            with open(prompts_json) as file:
+                prompts = json.load(file)
+            assert isinstance(prompts, list), "Prompts must be a list of strings"
+        else:
+            print("Ignoring prompts json for multi-modal inference")
+            if "Llama-3.2" in model:
+                prompts = get_sample_multi_modal_llama_inputs()
+            elif any(
+                name in model for name in ["Qwen2.5-VL", "Qwen3-VL", "gemma", "Mistral"]
+            ):
+                prompts = get_sample_multi_modal_inputs(model, multi_image)
+            else:
+                raise ValueError(
+                    f"Unsupported model for multi-modal inference test: {model}"
+                )
+        if num_repeat_prompts is not None:
+            prompts = prompts * num_repeat_prompts
+        print("Number of prompts:", len(prompts))
+
+        # Create non-uniform sampling params if requested
+        if non_uniform_sampling:
+            num_prompts = len(prompts)
+            sampling_params = create_non_uniform_sampling_params(
+                num_prompts, max_tokens, ignore_eos
+            )
+            print(f"Created {len(sampling_params)} non-uniform sampling params")
+    else:
+        assert perf_prompt_len is not None, (
+            "perf_prompt_len is required to generate dummy prompts"
+        )
+        print("Measuring performance with dummy prompts of length", perf_prompt_len)
+        print("Generating prompts with output length", max_tokens)
+
+        total_batch_size = max_seqs_in_batch * data_parallel_size
+
+        # Prompt token ids (dummy prompts)
+        prompt_token_ids_user = [0] * perf_prompt_len
+        if not multi_modal:
+            prompts = [
+                {"prompt_token_ids": prompt_token_ids_user}
+                for _ in range(total_batch_size)
+            ]
+        else:
+            if "Llama-3.2" in model:
+                IMAGE_TOKEN_ID = 128256  # Specific to multi-modal llama
+            elif "Qwen2.5-VL" in model or "Qwen3-VL" in model:
+                IMAGE_TOKEN_ID = 151655  # Specific to multi-modal qwen
+            elif "gemma" in model:
+                IMAGE_TOKEN_ID = 262144  # Specific to multi-modal gemma
+            elif "Mistral" in model:
+                IMAGE_TOKEN_ID = 10  # [IMG] token in Mistral tokenizer
+            else:
+                raise ValueError(
+                    f"Unsupported model for multi-modal inference test in perf "
+                    f"mode: {model}"
+                )
+            prompt_token_ids_user.insert(0, IMAGE_TOKEN_ID)
+            random_pixels = np.random.randint(0, 256, (512, 512, 3), dtype=np.uint8)
+            rand_img = PIL_Image.fromarray(
+                random_pixels, "RGB"
+            )  # Create a PIL Image from the random pixel data
+            prompts = [
+                {
+                    "prompt_token_ids": prompt_token_ids_user,
+                    "multi_modal_data": {"image": rand_img},
+                }
+                for _ in range(total_batch_size)
+            ]
+
+    # Validate sampling params size matches prompts size
+    if non_uniform_sampling:
+        assert isinstance(sampling_params, list), (
+            "sampling_params must be a list when non_uniform_sampling is enabled"
+        )
+    if isinstance(sampling_params, list):
+        num_prompts = len(prompts)
+        if len(sampling_params) != num_prompts:
+            raise ValueError(
+                f"Size of sampling_params ({len(sampling_params)}) must match "
+                f"size of prompts ({num_prompts})"
+            )
+
+    # Create and run LLM
+    if not async_engine:
+        llm = LLM(**engine_kw_args)
+        if not measure_perf:
+            generate_tokens(llm, prompts, sampling_params, print_output=True)
+        else:
+            max_model_len = llm.llm_engine.model_config.max_model_len
+            check_valid_perf_prompt_len(max_model_len, perf_prompt_len, sampling_params)
+            run_inference_perf(llm, prompts, sampling_params)
+    else:
+        print("Using async engine")
+        engine_args = AsyncEngineArgs(**engine_kw_args)
+
+        # For DP > 1, send prompts round-robin to DP ranks
+        if data_parallel_size > 1:
+            print("Will send prompts round-robin to DP ranks")
+            dp_ranks = [i % data_parallel_size for i in range(len(prompts))]
+        else:
+            dp_ranks = None
+
+        async def _run_inference_async():
+            async with build_async_engine_client_from_engine_args(engine_args) as llm:
+                if not measure_perf:
+                    await generate_tokens_async(
+                        llm,
+                        prompts,
+                        sampling_params,
+                        dp_ranks=dp_ranks,
+                        print_output=True,
+                    )
+                else:
+                    max_model_len = llm.model_config.max_model_len
+                    check_valid_perf_prompt_len(
+                        max_model_len, perf_prompt_len, sampling_params
+                    )
+                    await run_inference_perf_async(
+                        llm, prompts, sampling_params, dp_ranks=dp_ranks
+                    )
+
+        uvloop.run(_run_inference_async())
+
+
+def check_valid_perf_prompt_len(max_model_len, perf_prompt_len, sampling_params):
+    assert_str = (
+        f"prompt length ({perf_prompt_len}) + num generated tokens "
+        f"({sampling_params.max_tokens}) will exceed max_model_len "
+        f"({max_model_len})"
+    )
+    assert perf_prompt_len + sampling_params.max_tokens <= max_model_len, assert_str
+
+
+def run_inference_perf(
+    llm: LLM,
+    prompts,
+    sampling_params,
+    N_warmup=1,
+    N_inference=3,
+):
+    for i in tqdm(range(N_inference), desc="Inference runs"):
+        if i == N_warmup:
+            start_time = time.perf_counter()
+        generate_tokens(llm, prompts, sampling_params, print_output=False)
+    avg_time = (time.perf_counter() - start_time) / (N_inference - N_warmup)
+    print(f"Average time taken per inference run: {avg_time:.2f} s")
+
+
+async def run_inference_perf_async(
+    llm: LLM,
+    prompts,
+    sampling_params,
+    N_warmup=1,
+    N_inference=3,
+    dp_ranks=None,
+):
+    for i in tqdm(range(N_inference), desc="Inference runs"):
+        if i == N_warmup:
+            start_time = time.perf_counter()
+        await generate_tokens_async(
+            llm, prompts, sampling_params, dp_ranks=dp_ranks, print_output=False
+        )
+    avg_time = (time.perf_counter() - start_time) / (N_inference - N_warmup)
+    print(f"Average time taken per inference run: {avg_time:.2f} s")
+
+
+def _format_prompt_for_display(prompt: str) -> str:
+    """Format prompt for display by replacing repetitive image tokens."""
+    # Count and replace consecutive image_soft_token occurrences
+    pattern = r"(<image_soft_token>)+"
+
+    def replace_tokens(match):
+        count = match.group(0).count("<image_soft_token>")
+        return f"<image_tokens:{count}>"
+
+    cleaned_prompt = re.sub(pattern, replace_tokens, prompt)
+    return cleaned_prompt
+
+
+def generate_tokens(
+    llm: LLM, prompts, sampling_params, prompt_token_ids=None, print_output=True
+):
+    # Use tokenized prompts if provided
+    if prompt_token_ids is not None:
+        prompts = []
+        for single_prompt_token_ids in prompt_token_ids:
+            prompts.append(TokensPrompt(prompt_token_ids=single_prompt_token_ids))
+
+    # Generate texts from the prompts.
+    # The output is a list of RequestOutput objects
+    # that contain the prompt, generated text, and other information.
+    outputs = llm.generate(prompts, sampling_params)
+
+    # Print the outputs.
+    for output in outputs:
+        request_id = int(output.request_id) + 1
+        prompt = output.prompt
+        num_tokens_prompt = len(output.prompt_token_ids)
+        if not print_output:
+            continue
+        formatted_prompt = _format_prompt_for_display(prompt)
+        for sample_idx, completion in enumerate(output.outputs):
+            generated_text = completion.text
+            num_tokens_output = len(completion.token_ids)
+            print(
+                f"Prompt #{request_id} "
+                f"({num_tokens_prompt} tokens), sample {sample_idx}: "
+                f"{formatted_prompt!r} -> {generated_text!r} "
+                f"({num_tokens_output} tokens)\n"
+            )
+
+
+async def generate_tokens_async(
+    llm: AsyncLLM,
+    prompts,
+    sampling_params,
+    dp_ranks=None,
+    prompt_token_ids=None,
+    print_output=True,
+):
+    # Use tokenized prompts if provided
+    if prompt_token_ids is not None:
+        prompts = []
+        for single_prompt_token_ids in prompt_token_ids:
+            prompts.append(TokensPrompt(prompt_token_ids=single_prompt_token_ids))
+
+    if not isinstance(sampling_params, list):
+        sampling_params = [sampling_params] * len(prompts)
+
+    if dp_ranks:
+        assert len(dp_ranks) == len(prompts), (
+            "DP ranks must be the same length as prompts"
+        )
+
+    generators = []
+    for i, (prompt, sp) in enumerate(zip(prompts, sampling_params)):
+        if dp_ranks:
+            generator = llm.generate(
+                prompt, sp, request_id=f"test{i}", data_parallel_rank=dp_ranks[i]
+            )
+        else:
+            generator = llm.generate(prompt, sp, request_id=f"test{i}")
+        generators.append(generator)
+    all_gens = merge_async_iterators(*generators)
+    async for i, res in all_gens:
+        request_id = res.request_id
+        prompt = res.prompt
+        num_tokens_prompt = len(res.prompt_token_ids)
+        if print_output and res.finished:
+            formatted_prompt = _format_prompt_for_display(prompt)
+            for sample_idx, completion in enumerate(res.outputs):
+                generated_text = completion.text
+                num_tokens_output = len(completion.token_ids)
+                print(
+                    f"Prompt {request_id} "
+                    f"({num_tokens_prompt} tokens), sample {sample_idx}: "
+                    f"{formatted_prompt!r} -> {generated_text!r} "
+                    f"({num_tokens_output} tokens)\n"
+                )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model", type=str, default="meta-llama/Llama-3.1-70B", help="Model name"
+    )
+    parser.add_argument(
+        "--prompts_json",
+        type=str,
+        default="plugins/vllm-tt-plugin/examples/prompts.json",
+        help="Path to JSON file containing prompts",
+    )
+    parser.add_argument(
+        "--measure_perf", action="store_true", help="Measure performance"
+    )
+    parser.add_argument(
+        "--perf_prompt_len",
+        type=int,
+        default=128,
+        help="Length of dummy prompts for performance measurement",
+    )
+    parser.add_argument("--max_tokens", type=int, default=128, help="Length of outputs")
+    parser.add_argument(
+        "--greedy_sampling",
+        action="store_true",
+        help="Use greedy decoding instead of top-k/p",
+    )
+    parser.add_argument(
+        "--max_seqs_in_batch",
+        type=int,
+        default=32,
+        help="Maximum batch size for inference",
+    )
+    parser.add_argument(
+        "--num_repeat_prompts",
+        type=int,
+        default=2,
+        help="Number of times to repeat prompts",
+    )
+    parser.add_argument("--async_engine", action="store_true", help="Use async engine")
+    parser.add_argument(
+        "--multi_modal",
+        action="store_true",
+        help="Run multi-modal inference (vision + text)",
+    )
+    parser.add_argument(
+        "--multi_image", action="store_true", help="Run multi-image inference"
+    )
+    parser.add_argument(
+        "--test_increasing_seq_lens",
+        action="store_true",
+        help="Test generations of small to large sequences",
+    )
+    parser.add_argument(
+        "--plugin-config",
+        dest="plugin_config",
+        type=str,
+        default=None,
+        help="Plugin options as JSON, for example '{\"tt\": {...}}'",
+    )
+    parser.add_argument("--max_model_len", type=int, default=None, help="Max model len")
+    parser.add_argument(
+        "--max_num_batched_tokens",
+        type=int,
+        default=None,
+        help="Max num batched tokens",
+    )
+    parser.add_argument(
+        "--mm_processor_kwargs",
+        type=str,
+        default=None,
+        help="Multi-modal processor kwargs",
+    )
+    parser.add_argument(
+        "--data_parallel_size",
+        type=int,
+        default=1,
+        help="Data parallel size",
+    )
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=64,
+        help="KV cache block size",
+    )
+    parser.add_argument(
+        "--disable_prefix_caching",
+        dest="enable_prefix_caching",
+        action="store_false",
+        help="Disable prefix caching",
+        default=True,
+    )
+    parser.add_argument(
+        "--non_uniform_sampling",
+        action="store_true",
+        help=(
+            "Use non-uniform sampling params (vary top_k, top_p, "
+            "temperature per prompt). Cannot be used with --greedy_sampling, "
+            "--test_increasing_seq_lens, or --measure_perf"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    run_inference(
+        args.model,
+        args.prompts_json,
+        measure_perf=args.measure_perf,
+        perf_prompt_len=args.perf_prompt_len,
+        max_tokens=args.max_tokens,
+        greedy_sampling=args.greedy_sampling,
+        max_seqs_in_batch=args.max_seqs_in_batch,
+        num_repeat_prompts=args.num_repeat_prompts,
+        async_engine=args.async_engine,
+        multi_modal=args.multi_modal,
+        multi_image=args.multi_image,
+        mm_processor_kwargs=args.mm_processor_kwargs,
+        test_increasing_seq_lens=args.test_increasing_seq_lens,
+        plugin_config=args.plugin_config,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        data_parallel_size=args.data_parallel_size,
+        block_size=args.block_size,
+        enable_prefix_caching=args.enable_prefix_caching,
+        non_uniform_sampling=args.non_uniform_sampling,
+    )

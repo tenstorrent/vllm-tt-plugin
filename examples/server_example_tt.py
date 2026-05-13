@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import argparse
+import runpy
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="meta-llama/Llama-3.1-70B-Instruct",
+        help="Model name",
+    )
+    parser.add_argument(
+        "--max_num_seqs",
+        type=int,
+        default=32,
+        help="Maximum number of sequences to be processed in a single iteration",
+    )
+    parser.add_argument(
+        "--block_size", type=int, default=64, help="KV cache block size"
+    )
+    args, _ = parser.parse_known_args()
+
+    sys.argv.extend(
+        [
+            "--model",
+            args.model,
+            "--block_size",
+            str(args.block_size),
+            "--max_num_seqs",
+            str(args.max_num_seqs),
+        ]
+    )
+    runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
