@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import torch
 from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch

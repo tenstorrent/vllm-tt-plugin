@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 """Host-only unit tests for ``TTLaneInputBatch`` (single-process lane-DP).
 
 Covers the lane-chunked layout the batch owns on behalf of the model runner:

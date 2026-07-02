@@ -31,7 +31,7 @@ project. Each is subject to its own license terms:
   https://github.com/vllm-project/vllm/blob/main/LICENSE
 
 - tt-metal
-  Copyright 2026 Tenstorrent USA, Inc.
+  Copyright 2025 Tenstorrent USA, Inc.
   Licensed under Apache-2.0
   https://github.com/tenstorrent/tt-metal
   https://github.com/tenstorrent/tt-metal/blob/main/LICENSE

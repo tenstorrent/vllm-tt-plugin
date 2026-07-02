@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 """Host tests for the transparent gathered-DP -> single-process lane conversion.
 
 Galaxy-generator models (llama3_70b_galaxy, qwen3_32b_galaxy) are served on a
