@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import torch
-
 from vllm.v1.outputs import LogprobsTensors
 
 

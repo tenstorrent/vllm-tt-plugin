@@ -14,7 +14,6 @@ from PIL import Image as PIL_Image
 from pkg_resources import resource_filename
 from tqdm import tqdm
 from transformers import AutoTokenizer
-
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (

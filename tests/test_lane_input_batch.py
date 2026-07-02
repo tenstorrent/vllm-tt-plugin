@@ -19,14 +19,14 @@ No device / ttnn execution required.
 from types import SimpleNamespace
 
 import torch
-import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
-from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
-
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 
 VOCAB = 64
 BLOCK = 16

@@ -7,9 +7,9 @@ import sys
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
+
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,

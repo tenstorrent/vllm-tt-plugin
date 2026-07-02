@@ -10,13 +10,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import ttnn
-
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
+
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
     from vllm_tt_plugin.input_batch import CachedRequestState
     from vllm_tt_plugin.model_input import TTModelInput
     from vllm_tt_plugin.model_runner import TTModelRunner
