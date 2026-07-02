@@ -49,7 +49,7 @@ class TestSeedingAndVariety:
         all_greedy = results1[:greedy_count] + results2[:greedy_count]
         assert_deterministic(
             all_greedy,
-            "Greedy requests should produce the same outputacross positions and runs.",
+            "Greedy requests should produce the same output across positions and runs.",
         )
 
         # Check answers overall
@@ -71,7 +71,7 @@ class TestSeedingAndVariety:
         assert_varied(
             different_seeds,
             expected_variety,
-            "Seeded requests should produce different outputsfor different seeds.",
+            "Seeded requests should produce different outputs for different seeds.",
         )
 
         # Check first tokens to make sure prefill is varied
@@ -373,5 +373,6 @@ class TestSeedingAndVariety:
         all_results = result_1 + result_2
         assert_deterministic(
             all_results,
-            "top_k=1 requests should produce the same outputacross positions and runs.",
+            "top_k=1 requests should produce the same output across "
+            "positions and runs.",
         )
