@@ -84,9 +84,11 @@ source "$PYTHON_ENV_DIR/bin/activate"
 `VLLM_TARGET_DEVICE` is a build-time variable only and does not need to be set at
 runtime. The TT platform is detected automatically when `ttnn` is importable.
 
-Optionally install pre-commit hooks for local development:
+Install pre-commit hooks once in your active development environment. After
+installation, these checks run automatically on every `git commit`:
 
 ```bash
+uv pip install pre-commit
 pre-commit install
 ```
 

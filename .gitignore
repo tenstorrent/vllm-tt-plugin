@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and analysis output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+
+# Local environment files
+.env
+.env.*
+
+# Logs and crash dumps
+*.log
+core
+core.*
+
+# Local model, tensor, and profiler artifacts
+model_cache/
+tt_cache/
+vllm_cache/
+*.tensorbin
+tracy/
+profiler/
