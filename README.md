@@ -512,3 +512,17 @@ until per-group DP gather lands.
 - Model capability declarations (`model_capabilities` dict on the model class)
   are the preferred way to gate features like async decode and prefix caching,
   rather than hard-coded model-name checks.
+
+## Contributing
+
+Contributions are welcome! Bug reports and feature requests should be filed via
+[GitHub Issues](https://github.com/tenstorrent/vllm-tt-plugin/issues). Bug
+fixes and new functionality are submitted via pull requests. Pull requests are
+reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## License
+
+- [LICENSE](LICENSE) — Overall license for this project (Apache 2.0), except
+  where specified
+- [LICENSE_understanding.txt](LICENSE_understanding.txt) — Tenstorrent's
+  clarification of how the Apache 2.0 license applies to this repository
