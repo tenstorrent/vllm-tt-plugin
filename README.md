@@ -10,13 +10,12 @@ The plugin is self-contained: model registration, platform detection, request
 validation, scheduling, worker execution, model loading, async decode, single-
 process standard and multi-lane execution, gathered data-parallel execution
 and `tt-run` / MPI launch orchestration all live here. Nothing TT-specific
-needs to touch vLLM
-core.
+needs to touch vLLM core.
 
 ## Package Layout
 
 ```text
-plugins/vllm-tt-plugin/
+.
 +-- src/vllm_tt_plugin/
 |   +-- entrypoints.py       # vLLM plugin entry points
 |   +-- platform.py          # TTPlatform and config validation
@@ -52,28 +51,28 @@ Install tt-metal first by following
 If installing tt-metal from source, build it, create the virtual environment,
 and set the environment variables needed for tt-metal tests.
 
-Activate the environment where tt-metal is installed, then install vLLM and the
-TT plugin from the vLLM repository root:
+Activate the environment where tt-metal is installed, then install vLLM
+and the TT plugin:
 
 ```bash
-source plugins/vllm-tt-plugin/docs/install-vllm-tt.sh
+source docs/install-vllm-tt.sh
 ```
 
-The script installs base vLLM with `VLLM_TARGET_DEVICE=empty` because `tt` is
-provided by this plugin at runtime, not by the base vLLM build. It then installs
-the plugin with a few dependencies. Most dependencies come from the
-active tt-metal env.
+The script installs vLLM with
+`VLLM_TARGET_DEVICE=empty` because `tt` platform is provided by this plugin
+at runtime. It then installs the plugin with a few dependencies.
+Most dependencies come from the active tt-metal env.
 
 To install or refresh only the plugin package:
 
 ```bash
-uv pip install -e plugins/vllm-tt-plugin
+uv pip install -e .
 ```
 
 To run the offline Qwen-VL example, also install its extra:
 
 ```bash
-uv pip install -e "plugins/vllm-tt-plugin[examples]"
+uv pip install -e ".[examples]"
 ```
 
 After the first setup, activate the same environment before running vLLM:
@@ -146,14 +145,14 @@ for weights and environment variables.
 Run offline generation with the default Llama 3.1 70B model:
 
 ```bash
-MESH_DEVICE=T3K python plugins/vllm-tt-plugin/examples/offline_inference_tt.py
+MESH_DEVICE=T3K python examples/offline_inference_tt.py
 ```
 
 Measure offline performance for one batch of prompts:
 
 ```bash
 MESH_DEVICE=T3K \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py --measure_perf
+python examples/offline_inference_tt.py --measure_perf
 ```
 
 To run a different text model, set `MESH_DEVICE` to `N150`, `N300`, `T3K`, `TG`,
@@ -177,7 +176,7 @@ To run Llama 70B on Galaxy:
 MESH_DEVICE=TG \
 LLAMA_DIR=<path-to-weights> \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+python examples/offline_inference_tt.py \
   --model "meta-llama/Llama-3.1-70B-Instruct" \
   --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "fabric_config": "FABRIC_1D_RING", "worker_l1_size": 1344544, "trace_region_size": 216580672}}'
 ```
@@ -186,7 +185,7 @@ To run GPT-OSS 20B on Galaxy:
 
 ```bash
 MESH_DEVICE="(4,8)" \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+python examples/offline_inference_tt.py \
   --model "openai/gpt-oss-20b" \
   --max_seqs_in_batch 1 \
   --additional-config '{"tt": {"fabric_config": "FABRIC_1D_RING"}}'
@@ -196,7 +195,7 @@ Run Llama 3.2 Vision on N300:
 
 ```bash
 MESH_DEVICE=N300 \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+python examples/offline_inference_tt.py \
   --model "meta-llama/Llama-3.2-11B-Vision-Instruct" \
   --multi_modal \
   --max_seqs_in_batch 16 \
@@ -221,7 +220,7 @@ Start the OpenAI-compatible server:
 
 ```bash
 VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K \
-python plugins/vllm-tt-plugin/examples/server_example_tt.py
+python examples/server_example_tt.py
 ```
 
 Send a completion request:
@@ -331,7 +330,7 @@ changes are needed:
 MESH_DEVICE=TG \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
 VLLM_RPC_TIMEOUT=900000 \
-python plugins/vllm-tt-plugin/examples/server_example_tt.py \
+python examples/server_example_tt.py \
   --model "meta-llama/Llama-3.3-70B-Instruct" \
   --data_parallel_size 4 \
   --max_num_seqs 8 \
@@ -386,7 +385,7 @@ Offline benchmarking is done by passing `--measure_perf` to
 
 ```bash
 MESH_DEVICE=T3K \
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+python examples/offline_inference_tt.py \
   --model meta-llama/Llama-3.1-70B-Instruct \
   --measure_perf
 ```
@@ -407,8 +406,8 @@ vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct \
 For prefix-cache experiments, use prompts with shared prefixes:
 
 ```bash
-python plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
-  --prompts_json plugins/vllm-tt-plugin/examples/prompts_overlapping.json
+python examples/offline_inference_tt.py \
+  --prompts_json examples/prompts_overlapping.json
 ```
 
 You can also pass `--random-prefix-len <N>` to `vllm bench serve`.
@@ -419,7 +418,7 @@ The plugin ships server-facing tests under `tests/tt`. Start a vLLM server with
 a TT model, then run:
 
 ```bash
-pytest plugins/vllm-tt-plugin/tests/tt -v \
+pytest tests/tt -v \
   --tt-server-url=http://localhost:8000 \
   --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
@@ -428,10 +427,10 @@ Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
 Plugin-local unit tests that do not require a running server live directly
-under `plugins/vllm-tt-plugin/tests/`, for example:
+under `tests/`, for example:
 
 ```bash
-pytest plugins/vllm-tt-plugin/tests/test_lane_scheduler.py
+pytest tests/test_lane_scheduler.py
 ```
 
 ## Running On Multi-Host Systems
@@ -444,7 +443,7 @@ Example offline inference on two Wormhole Galaxy hosts with DP=2:
 
 ```bash
 MESH_DEVICE="(8,8)" \
-python -u plugins/vllm-tt-plugin/examples/offline_inference_tt.py \
+python -u examples/offline_inference_tt.py \
   --model <MODEL_NAME> \
   --data_parallel_size 2 \
   --async_engine \
@@ -503,23 +502,6 @@ Hybrid models are not yet supported with `data_parallel_size > 1`; the DP
 merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models
 until per-group DP gather lands.
 
-## Status
-
-This plugin currently lives alongside a vLLM fork that adds a small set of
-generic plugin mechanism extensions not yet present in upstream vLLM. Once those
-extensions are part of upstream, this plugin will be fully self-contained and
-will work against stock vLLM without any fork.
-
-The extensions needed are:
-
-- `ParallelConfig.engine_core_cls`: lets a platform plugin select an
-  alternative `EngineCore` implementation.
-- `ParallelConfig.engine_core_proc_cls`: lets a platform plugin select an
-  alternative `EngineCoreProc` implementation.
-- `ParallelConfig.dp_engine_core_proc_cls`: lets a platform plugin select an
-  alternative data-parallel engine process implementation.
-- `ParallelConfig.engine_core_launcher_cls`: lets a platform plugin own the
-  engine launch and handshake topology.
 
 ## Development Notes
 
