@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 """Unit tests for the single-process lane-DP coordinator.
 
 The coordinator is exercised over lightweight fake lane schedulers: a real

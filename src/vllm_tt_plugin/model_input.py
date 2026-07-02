@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 """Per-step input payloads handed from ``TTModelRunner`` to the TT model.
 

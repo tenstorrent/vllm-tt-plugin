@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 """Unit tests for ``get_num_available_blocks_tt``.
 
 The TT backend skips KV cache memory profiling and instead returns a
