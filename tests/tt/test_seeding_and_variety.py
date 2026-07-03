@@ -185,7 +185,7 @@ class TestSeedingAndVariety:
         prompt = "Random story: "
         configs = [
             RequestConfig(
-                prompt=prompt, max_tokens=20, temperature=10.0, top_k=50, seed=seed
+                prompt=prompt, max_tokens=20, temperature=2.0, top_k=50, seed=seed
             )
         ]
         results = []
@@ -201,7 +201,7 @@ class TestSeedingAndVariety:
         """
         prompt = "Random story: "
         configs = [
-            RequestConfig(prompt=prompt, max_tokens=20, temperature=10.0, top_k=50)
+            RequestConfig(prompt=prompt, max_tokens=20, temperature=2.0, top_k=50)
         ]
         results = []
         for _ in range(10):
@@ -234,7 +234,7 @@ class TestSeedingAndVariety:
         """
         prompt = "Random story: "
         configs = [
-            RequestConfig(prompt=prompt, max_tokens=20, temperature=10.0, top_k=50)
+            RequestConfig(prompt=prompt, max_tokens=20, temperature=2.0, top_k=50)
             for _ in range(max_batch_size)
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
@@ -259,24 +259,26 @@ class TestSeedingAndVariety:
         prompt = "Random letter: "
 
         configs = [
-            RequestConfig(prompt=prompt, max_tokens=10, temperature=5)
+            RequestConfig(prompt=prompt, max_tokens=10, temperature=2.0)
             for _ in range(batch_size)
         ]
 
         # Overall
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        assert_varied(results, 2, "With temperature=5, outputs should vary in batch.")
+        assert_varied(results, 2, "With temperature=2.0, outputs should vary in batch.")
 
         # First token (prefill)
         prefill_results = [x[:1] for x in results]
         assert_varied(
-            prefill_results, 2, "With temperature=5, first tokens should vary in batch."
+            prefill_results,
+            2,
+            "With temperature=2.0, first tokens should vary in batch.",
         )
 
     def test_temperature_varied_between_batches(self, tt_server, tt_model_name):
         prompt = "Random letter: "
 
-        configs = [RequestConfig(prompt=prompt, max_tokens=10, temperature=5)]
+        configs = [RequestConfig(prompt=prompt, max_tokens=10, temperature=2.0)]
 
         tries = 10
 
@@ -285,14 +287,16 @@ class TestSeedingAndVariety:
             run_concurrent_batch(tt_server, tt_model_name, configs)[0]
             for _ in range(tries)
         ]
-        assert_varied(results, 2, "With temperature=5, outputs should vary on re-runs.")
+        assert_varied(
+            results, 2, "With temperature=2.0, outputs should vary on re-runs."
+        )
 
         # First token (prefill)
         prefill_results = [x[:1] for x in results]
         assert_varied(
             prefill_results,
             2,
-            "With temperature=5, first tokens should vary on re-runs.",
+            "With temperature=2.0, first tokens should vary on re-runs.",
         )
 
     @pytest.mark.parametrize("batch_size", [15, 19, 32])
@@ -305,7 +309,7 @@ class TestSeedingAndVariety:
         ]
 
         topk_configs = [
-            RequestConfig(prompt=prompt, max_tokens=10, top_k=10, temperature=50)
+            RequestConfig(prompt=prompt, max_tokens=10, top_k=10, temperature=2.0)
             for _ in range(batch_size - num_greedy)
         ]
         joint_configs = greedy_config + topk_configs
