@@ -355,8 +355,14 @@ class TTLaneCoordinator(SchedulerInterface):
         A lane wants to prefill when it has queued requests and either nothing
         running (so it must prefill to make progress) or spare capacity to admit
         more alongside its running decodes.
+
+        ``skipped_waiting`` holds prefill requests blocked on grammar
+        compilation and counts as queued work: without it a lane whose only
+        pending request is a grammar-blocked structured-output request would
+        signal decode-only, and the base scheduler could then promote that
+        request into a mixed prefill+decode step.
         """
-        has_waiting = bool(sched.waiting)
+        has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
         has_running = bool(sched.running)
         has_capacity = len(sched.running) < self._per_lane_max
         return int(has_waiting and ((not has_running) or has_capacity))
