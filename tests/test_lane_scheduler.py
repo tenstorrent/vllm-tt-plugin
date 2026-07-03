@@ -4,8 +4,8 @@
 
 The coordinator is exercised over lightweight fake lane schedulers: a real
 ``TTScheduler`` needs a device KV cache config, but the coordinator only relies
-on a small surface of each lane (``waiting`` / ``running`` length, forced-mode
-scheduling, and ``update_from_output``).
+on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
+length, forced-mode scheduling, and ``update_from_output``).
 """
 
 from types import SimpleNamespace
@@ -32,8 +32,9 @@ class FakeLane:
     fallback.
     """
 
-    def __init__(self, waiting=0, running=0, pending_finished=()):
+    def __init__(self, waiting=0, running=0, skipped_waiting=0, pending_finished=()):
         self.waiting = [object()] * waiting
+        self.skipped_waiting = [object()] * skipped_waiting
         self.running = [object()] * running
         self._pending_finished = set(pending_finished)
         self._mode = TTSchedulingMode.DEFAULT
@@ -92,6 +93,14 @@ def test_negotiate_prefill_when_any_lane_wants_prefill():
 def test_negotiate_decode_when_no_lane_wants_prefill():
     coordinator = _make_coordinator([FakeLane(running=2), FakeLane(running=1)])
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.DECODE_ONLY
+
+
+def test_negotiate_prefill_when_lane_has_only_grammar_blocked_request():
+    # Lane 1's only pending work is a grammar-blocked structured-output request
+    # held in skipped_waiting (waiting is empty). It must still force prefill so
+    # the base scheduler cannot promote it into lane 0's decode step.
+    coordinator = _make_coordinator([FakeLane(running=2), FakeLane(skipped_waiting=1)])
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
 def test_idle_step_propagates_finished_req_ids():
