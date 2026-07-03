@@ -441,6 +441,15 @@ class TTPlatform(Platform):
         pass
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        # No-op: TT device context is owned by the ttnn mesh device opened in
+        # TTWorker.init_device, not by a torch device context. torch has no "tt"
+        # backend to switch to, so the base Platform.set_device raises
+        # NotImplementedError. vLLM's multiproc executor calls this from its
+        # async-output-copy thread, which would crash that thread without this.
+        pass
+
+    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         return True
 
