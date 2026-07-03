@@ -8,6 +8,7 @@ for the downstream vLLM pipeline.
 """
 
 import torch
+
 from vllm_tt_plugin.logprobs import build_logprobs_from_topk
 
 

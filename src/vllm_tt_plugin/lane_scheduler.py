@@ -43,6 +43,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import SchedulerStats
+
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,

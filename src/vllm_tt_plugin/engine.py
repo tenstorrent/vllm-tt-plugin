@@ -11,7 +11,6 @@ from typing import Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
-
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_tcp_uri
@@ -24,6 +23,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.request import Request
+
 from vllm_tt_plugin.config import get_tt_config, get_tt_per_lane_max_num_seqs
 from vllm_tt_plugin.scheduler import TTSchedulingMode
 

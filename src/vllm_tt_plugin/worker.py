@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import ttnn
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_architecture

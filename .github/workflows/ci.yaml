@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+
+# Only lint runs here. The unit tests import vllm_tt_plugin, which imports the
+# locally built TT vLLM (`empty` target) that is not installable on a stock
+# GitHub runner, so pytest belongs on a TT environment (see tt-metal's
+# vllm-nightly-tests), not in this workflow.
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: pre-commit/action@v3.0.1

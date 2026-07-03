@@ -11,6 +11,7 @@ tokenizer there, so the tests instantiate it with ``tokenizer=None`` and pass
 import json
 
 import pytest
+
 from vllm_tt_plugin.gemma4_tool_parser import Gemma4ToolParser
 
 

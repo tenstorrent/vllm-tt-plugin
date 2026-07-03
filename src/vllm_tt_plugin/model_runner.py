@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, cast
 import regex as re
 import torch
 import ttnn
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -33,6 +32,7 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,

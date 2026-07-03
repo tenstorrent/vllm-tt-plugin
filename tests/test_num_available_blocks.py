@@ -31,6 +31,7 @@ exercise the headroom formula.
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 from vllm_tt_plugin import config as tt_config
 
 

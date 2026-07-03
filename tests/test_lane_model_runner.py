@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.core.sched.output import SchedulerOutput
+
 from vllm_tt_plugin.async_decode import (
     SubmittedStepContext,
     TTAsyncDecodeController,
@@ -22,8 +24,6 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
-
-from vllm.v1.core.sched.output import SchedulerOutput
 
 VOCAB = 8
 BLOCK = 16

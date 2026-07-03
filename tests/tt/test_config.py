@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from vllm_tt_plugin import config as tt_config
 
 

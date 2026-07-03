@@ -24,6 +24,9 @@ dependencies = ["tblib>=3.1.0"]
 # (examples/offline_inference_tt.py), not by the serving path, and the tt-metal
 # env does not provide it.
 examples = ["qwen-vl-utils"]
+# Development tooling. ruff is pinned to match the .pre-commit-config.yaml hook
+# so a direct `ruff` invocation and the commit hook enforce identical rules.
+dev = ["pre-commit", "ruff==0.14.0", "pytest"]
 
 [project.entry-points."vllm.general_plugins"]
 tt_model_registry = "vllm_tt_plugin.entrypoints:register"
@@ -34,3 +37,39 @@ tt = "vllm_tt_plugin.entrypoints:platform_plugin"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vllm_tt_plugin*"]
+
+# Linting aligned to upstream vLLM rules
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-implicit-str-concat
+    "ISC",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # flake8-logging-format
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # zip without `strict=`
+    "B905",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+]
+
+[tool.ruff.format]
+docstring-code-format = true

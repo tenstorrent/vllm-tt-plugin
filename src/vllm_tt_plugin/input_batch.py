@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-
 from vllm.sampling_params import SamplingType
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.sample.logits_processor import (
@@ -21,6 +20,7 @@ from vllm.v1.sample.logits_processor.builtin import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
@@ -34,6 +34,7 @@ from vllm_tt_plugin.structured_output import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
     from vllm_tt_plugin.model_runner import TTModelRunner
 

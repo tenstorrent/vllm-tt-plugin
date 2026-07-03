@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import torch
+
 from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
 
 

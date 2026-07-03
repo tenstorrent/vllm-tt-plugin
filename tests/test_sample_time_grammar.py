@@ -18,10 +18,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from vllm.v1.core.sched.output import GrammarOutput
+
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
-
-from vllm.v1.core.sched.output import GrammarOutput
 
 VOCAB_WORDS = 2  # int32 words per grammar bitmask row
 

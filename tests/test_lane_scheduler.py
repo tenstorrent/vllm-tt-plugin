@@ -10,6 +10,9 @@ scheduling, and ``update_from_output``).
 
 from types import SimpleNamespace
 
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.engine import EngineCoreOutputs
+
 from vllm_tt_plugin.lane_scheduler import (
     TTLaneCoordinator,
     TTStepPlan,
@@ -17,9 +20,6 @@ from vllm_tt_plugin.lane_scheduler import (
     merge_lane_scheduler_outputs,
 )
 from vllm_tt_plugin.scheduler import TTSchedulingMode
-
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs
 
 
 class FakeLane:

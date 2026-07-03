@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 from torch import nn
-
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import get_model_architecture
+
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
