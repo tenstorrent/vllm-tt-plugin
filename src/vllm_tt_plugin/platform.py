@@ -495,6 +495,19 @@ class TTPlatform(Platform):
             )
             model_config.max_logprobs = MAX_TOP_K
 
+        # Opt into vLLM's auto-fit of max_model_len against the KV cache the TT
+        # device can actually hold. The TT worker sizes the KV cache from the
+        # model's total token budget (max_tokens_all_users) and pins it via
+        # cache_config.num_gpu_blocks_override, which is decoupled from the
+        # model's per-request max_model_len (often the HF default, e.g. 262144).
+        # vLLM's _check_enough_kv_cache_memory raises when max_model_len needs
+        # more KV than the override provides. Setting original_max_model_len=-1
+        # makes get_kv_cache_configs run _auto_fit_max_model_len, which clamps
+        # max_model_len down to the largest length the override-backed capacity
+        # can serve (it never expands, so a smaller user-set max_model_len is
+        # preserved) and syncs the reduced value to workers.
+        model_config.original_max_model_len = -1
+
         # Import and register models from tt-metal.
         #
         # NOTE: We also register TT models early in `vllm_tt_plugin.worker`
