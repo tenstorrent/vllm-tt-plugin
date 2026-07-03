@@ -54,6 +54,26 @@ def _galaxy_generator_version() -> str | None:
     return None
 
 
+# GPT-OSS is served by the tt_transformers generator, which drives data
+# parallelism inside a single process -- either user-row sharding on multi-row
+# meshes or one Generator over per-DP submeshes. Gathered multi-process DP is
+# therefore unnecessary: --data_parallel_size folds into in-process TT lanes,
+# the same as the Galaxy generators.
+_GPT_OSS_ARCH = "GptOssForCausalLM"
+
+
+def _model_folds_gather_dp_into_lanes(model_class) -> bool:
+    """Whether the model's gathered multi-process DP folds into in-process lanes.
+
+    True for the Galaxy generators and for GPT-OSS, both of which drive data
+    parallelism within a single process. Other models keep gathered
+    multi-process DP.
+    """
+    if _galaxy_generator_version() is not None:
+        return True
+    return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
+
+
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     """Reset DP-derived ParallelConfig fields to single-process values.
 
@@ -94,14 +114,15 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
-def _convert_galaxy_gather_dp_to_lanes(vllm_config: "VllmConfig") -> None:
+def _convert_gather_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     """Transparently convert gathered multi-process DP into in-process TT lanes.
 
-    Galaxy-generator models (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``) are
-    served by a single Galaxy device mesh. Gathered multi-process DP is
-    deprecated in favor of single-process TT lanes. Rather than asking users to
-    migrate flags, we run ``--data_parallel_size N`` as ``N`` in-process lanes:
-    record the resolved lane count and reset ``data_parallel_size`` to 1.
+    Models that run as a single shared device execute on one mesh -- the Galaxy
+    generators (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``) and GPT-OSS under
+    user-row sharding -- do not need gathered multi-process DP. Rather than
+    asking users to migrate flags, we run ``--data_parallel_size N`` as ``N``
+    in-process lanes: record the resolved lane count and reset
+    ``data_parallel_size`` to 1.
 
     To preserve the historical capacity contract -- where each of the ``N``
     gathered DP ranks handled ``max_num_seqs`` requests -- the global
@@ -110,16 +131,15 @@ def _convert_galaxy_gather_dp_to_lanes(vllm_config: "VllmConfig") -> None:
     value the user requested (e.g. ``--data_parallel_size 4 --max_num_seqs 8``
     becomes 4 lanes, each with max 8 seqs, for a global max of 32).
 
-    No-op unless a Galaxy-generator model is active with
-    ``data_parallel_size > 1``. Idempotent: after conversion
-    ``data_parallel_size == 1``, so re-entry short-circuits.
+    No-op unless ``data_parallel_size > 1`` and the model folds gathered DP
+    into lanes (``_model_folds_gather_dp_into_lanes``). Idempotent: after
+    conversion ``data_parallel_size == 1``, so re-entry short-circuits.
     """
     parallel_config = vllm_config.parallel_config
     data_parallel_size = parallel_config.data_parallel_size
     if data_parallel_size <= 1:
         return
-    galaxy_version = _galaxy_generator_version()
-    if galaxy_version is None:
+    if not _model_folds_gather_dp_into_lanes(model_class):
         return
 
     lanes = data_parallel_size
@@ -132,11 +152,10 @@ def _convert_galaxy_gather_dp_to_lanes(vllm_config: "VllmConfig") -> None:
     _collapse_parallel_config_to_single_process(parallel_config)
 
     logger.info(
-        "Galaxy model %s requested DP "
-        "(--data_parallel_size=%d); running single-process TT lane-DP instead "
+        "Model requested gathered DP (--data_parallel_size=%d) but runs as a "
+        "single device execute; running single-process TT lane-DP instead "
         "(%d lanes, per-lane max_num_seqs=%d, global max_num_seqs=%d).",
-        galaxy_version,
-        lanes,
+        data_parallel_size,
         lanes,
         per_lane_max_num_seqs,
         global_max_num_seqs,
@@ -615,12 +634,13 @@ class TTPlatform(Platform):
             )
             vllm_config.scheduler_config.async_scheduling = False
 
-        # Galaxy-generator models (Llama3 70B, Qwen3-32B) are served by a single
-        # device mesh. Convert
-        # it transparently into single-process TT lanes so users keep passing
-        # --data_parallel_size with no other flag changes. Must run before the
-        # validation/routing below so the lane path is selected.
-        _convert_galaxy_gather_dp_to_lanes(vllm_config)
+        # Single-execute models (Galaxy generators, GPT-OSS under user-row
+        # sharding) run one shared device execute on the full mesh, so gathered
+        # multi-process DP is folded transparently into single-process TT lanes
+        # -- users keep passing --data_parallel_size with no other flag changes.
+        # Must run before the validation/routing below so the lane path is
+        # selected. model_class carries the single-execute decision for GPT-OSS.
+        _convert_gather_dp_to_lanes(vllm_config, model_class)
 
         if uses_tt_lane_coordinator(vllm_config):
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
