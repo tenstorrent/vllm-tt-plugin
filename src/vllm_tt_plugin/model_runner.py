@@ -59,6 +59,7 @@ from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
+    normalize_greedy_device_sampling_params,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
@@ -1111,6 +1112,11 @@ class TTModelRunner:
             # depends also on other requests in the batch.
             # This means sampling is not perfectly deterministic
             # whenever device sampling is enabled.
+
+        if perform_device_sampling:
+            tt_sampling_params = normalize_greedy_device_sampling_params(
+                tt_sampling_params
+            )
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]

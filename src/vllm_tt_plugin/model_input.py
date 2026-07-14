@@ -60,6 +60,101 @@ def slice_tt_sampling_params(
     )
 
 
+def normalize_greedy_device_sampling_params(
+    sampling: TTSamplingParams,
+) -> TTSamplingParams:
+    """Convert greedy rows into the format TT device sampling expects.
+
+    vLLM marks greedy requests with ``temperature == 0``. TT's device sampler
+    does not use that convention, so for device sampling we rewrite greedy
+    rows to ``top_k=1, top_p=0, temperature=1``. That keeps greedy rows as
+    argmax, even when they share a batch with non-greedy rows.
+
+    This is only for payloads that will be sampled on device. Host sampling
+    should keep the original vLLM representation.
+
+    Examples
+    --------
+    >>> inputs = TTSamplingParams(
+    ...     temperature=[0.0, 0.8],
+    ...     top_k=[32, 10],
+    ...     top_p=[0.95, 0.9])
+    >>> outputs = normalize_greedy_device_sampling_params(inputs)
+    >>> outputs
+    TTSamplingParams(
+    ...     temperature=[1.0, 0.8],
+    ...     top_k=[1, 10],
+    ...     top_p=[0.0, 0.9], ...)
+    """
+    temperature = sampling.temperature
+    top_k = sampling.top_k
+    top_p = sampling.top_p
+
+    if isinstance(temperature, torch.Tensor):
+        greedy_mask = temperature == 0.0
+
+        if not greedy_mask.any().item():
+            return sampling
+
+        top_k = torch.as_tensor(top_k)
+        top_p = torch.as_tensor(top_p)
+
+        return TTSamplingParams(
+            temperature=torch.where(greedy_mask, torch.ones_like(temperature), temperature),
+            top_k=torch.where(greedy_mask, torch.ones_like(top_k), top_k),
+            top_p=torch.where(greedy_mask, torch.zeros_like(top_p), top_p),
+            presence_penalty=sampling.presence_penalty,
+            frequency_penalty=sampling.frequency_penalty,
+            repetition_penalty=sampling.repetition_penalty,
+            seed=sampling.seed,
+            num_logprobs=sampling.num_logprobs,
+            enable_log_probs=sampling.enable_log_probs,
+        )
+
+    if isinstance(temperature, list):
+        changed = False
+        new_temperature = list(temperature)
+        new_top_k = list(top_k)
+        new_top_p = list(top_p)
+
+        for i, temp in enumerate(temperature):
+            if temp == 0.0:
+                new_temperature[i] = 1.0
+                new_top_k[i] = 1
+                new_top_p[i] = 0.0
+                changed = True
+
+        if not changed:
+            return sampling
+
+        return TTSamplingParams(
+            temperature=new_temperature,
+            top_k=new_top_k,
+            top_p=new_top_p,
+            presence_penalty=sampling.presence_penalty,
+            frequency_penalty=sampling.frequency_penalty,
+            repetition_penalty=sampling.repetition_penalty,
+            seed=sampling.seed,
+            num_logprobs=sampling.num_logprobs,
+            enable_log_probs=sampling.enable_log_probs,
+        )
+
+    if temperature != 0.0:
+        return sampling
+
+    return TTSamplingParams(
+        temperature=1.0,
+        top_k=1,
+        top_p=0.0,
+        presence_penalty=sampling.presence_penalty,
+        frequency_penalty=sampling.frequency_penalty,
+        repetition_penalty=sampling.repetition_penalty,
+        seed=sampling.seed,
+        num_logprobs=sampling.num_logprobs,
+        enable_log_probs=sampling.enable_log_probs,
+    )
+
+
 @dataclass(frozen=True)
 class TTModelInput:
     input_tokens: torch.Tensor

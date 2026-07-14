@@ -25,6 +25,7 @@ from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
+    normalize_greedy_device_sampling_params,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.structured_output import (
@@ -1132,6 +1133,10 @@ class TTLaneInputBatch(InputBatch):
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=True, has_structured_outputs=has_structured
         )
+        if perform_device_sampling:
+            tt_sampling_params = normalize_greedy_device_sampling_params(
+                tt_sampling_params
+            )
 
         # The prompt/output token tensors feed device-side penalties only. Host
         # sampling rebuilds them itself in ``build_merged_sampling_metadata``, so
@@ -1212,6 +1217,10 @@ class TTLaneInputBatch(InputBatch):
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=False, has_structured_outputs=has_structured
         )
+        if perform_device_sampling:
+            tt_sampling_params = normalize_greedy_device_sampling_params(
+                tt_sampling_params
+            )
 
         # Device-side penalties only; host sampling rebuilds these in
         # ``build_merged_sampling_metadata`` (over the full slot batch), so
