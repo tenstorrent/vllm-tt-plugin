@@ -114,9 +114,7 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
-def _convert_gather_dp_to_lanes(
-    vllm_config: "VllmConfig", model_class=None
-) -> None:
+def _convert_gather_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     """Transparently convert gathered multi-process DP into in-process TT lanes.
 
     Models that run as a single shared device execute on one mesh -- the Galaxy

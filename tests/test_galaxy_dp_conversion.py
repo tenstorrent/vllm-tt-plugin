@@ -125,9 +125,7 @@ def test_gpt_oss_gather_dp_converted_to_lanes(monkeypatch):
     monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
     config = _vllm_config(data_parallel_size=4, max_num_seqs=32)
 
-    tt_platform._convert_gather_dp_to_lanes(
-        config, _model_class("GptOssForCausalLM")
-    )
+    tt_platform._convert_gather_dp_to_lanes(config, _model_class("GptOssForCausalLM"))
 
     assert config.parallel_config.data_parallel_size == 1
     assert tt_config.get_tt_data_parallel_size(config) == 4
@@ -143,9 +141,7 @@ def test_non_gpt_oss_model_not_converted(monkeypatch):
     monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
     config = _vllm_config(data_parallel_size=4, max_num_seqs=32)
 
-    tt_platform._convert_gather_dp_to_lanes(
-        config, _model_class("LlamaForCausalLM")
-    )
+    tt_platform._convert_gather_dp_to_lanes(config, _model_class("LlamaForCausalLM"))
 
     assert config.parallel_config.data_parallel_size == 4
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config

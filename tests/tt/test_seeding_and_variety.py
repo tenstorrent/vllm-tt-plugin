@@ -265,9 +265,7 @@ class TestSeedingAndVariety:
 
         # Overall
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        assert_varied(
-            results, 2, "With temperature=2.0, outputs should vary in batch."
-        )
+        assert_varied(results, 2, "With temperature=2.0, outputs should vary in batch.")
 
         # First token (prefill)
         prefill_results = [x[:1] for x in results]
