@@ -12,14 +12,21 @@ Requires the ttnn-enabled environment because importing the plugin modules pulls
 in ttnn.
 """
 
+import threading
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.core.sched.output import GrammarOutput
 
+from vllm_tt_plugin.async_decode import (
+    AsyncTTDPGatherOutput,
+    DeferredDecodeOutput,
+    TTAsyncDecodeController,
+)
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 
@@ -183,7 +190,10 @@ def test_apply_grammar_to_input_wraps_bitmask_in_single_element_list():
 
 def test_finish_async_decode_skips_bitmask_when_grammar_absent():
     calls: list = []
-    wrapper = SimpleNamespace(set_grammar_bitmask=lambda bm: calls.append(bm))
+    wrapper = SimpleNamespace(
+        set_grammar_bitmask=lambda bm: calls.append(("bitmask", bm)),
+        start_finalization=lambda: calls.append(("start", None)),
+    )
     runner = SimpleNamespace(_reorder_grammar_bitmask=lambda *a, **k: None)
 
     result = TTModelRunner._finish_async_decode(
@@ -191,13 +201,16 @@ def test_finish_async_decode_skips_bitmask_when_grammar_absent():
     )
 
     assert result is wrapper
-    assert calls == []  # no bitmask set on the wrapper
+    assert calls == [("start", None)]
 
 
 def test_finish_async_decode_sets_bitmask_when_grammar_present():
     calls: list = []
     bitmask = torch.tensor([[3, 4]], dtype=torch.int32)
-    wrapper = SimpleNamespace(set_grammar_bitmask=lambda bm: calls.append(bm))
+    wrapper = SimpleNamespace(
+        set_grammar_bitmask=lambda bm: calls.append(("bitmask", bm)),
+        start_finalization=lambda: calls.append(("start", None)),
+    )
     runner = SimpleNamespace(_reorder_grammar_bitmask=lambda *a, **k: bitmask)
 
     result = TTModelRunner._finish_async_decode(
@@ -205,7 +218,86 @@ def test_finish_async_decode_sets_bitmask_when_grammar_present():
     )
 
     assert result is wrapper
-    assert len(calls) == 1 and torch.equal(calls[0], bitmask)
+    assert len(calls) == 2
+    assert calls[0][0] == "bitmask" and torch.equal(calls[0][1], bitmask)
+    assert calls[1] == ("start", None)
+
+
+class _TestDeferredOutput(DeferredDecodeOutput):
+    def __init__(self, get_output_impl):
+        self._completion_event = threading.Event()
+        self._get_output_impl_fn = get_output_impl
+        self._init_deferred()
+
+    def _get_output_impl(self):
+        return self._get_output_impl_fn()
+
+
+def test_deferred_output_starts_finalization_eagerly_and_caches_result():
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def get_output_impl():
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return "sampled"
+
+    output = _TestDeferredOutput(get_output_impl)
+    output.start_finalization()
+    output.start_finalization()
+
+    assert started.wait(timeout=5)
+    release.set()
+    assert output.get_output() == "sampled"
+    assert output.get_output() == "sampled"
+    assert calls == 1
+    assert output.is_resolved()
+
+
+def test_deferred_output_caches_background_failure():
+    calls = 0
+
+    def get_output_impl():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("readback failed")
+
+    output = _TestDeferredOutput(get_output_impl)
+    output.start_finalization()
+
+    with pytest.raises(RuntimeError, match="readback failed"):
+        output.get_output()
+    with pytest.raises(RuntimeError, match="readback failed"):
+        output.get_output()
+
+    assert calls == 1
+    assert output.is_resolved()
+
+
+def test_submit_async_dp_decode_starts_finalization(monkeypatch):
+    submission = SimpleNamespace(tt_out=object())
+    registered: list[tuple[object, bool]] = []
+    started: list[object] = []
+    monkeypatch.setattr(
+        AsyncTTDPGatherOutput,
+        "start_finalization",
+        lambda output: started.append(output),
+    )
+    controller = SimpleNamespace(
+        can_use_steady_decode_fast_path=lambda model_input: True,
+        submit_decode=lambda model_input, **kwargs: submission,
+        register_pending_async_step=lambda step, *, overlap_ok: registered.append(
+            (step, overlap_ok)
+        ),
+    )
+
+    output = TTAsyncDecodeController.submit_async_dp_decode(controller, _model_input())
+
+    assert registered == [(output, True)]
+    assert started == [output]
 
 
 # --------------------------------------------------------------------------

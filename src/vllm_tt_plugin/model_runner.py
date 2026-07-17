@@ -2194,6 +2194,11 @@ class TTModelRunner:
         )
         if bitmask is not None:
             wrapper.set_grammar_bitmask(bitmask)
+        # vLLM 0.24 resolves AsyncModelRunnerOutput lazily. Start TT readback
+        # and host sampling now, after grammar metadata is attached, so CPU
+        # scheduling overlaps output processing without depending on executor
+        # implementation details.
+        wrapper.start_finalization()
         return wrapper
 
     def _finish_nondp_sync(

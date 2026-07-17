@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,6 +25,16 @@ logger = init_tt_logger(__name__)
 # re-application on the prefill->decode transition (see ``submit_decode``).
 _DEBUG_MROPE_ENV = os.environ.get("VLLM_TT_DEBUG_MROPE", "")
 DEBUG_MROPE = _DEBUG_MROPE_ENV not in ("", "0", "false", "False")
+
+# vLLM 0.24 resolves AsyncModelRunnerOutput lazily from Future.result().
+# TT readback and host sampling must start as soon as sample_tokens has attached
+# its grammar metadata, rather than waiting for the engine to consume that
+# future. A single worker preserves submission order and matches the eager
+# WorkerAsyncOutput lifecycle used by the previous vLLM integration.
+_ASYNC_OUTPUT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="TTAsyncOutput",
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -83,47 +94,59 @@ class CompletedDecodeStep:
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
-    """Run the deferred device readback exactly once, from whichever caller
-    reaches it first.
+    """Start deferred readback eagerly and materialize its result exactly once.
 
-    Two callers race for the same step from different threads: vLLM's
-    ``UniProcExecutor`` resolves it via ``get_output`` on its async-output
-    thread when async scheduling is on, while the runner's drain
-    (``TTAsyncDecodeController.wait_for_all_pending_async_steps``) resolves it
-    via ``ensure_finalized`` on the engine thread. ``_finalize_lock`` makes the
-    readback run exactly once across both threads; a second concurrent readback
-    of the same device submission corrupts the decode output. The completion
-    event is set here, when the readback actually runs, not only inside
-    ``get_output``. That is the invariant the drain depends on: vLLM 0.22's
-    ``step_with_batch_queue`` schedules the next batch before resolving the
-    prior future, so a drain that merely ``event.wait()``-ed would block forever
-    on an event nothing else has reached yet.
+    ``sample_tokens`` starts finalization after attaching any grammar metadata.
+    vLLM may later resolve the returned ``AsyncModelRunnerOutput`` lazily, while
+    the runner can concurrently drain it before submitting another incompatible
+    batch. ``_finalize_lock`` ensures only one caller performs readback and host
+    sampling. Both the result and any exception are cached for every later
+    caller, and the completion event is set for either outcome.
     """
 
     _completion_event: threading.Event
     _finalize_lock: threading.Lock
     _finalized: bool
     _cached_output: Any
+    _finalize_error: Exception | None
+    _finalize_future: Future[Any] | None
 
     def _init_deferred(self) -> None:
         self._finalized = False
         self._cached_output = None
+        self._finalize_error = None
+        self._finalize_future = None
         self._finalize_lock = threading.Lock()
 
     def ensure_finalized(self) -> Any:
-        if self._finalized:
-            return self._cached_output
-        with self._finalize_lock:
-            if not self._finalized:
-                self._cached_output = self._get_output_impl()
-                self._finalized = True
-                self._completion_event.set()
+        if not self._finalized:
+            with self._finalize_lock:
+                if not self._finalized:
+                    try:
+                        self._cached_output = self._get_output_impl()
+                    except Exception as exc:
+                        self._finalize_error = exc
+                    finally:
+                        self._finalized = True
+                        self._completion_event.set()
+        if self._finalize_error is not None:
+            raise self._finalize_error
         return self._cached_output
+
+    def start_finalization(self) -> None:
+        """Submit readback and host sampling to the ordered TT output thread."""
+        with self._finalize_lock:
+            if self._finalized or self._finalize_future is not None:
+                return
+            self._finalize_future = _ASYNC_OUTPUT_EXECUTOR.submit(self.ensure_finalized)
 
     def is_resolved(self) -> bool:
         return self._completion_event.is_set()
 
     def get_output(self) -> Any:
+        future = self._finalize_future
+        if future is not None:
+            return future.result()
         return self.ensure_finalized()
 
     def _get_output_impl(self) -> Any:
@@ -529,6 +552,9 @@ class TTAsyncDecodeController:
             completion_event=completion_event,
         )
         self.register_pending_async_step(step, overlap_ok=overlap_ok)
+        # Gathered-DP model inputs already include sample-time grammar metadata,
+        # so output processing can start immediately.
+        step.start_finalization()
         return step
 
     def submit_async_lane_decode(
