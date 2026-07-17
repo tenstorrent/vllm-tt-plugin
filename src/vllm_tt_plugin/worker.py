@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-import ast
 import math
 import os
 import time
+import warnings
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -48,6 +48,7 @@ from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
+    _parse_mesh_grid,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
@@ -63,6 +64,50 @@ logger = init_tt_logger(__name__)
 # before initializing multimodal caches; without this, early architecture
 # inspection may fail for TT-prefixed architectures.
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
+
+
+def _rank_owns_mesh(parallel_config: Any) -> bool:
+    """Return whether this worker process should own a TT mesh device.
+
+    Standard DP runs one independent TT mesh per rank. Upstream rewrites each
+    dense DP subprocess to look like a local DP=1 engine while preserving the
+    original shard identity in ``data_parallel_index`` and
+    ``data_parallel_rank_local``; treat those collapsed ranks as mesh-owning
+    too. True single-process modes still only have the rank-0 worker.
+    """
+    local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
+    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
+    data_parallel_index = getattr(parallel_config, "data_parallel_index", 0)
+    return (
+        data_parallel_size > 1 or data_parallel_index > 0 or local_dp_rank in (None, 0)
+    )
+
+
+def _resolve_mesh_grid(
+    mesh_device_env: str | None,
+    num_devices_available: int,
+    visible_devices_env: str | None,
+) -> tuple[int, int]:
+    mesh_grid = _parse_mesh_grid(
+        mesh_device_env,
+        num_devices_available,
+        tg_mesh_grid=(8, 4),
+    )
+
+    if visible_devices_env:
+        stored_mesh_grid = TTPlatform._standard_dp_mesh_grids.get(visible_devices_env)
+        if stored_mesh_grid is not None:
+            return stored_mesh_grid
+
+        visible_count = len([d for d in visible_devices_env.split(",") if d.strip()])
+        if visible_count > 0 and mesh_grid[0] * mesh_grid[1] != visible_count:
+            mesh_grid = (1, visible_count)
+        elif (
+            visible_count == 0 and mesh_grid[0] * mesh_grid[1] != num_devices_available
+        ):
+            mesh_grid = (1, num_devices_available)
+
+    return mesh_grid
 
 
 def _validate_tt_kv_cache_capacity(
@@ -133,20 +178,28 @@ class TTWorker(WorkerBase):
         # subprocess) before runner init.
         TTPlatform.check_and_update_config(self.vllm_config)
 
-        local_dp_rank = self.parallel_config.data_parallel_rank_local
-        # Open mesh only on local DP rank 0 (device ranks).
-        if local_dp_rank == 0:
-            self.mesh_device = open_mesh_device(
-                get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+        if not _rank_owns_mesh(self.parallel_config):
+            raise RuntimeError(
+                "TT worker reached an unsupported non-device rank state under "
+                "the standard-DP-only runtime path"
             )
-            self.device_config.device = self.mesh_device
-            assert self.mesh_device is not None
-            self.num_devices = self.mesh_device.get_num_devices()
-        else:
-            mesh_grid = get_mesh_grid(local_dp_rank)
-            self.mesh_device = None
-            # Num devices is required for determining num blocks in KV cache.
-            self.num_devices = mesh_grid[0] * mesh_grid[1]
+
+        local_dp_rank = self.parallel_config.data_parallel_rank_local
+        logger.info(
+            "TT worker standard-DP binding: data_parallel_index=%s "
+            "data_parallel_rank_local=%s %s=%s MESH_DEVICE=%s",
+            getattr(self.parallel_config, "data_parallel_index", None),
+            local_dp_rank,
+            TTPlatform.device_control_env_var,
+            os.environ.get(TTPlatform.device_control_env_var),
+            os.environ.get("MESH_DEVICE"),
+        )
+        self.mesh_device = open_mesh_device(
+            get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+        )
+        self.device_config.device = self.mesh_device
+        assert self.mesh_device is not None
+        self.num_devices = self.mesh_device.get_num_devices()
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -157,9 +210,7 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        # Only local DP rank 0 (device rank) loads the model
-        if self.parallel_config.data_parallel_rank_local == 0:
-            self.model_runner.load_model()
+        self.model_runner.load_model()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
@@ -300,8 +351,10 @@ class TTWorker(WorkerBase):
         return 1 << 64
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate TT KV cache (only DP rank 0) and initialize persistent
-        input batch (all DP ranks) with the specified kv_cache_config.
+        """Allocate TT KV cache and initialize persistent input batch.
+
+        Every standard-DP rank owns its own TT mesh/KV cache, while
+        single-process lane mode has only one rank.
         """
         _validate_tt_kv_cache_capacity(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -320,9 +373,8 @@ class TTWorker(WorkerBase):
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return CompilationTimes(language_model=0.0, encoder=0.0)
-        local_rank = self.parallel_config.data_parallel_rank_local
         elapsed = 0.0
-        if local_rank == 0:
+        if _rank_owns_mesh(self.parallel_config):
             start = time.perf_counter()
             self.model_runner.warmup_model()
             elapsed = time.perf_counter() - start
@@ -510,8 +562,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int) -> in
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
 
-    ``num_devices`` is the runtime-discovered physical device count, passed in
-    from the worker rather than read from config; it is not a vLLM config value.
+    ``num_devices`` is the runtime-discovered physical device count.
     """
 
     model_config = vllm_config.model_config
@@ -627,14 +678,14 @@ def get_dispatch_core_config(tt_config):
 
 def get_fabric_config(tt_config, num_devices):
     if num_devices == 1:
-        # No fabric config for single device
-        fabric_config = None
-    else:
-        # Set the most common value as default
-        is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
-        fabric_config = (
-            ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
-        )
+        # Ignore any explicit fabric request for single-device meshes.
+        return None
+
+    # Set the most common value as default
+    is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
+    fabric_config = (
+        ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
+    )
 
     # Override fabric_config if specified in TT plugin config.
     if tt_config is not None and "fabric_config" in tt_config:
@@ -717,49 +768,24 @@ def device_params_from_tt_config(tt_config, trace_mode):
     return device_params
 
 
-def get_mesh_grid(local_dp_rank=0):
-    if local_dp_rank == 0:
-        # Only DP rank 0 should query devices.
-        num_devices_available = ttnn.get_num_devices()
-    mesh_grid_dict = {
-        "N150": (1, 1),
-        "P100": (1, 1),
-        "P150": (1, 1),
-        "P150x2": (1, 2),
-        "N300": (1, 2),
-        "P300": (1, 2),
-        "N150x4": (1, 4),
-        "P150x4": (1, 4),
-        "T3K": (1, 8),
-        "P150x8": (1, 8),
-        "P300x2": (1, 4),
-        "TG": (8, 4),
-    }
-    mesh_device_env = os.environ.get("MESH_DEVICE")
-    if mesh_device_env is not None:
-        try:
-            # Try to parse as a literal tuple first
-            parsed_value = ast.literal_eval(mesh_device_env)
-            if isinstance(parsed_value, tuple) and len(parsed_value) == 2:
-                mesh_grid = parsed_value
-            else:
-                raise ValueError("Not a valid tuple")
-        except (ValueError, SyntaxError):
-            # If parsing fails, treat as a string key for mesh_grid_dict
-            assert mesh_device_env in mesh_grid_dict, (
-                f"Invalid MESH_DEVICE: {mesh_device_env}"
-            )
-            mesh_grid = mesh_grid_dict[mesh_device_env]
-    else:
-        assert local_dp_rank == 0, (
-            "MESH_DEVICE must be set when running with data_parallel_size > 1"
+def get_mesh_grid(*args: Any, **kwargs: Any):
+    if args or kwargs.get("local_dp_rank") is not None:
+        warnings.warn(
+            "get_mesh_grid() ignores deprecated local_dp_rank; mesh selection "
+            "now derives from MESH_DEVICE and TT_VISIBLE_DEVICES",
+            UserWarning,
+            stacklevel=2,
         )
-        mesh_grid = (1, num_devices_available)
 
-    assert (
-        local_dp_rank != 0
-        or ttnn.using_distributed_env()
-        or (mesh_grid[0] * mesh_grid[1] <= num_devices_available)
+    num_devices_available = ttnn.get_num_devices()
+    mesh_grid = _resolve_mesh_grid(
+        os.environ.get("MESH_DEVICE"),
+        num_devices_available,
+        os.environ.get(TTPlatform.device_control_env_var),
+    )
+
+    assert ttnn.using_distributed_env() or (
+        mesh_grid[0] * mesh_grid[1] <= num_devices_available
     ), (
         f"Requested mesh grid shape {mesh_grid} is larger than "
         f"number of available devices {num_devices_available}"
@@ -769,8 +795,7 @@ def get_mesh_grid(local_dp_rank=0):
 
 
 def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
-    assert local_dp_rank == 0, "open_mesh_device must run on local DP rank 0"
-    mesh_grid = get_mesh_grid(local_dp_rank)
+    mesh_grid = get_mesh_grid()
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)

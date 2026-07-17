@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import ast
 import json
+import multiprocessing
 import os
 import sys
+from contextlib import suppress
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
@@ -28,6 +31,12 @@ else:
     FlexibleArgumentParser = object
 
 logger = init_tt_logger(__name__)
+
+_STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
+_STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
+_STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
+
+StandardDPAssignmentT = tuple[str, tuple[int, int]]
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
@@ -54,6 +63,318 @@ def _galaxy_generator_version() -> str | None:
     return None
 
 
+def _uses_explicit_tt_mpi_launch(vllm_config: "VllmConfig") -> bool:
+    tt_config = get_tt_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        tt_config.get("rank_binding")
+        or tt_config.get("mpi_args")
+        or getattr(parallel_config, "nnodes", 1) > 1
+        or getattr(parallel_config, "node_rank", 0) > 0
+    )
+
+
+_MESH_GRID_PRESETS = {
+    "N150": (1, 1),
+    "P100": (1, 1),
+    "P150": (1, 1),
+    "P150x2": (1, 2),
+    "N300": (1, 2),
+    "P300": (1, 2),
+    "N150x4": (1, 4),
+    "P150x4": (1, 4),
+    "T3K": (1, 8),
+    "P150x8": (1, 8),
+    "P300x2": (1, 4),
+}
+
+
+def _parse_mesh_grid(
+    mesh_device_env: str | None,
+    num_devices_available: int,
+    *,
+    tg_mesh_grid: tuple[int, int],
+) -> tuple[int, int]:
+    mesh_grid_dict = dict(_MESH_GRID_PRESETS)
+    mesh_grid_dict["TG"] = tg_mesh_grid
+
+    if mesh_device_env is None:
+        return (1, num_devices_available)
+
+    try:
+        parsed_value = ast.literal_eval(mesh_device_env)
+        if isinstance(parsed_value, (tuple, list)) and len(parsed_value) == 2:
+            return tuple(int(dim) for dim in parsed_value)
+        raise ValueError("Not a valid tuple")
+
+    except (ValueError, SyntaxError, TypeError):
+        mesh_grid = mesh_grid_dict.get(mesh_device_env)
+        if mesh_grid is None:
+            raise ValueError(
+                f"Invalid MESH_DEVICE: {mesh_device_env}. "
+                f"Expected one of: {list(mesh_grid_dict.keys())}"
+            ) from None
+        return mesh_grid
+
+
+def _resolve_parent_mesh_grid(
+    mesh_device_env: str | None,
+    num_devices_available: int,
+) -> tuple[int, int]:
+    mesh_grid = _parse_mesh_grid(
+        mesh_device_env,
+        num_devices_available,
+        tg_mesh_grid=(4, 8),
+    )
+
+    if mesh_grid[0] * mesh_grid[1] != num_devices_available:
+        mesh_grid = (1, num_devices_available)
+
+    return mesh_grid
+
+
+def _maybe_reorder_standard_dp_visible_device_groups(
+    device_groups: list[StandardDPAssignmentT],
+    mesh_grid: tuple[int, int],
+    data_parallel_size: int,
+) -> list[StandardDPAssignmentT]:
+    import ttnn
+
+    if (
+        ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
+        and mesh_grid == (4, 8)
+        and data_parallel_size == 4
+        and len(device_groups) == 4
+    ):
+        reordered_groups = [device_groups[index] for index in (0, 2, 3, 1)]
+        logger.info(
+            "Reordered TT single-host DP device groups for WH Galaxy DP=4 "
+            "from row-major %s to mesh-id order %s",
+            [visible_devices for visible_devices, _shape in device_groups],
+            [visible_devices for visible_devices, _shape in reordered_groups],
+        )
+        return reordered_groups
+
+    return device_groups
+
+
+def _store_standard_dp_mesh_grids(
+    vllm_config: "VllmConfig",
+    mesh_grids: dict[str, tuple[int, int]],
+) -> None:
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+        vllm_config.additional_config = additional_config
+    additional_config[_STANDARD_DP_MESH_GRIDS_KEY] = {
+        visible_devices: [mesh_grid[0], mesh_grid[1]]
+        for visible_devices, mesh_grid in mesh_grids.items()
+    }
+
+
+def _load_standard_dp_mesh_grids(
+    vllm_config: "VllmConfig",
+) -> dict[str, tuple[int, int]]:
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    if not isinstance(additional_config, dict):
+        return {}
+
+    raw_mesh_grids = additional_config.get(_STANDARD_DP_MESH_GRIDS_KEY, {})
+    if not isinstance(raw_mesh_grids, dict):
+        return {}
+
+    mesh_grids: dict[str, tuple[int, int]] = {}
+    for visible_devices, mesh_grid in raw_mesh_grids.items():
+        if not isinstance(visible_devices, str):
+            continue
+        if not isinstance(mesh_grid, (list, tuple)) or len(mesh_grid) != 2:
+            continue
+        try:
+            mesh_grids[visible_devices] = (int(mesh_grid[0]), int(mesh_grid[1]))
+        except (TypeError, ValueError):
+            continue
+
+    return mesh_grids
+
+
+def _split_standard_dp_discovery_result(
+    discovery_result: list[str] | list[StandardDPAssignmentT] | None,
+) -> tuple[list[str] | None, dict[str, tuple[int, int]]]:
+    if discovery_result is None:
+        return None, {}
+    if not discovery_result:
+        return [], {}
+
+    first_entry = discovery_result[0]
+    if isinstance(first_entry, str):
+        return discovery_result, {}
+
+    assignments = discovery_result
+    return (
+        [visible_devices for visible_devices, _mesh_grid in assignments],
+        {visible_devices: mesh_grid for visible_devices, mesh_grid in assignments},
+    )
+
+
+def _discover_standard_dp_visible_device_groups(
+    mesh_device_env: str | None,
+    data_parallel_size: int,
+) -> list[StandardDPAssignmentT]:
+    import ttnn
+    from models.tt_transformers.tt.generator import create_submeshes
+
+    mesh_device = None
+    submeshes = []
+
+    try:
+        num_devices_available = ttnn.get_num_devices()
+        mesh_grid = _resolve_parent_mesh_grid(mesh_device_env, num_devices_available)
+        mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*mesh_grid))
+        submeshes = create_submeshes(mesh_device, data_parallel_size)
+        if len(submeshes) != data_parallel_size:
+            raise RuntimeError(
+                "TT create_submeshes returned "
+                f"{len(submeshes)} groups for data_parallel_size={data_parallel_size}"
+            )
+
+        device_groups = []
+        for dp_rank, submesh in enumerate(submeshes):
+            device_ids = list(submesh.get_device_ids())
+            if not device_ids:
+                raise RuntimeError(f"TT DP rank {dp_rank} resolved to an empty submesh")
+            device_groups.append(
+                (
+                    ",".join(str(device_id) for device_id in device_ids),
+                    tuple(int(dim) for dim in submesh.shape),
+                )
+            )
+
+        device_groups = _maybe_reorder_standard_dp_visible_device_groups(
+            device_groups,
+            mesh_grid,
+            data_parallel_size,
+        )
+
+        logger.info(
+            "Resolved TT single-host DP device groups: %s",
+            [
+                f"{visible_devices}@{mesh_shape}"
+                for visible_devices, mesh_shape in device_groups
+            ],
+        )
+
+        return device_groups
+
+    finally:
+        for submesh in submeshes:
+            with suppress(Exception):
+                ttnn.close_mesh_device(submesh)
+        if mesh_device is not None:
+            with suppress(Exception):
+                ttnn.close_mesh_device(mesh_device)
+
+
+def _run_standard_dp_visible_device_group_discovery(
+    conn,
+    mesh_device_env: str | None,
+    data_parallel_size: int,
+) -> None:
+    try:
+        conn.send(
+            (
+                "ok",
+                _discover_standard_dp_visible_device_groups(
+                    mesh_device_env, data_parallel_size
+                ),
+            )
+        )
+    except Exception as exc:
+        conn.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        conn.close()
+
+
+def _terminate_discovery_process(proc: multiprocessing.Process) -> None:
+    proc.terminate()
+    proc.join(timeout=_STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=_STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S)
+
+
+def _join_discovery_process_or_raise(
+    proc: multiprocessing.Process,
+    message: str,
+) -> None:
+    proc.join(timeout=_STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S)
+    if proc.is_alive():
+        _terminate_discovery_process(proc)
+        raise RuntimeError(message)
+
+
+def _resolve_standard_dp_visible_device_groups(
+    vllm_config: "VllmConfig",
+) -> list[StandardDPAssignmentT] | None:
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.data_parallel_size <= 1 or _uses_explicit_tt_mpi_launch(
+        vllm_config
+    ):
+        return None
+
+    mp_ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+    proc = mp_ctx.Process(
+        target=_run_standard_dp_visible_device_group_discovery,
+        args=(
+            child_conn,
+            os.environ.get("MESH_DEVICE"),
+            parallel_config.data_parallel_size,
+        ),
+        name="TTVisibleDevicesDiscovery",
+    )
+    proc.start()
+    child_conn.close()
+
+    try:
+        if not parent_conn.poll(_STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S):
+            _terminate_discovery_process(proc)
+            raise RuntimeError(
+                "TT standard-DP device discovery subprocess timed out after "
+                f"{_STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S:.1f}s waiting for "
+                "device groups"
+            )
+        status, payload = parent_conn.recv()
+
+    except EOFError as exc:
+        _join_discovery_process_or_raise(
+            proc,
+            "TT standard-DP device discovery subprocess did not exit cleanly "
+            "after closing its result pipe",
+        )
+        raise RuntimeError(
+            "TT standard-DP device discovery subprocess exited before returning "
+            "device groups"
+        ) from exc
+
+    finally:
+        parent_conn.close()
+
+    _join_discovery_process_or_raise(
+        proc,
+        "TT standard-DP device discovery subprocess did not exit after "
+        "returning device groups",
+    )
+    if proc.exitcode not in (0, None):
+        raise RuntimeError(
+            "TT standard-DP device discovery subprocess failed with exit code "
+            f"{proc.exitcode}"
+        )
+    if status != "ok":
+        raise RuntimeError(f"TT standard-DP device discovery failed: {payload}")
+
+    return payload
+
+
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     """Reset DP-derived ParallelConfig fields to single-process values.
 
@@ -66,16 +387,14 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     multiply it (no external launcher), so ``world_size_across_dp`` collapses to
     1 automatically once ``data_parallel_size`` is reset.
 
-    ``data_parallel_rank_local`` must be ``0`` here. The TT plugin gates device
-    bring-up on ``data_parallel_rank_local == 0``: that rank opens the mesh,
-    loads the model, and allocates the KV cache (see
-    ``worker.init_device``/``load_model`` and
-    ``TTModelRunner.initialize_kv_cache``). A single-process lane run owns the
-    one device mesh, so it is that device rank and must be ``0`` for those gates
-    to fire and bring the device up. ``0`` is also the value a genuine
-    single-process run resolves to (``ParallelConfig.__post_init__`` defaults
-    ``data_parallel_rank_local`` from ``VLLM_DP_RANK_LOCAL`` / ``VLLM_DP_RANK``,
-    both ``0``).
+    ``data_parallel_rank_local`` must be ``0`` here because a single-process
+    lane run owns one device mesh. Standard DP ownership is handled separately:
+    upstream rewrites each dense DP subprocess to a local DP=1 view while
+    preserving its shard identity, and the TT worker uses that preserved shard
+    index to decide that every standard-DP rank owns its own mesh/model/KV.
+    ``0`` is also the value a genuine single-process run resolves to
+    (``ParallelConfig.__post_init__`` defaults ``data_parallel_rank_local``
+    from ``VLLM_DP_RANK_LOCAL`` / ``VLLM_DP_RANK``, both ``0``).
     """
     parallel_config.data_parallel_size = 1
     parallel_config.data_parallel_size_local = 1
@@ -85,12 +404,11 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
     parallel_config.data_parallel_external_lb = False
     parallel_config.data_parallel_hybrid_lb = False
 
-    # ParallelConfig.__post_init__ latches distributed_executor_backend to "mp"
-    # whenever the original world_size_across_dp > 1 (from the user's
-    # --data_parallel_size N), and that runs before this hook. A single-process
-    # lane run owns one in-process worker, so force the uniproc executor;
-    # otherwise the worker runs in a separate process and its runtime
-    # ``num_gpu_blocks_override`` never reaches the engine's KV-cache sizing.
+    # A single-process lane run owns one in-process worker, so pin the uniproc
+    # executor. Newer vLLM derives it from ``world_size_across_dp`` and latches
+    # "mp" from the user's --data_parallel_size before this hook runs; pinning
+    # "uni" keeps lane-DP single-process there too, so the worker's runtime
+    # ``num_gpu_blocks_override`` still reaches the engine's KV-cache sizing.
     parallel_config.distributed_executor_backend = "uni"
 
 
@@ -407,10 +725,20 @@ class TTPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
     device_type: str = "tt"
+    device_control_env_var: str = "TT_VISIBLE_DEVICES"
+    _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
+    _standard_dp_mesh_grids: ClassVar[dict[str, tuple[int, int]]] = {}
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
+
+    @classmethod
+    def device_id_to_physical_device_id(cls, device_id: int):
+        groups = cls._standard_dp_visible_device_groups
+        if groups is not None:
+            return groups[device_id]
+        return super().device_id_to_physical_device_id(device_id)
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
@@ -451,6 +779,8 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
+        cls._standard_dp_visible_device_groups = None
+        cls._standard_dp_mesh_grids = {}
         if vllm_config.scheduler_config.enable_chunked_prefill:
             logger.info("Chunked prefill is not yet supported for TT backend")
             vllm_config.scheduler_config.enable_chunked_prefill = False
@@ -514,6 +844,11 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+        parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
+        parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
+        parallel_config.engine_core_launcher_cls = (
+            "vllm.v1.engine.utils.CoreEngineLauncher"
+        )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -622,7 +957,18 @@ class TTPlatform(Platform):
         # validation/routing below so the lane path is selected.
         _convert_galaxy_gather_dp_to_lanes(vllm_config)
 
-        if uses_tt_lane_coordinator(vllm_config):
+        is_lane_mode = uses_tt_lane_coordinator(vllm_config)
+        if (
+            getattr(model_config, "is_moe", False)
+            and parallel_config.data_parallel_size > 1
+            and not is_lane_mode
+        ):
+            raise ValueError(
+                "TT standard DP does not support MoE models yet. "
+                "Use data_parallel_size=1."
+            )
+
+        if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.
             validate_tt_lane_config(vllm_config)
@@ -633,6 +979,23 @@ class TTPlatform(Platform):
             )
         else:
             vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
+
+        parallel_config.dp_engine_core_proc_cls = "vllm.v1.engine.core.DPEngineCoreProc"
+
+        if not is_lane_mode:
+            cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)
+            discovery_result = _resolve_standard_dp_visible_device_groups(vllm_config)
+            (
+                cls._standard_dp_visible_device_groups,
+                resolved_mesh_grids,
+            ) = _split_standard_dp_discovery_result(discovery_result)
+            if resolved_mesh_grids:
+                cls._standard_dp_mesh_grids = resolved_mesh_grids
+                _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
+        if _uses_explicit_tt_mpi_launch(vllm_config):
+            parallel_config.engine_core_launcher_cls = (
+                "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
+            )
 
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)

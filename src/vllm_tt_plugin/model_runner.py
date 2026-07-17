@@ -215,10 +215,9 @@ class TTModelRunner:
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
 
-        # Sampler for sampling on host when device sampling is not supported.
-        # Only used by device ranks (local dp rank 0).
-        if self.parallel_config.data_parallel_rank_local == 0:
-            self.host_sampler = Sampler()
+        # Every standard-DP rank owns its own mesh and therefore its own host
+        # sampler state. Single-process modes also instantiate exactly one.
+        self.host_sampler = Sampler()
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
@@ -364,9 +363,10 @@ class TTModelRunner:
         # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
         # without re-deriving vLLM's group construction order. Non-hybrid
         # configurations (single group) skip the expansion entirely. The
-        # check is on ``len(kv_cache_groups)`` rather than the model class
-        # so it works on every DP rank — only ``data_parallel_rank_local
-        # == 0`` actually loads ``self.model``.
+        # check is on ``len(kv_cache_groups)`` rather than the model class so
+        # it works on every DP rank, including standard-DP subprocesses whose
+        # local parallel config is collapsed to DP=1 by upstream before the TT
+        # worker loads the model.
         self._layer_to_group_idx: list[int] | None = None
         if len(kv_cache_groups) > 1:
             num_layers = self.model_config.get_num_layers_by_block_type(
@@ -385,10 +385,6 @@ class TTModelRunner:
                     "in some group's layer_names."
                 )
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
-
-        # Only DP rank 0 allocates KV cache.
-        if self.parallel_config.data_parallel_rank_local != 0:
-            return
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
 
