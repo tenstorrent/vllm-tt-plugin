@@ -3,8 +3,8 @@
 
 """Unit tests for TT standard-DP routing and launch semantics."""
 
-import pathlib
 import importlib
+import pathlib
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -47,15 +47,25 @@ sched_interface = importlib.import_module("vllm.v1.core.sched.interface")
 if not hasattr(sched_interface, "PauseState"):
     sched_interface.PauseState = type("PauseState", (), {})
 
-import vllm.v1.engine.utils as engine_utils
-import vllm_tt_plugin.platform as tt_platform
-from vllm_tt_plugin.launcher import parse_tt_mpi_params
-from vllm_tt_plugin.platform import (
-    TTPlatform,
-    _maybe_reorder_standard_dp_visible_device_groups,
-    _resolve_standard_dp_visible_device_groups,
+engine_utils = importlib.import_module("vllm.v1.engine.utils")
+tt_platform = importlib.import_module("vllm_tt_plugin.platform")
+TTPlatform = tt_platform.TTPlatform
+_resolve_standard_dp_visible_device_groups = (
+    tt_platform._resolve_standard_dp_visible_device_groups
 )
-from vllm_tt_plugin.worker import TTWorker, _rank_owns_mesh, _resolve_mesh_grid
+
+dp_discovery = importlib.import_module("vllm_tt_plugin.utils.dp_discovery")
+_maybe_reorder_standard_dp_visible_device_groups = (
+    dp_discovery._maybe_reorder_standard_dp_visible_device_groups
+)
+
+launcher = importlib.import_module("vllm_tt_plugin.launcher")
+parse_tt_mpi_params = launcher.parse_tt_mpi_params
+
+worker = importlib.import_module("vllm_tt_plugin.worker")
+TTWorker = worker.TTWorker
+_rank_owns_mesh = worker._rank_owns_mesh
+_resolve_mesh_grid = worker._resolve_mesh_grid
 
 
 class TestDPModes:
@@ -307,6 +317,13 @@ class TestDPModes:
             == "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
         )
         assert TTPlatform._standard_dp_visible_device_groups is None
+
+    def test_standard_dp_discovery_target_uses_helper_module(self) -> None:
+        """Keep the spawned discovery target outside the platform module."""
+        assert (
+            tt_platform._run_standard_dp_visible_device_group_discovery.__module__
+            == "vllm_tt_plugin.utils.dp_discovery"
+        )
 
     def test_standard_dp_discovery_timeout_terminates_subprocess(
         self,

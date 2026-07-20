@@ -48,10 +48,10 @@ from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
-    _parse_mesh_grid,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
+from vllm_tt_plugin.utils.dp_discovery import _parse_mesh_grid
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
