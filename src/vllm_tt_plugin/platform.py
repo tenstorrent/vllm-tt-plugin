@@ -504,6 +504,17 @@ class TTPlatform(Platform):
             )
             model_config.max_logprobs = MAX_TOP_K
 
+        # Force the grammar backends to emit compact JSON. xgrammar and guidance
+        # allow arbitrary inter-field whitespace by default; under greedy decoding
+        # the model can pick a whitespace token as the argmax indefinitely,
+        # exhausting the token budget before it emits a property name and
+        # returning truncated, unparseable JSON. Masking whitespace out of the
+        # grammar makes that loop structurally impossible for any decoding
+        # strategy. Backend stays "auto" so schemas xgrammar cannot compile still
+        # fall back to guidance (which also honors this flag); outlines and
+        # lm-format-enforcer ignore it.
+        vllm_config.structured_outputs_config.disable_any_whitespace = True
+
         # Opt into vLLM's auto-fit of max_model_len against the KV cache the TT
         # device can actually hold. The TT worker sizes the KV cache from the
         # model's total token budget (max_tokens_all_users) and pins it via
