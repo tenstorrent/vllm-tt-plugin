@@ -441,6 +441,15 @@ class TTPlatform(Platform):
         pass
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        # No-op: TT device context is owned by the ttnn mesh device opened in
+        # TTWorker.init_device, not by a torch device context. torch has no "tt"
+        # backend to switch to, so the base Platform.set_device raises
+        # NotImplementedError. vLLM's multiproc executor calls this from its
+        # async-output-copy thread, which would crash that thread without this.
+        pass
+
+    @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
         return True
 
@@ -505,6 +514,19 @@ class TTPlatform(Platform):
         # fall back to guidance (which also honors this flag); outlines and
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
+
+        # Opt into vLLM's auto-fit of max_model_len against the KV cache the TT
+        # device can actually hold. The TT worker sizes the KV cache from the
+        # model's total token budget (max_tokens_all_users) and pins it via
+        # cache_config.num_gpu_blocks_override, which is decoupled from the
+        # model's per-request max_model_len (often the HF default, e.g. 262144).
+        # vLLM's _check_enough_kv_cache_memory raises when max_model_len needs
+        # more KV than the override provides. Setting original_max_model_len=-1
+        # makes get_kv_cache_configs run _auto_fit_max_model_len, which clamps
+        # max_model_len down to the largest length the override-backed capacity
+        # can serve (it never expands, so a smaller user-set max_model_len is
+        # preserved) and syncs the reduced value to workers.
+        model_config.original_max_model_len = -1
 
         # Import and register models from tt-metal.
         #
