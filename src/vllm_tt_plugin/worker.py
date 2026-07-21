@@ -14,12 +14,17 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_groups,
+    get_max_concurrency_for_kv_cache_config,
+    get_uniform_page_size,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
@@ -134,6 +139,35 @@ def _validate_tt_kv_cache_capacity(
         f"{kv_cache_config.num_blocks * vllm_config.cache_config.block_size:,} tokens, "
         "Increase max_tokens_all_users or reduce max_model_len."
     )
+
+
+def _available_kv_cache_memory_bytes_for_num_blocks(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    num_blocks: int,
+) -> int:
+    """Returns a byte budget that reconstructs ``num_blocks`` upstream.
+
+    Standard-DP now uses vLLM's upstream multiprocess executor, so mutating
+    ``cache_config.num_gpu_blocks_override`` inside the worker subprocess is not
+    sufficient on its own: the engine-side KV planner lives in a different
+    process. Instead, return the exact amount of "available memory" that makes
+    upstream's grouping logic resolve the desired TT block count.
+    """
+    kv_cache_groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
+    if not kv_cache_groups:
+        return 0
+
+    if len(kv_cache_groups) == 1 and isinstance(
+        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    ):
+        return kv_cache_groups[0].kv_cache_spec.page_size_bytes * num_blocks
+
+    group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    page_size = get_uniform_page_size(
+        [group.kv_cache_spec for group in kv_cache_groups]
+    )
+    return page_size * num_blocks * group_size
 
 
 class TTWorker(WorkerBase):
@@ -341,15 +375,19 @@ class TTWorker(WorkerBase):
         in conjunction with the output of get_kv_cache_spec to determine
         the number of kv cache blocks (total memory / page_size / num layers).
 
-        Currenly we just return a large dummy number of bytes similar to the
-        Spyre/Neuron backends and override the number of kv cache blocks.
+        NOTE: TT does not profile device memory yet. Instead, it computes the target
+              TT KV block count, then returns a synthetic byte budget that makes the
+              upstream KV planner reconstruct that same block count in the engine
+              process.
         """
-
-        # TODO: Once we can run profiling, return real available memory
-        # instead of overriding the number of blocks.
         num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
+        kv_cache_spec = self.get_kv_cache_spec()
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
-        return 1 << 64
+        return _available_kv_cache_memory_bytes_for_num_blocks(
+            self.vllm_config,
+            kv_cache_spec,
+            num_tt_blocks,
+        )
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate TT KV cache and initialize persistent input batch.
@@ -558,7 +596,7 @@ class TTWorker(WorkerBase):
             super().__del__()  # type: ignore
 
 
-def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int) -> int:
+def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
