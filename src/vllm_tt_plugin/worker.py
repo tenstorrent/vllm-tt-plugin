@@ -197,6 +197,7 @@ class TTWorker(WorkerBase):
         self.mesh_device = open_mesh_device(
             get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
         )
+        self.device = self.mesh_device
         self.device_config.device = self.mesh_device
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()

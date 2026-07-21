@@ -614,6 +614,20 @@ class TTPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def set_device(cls, device) -> None:
+        if device is None:
+            return
+
+        import ttnn
+
+        get_default_device = getattr(ttnn, "GetDefaultDevice", None)
+        current_device = (
+            get_default_device() if callable(get_default_device) else None
+        )
+        if current_device is not device:
+            ttnn.SetDefaultDevice(device)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
         cls._standard_dp_visible_device_groups = None

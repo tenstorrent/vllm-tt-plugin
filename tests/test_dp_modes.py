@@ -14,6 +14,7 @@ try:
     import ttnn
 except ImportError:
     ttnn = ModuleType("ttnn")
+    _default_device = {"value": None}
     ttnn.cluster = SimpleNamespace(
         ClusterType=SimpleNamespace(GALAXY="GALAXY"),
         get_cluster_type=lambda: "OTHER",
@@ -41,6 +42,10 @@ except ImportError:
     ttnn.close_mesh_device = lambda *args, **kwargs: None
     ttnn.ReadDeviceProfiler = lambda *args, **kwargs: None
     ttnn.set_fabric_config = lambda *args, **kwargs: None
+    ttnn.GetDefaultDevice = lambda: _default_device["value"]
+    ttnn.SetDefaultDevice = lambda device: _default_device.__setitem__(
+        "value", device
+    )
     sys.modules["ttnn"] = ttnn
 
 sched_interface = importlib.import_module("vllm.v1.core.sched.interface")
@@ -324,6 +329,60 @@ class TestDPModes:
             tt_platform._run_standard_dp_visible_device_group_discovery.__module__
             == "vllm_tt_plugin.utils.dp_discovery"
         )
+
+    def test_tt_platform_set_device_uses_ttnn_default_device(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        assigned_devices: list[object] = []
+
+        monkeypatch.setattr(ttnn, "GetDefaultDevice", lambda: None, raising=False)
+        monkeypatch.setattr(
+            ttnn,
+            "SetDefaultDevice",
+            lambda device: assigned_devices.append(device),
+            raising=False,
+        )
+
+        mesh_device = object()
+        TTPlatform.set_device(None)
+        TTPlatform.set_device(mesh_device)
+
+        assert assigned_devices == [mesh_device]
+
+    def test_init_device_tracks_mesh_as_worker_device(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
+        model_runner = SimpleNamespace()
+
+        worker_instance = TTWorker.__new__(TTWorker)
+        worker_instance.vllm_config = SimpleNamespace()
+        worker_instance.parallel_config = SimpleNamespace(
+            data_parallel_size=4,
+            data_parallel_rank_local=0,
+            data_parallel_index=0,
+        )
+        worker_instance.device_config = SimpleNamespace(device=None)
+        worker_instance.trace_mode = "all"
+        worker_instance.enable_model_warmup = True
+
+        monkeypatch.setattr(TTPlatform, "check_and_update_config", lambda _cfg: None)
+        monkeypatch.setattr(worker, "get_tt_config", lambda _cfg: {})
+        monkeypatch.setattr(
+            worker,
+            "open_mesh_device",
+            lambda _tt_config, _trace_mode, _local_dp_rank: mesh_device,
+        )
+        monkeypatch.setattr(worker, "TTModelRunner", lambda **_kwargs: model_runner)
+
+        TTWorker.init_device(worker_instance)
+
+        assert worker_instance.mesh_device is mesh_device
+        assert worker_instance.device is mesh_device
+        assert worker_instance.device_config.device is mesh_device
+        assert worker_instance.model_runner is model_runner
 
     def test_standard_dp_discovery_timeout_terminates_subprocess(
         self,
