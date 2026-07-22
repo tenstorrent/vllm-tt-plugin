@@ -38,6 +38,7 @@ logger = init_tt_logger(__name__)
 _STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
 _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
+_STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
@@ -89,6 +90,39 @@ def _store_standard_dp_mesh_grids(
         visible_devices: [mesh_grid[0], mesh_grid[1]]
         for visible_devices, mesh_grid in mesh_grids.items()
     }
+
+
+def _store_standard_dp_visible_groups(
+    vllm_config: "VllmConfig",
+    visible_groups: list[str],
+) -> None:
+    """Store the per-rank visible-device group list on the vLLM config.
+
+    Indexed by DP rank so worker subprocesses can recover
+    ``TT_VISIBLE_DEVICES`` from ``data_parallel_index`` when the
+    env-var does not propagate through the engine-core fork chain.
+    """
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+        vllm_config.additional_config = additional_config
+    additional_config[_STANDARD_DP_VISIBLE_GROUPS_KEY] = list(visible_groups)
+
+
+def _load_standard_dp_visible_groups(
+    vllm_config: "VllmConfig",
+) -> list[str] | None:
+    """Load the per-rank visible-device group list from the vLLM config."""
+    additional_config = getattr(vllm_config, "additional_config", None) or {}
+
+    if not isinstance(additional_config, dict):
+        return None
+
+    groups = additional_config.get(_STANDARD_DP_VISIBLE_GROUPS_KEY)
+    if not isinstance(groups, list) or not groups:
+        return None
+
+    return [str(g) for g in groups]
 
 
 def _load_standard_dp_mesh_grids(
@@ -843,6 +877,10 @@ class TTPlatform(Platform):
             if resolved_mesh_grids:
                 cls._standard_dp_mesh_grids = resolved_mesh_grids
                 _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
+            if cls._standard_dp_visible_device_groups:
+                _store_standard_dp_visible_groups(
+                    vllm_config, cls._standard_dp_visible_device_groups
+                )
         if _uses_explicit_tt_mpi_launch(vllm_config):
             parallel_config.engine_core_launcher_cls = (
                 "vllm_tt_plugin.launcher.TTCoreEngineLauncher"

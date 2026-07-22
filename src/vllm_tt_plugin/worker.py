@@ -53,6 +53,7 @@ from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     TTPlatform,
+    _load_standard_dp_visible_groups,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
@@ -85,6 +86,42 @@ def _rank_owns_mesh(parallel_config: Any) -> bool:
     data_parallel_index = getattr(parallel_config, "data_parallel_index", 0)
     return (
         data_parallel_size > 1 or data_parallel_index > 0 or local_dp_rank in (None, 0)
+    )
+
+
+def _ensure_visible_devices_env(
+    vllm_config: VllmConfig,
+    parallel_config,
+) -> None:
+    """Set ``TT_VISIBLE_DEVICES`` from the stored per-rank device groups
+    when the env var did not propagate through the engine-core fork chain.
+
+    Upstream sets the env var in the API-server process via
+    ``set_device_control_env_var`` before forking each engine-core.  On some
+    multi-device topologies (Galaxy) the env var may be lost by the time the
+    worker subprocess inside the engine-core's multiproc executor starts.
+
+    The per-rank visible-device list was persisted on ``additional_config``
+    by the parent's ``check_and_update_config`` and survives pickling, so we
+    can recover it here using ``data_parallel_index``.
+    """
+    evar = TTPlatform.device_control_env_var
+    if os.environ.get(evar):
+        return  # already set — nothing to do
+
+    dp_index = getattr(parallel_config, "data_parallel_index", 0)
+    groups = _load_standard_dp_visible_groups(vllm_config)
+    if groups is None or dp_index >= len(groups):
+        return  # no stored groups or index out of range
+
+    visible_devices = groups[dp_index]
+    os.environ[evar] = visible_devices
+
+    logger.info(
+        "Recovered %s=%s from config for data_parallel_index=%s",
+        evar,
+        visible_devices,
+        dp_index,
     )
 
 
@@ -217,6 +254,11 @@ class TTWorker(WorkerBase):
                 "TT worker reached an unsupported non-device rank state under "
                 "the standard-DP-only runtime path"
             )
+
+        # Recover TT_VISIBLE_DEVICES from the config if the env var did not
+        # propagate through the engine-core → multiproc-executor fork chain
+        # (e.g. on Galaxy where the env var may be cleared between forks).
+        _ensure_visible_devices_env(self.vllm_config, self.parallel_config)
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         logger.info(
