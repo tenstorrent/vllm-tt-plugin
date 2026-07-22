@@ -323,7 +323,13 @@ class TTDPEngineCoreProc(DPEngineCoreProc):
 
     def _dp_negotiate_forced_mode(self) -> TTSchedulingMode:
         has_running = bool(getattr(self.scheduler, "running", []))
-        has_waiting = bool(getattr(self.scheduler, "waiting", False))
+        # ``skipped_waiting`` holds prefill requests blocked on grammar
+        # compilation; count them so a rank with only grammar-blocked
+        # structured-output work still signals prefill intent instead of
+        # letting the base scheduler promote them into a gathered decode step.
+        has_waiting = bool(getattr(self.scheduler, "waiting", False)) or bool(
+            getattr(self.scheduler, "skipped_waiting", False)
+        )
         max_running = getattr(self.scheduler, "max_num_running_reqs", 0)
         has_capacity = len(getattr(self.scheduler, "running", [])) < max_running
         local_prefill_intent = (
