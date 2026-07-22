@@ -33,6 +33,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_tt_plugin.async_decode import (
+    DEBUG_MROPE,
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
@@ -2373,6 +2374,13 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
+                if DEBUG_MROPE:
+                    logger.info(
+                        "[mrope] prefill stored mrope_position_delta: "
+                        "req_id=%s delta=%s",
+                        req_id,
+                        self.requests[req_id].mrope_position_delta,
+                    )
             return tt_out
         return self.model.prefill_forward(**kwargs)
 

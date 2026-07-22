@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, fields, replace
@@ -13,7 +14,16 @@ import ttnn
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.structured_output import has_structured_outputs
+
+logger = init_tt_logger(__name__)
+
+# Verbose mrope/decode-reset tracing, off by default. Enable by exporting
+# ``VLLM_TT_DEBUG_MROPE=1`` on the server process to confirm the rope-delta
+# re-application on the prefill->decode transition (see ``submit_decode``).
+_DEBUG_MROPE_ENV = os.environ.get("VLLM_TT_DEBUG_MROPE", "")
+DEBUG_MROPE = _DEBUG_MROPE_ENV not in ("", "0", "false", "False")
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -606,18 +616,44 @@ class TTAsyncDecodeController:
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
-            if any(
+            # Re-apply per-request mrope deltas whenever the decode inputs are
+            # (re)staged from host: either the batch's request set changed, or a
+            # full input reset is in effect (the first decode after a
+            # prefill->decode switch, or a slot remap). ``reset_batch`` forces
+            # the model to rebuild ``rot_mat_idxs = current_pos + rope_deltas``
+            # from host, so ``rope_setup.rope_deltas`` must already be current
+            # for THIS batch. Gating only on ``previous_req_ids`` let a reset
+            # rebuild positions with a stale (zero) delta, silently corrupting
+            # multimodal decode while text (delta == 0) looked fine.
+            new_reqs = any(
                 req_id not in runner.previous_req_ids
                 for req_id in runner.input_batch.req_ids
-            ):
-                enc_dec_kwargs = {
-                    "rope_deltas_all_users": [
-                        runner.requests[req_id].mrope_position_delta
-                        for req_id in runner.input_batch.req_ids
-                    ]
-                }
+            )
+            if new_reqs or model_input.reset_batch:
+                rope_deltas_all_users = [
+                    runner.requests[req_id].mrope_position_delta
+                    for req_id in runner.input_batch.req_ids
+                ]
+                enc_dec_kwargs = {"rope_deltas_all_users": rope_deltas_all_users}
+                if DEBUG_MROPE:
+                    logger.info(
+                        "[mrope] re-apply rope_deltas: new_reqs=%s reset_batch=%s "
+                        "req_ids=%s deltas=%s prev_req_ids=%s",
+                        new_reqs,
+                        model_input.reset_batch,
+                        list(runner.input_batch.req_ids),
+                        rope_deltas_all_users,
+                        sorted(runner.previous_req_ids),
+                    )
             else:
                 enc_dec_kwargs = {"rope_deltas_all_users": None}
+                if DEBUG_MROPE:
+                    logger.info(
+                        "[mrope] skip rope_deltas (steady decode): req_ids=%s "
+                        "reset_batch=%s",
+                        list(runner.input_batch.req_ids),
+                        model_input.reset_batch,
+                    )
             runner.previous_req_ids = set(runner.input_batch.req_ids)
 
         enable_trace = runner.trace_mode in ["all", "decode_only"]
