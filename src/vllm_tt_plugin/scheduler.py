@@ -87,7 +87,9 @@ class TTScheduler(AsyncScheduler):
             getattr(self, "skipped_waiting", False)
         )
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # NOTE: `throttle_prefills` accepted for interface compatibility with the base
+        #        scheduler but unused - TT separates prefill/decode explicitly.
         has_waiting = self._has_pending_prefill()
         has_running = bool(self.running)
         mode = self._forced_mode
