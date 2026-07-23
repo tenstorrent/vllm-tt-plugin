@@ -12,8 +12,11 @@ def _vllm_config(
     data_parallel_size: int = 1,
     max_num_seqs: int = 8,
     lane_count: int | None = None,
+    tt_cfg: dict | None = None,
 ):
     additional_config: dict = {}
+    if tt_cfg is not None:
+        additional_config["tt"] = dict(tt_cfg)
     if lane_count is not None:
         additional_config[tt_config._RESOLVED_LANE_COUNT_KEY] = lane_count
 
@@ -43,10 +46,28 @@ def test_get_tt_max_batch_size_uses_global_cap_for_single_process_lanes():
     assert tt_config.get_tt_max_batch_size(config) == 32
 
 
-def test_get_tt_max_batch_size_keeps_gathered_dp_contract():
+def test_get_tt_data_parallel_size_is_one_for_standard_dp():
     config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
 
-    assert tt_config.get_tt_max_batch_size(config) == 32
+    assert tt_config.get_tt_data_parallel_size(config) == 1
+
+
+def test_legacy_tt_data_parallel_size_is_ignored_for_standard_dp():
+    config = _vllm_config(
+        data_parallel_size=4,
+        max_num_seqs=8,
+        tt_cfg={"tt_data_parallel_size": 99},
+    )
+
+    assert tt_config.get_tt_data_parallel_size(config) == 1
+    assert tt_config.get_tt_max_batch_size(config) == 8
+    assert not tt_config.uses_tt_lane_coordinator(config)
+
+
+def test_get_tt_max_batch_size_keeps_local_cap_for_standard_dp():
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
+
+    assert tt_config.get_tt_max_batch_size(config) == 8
 
 
 def test_uses_tt_lane_coordinator_only_for_single_process_lanes():

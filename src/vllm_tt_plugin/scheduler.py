@@ -36,6 +36,14 @@ class TTScheduler(AsyncScheduler):
       or all-decode.
     - No chunked prefill: each prefill must be scheduled in full.
 
+    The base scheduler holds prefill requests that are temporarily blocked
+    (e.g. waiting for grammar compilation) in a separate ``skipped_waiting``
+    queue, not ``waiting``. Its waiting loop drains both queues and can
+    promote a now-ready blocked request into the same step that schedules
+    running decodes. To preserve the all-prefill or all-decode invariant,
+    every place that inspects or hides pending prefill work must treat
+    ``waiting`` and ``skipped_waiting`` together.
+
     Inherits from AsyncScheduler to get num_output_placeholders support.
     TT uses this scheduler in both sync and async execution modes:
     - with async_scheduling=False, it behaves as the single TT scheduler
@@ -65,39 +73,61 @@ class TTScheduler(AsyncScheduler):
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
 
+    def _has_pending_prefill(self) -> bool:
+        """Whether any request is waiting to be prefilled.
+
+        Includes ``skipped_waiting`` because promotion from
+        ``skipped_waiting`` to ``waiting`` only happens inside the base
+        scheduler's prefill loop.  Without this check, a rank whose only
+        pending work is a grammar-blocked request would signal decode-only,
+        the prefill loop would never run, and the request would never be
+        promoted — stalling indefinitely.
+        """
+        return bool(self.waiting) or bool(
+            getattr(self, "skipped_waiting", False)
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        has_waiting = bool(self.waiting)
+        # NOTE: `throttle_prefills` accepted for interface compatibility with the base
+        #        scheduler but unused - TT separates prefill/decode explicitly.
+        has_waiting = self._has_pending_prefill()
         has_running = bool(self.running)
         mode = self._forced_mode
 
         if mode == TTSchedulingMode.PREFILL_ONLY:
-            # If waiting is empty, this intentionally returns an empty batch.
-            result = self._schedule_prefill_only(throttle_prefills)
+            result = self._schedule_prefill_only()
+            # If the forced prefill scheduled nothing (e.g. grammar still
+            # compiling, or KV pressure with chunked prefill disabled) but
+            # there are running decode requests, fall back to decode-only
+            # to avoid a livelock where no decode progress is made and no
+            # KV capacity is freed.
+            if result.total_num_scheduled_tokens == 0 and has_running:
+                result = self._schedule_decode_only()
             return self._finalize_scheduler_output(result)
         if mode == TTSchedulingMode.DECODE_ONLY:
             if has_waiting:
                 # Hide waiting so base scheduler cannot admit prefill.
-                result = self._schedule_decode_only(throttle_prefills)
+                result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
             # No waiting requests: base scheduler naturally runs decode-only.
-            result = super().schedule(throttle_prefills)
+            result = super().schedule()
             return self._finalize_scheduler_output(result)
 
         # Default mode:
         # Prefer prefill whenever waiting is non-empty to admit new requests.
         if has_waiting:
-            prefill_result = self._schedule_prefill_only(throttle_prefills)
+            prefill_result = self._schedule_prefill_only()
             # If waiting is non-empty but prefill cannot be admitted (e.g. KV
             # pressure and no chunked prefill), do not stall decode progress.
             # Fall back to decode-only so running requests can advance and free
             # capacity for later full-prefill admission.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running:
-                result = self._schedule_decode_only(throttle_prefills)
+                result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
             return self._finalize_scheduler_output(prefill_result)
 
         # No waiting requests in default mode: run decode-only naturally.
-        result = super().schedule(throttle_prefills)
+        result = super().schedule()
         return self._finalize_scheduler_output(result)
 
     def _finalize_scheduler_output(
@@ -105,9 +135,7 @@ class TTScheduler(AsyncScheduler):
     ) -> SchedulerOutput:
         return scheduler_output
 
-    def _schedule_prefill_only(
-        self, throttle_prefills: bool = False
-    ) -> SchedulerOutput:
+    def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule only waiting (prefill) requests.
 
         Temporarily hides the running (decode) requests so the base
@@ -120,26 +148,34 @@ class TTScheduler(AsyncScheduler):
         self.running = cast(list[Request], [])
         self.max_num_running_reqs = max(0, saved_max - len(saved_running))
         try:
-            result = super().schedule(throttle_prefills)
+            result = super().schedule()
         finally:
             self.running = saved_running + self.running
             self.max_num_running_reqs = saved_max
         return result
 
-    def _schedule_decode_only(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running (decode) requests.
 
-        Temporarily hides the waiting queue so the base scheduler's
-        waiting loop is a no-op.  Any requests that get preempted
-        during decode scheduling are merged back into the original
-        waiting queue afterwards.
+        Temporarily hides both the ``waiting`` and ``skipped_waiting`` queues
+        so the base scheduler's waiting loop is a no-op and cannot promote a
+        grammar-ready structured-output request into this decode step.  Any
+        requests that get preempted during decode scheduling are merged back
+        into the original queues afterwards.
         """
         saved_waiting = self.waiting
+        saved_skipped = getattr(self, "skipped_waiting", None)
         self.waiting = create_request_queue(self.policy)
+        if saved_skipped is not None:
+            self.skipped_waiting = create_request_queue(self.policy)
         try:
-            result = super().schedule(throttle_prefills)
+            result = super().schedule()
         finally:
             if self.waiting:
                 saved_waiting.prepend_requests(self.waiting)
+            if saved_skipped is not None:
+                if self.skipped_waiting:
+                    saved_skipped.prepend_requests(self.skipped_waiting)
+                self.skipped_waiting = saved_skipped
             self.waiting = saved_waiting
         return result
