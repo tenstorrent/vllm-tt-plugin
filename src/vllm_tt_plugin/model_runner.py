@@ -901,14 +901,37 @@ class TTModelRunner:
             # step we can legitimately see cached requests if they are resumed
             # from preemption (still prefill work).
             if cached_reqs.num_reqs > 0:
-                any_running = any(
-                    req_id not in cached_reqs.resumed_req_ids
+                running_req_ids = {
+                    req_id
                     for req_id in cached_reqs.req_ids
-                )
-                assert not any_running, (
-                    "Prefill batch should not include decode/running cached "
-                    "requests (req_id not in resumed_req_ids)."
-                )
+                    if req_id not in cached_reqs.resumed_req_ids
+                }
+                if running_req_ids:
+                    # Mixed prefill+decode batch detected. This should not
+                    # happen with TTScheduler but can occur under standard DP
+                    # async scheduling edge cases. Filter decode requests out
+                    # of this prefill step; they will be re-scheduled next.
+
+                    logger.warning(
+                        "Prefill batch contained %d running decode request(s); "
+                        "filtering them from this prefill step.",
+                        len(running_req_ids),
+                    )
+
+                    req_indices = [
+                        i
+                        for i in req_indices
+                        if input_batch.req_ids[i] not in running_req_ids
+                    ]
+                    num_reqs = len(req_indices)
+                    if num_reqs == 0:
+                        return None
+
+                    # Rebuild block tables for the filtered indices.
+                    block_tables_per_group = input_batch.block_tables_for_rows(
+                        req_indices, target_width
+                    )
+                    block_tables = block_tables_per_group[0]
 
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
