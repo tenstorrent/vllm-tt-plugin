@@ -284,6 +284,31 @@ Common options:
 | `config_pkl_dir` | Shared directory used to pass launch config to remote hosts. |
 | `env_passthrough` | Environment variable names or glob patterns propagated to remote hosts. |
 
+### `max_model_len` And KV Cache Capacity
+
+TT does not profile device memory. `TTWorker.determine_available_memory()`
+reports a dummy byte count and instead pins `num_gpu_blocks_override` to a block
+count derived from the model's `max_tokens_all_users` — the token budget shared
+by *all* concurrent requests. That pool is independent of `max_model_len`, which
+is the *per-request* context limit. Since vLLM sizes and validates the KV cache
+against the override-backed capacity, the two must be chosen together:
+
+| `--max-model-len` | Behavior |
+| --- | --- |
+| numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
+| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Lower `--max-model-len` or raise `max_tokens_all_users`. |
+| `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. |
+| omitted | The plugin logs a warning and falls back to `-1`, because the HF-derived default (e.g. 262144) normally exceeds the pool. |
+
+Auto-fit picks the largest length that fits **one** request, so it lands at
+roughly the whole pool with maximum concurrency `1.00x`: a single long request
+can occupy the entire KV cache and stall the rest. Prefer an explicit
+`--max-model-len` for serving, sized around
+`max_tokens_all_users / max_num_seqs`, and treat auto-fit as a convenience for
+one-off runs. `max_tokens_all_users` itself comes from the model class in
+tt-metal (`get_max_tokens_all_users`), which some models expose as an
+environment override such as `GEMMA4_MAX_TOKENS_ALL_USERS`.
+
 ## Runtime Architecture
 
 `TTPlatform.check_and_update_config()` is the main handoff from vLLM into the TT

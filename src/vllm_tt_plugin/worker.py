@@ -395,10 +395,16 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def update_max_model_len(self, max_model_len: int) -> None:
-        # The engine calls this via collective_rpc after an explicit
-        # max_model_len=-1 request auto-fits the value to available KV cache
-        # capacity. WorkerBase has no such hook, so TTWorker must synchronize
-        # the shared model config used by TTModelRunner.
+        # The engine calls this via collective_rpc when auto-fit reduced
+        # max_model_len to the KV cache capacity -- either because the user
+        # asked for it with --max-model-len -1, or because the option was
+        # omitted and TTPlatform.check_and_update_config fell back to auto-fit.
+        # WorkerBase has no such hook (only the GPU worker defines one), so
+        # TTWorker must provide it or the RPC raises AttributeError.
+        # TTModelRunner reads self.model_config.max_model_len directly when it
+        # builds the persistent input batch in initialize_kv_cache -- which the
+        # engine calls after this RPC -- so updating the shared model config is
+        # sufficient; it keeps no separate cached copy.
         self.model_config.max_model_len = max_model_len
 
     def compile_or_warm_up_model(self) -> CompilationTimes:

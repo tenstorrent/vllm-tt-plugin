@@ -52,6 +52,7 @@ class TestDPModes:
                 hf_config=SimpleNamespace(architectures=["DummyModel"]),
                 max_logprobs=10,
                 max_model_len=4,
+                original_max_model_len=None,
                 is_moe=False,
                 get_sliding_window=lambda: None,
             ),
@@ -103,19 +104,42 @@ class TestDPModes:
 
             TTPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("original_max_model_len", [None, 8192, -1])
-    def test_check_and_update_config_preserves_original_max_model_len(
+    @pytest.mark.parametrize("original_max_model_len", [8192, -1])
+    def test_check_and_update_config_preserves_explicit_max_model_len(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
-        original_max_model_len: int | None,
+        original_max_model_len: int,
     ) -> None:
+        """An explicit --max-model-len is never rewritten by the TT platform.
+
+        A numeric value must reach upstream's override-aware capacity check
+        unchanged (so an oversized value fails loudly instead of being silently
+        clamped), and an explicit -1 must stay -1.
+        """
         vllm_config.model_config.original_max_model_len = original_max_model_len
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
         assert vllm_config.model_config.original_max_model_len == original_max_model_len
+
+    def test_check_and_update_config_auto_fits_omitted_max_model_len(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        """An omitted --max-model-len falls back to upstream auto-fit.
+
+        The HF-derived default usually exceeds the TT KV pool, so opt into
+        vLLM's auto-fit rather than aborting startup.
+        """
+        vllm_config.model_config.original_max_model_len = None
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert vllm_config.model_config.original_max_model_len == -1
 
     def test_update_max_model_len_syncs_worker_model_config(self) -> None:
         worker_instance = TTWorker.__new__(TTWorker)
