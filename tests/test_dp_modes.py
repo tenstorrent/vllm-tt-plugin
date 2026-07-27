@@ -103,6 +103,28 @@ class TestDPModes:
 
             TTPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("original_max_model_len", [None, 8192, -1])
+    def test_check_and_update_config_preserves_original_max_model_len(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+        original_max_model_len: int | None,
+    ) -> None:
+        vllm_config.model_config.original_max_model_len = original_max_model_len
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert vllm_config.model_config.original_max_model_len == original_max_model_len
+
+    def test_update_max_model_len_syncs_worker_model_config(self) -> None:
+        worker_instance = TTWorker.__new__(TTWorker)
+        worker_instance.model_config = SimpleNamespace(max_model_len=262_144)
+
+        TTWorker.update_max_model_len(worker_instance, 131_072)
+
+        assert worker_instance.model_config.max_model_len == 131_072
+
     def test_upstream_dp_engine_core_is_default(
         self,
         monkeypatch: pytest.MonkeyPatch,
