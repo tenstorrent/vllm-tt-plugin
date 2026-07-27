@@ -72,23 +72,6 @@ logger = init_tt_logger(__name__)
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
 
 
-def _rank_owns_mesh(parallel_config: Any) -> bool:
-    """Return whether this worker process should own a TT mesh device.
-
-    Standard DP runs one independent TT mesh per rank. Upstream rewrites each
-    dense DP subprocess to look like a local DP=1 engine while preserving the
-    original shard identity in ``data_parallel_index`` and
-    ``data_parallel_rank_local``; treat those collapsed ranks as mesh-owning
-    too. True single-process modes still only have the rank-0 worker.
-    """
-    local_dp_rank = getattr(parallel_config, "data_parallel_rank_local", None)
-    data_parallel_size = getattr(parallel_config, "data_parallel_size", 1)
-    data_parallel_index = getattr(parallel_config, "data_parallel_index", 0)
-    return (
-        data_parallel_size > 1 or data_parallel_index > 0 or local_dp_rank in (None, 0)
-    )
-
-
 def _ensure_visible_devices_env(
     vllm_config: VllmConfig,
     parallel_config,
@@ -248,12 +231,6 @@ class TTWorker(WorkerBase):
         # means platform class attrs + config mutations must be applied per
         # subprocess) before runner init.
         TTPlatform.check_and_update_config(self.vllm_config)
-
-        if not _rank_owns_mesh(self.parallel_config):
-            raise RuntimeError(
-                "TT worker reached an unsupported non-device rank state under "
-                "the standard-DP-only runtime path"
-            )
 
         # Recover TT_VISIBLE_DEVICES from the config if the env var did not
         # propagate through the engine-core → multiproc-executor fork chain
@@ -465,11 +442,11 @@ class TTWorker(WorkerBase):
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return CompilationTimes(language_model=0.0, encoder=0.0)
-        elapsed = 0.0
-        if _rank_owns_mesh(self.parallel_config):
-            start = time.perf_counter()
-            self.model_runner.warmup_model()
-            elapsed = time.perf_counter() - start
+
+        start = time.perf_counter()
+        self.model_runner.warmup_model()
+        elapsed = time.perf_counter() - start
+
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 
     def execute_model(
