@@ -98,7 +98,7 @@ def test_negotiate_decode_when_no_lane_wants_prefill():
 def test_negotiate_prefill_when_lane_has_only_grammar_blocked_request():
     # Lane 1's only pending work is a grammar-blocked structured-output request
     # held in skipped_waiting (waiting is empty). It must still force prefill so
-    # the base scheduler cannot promote it into lane 0's decode step.
+    # the base scheduler can revisit and promote it after the grammar is ready.
     coordinator = _make_coordinator([FakeLane(running=2), FakeLane(skipped_waiting=1)])
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
