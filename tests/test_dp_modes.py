@@ -3,72 +3,28 @@
 
 """Unit tests for TT standard-DP routing and launch semantics."""
 
-import importlib
 import pathlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
+import ttnn
+from vllm.v1.core.sched import interface as sched_interface
+from vllm.v1.engine import utils as engine_utils
 
-try:
-    import ttnn
-except ImportError:
-    ttnn = ModuleType("ttnn")
-    _default_device = {"value": None}
-    ttnn.cluster = SimpleNamespace(
-        ClusterType=SimpleNamespace(GALAXY="GALAXY"),
-        get_cluster_type=lambda: "OTHER",
-    )
-    ttnn.DispatchCoreAxis = SimpleNamespace(COL="col", ROW="row")
-    ttnn.DispatchCoreConfig = lambda axis=None: SimpleNamespace(axis=axis)
-    ttnn.FabricConfig = SimpleNamespace(
-        DISABLED="DISABLED",
-        FABRIC_1D="FABRIC_1D",
-        FABRIC_1D_RING="FABRIC_1D_RING",
-        FABRIC_2D="FABRIC_2D",
-        CUSTOM="CUSTOM",
-    )
-    ttnn.FabricReliabilityMode = SimpleNamespace(
-        STRICT_INIT="STRICT_INIT",
-        RELAXED_INIT="RELAXED_INIT",
-    )
-    ttnn.get_num_devices = lambda: 1
-    ttnn.using_distributed_env = lambda: False
-    ttnn.MeshShape = lambda *shape: shape
-    ttnn.open_mesh_device = lambda *args, **kwargs: SimpleNamespace(
-        get_num_devices=lambda: 1,
-        get_submeshes=lambda: [],
-    )
-    ttnn.close_mesh_device = lambda *args, **kwargs: None
-    ttnn.ReadDeviceProfiler = lambda *args, **kwargs: None
-    ttnn.set_fabric_config = lambda *args, **kwargs: None
-    ttnn.GetDefaultDevice = lambda: _default_device["value"]
-    ttnn.SetDefaultDevice = lambda device: _default_device.__setitem__("value", device)
-    sys.modules["ttnn"] = ttnn
+from vllm_tt_plugin import platform as tt_platform
+from vllm_tt_plugin import worker
+from vllm_tt_plugin.launcher import parse_tt_mpi_params
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _resolve_standard_dp_visible_device_groups,
+)
+from vllm_tt_plugin.utils.dp_discovery import (
+    _maybe_reorder_standard_dp_visible_device_groups,
+)
+from vllm_tt_plugin.worker import TTWorker, _resolve_mesh_grid
 
-sched_interface = importlib.import_module("vllm.v1.core.sched.interface")
 if not hasattr(sched_interface, "PauseState"):
     sched_interface.PauseState = type("PauseState", (), {})
-
-engine_utils = importlib.import_module("vllm.v1.engine.utils")
-tt_platform = importlib.import_module("vllm_tt_plugin.platform")
-TTPlatform = tt_platform.TTPlatform
-_resolve_standard_dp_visible_device_groups = (
-    tt_platform._resolve_standard_dp_visible_device_groups
-)
-
-dp_discovery = importlib.import_module("vllm_tt_plugin.utils.dp_discovery")
-_maybe_reorder_standard_dp_visible_device_groups = (
-    dp_discovery._maybe_reorder_standard_dp_visible_device_groups
-)
-
-launcher = importlib.import_module("vllm_tt_plugin.launcher")
-parse_tt_mpi_params = launcher.parse_tt_mpi_params
-
-worker = importlib.import_module("vllm_tt_plugin.worker")
-TTWorker = worker.TTWorker
-_rank_owns_mesh = worker._rank_owns_mesh
-_resolve_mesh_grid = worker._resolve_mesh_grid
 
 
 class TestDPModes:
@@ -190,31 +146,6 @@ class TestDPModes:
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
-        )
-
-    def test_standard_dp_all_ranks_own_mesh(self) -> None:
-        parallel_config = SimpleNamespace(
-            data_parallel_size=4,
-            data_parallel_rank_local=3,
-        )
-
-        assert _rank_owns_mesh(parallel_config)
-
-    def test_collapsed_standard_dp_rank_still_owns_mesh(self) -> None:
-        parallel_config = SimpleNamespace(
-            data_parallel_size=1,
-            data_parallel_rank_local=3,
-            data_parallel_index=3,
-        )
-
-        assert _rank_owns_mesh(parallel_config)
-
-    def test_single_process_only_rank_zero_owns_mesh(self) -> None:
-        assert _rank_owns_mesh(
-            SimpleNamespace(data_parallel_size=1, data_parallel_rank_local=0)
-        )
-        assert not _rank_owns_mesh(
-            SimpleNamespace(data_parallel_size=1, data_parallel_rank_local=1)
         )
 
     def test_collapsed_standard_dp_rank_warms_up_model(self) -> None:

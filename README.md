@@ -30,6 +30,7 @@ needs to touch vLLM core.
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
 |   +-- config.py            # TT plugin config access
+|   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
 +-- tests/tt/                # Server-facing TT plugin tests
@@ -292,10 +293,10 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | vLLM config field | TT implementation |
 | --- | --- |
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
-| `parallel_config.engine_core_cls` | `vllm_tt_plugin.engine.TTEngineCore` |
-| `parallel_config.engine_core_proc_cls` | `vllm_tt_plugin.engine.TTEngineCoreProc` |
-| `parallel_config.dp_engine_core_proc_cls` | `vllm_tt_plugin.engine.TTDPEngineCoreProc` |
-| `parallel_config.engine_core_launcher_cls` | `vllm_tt_plugin.launcher.TTCoreEngineLauncher` |
+| `parallel_config.engine_core_cls` | `vllm.v1.engine.core.EngineCore` (upstream) |
+| `parallel_config.engine_core_proc_cls` | `vllm.v1.engine.core.EngineCoreProc` (upstream) |
+| `parallel_config.dp_engine_core_proc_cls` | `vllm.v1.engine.core.DPEngineCoreProc` (upstream) |
+| `parallel_config.engine_core_launcher_cls` | `vllm.v1.engine.utils.CoreEngineLauncher` (upstream); `vllm_tt_plugin.launcher.TTCoreEngineLauncher` when explicit MPI launch is active |
 | `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
 
 The execution model matches TT hardware characteristics:
@@ -304,12 +305,15 @@ The execution model matches TT hardware characteristics:
 - Chunked prefill is not used.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
-- For Galaxy-generator models (Llama3 70B, Qwen3-32B), `--data_parallel_size N`
-  runs as `N` in-process TT lanes scheduled by `TTLaneCoordinator` (one engine,
-  one device mesh); see [Single-Process Galaxy Serving](#single-process-galaxy-serving).
-- For other models, `--data_parallel_size N` uses gathered multi-process DP:
-  local rank inputs are collected, executed across the TT mesh, and outputs
-  scattered back to the participating ranks.
+- For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
+  `--data_parallel_size N` runs as `N` in-process TT lanes scheduled by
+  `TTLaneCoordinator` (one engine, one device mesh); see
+  [Single-Process Galaxy Serving](#single-process-galaxy-serving).
+- For other models, `--data_parallel_size N` uses standard multi-process DP:
+  each DP rank runs an independent engine core with its own TT submesh,
+  scheduler, and KV cache. Device groups are discovered at startup and assigned
+  via `TT_VISIBLE_DEVICES`. This is upstream vLLM's standard DP mechanism
+  (no gather/scatter; ranks are fully independent).
 - Multi-host execution uses `tt-run` / MPI while vLLM sees a normal
   engine-client handshake.
 

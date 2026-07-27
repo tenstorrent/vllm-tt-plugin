@@ -5,10 +5,10 @@ This note summarizes how TT execution works in the current TT vLLM integration, 
 The emphasis here is on the concepts:
 
 - sync vs async
-- non-DP vs gathered-DP
+- non-DP vs standard multi-process DP vs single-process lane-DP
 - what is scheduled locally vs what is coordinated globally
 
-Code pointers are intentionally minimal. If you need them, the main entry points are `src/vllm_tt_plugin/scheduler.py`, `src/vllm_tt_plugin/engine.py`, `src/vllm_tt_plugin/lane_scheduler.py`, and `src/vllm_tt_plugin/async_decode.py` in this repository.
+Code pointers are intentionally minimal. If you need them, the main entry points are `src/vllm_tt_plugin/scheduler.py`, `src/vllm_tt_plugin/lane_scheduler.py`, `src/vllm_tt_plugin/worker.py`, and `src/vllm_tt_plugin/async_decode.py` in this repository.
 
 ## Short Version
 
@@ -18,7 +18,8 @@ The current TT path is more specialized than upstream vLLM:
 - TT does not support mixed prefill+decode batches.
 - TT does not support chunked prefill at the scheduling level.
 - CPU-device work overlap is a decode optimization.
-- Gathered-DP is not just "the same thing on more ranks"; it adds a global mode negotiation and a gather/execute/scatter step around every DP execution.
+- Standard multi-process DP runs independent per-rank engines with no
+  gather/scatter. Single-process lane-DP coordinates lanes within one process.
 
 Upstream vLLM is more general:
 
@@ -259,100 +260,42 @@ merged multi-lane step; decode overlap uses the same steady-state checks, and
 if any lane breaks them pending async decode work is drained before the next
 step.
 
-## Queueing in Gathered-DP TT
+## Standard Multi-Process DP
 
-Gathered-DP is conceptually different from non-DP.
+For models that don't fold into single-process lanes (i.e., most non-Galaxy,
+non-GPT-OSS models), `--data_parallel_size N` uses upstream vLLM's standard
+multi-process DP:
 
-### What stays local
+- Each DP rank is an independent engine core process with its own scheduler,
+  KV cache, and TT submesh.
+- No cross-rank coordination or gather/scatter - ranks are fully independent.
+- Device groups are discovered at startup (`utils/dp_discovery.py`) and assigned
+  via `TT_VISIBLE_DEVICES` per rank.
+- Each rank uses `TTScheduler` (prefill/decode separation) identically to the
+  single-process non-DP path.
 
-Each DP rank still has its own local scheduler state:
+From the scheduling perspective, standard DP is equivalent to running N
+independent non-DP servers that happen to share the same physical machine.
 
-- local `waiting`
-- local `running`
-- local admission decisions
+## Gathered-DP (Historical — Fork Only)
 
-### What becomes global
+The gathered multi-process DP mode (global mode negotiation, gather/execute/scatter,
+single in-flight handle, cross-rank collectives) is not implemented in this
+standalone plugin. It remains available in the
+[tenstorrent/vllm](https://github.com/tenstorrent/vllm) fork for models that
+require it. This plugin uses upstream's standard DP mechanism instead.
 
-Before a gathered-DP step is executed, ranks first negotiate a global batch mode:
+## Non-DP vs Standard-DP
 
-- force prefill
-- force decode
-
-That negotiation is necessary because the gathered TT execution wants all ranks to participate in the same kind of step. Without that, one rank could try to admit prefill while another tries to advance decode, which would break the merged execution model.
-
-### The gathered-DP execution shape
-
-Once the mode is chosen:
-
-1. Each rank schedules locally under that forced mode.
-2. Each rank builds its local TT model input or an empty contribution.
-3. Per-rank inputs are gathered into one merged execution payload.
-4. The merged TT batch is executed on rank 0. The model (and tt-runtime) is responsible for submitting the work from rank 0 to the mesh.
-5. Results are read on rank 0 and split back by DP rank.
-6. Each rank applies only its own local result to its local scheduler state.
-
-That is the defining difference between gathered-DP and non-DP.
-
-### Queueing model in gathered-DP
-
-Gathered-DP does not behave like a generic multi-entry engine queue.
-
-Conceptually, it keeps at most one gathered execution step in flight:
-
-- previous gathered step may still be finishing
-- current step may be prepared and submitted
-- completion of the previous step may happen before or after the next submit, depending on whether overlap is safe
-
-So this code is closer to a controlled one-step pipeline than to a broad queue of independent futures.
-However, since the non-DP queue has depth of just 2 the host-device overlap timeline is similar in effect.
-
-### Threading and waiting in gathered-DP
-
-Gathered-DP uses less executor-side threading than the non-DP uniprocess path.
-
-The important waiting mechanisms are:
-
-- synchronous collectives for global mode negotiation and input gather
-- an in-flight gathered handle representing the previous decode submission
-- synchronous finalization when the previous gathered step must be retired
-
-At the lowest level, gathered-DP decode uses the same TT readback mechanism as non-DP decode:
-
-- submit decode without immediate host readback
-- arm asynchronous readback
-- later wait on read events with `ttnn.event_synchronize(...)`
-
-The difference is not the TT read primitive. The difference is the surrounding control flow: gathered-DP wraps that same read/finalize mechanism in cross-rank collectives and a single in-flight gathered handle.
-
-The async part is narrower than in non-DP:
-
-- decode submission may return a future-like gathered handle
-- finalization of that handle can be delayed until the next step
-- but all ranks still have to enter the collectives in the same order
-
-So gathered-DP is a synchronized collective loop with a possible one-step decode overlap.
-
-### Sync vs async in gathered-DP
-
-Gathered-DP is mixed-mode:
-
-- host-side gather/orchestration is synchronous
-- prefill execution is effectively synchronous
-- decode may use a one-step-ahead async submission/finalization pattern
-
-So in "DP async", the collective coordination remains synchronous. The async part is mostly the decode execution/readback overlap inside that coordinated loop.
-
-## Non-DP vs Gathered-DP
-
-| Topic | Non-DP TT | Gathered-DP TT |
+| Topic | Non-DP TT | Standard-DP TT |
 | --- | --- | --- |
-| Scheduler state | Local only | Local per rank |
-| Batch type per step | Prefill-only or decode-only | Same, globally forced across ranks |
-| Queueing shape | Host-side in-flight batch queue | Usually one gathered step in flight |
+| Scheduler state | Local only | Local per rank (independent) |
+| Batch type per step | Prefill-only or decode-only | Same, per rank independently |
+| Queueing shape | Host-side in-flight batch queue | Same, per rank |
 | Prefill behavior | Synchronous-style | Synchronous-style |
-| Decode overlap | Yes, when steady | Yes, but only after global coordination says it is safe |
-| Cross-rank coordination | None | Required every step |
-| Execution payload | Local TT model input | Gathered merged TT model input |
+| Decode overlap | Yes, when steady | Yes, per rank independently |
+| Cross-rank coordination | None | None (ranks are independent processes) |
+| Execution payload | Local TT model input | Local TT model input (per-rank submesh) |
 
 ## TT vs Upstream vLLM
 
