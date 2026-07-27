@@ -83,9 +83,7 @@ class TTScheduler(AsyncScheduler):
         the prefill loop would never run, and the request would never be
         promoted — stalling indefinitely.
         """
-        return bool(self.waiting) or bool(
-            getattr(self, "skipped_waiting", False)
-        )
+        return bool(self.waiting) or bool(getattr(self, "skipped_waiting", False))
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base

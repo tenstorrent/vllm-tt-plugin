@@ -778,9 +778,7 @@ class TTPlatform(Platform):
         import ttnn
 
         get_default_device = getattr(ttnn, "GetDefaultDevice", None)
-        current_device = (
-            get_default_device() if callable(get_default_device) else None
-        )
+        current_device = get_default_device() if callable(get_default_device) else None
         if current_device is not device:
             ttnn.SetDefaultDevice(device)
 

@@ -43,9 +43,7 @@ except ImportError:
     ttnn.ReadDeviceProfiler = lambda *args, **kwargs: None
     ttnn.set_fabric_config = lambda *args, **kwargs: None
     ttnn.GetDefaultDevice = lambda: _default_device["value"]
-    ttnn.SetDefaultDevice = lambda device: _default_device.__setitem__(
-        "value", device
-    )
+    ttnn.SetDefaultDevice = lambda device: _default_device.__setitem__("value", device)
     sys.modules["ttnn"] = ttnn
 
 sched_interface = importlib.import_module("vllm.v1.core.sched.interface")
