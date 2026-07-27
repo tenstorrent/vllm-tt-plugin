@@ -8,6 +8,27 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
 
+def test_forced_prefill_does_not_fallback_to_decode_per_lane(monkeypatch):
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.waiting.add_request(object())
+    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.running = [object()]
+    scheduler._forced_mode = TTSchedulingMode.PREFILL_ONLY
+
+    monkeypatch.setattr(scheduler, "_schedule_prefill_only", SchedulerOutput.make_empty)
+
+    def fail_local_decode_fallback():
+        raise AssertionError("forced prefill must remain coordinated across lanes")
+
+    monkeypatch.setattr(scheduler, "_schedule_decode_only", fail_local_decode_fallback)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+
+
 def test_forced_decode_hides_and_restores_skipped_waiting(monkeypatch):
     scheduler = TTScheduler.__new__(TTScheduler)
     scheduler.policy = SchedulingPolicy.FCFS

@@ -89,14 +89,10 @@ class TTScheduler(AsyncScheduler):
         mode = self._forced_mode
 
         if mode == TTSchedulingMode.PREFILL_ONLY:
+            # Forced mode is shared by every lane. Return an empty prefill
+            # result unchanged so the coordinator can decide whether all lanes
+            # should fall back to decode together.
             result = self._schedule_prefill_only()
-            # If the forced prefill scheduled nothing (e.g. grammar still
-            # compiling, or KV pressure with chunked prefill disabled) but
-            # there are running decode requests, fall back to decode-only
-            # to avoid a livelock where no decode progress is made and no
-            # KV capacity is freed.
-            if result.total_num_scheduled_tokens == 0 and has_running:
-                result = self._schedule_decode_only()
             return self._finalize_scheduler_output(result)
         if mode == TTSchedulingMode.DECODE_ONLY:
             if has_waiting:
