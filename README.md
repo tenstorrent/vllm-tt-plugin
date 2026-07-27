@@ -286,12 +286,20 @@ Common options:
 
 ### `max_model_len` And KV Cache Capacity
 
-TT does not profile device memory. `TTWorker.determine_available_memory()`
-reports a dummy byte count and instead pins `num_gpu_blocks_override` to a block
-count derived from the model's `max_tokens_all_users` — the token budget shared
-by *all* concurrent requests. That pool is independent of `max_model_len`, which
-is the *per-request* context limit. Since vLLM sizes and validates the KV cache
-against the override-backed capacity, the two must be chosen together:
+TT does not profile device memory. `get_num_available_blocks_tt()` instead
+derives a block count from the model's `max_tokens_all_users` — a per-model,
+per-device token budget declared by the model class in tt-metal
+(`get_max_tokens_all_users`, default 131072, sometimes exposed as an environment
+override such as `GEMMA4_MAX_TOKENS_ALL_USERS`), plus headroom for vLLM's
+worst-case block allocation and for sliding-window groups on hybrid models.
+`TTWorker.determine_available_memory()` publishes that count both as
+`cache_config.num_gpu_blocks_override` and as an equivalent byte budget — the
+latter is what reaches the engine-side KV planner, which in standard DP runs in
+a different process from the worker that set the override.
+
+That pool is the budget shared by *all* concurrent requests, and it is
+independent of `max_model_len`, the *per-request* context limit. Since vLLM
+sizes and validates the KV cache against it, the two must be chosen together:
 
 | `--max-model-len` | Behavior |
 | --- | --- |
@@ -305,9 +313,7 @@ roughly the whole pool with maximum concurrency `1.00x`: a single long request
 can occupy the entire KV cache and stall the rest. Prefer an explicit
 `--max-model-len` for serving, sized around
 `max_tokens_all_users / max_num_seqs`, and treat auto-fit as a convenience for
-one-off runs. `max_tokens_all_users` itself comes from the model class in
-tt-metal (`get_max_tokens_all_users`), which some models expose as an
-environment override such as `GEMMA4_MAX_TOKENS_ALL_USERS`.
+one-off runs.
 
 ## Runtime Architecture
 

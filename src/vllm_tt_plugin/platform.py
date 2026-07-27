@@ -849,16 +849,19 @@ class TTPlatform(Platform):
         # ``get_kv_cache_configs`` run ``_auto_fit_max_model_len``.
         #
         # TT sizes its KV pool from the model's total token budget
-        # (``max_tokens_all_users``) and pins it via
-        # ``cache_config.num_gpu_blocks_override``, decoupled from the
-        # per-request ``max_model_len``. Since vllm-project/vllm#41069 upstream
-        # rewrites ``available_memory`` to the override-backed capacity before
-        # both auto-fit and the admission check, so both plan against the real
-        # TT pool: an explicit length that does not fit aborts startup with an
-        # estimated servable length, and ``-1`` fits to the pool and syncs the
-        # result to the workers (``TTWorker.update_max_model_len``) and back to
-        # the API-server process (``EngineCoreReadyResponse.max_model_len``).
-        # No TT-local capacity check is needed on top of that.
+        # (``max_tokens_all_users``), which is decoupled from the per-request
+        # ``max_model_len``. ``TTWorker.determine_available_memory`` publishes
+        # that pool both as ``cache_config.num_gpu_blocks_override`` and as an
+        # equivalent byte budget, so upstream plans against the real TT
+        # capacity from either side: the returned budget already divides back
+        # into the TT block count, and where the override is visible in-process
+        # vllm-project/vllm#41069 rewrites ``available_memory`` to the same
+        # number before both auto-fit and the admission check. An explicit
+        # length that does not fit therefore aborts startup with an estimated
+        # servable length, and ``-1`` fits to the pool and syncs the result to
+        # the workers (``TTWorker.update_max_model_len``) and back to the
+        # API-server process (``EngineCoreReadyResponse.max_model_len``). No
+        # TT-local capacity check is needed on top of that.
         #
         # Explicit values -- numeric or ``-1`` -- are therefore left untouched.
         # Only an omitted value falls back to auto-fit, because the HF-derived
