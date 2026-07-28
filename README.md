@@ -3,14 +3,14 @@
 Tenstorrent backend plugin for vLLM.
 
 `vllm-tt-plugin` integrates Tenstorrent hardware into vLLM using the standard
-plugin mechanism. Install it alongside vLLM and, when `ttnn` is importable,
+plugin mechanism. Install it alongside vLLM and, when `ttnn` is importable
+([see TT-Metal](https://github.com/tenstorrent/tt-metal/tree/main)),
 TT hardware is automatically available as a vLLM platform.
 
 The plugin is self-contained: model registration, platform detection, request
 validation, scheduling, worker execution, model loading, async decode, single-
-process standard and multi-lane execution, gathered data-parallel execution
-and `tt-run` / MPI launch orchestration all live here. Nothing TT-specific
-needs to touch vLLM core.
+process standard and multi-lane execution, data-parallel execution all live
+here. Nothing TT-specific needs to touch vLLM core.
 
 ## Package Layout
 
@@ -44,6 +44,9 @@ for the appropriate tt-metal and vLLM commits.
 
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
+
+The installation script builds vLLM `0.24.0` from source with
+`VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
 
 ## Environment Setup
 
@@ -241,9 +244,7 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-Sampling parameters beyond `temperature`, `top_k`, and `top_p` require
-compatibility sampling mode. The compatibility sampling pathway is selected per
-batch when any request in the batch requires it.
+Requests that cannot use TT on-device sampling automatically fall back to vLLM’s host-side sampling path. This fallback is selected per batch and requires no user configuration.
 
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
@@ -275,14 +276,8 @@ Common options:
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
-| `input_queue_batching_delay` | Short idle delay in seconds to allow more requests to coalesce before TT execution. Default: `0.002`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
-| `rank_binding` | Rank-binding YAML used for `tt-run` / MPI launches. |
-| `mpi_args` | MPI launch arguments, for example host and rankfile settings. |
-| `extra_ttrun_args` | Additional raw arguments passed to `tt-run`. |
-| `config_pkl_dir` | Shared directory used to pass launch config to remote hosts. |
-| `env_passthrough` | Environment variable names or glob patterns propagated to remote hosts. |
 
 ## Runtime Architecture
 
@@ -293,16 +288,12 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | vLLM config field | TT implementation |
 | --- | --- |
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
-| `parallel_config.engine_core_cls` | `vllm.v1.engine.core.EngineCore` (upstream) |
-| `parallel_config.engine_core_proc_cls` | `vllm.v1.engine.core.EngineCoreProc` (upstream) |
-| `parallel_config.dp_engine_core_proc_cls` | `vllm.v1.engine.core.DPEngineCoreProc` (upstream) |
-| `parallel_config.engine_core_launcher_cls` | `vllm.v1.engine.utils.CoreEngineLauncher` (upstream); `vllm_tt_plugin.launcher.TTCoreEngineLauncher` when explicit MPI launch is active |
 | `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
 
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
-- Chunked prefill is not used.
+- Chunked prefill is not (yet) used.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -314,8 +305,6 @@ The execution model matches TT hardware characteristics:
   scheduler, and KV cache. Device groups are discovered at startup and assigned
   via `TT_VISIBLE_DEVICES`. This is upstream vLLM's standard DP mechanism
   (no gather/scatter; ranks are fully independent).
-- Multi-host execution uses `tt-run` / MPI while vLLM sees a normal
-  engine-client handshake.
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.
@@ -349,7 +338,7 @@ each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. For
 these single-execute Galaxy models this replaces the gathered DP=4 setup they
 used historically, so there is nothing to migrate. This conversion is specific
 to the Galaxy generators; other model families still run `--data_parallel_size`
-as gathered multi-process DP (see [Runtime Architecture](#runtime-architecture)).
+as multi-process DP.
 At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
@@ -360,9 +349,13 @@ implementations. Current families:
 - Llama 3.1 / 3.2 / 3.3 text models (`TTLlamaForCausalLM`)
 - Llama 3.2 vision models (`TTMllamaForConditionalGeneration`)
 - Qwen 2.5 and Qwen 3 text models (`TTQwen2ForCausalLM`, `TTQwen3ForCausalLM`)
+- Qwen 3.5 text models on Blackhole (`TTQwen3_5ForConditionalGeneration`)
 - Qwen 2.5-VL and Qwen 3-VL vision-language models
 - Mistral and Mistral 3 multimodal models
 - Gemma 3 multimodal models
+- Gemma 4 text-only models (`TTGemma4ForCausalLM`,
+  `TTGemma4ForConditionalGeneration`,
+  `TTGemma4UnifiedForConditionalGeneration`)
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 
@@ -421,7 +414,7 @@ Client-server benchmarking can be done with `vllm bench serve` after starting
 the server:
 
 ```bash
-vllm bench serve --model meta-llama/Llama-3.2-1B-Instruct \
+vllm bench serve --model meta-llama/Llama-3.1-70B-Instruct \
   --dataset-name random \
   --random-input-len 128 \
   --random-output-len 128 \
@@ -459,42 +452,6 @@ under `tests/`, for example:
 ```bash
 pytest tests/test_lane_scheduler.py
 ```
-
-## Running On Multi-Host Systems
-
-For multi-host offline inference or serving, launch vLLM from the host that has
-MPI rank 0, as determined from the rankfile. Under the hood, the plugin uses
-`tt-run` from tt-metal to spawn MPI processes on each host.
-
-Example offline inference on two Wormhole Galaxy hosts with DP=2:
-
-```bash
-MESH_DEVICE="(8,8)" \
-python -u examples/offline_inference_tt.py \
-  --model <MODEL_NAME> \
-  --data_parallel_size 2 \
-  --async_engine \
-  --additional-config '{
-    "tt": {
-      "rank_binding": "<TT_METAL>/tests/tt_metal/distributed/config/dual_galaxy_rank_bindings.yaml",
-      "extra_ttrun_args": "--tcp-interface cnx1",
-      "mpi_args": "--host <HOST1>,<HOST2> --map-by rankfile:file=/etc/mpirun/rankfile",
-      "config_pkl_dir": "<SHARED_TMP_DIR>",
-      "fabric_config": "FABRIC_1D",
-      "fabric_reliability_mode": "RELAXED_INIT",
-      "env_passthrough": ["VLLM_*", "MESH_DEVICE"]
-    }
-  }'
-```
-
-Notes:
-
-- The `rank_binding` YAML needs an absolute path for `mesh_graph_desc_path`.
-- `config_pkl_dir` must be shared by all hosts.
-- Environment variables can be propagated through `env_passthrough` in
-  `--additional-config` or through `global_env` in the rank-binding file.
-- `extra_ttrun_args` passes raw flags to `tt-run`, such as
-  `"--tcp-interface cnx1"`, `"--bare"`, or `"--debug-gdbserver"`.
 
 ## Hybrid Attention Models
 

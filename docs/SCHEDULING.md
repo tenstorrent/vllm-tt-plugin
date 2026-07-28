@@ -5,10 +5,14 @@ This note summarizes how TT execution works in the current TT vLLM integration, 
 The emphasis here is on the concepts:
 
 - sync vs async
-- non-DP vs standard multi-process DP vs single-process lane-DP
-- what is scheduled locally vs what is coordinated globally
+- single-process non-DP vs single-process lane-DP vs standard multi-process DP
+- what is coordinated within one process vs what remains independent per rank
 
-Code pointers are intentionally minimal. If you need them, the main entry points are `src/vllm_tt_plugin/scheduler.py`, `src/vllm_tt_plugin/lane_scheduler.py`, `src/vllm_tt_plugin/worker.py`, and `src/vllm_tt_plugin/async_decode.py` in this repository.
+Code pointers are intentionally minimal. The main entry points are
+`src/vllm_tt_plugin/platform.py`, `src/vllm_tt_plugin/scheduler.py`,
+`src/vllm_tt_plugin/lane_scheduler.py`, `src/vllm_tt_plugin/worker.py`,
+`src/vllm_tt_plugin/model_runner.py`, `src/vllm_tt_plugin/async_decode.py`, and
+`src/vllm_tt_plugin/utils/dp_discovery.py`.
 
 ## Short Version
 
@@ -18,8 +22,9 @@ The current TT path is more specialized than upstream vLLM:
 - TT does not support mixed prefill+decode batches.
 - TT does not support chunked prefill at the scheduling level.
 - CPU-device work overlap is a decode optimization.
-- Standard multi-process DP runs independent per-rank engines with no
-  gather/scatter. Single-process lane-DP coordinates lanes within one process.
+- Standard multi-process DP runs independent per-rank engines.
+- Single-process lane-DP coordinates lanes within one process and executes one
+  merged TT batch.
 
 Upstream vLLM is more general:
 
@@ -30,19 +35,31 @@ Upstream vLLM is more general:
 
 ## Mental Model
 
-There are still two important scheduler-side collections:
+There are three important scheduler-side collections:
 
 - `waiting`: requests not yet admitted into active execution
+- `skipped_waiting`: pending prefill requests temporarily blocked, for example
+  while their structured-output grammar is compiled
 - `running`: requests already admitted and holding active scheduler state
 
-What TT changes is not the existence of those queues, but the rules for choosing what kind of work a step may contain and how that scheduled work is executed afterward.
+TT treats `waiting` and `skipped_waiting` together when checking for pending
+prefill work. What TT changes is not the existence of these collections, but
+the rules for choosing what kind of work a step may contain and how that
+scheduled work is executed afterward.
 
 For TT, it is useful to think in terms of two batch types:
 
-- prefill batch: admits new work from `waiting`
+- prefill batch: admits ready work from the pending prefill queues
 - decode batch: advances already-running work from `running`
 
 That is a simplification compared with upstream vLLM, but it matches how the TT path is intentionally organized today.
+
+TT still performs continuous batching in the broad sense: requests arrive in
+`waiting`, may be held in `skipped_waiting`, are admitted while other requests
+remain active, can be preempted back to `waiting`, and leave independently as
+they finish. The restriction is within each device step: TT does not mix
+prefill and decode work or make incremental chunked-prefill progress in the
+same way as upstream.
 
 ## Current TT Execution Flow
 
@@ -69,26 +86,40 @@ This is the main conceptual difference from upstream.
 
 ### 3. Engine step selection
 
-After scheduling, the engine uses one of four execution styles:
+The scheduler runs in one of three topologies:
 
-1. Synchronous path
-2. Non-DP async path
-3. Gathered-DP async path
-4. Single-process multi-lane path
+1. Single-process non-DP: one engine, one scheduler, and one TT worker.
+2. Single-process lane-DP: one engine coordinates multiple lane schedulers and
+   submits one merged TT batch.
+3. Standard multi-process DP: each rank has an independent engine, scheduler,
+   KV cache, TT worker, and TT submesh.
 
-Which path is used depends mostly on:
+Each engine process can execute synchronously or use async decode overlap. The
+choice depends on:
 
-- whether async scheduling is enabled
-- whether data parallel execution requires gathered coordination
+- whether the effective `async_scheduling` setting is enabled
+- whether the selected model declares async decode support
+- whether the current batch satisfies the steady-decode fast-path conditions
+
+vLLM normally enables async scheduling when the configuration is compatible.
+The TT platform turns it off when the selected model does not declare
+`supports_async_decode`.
+
+With standard DP there is no global prefill/decode decision. One rank can run
+prefill while another runs decode.
 
 ### 4. Worker/model-runner execution
 
 The TT worker forwards scheduled work into the TT model runner.
 
-At that point, the important split is:
+For non-DP, lane-DP, and standard-DP ranks, execution is split into forward and
+sample phases:
 
-- prefill is effectively synchronous
-- decode may be synchronous or asynchronously overlapped
+1. `execute_model()` prepares and submits the TT forward.
+2. `sample_tokens()` applies sample-time grammar state and produces tokens.
+
+Prefill remains effectively synchronous. Decode may return a deferred output
+whose host readback and sampling are finalized asynchronously.
 
 Even when a call crosses an async-looking executor boundary, TT prefill still behaves like a synchronous step in practice. The meaningful overlap optimization is decode.
 
@@ -109,11 +140,17 @@ That lag is intentional and is what creates host/device overlap.
 
 The TT scheduler behaves like this:
 
-- if there is admissible waiting work, prefer prefill
+- if `waiting` or `skipped_waiting` contains pending prefill work, run the prefill scheduling pass so newly ready requests can be promoted and admitted.
 - otherwise, advance decode work
-- if waiting exists but cannot be admitted as full prefill, decode can run to free capacity
+- if pending prefill work cannot be admitted, fall back to decode to free
+  capacity
 
 The reason for this policy is simple: TT currently wants a homogeneous batch type per step, and it wants full-prefill admission rather than upstream-style incremental prefill progress.
+
+At configuration time the platform turns requested chunked prefill off. If
+`max_num_batched_tokens` is then smaller than `max_model_len`, it raises that
+token budget to `max_model_len` so a full prompt can be admitted instead of
+leaving an unschedulable request in `waiting`.
 
 ### Why TT uses an async-style scheduler even in TT-specific flows
 
@@ -128,11 +165,14 @@ It means:
 
 That mechanism matters most for steady-state decode.
 
-## Queueing in Non-DP TT
+## Queueing Within One Engine Process
 
 ### What is queued
 
-In non-DP mode, the engine keeps a host-side queue of in-flight scheduled steps. Conceptually, each queue entry is:
+When async scheduling is enabled, an engine keeps a host-side queue of
+in-flight scheduled steps. This applies to a non-DP engine, the one engine in
+lane-DP, and each independent engine rank in standard DP. Conceptually, each
+queue entry contains:
 
 - the scheduled batch description
 - a future or future-like handle for its output
@@ -144,7 +184,7 @@ The queue is used with a "fill before blocking" policy:
 
 ### What async really means here
 
-For TT non-DP, async primarily means:
+For TT, async primarily means:
 
 - decode submission can run ahead of host-side result application
 - device readback/finalization can complete later
@@ -160,15 +200,17 @@ In practice:
 
 - prefill remains a synchronous-style step
 - decode can use the steady async path when invariants hold
-- during steady-state decode, one or two steps are submitted to the device at any time. Thus the device should see no gaps in execution.
+- at most two scheduled steps can be outstanding; this allows overlap but does
+  not guarantee it for every batch
 
-### Threading and waiting in non-DP
+### Threading and waiting
 
 There are three different mechanisms involved, and they serve different purposes.
 
 #### 1. Engine batch queue
 
-The engine keeps a small queue of in-flight scheduled steps. In TT async non-DP, that queue depth is `2` when async scheduling is enabled.
+The engine keeps a small queue of in-flight scheduled steps. With async
+scheduling enabled, the queue depth is `2`.
 
 This queue defines how many scheduled steps can be outstanding. It is an engine/executor queue, not a TT-model-internal queue.
 
@@ -185,17 +227,24 @@ In uniprocess mode there is one background output thread. In multiprocess mode t
 
 #### 3. TT decode completion signaling
 
-Inside the TT runner, async decode completion is tracked with `threading.Event` objects plus lock-protected deques.
+Inside the TT runner, async decode completion is tracked with deferred output
+objects, `threading.Event` objects, and lock-protected deques.
 
-These structures do not execute the decode. They only track whether a submitted async decode step has finished host-side finalization.
+These structures do not execute the device decode. They ensure that deferred
+host readback and finalization run exactly once, even if the executor output
+thread and the engine thread reach the same result concurrently.
 
 The important pieces are:
 
-- `_pending_async_events`: decode steps submitted but not yet marked complete
+- `_pending_async_steps`: submitted decode steps that may still need finalization
+- `_pending_async_overlap_ok`: whether each pending step can remain overlapped
 - `_completed_decode_steps`: decode results that have completed readback/finalization but have not yet been applied back to runner state
 - `_steady_decode_lock`: protects those deques
 
-The event is set only after `get_output()` has finished finalizing the decode output. So the event means "this decode result is ready to apply", not merely "submission happened".
+The completion event is set after one-time finalization completes, whether
+finalization was triggered by `get_output()` or by an explicit runner drain. It
+means "this decode result is ready to consume", not merely "submission
+happened".
 
 #### 3a. Basic TT async mechanism
 
@@ -219,83 +268,132 @@ This is why the higher-level future/event bookkeeping exists. It is tracking whe
 
 #### 4. Where the code actually waits
 
-There are two important wait points in non-DP TT:
+There are two important wait points:
 
 - engine-level wait: when the batch queue cannot be filled further, the engine blocks on the oldest queued future
-- runner-level drain wait: before leaving the steady decode fast path, TT may wait for all pending async decode events and then apply the completed steps
+- runner-level drain: before leaving the steady decode fast path, TT finalizes
+  all pending deferred decode outputs and applies the completed steps
 
-So the host does not continuously poll. It mostly waits at explicit boundaries:
+The runner drain calls the idempotent `ensure_finalized()` operation. It does
+not merely wait for another thread to set an event, because the engine may need
+to drain before the executor has resolved the older future.
+
+So the host does not continuously poll. It blocks or finalizes at explicit
+boundaries:
 
 - `future.result()` at the engine/executor boundary
-- `event.wait()` when the runner must drain pending async decode work
+- `ensure_finalized()` when the runner must drain pending async decode work
 
 ### When steady async decode is allowed
 
-TT only keeps decode overlapped when the batch is "steady" enough. In plain terms, overlap is allowed only when the batch shape and sampling path are stable.
+Async scheduling is first gated by model capability. If a model does not
+declare `supports_async_decode`, the platform disables async scheduling. The
+steady path also requires TT tracing, so `trace_mode="none"` disables overlap.
+
+TT only keeps decode overlapped when the batch is "steady" enough. In plain
+terms, overlap is allowed only when the batch shape and sampling path are
+stable and sampling can run on device.
 
 Overlap is disabled and pending async work is drained when correctness would otherwise become ambiguous, for example when there is:
 
 - prompt activity or resumed prefill work
 - layout change in the decode batch
 - structured output bookkeeping
-- penalties or host-side logits processing
-- host-only sampling requirements
-- logprobs or other features that force a more synchronous path
+- penalties, allowed-token masks, bad-word filtering, or logits processors
+- any other requirement for host-side sampling
+- logprobs, including an explicit `logprobs=0`, or other features that force a
+  more synchronous path
 
 So the TT async path is best understood as a fast path for steady decode, not as a universal async execution model.
 
+The effective `async_scheduling` setting controls this engine and device
+overlap. It can be disabled explicitly with `--no-async-scheduling`.
+`--async_engine` in the offline example controls use of vLLM's asynchronous
+client API and is a separate option.
+
 ## Queueing in Single-Process Lane TT
 
-Single-process lane mode sits between non-DP and gathered-DP: still one vLLM
-engine process and one TT worker, but `TTLaneCoordinator` owns one independent
-`TTScheduler` per lane (each with its own `waiting`/`running` queues and
-prefill/decode admission) and merges their `SchedulerOutput` objects into one
-engine-facing batch. Unlike gathered-DP there is no MPI coordination or
-gather/scatter: one process computes the global forced mode, one worker builds
-the per-lane TT inputs, one merged TT launch runs across all submeshes, and the
-merged runner output is split back by lane in-process.
+Single-process lane-DP uses one vLLM engine process and one TT worker.
+`TTLaneCoordinator` owns one independent `TTScheduler` per lane. Each lane has
+its own `waiting` and `running` queues, admission decisions, KV cache manager,
+and lane-local block ID space.
+
+New requests are assigned to the least-loaded lane and remain bound to that
+lane. Because the device executes all lanes together, the coordinator selects
+one shared mode for each step:
+
+- if any lane can admit prefill, all lanes run a prefill step
+- otherwise, all lanes run a decode step
+- a lane with no work for the selected mode contributes an empty part of the
+  merged batch
+
+If a forced prefill step admits zero tokens while any lane has running decode
+requests, the coordinator retries the step in decode mode. This prevents KV
+pressure from causing a no-progress loop.
+
+The coordinator merges the per-lane `SchedulerOutput` objects, the worker
+builds one merged TT input, and the runner splits the output back by lane in
+process. No process-level collectives are involved.
 
 Lane mode reuses the non-DP TT async queue depth, but each queued item is a
 merged multi-lane step; decode overlap uses the same steady-state checks, and
 if any lane breaks them pending async decode work is drained before the next
 step.
 
+For single-execute models, `--data_parallel_size N` is transparently folded
+into `N` in-process lanes. This covers Galaxy generators selected with
+`TT_LLAMA_TEXT_VER=llama3_70b_galaxy` or
+`TT_QWEN3_TEXT_VER=qwen3_32b_galaxy`, and GPT-OSS selected by its model
+architecture. The user-provided `--max_num_seqs M` remains the capacity per
+lane, so the engine's global capacity becomes `N * M`.
+
+Lane-DP does not currently support request-specific RoPE state, including mRoPE
+vision models.
+
 ## Standard Multi-Process DP
 
-For models that don't fold into single-process lanes (i.e., most non-Galaxy,
-non-GPT-OSS models), `--data_parallel_size N` uses upstream vLLM's standard
-multi-process DP:
+Models that do not fold into lane-DP use upstream vLLM's standard
+multi-process DP when started with `--data_parallel_size N`.
 
-- Each DP rank is an independent engine core process with its own scheduler,
-  KV cache, and TT submesh.
-- No cross-rank coordination or gather/scatter - ranks are fully independent.
-- Device groups are discovered at startup (`utils/dp_discovery.py`) and assigned
-  via `TT_VISIBLE_DEVICES` per rank.
-- Each rank uses `TTScheduler` (prefill/decode separation) identically to the
-  single-process non-DP path.
+Each DP rank has:
 
-From the scheduling perspective, standard DP is equivalent to running N
-independent non-DP servers that happen to share the same physical machine.
+- an independent engine core process
+- its own `TTScheduler`, `waiting` queue, and `running` set
+- its own KV cache
+- its own TT worker and TT submesh
 
-## Gathered-DP (Historical — Fork Only)
+The ranks do not negotiate a shared batch mode. Each rank independently chooses
+prefill or decode, executes a local TT batch, and updates only its own request
+state. From the scheduling perspective, this is equivalent to running `N`
+independent TT servers behind vLLM's DP request routing.
 
-The gathered multi-process DP mode (global mode negotiation, gather/execute/scatter,
-single in-flight handle, cross-rank collectives) is not implemented in this
-standalone plugin. It remains available in the
-[tenstorrent/vllm](https://github.com/tenstorrent/vllm) fork for models that
-require it. This plugin uses upstream's standard DP mechanism instead.
+On a single host, the plugin discovers TT device groups at startup and assigns
+one group to each rank through `TT_VISIBLE_DEVICES`. Request routing binds each
+request to one rank; requests do not migrate between ranks.
 
-## Non-DP vs Standard-DP
+For standard DP, `--max_num_seqs M` is the capacity of each rank. The plugin
+does not multiply the rank-local model or KV-cache capacity by the number of
+ranks.
 
-| Topic | Non-DP TT | Standard-DP TT |
+Async decode is also rank-local. Each rank has its own queue and applies the
+same steady-decode checks described above. One rank draining or switching to
+prefill does not force the other ranks to do the same.
+
+Standard DP does not currently support MoE models. Single-execute models that
+need internal data-parallel lanes, such as GPT-OSS, are folded into lane-DP
+instead.
+
+## Non-DP vs Standard DP
+
+| Topic | Non-DP TT | Standard multi-process DP |
 | --- | --- | --- |
-| Scheduler state | Local only | Local per rank (independent) |
-| Batch type per step | Prefill-only or decode-only | Same, per rank independently |
-| Queueing shape | Host-side in-flight batch queue | Same, per rank |
-| Prefill behavior | Synchronous-style | Synchronous-style |
-| Decode overlap | Yes, when steady | Yes, per rank independently |
-| Cross-rank coordination | None | None (ranks are independent processes) |
-| Execution payload | Local TT model input | Local TT model input (per-rank submesh) |
+| Scheduler state | One local scheduler | One independent scheduler per rank |
+| Batch type per step | Prefill-only or decode-only | Same, selected independently per rank |
+| Queueing shape | One host-side in-flight queue | One host-side queue per rank |
+| Prefill behavior | Synchronous-style | Synchronous-style per rank |
+| Decode overlap | Yes, when steady | Yes, independently per rank |
+| Shared batch-mode or model-data coordination | None | None |
+| Execution payload | One local TT model input | One local TT model input per submesh |
 
 ## TT vs Upstream vLLM
 
@@ -325,8 +423,9 @@ That queueing model is backend-agnostic. It is mainly about executor pipelining.
 
 TT inherits that idea, but changes the meaning of "async":
 
-- in TT non-DP, the useful overlap is mostly decode steady-state overlap
-- in TT gathered-DP, the queueing becomes a single in-flight gathered pipeline rather than the generic upstream queue model
+- in each TT engine process, useful overlap is limited to steady-state decode
+- in lane-DP, each queued item is one merged multi-lane step
+- in standard DP, every rank owns an independent queue
 
 ### 2a. Waiting model
 
@@ -342,7 +441,7 @@ So compared with upstream, TT has more explicit "submit now, finalize later, app
 
 ### 3. Sampling boundary
 
-In upstream , execution and token sampling are more naturally separable.
+In upstream vLLM, execution and token sampling are more naturally separable.
 
 In the TT path, more of the decode and sampling behavior is bundled into TT-specific execution handling because the device/host readback path and device-sampling path are part of the TT execution contract.
 
@@ -350,14 +449,18 @@ This is one reason TT needs extra execution helpers instead of using only the ge
 
 ### 4. DP behavior
 
-Upstream does not use the TT-style gathered-DP execution contract described above.
+Standard TT DP uses upstream vLLM's independent per-rank engine model. TT adds
+device discovery and submesh assignment, but it does not add per-step
+cross-rank scheduling or execution collectives.
 
-The TT gathered-DP path adds several concepts that are TT-specific:
+Single-process lane-DP is TT-specific because one engine coordinates several
+device lanes. It adds:
 
-- global prefill/decode mode negotiation
-- gather of per-rank TT inputs into one merged execution payload
-- scatter/apply of per-rank outputs back into local scheduler state
-- conservative global checks before allowing steady decode overlap
+- static request-to-lane assignment
+- one prefill/decode mode shared by all in-process lanes
+- merging lane scheduler outputs into one TT input
+- splitting the merged result back into lane-local scheduler state
+- conservative all-lane checks before allowing steady decode overlap
 
 ## Practical Takeaways
 
@@ -366,8 +469,11 @@ If you want the most accurate mental model for the current TT stack, use this:
 - The scheduler is local, but TT execution rules are specialized.
 - TT prefill and decode are treated as different batch modes.
 - Async mainly means decode overlap, not fully async end-to-end execution.
-- Non-DP uses a local queue of in-flight steps.
-- Gathered-DP uses a globally coordinated one-step pipeline.
-- Upstream vLLM `main` is more general and less phase-constrained than the TT path.
+- Each engine process uses a local queue of in-flight steps.
+- Standard DP ranks schedule and execute independently.
+- Lane-DP coordinates multiple schedulers only within one process.
+- Upstream vLLM scheduling is more general and less phase-constrained than the
+  TT path.
 
-That is the core reason the TT branch currently has TT-specific scheduler and engine-step code rather than fitting entirely inside the upstream generic scheduler/executor flow.
+That is why TT keeps a specialized scheduler and model-runner path while still
+using upstream's engine and standard DP structure where possible.
