@@ -36,13 +36,11 @@ class TTScheduler(AsyncScheduler):
       or all-decode.
     - No chunked prefill: each prefill must be scheduled in full.
 
-    The base scheduler holds prefill requests that are temporarily blocked
-    (e.g. waiting for grammar compilation) in a separate ``skipped_waiting``
-    queue, not ``waiting``. Its waiting loop drains both queues and can
-    promote a now-ready blocked request into the same step that schedules
-    running decodes. To preserve the all-prefill or all-decode invariant,
-    every place that inspects or hides pending prefill work must treat
-    ``waiting`` and ``skipped_waiting`` together.
+    The base scheduler holds temporarily blocked prefill requests (e.g. while
+    a structured-output grammar compiles) in ``skipped_waiting`` rather than
+    ``waiting``. Its prefill loop revisits that queue and promotes requests
+    whose dependency is ready. Decode-only scheduling must hide both queues so
+    that the base scheduler cannot admit a prefill into a decode step.
 
     Inherits from AsyncScheduler to get num_output_placeholders support.
     TT uses this scheduler in both sync and async execution modes:
@@ -52,7 +50,7 @@ class TTScheduler(AsyncScheduler):
       re-scheduled before update_from_output processes the previous step's
       results, enabling host/device overlap
 
-    Supports ``set_forced_mode`` for DP-gather coordination:
+    Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
       queue is non-empty).
     - ``TTSchedulingMode.PREFILL_ONLY`` forces prefill-only (and may return an
@@ -76,12 +74,10 @@ class TTScheduler(AsyncScheduler):
     def _has_pending_prefill(self) -> bool:
         """Whether any request is waiting to be prefilled.
 
-        Includes ``skipped_waiting`` because promotion from
-        ``skipped_waiting`` to ``waiting`` only happens inside the base
-        scheduler's prefill loop.  Without this check, a rank whose only
-        pending work is a grammar-blocked request would signal decode-only,
-        the prefill loop would never run, and the request would never be
-        promoted — stalling indefinitely.
+        A request in ``skipped_waiting`` still needs a future prefill pass:
+        that is where the base scheduler retries promotion after its dependency
+        becomes ready. In decode-only mode this check also ensures both waiting
+        queues are hidden from the base scheduler.
         """
         return bool(self.waiting) or bool(getattr(self, "skipped_waiting", False))
 
@@ -93,14 +89,10 @@ class TTScheduler(AsyncScheduler):
         mode = self._forced_mode
 
         if mode == TTSchedulingMode.PREFILL_ONLY:
+            # Forced mode is shared by every lane. Return an empty prefill
+            # result unchanged so the coordinator can decide whether all lanes
+            # should fall back to decode together.
             result = self._schedule_prefill_only()
-            # If the forced prefill scheduled nothing (e.g. grammar still
-            # compiling, or KV pressure with chunked prefill disabled) but
-            # there are running decode requests, fall back to decode-only
-            # to avoid a livelock where no decode progress is made and no
-            # KV capacity is freed.
-            if result.total_num_scheduled_tokens == 0 and has_running:
-                result = self._schedule_decode_only()
             return self._finalize_scheduler_output(result)
         if mode == TTSchedulingMode.DECODE_ONLY:
             if has_waiting:
