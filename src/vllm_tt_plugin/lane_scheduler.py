@@ -358,11 +358,7 @@ class TTLaneCoordinator(SchedulerInterface):
         more alongside its running decodes.
 
         ``skipped_waiting`` holds prefill requests blocked on grammar
-        compilation and counts as queued work: without it a lane whose only
-        pending request is a grammar-blocked structured-output request would
-        signal decode-only. Decode-only scheduling hides that queue, so the
-        base scheduler would never revisit it to promote the request after its
-        grammar becomes ready.
+        compilation. We want to try to schedule them, because otherwise base scheduler won't revisit and promote them - decode intent hides that queue.
         """
         has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
         has_running = bool(sched.running)
