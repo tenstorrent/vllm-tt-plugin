@@ -358,7 +358,9 @@ class TTLaneCoordinator(SchedulerInterface):
         more alongside its running decodes.
 
         ``skipped_waiting`` holds prefill requests blocked on grammar
-        compilation. We want to try to schedule them, because otherwise base scheduler won't revisit and promote them - decode intent hides that queue.
+        compilation. We want to try to schedule them, because otherwise the
+        base scheduler won't revisit and promote them - decode intent hides
+        that queue.
         """
         has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
         has_running = bool(sched.running)
