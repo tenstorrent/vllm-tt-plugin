@@ -56,7 +56,8 @@ If installing tt-metal from source, build it, create the virtual environment,
 and set the environment variables needed for tt-metal tests.
 
 Activate the environment where tt-metal is installed, then install vLLM
-and the TT plugin:
+and the TT plugin. Run it from the repository root, which the relative paths
+inside assume:
 
 ```bash
 source docs/install-vllm-tt.sh
@@ -66,6 +67,13 @@ The script installs vLLM with
 `VLLM_TARGET_DEVICE=empty` because `tt` platform is provided by this plugin
 at runtime. It then installs the plugin with a few dependencies.
 Most dependencies come from the active tt-metal env.
+
+vLLM is installed with `--override docs/vllm-overrides.txt`. vLLM asks for
+`opencv-python-headless>=4.13.0`, which requires `numpy>=2`, while `ttnn` pins
+`numpy<2`; without the override the install cannot resolve. The overrides keep
+`numpy<2` and hold opencv at the last release compatible with it. opencv is only
+reached by vLLM's video-IO path, which no TT-supported model uses. See the
+comments in that file before changing the pinned vLLM version.
 
 To install or refresh only the plugin package:
 
