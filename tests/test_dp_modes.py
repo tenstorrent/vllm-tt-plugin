@@ -104,38 +104,26 @@ class TestDPModes:
 
             TTPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("original_max_model_len", [8192, -1])
-    def test_check_and_update_config_preserves_explicit_max_model_len(
+    @pytest.mark.parametrize("original_max_model_len", [8192, -1, None])
+    def test_check_and_update_config_never_rewrites_max_model_len(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
-        original_max_model_len: int,
+        original_max_model_len: int | None,
     ) -> None:
-        """An explicit --max-model-len is never rewritten by the TT platform.
+        """The TT platform leaves vLLM's max_model_len policy alone.
 
         A numeric value must reach upstream's override-aware capacity check
         unchanged (so an oversized value fails loudly instead of being silently
-        clamped), and an explicit -1 must stay -1.
+        clamped), an explicit -1 must stay -1 so upstream auto-fits, and an
+        omitted value must stay None so upstream keeps its HF-derived default.
         """
         vllm_config.model_config.original_max_model_len = original_max_model_len
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
         assert vllm_config.model_config.original_max_model_len == original_max_model_len
-
-    def test_check_and_update_config_preserves_omitted_max_model_len(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        vllm_config: SimpleNamespace,
-        dummy_model_class: type,
-    ) -> None:
-        """An omitted --max-model-len keeps upstream's HF-derived default."""
-        vllm_config.model_config.original_max_model_len = None
-
-        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
-
-        assert vllm_config.model_config.original_max_model_len is None
 
     def test_update_max_model_len_syncs_worker_model_config(self) -> None:
         worker_instance = TTWorker.__new__(TTWorker)
