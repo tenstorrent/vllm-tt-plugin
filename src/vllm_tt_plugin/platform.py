@@ -842,46 +842,9 @@ class TTPlatform(Platform):
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
 
-        # max_model_len policy. vLLM's config parser records the user's raw
-        # request in ``model_config.original_max_model_len``: ``None`` when the
-        # option was omitted, a positive int for an explicit limit, or ``-1``
-        # for an explicit "fit it to the hardware". Only ``-1`` makes
-        # ``get_kv_cache_configs`` run ``_auto_fit_max_model_len``.
-        #
-        # TT sizes its KV pool from the model's total token budget
-        # (``max_tokens_all_users``), which is decoupled from the per-request
-        # ``max_model_len``. ``TTWorker.determine_available_memory`` publishes
-        # that pool both as ``cache_config.num_gpu_blocks_override`` and as an
-        # equivalent byte budget, so upstream plans against the real TT
-        # capacity from either side: the returned budget already divides back
-        # into the TT block count, and where the override is visible in-process
-        # vllm-project/vllm#41069 rewrites ``available_memory`` to the same
-        # number before both auto-fit and the admission check. An explicit
-        # length that does not fit therefore aborts startup with an estimated
-        # servable length, and ``-1`` fits to the pool and syncs the result to
-        # the workers (``TTWorker.update_max_model_len``) and back to the
-        # API-server process (``EngineCoreReadyResponse.max_model_len``). No
-        # TT-local capacity check is needed on top of that.
-        #
-        # Explicit values -- numeric or ``-1`` -- are therefore left untouched.
-        # Only an omitted value falls back to auto-fit, because the HF-derived
-        # default (e.g. gemma-4-12B's 262144) almost always exceeds the TT pool
-        # and would otherwise abort startup for every such model.
-        #
-        # Auto-fit runs after the chunked-prefill bump above, which already
-        # raised ``max_num_batched_tokens`` to the pre-fit ``max_model_len``.
-        # Auto-fit only ever lowers ``max_model_len``, so the
-        # ``max_num_batched_tokens >= max_model_len`` invariant still holds; the
-        # only cost is host block-table buffers sized for the larger value.
-        if model_config.original_max_model_len is None:
-            logger.warning(
-                "max_model_len was not set; fitting it to the TT KV cache "
-                "capacity. Auto-fit stops at the length that fills the whole "
-                "pool, i.e. maximum concurrency 1.00x, so one request can "
-                "occupy the entire KV cache. For serving, pass --max-model-len "
-                "explicitly (roughly max_tokens_all_users / max_num_seqs)."
-            )
-            model_config.original_max_model_len = -1
+        # Preserve vLLM's max_model_len policy: omitted uses the HF-derived
+        # value, -1 auto-fits, and a positive value is used as given. The TT
+        # worker reports the real KV capacity for upstream's capacity check.
 
         # Import and register models from tt-metal.
         #

@@ -306,12 +306,12 @@ sizes and validates the KV cache against it, the two must be chosen together:
 | numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
 | numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Lower `--max-model-len` or raise `max_tokens_all_users`. |
 | `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. |
-| omitted | The plugin logs a warning and falls back to `-1`, because the HF-derived default (e.g. 262144) normally exceeds the pool. |
+| omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
 
-Auto-fit picks the largest length that fits **one** request, so it lands at
-roughly the whole pool with maximum concurrency `1.00x`: a single long request
-can occupy the entire KV cache and stall the rest. Prefer an explicit
-`--max-model-len` for serving, sized around
+Explicit `-1` auto-fit picks the largest length that fits **one** request, so it
+lands at roughly the whole pool with maximum concurrency `1.00x`: a single long
+request can occupy the entire KV cache and stall the rest. Prefer an explicit
+positive `--max-model-len` for serving, sized around
 `max_tokens_all_users / max_num_seqs`, and treat auto-fit as a convenience for
 one-off runs.
 

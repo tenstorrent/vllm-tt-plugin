@@ -124,22 +124,18 @@ class TestDPModes:
 
         assert vllm_config.model_config.original_max_model_len == original_max_model_len
 
-    def test_check_and_update_config_auto_fits_omitted_max_model_len(
+    def test_check_and_update_config_preserves_omitted_max_model_len(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
-        """An omitted --max-model-len falls back to upstream auto-fit.
-
-        The HF-derived default usually exceeds the TT KV pool, so opt into
-        vLLM's auto-fit rather than aborting startup.
-        """
+        """An omitted --max-model-len keeps upstream's HF-derived default."""
         vllm_config.model_config.original_max_model_len = None
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
-        assert vllm_config.model_config.original_max_model_len == -1
+        assert vllm_config.model_config.original_max_model_len is None
 
     def test_update_max_model_len_syncs_worker_model_config(self) -> None:
         worker_instance = TTWorker.__new__(TTWorker)
