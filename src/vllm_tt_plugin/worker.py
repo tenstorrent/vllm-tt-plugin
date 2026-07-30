@@ -16,7 +16,6 @@ from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
-    get_max_concurrency_for_kv_cache_config,
     get_uniform_page_size,
 )
 from vllm.v1.kv_cache_interface import (
@@ -133,32 +132,6 @@ def _resolve_mesh_grid(
             mesh_grid = (1, num_devices_available)
 
     return mesh_grid
-
-
-def _validate_tt_kv_cache_capacity(
-    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> None:
-    """Reject TT KV configs that cannot serve one max_model_len request."""
-    # When rebased to include https://github.com/vllm-project/vllm/pull/41069
-    # verify and remove this check.
-    if not kv_cache_config.kv_cache_groups:
-        return
-
-    max_concurrency = get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config
-    )
-    if max_concurrency >= 1.0:
-        return
-
-    model_config = vllm_config.model_config
-    raise ValueError(
-        "TT KV cache cannot hold one request at max_model_len. "
-        f"Maximum concurrency for {model_config.max_model_len:,} tokens per "
-        f"request is {max_concurrency:.2f}x, but must be at least 1.00x. "
-        f"num_blocks={kv_cache_config.num_blocks}, corresponding to approximately "
-        f"{kv_cache_config.num_blocks * vllm_config.cache_config.block_size:,} tokens, "
-        "Increase max_tokens_all_users or reduce max_model_len."
-    )
 
 
 def _available_kv_cache_memory_bytes_for_num_blocks(
@@ -414,7 +387,6 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank.
         """
-        _validate_tt_kv_cache_capacity(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
@@ -423,14 +395,14 @@ class TTWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def update_max_model_len(self, max_model_len: int) -> None:
-        # The engine calls this via collective_rpc after get_kv_cache_configs
-        # auto-fits max_model_len down to the KV cache the TT device can hold
-        # (TTPlatform.check_and_update_config opts in by setting
-        # original_max_model_len=-1). WorkerBase has no such hook -- only the GPU
-        # worker defines it -- so TTWorker must provide it or the RPC raises
-        # AttributeError. TTModelRunner reads self.model_config.max_model_len
-        # directly for KV-cache sizing and per-request bounds, so updating the
-        # shared model_config is sufficient; it keeps no separate cached copy.
+        # The engine calls this via collective_rpc when --max-model-len -1
+        # auto-fit reduces max_model_len to the KV cache capacity.
+        # WorkerBase has no such hook (only the GPU worker defines one), so
+        # TTWorker must provide it or the RPC raises AttributeError.
+        # TTModelRunner reads self.model_config.max_model_len directly when it
+        # builds the persistent input batch in initialize_kv_cache -- which the
+        # engine calls after this RPC -- so updating the shared model config is
+        # sufficient; it keeps no separate cached copy.
         self.model_config.max_model_len = max_model_len
 
     def compile_or_warm_up_model(self) -> CompilationTimes:

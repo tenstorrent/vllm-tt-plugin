@@ -279,6 +279,37 @@ Common options:
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
 
+### `max_model_len` And KV Cache Capacity
+
+TT does not profile device memory. `get_num_available_blocks_tt()` instead
+derives a block count from the model's `max_tokens_all_users` — a per-model,
+per-device token budget declared by the model class in tt-metal
+(`get_max_tokens_all_users`, default 131072, sometimes exposed as an environment
+override such as `GEMMA4_MAX_TOKENS_ALL_USERS`), plus headroom for vLLM's
+worst-case block allocation and for sliding-window groups on hybrid models.
+`TTWorker.determine_available_memory()` publishes that count both as
+`cache_config.num_gpu_blocks_override` and as an equivalent byte budget — the
+latter is what reaches the engine-side KV planner, which in standard DP runs in
+a different process from the worker that set the override.
+
+That pool is the budget shared by *all* concurrent requests, and it is
+independent of `max_model_len`, the *per-request* context limit. Since vLLM
+sizes and validates the KV cache against it, the two must be chosen together:
+
+| `--max-model-len` | Behavior |
+| --- | --- |
+| numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
+| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Lower `--max-model-len` or raise `max_tokens_all_users`. |
+| `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. |
+| omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
+
+Explicit `-1` auto-fit picks the largest length that fits **one** request, so it
+lands at roughly the whole pool with maximum concurrency `1.00x`: a single long
+request can occupy the entire KV cache and stall the rest. Prefer an explicit
+positive `--max-model-len` for serving, sized around
+`max_tokens_all_users / max_num_seqs`, and treat auto-fit as a convenience for
+one-off runs.
+
 ## Runtime Architecture
 
 `TTPlatform.check_and_update_config()` is the main handoff from vLLM into the TT
