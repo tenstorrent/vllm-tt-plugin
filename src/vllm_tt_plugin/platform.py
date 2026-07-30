@@ -842,7 +842,6 @@ class TTPlatform(Platform):
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
 
-
         # Import and register models from tt-metal.
         #
         # NOTE: We also register TT models early in `vllm_tt_plugin.worker`
