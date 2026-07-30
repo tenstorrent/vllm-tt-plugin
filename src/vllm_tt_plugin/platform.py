@@ -842,9 +842,6 @@ class TTPlatform(Platform):
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
 
-        # Preserve vLLM's max_model_len policy: omitted uses the HF-derived
-        # value, -1 auto-fits, and a positive value is used as given. The TT
-        # worker reports the real KV capacity for upstream's capacity check.
 
         # Import and register models from tt-metal.
         #
