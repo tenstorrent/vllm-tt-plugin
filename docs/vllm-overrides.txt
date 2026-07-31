@@ -1,8 +1,8 @@
 # Dependency overrides for the vLLM install in install-vllm-tt.sh.
 #
 # ttnn pins numpy>=1.24.4,<2, but vLLM's requirements/common.txt asks for
-# opencv-python-headless>=4.13.0, which requires numpy>=2. The two are
-# unsatisfiable together, so the install fails without an override.
+# opencv-python-headless>=4.13.0, which requires numpy>=2.
+# Without overrides, the install rewrites numpy with the newer version.
 #
 # numpy<2 wins: it is fixed by the tt-metal env this plugin runs inside
 # (tt-metal pyproject.toml and tt_metal/python_env/requirements-dev.txt) and
@@ -10,11 +10,8 @@
 # path (vllm/multimodal/video.py), which no TT-registered model uses, so 4.11 —
 # the last release without a numpy 2 floor — is safe.
 #
-# These must be overrides rather than constraints: vLLM *declares*
-# opencv-python-headless>=4.13.0, and a constraint can only narrow a declared
-# range, never contradict it.
-#
 # Revisit when bumping the pinned vLLM version (upstream may relax the opencv
-# floor again), or if a TT-supported model gains video input.
+# floor again), or if a TT-supported model gains video input, or if tt-metal
+# bumps the numpy requirement.
 opencv-python-headless==4.11.0.86
 numpy>=1.24.4,<2
