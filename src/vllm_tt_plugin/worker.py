@@ -5,6 +5,7 @@ import math
 import os
 import time
 import warnings
+from collections import Counter
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -22,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -46,6 +48,7 @@ except ImportError:  # pragma: no cover - older vLLM without the timing contract
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_max_batch_size,
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.model_input import TTModelInput
@@ -69,6 +72,25 @@ logger = init_tt_logger(__name__)
 # before initializing multimodal caches; without this, early architecture
 # inspection may fail for TT-prefixed architectures.
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
+
+
+def _count_mamba_cache_groups(kv_cache_specs: dict[str, KVCacheSpec] | None) -> int:
+    """Mirror upstream hybrid grouping and count logical Mamba block tables."""
+    if not kv_cache_specs:
+        return 0
+    same_spec_counts = Counter(kv_cache_specs.values())
+    if not any(isinstance(spec, MambaSpec) for spec in same_spec_counts):
+        return 0
+
+    layer_counts = list(same_spec_counts.values())
+    group_size = min(layer_counts)
+    if max(layer_counts) < group_size * 1.25:
+        group_size = max(layer_counts)
+    return sum(
+        math.ceil(count / group_size)
+        for spec, count in same_spec_counts.items()
+        if isinstance(spec, MambaSpec)
+    )
 
 
 def _ensure_visible_devices_env(
@@ -645,6 +667,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
     # endregion
 
+    # Resolve model-owned hybrid specs before doing any block-sized arithmetic.
+    # Qwen may raise the upstream minimum hybrid block to a traced-prefill page
+    # boundary; using the old size for per-request padding would under-reserve
+    # the shared BlockPool.
+    cache_spec_hook = getattr(model_class, "get_kv_cache_spec", None)
+    kv_cache_specs = (
+        cache_spec_hook(vllm_config) if cache_spec_hook is not None else None
+    )
+
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
     # allocate an extra block_size per user since vLLM uses a worst-case
     # heuristic and assumes each touched block will require a new
@@ -692,7 +723,51 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
             sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC
         )
 
+    # Cache mode "none" still allocates one logical block per request for
+    # every Mamba group. TT keeps the actual recurrent tensors in a compact
+    # model-owned pool, but the IDs still consume upstream BlockPool entries.
+    if kv_cache_specs is not None:
+        mamba_groups = _count_mamba_cache_groups(kv_cache_specs)
+        max_tokens_all_users += (
+            mamba_groups * max_batch * cache_config.block_size
+        )
+
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+
+    # TT lowers MambaSpec mode "none" into model-owned typed state pools
+    # rather than the shared raw KV slab. Reserve their actual per-device DRAM
+    # by removing the equivalent number of all-attention blocks.
+    managed_state_hook = getattr(model_class, "get_managed_state_pool_bytes", None)
+    if managed_state_hook is not None:
+        managed_state_bytes = int(
+            managed_state_hook(
+                vllm_config,
+                get_tt_max_batch_size(vllm_config),
+            )
+        )
+        attention_bytes_per_block = sum(
+            spec.page_size_bytes
+            for spec in (kv_cache_specs or {}).values()
+            if isinstance(spec, FullAttentionSpec)
+        )
+        if managed_state_bytes and not attention_bytes_per_block:
+            raise ValueError("Managed Mamba state has no attention cache capacity to reserve")
+        reserved_blocks = (
+            math.ceil(managed_state_bytes / attention_bytes_per_block)
+            if managed_state_bytes
+            else 0
+        )
+        if reserved_blocks >= num_tt_blocks:
+            raise ValueError(
+                f"Managed Mamba state requires {reserved_blocks} cache-block equivalents, "
+                f"but only {num_tt_blocks} blocks are configured"
+            )
+        num_tt_blocks -= reserved_blocks
+        logger.info(
+            "Reserving %d bytes (%d all-attention block equivalents) for managed Mamba state",
+            managed_state_bytes,
+            reserved_blocks,
+        )
 
     return num_tt_blocks
 
