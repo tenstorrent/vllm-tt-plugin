@@ -12,6 +12,7 @@
 #
 # Revisit when bumping the pinned vLLM version (upstream may relax the opencv
 # floor again), or if a TT-supported model gains video input, or if tt-metal
-# bumps the numpy requirement.
+# bumps the numpy requirement
+# (https://github.com/tenstorrent/tt-metal/issues/30193).
 opencv-python-headless==4.11.0.86
 numpy>=1.24.4,<2
