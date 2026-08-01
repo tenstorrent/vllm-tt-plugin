@@ -888,6 +888,25 @@ class TTPlatform(Platform):
                 f"Available TT architectures: {tt_archs}"
             )
 
+        # Pooling / embedding models (text embedding, cross-encoder rerankers)
+        # are prefill-only: no KV cache, no decode, no on-device sampling, and
+        # no TT data-parallel/lane orchestration. The generative routing below
+        # (sample_on_device, async decode, DP device discovery, the
+        # decode-oriented TTScheduler) does not apply, so configure the minimal
+        # pooling path and return early. vLLM's default V1 scheduler drives the
+        # single-pass pooling forward; the worker selects TTPoolingModelRunner
+        # from ``runner_type == "pooling"``.
+        if vllm_config.model_config.runner_type == "pooling":
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm.v1.core.sched.scheduler.Scheduler"
+            )
+            if vllm_config.cache_config is not None:
+                vllm_config.cache_config.enable_prefix_caching = False
+            logger.info(
+                "Configured TT pooling model path (default scheduler, no KV cache)."
+            )
+            return
+
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config
         # This is needed to catch incompatible requests early enough

@@ -56,6 +56,7 @@ from vllm_tt_plugin.platform import (
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
+from vllm_tt_plugin.pooling_runner import TTPoolingModelRunner
 from vllm_tt_plugin.utils.dp_discovery import _parse_mesh_grid
 
 if TYPE_CHECKING:
@@ -228,7 +229,16 @@ class TTWorker(WorkerBase):
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
         # Init ModelRunner here, so that we have access to self.mesh_device.
-        self.model_runner: TTModelRunner = TTModelRunner(
+        # Pooling / embedding models (runner_type == "pooling", e.g. text
+        # embedding and cross-encoder rerankers) use a dedicated runner with no
+        # KV cache, page tables, decode or sampling; generative models use the
+        # full TTModelRunner. Both take the same constructor signature.
+        runner_cls: type[TTModelRunner] | type[TTPoolingModelRunner] = (
+            TTPoolingModelRunner
+            if self.model_config.runner_type == "pooling"
+            else TTModelRunner
+        )
+        self.model_runner: TTModelRunner | TTPoolingModelRunner = runner_cls(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
@@ -273,6 +283,9 @@ class TTWorker(WorkerBase):
            we don't run profiling for available memory and instead override
            num blocks via ``self.cache_config.num_gpu_blocks_override``.
         """
+        # Pooling / embedding models have no attention KV cache.
+        if isinstance(self.model_runner, TTPoolingModelRunner):
+            return {}
         spec_from_hook = self._try_get_spec_from_model_hook()
         if spec_from_hook is not None:
             return spec_from_hook
@@ -372,6 +385,10 @@ class TTWorker(WorkerBase):
               upstream KV planner reconstruct that same block count in the engine
               process.
         """
+        # Pooling / embedding models allocate no KV cache, so there is no block
+        # budget to reconstruct.
+        if isinstance(self.model_runner, TTPoolingModelRunner):
+            return 0
         num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
         kv_cache_spec = self.get_kv_cache_spec()
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
@@ -385,8 +402,12 @@ class TTWorker(WorkerBase):
         """Allocate TT KV cache and initialize persistent input batch.
 
         Every standard-DP rank owns its own TT mesh/KV cache, while
-        single-process lane mode has only one rank.
+        single-process lane mode has only one rank. Pooling / embedding models
+        have no KV cache, so there is nothing to allocate for them.
         """
+        if isinstance(self.model_runner, TTPoolingModelRunner):
+            logger.info("Skipping KV cache initialization for pooling model")
+            return
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
@@ -447,6 +468,16 @@ class TTWorker(WorkerBase):
         wrapper for overlapped decode, otherwise a completed output.
         """
         assert self.is_driver_worker, "There should only be one Worker for TT"
+        # Pooling / embedding models complete inside execute_model (which
+        # returns a filled ModelRunnerOutput rather than None), so the engine's
+        # forward-then-sample path never reaches sample_tokens for them. Guard
+        # explicitly: the pooling runner has no sampling stage, and reaching
+        # here would otherwise surface as an opaque AttributeError.
+        if isinstance(self.model_runner, TTPoolingModelRunner):
+            raise RuntimeError(
+                "sample_tokens is not applicable to pooling models; "
+                "execute_model returns the pooled output directly."
+            )
         return self.model_runner.sample_tokens(grammar_output)
 
     def check_health(self) -> None:
