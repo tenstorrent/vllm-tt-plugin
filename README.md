@@ -56,7 +56,8 @@ If installing tt-metal from source, build it, create the virtual environment,
 and set the environment variables needed for tt-metal tests.
 
 Activate the environment where tt-metal is installed, then install vLLM
-and the TT plugin:
+and the TT plugin. Run it from the repository root, which the relative paths
+inside assume:
 
 ```bash
 source docs/install-vllm-tt.sh
