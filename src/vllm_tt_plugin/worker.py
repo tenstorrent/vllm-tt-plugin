@@ -71,39 +71,45 @@ logger = init_tt_logger(__name__)
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
 
 
-def _ensure_visible_devices_env(
+def _bind_visible_devices_env(
     vllm_config: VllmConfig,
     parallel_config,
 ) -> None:
-    """Set ``TT_VISIBLE_DEVICES`` from the stored per-rank device groups
-    when the env var did not propagate through the engine-core fork chain.
+    """Bind ``TT_VISIBLE_DEVICES`` to this rank's discovered device group.
 
-    Upstream sets the env var in the API-server process via
-    ``set_device_control_env_var`` before forking each engine-core.  On some
-    multi-device topologies (Galaxy) the env var may be lost by the time the
-    worker subprocess inside the engine-core's multiproc executor starts.
+    vLLM does not rewrite the device-control env var per engine-core process,
+    so every rank inherits the launching process's value verbatim. An inherited
+    value must therefore be overwritten, not trusted: leaving it in place points
+    all ranks at the same chips.
 
-    The per-rank visible-device list was persisted on ``additional_config``
-    by the parent's ``check_and_update_config`` and survives pickling, so we
-    can recover it here using ``data_parallel_index``.
+    Stored groups exist only for discovered standard DP. Explicit MPI launches
+    bind their own ranks and store nothing, so they keep their inherited value.
     """
-    evar = TTPlatform.device_control_env_var
-    if os.environ.get(evar):
-        return  # already set — nothing to do
+    groups = _load_standard_dp_visible_groups(vllm_config)
+    if groups is None:
+        return
 
     dp_index = getattr(parallel_config, "data_parallel_index", 0)
-    groups = _load_standard_dp_visible_groups(vllm_config)
-    if groups is None or dp_index >= len(groups):
-        return  # no stored groups or index out of range
+    if dp_index >= len(groups):
+        raise RuntimeError(
+            f"TT standard-DP rank {dp_index} has no discovered device group; "
+            f"discovery produced {len(groups)}: {groups}"
+        )
 
+    evar = TTPlatform.device_control_env_var
     visible_devices = groups[dp_index]
+    inherited = os.environ.get(evar)
+    if inherited == visible_devices:
+        return
+
     os.environ[evar] = visible_devices
 
     logger.info(
-        "Recovered %s=%s from config for data_parallel_index=%s",
+        "Bound %s=%s for data_parallel_index=%s (inherited %r)",
         evar,
         visible_devices,
         dp_index,
+        inherited,
     )
 
 
@@ -200,15 +206,14 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        # Bind the device group before anything can touch the TT runtime: model
+        # registration below resolves and imports TT model modules.
+        _bind_visible_devices_env(self.vllm_config, self.parallel_config)
+
         # Validate/apply TT config in this worker process (multiprocessing
         # means platform class attrs + config mutations must be applied per
         # subprocess) before runner init.
         TTPlatform.check_and_update_config(self.vllm_config)
-
-        # Recover TT_VISIBLE_DEVICES from the config if the env var did not
-        # propagate through the engine-core → multiproc-executor fork chain
-        # (e.g. on Galaxy where the env var may be cleared between forks).
-        _ensure_visible_devices_env(self.vllm_config, self.parallel_config)
 
         local_dp_rank = self.parallel_config.data_parallel_rank_local
         logger.info(
