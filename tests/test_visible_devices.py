@@ -209,8 +209,9 @@ def test_visible_devices_use_discovered_submesh_shape(
     assert _resolve_mesh_grid("TG", 4, "0,1,2,3") == (2, 2)
 
 
-def test_standard_dp_visible_device_groups_feed_upstream_env_assignment(
+def test_standard_dp_visible_device_groups_feed_upstream_gpu_id_assignment(
     monkeypatch: pytest.MonkeyPatch,
+    vllm_config: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(engine_utils, "current_platform", TTPlatform)
     monkeypatch.setattr(
@@ -219,11 +220,11 @@ def test_standard_dp_visible_device_groups_feed_upstream_env_assignment(
         ["24,25,26,27,3,2,1,0", "16,17,18,19,20,21,22,23"],
     )
 
-    assert engine_utils.get_physical_gpu_ids_for_local_dp_rank(
-        TTPlatform.device_control_env_var,
-        local_dp_rank=1,
-        world_size=1,
-    ) == ["16,17,18,19,20,21,22,23"]
+    engine_utils.set_assigned_physical_gpu_ids_for_dp_rank(vllm_config, local_dp_rank=1)
+
+    assert vllm_config.parallel_config.assigned_physical_gpu_ids == [
+        "16,17,18,19,20,21,22,23"
+    ]
 
 
 @pytest.mark.parametrize("inherited", [None, "", "0,1,2,3,4,5,6,7", "9,9"])
