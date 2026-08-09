@@ -29,6 +29,81 @@ def _register_tt_reasoning_parsers() -> None:
         "vllm_tt_plugin.gemma4_reasoning_parser",
         "Gemma4ReasoningParser",
     )
+    ReasoningParserManager.register_lazy_module(
+        "diffusion_gemma",
+        "vllm_tt_plugin.gemma4_reasoning_parser",
+        "Gemma4ReasoningParser",
+    )
+    _install_diffusion_gemma_complete_parser_adapter()
+
+
+def _install_diffusion_gemma_complete_parser_adapter() -> None:
+    """Forward non-streaming token IDs to the DiffusionGemma parser.
+
+    vLLM 0.24 supplies ``model_output_token_ids`` to ``Parser.parse`` but its
+    generated ``DelegatingParser`` ignores them. DiffusionGemma needs those IDs
+    because normal detokenization may strip its reasoning markers. Keep the
+    compatibility adapter scoped to the plugin's ``diffusion_gemma`` alias.
+    """
+    from collections.abc import Sequence
+    from typing import Any
+
+    from vllm.parser.parser_manager import ParserManager
+
+    if getattr(ParserManager, "_tt_diffusion_complete_parser_installed", False):
+        return
+
+    original_get_parser = ParserManager.get_parser
+
+    @classmethod
+    def get_parser(
+        cls,
+        tool_parser_name: str | None = None,
+        reasoning_parser_name: str | None = None,
+        enable_auto_tools: bool = False,
+        model_name: str | None = None,
+        is_harmony: bool = False,
+    ):
+        del cls
+        parser_cls = original_get_parser(
+            tool_parser_name=tool_parser_name,
+            reasoning_parser_name=reasoning_parser_name,
+            enable_auto_tools=enable_auto_tools,
+            model_name=model_name,
+            is_harmony=is_harmony,
+        )
+        if parser_cls is None or reasoning_parser_name != "diffusion_gemma":
+            return parser_cls
+
+        class DiffusionGemmaParser(parser_cls):
+            def parse(
+                self,
+                model_output: str,
+                request: Any,
+                enable_auto_tools: bool = False,
+                model_output_token_ids: Sequence[int] = (),
+            ):
+                reasoning_parser = self.reasoning_parser
+                token_extractor = getattr(
+                    reasoning_parser, "extract_reasoning_from_token_ids", None
+                )
+                if model_output_token_ids and callable(token_extractor):
+                    reasoning, content = token_extractor(
+                        model_output_token_ids, model_output
+                    )
+                else:
+                    reasoning, content = self.extract_reasoning(model_output, request)
+                tool_calls, content = self._extract_tool_calls(
+                    content=content,
+                    request=request,
+                    enable_auto_tools=enable_auto_tools,
+                )
+                return reasoning, content, tool_calls
+
+        return DiffusionGemmaParser
+
+    ParserManager.get_parser = get_parser
+    ParserManager._tt_diffusion_complete_parser_installed = True
 
 
 def _register_tt_tool_parsers() -> None:

@@ -108,3 +108,19 @@ def test_store_tt_lane_count_rejects_zero():
 
     with pytest.raises(ValueError, match="lane count must be >= 1"):
         tt_config.store_tt_lane_count(config, 0)
+
+
+def test_output_tokens_per_step_defaults_to_ar_and_round_trips():
+    config = _vllm_config()
+
+    assert tt_config.get_tt_output_tokens_per_step(config) == 1
+
+    tt_config.store_tt_output_tokens_per_step(config, 256)
+
+    assert tt_config.get_tt_output_tokens_per_step(config) == 256
+
+
+@pytest.mark.parametrize("invalid", [True, 0, -1, 1.5, "256"])
+def test_output_tokens_per_step_rejects_invalid_values(invalid):
+    with pytest.raises(ValueError, match="integer >= 1"):
+        tt_config.store_tt_output_tokens_per_step(_vllm_config(), invalid)

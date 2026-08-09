@@ -435,6 +435,10 @@ class TTWorker(WorkerBase):
         assert self.is_driver_worker, "There should only be one Worker for TT"
         return self.model_runner.execute_model(scheduler_output)
 
+    def take_draft_token_ids(self) -> None:
+        """Diffusion models trigger this vLLM 0.24 worker RPC but TT has no drafter."""
+        return None
+
     def sample_tokens(
         self,
         grammar_output: "GrammarOutput | None",
@@ -452,6 +456,10 @@ class TTWorker(WorkerBase):
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return
+
+    def shutdown(self) -> None:
+        """Release model-owned captures before the worker process exits."""
+        self.model_runner.shutdown()
 
     # ---- DP gather hooks called by DPEngineCoreProc in core.py ----
 

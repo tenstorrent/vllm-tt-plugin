@@ -230,6 +230,11 @@ VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K \
 python examples/server_example_tt.py
 ```
 
+DiffusionGemma uses a 256-token block-serving contract with stricter launch and
+request constraints. See [DiffusionGemma block serving](docs/diffusion-gemma.md)
+for the exact vLLM 0.24 command, paired tt-metal commit, request validation, and
+block metrics.
+
 Send a completion request:
 
 ```bash

@@ -67,6 +67,7 @@ class TestDPModes:
             speculative_config=None,
             lora_config=None,
             cache_config=SimpleNamespace(enable_prefix_caching=False),
+            structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
         )
 
     @pytest.fixture
@@ -479,14 +480,11 @@ class TestDPModes:
             ["24,25,26,27,3,2,1,0", "16,17,18,19,20,21,22,23"],
         )
 
-        assert (
-            engine_utils.get_device_indices(
-                TTPlatform.device_control_env_var,
-                local_dp_rank=1,
-                world_size=1,
-            )
-            == "16,17,18,19,20,21,22,23"
-        )
+        assert engine_utils.get_physical_gpu_ids_for_local_dp_rank(
+            TTPlatform.device_control_env_var,
+            local_dp_rank=1,
+            world_size=1,
+        ) == ["16,17,18,19,20,21,22,23"]
 
     def test_legacy_gathered_override_is_ignored_by_platform(
         self,

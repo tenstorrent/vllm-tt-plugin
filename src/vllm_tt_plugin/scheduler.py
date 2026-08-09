@@ -7,8 +7,10 @@ from typing import cast
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
+from vllm_tt_plugin.config import get_tt_output_tokens_per_step
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
@@ -67,6 +69,8 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
+        self._is_block_output_model = self._output_tokens_per_step > 1
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -169,3 +173,64 @@ class TTScheduler(AsyncScheduler):
                 self.skipped_waiting = saved_skipped
             self.waiting = saved_waiting
         return result
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Avoid a stale-canvas resume that vLLM's AR reset cannot represent."""
+        if self._is_block_output_model and reset_running_requests and self.running:
+            logger.error(
+                "Cannot reset prefix cache while a block-output request is "
+                "running; finish or abort the request first."
+            )
+            return False
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Reserve the complete physical output emitted by each block step.
+
+        vLLM 0.24 reserves zero sampled tokens for models detected as
+        diffusion. The TT adapter nevertheless returns one K-token canvas, so
+        reserve K positions after the normal scheduled-input accounting.
+        """
+        super()._update_after_schedule(scheduler_output)
+        if not self._is_block_output_model:
+            return
+        extra_placeholders = (
+            self._output_tokens_per_step - self.num_sampled_tokens_per_step
+        )
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if not request.is_prefill_chunk:
+                request.num_output_placeholders += extra_placeholders
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        """Commit one block and reconcile its full physical reservation."""
+        if not self._is_block_output_model:
+            return super()._update_request_with_output(request, new_token_ids)
+        if request.async_tokens_to_discard:
+            raise RuntimeError(
+                "A stale async output reached synchronous block serving; "
+                "block-output async scheduling and running prefix resets are "
+                "unsupported"
+            )
+        if len(new_token_ids) != self._output_tokens_per_step:
+            raise ValueError(
+                "Model output width violates output_tokens_per_step: "
+                f"{len(new_token_ids)} != {self._output_tokens_per_step}"
+            )
+
+        # Scheduler appends token-by-token and trims at EOS, stop tokens,
+        # max_tokens, or max_model_len. The reservation is physical, so consume
+        # all K placeholders even when the client-visible block is trimmed.
+        new_token_ids, stopped = Scheduler._update_request_with_output(
+            self, request, new_token_ids
+        )
+        request.num_output_placeholders -= self._output_tokens_per_step
+        if request.num_output_placeholders < 0:
+            raise RuntimeError(
+                "Output placeholders underflowed after block-output reconciliation"
+            )
+        return new_token_ids, stopped
