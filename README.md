@@ -68,6 +68,15 @@ The script installs vLLM with
 at runtime. It then installs the plugin with a few dependencies.
 Most dependencies come from the active tt-metal env.
 
+The script also installs vLLM's dependency list itself, fetched from
+`requirements/common.txt` at the pinned vLLM tag, and installs vLLM with
+`--no-deps`. Resolving them the usual way pulls vLLM's CUDA dependency set
+(torch pinned, `flashinfer`, `tilelang`, `nvidia-*`), which would fight the
+tt-metal env over `torch` and add several GB. This means the script needs network
+access to `raw.githubusercontent.com` beyond the package index. When installing
+inside a container, also set `UV_NO_CACHE=1` to keep the uv cache out of the
+image layer.
+
 To install or refresh only the plugin package:
 
 ```bash
