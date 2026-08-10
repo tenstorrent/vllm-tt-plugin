@@ -1230,10 +1230,24 @@ class TTPlatform(Platform):
             prompt_len = len(prompt_token_ids)
             max_tokens = params.max_tokens
             if max_tokens is None:
-                raise ValueError(
-                    "Block-output request max_tokens was not resolved before "
-                    "platform validation"
-                )
+                # OpenAI serving resolves max_tokens before this hook, but
+                # offline callers can pass max_tokens=None (the processor
+                # defaults it only after validation). Mirror the server-side
+                # whole-canvas default instead of failing opaquely; the
+                # neutralization block below documents the in-place mutation
+                # contract.
+                remaining = max_model_len - prompt_len
+                if remaining < output_size:
+                    raise ValueError(
+                        f"Prompt length {prompt_len} leaves "
+                        f"{max(0, remaining)} tokens within "
+                        f"max_model_len={max_model_len}, but this model "
+                        f"commits physical {output_size}-token output "
+                        "canvases. Use a shorter prompt or a larger max "
+                        "model length."
+                    )
+                params.max_tokens = remaining // output_size * output_size
+                max_tokens = params.max_tokens
             physical_output_tokens = (
                 (max_tokens + output_size - 1) // output_size
             ) * output_size

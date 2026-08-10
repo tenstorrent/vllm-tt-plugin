@@ -87,7 +87,22 @@ def _install_diffusion_gemma_complete_parser_adapter() -> None:
                 token_extractor = getattr(
                     reasoning_parser, "extract_reasoning_from_token_ids", None
                 )
-                if model_output_token_ids and callable(token_extractor):
+                # When the request kept special tokens (the tool parser's
+                # adjust_request forces skip_special_tokens=False whenever
+                # tools are enabled), the plain text path both suffices and
+                # preserves the literal <|tool_call> frames the tool parser
+                # needs; re-decoding segments with skip_special_tokens=True
+                # would strip them. The token-ID rescue is only for text that
+                # detokenization already stripped the channel markers from.
+                marker_text_visible = (
+                    reasoning_parser.start_token in model_output
+                    or reasoning_parser.end_token in model_output
+                )
+                if (
+                    model_output_token_ids
+                    and callable(token_extractor)
+                    and not marker_text_visible
+                ):
                     reasoning, content = token_extractor(
                         model_output_token_ids, model_output
                     )

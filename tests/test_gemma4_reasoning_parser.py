@@ -10,6 +10,7 @@ class FakeTokenizer:
         11: "Answer.",
         12: "thought\nPart ",
         13: "two.",
+        14: "call:get_weather{}",
     }
 
     def get_vocab(self):
@@ -142,3 +143,25 @@ def test_non_streaming_stripped_markers_split_from_token_ids():
 
     assert reasoning == "Reason."
     assert content == "Answer."
+
+
+def test_token_id_extraction_ends_reasoning_at_tool_call():
+    """A tool call terminates an open thinking channel; its payload must not
+    be swallowed into the reasoning field."""
+    reasoning, content = _parser().extract_reasoning_from_token_ids(
+        [1, 10, 4, 14], "thought\nReason.call:get_weather{}"
+    )
+
+    assert reasoning == "Reason."
+    assert content == "call:get_weather{}"
+
+
+def test_token_id_extraction_without_channel_keeps_content_intact():
+    """No thinking channel: a bare tool call (or plain content) must pass
+    through as content, not be reinterpreted as reasoning."""
+    reasoning, content = _parser().extract_reasoning_from_token_ids(
+        [4, 14, 11], "call:get_weather{}Answer."
+    )
+
+    assert reasoning is None
+    assert content == "call:get_weather{}Answer."

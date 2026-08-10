@@ -97,14 +97,31 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         if start_idx is None and end_idx is None:
             return None, fallback_text
 
+        # A tool call inside an open thinking channel terminates it even
+        # without the close marker (``is_reasoning_end`` treats it that way);
+        # keep the call payload out of the reasoning field.
+        tool_idx = (
+            _index_after(token_ids, self.tool_call_token_id, search_from)
+            if start_idx is not None
+            else None
+        )
+        if tool_idx is not None and (end_idx is None or tool_idx < end_idx):
+            reasoning_end = tool_idx
+            content_start = tool_idx
+        elif end_idx is not None:
+            reasoning_end = end_idx
+            content_start = end_idx + 1
+        else:
+            reasoning_end = len(token_ids)
+            content_start = None
+
         reasoning_start = start_idx + 1 if start_idx is not None else 0
-        reasoning_end = end_idx if end_idx is not None else len(token_ids)
         reasoning = _strip_thought_label(
             self._decode_visible(token_ids[reasoning_start:reasoning_end])
         )
         content = (
-            self._decode_visible(token_ids[end_idx + 1 :])
-            if end_idx is not None
+            self._decode_visible(token_ids[content_start:])
+            if content_start is not None
             else None
         )
         return reasoning or None, content or None

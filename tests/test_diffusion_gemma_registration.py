@@ -72,3 +72,30 @@ def test_non_streaming_parser_adapter_uses_raw_token_ids():
     assert reasoning == "Reason."
     assert content == "Answer."
     assert tool_calls == []
+
+
+def test_non_streaming_parser_prefers_text_when_markers_visible():
+    """When the request kept special tokens (the tool parser's adjust_request
+    forces skip_special_tokens=False whenever tools are enabled), the text
+    path must be used so literal <|tool_call> frames survive for the tool
+    parser instead of being stripped by segment re-decoding."""
+    ReasoningParserManager.register_module(
+        name="diffusion_gemma",
+        module=Gemma4ReasoningParser,
+    )
+    _register_tt_reasoning_parsers()
+    parser_cls = ParserManager.get_parser(
+        reasoning_parser_name="diffusion_gemma",
+    )
+    assert parser_cls is not None
+
+    parser = parser_cls(FakeTokenizer())
+    reasoning, content, tool_calls = parser.parse(
+        "<|channel>thought\nReason.<channel|><|tool_call>call:get_weather{}",
+        request=None,
+        model_output_token_ids=[1, 10, 2, 4, 14],
+    )
+
+    assert reasoning == "Reason."
+    assert content is not None and "<|tool_call>" in content
+    assert tool_calls == []

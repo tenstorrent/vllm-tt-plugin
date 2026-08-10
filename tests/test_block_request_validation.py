@@ -195,3 +195,22 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
 
     with pytest.raises(ValueError, match=message):
         TTPlatform.check_and_update_config(config)
+
+
+def test_offline_unresolved_max_tokens_gets_whole_canvas_default():
+    """Offline callers can reach validation with max_tokens=None; mirror the
+    server-side whole-canvas default instead of failing opaquely."""
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+
+    _validate(params, prompt_len=200)
+
+    assert params.max_tokens == 768
+
+
+def test_offline_unresolved_max_tokens_rejected_when_no_canvas_fits():
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+
+    with pytest.raises(ValueError, match="physical 256-token output canvases"):
+        _validate(params, prompt_len=1000)

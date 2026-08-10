@@ -233,12 +233,15 @@ class TTModelRunner:
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
 
-    def __del__(self) -> None:
-        """Release model-owned persistent captures before TT devices close."""
-        self.shutdown()
-
     def shutdown(self) -> None:
-        """Deterministically release optional model-lifetime captures."""
+        """Deterministically release optional model-lifetime captures.
+
+        Called from ``TTWorker.shutdown`` while the mesh is still open. This
+        is intentionally not wired to ``__del__``: the runner sits in
+        reference cycles, so a destructor can fire during interpreter
+        teardown after the devices closed, where a device-side release is
+        worse than leaking the capture to process exit.
+        """
         if getattr(self, "_persistent_capture_released", False):
             return
         release = getattr(

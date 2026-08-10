@@ -31,7 +31,9 @@ CANVAS = 16
 MAX_MODEL_LEN = 256
 
 
-def _scheduler(output_width: int = CANVAS) -> TTScheduler:
+def _scheduler(
+    output_width: int = CANVAS, *, diffusion_checkpoint: bool = False
+) -> TTScheduler:
     model_config = ModelConfig(
         model="Qwen/Qwen2-0.5B-Instruct",
         dtype="float16",
@@ -60,6 +62,12 @@ def _scheduler(output_width: int = CANVAS) -> TTScheduler:
         device_config=DeviceConfig(device="cpu"),
     )
     config.scheduler_config.async_scheduling = False
+    if diffusion_checkpoint:
+        # A real DiffusionGemma checkpoint flags is_diffusion through
+        # hf_config.canvas_length (num_sampled_tokens_per_step becomes 0).
+        # The platform hook clears the upstream auto-created DiffusionConfig,
+        # so config.diffusion_config stays None here — the post-hook state.
+        config.model_config.hf_config.canvas_length = output_width
     store_tt_output_tokens_per_step(config, output_width)
     num_blocks = MAX_MODEL_LEN // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
@@ -184,3 +192,44 @@ def test_k1_delegates_to_upstream_async_scheduler():
     assert outputs[0].outputs[0].new_token_ids == [7]
     assert request.num_output_placeholders == 0
     assert cache_calls
+
+
+def test_diffusion_checkpoint_books_exactly_one_canvas():
+    """Regression for the canvas-as-spec double booking: upstream 0.24 turns
+    an uncleared DiffusionConfig into num_spec_tokens=canvas_length, stacking
+    256 speculative placeholders on the plugin's physical reservation until
+    long generations park unfinished. With the platform hook clearing it, a
+    diffusion-flagged config must book exactly one canvas per step."""
+    from vllm.config.diffusion import DiffusionConfig
+
+    scheduler = _scheduler(diffusion_checkpoint=True)
+
+    assert scheduler.num_sampled_tokens_per_step == 0
+    assert scheduler.num_spec_tokens == 0
+    # The live property chain the platform hook must keep broken: an
+    # uncleared DiffusionConfig resurrects canvas-as-spec accounting.
+    assert scheduler.vllm_config.num_speculative_tokens == 0
+    scheduler.vllm_config.diffusion_config = DiffusionConfig(canvas_length=CANVAS)
+    assert scheduler.vllm_config.num_speculative_tokens == CANVAS
+    scheduler.vllm_config.diffusion_config = None
+
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+
+    assert prefill.num_scheduled_tokens == {"req-0": 32}
+    assert prefill.num_spec_tokens_to_schedule == 0
+    assert list(request.spec_token_ids) == []
+    assert request.num_output_placeholders == CANVAS
+
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+    assert request.num_output_placeholders == 0
+
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens == {"req-0": CANVAS}
+    assert decode.num_spec_tokens_to_schedule == 0
+    assert request.num_output_placeholders == CANVAS
+
+    scheduler.update_from_output(decode, _runner_output(decode, list(range(CANVAS))))
+    assert request.num_output_placeholders == 0
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED

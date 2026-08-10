@@ -459,7 +459,9 @@ class TTWorker(WorkerBase):
 
     def shutdown(self) -> None:
         """Release model-owned captures before the worker process exits."""
-        self.model_runner.shutdown()
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            runner.shutdown()
 
     # ---- DP gather hooks called by DPEngineCoreProc in core.py ----
 
