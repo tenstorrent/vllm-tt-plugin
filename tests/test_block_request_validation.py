@@ -126,6 +126,7 @@ def _config(*, max_num_seqs=1, data_parallel_size=1, async_scheduling=False):
             data_parallel_size=data_parallel_size,
             worker_cls="auto",
         ),
+        diffusion_config=SimpleNamespace(canvas_length=256),
         speculative_config=None,
         lora_config=None,
     )
@@ -168,6 +169,7 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.model_config.generation_config == "vllm"
+    assert config.diffusion_config is None
 
 
 @pytest.mark.parametrize(

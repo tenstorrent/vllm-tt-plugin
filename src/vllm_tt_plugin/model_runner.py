@@ -656,7 +656,7 @@ class TTModelRunner:
 
         # Explicit preemption invalidates model-owned request state. Temporary
         # unscheduling does not: a request may simply be hidden for this step.
-        for req_id in scheduler_output.preempted_req_ids:
+        for req_id in scheduler_output.preempted_req_ids or ():
             self._release_model_request(req_id)
 
         # Remove the unscheduled requests from the persistent batch.

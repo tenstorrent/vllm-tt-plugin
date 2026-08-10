@@ -991,6 +991,18 @@ class TTPlatform(Platform):
                 "in model_capabilities"
             )
         if is_block_output_model:
+            # Upstream 0.24 recognizes DiffusionGemma's original HF
+            # architecture before this platform hook runs and injects a
+            # DiffusionConfig(canvas_length=256). Scheduler interprets that
+            # canvas as speculative draft tokens, while this plugin separately
+            # reserves the model-owned output block. Clear the upstream
+            # diffusion path so one physical canvas is accounted exactly once.
+            if vllm_config.diffusion_config is not None:
+                logger.info(
+                    "Block-output model owns diffusion scheduling; disabling "
+                    "upstream DiffusionConfig speculative-token accounting."
+                )
+                vllm_config.diffusion_config = None
             if model_config.max_model_len < output_tokens_per_step:
                 raise ValueError(
                     f"max_model_len={model_config.max_model_len} must be at least "

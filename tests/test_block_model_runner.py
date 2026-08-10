@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
@@ -96,6 +97,26 @@ def test_ar_k1_output_shape_is_unchanged():
 
 def test_worker_024_draft_token_rpc_returns_none():
     assert TTWorker.take_draft_token_ids(TTWorker.__new__(TTWorker)) is None
+
+
+def test_update_states_accepts_absent_preemption_metadata():
+    scheduler_output = SchedulerOutput.make_empty()
+    assert scheduler_output.preempted_req_ids is None
+
+    refreshed = []
+    runner = SimpleNamespace(
+        requests={},
+        encoder_cache={},
+        input_batch=SimpleNamespace(
+            req_id_to_index={},
+            refresh_logitsprocs=lambda: refreshed.append(True),
+        ),
+        _decode_layout_changed_since_last_decode=False,
+    )
+
+    TTModelRunner._update_states(runner, scheduler_output)
+
+    assert refreshed == [True]
 
 
 def test_worker_shutdown_releases_persistent_capture_once():
