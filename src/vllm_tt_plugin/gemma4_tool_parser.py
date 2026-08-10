@@ -5,8 +5,12 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from openai.types.responses import ToolChoiceFunction
 from vllm.entrypoints.chat_utils import make_tool_call_id
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRequest,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -15,6 +19,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 
@@ -43,14 +48,17 @@ class Gemma4ToolParser(ToolParser):
     and normalizes arguments into a JSON string for the OpenAI tool-call schema.
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
-        super().__init__(tokenizer)
+    supports_required_and_named = False
+
+    def __init__(self, tokenizer: TokenizerLike, tools: list[Any] | None = None):
+        super().__init__(tokenizer, tools)
 
         # Streaming state.
         self.current_tool_name_sent: bool = False
         self.prev_tool_call_arr: list[dict] = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
+        self._tool_names_sent: set[int] = set()
 
         self.tool_call_start_token: str = TOOL_CALL_START
         self.tool_call_end_token: str = TOOL_CALL_END
@@ -58,8 +66,19 @@ class Gemma4ToolParser(ToolParser):
         # Buffer holding a possibly-partial trailing special token across
         # streaming deltas (the tokens span multiple pieces).
         self.buffered_delta_text: str = ""
+        self._last_current_text: str = ""
 
-    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        if request.tools:
+            tool_choice = request.tool_choice
+            if tool_choice == "required" or isinstance(
+                tool_choice,
+                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
+            ):
+                request.skip_special_tokens = False
+                return request
         request = super().adjust_request(request)
         # The format is built entirely out of special tokens, so they must not
         # be stripped from the decoded output.
@@ -85,6 +104,8 @@ class Gemma4ToolParser(ToolParser):
             return self._parse_object(s, i)
         if c == "[":
             return self._parse_array(s, i)
+        if c in ",}]":
+            raise ValueError(f"Unexpected delimiter {c!r} at position {i}")
 
         # Bare token: number / bool / null (read up to the next delimiter).
         j = i
@@ -112,7 +133,10 @@ class Gemma4ToolParser(ToolParser):
                 and len(key) >= 2 * len(QUOTE)
             ):
                 key = key[len(QUOTE) : -len(QUOTE)]
-            value, i = self._parse_value(s, colon + 1)
+            value_start = colon + 1
+            value, i = self._parse_value(s, value_start)
+            if i <= value_start:
+                raise ValueError(f"Parser made no progress at position {value_start}")
             obj[key] = value
         if i < n and s[i] == "}":
             i += 1
@@ -128,7 +152,10 @@ class Gemma4ToolParser(ToolParser):
                 i += 1
             if i >= n or s[i] == "]":
                 break
-            value, i = self._parse_value(s, i)
+            value_start = i
+            value, i = self._parse_value(s, value_start)
+            if i <= value_start:
+                raise ValueError(f"Parser made no progress at position {value_start}")
             arr.append(value)
         if i < n and s[i] == "]":
             i += 1
@@ -194,29 +221,39 @@ class Gemma4ToolParser(ToolParser):
 
         try:
             tool_calls: list[ToolCall] = []
-            for body, complete in self._iter_blocks(model_output):
-                if not complete:
-                    continue
+            visible_parts: list[str] = []
+            cursor = 0
+            while True:
+                start = model_output.find(TOOL_CALL_START, cursor)
+                if start == -1:
+                    visible_parts.append(model_output[cursor:])
+                    break
+                visible_parts.append(model_output[cursor:start])
+                body_start = start + len(TOOL_CALL_START)
+                end = model_output.find(TOOL_CALL_END, body_start)
+                if end == -1:
+                    visible_parts.append(model_output[start:])
+                    break
+                body = model_output[body_start:end]
                 name, arguments = self._parse_call(body)
-                if not name:
-                    continue
-                tool_calls.append(
-                    ToolCall(
-                        type="function",
-                        function=FunctionCall(
-                            name=name,
-                            arguments=json.dumps(arguments, ensure_ascii=False),
-                        ),
+                if name:
+                    tool_calls.append(
+                        ToolCall(
+                            type="function",
+                            function=FunctionCall(
+                                name=name,
+                                arguments=json.dumps(arguments, ensure_ascii=False),
+                            ),
+                        )
                     )
-                )
+                cursor = end + len(TOOL_CALL_END)
 
             if not tool_calls:
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
 
-            content_end = model_output.find(TOOL_CALL_START)
-            content = model_output[:content_end].strip() if content_end > 0 else ""
+            content = "".join(visible_parts)
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
@@ -256,8 +293,14 @@ class Gemma4ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        buffered_prefix = self.buffered_delta_text
         delta_text = self._buffer_delta_text(delta_text)
-        current_text = previous_text + delta_text
+        self._last_current_text = current_text
+        visible_previous_text = (
+            previous_text[: -len(buffered_prefix)]
+            if buffered_prefix and previous_text.endswith(buffered_prefix)
+            else previous_text
+        )
 
         # No tool call yet: stream as plain content.
         if TOOL_CALL_START not in current_text:
@@ -266,30 +309,129 @@ class Gemma4ToolParser(ToolParser):
         try:
             start_count = current_text.count(TOOL_CALL_START)
             end_count = current_text.count(TOOL_CALL_END)
-            prev_start_count = previous_text.count(TOOL_CALL_START)
-            prev_end_count = previous_text.count(TOOL_CALL_END)
+            previous_complete_count = previous_text.count(TOOL_CALL_END)
 
-            # A new tool call opened in this delta: set up per-call state.
-            if start_count > prev_start_count:
-                self.current_tool_id += 1
-                self.current_tool_name_sent = False
+            while len(self.streamed_args_for_tool) < start_count:
                 self.streamed_args_for_tool.append("")
                 self.prev_tool_call_arr.append({})
+            self.current_tool_id = start_count - 1
+            self.current_tool_name_sent = self.current_tool_id in self._tool_names_sent
 
-            # The current tool call just closed: emit the complete arguments in a
-            # single delta (concatenated deltas must form valid JSON, so we never
-            # stream a partial object that already carries a closing brace).
-            if end_count > prev_end_count:
-                return self._emit_completed_call(current_text)
+            tool_calls = [
+                tool_call
+                for index in range(previous_complete_count, end_count)
+                if (tool_call := self._emit_completed_call(current_text, index))
+                is not None
+            ]
+            visible_before = self._visible_content(visible_previous_text)
+            visible_after = self._visible_content(current_text)
+            visible_delta = (
+                visible_after[len(visible_before) :]
+                if visible_after.startswith(visible_before)
+                else visible_after
+            )
+            if tool_calls:
+                return DeltaMessage(
+                    content=visible_delta or None,
+                    tool_calls=tool_calls,
+                )
 
             # Mid open call: emit the function name as soon as it is known.
             if start_count > end_count and not self.current_tool_name_sent:
-                return self._maybe_emit_name(current_text)
+                result = self._maybe_emit_name(current_text)
+                if result is not None and visible_delta:
+                    result.content = visible_delta
+                return result
 
-            return None
+            return DeltaMessage(content=visible_delta) if visible_delta else None
         except Exception:
             logger.exception("Error in Gemma4 streaming tool call extraction")
             return None
+
+    @staticmethod
+    def _visible_content(text: str) -> str:
+        parts: list[str] = []
+        idx = 0
+        while True:
+            start = text.find(TOOL_CALL_START, idx)
+            if start == -1:
+                parts.append(text[idx:])
+                return "".join(parts)
+            parts.append(text[idx:start])
+            end = text.find(TOOL_CALL_END, start + len(TOOL_CALL_START))
+            if end == -1:
+                return "".join(parts)
+            idx = end + len(TOOL_CALL_END)
+
+    def get_remaining_unstreamed_args(self) -> str:
+        # Partial calls are finalized by finish_streaming(). The generic vLLM
+        # fallback serializes an empty parser state as "{}", fabricating
+        # arguments for a stream that stopped immediately after the opening brace.
+        return ""
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        buffered_content = ""
+        text = self._last_current_text
+        last_start = text.rfind(TOOL_CALL_START)
+        last_end = text.rfind(TOOL_CALL_END)
+        open_call = last_start > last_end
+        if not open_call:
+            buffered_content = self.buffered_delta_text
+        self.buffered_delta_text = ""
+
+        tool_call: DeltaToolCall | None = None
+        if open_call:
+            body = text[last_start + len(TOOL_CALL_START) :]
+            try:
+                name, arguments = self._parse_call(body)
+            except (IndexError, ValueError):
+                logger.exception("Malformed unfinished Gemma4 tool call")
+                return None
+            brace = body.find("{", len(CALL_PREFIX))
+            empty_object_complete = brace >= 0 and body[brace + 1 :].strip() == "}"
+            tool_index = text.count(TOOL_CALL_START) - 1
+            while len(self.streamed_args_for_tool) <= tool_index:
+                self.streamed_args_for_tool.append("")
+                self.prev_tool_call_arr.append({})
+            if name:
+                arguments_json = (
+                    json.dumps(arguments, ensure_ascii=False)
+                    if arguments or empty_object_complete
+                    else None
+                )
+                if tool_index not in self._tool_names_sent:
+                    self._tool_names_sent.add(tool_index)
+                    tool_call = DeltaToolCall(
+                        index=tool_index,
+                        type="function",
+                        id=make_tool_call_id(),
+                        function=DeltaFunctionCall(
+                            name=name,
+                            arguments=arguments_json,
+                        ).model_dump(exclude_none=True),
+                    )
+                elif arguments_json and not self.streamed_args_for_tool[tool_index]:
+                    tool_call = DeltaToolCall(
+                        index=tool_index,
+                        function=DeltaFunctionCall(arguments=arguments_json).model_dump(
+                            exclude_none=True
+                        ),
+                    )
+                if arguments_json:
+                    self.streamed_args_for_tool[tool_index] = arguments_json
+                    self.prev_tool_call_arr[tool_index] = {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+
+        if tool_call is None and not buffered_content:
+            return None
+        if tool_call is None:
+            return DeltaMessage(content=buffered_content)
+        return DeltaMessage(
+            content=buffered_content or None,
+            tool_calls=[tool_call],
+        )
 
     def _maybe_emit_name(self, current_text: str) -> DeltaMessage | None:
         start = current_text.rfind(TOOL_CALL_START) + len(TOOL_CALL_START)
@@ -303,6 +445,7 @@ class Gemma4ToolParser(ToolParser):
         if not func_name:
             return None
         self.current_tool_name_sent = True
+        self._tool_names_sent.add(self.current_tool_id)
         self.prev_tool_call_arr[self.current_tool_id] = {
             "name": func_name,
             "arguments": {},
@@ -320,44 +463,40 @@ class Gemma4ToolParser(ToolParser):
             ]
         )
 
-    def _emit_completed_call(self, current_text: str) -> DeltaMessage | None:
+    def _emit_completed_call(
+        self, current_text: str, tool_index: int
+    ) -> DeltaToolCall | None:
         blocks = [
             body for body, complete in self._iter_blocks(current_text) if complete
         ]
-        if not (0 <= self.current_tool_id < len(blocks)):
+        if not (0 <= tool_index < len(blocks)):
             return None
-        if self.streamed_args_for_tool[self.current_tool_id]:
+        if self.streamed_args_for_tool[tool_index]:
             return None  # already emitted
-        name, arguments = self._parse_call(blocks[self.current_tool_id])
+        name, arguments = self._parse_call(blocks[tool_index])
+        if not name:
+            return None
         args_json = json.dumps(arguments, ensure_ascii=False)
-        self.streamed_args_for_tool[self.current_tool_id] = args_json
-        self.prev_tool_call_arr[self.current_tool_id] = {
+        self.streamed_args_for_tool[tool_index] = args_json
+        self.prev_tool_call_arr[tool_index] = {
             "name": name,
             "arguments": arguments,
         }
 
         # If the whole call arrived in one delta the name was never sent; include
         # it (plus id/type) here. Otherwise emit only the arguments for this index.
-        if not self.current_tool_name_sent:
-            self.current_tool_name_sent = True
+        if tool_index not in self._tool_names_sent:
+            self._tool_names_sent.add(tool_index)
             function = DeltaFunctionCall(name=name, arguments=args_json)
-            return DeltaMessage(
-                tool_calls=[
-                    DeltaToolCall(
-                        index=self.current_tool_id,
-                        type="function",
-                        id=make_tool_call_id(),
-                        function=function.model_dump(exclude_none=True),
-                    )
-                ]
+            return DeltaToolCall(
+                index=tool_index,
+                type="function",
+                id=make_tool_call_id(),
+                function=function.model_dump(exclude_none=True),
             )
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=self.current_tool_id,
-                    function=DeltaFunctionCall(arguments=args_json).model_dump(
-                        exclude_none=True
-                    ),
-                )
-            ]
+        return DeltaToolCall(
+            index=tool_index,
+            function=DeltaFunctionCall(arguments=args_json).model_dump(
+                exclude_none=True
+            ),
         )

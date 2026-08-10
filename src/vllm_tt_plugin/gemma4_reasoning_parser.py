@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 _THOUGHT_PREFIX = "thought\n"
+_TOOL_CALL_START = "<|tool_call>"
 
 
 class Gemma4ReasoningParser(BaseThinkingReasoningParser):
@@ -26,6 +27,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         self._prefix_stripped: bool = False
         self._stream_phase: str = "unknown"
         self._marker_buffer: str = ""
+        self._text_reasoning_ended: bool = False
         self.new_turn_token_id = self.vocab["<|turn>"]
         self.tool_call_token_id = self.vocab["<|tool_call>"]
         self.tool_response_token_id = self.vocab["<|tool_response>"]
@@ -62,6 +64,23 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                 return True
         return False
 
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Sequence[int]
+    ) -> bool:
+        return (
+            self._text_reasoning_ended
+            or self.end_token_id in delta_ids
+            or self.tool_call_token_id in delta_ids
+        )
+
+    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        if self.end_token_id in input_ids:
+            return super().extract_content_ids(input_ids)
+        if self.tool_call_token_id in input_ids:
+            tool_idx = input_ids.index(self.tool_call_token_id)
+            return input_ids[tool_idx:]
+        return []
+
     def extract_reasoning(
         self,
         model_output: str,
@@ -69,6 +88,14 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
     ) -> tuple[str | None, str | None]:
         if self.start_token not in model_output and self.end_token not in model_output:
             return None, model_output
+
+        if self.start_token in model_output:
+            after_start = model_output.partition(self.start_token)[2]
+            tool_idx = after_start.find(_TOOL_CALL_START)
+            end_idx = after_start.find(self.end_token)
+            if tool_idx >= 0 and (end_idx < 0 or tool_idx < end_idx):
+                reasoning = _strip_thought_label(after_start[:tool_idx])
+                return reasoning or None, after_start[tool_idx:] or None
 
         reasoning, content = super().extract_reasoning(model_output, request)
         if reasoning is not None:
@@ -120,11 +147,31 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             self._decode_visible(token_ids[reasoning_start:reasoning_end])
         )
         content = (
-            self._decode_visible(token_ids[content_start:])
+            self._decode_raw(token_ids[content_start:])
             if content_start is not None
             else None
         )
         return reasoning or None, content or None
+
+    def get_streaming_fallback_content(
+        self,
+        previous_text: str,
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> str | None:
+        del previous_text, request
+        if self._prefix_stripped or not self._reasoning_text:
+            return None
+        self._prefix_stripped = True
+        return self._reasoning_text
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        if not self._marker_buffer:
+            return None
+        buffered = self._marker_buffer
+        self._marker_buffer = ""
+        if self._stream_phase == "reasoning":
+            return DeltaMessage(reasoning=buffered)
+        return DeltaMessage(content=buffered)
 
     def extract_reasoning_streaming(
         self,
@@ -173,7 +220,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         if _THOUGHT_PREFIX.startswith(self._reasoning_text):
             # If the reasoning marker also ended in this delta, the short text
             # is the complete reasoning body rather than a partial label.
-            if result.content is not None:
+            if self._stream_phase == "content":
                 self._prefix_stripped = True
                 result.reasoning = self._reasoning_text
                 return result
@@ -191,36 +238,61 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
     ) -> DeltaMessage | None:
         """Split a delta by marker IDs, even when decoded marker text is absent."""
         if self.start_token_id in delta_token_ids:
+            buffered_prefix = self._marker_buffer
+            self._marker_buffer = ""
             start_idx = delta_token_ids.index(self.start_token_id)
             end_idx = _index_after(delta_token_ids, self.end_token_id, start_idx + 1)
-            prefix = self._decode_visible(delta_token_ids[:start_idx])
-            if end_idx is None:
+            tool_idx = _index_after(
+                delta_token_ids, self.tool_call_token_id, start_idx + 1
+            )
+            prefix = buffered_prefix + self._decode_visible(delta_token_ids[:start_idx])
+            if tool_idx is not None and (end_idx is None or tool_idx < end_idx):
+                reasoning_end = tool_idx
+                content_start = tool_idx
+            elif end_idx is not None:
+                reasoning_end = end_idx
+                content_start = end_idx + 1
+            else:
                 self._stream_phase = "reasoning"
                 reasoning = self._decode_visible(delta_token_ids[start_idx + 1 :])
                 return _delta(prefix, reasoning, None)
 
             self._stream_phase = "content"
-            reasoning = self._decode_visible(delta_token_ids[start_idx + 1 : end_idx])
-            content = self._decode_visible(delta_token_ids[end_idx + 1 :])
+            reasoning = self._decode_visible(
+                delta_token_ids[start_idx + 1 : reasoning_end]
+            )
+            content = self._decode_raw(delta_token_ids[content_start:])
             return _delta(prefix, reasoning, content)
 
         previous_in_reasoning = (
             self.start_token_id in previous_token_ids
             and not self.is_reasoning_end(previous_token_ids)
         )
-        if self._marker_buffer or self.end_token in delta_text:
-            return self._extract_stream_text(delta_text)
         if previous_in_reasoning or self._stream_phase == "reasoning":
-            if self.end_token_id in delta_token_ids:
-                end_idx = delta_token_ids.index(self.end_token_id)
+            end_idx = _index_after(delta_token_ids, self.end_token_id, 0)
+            tool_idx = _index_after(delta_token_ids, self.tool_call_token_id, 0)
+            if end_idx is not None or tool_idx is not None:
+                self._marker_buffer = ""
+                if tool_idx is not None and (end_idx is None or tool_idx < end_idx):
+                    reasoning_end = tool_idx
+                    content_start = tool_idx
+                else:
+                    reasoning_end = end_idx
+                    content_start = end_idx + 1
                 self._stream_phase = "content"
                 return _delta(
                     None,
-                    self._decode_visible(delta_token_ids[:end_idx]),
-                    self._decode_visible(delta_token_ids[end_idx + 1 :]),
+                    self._decode_visible(delta_token_ids[:reasoning_end]),
+                    self._decode_raw(delta_token_ids[content_start:]),
                 )
-            return DeltaMessage(reasoning=delta_text) if delta_text else None
+            return self._extract_stream_text(delta_text)
 
+        if (
+            self._marker_buffer
+            or self.end_token in delta_text
+            or _TOOL_CALL_START in delta_text
+        ):
+            return self._extract_stream_text(delta_text)
         if self.is_reasoning_end(previous_token_ids) or self._stream_phase == "content":
             return DeltaMessage(content=delta_text) if delta_text else None
 
@@ -251,12 +323,31 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
     def _extract_reasoning_text(
         self, text: str, prefix_content: str | None
     ) -> DeltaMessage | None:
-        if self.end_token in text:
-            reasoning, _, content = text.partition(self.end_token)
+        markers = [
+            (index, marker)
+            for marker in (self.end_token, _TOOL_CALL_START)
+            if (index := text.find(marker)) >= 0
+        ]
+        if markers:
+            marker_idx, marker = min(markers, key=lambda item: item[0])
+            reasoning = text[:marker_idx]
+            content_start = (
+                marker_idx
+                if marker == _TOOL_CALL_START
+                else marker_idx + len(self.end_token)
+            )
+            content = text[content_start:]
             self._stream_phase = "content"
+            self._text_reasoning_ended = True
             return _delta(prefix_content, reasoning, content)
 
-        held = _longest_marker_prefix_suffix(text, self.end_token)
+        held = max(
+            (
+                _longest_marker_prefix_suffix(text, marker)
+                for marker in (self.end_token, _TOOL_CALL_START)
+            ),
+            key=len,
+        )
         if held:
             self._marker_buffer = held
             text = text[: -len(held)]
@@ -268,6 +359,16 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         try:
             return self.model_tokenizer.decode(
                 list(token_ids), skip_special_tokens=True
+            )
+        except TypeError:
+            return self.model_tokenizer.decode(list(token_ids))
+
+    def _decode_raw(self, token_ids: Sequence[int]) -> str:
+        if not token_ids:
+            return ""
+        try:
+            return self.model_tokenizer.decode(
+                list(token_ids), skip_special_tokens=False
             )
         except TypeError:
             return self.model_tokenizer.decode(list(token_ids))

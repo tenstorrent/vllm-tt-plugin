@@ -6,19 +6,65 @@ from types import SimpleNamespace
 import pytest
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 
-from vllm_tt_plugin.config import get_tt_output_tokens_per_step
-from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.config import (
+    get_tt_output_tokens_per_step,
+    store_tt_output_tokens_per_step,
+)
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _install_block_output_input_processor_patch,
+)
 
 
 @pytest.fixture(autouse=True)
 def block_contract(monkeypatch):
     monkeypatch.setattr(TTPlatform, "output_tokens_per_step", 256)
-    monkeypatch.setattr(TTPlatform, "block_model_max_len", 1024)
+    monkeypatch.setattr(
+        TTPlatform,
+        "block_model_config",
+        SimpleNamespace(max_model_len=1024),
+    )
 
 
 def _validate(params: SamplingParams, prompt_len: int = 32) -> None:
     prompt = {"prompt_token_ids": [1] * prompt_len}
     TTPlatform.validate_request(prompt, params)
+
+
+def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
+    """Install the vLLM 0.24 validate -> clone -> default boundary."""
+    import vllm.v1.engine.input_processor as input_processor
+
+    def process_inputs(self, request_id, prompt, params, *args, **kwargs):
+        TTPlatform.validate_request(prompt, params)
+        cloned_params = params.clone()
+        if cloned_params.max_tokens is None:
+            cloned_params.max_tokens = self.model_config.max_model_len - len(
+                prompt["prompt_token_ids"]
+            )
+        return SimpleNamespace(sampling_params=cloned_params)
+
+    monkeypatch.setattr(
+        input_processor.InputProcessor,
+        "process_inputs",
+        process_inputs,
+    )
+    monkeypatch.delattr(
+        input_processor,
+        "_tt_original_process_inputs",
+        raising=False,
+    )
+    _install_block_output_input_processor_patch()
+
+    model_config = SimpleNamespace(max_model_len=max_model_len)
+    config = SimpleNamespace(additional_config={}, model_config=model_config)
+    store_tt_output_tokens_per_step(config, output_size)
+    monkeypatch.setattr(TTPlatform, "output_tokens_per_step", output_size)
+    monkeypatch.setattr(TTPlatform, "block_model_config", model_config)
+    return input_processor.InputProcessor, SimpleNamespace(
+        vllm_config=config,
+        model_config=model_config,
+    )
 
 
 def test_short_logical_request_reserves_one_physical_canvas():
@@ -37,6 +83,23 @@ def test_platform_default_is_clamped_to_whole_canvases():
     assert platform.get_max_output_tokens(768) == 256
     with pytest.raises(ValueError, match="physical 256-token output canvases"):
         platform.get_max_output_tokens(769)
+
+
+def test_auto_fitted_frontend_limit_is_read_live(monkeypatch):
+    config = _config()
+    _patch_model_resolution(monkeypatch)
+    TTPlatform.check_and_update_config(config)
+    platform = TTPlatform()
+
+    assert platform.get_max_output_tokens(32) == 768
+
+    # Mirrors vLLM 0.24 CoreEngineReadyResponse updating the same frontend
+    # ModelConfig object after --max-model-len -1 auto-fit.
+    config.model_config.max_model_len = 640
+
+    assert platform.get_max_output_tokens(32) == 512
+    with pytest.raises(ValueError, match=r"requires 256 physical.*exceeding"):
+        _validate(SamplingParams(max_tokens=16), prompt_len=400)
 
 
 @pytest.mark.parametrize(
@@ -197,20 +260,104 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
         TTPlatform.check_and_update_config(config)
 
 
-def test_offline_unresolved_max_tokens_gets_whole_canvas_default():
-    """Offline callers can reach validation with max_tokens=None; mirror the
-    server-side whole-canvas default instead of failing opaquely."""
+@pytest.mark.parametrize("prompt_lens", [(256, 768), (768, 256)])
+def test_offline_unresolved_max_tokens_is_not_mutated(prompt_lens):
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
-    _validate(params, prompt_len=200)
+    for prompt_len in prompt_lens:
+        _validate(params, prompt_len=prompt_len)
 
-    assert params.max_tokens == 768
+    assert params.max_tokens is None
 
 
-def test_offline_unresolved_max_tokens_rejected_when_no_canvas_fits():
+@pytest.mark.parametrize(
+    ("prompt_lens", "expected"),
+    [
+        ((200, 600), (768, 256)),
+        ((600, 200), (256, 768)),
+    ],
+)
+def test_input_processor_rounds_only_cloned_unresolved_default(
+    monkeypatch, prompt_lens, expected
+):
+    processor_cls, processor = _processor_harness(monkeypatch)
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+
+    actual = tuple(
+        processor_cls.process_inputs(
+            processor,
+            f"request-{prompt_len}",
+            {"prompt_token_ids": [1] * prompt_len},
+            params,
+        ).sampling_params.max_tokens
+        for prompt_len in prompt_lens
+    )
+
+    assert actual == expected
+    assert params.max_tokens is None
+
+
+def test_input_processor_preserves_explicit_max_tokens(monkeypatch):
+    processor_cls, processor = _processor_harness(monkeypatch)
+    params = SamplingParams(max_tokens=17)
+
+    request = processor_cls.process_inputs(
+        processor,
+        "explicit",
+        {"prompt_token_ids": [1] * 200},
+        params,
+    )
+
+    assert request.sampling_params.max_tokens == 17
+    assert params.max_tokens == 17
+
+
+def test_input_processor_uses_live_fitted_max_model_len(monkeypatch):
+    processor_cls, processor = _processor_harness(monkeypatch)
+    processor.model_config.max_model_len = 640
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+
+    request = processor_cls.process_inputs(
+        processor,
+        "fitted",
+        {"prompt_token_ids": [1] * 128},
+        params,
+    )
+
+    assert request.sampling_params.max_tokens == 512
+    assert params.max_tokens is None
+
+
+def test_input_processor_wrapper_is_inert_for_ar_models(monkeypatch):
+    processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+
+    request = processor_cls.process_inputs(
+        processor,
+        "ar",
+        {"prompt_token_ids": [1] * 200},
+        params,
+    )
+
+    assert request.sampling_params.max_tokens == 824
+    assert params.max_tokens is None
+
+
+def test_input_processor_rejects_when_no_canvas_fits(monkeypatch):
+    processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
     with pytest.raises(ValueError, match="physical 256-token output canvases"):
-        _validate(params, prompt_len=1000)
+        processor_cls.process_inputs(
+            processor,
+            "too-long",
+            {"prompt_token_ids": [1] * 1000},
+            params,
+        )
+
+    assert params.max_tokens is None

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
@@ -119,16 +120,74 @@ def test_update_states_accepts_absent_preemption_metadata():
     assert refreshed == [True]
 
 
-def test_worker_shutdown_releases_persistent_capture_once():
+@pytest.mark.parametrize(
+    ("finished_req_ids", "preempted_req_ids", "request_retained"),
+    [
+        ({"req-0"}, None, False),
+        (set(), {"req-0"}, True),
+    ],
+    ids=["finished", "preempted"],
+)
+def test_update_states_releases_model_request_before_removing_row(
+    finished_req_ids, preempted_req_ids, request_retained
+):
+    events = []
+
+    class InputBatchSpy:
+        def __init__(self):
+            self.req_id_to_index = {"req-0": 3}
+
+        def remove_request(self, req_id):
+            events.append(("remove", req_id))
+            return self.req_id_to_index.pop(req_id, None)
+
+        def condense(self, removed_req_indices):
+            pass
+
+        def refresh_logitsprocs(self):
+            pass
+
+    input_batch = InputBatchSpy()
+
+    def release_request(row):
+        assert input_batch.req_id_to_index["req-0"] == row
+        events.append(("release", row))
+
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.requests = {"req-0": object()}
+    runner.encoder_cache = {}
+    runner.input_batch = input_batch
+    runner.model = SimpleNamespace(release_request=release_request)
+    runner._decode_layout_changed_since_last_decode = False
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.finished_req_ids = finished_req_ids
+    scheduler_output.preempted_req_ids = preempted_req_ids
+
+    runner._update_states(scheduler_output)
+
+    assert events == [("release", 3), ("remove", "req-0")]
+    assert "req-0" not in input_batch.req_id_to_index
+    assert ("req-0" in runner.requests) is request_retained
+
+
+def test_worker_wrapper_shutdown_releases_persistent_capture_once():
     releases = []
     runner = TTModelRunner.__new__(TTModelRunner)
     runner._persistent_capture_released = False
     runner.model = SimpleNamespace(
         release_persistent_capture=lambda: releases.append("released")
     )
-    worker = SimpleNamespace(model_runner=runner)
+    worker = TTWorker.__new__(TTWorker)
+    worker.model_runner = runner
+    wrapper = WorkerWrapperBase()
+    wrapper.worker = worker
 
-    TTWorker.shutdown(worker)
+    wrapper.shutdown()
+    assert releases == ["released"]
+
     runner.shutdown()
+    assert releases == ["released"]
 
+    wrapper.shutdown()
     assert releases == ["released"]

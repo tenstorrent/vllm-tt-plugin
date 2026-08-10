@@ -25,7 +25,7 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
 |   +-- engine.py            # TT engine core and DP engine processes
-|   +-- launcher.py          # tt-run / MPI launch integration
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.24)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers

@@ -210,7 +210,7 @@ class TestDPModes:
 
         assert _resolve_mesh_grid("TG", 4, "0,1,2,3") == (2, 2)
 
-    def test_single_host_standard_dp_uses_upstream_launcher(
+    def test_single_host_standard_dp_uses_builtin_launch_path(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
@@ -225,9 +225,9 @@ class TestDPModes:
             visible_device_groups=["24,25", "26,27", "3,2", "1,0"],
         )
 
-        assert (
-            vllm_config.parallel_config.engine_core_launcher_cls
-            == "vllm.v1.engine.utils.CoreEngineLauncher"
+        assert not hasattr(
+            vllm_config.parallel_config,
+            "engine_core_launcher_cls",
         )
         assert TTPlatform._standard_dp_visible_device_groups == [
             "24,25",
@@ -264,24 +264,30 @@ class TestDPModes:
             ("8,9,10,11,12,13,14,15", (1, 8)),
         ]
 
-    def test_rank_binding_keeps_tt_launcher(
+    @pytest.mark.parametrize(
+        ("tt_config", "parallel_overrides"),
+        [
+            ({"rank_binding": "/tmp/rank_binding.yaml"}, {}),
+            ({"mpi_args": "--host hostA"}, {}),
+            ({}, {"nnodes": 2}),
+            ({}, {"node_rank": 1}),
+        ],
+    )
+    def test_explicit_tt_launch_fails_fast_on_vllm_024(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
+        tt_config: dict,
+        parallel_overrides: dict,
     ) -> None:
         vllm_config.parallel_config.data_parallel_size = 4
-        vllm_config.additional_config = {
-            "tt": {"rank_binding": "/tmp/rank_binding.yaml"}
-        }
+        vllm_config.additional_config = {"tt": tt_config}
+        for key, value in parallel_overrides.items():
+            setattr(vllm_config.parallel_config, key, value)
 
-        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
-
-        assert (
-            vllm_config.parallel_config.engine_core_launcher_cls
-            == "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
-        )
-        assert TTPlatform._standard_dp_visible_device_groups is None
+        with pytest.raises(RuntimeError, match="does not invoke.*CoreEngineLauncher"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_standard_dp_discovery_target_uses_helper_module(self) -> None:
         """Keep the spawned discovery target outside the platform module."""

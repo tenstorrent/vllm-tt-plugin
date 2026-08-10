@@ -115,6 +115,56 @@ def _install_diffusion_gemma_complete_parser_adapter() -> None:
                 )
                 return reasoning, content, tool_calls
 
+            def finalize_generation(
+                self,
+                delta_message,
+                request: Any,
+                state,
+            ):
+                result = super().finalize_generation(delta_message, request, state)
+                for parser in (self.reasoning_parser, self.tool_parser):
+                    finish_streaming = getattr(parser, "finish_streaming", None)
+                    if not callable(finish_streaming):
+                        continue
+                    flushed = finish_streaming()
+                    if flushed is None:
+                        continue
+                    if result is None:
+                        result = flushed
+                        continue
+
+                    if flushed.reasoning:
+                        result.reasoning = (result.reasoning or "") + flushed.reasoning
+                    if flushed.content:
+                        result.content = (result.content or "") + flushed.content
+                    for flushed_call in flushed.tool_calls or []:
+                        existing_call = next(
+                            (
+                                call
+                                for call in result.tool_calls or []
+                                if call.index == flushed_call.index
+                            ),
+                            None,
+                        )
+                        if (
+                            existing_call is not None
+                            and existing_call.function is not None
+                            and flushed_call.function is not None
+                        ):
+                            if flushed_call.function.name:
+                                existing_call.function.name = (
+                                    existing_call.function.name
+                                    or flushed_call.function.name
+                                )
+                            if flushed_call.function.arguments:
+                                existing_call.function.arguments = (
+                                    existing_call.function.arguments or ""
+                                ) + flushed_call.function.arguments
+                        else:
+                            result.tool_calls = list(result.tool_calls or [])
+                            result.tool_calls.append(flushed_call)
+                return result
+
         return DiffusionGemmaParser
 
     ParserManager.get_parser = get_parser
