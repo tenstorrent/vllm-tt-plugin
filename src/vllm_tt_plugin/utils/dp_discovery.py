@@ -43,6 +43,9 @@ def _parse_mesh_grid(
     """
     mesh_grid_dict = dict(_MESH_GRID_PRESETS)
     mesh_grid_dict["TG"] = tg_mesh_grid
+    # BH Galaxy is 32x P150 in the same 32-chip topology as the WH Galaxy, so it
+    # takes the caller's Galaxy grid too.
+    mesh_grid_dict["BH-Galaxy"] = tg_mesh_grid
 
     if mesh_device_env is None:
         return (1, num_devices_available)

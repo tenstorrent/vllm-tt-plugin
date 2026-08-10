@@ -163,7 +163,7 @@ python examples/offline_inference_tt.py --measure_perf
 ```
 
 To run a different text model, set `MESH_DEVICE` to `N150`, `N300`, `T3K`, `TG`,
-or a mesh shape such as `"(4,8)"`, then pass `--model`:
+`BH-Galaxy`, or a mesh shape such as `"(4,8)"`, then pass `--model`:
 
 - Llama 3.1 8B: `--model "meta-llama/Llama-3.1-8B"`
 - Llama 3.2 1B: `--model "meta-llama/Llama-3.2-1B"`
