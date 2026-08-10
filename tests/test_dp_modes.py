@@ -218,13 +218,19 @@ class TestDPModes:
         mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
         model_runner = SimpleNamespace()
 
-        worker_instance = TTWorker.__new__(TTWorker)
-        worker_instance.vllm_config = SimpleNamespace()
-        worker_instance.parallel_config = SimpleNamespace(
+        parallel_config = SimpleNamespace(
             data_parallel_size=4,
             data_parallel_rank_local=0,
             data_parallel_index=0,
+            assigned_physical_gpu_ids=None,
         )
+
+        worker_instance = TTWorker.__new__(TTWorker)
+        worker_instance.vllm_config = SimpleNamespace(
+            additional_config={}, parallel_config=parallel_config
+        )
+        # WorkerBase aliases the field; keep the test's view identical.
+        worker_instance.parallel_config = parallel_config
         worker_instance.device_config = SimpleNamespace(device=None)
         worker_instance.trace_mode = "all"
         worker_instance.enable_model_warmup = True

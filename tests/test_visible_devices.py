@@ -4,7 +4,7 @@
 """Host tests for the standard-DP ``TT_VISIBLE_DEVICES`` group lifecycle.
 
 Covers discovery of the per-rank device groups, their mesh-order fixup, the
-mesh grid they resolve to, the handoff to vLLM's device-index assignment, and
+mesh grid they resolve to, the handoff to ``assigned_physical_gpu_ids``, and
 the per-rank env binding the worker applies.
 """
 
@@ -28,9 +28,28 @@ from vllm_tt_plugin.worker import _bind_visible_devices_env, _resolve_mesh_grid
 EVAR = TTPlatform.device_control_env_var
 
 
-def _discovered_groups_config(*visible_groups: str) -> SimpleNamespace:
+@pytest.fixture(autouse=True)
+def _restore_visible_devices_env():
+    """The function under test writes ``os.environ`` outside monkeypatch."""
+    inherited = os.environ.get(EVAR)
+    yield
+    if inherited is None:
+        os.environ.pop(EVAR, None)
+    else:
+        os.environ[EVAR] = inherited
+
+
+def _discovered_groups_config(
+    *visible_groups: str,
+    local_dp_rank: int | None = 0,
+    assigned_physical_gpu_ids: list[str] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        additional_config={"_tt_standard_dp_visible_groups": list(visible_groups)}
+        additional_config={"_tt_standard_dp_visible_groups": list(visible_groups)},
+        parallel_config=SimpleNamespace(
+            assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+            data_parallel_rank_local=local_dp_rank,
+        ),
     )
 
 
@@ -228,7 +247,7 @@ def test_standard_dp_visible_device_groups_feed_upstream_gpu_id_assignment(
 
 
 @pytest.mark.parametrize("inherited", [None, "", "0,1,2,3,4,5,6,7", "9,9"])
-def test_discovered_group_overrides_inherited_visible_devices(
+def test_assigned_physical_gpu_ids_override_inherited_visible_devices(
     monkeypatch: pytest.MonkeyPatch,
     inherited: str | None,
 ) -> None:
@@ -238,36 +257,62 @@ def test_discovered_group_overrides_inherited_visible_devices(
     else:
         monkeypatch.setenv(EVAR, inherited)
 
-    discovered = _discovered_groups_config("0,1,2,3", "4,5,6,7")
+    _bind_visible_devices_env(
+        _discovered_groups_config(
+            "0,1,2,3",
+            "4,5,6,7",
+            local_dp_rank=0,
+            assigned_physical_gpu_ids=["4,5,6,7"],
+        )
+    )
 
-    _bind_visible_devices_env(discovered, SimpleNamespace(data_parallel_index=0))
+    assert os.environ[EVAR] == "4,5,6,7"
+
+
+def test_discovered_group_binds_when_upstream_left_ids_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback keys the stored groups by local DP rank, as init_device does."""
+    monkeypatch.setenv(EVAR, "0,1,2,3,4,5,6,7")
+
+    _bind_visible_devices_env(_discovered_groups_config("0,1,2,3", "4,5,6,7"))
     assert os.environ[EVAR] == "0,1,2,3"
 
-    _bind_visible_devices_env(discovered, SimpleNamespace(data_parallel_index=1))
+    _bind_visible_devices_env(
+        _discovered_groups_config("0,1,2,3", "4,5,6,7", local_dp_rank=1)
+    )
     assert os.environ[EVAR] == "4,5,6,7"
 
 
 def test_explicit_mpi_launch_keeps_inherited_visible_devices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MPI rank binding stores no groups and owns its own env."""
+    """MPI rank binding populates neither channel and owns its own env."""
     monkeypatch.setenv(EVAR, "5")
 
     _bind_visible_devices_env(
-        SimpleNamespace(additional_config={}),
-        SimpleNamespace(data_parallel_index=0),
+        SimpleNamespace(
+            additional_config={},
+            parallel_config=SimpleNamespace(
+                assigned_physical_gpu_ids=None,
+                data_parallel_rank_local=0,
+            ),
+        )
     )
 
     assert os.environ[EVAR] == "5"
 
 
+@pytest.mark.parametrize("local_dp_rank", [1, -1, None])
 def test_rank_without_discovered_group_fails_loudly(
     monkeypatch: pytest.MonkeyPatch,
+    local_dp_rank: int | None,
 ) -> None:
     monkeypatch.setenv(EVAR, "0,1,2,3")
 
-    with pytest.raises(RuntimeError, match="no discovered device group"):
+    with pytest.raises(RuntimeError, match="No TT device group for local DP rank"):
         _bind_visible_devices_env(
-            _discovered_groups_config("0,1,2,3"),
-            SimpleNamespace(data_parallel_index=1),
+            _discovered_groups_config("0,1,2,3", local_dp_rank=local_dp_rank)
         )
+
+    assert os.environ[EVAR] == "0,1,2,3"

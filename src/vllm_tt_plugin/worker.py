@@ -51,6 +51,7 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
+    _STANDARD_DP_VISIBLE_GROUPS_KEY,
     TTPlatform,
     _load_standard_dp_visible_groups,
     _should_pre_register_tt_test_models_from_cli,
@@ -71,44 +72,50 @@ logger = init_tt_logger(__name__)
 register_tt_models(register_test_models=_should_pre_register_tt_test_models_from_cli())
 
 
-def _bind_visible_devices_env(
-    vllm_config: VllmConfig,
-    parallel_config,
-) -> None:
-    """Bind ``TT_VISIBLE_DEVICES`` to this rank's discovered device group.
+def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
+    """Bind ``TT_VISIBLE_DEVICES`` to this rank's device group.
 
-    vLLM does not rewrite the device-control env var per engine-core process,
-    so every rank inherits the launching process's value verbatim. An inherited
-    value must therefore be overwritten, not trusted: leaving it in place points
-    all ranks at the same chips.
+    As of vLLM v0.24, ``set_assigned_physical_gpu_ids_for_dp_rank`` writes
+    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a per-rank
+    env var. tt-metal reads only the env var, so the worker materializes it here;
+    otherwise every rank keeps the launcher's value and they share chips.
 
-    Stored groups exist only for discovered standard DP. Explicit MPI launches
-    bind their own ranks and store nothing, so they keep their inherited value.
+    Discovery's stored groups are the fallback. MPI launches populate neither and
+    keep the inherited value.
+
+    Raises:
+        RuntimeError: the fallback holds no group for this rank.
     """
-    groups = _load_standard_dp_visible_groups(vllm_config)
-    if groups is None:
-        return
+    parallel_config = vllm_config.parallel_config
+    assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
 
-    dp_index = getattr(parallel_config, "data_parallel_index", 0)
-    if dp_index >= len(groups):
-        raise RuntimeError(
-            f"TT standard-DP rank {dp_index} has no discovered device group; "
-            f"discovery produced {len(groups)}: {groups}"
-        )
+    if assigned_physical_gpu_ids:
+        visible_devices = ",".join(str(d) for d in assigned_physical_gpu_ids)
+    else:
+        groups = _load_standard_dp_visible_groups(vllm_config)
+        if groups is None:
+            return
+
+        # Same index space as the mesh selection in ``init_device``.
+        local_dp_rank = parallel_config.data_parallel_rank_local
+        if local_dp_rank is None or not 0 <= local_dp_rank < len(groups):
+            raise RuntimeError(
+                f"No TT device group for local DP rank {local_dp_rank}: "
+                f"discovery stored {len(groups)} group(s) under "
+                f"additional_config[{_STANDARD_DP_VISIBLE_GROUPS_KEY!r}]"
+            )
+
+        visible_devices = groups[local_dp_rank]
 
     evar = TTPlatform.device_control_env_var
-    visible_devices = groups[dp_index]
     inherited = os.environ.get(evar)
-    if inherited == visible_devices:
-        return
-
     os.environ[evar] = visible_devices
 
     logger.info(
-        "Bound %s=%s for data_parallel_index=%s (inherited %r)",
+        "Bound %s=%s for local DP rank %s (inherited %r)",
         evar,
         visible_devices,
-        dp_index,
+        parallel_config.data_parallel_rank_local,
         inherited,
     )
 
@@ -206,9 +213,10 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
-        # Bind the device group before anything can touch the TT runtime: model
-        # registration below resolves and imports TT model modules.
-        _bind_visible_devices_env(self.vllm_config, self.parallel_config)
+        # tt-metal latches the visible set at first cluster construction and never
+        # re-reads the env var, so bind before `check_and_update_config` ->
+        # `get_model_architecture` imports the tt-metal model module.
+        _bind_visible_devices_env(self.vllm_config)
 
         # Validate/apply TT config in this worker process (multiprocessing
         # means platform class attrs + config mutations must be applied per
@@ -219,7 +227,7 @@ class TTWorker(WorkerBase):
         logger.info(
             "TT worker standard-DP binding: data_parallel_index=%s "
             "data_parallel_rank_local=%s %s=%s MESH_DEVICE=%s",
-            getattr(self.parallel_config, "data_parallel_index", None),
+            self.parallel_config.data_parallel_index,
             local_dp_rank,
             TTPlatform.device_control_env_var,
             os.environ.get(TTPlatform.device_control_env_var),
