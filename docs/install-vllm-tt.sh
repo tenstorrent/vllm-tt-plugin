@@ -20,8 +20,8 @@ curl -fsSL \
 uv pip install --override docs/vllm-overrides.txt \
     -r "$VLLM_COMMON_REQUIREMENTS"   # see that file for why. Must read when bumping vllm version!
 rm -f "$VLLM_COMMON_REQUIREMENTS"
-# --no-binary-package: the published wheel is the CUDA build, kernels included.
-# vLLM ends up declaring no torch dependency, which is intended; torch belongs to
-# the tt-metal env this plugin runs inside.
-VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary-package vllm vllm==0.24.0
+# --no-binary vllm: the published wheel is the CUDA build, kernels included, so
+# vLLM has to come from source. vLLM ends up declaring no torch dependency, which
+# is intended; torch belongs to the tt-metal env this plugin runs inside.
+VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.24.0
 uv pip install -e .
