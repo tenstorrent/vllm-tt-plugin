@@ -64,21 +64,19 @@ for all model calls, and no vLLM automatic prefix caching or scheduler chunked
 prefill. Async scheduling, structured output, vLLM logprobs, host sampling,
 custom logits processors, and multiple responses are rejected.
 
-Omitted controls and these neutral transport values are accepted:
+HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 
-- `temperature=1.0`
-- `top_p=1.0`
-- `top_k=0` or `-1`
-- `min_p=0.0`
-- no seed
-- presence/frequency penalties `0.0`
-- repetition penalty `1.0`
+- `temperature`, `top_p`, `top_k`, and `min_p`
+- `seed`
+- presence, frequency, and repetition penalties
 
-Explicit non-neutral values are rejected with a 4xx request error; they are
-never silently ignored or rewritten. Response-contract controls such as
-`n>1`, logprobs, structured outputs, bad words, logit bias, allowed token IDs,
-nonzero minimum tokens, and custom sampling `extra_args` are also rejected
-before EngineCore.
+The model-owned denoise loop always uses its internal temperature schedule and
+Gumbel sampler, so these fields do not alter generation. Validation neutralizes
+them in place before vLLM clones `SamplingParams`; offline callers must not
+reuse the same object for a later autoregressive request. Response-contract
+controls such as `n>1`, logprobs, structured outputs, bad words, logit bias,
+allowed token IDs, nonzero minimum tokens, and custom sampling `extra_args`
+remain rejected before EngineCore.
 
 Physical admission rounds logical output up to complete canvases:
 

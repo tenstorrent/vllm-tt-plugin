@@ -1247,37 +1247,48 @@ class TTPlatform(Platform):
                     "shorter prompt."
                 )
 
-        unsupported = []
+        # The model owns its Gumbel sampler and temperature schedule. Common
+        # OpenAI clients still send transport sampling controls, so accept and
+        # neutralize those values before InputProcessor clones SamplingParams.
+        # This intentionally mutates the caller-owned object; server requests
+        # construct a fresh object, while offline callers should not reuse it
+        # across block-output and autoregressive models.
+        ignored = []
         if params.temperature != 1.0:
-            unsupported.append(
-                f"temperature={params.temperature!r} (accepted neutral value: 1.0)"
-            )
+            ignored.append(f"temperature={params.temperature!r}")
+            params.temperature = 1.0
         if params.top_p != 1.0:
-            unsupported.append(f"top_p={params.top_p!r} (accepted neutral value: 1.0)")
+            ignored.append(f"top_p={params.top_p!r}")
+            params.top_p = 1.0
         if params.top_k not in (0, -1):
-            unsupported.append(
-                f"top_k={params.top_k!r} (accepted neutral values: 0 or -1)"
-            )
+            ignored.append(f"top_k={params.top_k!r}")
+            params.top_k = 0
         if params.min_p != 0.0:
-            unsupported.append(f"min_p={params.min_p!r} (accepted neutral value: 0.0)")
+            ignored.append(f"min_p={params.min_p!r}")
+            params.min_p = 0.0
         if params.seed is not None:
-            unsupported.append(f"seed={params.seed!r} (accepted: omitted/None)")
+            ignored.append(f"seed={params.seed!r}")
+            params.seed = None
         if params.presence_penalty != 0.0:
-            unsupported.append(
-                f"presence_penalty={params.presence_penalty!r} "
-                "(accepted neutral value: 0.0)"
-            )
+            ignored.append(f"presence_penalty={params.presence_penalty!r}")
+            params.presence_penalty = 0.0
         if params.frequency_penalty != 0.0:
-            unsupported.append(
-                f"frequency_penalty={params.frequency_penalty!r} "
-                "(accepted neutral value: 0.0)"
-            )
+            ignored.append(f"frequency_penalty={params.frequency_penalty!r}")
+            params.frequency_penalty = 0.0
         if params.repetition_penalty != 1.0:
-            unsupported.append(
-                f"repetition_penalty={params.repetition_penalty!r} "
-                "(accepted neutral value: 1.0)"
+            ignored.append(f"repetition_penalty={params.repetition_penalty!r}")
+            params.repetition_penalty = 1.0
+        if ignored:
+            logger.warning_once(
+                "This block-output model uses its model-owned sampler; HTTP "
+                "sampling controls are accepted but ignored."
+            )
+            logger.debug(
+                "Ignoring unsupported sampling controls for block-output model: %s",
+                "; ".join(ignored),
             )
 
+        unsupported = []
         if params.n != 1:
             unsupported.append(f"n={params.n!r} (accepted: 1)")
         if params.logprobs is not None:

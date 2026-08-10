@@ -52,13 +52,22 @@ def test_platform_default_is_clamped_to_whole_canvases():
         ("repetition_penalty", 1.1),
     ],
 )
-def test_non_neutral_sampling_controls_are_rejected_without_mutation(field, value):
+def test_non_neutral_sampling_controls_are_accepted_and_neutralized(field, value):
     params = SamplingParams(max_tokens=16, **{field: value})
 
-    with pytest.raises(ValueError, match=field):
-        _validate(params)
+    _validate(params)
 
-    assert getattr(params, field) == value
+    expected = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "seed": None,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
+    assert getattr(params, field) == expected[field]
 
 
 @pytest.mark.parametrize(
