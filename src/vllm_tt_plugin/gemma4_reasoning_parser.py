@@ -331,7 +331,11 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             (self.start_token_id,),
             quote_token_id=self.quote_token_id,
         )
-        if start_idx is not None and self._stream_phase != "reasoning":
+        if (
+            start_idx is not None
+            and self._stream_phase != "reasoning"
+            and not self.is_reasoning_end_streaming(previous_token_ids, ())
+        ):
             buffered_prefix = self._marker_buffer
             self._marker_buffer = ""
             transition_idx, transition_id, _ = _scan_unquoted_token(
@@ -384,9 +388,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             and not self.is_reasoning_end(previous_token_ids)
         )
         if previous_in_reasoning or self._stream_phase == "reasoning":
-            initial_in_quote = self._reasoning_quote_state(
-                previous_text, previous_token_ids
-            )
+            initial_in_quote = self._reasoning_id_quote_state(previous_token_ids)
             transition_idx, transition_id, _ = _scan_unquoted_token(
                 delta_token_ids,
                 (self.end_token_id, self.tool_call_token_id),
@@ -431,7 +433,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             return self._extract_stream_text(
                 delta_text,
                 previous_text,
-                initial_in_quote=initial_in_quote,
+                initial_in_quote=self._reasoning_text_quote_state(previous_text),
             )
 
         if (
@@ -496,7 +498,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
         if self._stream_phase == "reasoning":
             if initial_in_quote is None:
-                initial_in_quote = self._reasoning_quote_state(previous_text, ())
+                initial_in_quote = self._reasoning_text_quote_state(previous_text)
             return self._extract_reasoning_text(
                 combined, None, initial_in_quote=initial_in_quote
             )
@@ -570,7 +572,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                     reasoning_ended = True
                 continue
 
-            if token_id == self.start_token_id:
+            if token_id == self.start_token_id and not reasoning_ended:
                 reasoning_open = True
                 in_quote = False
                 reasoning_ended = False
@@ -581,38 +583,10 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
 
         return reasoning_open, in_quote, reasoning_ended
 
-    def _reasoning_quote_state(
+    def _reasoning_text_quote_state(
         self,
         previous_text: str,
-        previous_token_ids: Sequence[int],
     ) -> bool:
-        if _QUOTE in previous_text or self.start_token in previous_text:
-            start_idx, _, _ = _scan_unquoted_marker(
-                previous_text,
-                (self.start_token,),
-                initial_in_quote=self._prompt_reasoning_in_quote,
-            )
-            text_start = (
-                start_idx + len(self.start_token) if start_idx is not None else 0
-            )
-            _, _, in_quote = _scan_unquoted_marker(
-                previous_text,
-                (),
-                start=text_start,
-                initial_in_quote=(
-                    False if start_idx is not None else self._prompt_reasoning_in_quote
-                ),
-            )
-            return in_quote
-
-        reasoning_open, in_quote, _ = self._reasoning_id_state(
-            previous_token_ids,
-            initial_reasoning_open=self._prompt_reasoning_active,
-            initial_in_quote=self._prompt_reasoning_in_quote,
-        )
-        if reasoning_open and self.quote_token_id is not None:
-            return in_quote
-
         start_idx, _, _ = _scan_unquoted_marker(
             previous_text,
             (self.start_token,),
@@ -628,6 +602,17 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             ),
         )
         return in_quote
+
+    def _reasoning_id_quote_state(
+        self,
+        previous_token_ids: Sequence[int],
+    ) -> bool:
+        reasoning_open, in_quote, _ = self._reasoning_id_state(
+            previous_token_ids,
+            initial_reasoning_open=self._prompt_reasoning_active,
+            initial_in_quote=self._prompt_reasoning_in_quote,
+        )
+        return reasoning_open and self.quote_token_id is not None and in_quote
 
     def _decode_visible(self, token_ids: Sequence[int]) -> str:
         if not token_ids:

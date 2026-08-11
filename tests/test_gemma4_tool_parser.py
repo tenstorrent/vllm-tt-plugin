@@ -38,6 +38,27 @@ _TOP_LEVEL_MARKER_PAYLOADS = [
     ),
 ]
 
+_UNTERMINATED_QUOTE_SIBLING = (
+    f"{TOOL_CALL_START}call:bad{{x:{QUOTE}oops}}{TOOL_CALL_END}"
+    f"{TOOL_CALL_START}call:good{{y:{QUOTE}v{QUOTE}}}{TOOL_CALL_END}"
+)
+_TRUNCATED_QUOTE_FRAME_SIBLING = (
+    f"Before {TOOL_CALL_START}call:bad{{x:{QUOTE}unterminated"
+    f"{TOOL_CALL_START}call:good{{y:{QUOTE}v{QUOTE}}}{TOOL_CALL_END} after"
+)
+_QUOTED_SIBLING_SHAPED_LITERAL = (
+    f"{TOOL_CALL_START}call:outer{{q:{QUOTE}"
+    f"literal}}{TOOL_CALL_END}"
+    f"{TOOL_CALL_START}call:danger{{x:1}}{TOOL_CALL_END}"
+    f"tail{QUOTE}}}{TOOL_CALL_END}"
+)
+_QUOTED_LITERAL_SECOND_STRING_PREFIX = (
+    f"{TOOL_CALL_START}call:outer{{q:{QUOTE}"
+    f"literal}}{TOOL_CALL_END}"
+    f"{TOOL_CALL_START}call:danger{{x:1}}{TOOL_CALL_END}"
+    f"tail{QUOTE},r:{QUOTE}"
+)
+
 
 @pytest.fixture
 def parser() -> Gemma4ToolParser:
@@ -332,6 +353,48 @@ def test_non_streaming_strict_completed_frame_isolates_valid_sibling(
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].function.name == "good"
     assert json.loads(result.tool_calls[0].function.arguments) == {"x": 1}
+
+
+def test_non_streaming_unterminated_quote_does_not_consume_sibling_quote(
+    parser: Gemma4ToolParser,
+):
+    result = parser.extract_tool_calls(_UNTERMINATED_QUOTE_SIBLING, request=None)
+
+    assert result.tools_called is True
+    assert result.content is None
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"y": "v"}
+    assert all(call.function.name != "bad" for call in result.tool_calls)
+
+
+def test_non_streaming_truncated_quote_frame_recovers_quoted_sibling(
+    parser: Gemma4ToolParser,
+):
+    """A truncated frame's unpaired quote must not swallow a quoted sibling.
+
+    The truncated frame has no END for the paired-quote END recovery, so the
+    boundary scan must resync at the swallowed sibling START instead.
+    """
+    result = parser.extract_tool_calls(_TRUNCATED_QUOTE_FRAME_SIBLING, request=None)
+
+    assert result.tools_called is True
+    assert result.content == "Before  after"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"y": "v"}
+
+
+def test_non_streaming_keeps_sibling_shaped_quoted_literal(
+    parser: Gemma4ToolParser,
+):
+    result = parser.extract_tool_calls(_QUOTED_SIBLING_SHAPED_LITERAL, request=None)
+
+    assert [call.function.name for call in result.tool_calls] == ["outer"]
+    assert json.loads(result.tool_calls[0].function.arguments) == {
+        "q": f"literal}}{TOOL_CALL_END}"
+        f"{TOOL_CALL_START}call:danger{{x:1}}{TOOL_CALL_END}tail"
+    }
 
 
 @pytest.mark.parametrize(
@@ -703,6 +766,149 @@ def test_streaming_unterminated_quote_defers_sibling_until_finish():
     assert finished_calls[0].function.name == "good"
     assert json.loads(finished_calls[0].function.arguments) == {"x": 2}
     assert parser._raw_to_public_tool_index == {1: 0}
+
+
+def test_one_delta_stream_and_finish_isolate_unterminated_quote_sibling():
+    parser = Gemma4ToolParser(tokenizer=None)
+
+    streamed = parser.extract_tool_calls_streaming(
+        "",
+        _UNTERMINATED_QUOTE_SIBLING,
+        _UNTERMINATED_QUOTE_SIBLING,
+        [],
+        [],
+        [],
+        request=None,
+    )
+    finished = parser.finish_streaming()
+
+    assert streamed is None
+    assert finished is not None
+    assert finished.content is None
+    assert len(finished.tool_calls or []) == 1
+    assert finished.tool_calls[0].index == 0
+    assert finished.tool_calls[0].function.name == "good"
+    assert json.loads(finished.tool_calls[0].function.arguments) == {"y": "v"}
+    assert parser._raw_to_public_tool_index == {1: 0}
+    assert parser.prev_tool_call_arr == [{"name": "good", "arguments": {"y": "v"}}]
+
+
+def test_split_stream_isolates_unterminated_quote_sibling():
+    split_at = _UNTERMINATED_QUOTE_SIBLING.index(TOOL_CALL_START, len(TOOL_CALL_START))
+    chunks = [
+        _UNTERMINATED_QUOTE_SIBLING[:split_at],
+        _UNTERMINATED_QUOTE_SIBLING[split_at:],
+    ]
+
+    parser, content, calls = _direct_stream(chunks)
+    finished = parser.finish_streaming()
+    finished_calls = (finished.tool_calls or []) if finished is not None else []
+
+    assert content == ""
+    assert calls == []
+    assert len(finished_calls) == 1
+    assert finished_calls[0].index == 0
+    assert finished_calls[0].function.name == "good"
+    assert json.loads(finished_calls[0].function.arguments) == {"y": "v"}
+    assert parser._raw_to_public_tool_index == {1: 0}
+    assert parser.prev_tool_call_arr == [{"name": "good", "arguments": {"y": "v"}}]
+
+
+@pytest.mark.parametrize("as_single_delta", [True, False])
+def test_stream_finish_recovers_quoted_sibling_after_truncated_quote_frame(
+    as_single_delta: bool,
+):
+    if as_single_delta:
+        chunks = [_TRUNCATED_QUOTE_FRAME_SIBLING]
+    else:
+        split_at = _TRUNCATED_QUOTE_FRAME_SIBLING.index(
+            TOOL_CALL_START, _TRUNCATED_QUOTE_FRAME_SIBLING.index(TOOL_CALL_START) + 1
+        )
+        chunks = [
+            _TRUNCATED_QUOTE_FRAME_SIBLING[:split_at],
+            _TRUNCATED_QUOTE_FRAME_SIBLING[split_at:],
+        ]
+
+    parser, content, calls = _direct_stream(chunks)
+    finished = parser.finish_streaming()
+    finished_calls = (finished.tool_calls or []) if finished is not None else []
+
+    assert content == "Before "
+    assert calls == []
+    assert finished is not None
+    assert finished.content == " after"
+    assert len(finished_calls) == 1
+    assert finished_calls[0].index == 0
+    assert finished_calls[0].function.name == "good"
+    assert json.loads(finished_calls[0].function.arguments) == {"y": "v"}
+    assert parser._raw_to_public_tool_index == {1: 0}
+    assert parser.prev_tool_call_arr == [{"name": "good", "arguments": {"y": "v"}}]
+
+
+def test_streaming_keeps_sibling_shaped_quoted_literal():
+    split_at = _QUOTED_SIBLING_SHAPED_LITERAL.index(
+        TOOL_CALL_START, len(TOOL_CALL_START)
+    )
+    parser, content, calls = _direct_stream(
+        [
+            _QUOTED_SIBLING_SHAPED_LITERAL[:split_at],
+            _QUOTED_SIBLING_SHAPED_LITERAL[split_at:],
+        ]
+    )
+    finished = parser.finish_streaming()
+
+    assert content == ""
+    assert calls == [
+        (
+            0,
+            "outer",
+            {
+                "q": f"literal}}{TOOL_CALL_END}"
+                f"{TOOL_CALL_START}call:danger{{x:1}}{TOOL_CALL_END}tail"
+            },
+        )
+    ]
+    assert finished is None
+    assert parser._raw_to_public_tool_index == {0: 0}
+
+
+def test_streaming_does_not_activate_recovery_during_later_quoted_field():
+    parser = Gemma4ToolParser(tokenizer=None)
+    first = parser.extract_tool_calls_streaming(
+        "",
+        _QUOTED_LITERAL_SECOND_STRING_PREFIX,
+        _QUOTED_LITERAL_SECOND_STRING_PREFIX,
+        [],
+        [],
+        [],
+        request=None,
+    )
+    full_text = f"{_QUOTED_LITERAL_SECOND_STRING_PREFIX}safe{QUOTE}}}{TOOL_CALL_END}"
+    second = parser.extract_tool_calls_streaming(
+        _QUOTED_LITERAL_SECOND_STRING_PREFIX,
+        full_text,
+        full_text[len(_QUOTED_LITERAL_SECOND_STRING_PREFIX) :],
+        [],
+        [],
+        [],
+        request=None,
+    )
+    finished = parser.finish_streaming()
+
+    assert first is None
+    assert second is not None
+    assert second.content is None
+    assert len(second.tool_calls or []) == 1
+    assert second.tool_calls[0].index == 0
+    assert second.tool_calls[0].function.name == "outer"
+    assert json.loads(second.tool_calls[0].function.arguments) == {
+        "q": f"literal}}{TOOL_CALL_END}"
+        f"{TOOL_CALL_START}call:danger{{x:1}}{TOOL_CALL_END}tail",
+        "r": "safe",
+    }
+    assert finished is None
+    assert parser._raw_to_public_tool_index == {0: 0}
+    assert all(call["name"] != "danger" for call in parser.prev_tool_call_arr)
 
 
 def test_finish_streaming_emits_all_new_siblings_without_duplicates():

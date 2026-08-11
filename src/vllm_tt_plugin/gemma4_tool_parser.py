@@ -254,12 +254,59 @@ class Gemma4ToolParser(ToolParser):
         after it.
         """
         i = body_start
+        object_depth = 0
+        recovery_end: int | None = None
+        recovery_start: int | None = None
         while i < len(text):
             if text.startswith(QUOTE, i):
                 quote_end = text.find(QUOTE, i + len(QUOTE))
                 if quote_end != -1:
+                    # A malformed frame's opening quote can otherwise pair with
+                    # a later sibling's opening quote. Record a frame-local
+                    # recovery boundary, but use it only at finalization if that
+                    # pairing leaves a later quote unmatched. Streaming cannot
+                    # commit the recovery before a future chunk might close the
+                    # quote. This preserves valid quoted sibling-shaped data.
+                    candidate_depth = object_depth
+                    scan_at = i + len(QUOTE)
+                    candidate_end = text.find(TOOL_CALL_END, scan_at, quote_end)
+                    while candidate_end != -1:
+                        for char in text[scan_at:candidate_end]:
+                            if char == "{":
+                                candidate_depth += 1
+                            elif char == "}":
+                                candidate_depth -= 1
+                        sibling_start = text.find(
+                            TOOL_CALL_START,
+                            candidate_end + len(TOOL_CALL_END),
+                            quote_end,
+                        )
+                        if (
+                            object_depth > 0
+                            and candidate_depth <= 0
+                            and sibling_start != -1
+                        ):
+                            recovery_end = candidate_end
+                            break
+                        scan_at = candidate_end + len(TOOL_CALL_END)
+                        candidate_end = text.find(TOOL_CALL_END, scan_at, quote_end)
+                    if object_depth > 0 and recovery_start is None:
+                        # A truncated frame has no END to recover at, but the
+                        # pairing may still have swallowed a sibling frame's
+                        # START; that START truncates the current frame.
+                        swallowed_start = text.find(
+                            TOOL_CALL_START, i + len(QUOTE), quote_end
+                        )
+                        if swallowed_start != -1:
+                            recovery_start = swallowed_start
                     i = quote_end + len(QUOTE)
                     continue
+                if final:
+                    recovered = Gemma4ToolParser._preferred_recovery(
+                        recovery_end, recovery_start
+                    )
+                    if recovered is not None:
+                        return recovered
                 if not final:
                     return None
                 i += len(QUOTE)
@@ -268,7 +315,26 @@ class Gemma4ToolParser(ToolParser):
                 return i, False
             if text.startswith(TOOL_CALL_END, i):
                 return i, True
+            if text[i] == "{":
+                object_depth += 1
+            elif text[i] == "}":
+                object_depth -= 1
             i += 1
+        if final:
+            return Gemma4ToolParser._preferred_recovery(recovery_end, recovery_start)
+        return None
+
+    @staticmethod
+    def _preferred_recovery(
+        recovery_end: int | None, recovery_start: int | None
+    ) -> tuple[int, bool] | None:
+        """Pick the earliest recorded recovery boundary, END before START."""
+        if recovery_end is not None and (
+            recovery_start is None or recovery_end <= recovery_start
+        ):
+            return recovery_end, True
+        if recovery_start is not None:
+            return recovery_start, False
         return None
 
     @staticmethod

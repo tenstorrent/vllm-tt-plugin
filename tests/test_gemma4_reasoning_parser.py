@@ -27,6 +27,12 @@ class FakeTokenizer:
         30: " middle ",
         31: "call:good{}",
         32: " after",
+        33: "thought\nReason.",
+        34: '<|"|>',
+        35: "one",
+        36: "mid",
+        37: "two",
+        38: "end",
     }
     special_pieces = {
         1: "<|channel>",
@@ -273,6 +279,49 @@ def test_streaming_token_ids_keep_quoted_tool_literal_across_deltas():
         assert not parser.is_reasoning_end_streaming(first_ids + second_ids, second_ids)
 
 
+def test_streaming_quote_state_stays_in_text_or_token_id_domain():
+    tokenizer = FakeTokenizer()
+    tool = "<|tool_call>call:good{}<tool_call|>"
+
+    cases = (
+        ([33, 34], [34, 2, 4, 31, 6]),
+        ([33, 7], [7, 2, 4, 31, 6]),
+        ([], []),
+    )
+    for first_ids, second_ids in cases:
+        parser = _parser()
+        parser.adjust_initial_state_from_prompt([1])
+        first_text = (
+            tokenizer.decode(first_ids, skip_special_tokens=False)
+            if first_ids
+            else 'thought\nReason.<|"|>'
+        )
+        second_text = (
+            tokenizer.decode(second_ids, skip_special_tokens=False)
+            if second_ids
+            else f'<|"|><channel|>{tool}'
+        )
+
+        first = parser.extract_reasoning_streaming(
+            "", first_text, first_text, [], first_ids, first_ids
+        )
+        second = parser.extract_reasoning_streaming(
+            first_text,
+            first_text + second_text,
+            second_text,
+            first_ids,
+            first_ids + second_ids,
+            second_ids,
+        )
+
+        assert first is not None
+        assert first.reasoning == 'Reason.<|"|>'
+        assert second is not None
+        assert second.reasoning == '<|"|>'
+        assert second.content == tool
+        assert "call:good" not in second.reasoning
+
+
 def test_fragmented_quote_delimiters_preserve_reasoning_transitions():
     quote = '<|"|>'
     danger = "<|tool_call>call:danger{}<tool_call|>"
@@ -455,6 +504,72 @@ def test_prompt_turn_and_tool_response_reset_start_fresh_reasoning():
 
         assert reasoning == "R."
         assert content == "A"
+
+
+def test_repeated_channel_markers_match_nonstream_across_40_chunkings():
+    tokenizer = FakeTokenizer()
+    token_ids = [1, 35, 2, 36, 1, 37, 2, 38]
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    expected = _parser().extract_reasoning(text, request=None)
+
+    token_boundaries = [(split,) for split in range(1, len(token_ids))]
+    token_boundaries += [
+        (first, second)
+        for first in range(1, len(token_ids))
+        for second in range(first + 1, len(token_ids))
+    ][:13]
+    text_boundaries = [(index * len(text)) // 21 for index in range(1, 21)]
+    chunkings = []
+    for boundaries in token_boundaries:
+        offsets = (0, *boundaries, len(token_ids))
+        id_chunks = [token_ids[start:end] for start, end in zip(offsets, offsets[1:])]
+        chunkings.append(
+            (
+                [tokenizer.decode(ids, skip_special_tokens=False) for ids in id_chunks],
+                id_chunks,
+            )
+        )
+    for boundary in text_boundaries:
+        chunkings.append(([text[:boundary], text[boundary:]], [[], []]))
+
+    assert expected == ("one", "mid<|channel>two<channel|>end")
+    assert len(chunkings) == 40
+    for chunks, id_chunks in chunkings:
+        parser = _parser()
+        previous_text = ""
+        previous_ids = []
+        reasoning = ""
+        content = ""
+        for chunk, delta_ids in zip(chunks, id_chunks):
+            result = parser.extract_reasoning_streaming(
+                previous_text,
+                previous_text + chunk,
+                chunk,
+                previous_ids,
+                previous_ids + delta_ids,
+                delta_ids,
+            )
+            if result is not None:
+                reasoning += result.reasoning or ""
+                content += result.content or ""
+            previous_text += chunk
+            previous_ids += delta_ids
+
+        assert (reasoning, content) == expected, (chunks, id_chunks)
+
+
+def test_repeated_channel_stickiness_resets_for_a_fresh_turn():
+    closed_ids = [1, 35, 2, 36, 1, 37]
+
+    assert _parser().is_reasoning_end(closed_ids)
+    for reset_id in (3, 5):
+        reasoning_open, _, reasoning_ended = _parser()._reasoning_id_state(
+            [*closed_ids, reset_id, 1, 37]
+        )
+
+        assert reasoning_open
+        assert not reasoning_ended
+        assert _parser().is_reasoning_end([*closed_ids, reset_id, 1, 37, 2])
 
 
 def test_empty_and_arbitrary_prompts_keep_no_channel_content():

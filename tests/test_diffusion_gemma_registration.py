@@ -25,9 +25,13 @@ _TOP_LEVEL_MARKER_PAYLOADS = (
 )
 
 
-def _unified_parser(*, with_tools: bool = True):
+def _unified_parser(
+    *,
+    with_tools: bool = True,
+    reasoning_parser_name: str = "diffusion_gemma",
+):
     ReasoningParserManager.register_module(
-        name="diffusion_gemma",
+        name=reasoning_parser_name,
         module=Gemma4ReasoningParser,
     )
     if with_tools:
@@ -38,7 +42,7 @@ def _unified_parser(*, with_tools: bool = True):
     _register_tt_reasoning_parsers()
     parser_cls = ParserManager.get_parser(
         tool_parser_name="gemma4" if with_tools else None,
-        reasoning_parser_name="diffusion_gemma",
+        reasoning_parser_name=reasoning_parser_name,
         enable_auto_tools=with_tools,
     )
     assert parser_cls is not None
@@ -72,7 +76,7 @@ def _stream_unified_chunks(chunks, token_chunks=None, prompt_token_ids=None):
     return reasoning, content, tool_calls
 
 
-def test_diffusion_gemma_reasoning_parser_alias(monkeypatch):
+def test_gemma4_reasoning_parser_aliases(monkeypatch):
     registrations = []
     monkeypatch.setattr(
         ReasoningParserManager,
@@ -82,11 +86,12 @@ def test_diffusion_gemma_reasoning_parser_alias(monkeypatch):
 
     _register_tt_reasoning_parsers()
 
-    assert (
-        "diffusion_gemma",
-        "vllm_tt_plugin.gemma4_reasoning_parser",
-        "Gemma4ReasoningParser",
-    ) in registrations
+    for alias in ("diffusion_gemma", "gemma4"):
+        assert (
+            alias,
+            "vllm_tt_plugin.gemma4_reasoning_parser",
+            "Gemma4ReasoningParser",
+        ) in registrations
 
 
 def test_diffusion_gemma_model_architecture_aliases(monkeypatch):
@@ -213,6 +218,54 @@ def test_unified_parser_handles_implicit_reasoning_to_tool_transition():
     assert streamed.tool_calls[0].function.name == "get_weather"
 
 
+def test_unified_streaming_ordinary_quote_text_does_not_hide_real_tool_ids():
+    tokenizer = FakeTokenizer()
+    first_ids = [33, 34]
+    second_ids = [34, 2, 4, 31, 6]
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        [
+            tokenizer.decode(first_ids, skip_special_tokens=False),
+            tokenizer.decode(second_ids, skip_special_tokens=False),
+        ],
+        [first_ids, second_ids],
+        prompt_token_ids=[1],
+    )
+
+    assert reasoning == 'Reason.<|"|><|"|>'
+    assert content == ""
+    assert [call.function.name for call in tool_calls] == ["good"]
+    assert "call:good" not in reasoning
+
+
+def test_unified_repeated_channel_markers_match_nonstream_across_chunks():
+    tokenizer = FakeTokenizer()
+    token_ids = [1, 35, 2, 36, 1, 37, 2, 38]
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    expected_reasoning, expected_content, expected_tools = _unified_parser().parse(
+        text,
+        request=request,
+        enable_auto_tools=True,
+        model_output_token_ids=token_ids,
+    )
+
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        [
+            tokenizer.decode(token_ids[:4], skip_special_tokens=False),
+            tokenizer.decode(token_ids[4:], skip_special_tokens=False),
+        ],
+        [token_ids[:4], token_ids[4:]],
+    )
+
+    assert (expected_reasoning, expected_content) == (
+        "one",
+        "mid<|channel>two<channel|>end",
+    )
+    assert not expected_tools
+    assert (reasoning, content) == (expected_reasoning, expected_content)
+    assert tool_calls == []
+
+
 def test_unified_short_reasoning_prefix_emitted_on_next_delta_end():
     parser = _unified_parser(with_tools=False)
     request = SimpleNamespace(tool_choice="none", tools=[])
@@ -336,6 +389,34 @@ def test_unified_finished_stream_flushes_short_prefix_as_reasoning():
     assert result is not None
     assert result.reasoning == "tho"
     assert result.content is None
+
+
+def test_gemma4_alias_finished_stream_flushes_short_prefix_once():
+    parser = _unified_parser(
+        with_tools=False,
+        reasoning_parser_name="gemma4",
+    )
+    request = SimpleNamespace(tool_choice="none", tools=[])
+
+    result = parser.parse_delta(
+        delta_text="<|channel>tho",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=True,
+    )
+    repeated_finish = parser.parse_delta(
+        delta_text="",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=True,
+    )
+
+    assert result is not None
+    assert result.reasoning == "tho"
+    assert result.content is None
+    assert repeated_finish is None
 
 
 def test_unified_finished_stream_does_not_duplicate_incomplete_reasoning():
@@ -480,6 +561,44 @@ def test_unified_streaming_truncated_tool_resyncs_to_valid_sibling():
     assert tool_calls[0].function.name == "good"
     assert json.loads(tool_calls[0].function.arguments) == {"x": 2}
     assert parser.tool_parser._raw_to_public_tool_index == {1: 0}
+
+
+def test_unified_streaming_unterminated_tool_quote_keeps_valid_sibling():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        (
+            "<|channel>thought\nR.<channel|>"
+            f"{TOOL_CALL_START}call:bad{{x:{QUOTE}oops}}{TOOL_CALL_END}"
+        ),
+        f"{TOOL_CALL_START}call:good{{y:{QUOTE}v{QUOTE}}}{TOOL_CALL_END}",
+    ]
+    reasoning = ""
+    content = ""
+    tool_calls = []
+
+    for index, chunk in enumerate(chunks):
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=index == len(chunks) - 1,
+        )
+        if result is not None:
+            reasoning += result.reasoning or ""
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    assert reasoning == "R."
+    assert content == ""
+    assert [call.index for call in tool_calls] == [0]
+    assert [call.function.name for call in tool_calls] == ["good"]
+    assert json.loads(tool_calls[0].function.arguments) == {"y": "v"}
+    assert parser.tool_parser._raw_to_public_tool_index == {1: 0}
+    assert parser.tool_parser.prev_tool_call_arr == [
+        {"name": "good", "arguments": {"y": "v"}}
+    ]
 
 
 def test_unified_streaming_preserves_paired_quoted_tool_markers():

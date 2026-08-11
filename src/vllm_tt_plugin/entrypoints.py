@@ -34,23 +34,23 @@ def _register_tt_reasoning_parsers() -> None:
         "vllm_tt_plugin.gemma4_reasoning_parser",
         "Gemma4ReasoningParser",
     )
-    _install_diffusion_gemma_complete_parser_adapter()
+    _install_gemma4_complete_parser_adapter()
 
 
-def _install_diffusion_gemma_complete_parser_adapter() -> None:
-    """Forward non-streaming token IDs to the DiffusionGemma parser.
+def _install_gemma4_complete_parser_adapter() -> None:
+    """Adapt vLLM 0.24 parsing for both plugin-owned Gemma 4 aliases.
 
     vLLM 0.24 supplies ``model_output_token_ids`` to ``Parser.parse`` but its
-    generated ``DelegatingParser`` ignores them. DiffusionGemma needs those IDs
-    because normal detokenization may strip its reasoning markers. Keep the
-    compatibility adapter scoped to the plugin's ``diffusion_gemma`` alias.
+    generated ``DelegatingParser`` ignores them and does not own the final
+    ``finish_streaming`` flush. ``Gemma4ReasoningParser`` needs both compatibility
+    paths under the plugin's ``diffusion_gemma`` and ``gemma4`` aliases.
     """
     from collections.abc import Sequence
     from typing import Any
 
     from vllm.parser.parser_manager import ParserManager
 
-    if getattr(ParserManager, "_tt_diffusion_complete_parser_installed", False):
+    if getattr(ParserManager, "_tt_gemma4_complete_parser_installed", False):
         return
 
     original_get_parser = ParserManager.get_parser
@@ -72,10 +72,13 @@ def _install_diffusion_gemma_complete_parser_adapter() -> None:
             model_name=model_name,
             is_harmony=is_harmony,
         )
-        if parser_cls is None or reasoning_parser_name != "diffusion_gemma":
+        if parser_cls is None or reasoning_parser_name not in {
+            "diffusion_gemma",
+            "gemma4",
+        }:
             return parser_cls
 
-        class DiffusionGemmaParser(parser_cls):
+        class Gemma4CompleteParser(parser_cls):
             def parse(
                 self,
                 model_output: str,
@@ -165,10 +168,10 @@ def _install_diffusion_gemma_complete_parser_adapter() -> None:
                             result.tool_calls.append(flushed_call)
                 return result
 
-        return DiffusionGemmaParser
+        return Gemma4CompleteParser
 
     ParserManager.get_parser = get_parser
-    ParserManager._tt_diffusion_complete_parser_installed = True
+    ParserManager._tt_gemma4_complete_parser_installed = True
 
 
 def _register_tt_tool_parsers() -> None:
