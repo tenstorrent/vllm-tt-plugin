@@ -23,7 +23,11 @@ from vllm_tt_plugin.platform import (
 from vllm_tt_plugin.utils.dp_discovery import (
     _maybe_reorder_standard_dp_visible_device_groups,
 )
-from vllm_tt_plugin.worker import _bind_visible_devices_env, _resolve_mesh_grid
+from vllm_tt_plugin.worker import (
+    _bind_visible_devices_env,
+    _resolve_mesh_grid,
+    _resolve_parent_mesh_grid,
+)
 
 EVAR = TTPlatform.device_control_env_var
 
@@ -218,6 +222,16 @@ def test_visible_devices_override_full_machine_mesh_preset() -> None:
     assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)
     assert _resolve_mesh_grid("TG", 8, "0,1,2,3,4,5,6,7") == (1, 8)
     assert _resolve_mesh_grid("P150x8", 8, "3") == (1, 1)
+
+
+def test_bh_galaxy_resolves_like_wh_galaxy() -> None:
+    assert _resolve_mesh_grid("BH-Galaxy", 32, None) == (8, 4)
+    assert _resolve_mesh_grid("BH-Galaxy", 32, None) == _resolve_mesh_grid(
+        "TG", 32, None
+    )
+    assert _resolve_parent_mesh_grid("BH-Galaxy", 32) == _resolve_parent_mesh_grid(
+        "TG", 32
+    )
 
 
 def test_visible_devices_use_discovered_submesh_shape(
