@@ -4,6 +4,11 @@
 
 from types import SimpleNamespace
 
+# vLLM's own bootstrap resolves the platform plugin, which imports this module.
+# Letting the plugin module trigger that bootstrap deadlocks the cycle on a
+# half-built module, so let vLLM finish importing itself first.
+import vllm  # noqa: F401
+
 from vllm_tt_plugin.platform import _apply_chunked_prefill_policy
 
 

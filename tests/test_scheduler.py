@@ -116,7 +116,8 @@ def test_prefill_only_hides_decodes_but_keeps_continuations(monkeypatch):
     assert seen["running"] == [continuation]
     # One slot is held by the hidden decode, so the waiting loop sees 8 - 1.
     assert seen["max_num_running_reqs"] == 7
-    assert set(scheduler.running) == {decode, continuation}
+    # Restored: the hidden decodes are appended back after the base pass.
+    assert scheduler.running == [continuation, decode]
     assert scheduler.max_num_running_reqs == 8
 
 
@@ -137,7 +138,7 @@ def test_decode_only_hides_continuations_and_restores_them(monkeypatch):
     scheduler.schedule()
 
     assert seen["running"] == [decode]
-    assert set(scheduler.running) == {decode, continuation}
+    assert scheduler.running == [decode, continuation]
 
 
 def test_preempt_marks_in_flight_async_outputs_stale(monkeypatch):
