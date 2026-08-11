@@ -90,21 +90,28 @@ def _install_gemma4_complete_parser_adapter() -> None:
                 token_extractor = getattr(
                     reasoning_parser, "extract_reasoning_from_token_ids", None
                 )
-                # When the request kept special tokens (the tool parser's
-                # adjust_request forces skip_special_tokens=False whenever
-                # tools are enabled), the plain text path both suffices and
-                # preserves the literal <|tool_call> frames the tool parser
-                # needs; re-decoding segments with skip_special_tokens=True
-                # would strip them. The token-ID rescue is only for text that
-                # detokenization already stripped the channel markers from.
-                marker_text_visible = (
-                    reasoning_parser.start_token in model_output
-                    or reasoning_parser.end_token in model_output
-                )
+                # The token-ID domain is authoritative whenever the output
+                # carries real structural marker tokens: a marker spelled as
+                # ordinary text (including a text-spelled quote marker, which
+                # would blind the text scan's quote toggling) is then literal
+                # data, matching the streaming path's ID-domain scans. The
+                # extractor decodes content with skip_special_tokens=False, so
+                # literal <|tool_call> frames survive for the tool parser. The
+                # text path remains the fallback for tokenizers that expose
+                # markers only as text pieces (no structural token IDs).
+                structural_token_ids = {
+                    getattr(reasoning_parser, "start_token_id", None),
+                    getattr(reasoning_parser, "end_token_id", None),
+                    getattr(reasoning_parser, "tool_call_token_id", None),
+                }
+                structural_token_ids.discard(None)
                 if (
                     model_output_token_ids
                     and callable(token_extractor)
-                    and not marker_text_visible
+                    and any(
+                        token_id in structural_token_ids
+                        for token_id in model_output_token_ids
+                    )
                 ):
                     reasoning, content = token_extractor(
                         model_output_token_ids, model_output

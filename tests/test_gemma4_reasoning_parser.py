@@ -558,6 +558,28 @@ def test_repeated_channel_markers_match_nonstream_across_40_chunkings():
         assert (reasoning, content) == expected, (chunks, id_chunks)
 
 
+def test_trailing_turn_after_id_close_keeps_streaming_handoff_ended():
+    """The walk's fresh-turn reset must not un-end the orchestrator handoff
+    for the delta whose own extraction already transitioned to content: a
+    close + tool frame + trailing <|turn> in ONE delta previously reported
+    is_reasoning_end_streaming == False, so the tool phase was never entered
+    and completed calls were dropped."""
+    parser = _parser()
+    ids = [1, 10, 2, 4, 14, 6, 3]
+    delta_text = FakeTokenizer().decode(ids, skip_special_tokens=False)
+
+    result = parser.extract_reasoning_streaming(
+        "", delta_text, delta_text, [], ids, ids
+    )
+
+    assert result is not None
+    assert result.reasoning == "Reason."
+    assert parser.is_reasoning_end_streaming(ids, []) is True
+    # The raw walk keeps fresh-turn semantics (a new <|channel> after the
+    # reset may open a new block); only the per-stream handoff is latched.
+    assert not _parser().is_reasoning_end(ids)
+
+
 def test_repeated_channel_stickiness_resets_for_a_fresh_turn():
     closed_ids = [1, 35, 2, 36, 1, 37]
 

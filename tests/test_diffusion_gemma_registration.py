@@ -141,11 +141,11 @@ def test_non_streaming_parser_adapter_uses_raw_token_ids():
     assert tool_calls == []
 
 
-def test_non_streaming_parser_prefers_text_when_markers_visible():
-    """When the request kept special tokens (the tool parser's adjust_request
-    forces skip_special_tokens=False whenever tools are enabled), the text
-    path must be used so literal <|tool_call> frames survive for the tool
-    parser instead of being stripped by segment re-decoding."""
+def test_non_streaming_parser_keeps_tool_frames_with_markers_visible():
+    """With real structural token IDs present the ID-domain extractor is
+    authoritative even when marker text is visible; it decodes content with
+    skip_special_tokens=False, so literal <|tool_call> frames survive for the
+    tool parser."""
     ReasoningParserManager.register_module(
         name="diffusion_gemma",
         module=Gemma4ReasoningParser,
@@ -186,6 +186,56 @@ def test_streaming_unified_parser_preserves_same_canvas_tool_call():
     assert result.content is None
     assert result.tool_calls
     assert result.tool_calls[0].function.name == "get_weather"
+
+
+def test_unified_whole_canvas_trailing_turn_keeps_tool_call():
+    """A trailing <|turn>/<|tool_response> in the same delta as the reasoning
+    close (the stop token lands in the final canvas, and vLLM 0.24 appends the
+    stop token id to token_ids even when its text is stripped) must not un-end
+    the reasoning handoff: the completed tool call has to reach the tool
+    parser instead of leaking as raw frame text in content."""
+    tokenizer = FakeTokenizer()
+    for tail_id in (3, 5):
+        parser = _unified_parser()
+        token_ids = [1, 10, 2, 4, 17, 6, tail_id]
+        delta_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+        result = parser.parse_delta(
+            delta_text=delta_text,
+            delta_token_ids=token_ids,
+            request=SimpleNamespace(tool_choice="auto", tools=[]),
+            prompt_token_ids=[],
+            finished=True,
+        )
+
+        assert result is not None
+        assert result.reasoning == "Reason."
+        assert "<|tool_call>" not in (result.content or "")
+        assert result.tool_calls
+        assert result.tool_calls[0].function.name == "a"
+        assert json.loads(result.tool_calls[0].function.arguments) == {"x": 1}
+
+
+def test_unified_nonstream_text_spelled_quote_keeps_id_domain():
+    """A quote marker spelled as ordinary text tokens inside reasoning must
+    not blind the non-streaming parse: with real structural token IDs present
+    the ID domain is authoritative, matching the streaming path, so the close
+    marker and the tool frame stay structural."""
+    tokenizer = FakeTokenizer()
+    parser = _unified_parser()
+    token_ids = [1, 33, 34, 11, 2, 28, 4, 17, 6]
+    model_output = tokenizer.decode(token_ids, skip_special_tokens=False)
+
+    reasoning, content, tool_calls = parser.parse(
+        model_output,
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+        model_output_token_ids=token_ids,
+    )
+
+    assert reasoning == 'Reason.<|"|>Answer.'
+    assert content == "Before "
+    assert tool_calls and tool_calls[0].name == "a"
+    assert json.loads(tool_calls[0].arguments) == {"x": 1}
 
 
 def test_unified_parser_handles_implicit_reasoning_to_tool_transition():

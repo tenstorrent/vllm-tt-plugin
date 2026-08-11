@@ -29,6 +29,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         self._stream_phase: str = "unknown"
         self._marker_buffer: str = ""
         self._text_reasoning_ended: bool = False
+        self._id_reasoning_ended: bool = False
         self._stream_content_start: int | None = None
         self._prompt_reasoning_active: bool = False
         self._prompt_reasoning_in_quote: bool = False
@@ -64,7 +65,15 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             initial_reasoning_open=self._prompt_reasoning_active,
             initial_in_quote=self._prompt_reasoning_in_quote,
         )
-        return self._text_reasoning_ended or token_reasoning_ended
+        # _id_reasoning_ended latches ID-path transitions to content, so a
+        # trailing <|turn>/<|tool_response> in the same delta as the close
+        # (the walk's fresh-turn reset) cannot un-end the orchestrator handoff
+        # for a stream whose own extraction already moved past reasoning.
+        return (
+            self._text_reasoning_ended
+            or self._id_reasoning_ended
+            or token_reasoning_ended
+        )
 
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         self._prompt_reasoning_active = False
@@ -357,6 +366,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                 return _delta(prefix, reasoning, None)
 
             self._stream_phase = "content"
+            self._id_reasoning_ended = True
             self._stream_content_start = content_start
             reasoning = self._decode_reasoning(
                 delta_token_ids[start_idx + 1 : reasoning_end]
@@ -405,6 +415,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                     reasoning_end = transition_idx
                     content_start = transition_idx + 1
                 self._stream_phase = "content"
+                self._id_reasoning_ended = True
                 self._stream_content_start = content_start
                 return _delta(
                     None,

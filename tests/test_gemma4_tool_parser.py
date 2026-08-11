@@ -46,6 +46,10 @@ _TRUNCATED_QUOTE_FRAME_SIBLING = (
     f"Before {TOOL_CALL_START}call:bad{{x:{QUOTE}unterminated"
     f"{TOOL_CALL_START}call:good{{y:{QUOTE}v{QUOTE}}}{TOOL_CALL_END} after"
 )
+_UNTERMINATED_QUOTE_SIBLING_WITH_MIDDLE = (
+    f"Before {TOOL_CALL_START}call:bad{{x:{QUOTE}oops}}{TOOL_CALL_END}"
+    f" MIDDLE {TOOL_CALL_START}call:good{{y:{QUOTE}v{QUOTE}}}{TOOL_CALL_END} after"
+)
 _QUOTED_SIBLING_SHAPED_LITERAL = (
     f"{TOOL_CALL_START}call:outer{{q:{QUOTE}"
     f"literal}}{TOOL_CALL_END}"
@@ -383,6 +387,38 @@ def test_non_streaming_truncated_quote_frame_recovers_quoted_sibling(
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].function.name == "good"
     assert json.loads(result.tool_calls[0].function.arguments) == {"y": "v"}
+
+
+def test_non_streaming_end_recovery_preserves_content_between_frames(
+    parser: Gemma4ToolParser,
+):
+    """Pin recovery_end specifically: the malformed frame must finalize at its
+    own END marker so visible text between that END and the sibling START
+    survives. recovery_start alone would truncate at the sibling START and
+    silently drop the MIDDLE text."""
+    result = parser.extract_tool_calls(
+        _UNTERMINATED_QUOTE_SIBLING_WITH_MIDDLE, request=None
+    )
+
+    assert result.tools_called is True
+    assert result.content == "Before  MIDDLE  after"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"y": "v"}
+
+
+def test_stream_finish_end_recovery_preserves_content_between_frames():
+    parser, content, calls = _direct_stream([_UNTERMINATED_QUOTE_SIBLING_WITH_MIDDLE])
+    finished = parser.finish_streaming()
+    finished_calls = (finished.tool_calls or []) if finished is not None else []
+
+    assert calls == []
+    assert finished is not None
+    assert content + (finished.content or "") == "Before  MIDDLE  after"
+    assert len(finished_calls) == 1
+    assert finished_calls[0].index == 0
+    assert finished_calls[0].function.name == "good"
+    assert json.loads(finished_calls[0].function.arguments) == {"y": "v"}
 
 
 def test_non_streaming_keeps_sibling_shaped_quoted_literal(
