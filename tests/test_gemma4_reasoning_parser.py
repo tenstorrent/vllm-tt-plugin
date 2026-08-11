@@ -21,6 +21,7 @@ class FakeTokenizer:
         24: "<|tool_call>call:a{",
         25: "<|tool_call>call:a{x:1",
         26: "Tail<|too",
+        27: "<chan",
     }
     special_pieces = {
         1: "<|channel>",
@@ -167,6 +168,102 @@ def test_short_reasoning_prefix_emitted_when_phase_ends():
     assert result is not None
     assert result.reasoning == "tho"
     assert result.content is None
+
+
+def test_short_reasoning_prefix_emitted_when_next_delta_ends_reasoning():
+    parser = _parser()
+    first_text = "<|channel>tho"
+    second_text = "<channel|>Answer."
+
+    first = parser.extract_reasoning_streaming(
+        "",
+        first_text,
+        first_text,
+        [],
+        [],
+        [],
+    )
+    second = parser.extract_reasoning_streaming(
+        first_text,
+        first_text + second_text,
+        second_text,
+        [],
+        [],
+        [],
+    )
+
+    assert first is None
+    assert second is not None
+    assert second.reasoning == "tho"
+    assert second.content == "Answer."
+
+
+def test_short_reasoning_prefix_emitted_before_next_delta_tool_call():
+    parser = _parser()
+    first_text = "<|channel>tho"
+    second_text = "<|tool_call>call:get_weather{}<tool_call|>"
+
+    first = parser.extract_reasoning_streaming(
+        "",
+        first_text,
+        first_text,
+        [],
+        [],
+        [],
+    )
+    second = parser.extract_reasoning_streaming(
+        first_text,
+        first_text + second_text,
+        second_text,
+        [],
+        [],
+        [],
+    )
+
+    assert first is None
+    assert second is not None
+    assert second.reasoning == "tho"
+    assert second.content == "<|tool_call>call:get_weather{}<tool_call|>"
+
+
+def test_held_reasoning_marker_prefix_precedes_definitive_end_id():
+    tokenizer = FakeTokenizer()
+    parser = _parser()
+    first_ids = [1, 10]
+    held_ids = [27]
+    final_ids = [2, 11]
+
+    first = parser.extract_reasoning_streaming(
+        "",
+        tokenizer.decode(first_ids, skip_special_tokens=False),
+        tokenizer.decode(first_ids, skip_special_tokens=False),
+        [],
+        first_ids,
+        first_ids,
+    )
+    held = parser.extract_reasoning_streaming(
+        tokenizer.decode(first_ids, skip_special_tokens=False),
+        tokenizer.decode(first_ids + held_ids, skip_special_tokens=False),
+        tokenizer.decode(held_ids, skip_special_tokens=False),
+        first_ids,
+        first_ids + held_ids,
+        held_ids,
+    )
+    final = parser.extract_reasoning_streaming(
+        tokenizer.decode(first_ids + held_ids, skip_special_tokens=False),
+        tokenizer.decode(first_ids + held_ids + final_ids, skip_special_tokens=False),
+        tokenizer.decode(final_ids, skip_special_tokens=False),
+        first_ids + held_ids,
+        first_ids + held_ids + final_ids,
+        final_ids,
+    )
+
+    assert first is not None and first.reasoning == "Reason."
+    assert held is None
+    assert final is not None
+    assert final.reasoning == "<chan"
+    assert final.content == "Answer."
+    assert parser._marker_buffer == ""
 
 
 def test_literal_marker_can_split_across_text_deltas():

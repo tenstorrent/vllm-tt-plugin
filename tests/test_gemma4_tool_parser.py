@@ -197,11 +197,82 @@ def test_non_streaming_preserves_all_content_and_skips_nameless_calls(
     assert result.content == "Before middle  between after"
 
 
+def test_non_streaming_isolates_malformed_sibling_calls(
+    parser: Gemma4ToolParser,
+):
+    out = (
+        "Before "
+        "<|tool_call>call:a{x:1}<tool_call|>"
+        "<|tool_call>call:bad{xs:[1,}}<tool_call|>"
+        "<|tool_call>call:b{y:2}<tool_call|>"
+        " after"
+    )
+
+    with _fail_if_parser_stalls():
+        result = parser.extract_tool_calls(out, request=None)
+
+    assert result.tools_called is True
+    assert result.content == "Before  after"
+    assert [call.function.name for call in result.tool_calls] == ["a", "b"]
+    assert [json.loads(call.function.arguments) for call in result.tool_calls] == [
+        {"x": 1},
+        {"y": 2},
+    ]
+    assert "call:bad" not in result.content
+
+
+_STRICTLY_MALFORMED_COMPLETED_BODIES = [
+    pytest.param("call:get_wea", id="missing-opening-brace"),
+    pytest.param("call:bad{x:1", id="missing-outer-close"),
+    pytest.param(
+        'call:bad{x:<|"|>unterminated}',
+        id="unterminated-quote-token",
+    ),
+    pytest.param("call:bad{xs:[1,2}", id="mismatched-array-close"),
+]
+
+
+@pytest.mark.parametrize(
+    "malformed_body",
+    _STRICTLY_MALFORMED_COMPLETED_BODIES,
+)
+def test_non_streaming_strict_completed_frame_isolates_valid_sibling(
+    parser: Gemma4ToolParser,
+    malformed_body: str,
+):
+    out = (
+        f"<|tool_call>{malformed_body}<tool_call|>"
+        "<|tool_call>call:good{x:1}<tool_call|>"
+    )
+
+    result = parser.extract_tool_calls(out, request=None)
+
+    assert result.tools_called is True
+    assert result.content is None
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"x": 1}
+
+
 def test_incomplete_block_is_ignored(parser: Gemma4ToolParser):
     # No closing <tool_call|>: not emitted as a completed call.
     out = "<|tool_call>call:a{x:1"
     result = parser.extract_tool_calls(out, request=None)
     assert result.tools_called is False
+    assert result.content is None
+
+
+def test_non_streaming_truncated_frame_does_not_leak_special_tokens(
+    parser: Gemma4ToolParser,
+):
+    out = "Visible <|tool_call>call:a{x:1"
+
+    result = parser.extract_tool_calls(out, request=None)
+
+    assert result.tools_called is False
+    assert result.tool_calls == []
+    assert result.content == "Visible "
+    assert "<|tool_call>" not in result.content
 
 
 def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
@@ -267,6 +338,173 @@ def test_streaming_emits_multiple_calls_and_surrounding_content(
     ]
 
 
+def test_streaming_isolates_malformed_sibling_calls(
+    parser: Gemma4ToolParser,
+):
+    text = (
+        "Before "
+        "<|tool_call>call:a{x:1}<tool_call|>"
+        "<|tool_call>call:bad{xs:[1,}}<tool_call|>"
+        "<|tool_call>call:b{y:2}<tool_call|>"
+        " after"
+    )
+
+    with _fail_if_parser_stalls():
+        result = parser.extract_tool_calls_streaming(
+            "", text, text, [], [], [], request=None
+        )
+
+    assert result is not None
+    assert result.content == "Before  after"
+    assert result.tool_calls
+    assert [call.index for call in result.tool_calls] == [0, 1]
+    assert [call.function.name for call in result.tool_calls] == ["a", "b"]
+    assert [json.loads(call.function.arguments) for call in result.tool_calls] == [
+        {"x": 1},
+        {"y": 2},
+    ]
+    assert parser.streamed_args_for_tool == ['{"x": 1}', '{"y": 2}']
+    assert parser.prev_tool_call_arr == [
+        {"name": "a", "arguments": {"x": 1}},
+        {"name": "b", "arguments": {"y": 2}},
+    ]
+    assert parser._raw_to_public_tool_index == {0: 0, 2: 1}
+
+
+@pytest.mark.parametrize(
+    "malformed_body",
+    _STRICTLY_MALFORMED_COMPLETED_BODIES,
+)
+def test_streaming_strict_completed_frame_isolates_valid_sibling(
+    parser: Gemma4ToolParser,
+    malformed_body: str,
+):
+    text = (
+        f"<|tool_call>{malformed_body}<tool_call|>"
+        "<|tool_call>call:good{x:1}<tool_call|>"
+    )
+
+    result = parser.extract_tool_calls_streaming(
+        "", text, text, [], [], [], request=None
+    )
+
+    assert result is not None
+    assert result.content is None
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].index == 0
+    assert result.tool_calls[0].id is not None
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"x": 1}
+    assert parser._raw_to_public_tool_index == {1: 0}
+    assert parser.streamed_args_for_tool == ['{"x": 1}']
+    assert parser.prev_tool_call_arr == [{"name": "good", "arguments": {"x": 1}}]
+
+
+def test_split_malformed_call_never_commits_before_valid_sibling(
+    parser: Gemma4ToolParser,
+):
+    chunks = [
+        "<|tool_call>call:bad{xs:[1,",
+        "}}<tool_call|><|tool_call>call:good{x:1}<tool_call|>",
+    ]
+    previous_text = ""
+    results = []
+    tool_calls = []
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        results.append(result)
+        if result is not None:
+            tool_calls.extend(result.tool_calls or [])
+        previous_text = current_text
+
+    assert results[0] is None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].index == 0
+    assert tool_calls[0].id is not None
+    assert tool_calls[0].function.name == "good"
+    assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+    assert parser._raw_to_public_tool_index == {1: 0}
+    assert parser.streamed_args_for_tool == ['{"x": 1}']
+    assert parser.prev_tool_call_arr == [{"name": "good", "arguments": {"x": 1}}]
+
+
+def test_streaming_reuses_contiguous_index_after_malformed_raw_block(
+    parser: Gemma4ToolParser,
+):
+    chunks = [
+        "<|tool_call>call:a{x:1}<tool_call|>",
+        "<|tool_call>call:bad{xs:[1,}}<tool_call|><|tool_call>call:b{",
+        "y:2}<tool_call|>",
+    ]
+    previous_text = ""
+    tool_calls = []
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            tool_calls.extend(result.tool_calls or [])
+        previous_text = current_text
+
+    assert [call.index for call in tool_calls] == [0, 1]
+    assert [call.function.name for call in tool_calls] == ["a", "b"]
+    assert json.loads(tool_calls[-1].function.arguments) == {"y": 2}
+    assert parser._raw_to_public_tool_index == {0: 0, 2: 1}
+
+
+def test_finish_streaming_reuses_contiguous_index_after_malformed_raw_block(
+    parser: Gemma4ToolParser,
+):
+    chunks = [
+        "<|tool_call>call:a{x:1}<tool_call|>",
+        "<|tool_call>call:bad{xs:[1,}}<tool_call|><|tool_call>call:b{y:2",
+    ]
+    previous_text = ""
+    tool_calls = []
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            tool_calls.extend(result.tool_calls or [])
+        previous_text = current_text
+
+    final = parser.finish_streaming()
+    assert final is not None
+    tool_calls.extend(final.tool_calls or [])
+
+    assert [call.index for call in tool_calls] == [0, 1]
+    assert tool_calls[1].function.name == "b"
+    assert json.loads(tool_calls[1].function.arguments) == {"y": 2}
+    assert parser._raw_to_public_tool_index == {0: 0, 2: 1}
+
+
 def test_streaming_skips_nameless_completed_call(parser: Gemma4ToolParser):
     delta_text = "<|tool_call>not-a-call{x:1}<tool_call|>"
 
@@ -308,9 +546,89 @@ def test_streaming_split_markers_do_not_duplicate_or_leak(
     assert content == "BeforeAfter"
     assert "<|tool_" not in content
     assert "<tool_" not in content
-    assert [call.index for call in tool_calls] == [0, 0]
+    assert [call.index for call in tool_calls] == [0]
     assert tool_calls[0].function.name == "a"
-    assert json.loads(tool_calls[1].function.arguments) == {"x": 1}
+    assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+
+
+def test_streaming_hides_newly_buffered_suffix_after_completed_call(
+    parser: Gemma4ToolParser,
+):
+    chunks = [
+        "Hi <|tool_call>call:a{x:1}<tool_call|><|tool_",
+        "call>call:b{}<tool_call|>",
+    ]
+    previous_text = ""
+    content = ""
+    names: dict[int, str] = {}
+    arguments: dict[int, str] = {}
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            for call in result.tool_calls or []:
+                if call.function.name:
+                    names[call.index] = call.function.name
+                if call.function.arguments:
+                    arguments[call.index] = (
+                        arguments.get(call.index, "") + call.function.arguments
+                    )
+        previous_text = current_text
+
+    assert content == "Hi "
+    assert "<|tool_" not in content
+    assert names == {0: "a", 1: "b"}
+    assert {index: json.loads(value) for index, value in arguments.items()} == {
+        0: {"x": 1},
+        1: {},
+    }
+
+
+def test_streaming_keeps_visible_content_while_function_name_is_incomplete(
+    parser: Gemma4ToolParser,
+):
+    chunks = [
+        "Let me check. <|tool_call>call:",
+        "get_weather{}<tool_call|>",
+    ]
+    previous_text = ""
+    content = ""
+    names: list[str] = []
+    arguments = ""
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            for call in result.tool_calls or []:
+                if call.function.name:
+                    names.append(call.function.name)
+                if call.function.arguments:
+                    arguments += call.function.arguments
+        previous_text = current_text
+
+    assert content == "Let me check. "
+    assert names == ["get_weather"]
+    assert json.loads(arguments) == {}
 
 
 def test_malformed_nested_array_returns_without_stalling(
@@ -322,7 +640,7 @@ def test_malformed_nested_array_returns_without_stalling(
         result = parser.extract_tool_calls(text, request=None)
 
     assert result.tools_called is False
-    assert result.content == text
+    assert result.content is None
 
 
 def test_malformed_nested_array_direct_parser_fails_without_stalling(
@@ -355,3 +673,43 @@ def test_malformed_unfinished_stream_finalizes_without_stalling(
         result = parser.finish_streaming()
 
     assert result is None
+
+
+def test_finish_streaming_does_not_invent_half_function_name(
+    parser: Gemma4ToolParser,
+):
+    text = "<|tool_call>call:get_wea"
+    streamed = parser.extract_tool_calls_streaming(
+        "", text, text, [], [], [], request=None
+    )
+
+    assert streamed is None
+    assert parser.finish_streaming() is None
+    assert parser._raw_to_public_tool_index == {}
+    assert parser.prev_tool_call_arr == []
+
+
+def test_finish_streaming_distinguishes_open_and_complete_empty_arguments():
+    open_parser = Gemma4ToolParser(tokenizer=None)
+    open_text = "<|tool_call>call:ping{"
+    open_name = open_parser.extract_tool_calls_streaming(
+        "", open_text, open_text, [], [], [], request=None
+    )
+    open_finish = open_parser.finish_streaming()
+
+    assert open_name is None
+    assert open_finish is not None
+    assert open_finish.tool_calls[0].function.name == "ping"
+    assert open_finish.tool_calls[0].function.arguments is None
+
+    complete_parser = Gemma4ToolParser(tokenizer=None)
+    complete_text = "<|tool_call>call:ping{}"
+    complete_name = complete_parser.extract_tool_calls_streaming(
+        "", complete_text, complete_text, [], [], [], request=None
+    )
+    complete_finish = complete_parser.finish_streaming()
+
+    assert complete_name is None
+    assert complete_finish is not None
+    assert complete_finish.tool_calls[0].function.name == "ping"
+    assert json.loads(complete_finish.tool_calls[0].function.arguments) == {}

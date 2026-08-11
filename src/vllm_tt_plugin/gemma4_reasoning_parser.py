@@ -186,11 +186,8 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         result = self._extract_stream_delta(
             delta_text, previous_token_ids, delta_token_ids
         )
-        if result is None:
-            return None
-
-        if result.reasoning is None:
-            return result
+        if result is None or result.reasoning is None:
+            return self._flush_short_reasoning_on_transition(result)
 
         self._reasoning_text += result.reasoning
 
@@ -227,6 +224,23 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             return None
 
         self._prefix_stripped = True
+        result.reasoning = self._reasoning_text
+        return result
+
+    def _flush_short_reasoning_on_transition(
+        self, result: DeltaMessage | None
+    ) -> DeltaMessage | None:
+        if (
+            self._stream_phase != "content"
+            or self._prefix_stripped
+            or not self._reasoning_text
+            or not _THOUGHT_PREFIX.startswith(self._reasoning_text)
+        ):
+            return result
+
+        self._prefix_stripped = True
+        if result is None:
+            result = DeltaMessage()
         result.reasoning = self._reasoning_text
         return result
 
@@ -272,6 +286,7 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
             end_idx = _index_after(delta_token_ids, self.end_token_id, 0)
             tool_idx = _index_after(delta_token_ids, self.tool_call_token_id, 0)
             if end_idx is not None or tool_idx is not None:
+                buffered_reasoning = self._marker_buffer
                 self._marker_buffer = ""
                 if tool_idx is not None and (end_idx is None or tool_idx < end_idx):
                     reasoning_end = tool_idx
@@ -282,7 +297,8 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                 self._stream_phase = "content"
                 return _delta(
                     None,
-                    self._decode_visible(delta_token_ids[:reasoning_end]),
+                    buffered_reasoning
+                    + self._decode_visible(delta_token_ids[:reasoning_end]),
                     self._decode_raw(delta_token_ids[content_start:]),
                 )
             return self._extract_stream_text(delta_text)

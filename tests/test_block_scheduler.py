@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+import pytest
 import torch
 from vllm.config import (
     CacheConfig,
@@ -177,6 +178,65 @@ def test_eos_trims_canvas_and_consumes_physical_reservation():
     assert outputs[0].outputs[0].new_token_ids == [0, 2]
     assert request.num_output_placeholders == 0
     assert request.status == RequestStatus.FINISHED_STOPPED
+
+
+def test_running_block_request_rejects_prefix_cache_reset():
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    assert scheduler.running == [request]
+    assert (
+        scheduler.reset_prefix_cache(
+            reset_running_requests=True,
+            reset_connector=False,
+        )
+        is False
+    )
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
+
+
+def test_block_output_rejects_stale_async_frame():
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    request.async_tokens_to_discard = 1
+
+    with pytest.raises(RuntimeError, match="stale async output"):
+        scheduler.update_from_output(
+            prefill,
+            _runner_output(prefill, list(range(CANVAS))),
+        )
+
+
+def test_block_output_rejects_wrong_width():
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+
+    with pytest.raises(ValueError, match=r"15 != 16"):
+        scheduler.update_from_output(
+            prefill,
+            _runner_output(prefill, list(range(CANVAS - 1))),
+        )
+
+
+def test_block_output_rejects_placeholder_underflow():
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    request.num_output_placeholders = CANVAS - 1
+
+    with pytest.raises(RuntimeError, match="placeholders underflowed"):
+        scheduler.update_from_output(
+            prefill,
+            _runner_output(prefill, list(range(CANVAS))),
+        )
 
 
 def test_k1_delegates_to_upstream_async_scheduler():

@@ -176,6 +176,92 @@ def test_unified_parser_handles_implicit_reasoning_to_tool_transition():
     assert streamed.tool_calls[0].function.name == "get_weather"
 
 
+def test_unified_short_reasoning_prefix_emitted_on_next_delta_end():
+    parser = _unified_parser(with_tools=False)
+    request = SimpleNamespace(tool_choice="none", tools=[])
+
+    first = parser.parse_delta(
+        delta_text="<|channel>tho",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+    second = parser.parse_delta(
+        delta_text="<channel|>Answer.",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+
+    assert first is None
+    assert second is not None
+    assert second.reasoning == "tho"
+    assert second.content == "Answer."
+
+
+def test_unified_short_reasoning_prefix_emitted_before_next_delta_tool():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+
+    first = parser.parse_delta(
+        delta_text="<|channel>tho",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+    second = parser.parse_delta(
+        delta_text="<|tool_call>call:get_weather{}<tool_call|>",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+
+    assert first is None
+    assert second is not None
+    assert second.reasoning == "tho"
+    assert second.content is None
+    assert second.tool_calls
+    assert second.tool_calls[0].function.name == "get_weather"
+
+
+def test_unified_held_reasoning_prefix_precedes_definitive_end_id():
+    tokenizer = FakeTokenizer()
+    parser = _unified_parser(with_tools=False)
+    request = SimpleNamespace(tool_choice="none", tools=[])
+
+    first = parser.parse_delta(
+        delta_text=tokenizer.decode([1, 10], skip_special_tokens=False),
+        delta_token_ids=[1, 10],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+    held = parser.parse_delta(
+        delta_text=tokenizer.decode([27], skip_special_tokens=False),
+        delta_token_ids=[27],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+    final = parser.parse_delta(
+        delta_text=tokenizer.decode([2, 11], skip_special_tokens=False),
+        delta_token_ids=[2, 11],
+        request=request,
+        prompt_token_ids=[],
+        finished=False,
+    )
+
+    assert first is not None and first.reasoning == "Reason."
+    assert held is None
+    assert final is not None
+    assert final.reasoning == "<chan"
+    assert final.content == "Answer."
+
+
 def test_unified_streaming_emits_multiple_tools_and_visible_content():
     tokenizer = FakeTokenizer()
     token_ids = [1, 10, 2, 16, 4, 17, 6, 18, 4, 19, 6, 20]
@@ -261,9 +347,100 @@ def test_unified_streaming_handles_split_tool_markers():
     assert content == "BeforeAfter"
     assert "<|tool_" not in content
     assert "<tool_" not in content
-    assert [call.index for call in tool_calls] == [0, 0]
+    assert [call.index for call in tool_calls] == [0]
     assert tool_calls[0].function.name == "a"
-    assert json.loads(tool_calls[1].function.arguments) == {"x": 1}
+    assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+
+
+def test_unified_streaming_hides_held_marker_after_completed_tool():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        (
+            "<|channel>thought\nR.<channel|>"
+            "Hi <|tool_call>call:a{x:1}<tool_call|><|tool_"
+        ),
+        "call>call:b{}<tool_call|>",
+    ]
+    content = ""
+    tool_calls = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    assert content == "Hi "
+    assert "<|tool_" not in content
+    assert [call.index for call in tool_calls] == [0, 1]
+    assert [call.function.name for call in tool_calls] == ["a", "b"]
+
+
+def test_unified_split_malformed_tool_never_commits_before_valid_sibling():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        "<|channel>thought\nR.<channel|><|tool_call>call:bad{xs:[1,",
+        "}}<tool_call|><|tool_call>call:good{x:1}<tool_call|>",
+    ]
+    tool_calls = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        if result is not None:
+            tool_calls.extend(result.tool_calls or [])
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0].index == 0
+    assert tool_calls[0].id is not None
+    assert tool_calls[0].function.name == "good"
+    assert json.loads(tool_calls[0].function.arguments) == {"x": 1}
+    assert parser._stream_state.history_tool_call_cnt == 1
+    assert parser.tool_parser._raw_to_public_tool_index == {1: 0}
+    assert parser.tool_parser.prev_tool_call_arr == [
+        {"name": "good", "arguments": {"x": 1}}
+    ]
+
+
+def test_unified_strict_completed_tool_isolates_valid_sibling():
+    parser = _unified_parser()
+    result = parser.parse_delta(
+        delta_text=(
+            "<|channel>thought\nR.<channel|>"
+            "<|tool_call>call:get_wea<tool_call|>"
+            "<|tool_call>call:good{x:1}<tool_call|>"
+        ),
+        delta_token_ids=[],
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        prompt_token_ids=[],
+        finished=False,
+    )
+
+    assert result is not None
+    assert result.tool_calls
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].index == 0
+    assert result.tool_calls[0].id is not None
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"x": 1}
+    assert parser._stream_state.history_tool_call_cnt == 1
+    assert parser.tool_parser._raw_to_public_tool_index == {1: 0}
+    assert parser.tool_parser.prev_tool_call_arr == [
+        {"name": "good", "arguments": {"x": 1}}
+    ]
 
 
 def test_unified_finish_does_not_fabricate_empty_arguments():

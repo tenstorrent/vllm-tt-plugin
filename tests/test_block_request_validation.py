@@ -213,6 +213,15 @@ class BlockModel:
     }
 
 
+class ARModel:
+    model_capabilities = {
+        "output_tokens_per_step": 1,
+        "supports_sample_on_device": True,
+        "supports_async_decode": False,
+        "supports_prefix_caching": False,
+    }
+
+
 def _patch_model_resolution(monkeypatch, model_class=BlockModel):
     monkeypatch.setattr(
         "vllm_tt_plugin.platform.register_tt_models", lambda *_args, **_kwargs: None
@@ -242,6 +251,64 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.model_config.generation_config == "vllm"
     assert config.diffusion_config is None
+
+
+@pytest.mark.parametrize(
+    ("model_class", "expected_max_tokens", "expected_wrapped"),
+    [
+        (BlockModel, 768, True),
+        (ARModel, 824, False),
+    ],
+)
+def test_startup_installs_input_processor_patch_only_for_block_models(
+    monkeypatch, model_class, expected_max_tokens, expected_wrapped
+):
+    import vllm.v1.engine.input_processor as input_processor
+
+    def process_inputs(self, request_id, prompt, params, *args, **kwargs):
+        TTPlatform.validate_request(prompt, params)
+        cloned_params = params.clone()
+        if cloned_params.max_tokens is None:
+            cloned_params.max_tokens = self.model_config.max_model_len - len(
+                prompt["prompt_token_ids"]
+            )
+        return SimpleNamespace(sampling_params=cloned_params)
+
+    monkeypatch.setattr(
+        input_processor.InputProcessor,
+        "process_inputs",
+        process_inputs,
+    )
+    monkeypatch.delattr(
+        input_processor,
+        "_tt_original_process_inputs",
+        raising=False,
+    )
+    config = _config()
+    _patch_model_resolution(monkeypatch, model_class)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert (
+        input_processor.InputProcessor.process_inputs is not process_inputs
+    ) is expected_wrapped
+    assert hasattr(input_processor, "_tt_original_process_inputs") is expected_wrapped
+
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+    processor = SimpleNamespace(
+        vllm_config=config,
+        model_config=config.model_config,
+    )
+    request = input_processor.InputProcessor.process_inputs(
+        processor,
+        "request",
+        {"prompt_token_ids": [1] * 200},
+        params,
+    )
+
+    assert request.sampling_params.max_tokens == expected_max_tokens
+    assert params.max_tokens is None
 
 
 @pytest.mark.parametrize(
