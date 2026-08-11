@@ -20,7 +20,23 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
-from vllm_tt_plugin.gemma4_tool_parser import Gemma4ToolParser
+from vllm_tt_plugin.gemma4_tool_parser import (
+    QUOTE,
+    TOOL_CALL_END,
+    TOOL_CALL_START,
+    Gemma4ToolParser,
+)
+
+_TOP_LEVEL_MARKER_PAYLOADS = [
+    pytest.param(
+        f"{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}",
+        id="start-before-end",
+    ),
+    pytest.param(
+        f"{TOOL_CALL_END}{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}",
+        id="end-before-start",
+    ),
+]
 
 
 @pytest.fixture
@@ -113,6 +129,59 @@ def test_no_tool_call_returns_content(parser: Gemma4ToolParser):
     assert result.content == out
 
 
+def test_lone_unmatched_end_uses_cleaned_content_branch(parser: Gemma4ToolParser):
+    result = parser.extract_tool_calls(
+        f"Before {TOOL_CALL_END} after",
+        request=None,
+    )
+
+    assert result.tools_called is True
+    assert result.tool_calls == []
+    assert result.content == "Before  after"
+
+
+@pytest.mark.parametrize("payload", _TOP_LEVEL_MARKER_PAYLOADS)
+def test_nonstream_top_level_paired_quote_preserves_literal_markers(
+    parser: Gemma4ToolParser,
+    payload: str,
+):
+    text = f"Before {QUOTE}{payload}{QUOTE} after"
+
+    result = parser.extract_tool_calls(text, request=None)
+
+    assert result.tools_called is False
+    assert result.tool_calls == []
+    assert result.content == text
+
+
+@pytest.mark.parametrize("payload", _TOP_LEVEL_MARKER_PAYLOADS)
+def test_nonstream_top_level_unclosed_quote_preserves_literal_markers(
+    parser: Gemma4ToolParser,
+    payload: str,
+):
+    text = f"Before {QUOTE}{payload} after"
+
+    result = parser.extract_tool_calls(text, request=None)
+
+    assert result.tools_called is False
+    assert result.tool_calls == []
+    assert result.content == text
+
+
+def test_nonstream_real_call_after_closed_top_level_quote():
+    payload = f"{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}"
+    quoted = f"{QUOTE}{payload}{QUOTE}"
+    text = (
+        f"Before {quoted} middle {TOOL_CALL_START}call:good{{x:1}}{TOOL_CALL_END} after"
+    )
+
+    result = Gemma4ToolParser(tokenizer=None).extract_tool_calls(text, request=None)
+
+    assert result.tools_called is True
+    assert result.content == f"Before {quoted} middle  after"
+    assert [call.function.name for call in result.tool_calls] == ["good"]
+
+
 def test_single_call_string_arg(parser: Gemma4ToolParser):
     out = '<|tool_call>call:get_weather{location:<|"|>Paris, FR<|"|>}<tool_call|>'
     result = parser.extract_tool_calls(out, request=None)
@@ -162,6 +231,17 @@ def test_string_value_with_delimiters(parser: Gemma4ToolParser):
     # The quote token makes the string atomic, so embedded {}/[]/, are literal.
     out = '<|tool_call>call:h{q:<|"|>a{b},c[d]<|"|>}<tool_call|>'
     assert _args(parser, out) == {"q": "a{b},c[d]"}
+
+
+def test_string_value_with_paired_tool_markers(parser: Gemma4ToolParser):
+    marker_text = (
+        f"before{TOOL_CALL_END}{TOOL_CALL_START}call:b{{x:2}}{TOOL_CALL_END}after"
+    )
+    out = f'<|tool_call>call:h{{q:<|"|>{marker_text}<|"|>}}<tool_call|>'
+    result = parser.extract_tool_calls(out, request=None)
+
+    assert [call.function.name for call in result.tool_calls] == ["h"]
+    assert json.loads(result.tool_calls[0].function.arguments) == {"q": marker_text}
 
 
 def test_multiple_calls_and_leading_content(parser: Gemma4ToolParser):
@@ -254,11 +334,29 @@ def test_non_streaming_strict_completed_frame_isolates_valid_sibling(
     assert json.loads(result.tool_calls[0].function.arguments) == {"x": 1}
 
 
-def test_incomplete_block_is_ignored(parser: Gemma4ToolParser):
+@pytest.mark.parametrize(
+    "malformed_body",
+    _STRICTLY_MALFORMED_COMPLETED_BODIES,
+)
+def test_non_streaming_all_malformed_frames_use_cleaned_content_branch(
+    parser: Gemma4ToolParser,
+    malformed_body: str,
+):
+    out = f"Before <|tool_call>{malformed_body}<tool_call|> after"
+
+    result = parser.extract_tool_calls(out, request=None)
+
+    assert result.tools_called is True
+    assert result.tool_calls == []
+    assert result.content == "Before  after"
+
+
+def test_incomplete_block_uses_cleaned_content_branch(parser: Gemma4ToolParser):
     # No closing <tool_call|>: not emitted as a completed call.
     out = "<|tool_call>call:a{x:1"
     result = parser.extract_tool_calls(out, request=None)
-    assert result.tools_called is False
+    assert result.tools_called is True
+    assert result.tool_calls == []
     assert result.content is None
 
 
@@ -269,10 +367,24 @@ def test_non_streaming_truncated_frame_does_not_leak_special_tokens(
 
     result = parser.extract_tool_calls(out, request=None)
 
-    assert result.tools_called is False
+    assert result.tools_called is True
     assert result.tool_calls == []
     assert result.content == "Visible "
     assert "<|tool_call>" not in result.content
+
+
+def test_non_streaming_truncated_frame_resyncs_to_valid_sibling(
+    parser: Gemma4ToolParser,
+):
+    out = "Before <|tool_call>call:bad{x:1<|tool_call>call:good{x:2}<tool_call|> after"
+
+    result = parser.extract_tool_calls(out, request=None)
+
+    assert result.tools_called is True
+    assert result.content == "Before  after"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].function.name == "good"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"x": 2}
 
 
 def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
@@ -310,6 +422,310 @@ def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
 
     assert name == "get_weather"
     assert json.loads(args_acc) == {"location": "Paris", "units": "c"}
+
+
+def _direct_stream(chunks: list[str]):
+    parser = Gemma4ToolParser(tokenizer=None)
+    previous_text = ""
+    content = ""
+    tool_calls = []
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+        previous_text = current_text
+
+    assert all(call.id is not None for call in tool_calls)
+    summary = [
+        (
+            call.index,
+            call.function.name,
+            json.loads(call.function.arguments),
+        )
+        for call in tool_calls
+    ]
+    return parser, content, summary
+
+
+@pytest.mark.parametrize("payload", _TOP_LEVEL_MARKER_PAYLOADS)
+def test_streaming_top_level_paired_quote_never_executes_literal_markers(
+    payload: str,
+):
+    parser = Gemma4ToolParser(tokenizer=None)
+    chunks = [f"Before {QUOTE}", payload, f"{QUOTE} after"]
+    previous_text = ""
+    content = ""
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            assert result.tool_calls == []
+        previous_text = current_text
+
+    assert content == "".join(chunks)
+    assert parser.finish_streaming() is None
+    assert parser._raw_to_public_tool_index == {}
+
+
+@pytest.mark.parametrize("payload", _TOP_LEVEL_MARKER_PAYLOADS)
+def test_streaming_top_level_unclosed_quote_stays_literal_at_finish(
+    payload: str,
+):
+    parser = Gemma4ToolParser(tokenizer=None)
+    chunks = [f"Before {QUOTE}", payload, " after"]
+    previous_text = ""
+    content = ""
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            assert result.tool_calls == []
+        previous_text = current_text
+
+    assert content == "".join(chunks)
+    assert parser.finish_streaming() is None
+    assert parser._raw_to_public_tool_index == {}
+
+
+def test_streaming_real_call_after_closed_top_level_quote_emits():
+    payload = f"{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}"
+    parser = Gemma4ToolParser(tokenizer=None)
+    chunks = [
+        f"Before {QUOTE}",
+        payload,
+        (f"{QUOTE} middle {TOOL_CALL_START}call:good{{x:1}}{TOOL_CALL_END} after"),
+    ]
+    previous_text = ""
+    content = ""
+    tool_calls = []
+
+    for index, chunk in enumerate(chunks):
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+            if index < 2:
+                assert result.tool_calls == []
+        previous_text = current_text
+
+    quoted = f"{QUOTE}{payload}{QUOTE}"
+    assert content == f"Before {quoted} middle  after"
+    assert [call.index for call in tool_calls] == [0]
+    assert [call.function.name for call in tool_calls] == ["good"]
+
+
+def test_streaming_stray_end_is_chunk_invariant_and_keeps_call_indices():
+    chunks = [
+        "<|tool_call>call:a{x:1}<tool_call|>",
+        " visible x ",
+        TOOL_CALL_END,
+        " visible y ",
+        "<|tool_call>call:b{x:2}<tool_call|>",
+        "<|tool_call>call:c{x:3}<tool_call|>",
+    ]
+
+    chunked_parser, chunked_content, chunked_calls = _direct_stream(chunks)
+    _, one_delta_content, one_delta_calls = _direct_stream(["".join(chunks)])
+
+    expected_calls = [
+        (0, "a", {"x": 1}),
+        (1, "b", {"x": 2}),
+        (2, "c", {"x": 3}),
+    ]
+    assert chunked_content == one_delta_content == " visible x  visible y "
+    assert TOOL_CALL_END not in chunked_content
+    assert chunked_calls == one_delta_calls == expected_calls
+    assert chunked_parser._raw_to_public_tool_index == {0: 0, 1: 1, 2: 2}
+
+
+def test_streaming_quoted_end_is_chunk_invariant_and_keeps_call_indices():
+    chunks = [
+        '<|tool_call>call:a{q:<|"|>before',
+        TOOL_CALL_END,
+        'after<|"|>}<tool_call|>',
+        " visible ",
+        "<|tool_call>call:b{x:2}<tool_call|>",
+        "<|tool_call>call:c{x:3}<tool_call|>",
+    ]
+
+    chunked_parser, chunked_content, chunked_calls = _direct_stream(chunks)
+    _, one_delta_content, one_delta_calls = _direct_stream(["".join(chunks)])
+
+    expected_calls = [
+        (0, "a", {"q": "before<tool_call|>after"}),
+        (1, "b", {"x": 2}),
+        (2, "c", {"x": 3}),
+    ]
+    assert chunked_content == one_delta_content == " visible "
+    assert chunked_calls == one_delta_calls == expected_calls
+    assert chunked_parser._raw_to_public_tool_index == {0: 0, 1: 1, 2: 2}
+
+
+def test_streaming_paired_tool_markers_are_literal_and_chunk_invariant():
+    marker_text = (
+        f"before{TOOL_CALL_END}{TOOL_CALL_START}call:b{{x:2}}{TOOL_CALL_END}after"
+    )
+    chunks = [
+        f'<|tool_call>call:a{{q:<|"|>before{TOOL_CALL_END}',
+        f"{TOOL_CALL_START}call:b{{x:2}}{TOOL_CALL_END}after",
+        '<|"|>}<tool_call|>',
+    ]
+
+    parser = Gemma4ToolParser(tokenizer=None)
+    previous_text = ""
+    content = ""
+    chunked_calls = []
+    interim_tool_deltas = []
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        interim_tool_deltas.append(
+            list(result.tool_calls or []) if result is not None else []
+        )
+        if result is not None:
+            content += result.content or ""
+            chunked_calls.extend(result.tool_calls or [])
+        previous_text = current_text
+
+    _, one_delta_content, one_delta_calls = _direct_stream(["".join(chunks)])
+
+    expected_calls = [(0, "a", {"q": marker_text})]
+    chunked_summary = [
+        (
+            call.index,
+            call.function.name,
+            json.loads(call.function.arguments),
+        )
+        for call in chunked_calls
+    ]
+    assert interim_tool_deltas[:2] == [[], []]
+    assert content == one_delta_content == ""
+    assert chunked_summary == one_delta_calls == expected_calls
+    assert parser._raw_to_public_tool_index == {0: 0}
+
+
+def test_streaming_truncated_frame_resyncs_to_valid_sibling():
+    chunks = [
+        "Before <|tool_call>call:bad{x:1",
+        "<|tool_call>call:good{x:2}<tool_call|> after",
+    ]
+
+    parser, content, calls = _direct_stream(chunks)
+
+    assert content == "Before  after"
+    assert calls == [(0, "good", {"x": 2})]
+    assert parser._raw_to_public_tool_index == {1: 0}
+    assert parser.prev_tool_call_arr == [{"name": "good", "arguments": {"x": 2}}]
+
+
+def test_streaming_unterminated_quote_defers_sibling_until_finish():
+    chunks = [
+        'Before <|tool_call>call:bad{x:<|"|>unterminated',
+        "<|tool_call>call:good{x:2}<tool_call|> after",
+    ]
+    parser = Gemma4ToolParser(tokenizer=None)
+    previous_text = ""
+    content = ""
+    streamed_calls = []
+
+    for chunk in chunks:
+        current_text = previous_text + chunk
+        result = parser.extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            chunk,
+            [],
+            [],
+            [],
+            request=None,
+        )
+        if result is not None:
+            content += result.content or ""
+            streamed_calls.extend(result.tool_calls or [])
+        previous_text = current_text
+
+    assert streamed_calls == []
+    finished = parser.finish_streaming()
+
+    assert finished is not None
+    content += finished.content or ""
+    finished_calls = finished.tool_calls or []
+    assert content == "Before  after"
+    assert len(finished_calls) == 1
+    assert finished_calls[0].index == 0
+    assert finished_calls[0].function.name == "good"
+    assert json.loads(finished_calls[0].function.arguments) == {"x": 2}
+    assert parser._raw_to_public_tool_index == {1: 0}
+
+
+def test_finish_streaming_emits_all_new_siblings_without_duplicates():
+    text = (
+        "<|tool_call>call:a{x:1}<tool_call|>"
+        'Before <|tool_call>call:bad{x:<|"|>unterminated'
+        "<|tool_call>call:b{x:2}<tool_call|>"
+        "<|tool_call>call:c{x:3}<tool_call|> after"
+    )
+    parser = Gemma4ToolParser(tokenizer=None)
+    streamed = parser.extract_tool_calls_streaming(
+        "", text, text, [], [], [], request=None
+    )
+
+    assert streamed is not None
+    assert [call.function.name for call in streamed.tool_calls or []] == ["a"]
+    finished = parser.finish_streaming()
+
+    assert finished is not None
+    assert finished.content == " after"
+    assert [call.index for call in finished.tool_calls or []] == [1, 2]
+    assert [call.function.name for call in finished.tool_calls or []] == ["b", "c"]
+    assert parser._raw_to_public_tool_index == {0: 0, 2: 1, 3: 2}
 
 
 def test_streaming_emits_multiple_calls_and_surrounding_content(
@@ -387,6 +803,10 @@ def test_streaming_strict_completed_frame_isolates_valid_sibling(
     result = parser.extract_tool_calls_streaming(
         "", text, text, [], [], [], request=None
     )
+
+    if malformed_body == 'call:bad{x:<|"|>unterminated}':
+        assert result is None
+        result = parser.finish_streaming()
 
     assert result is not None
     assert result.content is None
@@ -639,7 +1059,8 @@ def test_malformed_nested_array_returns_without_stalling(
     with _fail_if_parser_stalls():
         result = parser.extract_tool_calls(text, request=None)
 
-    assert result.tools_called is False
+    assert result.tools_called is True
+    assert result.tool_calls == []
     assert result.content is None
 
 
@@ -675,6 +1096,37 @@ def test_malformed_unfinished_stream_finalizes_without_stalling(
     assert result is None
 
 
+def test_malformed_completed_quote_is_not_emitted_at_stream_finish(
+    parser: Gemma4ToolParser,
+):
+    text = '<|tool_call>call:f{x:<|"|>unterminated}<tool_call|>'
+    streamed = parser.extract_tool_calls_streaming(
+        "", text, text, [], [], [], request=None
+    )
+
+    assert streamed is None
+    assert parser.finish_streaming() is None
+    assert parser._raw_to_public_tool_index == {}
+    assert parser.prev_tool_call_arr == []
+
+
+def test_stream_finish_recovers_content_after_final_malformed_quote(
+    parser: Gemma4ToolParser,
+):
+    text = 'Before <|tool_call>call:f{x:<|"|>unterminated}<tool_call|> after'
+    streamed = parser.extract_tool_calls_streaming(
+        "", text, text, [], [], [], request=None
+    )
+    finished = parser.finish_streaming()
+
+    assert streamed is not None
+    assert streamed.content == "Before "
+    assert streamed.tool_calls == []
+    assert finished is not None
+    assert finished.content == " after"
+    assert finished.tool_calls == []
+
+
 def test_finish_streaming_does_not_invent_half_function_name(
     parser: Gemma4ToolParser,
 ):
@@ -687,6 +1139,23 @@ def test_finish_streaming_does_not_invent_half_function_name(
     assert parser.finish_streaming() is None
     assert parser._raw_to_public_tool_index == {}
     assert parser.prev_tool_call_arr == []
+
+
+def test_finish_streaming_does_not_leak_buffered_marker_inside_open_call(
+    parser: Gemma4ToolParser,
+):
+    text = "<|tool_call>call:ping{x:1}<|tool_"
+    streamed = parser.extract_tool_calls_streaming(
+        "", text, text, [], [], [], request=None
+    )
+    finished = parser.finish_streaming()
+
+    assert streamed is None
+    assert finished is not None
+    assert finished.content is None
+    assert len(finished.tool_calls) == 1
+    assert finished.tool_calls[0].function.name == "ping"
+    assert json.loads(finished.tool_calls[0].function.arguments) == {"x": 1}
 
 
 def test_finish_streaming_distinguishes_open_and_complete_empty_arguments():

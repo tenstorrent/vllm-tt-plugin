@@ -241,21 +241,103 @@ class Gemma4ToolParser(ToolParser):
             )
         return name, arguments
 
-    def _iter_blocks(self, text: str):
-        """Yield (block_body, complete) for each ``<|tool_call>`` block."""
+    @staticmethod
+    def _find_block_boundary(
+        text: str, body_start: int, *, final: bool = False
+    ) -> tuple[int, bool] | None:
+        """Find the next structural frame boundary.
+
+        The boolean is true for a complete END boundary and false for a nested
+        START that truncates the current frame. Markers inside a paired quote
+        are always literal. An unpaired quote blocks ordinary streaming
+        classification; only final scanning may recover structural markers
+        after it.
+        """
+        i = body_start
+        while i < len(text):
+            if text.startswith(QUOTE, i):
+                quote_end = text.find(QUOTE, i + len(QUOTE))
+                if quote_end != -1:
+                    i = quote_end + len(QUOTE)
+                    continue
+                if not final:
+                    return None
+                i += len(QUOTE)
+                continue
+            if text.startswith(TOOL_CALL_START, i):
+                return i, False
+            if text.startswith(TOOL_CALL_END, i):
+                return i, True
+            i += 1
+        return None
+
+    @staticmethod
+    def _iter_top_level_markers(text: str, start: int = 0):
+        """Yield structural START/END markers outside top-level quotes."""
+        i = start
+        while i < len(text):
+            if text.startswith(QUOTE, i):
+                quote_end = text.find(QUOTE, i + len(QUOTE))
+                if quote_end == -1:
+                    return
+                i = quote_end + len(QUOTE)
+                continue
+            if text.startswith(TOOL_CALL_START, i):
+                yield i, TOOL_CALL_START
+                i += len(TOOL_CALL_START)
+                continue
+            if text.startswith(TOOL_CALL_END, i):
+                yield i, TOOL_CALL_END
+                i += len(TOOL_CALL_END)
+                continue
+            i += 1
+
+    @classmethod
+    def _find_top_level_start(cls, text: str, start: int) -> int | None:
+        for marker_at, marker in cls._iter_top_level_markers(text, start):
+            if marker == TOOL_CALL_START:
+                return marker_at
+        return None
+
+    @classmethod
+    def _clean_top_level_visible(cls, text: str) -> str:
+        """Remove unmatched structural ENDs while preserving quoted markers."""
+        parts: list[str] = []
+        cursor = 0
+        for marker_at, marker in cls._iter_top_level_markers(text):
+            if marker != TOOL_CALL_END:
+                continue
+            parts.append(text[cursor:marker_at])
+            cursor = marker_at + len(TOOL_CALL_END)
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+    @classmethod
+    def _iter_block_spans(cls, text: str, *, final: bool = False):
+        """Yield (start, end_after, body, complete) for START-anchored blocks."""
         idx = 0
         n = len(text)
         while True:
-            start = text.find(TOOL_CALL_START, idx)
-            if start == -1:
+            start = cls._find_top_level_start(text, idx)
+            if start is None:
                 return
             body_start = start + len(TOOL_CALL_START)
-            end = text.find(TOOL_CALL_END, body_start)
-            if end == -1:
-                yield text[body_start:n], False
+            boundary = cls._find_block_boundary(text, body_start, final=final)
+            if boundary is None:
+                yield start, n, text[body_start:n], False
                 return
-            yield text[body_start:end], True
-            idx = end + len(TOOL_CALL_END)
+            boundary_at, complete = boundary
+            boundary_after = (
+                boundary_at + len(TOOL_CALL_END) if complete else boundary_at
+            )
+            yield start, boundary_after, text[body_start:boundary_at], complete
+            idx = boundary_after
+
+    @classmethod
+    def _iter_blocks(cls, text: str, *, final: bool = False):
+        """Yield (block_body, complete) for each ``<|tool_call>`` block."""
+        for _, _, body, complete in cls._iter_block_spans(text, final=final):
+            yield body, complete
 
     # ------------------------------------------------------------------
     # Non-streaming
@@ -265,26 +347,36 @@ class Gemma4ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        if TOOL_CALL_START not in model_output:
+        top_level_markers = list(self._iter_top_level_markers(model_output))
+        has_start = any(marker == TOOL_CALL_START for _, marker in top_level_markers)
+        has_end = any(marker == TOOL_CALL_END for _, marker in top_level_markers)
+        if not has_start and not has_end:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
+            )
+        if not has_start:
+            content = self._clean_top_level_visible(model_output)
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=[],
+                content=content or None,
             )
 
         tool_calls: list[ToolCall] = []
         visible_parts: list[str] = []
         cursor = 0
-        while True:
-            start = model_output.find(TOOL_CALL_START, cursor)
-            if start == -1:
-                visible_parts.append(model_output[cursor:])
-                break
-            visible_parts.append(model_output[cursor:start])
-            body_start = start + len(TOOL_CALL_START)
-            end = model_output.find(TOOL_CALL_END, body_start)
-            if end == -1:
+        for start, end_after, body, complete in self._iter_block_spans(
+            model_output, final=True
+        ):
+            visible_parts.append(
+                self._clean_top_level_visible(model_output[cursor:start])
+            )
+            if not complete:
                 # A truncated frame is structural output, not assistant content.
-                break
-            body = model_output[body_start:end]
+                cursor = end_after
+                if end_after == len(model_output):
+                    break
+                continue
             try:
                 name, arguments = self._parse_completed_call(body)
             except (IndexError, ValueError) as exc:
@@ -298,11 +390,12 @@ class Gemma4ToolParser(ToolParser):
                     ),
                 )
                 tool_calls.append(tool_call)
-            cursor = end + len(TOOL_CALL_END)
+            cursor = end_after
 
+        visible_parts.append(self._clean_top_level_visible(model_output[cursor:]))
         content = "".join(visible_parts)
         return ExtractedToolCallInformation(
-            tools_called=bool(tool_calls),
+            tools_called=True,
             tool_calls=tool_calls,
             content=content or None,
         )
@@ -350,16 +443,16 @@ class Gemma4ToolParser(ToolParser):
             else current_text
         )
 
-        # No tool call yet: stream as plain content.
-        if TOOL_CALL_START not in current_text:
-            return DeltaMessage(content=delta_text) if delta_text else None
-
         try:
-            end_count = current_text.count(TOOL_CALL_END)
-            previous_complete_count = previous_text.count(TOOL_CALL_END)
+            previous_complete_count = sum(
+                complete for _, complete in self._iter_blocks(previous_text)
+            )
+            current_complete_count = sum(
+                complete for _, complete in self._iter_blocks(current_text)
+            )
 
             tool_calls: list[DeltaToolCall] = []
-            for index in range(previous_complete_count, end_count):
+            for index in range(previous_complete_count, current_complete_count):
                 try:
                     tool_call = self._emit_completed_call(current_text, index)
                 except (IndexError, ValueError) as exc:
@@ -389,20 +482,20 @@ class Gemma4ToolParser(ToolParser):
             logger.exception("Error in Gemma4 streaming tool call extraction")
             return None
 
-    @staticmethod
-    def _visible_content(text: str) -> str:
+    @classmethod
+    def _visible_content(cls, text: str, *, final: bool = False) -> str:
         parts: list[str] = []
-        idx = 0
-        while True:
-            start = text.find(TOOL_CALL_START, idx)
-            if start == -1:
-                parts.append(text[idx:])
-                return "".join(parts)
-            parts.append(text[idx:start])
-            end = text.find(TOOL_CALL_END, start + len(TOOL_CALL_START))
-            if end == -1:
-                return "".join(parts)
-            idx = end + len(TOOL_CALL_END)
+        cursor = 0
+        for start, end_after, _, complete in cls._iter_block_spans(text, final=final):
+            parts.append(cls._clean_top_level_visible(text[cursor:start]))
+            if not complete:
+                cursor = end_after
+                if end_after == len(text):
+                    return "".join(parts)
+                continue
+            cursor = end_after
+        parts.append(cls._clean_top_level_visible(text[cursor:]))
+        return "".join(parts)
 
     def _candidate_public_tool_index(self, raw_index: int) -> int:
         return self._raw_to_public_tool_index.get(
@@ -427,78 +520,116 @@ class Gemma4ToolParser(ToolParser):
         return ""
 
     def finish_streaming(self) -> DeltaMessage | None:
-        buffered_content = ""
         text = self._last_current_text
-        last_start = text.rfind(TOOL_CALL_START)
-        last_end = text.rfind(TOOL_CALL_END)
-        open_call = last_start > last_end
+        buffered_suffix = self.buffered_delta_text
+        visible_text = (
+            text[: -len(buffered_suffix)]
+            if buffered_suffix and text.endswith(buffered_suffix)
+            else text
+        )
+        provisional_visible = self._visible_content(visible_text)
+        final_visible = self._visible_content(visible_text, final=True)
+        buffered_content = (
+            final_visible[len(provisional_visible) :]
+            if final_visible.startswith(provisional_visible)
+            else final_visible
+        )
+
+        blocks = list(self._iter_blocks(visible_text, final=True))
+        open_call = bool(blocks and not blocks[-1][1])
         if not open_call:
-            buffered_content = self.buffered_delta_text
+            buffered_content += buffered_suffix
         self.buffered_delta_text = ""
 
-        tool_call: DeltaToolCall | None = None
+        tool_calls: list[DeltaToolCall] = []
+        final_complete_count = sum(complete for _, complete in blocks)
+        for complete_index in range(final_complete_count):
+            try:
+                tool_call = self._emit_completed_call(
+                    visible_text, complete_index, final=True
+                )
+            except (IndexError, ValueError) as exc:
+                logger.warning(
+                    "Skipping malformed finalized Gemma4 tool call at index %d: %s",
+                    complete_index,
+                    exc,
+                )
+                continue
+            if tool_call is not None:
+                tool_calls.append(tool_call)
+
         if open_call:
-            body = text[last_start + len(TOOL_CALL_START) :]
+            body = blocks[-1][0]
             brace = body.find("{", len(CALL_PREFIX))
             if brace == -1:
-                return (
-                    DeltaMessage(content=buffered_content) if buffered_content else None
-                )
-            try:
-                name, arguments = self._parse_call(body)
-            except (IndexError, ValueError):
-                logger.exception("Malformed unfinished Gemma4 tool call")
-                return None
-            empty_object_complete = brace >= 0 and body[brace + 1 :].strip() == "}"
-            tool_index = text.count(TOOL_CALL_START) - 1
-            if name and tool_index not in self._raw_to_public_tool_index:
-                arguments_json = (
-                    json.dumps(arguments, ensure_ascii=False)
-                    if arguments or empty_object_complete
-                    else None
-                )
-                public_index = self._candidate_public_tool_index(tool_index)
-                tool_call = DeltaToolCall(
-                    index=public_index,
-                    type="function",
-                    id=make_tool_call_id(),
-                    function=DeltaFunctionCall(
-                        name=name,
-                        arguments=arguments_json,
-                    ).model_dump(exclude_none=True),
-                )
-                self._record_public_tool_index(tool_index, public_index)
-                self.streamed_args_for_tool.append(arguments_json or "")
-                self.prev_tool_call_arr.append(
-                    {
-                        "name": name,
-                        "arguments": arguments,
-                    }
-                )
+                if not tool_calls and not buffered_content:
+                    return None
+            else:
+                try:
+                    name, arguments = self._parse_call(body)
+                except (IndexError, ValueError):
+                    logger.exception("Malformed unfinished Gemma4 tool call")
+                else:
+                    empty_object_complete = body[brace + 1 :].strip() == "}"
+                    tool_index = len(blocks) - 1
+                    if name and tool_index not in self._raw_to_public_tool_index:
+                        arguments_json = (
+                            json.dumps(arguments, ensure_ascii=False)
+                            if arguments or empty_object_complete
+                            else None
+                        )
+                        public_index = self._candidate_public_tool_index(tool_index)
+                        tool_call = DeltaToolCall(
+                            index=public_index,
+                            type="function",
+                            id=make_tool_call_id(),
+                            function=DeltaFunctionCall(
+                                name=name,
+                                arguments=arguments_json,
+                            ).model_dump(exclude_none=True),
+                        )
+                        self._record_public_tool_index(tool_index, public_index)
+                        self.streamed_args_for_tool.append(arguments_json or "")
+                        self.prev_tool_call_arr.append(
+                            {
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        )
+                        tool_calls.append(tool_call)
 
-        if tool_call is None and not buffered_content:
+        if not tool_calls and not buffered_content:
             return None
-        if tool_call is None:
+        if not tool_calls:
             return DeltaMessage(content=buffered_content)
         return DeltaMessage(
             content=buffered_content or None,
-            tool_calls=[tool_call],
+            tool_calls=tool_calls,
         )
 
     def _emit_completed_call(
-        self, current_text: str, tool_index: int
+        self,
+        current_text: str,
+        complete_index: int,
+        *,
+        final: bool = False,
     ) -> DeltaToolCall | None:
         blocks = [
-            body for body, complete in self._iter_blocks(current_text) if complete
+            (raw_index, body)
+            for raw_index, (body, complete) in enumerate(
+                self._iter_blocks(current_text, final=final)
+            )
+            if complete
         ]
-        if not (0 <= tool_index < len(blocks)):
+        if not (0 <= complete_index < len(blocks)):
             return None
-        if tool_index in self._raw_to_public_tool_index:
+        raw_index, body = blocks[complete_index]
+        if raw_index in self._raw_to_public_tool_index:
             return None  # already emitted
-        name, arguments = self._parse_completed_call(blocks[tool_index])
+        name, arguments = self._parse_completed_call(body)
         args_json = json.dumps(arguments, ensure_ascii=False)
 
-        public_index = self._candidate_public_tool_index(tool_index)
+        public_index = self._candidate_public_tool_index(raw_index)
         function = DeltaFunctionCall(name=name, arguments=args_json)
         tool_call = DeltaToolCall(
             index=public_index,
@@ -507,7 +638,7 @@ class Gemma4ToolParser(ToolParser):
             function=function.model_dump(exclude_none=True),
         )
 
-        self._record_public_tool_index(tool_index, public_index)
+        self._record_public_tool_index(raw_index, public_index)
         self.streamed_args_for_tool.append(args_json)
         self.prev_tool_call_arr.append(
             {

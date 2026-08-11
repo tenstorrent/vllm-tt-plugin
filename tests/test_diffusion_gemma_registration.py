@@ -12,7 +12,17 @@ from tests.test_gemma4_reasoning_parser import FakeTokenizer
 from vllm_tt_plugin import platform
 from vllm_tt_plugin.entrypoints import _register_tt_reasoning_parsers
 from vllm_tt_plugin.gemma4_reasoning_parser import Gemma4ReasoningParser
-from vllm_tt_plugin.gemma4_tool_parser import Gemma4ToolParser
+from vllm_tt_plugin.gemma4_tool_parser import (
+    QUOTE,
+    TOOL_CALL_END,
+    TOOL_CALL_START,
+    Gemma4ToolParser,
+)
+
+_TOP_LEVEL_MARKER_PAYLOADS = (
+    f"{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}",
+    f"{TOOL_CALL_END}{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}",
+)
 
 
 def _unified_parser(*, with_tools: bool = True):
@@ -33,6 +43,33 @@ def _unified_parser(*, with_tools: bool = True):
     )
     assert parser_cls is not None
     return parser_cls(FakeTokenizer(), tools=[])
+
+
+def _stream_unified_chunks(chunks, token_chunks=None, prompt_token_ids=None):
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    reasoning = ""
+    content = ""
+    tool_calls = []
+    if token_chunks is None:
+        token_chunks = [[] for _ in chunks]
+    if prompt_token_ids is None:
+        prompt_token_ids = []
+
+    for chunk, token_ids in zip(chunks, token_chunks):
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=token_ids,
+            request=request,
+            prompt_token_ids=prompt_token_ids,
+            finished=False,
+        )
+        if result is not None:
+            reasoning += result.reasoning or ""
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    return reasoning, content, tool_calls
 
 
 def test_diffusion_gemma_reasoning_parser_alias(monkeypatch):
@@ -283,7 +320,7 @@ def test_unified_streaming_emits_multiple_tools_and_visible_content():
     assert [tool.function.name for tool in result.tool_calls] == ["a", "b"]
 
 
-def test_unified_finished_stream_flushes_short_reasoning_prefix():
+def test_unified_finished_stream_flushes_short_prefix_as_reasoning():
     tokenizer = FakeTokenizer()
     token_ids = [1, 15]
     delta_text = tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -297,8 +334,8 @@ def test_unified_finished_stream_flushes_short_reasoning_prefix():
     )
 
     assert result is not None
-    assert result.reasoning is None
-    assert result.content == "tho"
+    assert result.reasoning == "tho"
+    assert result.content is None
 
 
 def test_unified_finished_stream_does_not_duplicate_incomplete_reasoning():
@@ -383,6 +420,522 @@ def test_unified_streaming_hides_held_marker_after_completed_tool():
     assert [call.function.name for call in tool_calls] == ["a", "b"]
 
 
+def test_unified_streaming_stray_end_keeps_later_tools():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        "<|channel>thought\nR.<channel|><|tool_call>call:a{x:1}<tool_call|>",
+        " visible x ",
+        "<tool_call|>",
+        " visible y ",
+        "<|tool_call>call:b{x:2}<tool_call|>",
+        "<|tool_call>call:c{x:3}<tool_call|>",
+    ]
+    content = ""
+    tool_calls = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    assert content == " visible x  visible y "
+    assert "<tool_call|>" not in content
+    assert [call.index for call in tool_calls] == [0, 1, 2]
+    assert [call.function.name for call in tool_calls] == ["a", "b", "c"]
+
+
+def test_unified_streaming_truncated_tool_resyncs_to_valid_sibling():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        ("<|channel>thought\nR.<channel|>Before <|tool_call>call:bad{x:1"),
+        "<|tool_call>call:good{x:2}<tool_call|> after",
+    ]
+    content = ""
+    tool_calls = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    assert content == "Before  after"
+    assert len(tool_calls) == 1
+    assert tool_calls[0].index == 0
+    assert tool_calls[0].function.name == "good"
+    assert json.loads(tool_calls[0].function.arguments) == {"x": 2}
+    assert parser.tool_parser._raw_to_public_tool_index == {1: 0}
+
+
+def test_unified_streaming_preserves_paired_quoted_tool_markers():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        ('<|channel>thought\nR.<channel|><|tool_call>call:a{q:<|"|>before<tool_call|>'),
+        "<|tool_call>call:b{x:2}<tool_call|>after",
+        '<|"|>}<tool_call|>',
+    ]
+    content = ""
+    tool_calls = []
+    interim_tool_deltas = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        interim_tool_deltas.append(
+            list(result.tool_calls or []) if result is not None else []
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    assert interim_tool_deltas[:2] == [[], []]
+    assert content == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0].index == 0
+    assert tool_calls[0].function.name == "a"
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "q": ("before<tool_call|><|tool_call>call:b{x:2}<tool_call|>after")
+    }
+
+
+def test_unified_streaming_top_level_paired_quotes_stay_literal():
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+
+    for payload in _TOP_LEVEL_MARKER_PAYLOADS:
+        parser = _unified_parser()
+        chunks = [
+            f"<|channel>thought\nR.<channel|>Before {QUOTE}",
+            payload,
+            f"{QUOTE} after",
+        ]
+        content = ""
+        tool_calls = []
+
+        for chunk in chunks:
+            result = parser.parse_delta(
+                delta_text=chunk,
+                delta_token_ids=[],
+                request=request,
+                prompt_token_ids=[],
+                finished=False,
+            )
+            if result is not None:
+                content += result.content or ""
+                tool_calls.extend(result.tool_calls or [])
+
+        assert content == f"Before {QUOTE}{payload}{QUOTE} after"
+        assert tool_calls == []
+
+
+def test_unified_streaming_top_level_unclosed_quote_stays_literal_at_finish():
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+
+    for payload in _TOP_LEVEL_MARKER_PAYLOADS:
+        parser = _unified_parser()
+        chunks = [
+            f"<|channel>thought\nR.<channel|>Before {QUOTE}",
+            payload,
+            " after",
+        ]
+        content = ""
+        tool_calls = []
+
+        for chunk in chunks:
+            result = parser.parse_delta(
+                delta_text=chunk,
+                delta_token_ids=[],
+                request=request,
+                prompt_token_ids=[],
+                finished=False,
+            )
+            if result is not None:
+                content += result.content or ""
+                tool_calls.extend(result.tool_calls or [])
+
+        finished = parser.parse_delta(
+            delta_text="",
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=True,
+        )
+        if finished is not None:
+            content += finished.content or ""
+            tool_calls.extend(finished.tool_calls or [])
+
+        assert content == f"Before {QUOTE}{payload} after"
+        assert tool_calls == []
+
+
+def test_unified_streaming_real_call_after_closed_top_level_quote():
+    payload = _TOP_LEVEL_MARKER_PAYLOADS[0]
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        f"<|channel>thought\nR.<channel|>Before {QUOTE}",
+        payload,
+        (f"{QUOTE} middle {TOOL_CALL_START}call:good{{x:1}}{TOOL_CALL_END} after"),
+    ]
+    content = ""
+    tool_calls = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        if result is not None:
+            content += result.content or ""
+            tool_calls.extend(result.tool_calls or [])
+
+    assert content == f"Before {QUOTE}{payload}{QUOTE} middle  after"
+    assert [call.index for call in tool_calls] == [0]
+    assert [call.function.name for call in tool_calls] == ["good"]
+
+
+def test_unified_no_channel_quote_handoff_is_chunk_invariant():
+    for payload in _TOP_LEVEL_MARKER_PAYLOADS:
+        expected = f"Before {QUOTE}{payload}{QUOTE} after"
+        chunkings = (
+            [expected],
+            [f"Before {QUOTE}", payload, f"{QUOTE} after"],
+        )
+
+        for chunks in chunkings:
+            reasoning, content, tool_calls = _stream_unified_chunks(chunks)
+
+            assert reasoning == ""
+            assert content == expected
+            assert tool_calls == []
+
+
+def test_unified_no_channel_real_tool_after_closed_quote():
+    danger = _TOP_LEVEL_MARKER_PAYLOADS[0]
+    real_tool = f"{TOOL_CALL_START}call:good{{x:1}}{TOOL_CALL_END}"
+    chunks = [
+        f"Before {QUOTE}",
+        danger,
+        f"{QUOTE} middle {real_tool} after",
+    ]
+
+    reasoning, content, tool_calls = _stream_unified_chunks(chunks)
+
+    assert reasoning == ""
+    assert content == f"Before {QUOTE}{danger}{QUOTE} middle  after"
+    assert [call.function.name for call in tool_calls] == ["good"]
+    assert all(call.function.name != "danger" for call in tool_calls)
+
+
+def test_unified_no_channel_quote_handoff_with_real_token_ids():
+    tokenizer = FakeTokenizer()
+    payload_ids = (
+        [4, 29, 6],
+        [6, 4, 29, 6],
+    )
+
+    for marker_ids in payload_ids:
+        token_chunks = ([28, 7], marker_ids, [7, 32])
+        chunks = [
+            tokenizer.decode(ids, skip_special_tokens=False) for ids in token_chunks
+        ]
+        reasoning, content, tool_calls = _stream_unified_chunks(chunks, token_chunks)
+
+        assert reasoning == ""
+        assert content == "".join(chunks)
+        assert tool_calls == []
+
+    real_tool_ids = [4, 31, 6]
+    token_chunks = ([28, 7], payload_ids[0], [7, 30, *real_tool_ids, 32])
+    chunks = [tokenizer.decode(ids, skip_special_tokens=False) for ids in token_chunks]
+    reasoning, content, tool_calls = _stream_unified_chunks(chunks, token_chunks)
+
+    assert reasoning == ""
+    assert content == (
+        f"Before {QUOTE}{TOOL_CALL_START}call:danger{{}}{TOOL_CALL_END}"
+        f"{QUOTE} middle  after"
+    )
+    assert [call.function.name for call in tool_calls] == ["good"]
+    assert all(call.function.name != "danger" for call in tool_calls)
+
+
+def test_unified_nonstream_open_reasoning_quotes_are_literal():
+    tokenizer = FakeTokenizer()
+    payloads = (
+        (
+            _TOP_LEVEL_MARKER_PAYLOADS[0],
+            [4, 29, 6],
+        ),
+        (
+            _TOP_LEVEL_MARKER_PAYLOADS[1],
+            [6, 4, 29, 6],
+        ),
+    )
+
+    for payload, payload_ids in payloads:
+        quoted = f"{QUOTE}{payload}{QUOTE}"
+        reasoning, content, tool_calls = _unified_parser().parse(
+            f"<|channel>thought\nReason.{quoted}",
+            request=SimpleNamespace(tool_choice="auto", tools=[]),
+            enable_auto_tools=True,
+        )
+
+        assert reasoning == f"Reason.{quoted}"
+        assert content is None
+        assert not tool_calls
+
+        token_ids = [1, 10, 7, *payload_ids, 7]
+        reasoning, content, tool_calls = _unified_parser().parse(
+            tokenizer.decode(token_ids, skip_special_tokens=True),
+            request=SimpleNamespace(tool_choice="auto", tools=[]),
+            enable_auto_tools=True,
+            model_output_token_ids=token_ids,
+        )
+
+        assert reasoning == f"Reason.{quoted}"
+        assert content is None
+        assert not tool_calls
+
+    real_tool = f"{TOOL_CALL_START}call:good{{}}{TOOL_CALL_END}"
+    quoted_danger = f"{QUOTE}{_TOP_LEVEL_MARKER_PAYLOADS[0]}{QUOTE}"
+    reasoning, content, tool_calls = _unified_parser().parse(
+        f"<|channel>thought\nReason.{quoted_danger} middle {real_tool} after",
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+    )
+
+    assert reasoning == f"Reason.{quoted_danger} middle "
+    assert content == " after"
+    assert [call.name for call in tool_calls] == ["good"]
+    assert all(call.name != "danger" for call in tool_calls)
+
+    token_ids = [1, 10, 7, 4, 29, 6, 7, 30, 4, 31, 6, 32]
+    reasoning, content, tool_calls = _unified_parser().parse(
+        tokenizer.decode(token_ids, skip_special_tokens=True),
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+        model_output_token_ids=token_ids,
+    )
+
+    assert reasoning == f"Reason.{quoted_danger} middle "
+    assert content == " after"
+    assert [call.name for call in tool_calls] == ["good"]
+    assert all(call.name != "danger" for call in tool_calls)
+
+
+def test_unified_fragmented_reasoning_quotes_are_chunk_invariant():
+    danger = _TOP_LEVEL_MARKER_PAYLOADS[0]
+    good = f"{TOOL_CALL_START}call:good{{}}{TOOL_CALL_END}"
+    prefix = "<|channel>thought\nR."
+    expected_reasoning = f"R.{QUOTE}{danger}{QUOTE}"
+    chunkings = [[f"{prefix}{QUOTE}{danger}{QUOTE}{good}"]]
+
+    for split in range(1, len(QUOTE)):
+        chunkings.append(
+            [
+                f"{prefix}{QUOTE[:split]}",
+                f"{QUOTE[split:]}{danger}{QUOTE}{good}",
+            ]
+        )
+        chunkings.append(
+            [
+                f"{prefix}{QUOTE}{danger}{QUOTE[:split]}",
+                f"{QUOTE[split:]}{good}",
+            ]
+        )
+
+    for chunks in chunkings:
+        reasoning, content, tool_calls = _stream_unified_chunks(chunks)
+
+        assert reasoning == expected_reasoning
+        assert content == ""
+        assert [call.function.name for call in tool_calls] == ["good"]
+        assert all(call.function.name != "danger" for call in tool_calls)
+
+
+def test_unified_empty_prompt_omitted_start_is_chunk_invariant():
+    chunkings = (
+        ["thought\nR.<channel|>A"],
+        ["tho", "ught\nR.", "<channel|>A"],
+        ["thought", "\nR.<chan", "nel|>A"],
+        ["tho", "ught\nR.<chan", "nel|>A"],
+        ["thought\nR.<chan", "nel|>A"],
+    )
+
+    for chunks in chunkings:
+        reasoning, content, tool_calls = _stream_unified_chunks(
+            chunks,
+            prompt_token_ids=[],
+        )
+
+        assert reasoning == "R."
+        assert content == "A"
+        assert tool_calls == []
+
+    tokenizer = FakeTokenizer()
+    token_ids = [12, 2, 11]
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        [tokenizer.decode(token_ids, skip_special_tokens=False)],
+        [token_ids],
+        prompt_token_ids=[],
+    )
+
+    assert reasoning == "Part "
+    assert content == "Answer."
+    assert tool_calls == []
+
+
+def test_unified_empty_prompt_quoted_end_and_plain_controls():
+    quoted_end = f"Before {QUOTE}<channel|>{QUOTE} after"
+    for text in (quoted_end, "Plain answer."):
+        reasoning, content, tool_calls = _stream_unified_chunks(
+            [text],
+            prompt_token_ids=[],
+        )
+
+        assert reasoning == ""
+        assert content == text
+        assert tool_calls == []
+
+
+def test_unified_prompt_open_omitted_start_text_and_ids():
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        ["thought\nR.<channel|>A"],
+        prompt_token_ids=[1],
+    )
+
+    assert reasoning == "R."
+    assert content == "A"
+    assert tool_calls == []
+
+    tokenizer = FakeTokenizer()
+    token_ids = [12, 2, 11]
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        [tokenizer.decode(token_ids, skip_special_tokens=False)],
+        [token_ids],
+        prompt_token_ids=[1],
+    )
+
+    assert reasoning == "Part "
+    assert content == "Answer."
+    assert tool_calls == []
+
+
+def test_unified_prompt_quote_carry_blocks_danger_until_close():
+    danger = _TOP_LEVEL_MARKER_PAYLOADS[0]
+    good = f"{TOOL_CALL_START}call:good{{}}{TOOL_CALL_END}"
+
+    for split in range(1, len(QUOTE)):
+        reasoning, content, tool_calls = _stream_unified_chunks(
+            [f"{danger}{QUOTE[:split]}", f"{QUOTE[split:]}{good}"],
+            prompt_token_ids=[1, 7],
+        )
+
+        assert reasoning == f"{danger}{QUOTE}"
+        assert content == ""
+        assert [call.function.name for call in tool_calls] == ["good"]
+        assert all(call.function.name != "danger" for call in tool_calls)
+
+    tokenizer = FakeTokenizer()
+    token_ids = [4, 29, 6, 7, 4, 31, 6]
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        [tokenizer.decode(token_ids, skip_special_tokens=False)],
+        [token_ids],
+        prompt_token_ids=[1, 7],
+    )
+
+    assert reasoning == f"{danger}{QUOTE}"
+    assert content == ""
+    assert [call.function.name for call in tool_calls] == ["good"]
+    assert all(call.function.name != "danger" for call in tool_calls)
+
+
+def test_unified_prompt_new_turn_reset_and_empty_control():
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        ["thought\nR.<channel|>A"],
+        prompt_token_ids=[1, 7, 3],
+    )
+
+    assert reasoning == "R."
+    assert content == "A"
+    assert tool_calls == []
+
+    reasoning, content, tool_calls = _stream_unified_chunks(
+        ["Plain answer."],
+        prompt_token_ids=[],
+    )
+
+    assert reasoning == ""
+    assert content == "Plain answer."
+    assert tool_calls == []
+
+
+def test_unified_unterminated_quote_defers_sibling_until_finish():
+    parser = _unified_parser()
+    request = SimpleNamespace(tool_choice="auto", tools=[])
+    chunks = [
+        (
+            "<|channel>thought\nR.<channel|>"
+            'Before <|tool_call>call:bad{x:<|"|>unterminated'
+        ),
+        "<|tool_call>call:good{x:2}<tool_call|> after",
+    ]
+    content = ""
+    streamed_calls = []
+
+    for chunk in chunks:
+        result = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[],
+            request=request,
+            prompt_token_ids=[],
+            finished=False,
+        )
+        if result is not None:
+            content += result.content or ""
+            streamed_calls.extend(result.tool_calls or [])
+
+    assert streamed_calls == []
+    finished = parser.parse_delta(
+        delta_text="",
+        delta_token_ids=[],
+        request=request,
+        prompt_token_ids=[],
+        finished=True,
+    )
+
+    assert finished is not None
+    content += finished.content or ""
+    assert content == "Before  after"
+    assert len(finished.tool_calls or []) == 1
+    assert finished.tool_calls[0].index == 0
+    assert finished.tool_calls[0].function.name == "good"
+    assert json.loads(finished.tool_calls[0].function.arguments) == {"x": 2}
+
+
 def test_unified_split_malformed_tool_never_commits_before_valid_sibling():
     parser = _unified_parser()
     request = SimpleNamespace(tool_choice="auto", tools=[])
@@ -441,6 +994,118 @@ def test_unified_strict_completed_tool_isolates_valid_sibling():
     assert parser.tool_parser.prev_tool_call_arr == [
         {"name": "good", "arguments": {"x": 1}}
     ]
+
+
+def test_unified_nonstream_all_malformed_tool_uses_cleaned_content():
+    parser = _unified_parser()
+    reasoning, content, tool_calls = parser.parse(
+        (
+            "<|channel>thought\nR.<channel|>"
+            "hello <|tool_call>call:f{x:1]}<tool_call|> bye"
+        ),
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+    )
+
+    assert reasoning == "R."
+    assert content == "hello  bye"
+    assert tool_calls == []
+
+
+def test_unified_nonstream_truncated_tool_resyncs_to_valid_sibling():
+    reasoning, content, tool_calls = _unified_parser().parse(
+        (
+            "<|channel>thought\nR.<channel|>"
+            "Before <|tool_call>call:bad{x:1"
+            "<|tool_call>call:good{x:2}<tool_call|> after"
+        ),
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+    )
+
+    assert reasoning == "R."
+    assert content == "Before  after"
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "good"
+    assert json.loads(tool_calls[0].arguments) == {"x": 2}
+
+
+def test_unified_nonstream_cleans_lone_unmatched_tool_end():
+    reasoning, content, tool_calls = _unified_parser().parse(
+        "<|channel>thought\nR.<channel|>Before <tool_call|> after",
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+    )
+
+    assert reasoning == "R."
+    assert content == "Before  after"
+    assert tool_calls == []
+
+
+def test_unified_nonstream_top_level_paired_quotes_stay_literal():
+    for payload in _TOP_LEVEL_MARKER_PAYLOADS:
+        text = f"Before {QUOTE}{payload}{QUOTE} after"
+        reasoning, content, tool_calls = _unified_parser().parse(
+            f"<|channel>thought\nR.<channel|>{text}",
+            request=SimpleNamespace(tool_choice="auto", tools=[]),
+            enable_auto_tools=True,
+        )
+
+        assert reasoning == "R."
+        assert content == text
+        assert not tool_calls
+
+
+def test_unified_nonstream_top_level_unclosed_quotes_stay_literal():
+    for payload in _TOP_LEVEL_MARKER_PAYLOADS:
+        text = f"Before {QUOTE}{payload} after"
+        reasoning, content, tool_calls = _unified_parser().parse(
+            f"<|channel>thought\nR.<channel|>{text}",
+            request=SimpleNamespace(tool_choice="auto", tools=[]),
+            enable_auto_tools=True,
+        )
+
+        assert reasoning == "R."
+        assert content == text
+        assert not tool_calls
+
+
+def test_unified_nonstream_real_call_after_closed_top_level_quote():
+    payload = _TOP_LEVEL_MARKER_PAYLOADS[0]
+    quoted = f"{QUOTE}{payload}{QUOTE}"
+    reasoning, content, tool_calls = _unified_parser().parse(
+        (
+            f"<|channel>thought\nR.<channel|>Before {quoted} middle "
+            f"{TOOL_CALL_START}call:good{{x:1}}{TOOL_CALL_END} after"
+        ),
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+    )
+
+    assert reasoning == "R."
+    assert content == f"Before {quoted} middle  after"
+    assert [call.name for call in tool_calls] == ["good"]
+
+
+def test_unified_nonstream_preserves_paired_quoted_tool_markers():
+    reasoning, content, tool_calls = _unified_parser().parse(
+        (
+            "<|channel>thought\nR.<channel|>"
+            '<|tool_call>call:a{q:<|"|>before<tool_call|>'
+            "<|tool_call>call:b{x:2}<tool_call|>"
+            'after<|"|>}<tool_call|>'
+        ),
+        request=SimpleNamespace(tool_choice="auto", tools=[]),
+        enable_auto_tools=True,
+    )
+
+    assert reasoning == "R."
+    assert content is None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "a"
+    assert json.loads(tool_calls[0].arguments) == {
+        "q": ("before<tool_call|><|tool_call>call:b{x:2}<tool_call|>after")
+    }
 
 
 def test_unified_finish_does_not_fabricate_empty_arguments():
