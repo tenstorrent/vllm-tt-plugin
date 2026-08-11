@@ -433,7 +433,8 @@ clear error before anything reaches the device:
 - LoRA is not currently supported.
 - Chunked prefill is disabled for every model type except Gemma 4, and
   `max_num_batched_tokens` is bumped to `max_model_len` when it is disabled.
-- Multimodal inputs are never split across chunk boundaries.
+- Where chunked prefill is active, multimodal inputs are never split across a
+  chunk boundary.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.

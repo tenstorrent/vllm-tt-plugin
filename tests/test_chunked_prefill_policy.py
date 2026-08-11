@@ -25,6 +25,7 @@ def _vllm_config(
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_batched_tokens=max_num_batched_tokens,
             long_prefill_token_threshold=long_prefill_token_threshold,
+            disable_chunked_mm_input=False,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(model_type=model_type),
@@ -41,6 +42,7 @@ def test_gemma4_keeps_chunked_prefill_and_its_token_budget():
     assert config.scheduler_config.enable_chunked_prefill is True
     assert config.scheduler_config.max_num_batched_tokens == 2048
     assert config.scheduler_config.long_prefill_token_threshold == 512
+    assert config.scheduler_config.disable_chunked_mm_input is True
 
 
 def test_unified_gemma4_checkpoint_also_keeps_chunked_prefill():
@@ -58,6 +60,20 @@ def test_other_model_type_loses_chunked_prefill_and_gets_a_full_prompt_budget():
 
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.max_num_batched_tokens == 16384
+
+
+def test_unsplit_prefill_leaves_chunked_mm_input_enabled():
+    # vLLM raises outright when this is set and one mm item is larger than
+    # max_num_batched_tokens, e.g. a VL model pinned to a short max_model_len.
+    # With prefill never split the flag is inert, so it must stay off.
+    config = _vllm_config(
+        model_type="qwen2_5_vl", max_num_batched_tokens=2048, max_model_len=2048
+    )
+
+    _apply_chunked_prefill_policy(config)
+
+    assert config.scheduler_config.enable_chunked_prefill is False
+    assert config.scheduler_config.disable_chunked_mm_input is False
 
 
 def test_other_model_type_zeroes_the_long_prefill_threshold():
