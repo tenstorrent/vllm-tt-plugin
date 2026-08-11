@@ -228,7 +228,7 @@ class TTLaneCoordinator(SchedulerInterface):
 
     Owns one fully independent :class:`TTScheduler` per lane. Each lane
     scheduler has its own waiting/running queues and its own KV cache manager,
-    so the coordinator behaves like several co-located gathered-DP engines: a
+    so the coordinator behaves like several co-located DP engines: a
     request belongs to exactly one lane and only that lane's scheduler ever
     sees it. Every lane's KV cache manager is sized identically (the same
     ``kv_cache_config``) because each lane drives a physically separate, equally
@@ -336,10 +336,9 @@ class TTLaneCoordinator(SchedulerInterface):
         Assignment is static: a request is bound to one lane at admission
         (recorded in the coordinator's maps) and never migrates,
         exactly as vLLM DP binds each request to one engine at intake with no
-        later migration. So a lane can sit idle while another has queued work --
-        no worse than the gathered-DP behavior this replaces. Cross-lane
-        rebalancing (e.g. work-stealing) is a possible future follow-up, not
-        part of this change.
+        later migration. So a lane can sit idle while another has queued work,
+        the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
+        is a possible future follow-up.
         """
         best_lane = 0
         best_score: int | None = None

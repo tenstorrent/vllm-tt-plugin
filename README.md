@@ -24,7 +24,6 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- engine.py            # TT engine core and DP engine processes
 |   +-- launcher.py          # tt-run / MPI launch integration
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
@@ -375,11 +374,9 @@ python examples/server_example_tt.py \
 ```
 
 `--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
-each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. For
-these single-execute Galaxy models this replaces the gathered DP=4 setup they
-used historically, so there is nothing to migrate. This conversion is specific
-to the Galaxy generators; other model families still run `--data_parallel_size`
-as multi-process DP.
+each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. This
+conversion is specific to the Galaxy generators and GPT-OSS; other model
+families still run `--data_parallel_size` as multi-process DP.
 At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
@@ -523,9 +520,10 @@ Models that do not opt in stay on the legacy `Generator` path: uniform
 single-group KV cache, one page table, and no behavioral change. The plugin only
 sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
 
-Hybrid models are not yet supported with `data_parallel_size > 1`; the DP
-merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models
-until per-group DP gather lands.
+Hybrid models with `data_parallel_size > 1` have not been validated on
+hardware. Both DP modes carry the full per-group block tables (a standard-DP
+rank is an independent DP=1 engine, and lane-DP builds per-group tables for the
+merged batch), so there is no known blocker, but the combination is untested.
 
 
 ## Development Notes
