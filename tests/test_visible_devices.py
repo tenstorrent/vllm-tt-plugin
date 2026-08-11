@@ -301,13 +301,11 @@ def test_explicit_mpi_launch_keeps_inherited_visible_devices(
     """MPI rank binding populates neither channel and owns its own env."""
     monkeypatch.setenv(EVAR, "5")
 
+    # The fork vLLM the MPI launcher targets has no assigned_physical_gpu_ids.
     _bind_visible_devices_env(
         SimpleNamespace(
             additional_config={},
-            parallel_config=SimpleNamespace(
-                assigned_physical_gpu_ids=None,
-                data_parallel_rank_local=0,
-            ),
+            parallel_config=SimpleNamespace(data_parallel_rank_local=0),
         )
     )
 

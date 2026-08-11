@@ -87,7 +87,10 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
         RuntimeError: the fallback holds no group for this rank.
     """
     parallel_config = vllm_config.parallel_config
-    assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
+    # Absent on the fork vLLM that the explicit MPI launcher targets.
+    assigned_physical_gpu_ids = getattr(
+        parallel_config, "assigned_physical_gpu_ids", None
+    )
 
     if assigned_physical_gpu_ids:
         visible_devices = ",".join(str(d) for d in assigned_physical_gpu_ids)
