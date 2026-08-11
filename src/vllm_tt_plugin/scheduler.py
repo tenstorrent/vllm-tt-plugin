@@ -53,6 +53,8 @@ class TTScheduler(AsyncScheduler):
     - with async_scheduling=True, placeholders allow decode requests to be
       re-scheduled before update_from_output processes the previous step's
       results, enabling host/device overlap
+    - under async scheduling, preemption invalidates the request's
+      scheduled-but-unreturned outputs (see ``_preempt_request``)
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
@@ -194,3 +196,22 @@ class TTScheduler(AsyncScheduler):
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Preempt a request and invalidate its in-flight async outputs.
+
+        The base class frees the request's KV cache and queues it to redo its
+        prefill from scratch.  Under async scheduling the tokens it already
+        scheduled are still on their way back, and they were computed against
+        the now-freed cache, so mark them to be dropped on arrival.
+        ``num_output_placeholders`` is exactly that in-flight count, and
+        ``AsyncScheduler._update_request_with_output`` drops one frame per
+        pending discard.
+        """
+        super()._preempt_request(request, timestamp)
+
+        if not self.scheduler_config.async_scheduling:
+            return
+
+        request.async_tokens_to_discard += request.num_output_placeholders
+        request.num_output_placeholders = 0

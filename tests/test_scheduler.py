@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
@@ -137,3 +138,31 @@ def test_decode_only_hides_continuations_and_restores_them(monkeypatch):
 
     assert seen["running"] == [decode]
     assert set(scheduler.running) == {decode, continuation}
+
+
+def test_preempt_marks_in_flight_async_outputs_stale(monkeypatch):
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
+    request = SimpleNamespace(num_output_placeholders=2, async_tokens_to_discard=0)
+
+    monkeypatch.setattr(Scheduler, "_preempt_request", lambda *args: None)
+
+    scheduler._preempt_request(request, 0.0)
+
+    # The two tokens already in flight were computed against the freed KV
+    # blocks, so the base class must drop them when they come back.
+    assert request.async_tokens_to_discard == 2
+    assert request.num_output_placeholders == 0
+
+
+def test_preempt_leaves_outputs_alone_without_async_scheduling(monkeypatch):
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
+    request = SimpleNamespace(num_output_placeholders=2, async_tokens_to_discard=0)
+
+    monkeypatch.setattr(Scheduler, "_preempt_request", lambda *args: None)
+
+    scheduler._preempt_request(request, 0.0)
+
+    assert request.async_tokens_to_discard == 0
+    assert request.num_output_placeholders == 2
