@@ -22,12 +22,9 @@ from vllm_tt_plugin.platform import (
 )
 from vllm_tt_plugin.utils.dp_discovery import (
     _maybe_reorder_standard_dp_visible_device_groups,
-)
-from vllm_tt_plugin.worker import (
-    _bind_visible_devices_env,
-    _resolve_mesh_grid,
     _resolve_parent_mesh_grid,
 )
+from vllm_tt_plugin.worker import _bind_visible_devices_env, _resolve_mesh_grid
 
 EVAR = TTPlatform.device_control_env_var
 

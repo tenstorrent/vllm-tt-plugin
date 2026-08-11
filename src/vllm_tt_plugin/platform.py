@@ -731,7 +731,13 @@ class TTPlatform(Platform):
     simple_compile_backend: str = "eager"
 
     @classmethod
-    def device_id_to_physical_device_id(cls, device_id: int):
+    def device_id_to_physical_device_id(cls, device_id: int) -> str | int:
+        """Map a DP rank to its whole comma-joined TT device group.
+
+        Deviates from upstream, where ``device_id`` is a device index and the
+        return is one physical id. ``assigned_physical_gpu_ids`` therefore holds
+        a single group string, not the ``list[int]`` upstream declares.
+        """
         groups = cls._standard_dp_visible_device_groups
         if groups is not None:
             return groups[device_id]
