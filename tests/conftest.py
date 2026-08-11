@@ -5,11 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-# ``vllm`` must finish importing before any plugin module, otherwise vllm's own
-# platform resolution re-enters the plugin against a partially initialized
-# ``vllm.platforms``.
-import vllm  # noqa: E402, F401, I001  isort: skip
-
 
 @pytest.fixture
 def vllm_config() -> SimpleNamespace:
