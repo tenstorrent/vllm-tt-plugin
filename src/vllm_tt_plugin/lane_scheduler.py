@@ -356,6 +356,10 @@ class TTLaneCoordinator(SchedulerInterface):
         running (so it must prefill to make progress) or spare capacity to admit
         more alongside its running decodes.
 
+        A partial prefill continuation always wants to prefill, even with the
+        lane at capacity: it already holds one of those slots and only a
+        prefill step can advance it.
+
         ``skipped_waiting`` holds prefill requests blocked on grammar
         compilation. We want to try to schedule them, because otherwise the
         base scheduler won't revisit and promote them - decode intent hides
@@ -363,8 +367,11 @@ class TTLaneCoordinator(SchedulerInterface):
         """
         has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
         has_running = bool(sched.running)
+        has_partial_prefill = any(r.is_prefill_chunk for r in sched.running)
         has_capacity = len(sched.running) < self._per_lane_max
-        return int(has_waiting and ((not has_running) or has_capacity))
+        return int(
+            has_partial_prefill or (has_waiting and ((not has_running) or has_capacity))
+        )
 
     def _negotiate_forced_mode(self) -> TTSchedulingMode:
         """Pick the single mode (prefill- or decode-only) all lanes will run.
@@ -500,16 +507,20 @@ class TTLaneCoordinator(SchedulerInterface):
         lane_outputs = self._schedule_all_lanes(forced_mode)
         merged = merge_lane_scheduler_outputs(lane_outputs)
 
-        # Decode fallback: a forced prefill step can schedule zero tokens (no
-        # chunked prefill + KV pressure means no full prefill fits). If any lane
-        # has running decodes, falling back to a decode-only step keeps them
-        # advancing — without this the step makes no global progress and the
-        # engine livelocks. Mirrors the base scheduler's DEFAULT-mode fallback,
-        # which the forced mode bypasses.
+        # Decode fallback: a forced prefill step can schedule zero tokens (KV
+        # pressure means no prefill fits). If any lane has running decodes,
+        # falling back to a decode-only step keeps them advancing - without
+        # this the step makes no global progress and the engine livelocks.
+        # Mirrors the base scheduler's DEFAULT-mode fallback, which the forced
+        # mode bypasses. Partial prefills do not count: a decode step cannot
+        # advance them, so falling back on their account would livelock too.
         if (
             forced_mode == TTSchedulingMode.PREFILL_ONLY
             and merged.total_num_scheduled_tokens == 0
-            and any(sched.running for sched in self.lanes)
+            and any(
+                any(not r.is_prefill_chunk for r in sched.running)
+                for sched in self.lanes
+            )
         ):
             # The discarded prefill pass already drained each lane's
             # finished/freed-encoder bookkeeping; carry it onto the decode pass

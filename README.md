@@ -333,7 +333,9 @@ selects the TT-owned runtime classes through vLLM's extension points:
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
-- Chunked prefill is not (yet) used.
+- Token-chunked prefill is available for Gemma 4: a long prompt is split across
+  prefill steps and only the chunk that completes the prompt emits a token.
+  Every other model type keeps prefill unsplit.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -429,7 +431,9 @@ clear error before anything reaches the device:
 - Tensor parallel and pipeline parallel execution are not supported.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
-- Chunked prefill is disabled.
+- Chunked prefill is disabled for every model type except Gemma 4, and
+  `max_num_batched_tokens` is bumped to `max_model_len` when it is disabled.
+- Multimodal inputs are never split across chunk boundaries.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
