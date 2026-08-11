@@ -436,11 +436,12 @@ def _install_tt_harmony_truncation_patch() -> None:
 
 
 def _install_block_output_input_processor_patch() -> None:
-    """Round unresolved block-output defaults after vLLM clones params.
+    """Reject unsupported resumable requests and round block-output defaults.
 
     vLLM 0.24 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
-    validate with a whole-canvas default without mutating the shared input.
+    reject streaming-input sessions before EngineCore and validate with a
+    whole-canvas default without mutating the shared input.
 
     TODO: remove once vLLM exposes a platform hook for per-request defaults.
     """
@@ -454,12 +455,18 @@ def _install_block_output_input_processor_patch() -> None:
     input_processor._tt_original_process_inputs = original
 
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
+        output_size = get_tt_output_tokens_per_step(self.vllm_config)
+        if output_size > 1 and kwargs.get("resumable", False):
+            raise ValueError(
+                "TT block-output models do not support resumable streaming-input "
+                "requests"
+            )
+
         unresolved_max_tokens = (
             isinstance(params, SamplingParams) and params.max_tokens is None
         )
         request = original(self, request_id, prompt, params, *args, **kwargs)
 
-        output_size = get_tt_output_tokens_per_step(self.vllm_config)
         cloned_params = request.sampling_params
         if (
             unresolved_max_tokens

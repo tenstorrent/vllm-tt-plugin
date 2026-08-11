@@ -36,13 +36,17 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     import vllm.v1.engine.input_processor as input_processor
 
     def process_inputs(self, request_id, prompt, params, *args, **kwargs):
+        self.process_inputs_calls.append(kwargs)
         TTPlatform.validate_request(prompt, params)
         cloned_params = params.clone()
         if cloned_params.max_tokens is None:
             cloned_params.max_tokens = self.model_config.max_model_len - len(
                 prompt["prompt_token_ids"]
             )
-        return SimpleNamespace(sampling_params=cloned_params)
+        return SimpleNamespace(
+            sampling_params=cloned_params,
+            resumable=kwargs.get("resumable", False),
+        )
 
     monkeypatch.setattr(
         input_processor.InputProcessor,
@@ -64,6 +68,7 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     return input_processor.InputProcessor, SimpleNamespace(
         vllm_config=config,
         model_config=model_config,
+        process_inputs_calls=[],
     )
 
 
@@ -412,6 +417,38 @@ def test_input_processor_wrapper_is_inert_for_ar_models(monkeypatch):
 
     assert request.sampling_params.max_tokens == 824
     assert params.max_tokens is None
+
+
+def test_input_processor_rejects_resumable_block_request_before_upstream(
+    monkeypatch,
+):
+    processor_cls, processor = _processor_harness(monkeypatch)
+
+    with pytest.raises(ValueError, match="do not support resumable streaming-input"):
+        processor_cls.process_inputs(
+            processor,
+            "streaming-input",
+            {"prompt_token_ids": [1] * 200},
+            SamplingParams(max_tokens=256),
+            resumable=True,
+        )
+
+    assert processor.process_inputs_calls == []
+
+
+def test_input_processor_preserves_resumable_ar_request(monkeypatch):
+    processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
+
+    request = processor_cls.process_inputs(
+        processor,
+        "streaming-input-ar",
+        {"prompt_token_ids": [1] * 200},
+        SamplingParams(max_tokens=16),
+        resumable=True,
+    )
+
+    assert request.resumable is True
+    assert processor.process_inputs_calls == [{"resumable": True}]
 
 
 def test_input_processor_rejects_when_no_canvas_fits(monkeypatch):
