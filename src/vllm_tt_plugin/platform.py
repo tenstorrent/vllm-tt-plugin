@@ -98,9 +98,8 @@ def _store_standard_dp_visible_groups(
 ) -> None:
     """Store the per-rank visible-device group list on the vLLM config.
 
-    Indexed by DP rank so worker subprocesses can recover
-    ``TT_VISIBLE_DEVICES`` from ``data_parallel_index`` when the
-    env-var does not propagate through the engine-core fork chain.
+    Indexed by DP rank, and kept on ``additional_config`` because that is a
+    declared config field and so survives pickling into the worker subprocess.
     """
     additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
@@ -112,14 +111,18 @@ def _store_standard_dp_visible_groups(
 def _load_standard_dp_visible_groups(
     vllm_config: "VllmConfig",
 ) -> list[str] | None:
-    """Load the per-rank visible-device group list from the vLLM config."""
+    """Load the per-rank visible-device group list from the vLLM config.
+
+    ``None`` means nothing was stored. An empty list means discovery stored
+    nothing usable, which callers must not treat as "keep the inherited value".
+    """
     additional_config = getattr(vllm_config, "additional_config", None) or {}
 
     if not isinstance(additional_config, dict):
         return None
 
     groups = additional_config.get(_STANDARD_DP_VISIBLE_GROUPS_KEY)
-    if not isinstance(groups, list) or not groups:
+    if not isinstance(groups, list):
         return None
 
     return [str(g) for g in groups]
@@ -1010,7 +1013,7 @@ class TTPlatform(Platform):
             if resolved_mesh_grids:
                 cls._standard_dp_mesh_grids = resolved_mesh_grids
                 _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
-            if cls._standard_dp_visible_device_groups:
+            if cls._standard_dp_visible_device_groups is not None:
                 _store_standard_dp_visible_groups(
                     vllm_config, cls._standard_dp_visible_device_groups
                 )

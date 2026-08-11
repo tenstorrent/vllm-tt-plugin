@@ -316,3 +316,15 @@ def test_rank_without_discovered_group_fails_loudly(
         )
 
     assert os.environ[EVAR] == "0,1,2,3"
+
+
+def test_empty_discovery_result_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero groups is a broken discovery, not a licence to keep the inherited value."""
+    monkeypatch.setenv(EVAR, "0,1,2,3")
+
+    with pytest.raises(RuntimeError, match="No TT device group for local DP rank"):
+        _bind_visible_devices_env(_discovered_groups_config())
+
+    assert os.environ[EVAR] == "0,1,2,3"
