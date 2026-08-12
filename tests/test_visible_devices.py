@@ -261,8 +261,6 @@ def test_stored_groups_suppress_rediscovery_on_config_reapply(
     def _fail_discovery(_vllm_config):
         raise AssertionError("discovery must only run where the whole machine is seen")
 
-    monkeypatch.setattr(TTPlatform, "_standard_dp_visible_device_groups", None)
-    monkeypatch.setattr(TTPlatform, "_standard_dp_mesh_grids", {})
     monkeypatch.setattr(
         "vllm_tt_plugin.platform._resolve_standard_dp_visible_device_groups",
         _fail_discovery,

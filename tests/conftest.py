@@ -5,6 +5,37 @@ from types import SimpleNamespace
 
 import pytest
 
+# `TTPlatform.check_and_update_config` records its results on the class rather
+# than on the config it is handed, so one test that calls it configures every
+# test that runs after it,  across files.
+_TT_PLATFORM_CONFIG_ATTRS = (
+    "_standard_dp_visible_device_groups",
+    "_standard_dp_mesh_grids",
+    "sample_on_device_mode",
+    "always_compat_sampling",
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_tt_platform_class_state():
+    # Deferred: importing the platform from conftest runs before vLLM has
+    # finished resolving its platform plugins, and that import is circular.
+    from vllm_tt_plugin.platform import TTPlatform
+
+    unset = object()
+    saved = {
+        name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
+    }
+
+    yield
+
+    for name, value in saved.items():
+        if value is unset:
+            if name in TTPlatform.__dict__:
+                delattr(TTPlatform, name)
+        else:
+            setattr(TTPlatform, name, value)
+
 
 @pytest.fixture
 def vllm_config() -> SimpleNamespace:
