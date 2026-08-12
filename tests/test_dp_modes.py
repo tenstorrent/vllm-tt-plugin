@@ -47,6 +47,9 @@ class TestDPModes:
                 data_parallel_backend="mp",
                 nnodes=1,
                 node_rank=0,
+                # Seeded with vLLM's own default so the assertions below catch a
+                # plugin-side override rather than the absence of one.
+                dp_engine_core_proc_cls="vllm.v1.engine.core.DPEngineCoreProc",
             ),
             model_config=SimpleNamespace(
                 model="dummy",
@@ -498,7 +501,7 @@ class TestDPModes:
             == "16,17,18,19,20,21,22,23"
         )
 
-    def test_legacy_gathered_override_is_ignored_by_platform(
+    def test_legacy_tt_dp_override_is_ignored_by_platform(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
@@ -726,7 +729,7 @@ class TestDPModes:
         with pytest.raises(RuntimeError, match="duplicate rank 0"):
             parse_tt_mpi_params(vllm_config)
 
-    def test_legacy_gathered_override_is_ignored_by_launcher(
+    def test_legacy_tt_dp_override_is_ignored_by_launcher(
         self,
         tmp_path: pathlib.Path,
         vllm_config: SimpleNamespace,
