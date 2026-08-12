@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-import time
 from enum import Enum
 from typing import cast
 
@@ -54,8 +53,16 @@ class TTScheduler(AsyncScheduler):
     - with async_scheduling=True, placeholders allow decode requests to be
       re-scheduled before update_from_output processes the previous step's
       results, enabling host/device overlap
-    - under async scheduling, preemption invalidates the request's
-      scheduled-but-unreturned outputs (see ``_preempt_request``)
+    - under async scheduling a preempted request keeps the tokens it had
+      already scheduled but not yet received, and needs no TT-side handling
+      for them. Those tokens are valid: the forward that produced them ran to
+      completion before the preempt freed any block, device submits form a
+      strict queue, and every async op is forced to complete before the next
+      prefill, so no later write can reach the KV they were computed against.
+      The base class appends them on arrival and the resumed prefill replays
+      them. ``Request.async_tokens_to_discard`` serves the wholesale
+      ``reset_prefix_cache`` teardown only; wiring ordinary preemption into it
+      drops valid tokens and silently truncates the response.
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
@@ -197,59 +204,3 @@ class TTScheduler(AsyncScheduler):
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
-
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
-        """Preempt a request and invalidate its in-flight async outputs.
-
-        The base class frees the request's KV cache and queues it to redo its
-        prefill from scratch.  Under async scheduling the tokens it already
-        scheduled are still on their way back, and they were computed against
-        the now-freed cache, so mark them to be dropped on arrival.
-        ``num_output_placeholders`` is exactly that in-flight count, and
-        ``AsyncScheduler._update_request_with_output`` drops one frame per
-        pending discard.
-        """
-        super()._preempt_request(request, timestamp)
-
-        if not self.scheduler_config.async_scheduling:
-            return
-
-        request.async_tokens_to_discard += request.num_output_placeholders
-        request.num_output_placeholders = 0
-
-    def reset_prefix_cache(
-        self, reset_running_requests: bool = False, reset_connector: bool = False
-    ) -> bool:
-        """Reset the KV prefix cache.
-
-        vLLM 0.24.0's base implementation already discards stale async outputs
-        for the reset-prefix-cache path *after* calling ``_preempt_request``.
-        TT broadens stale-output invalidation to every preemption inside
-        ``_preempt_request`` itself, so reusing the base method verbatim would
-        overwrite that discard count with zero.
-        """
-        if not (reset_running_requests and self.scheduler_config.async_scheduling):
-            return super().reset_prefix_cache(
-                reset_running_requests, reset_connector
-            )
-
-        timestamp = time.monotonic()
-        while self.running:
-            request = self.running.pop()
-            self._preempt_request(request, timestamp)
-
-        self.prev_step_scheduled_req_ids.clear()
-
-        reset_successful = self.kv_cache_manager.reset_prefix_cache()
-        if not reset_successful:
-            raise RuntimeError(
-                "Failed to reset KV cache even when all the running requests are "
-                "preempted and moved to the waiting queue. This is likely due to "
-                "the presence of running requests waiting for remote KV transfer, "
-                "which is not supported yet."
-            )
-
-        if reset_connector:
-            reset_successful = self.reset_connector_cache() and reset_successful
-
-        return reset_successful

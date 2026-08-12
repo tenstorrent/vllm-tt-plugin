@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
@@ -139,53 +138,3 @@ def test_decode_only_hides_continuations_and_restores_them(monkeypatch):
 
     assert seen["running"] == [decode]
     assert scheduler.running == [decode, continuation]
-
-
-def test_preempt_marks_in_flight_async_outputs_stale(monkeypatch):
-    scheduler = TTScheduler.__new__(TTScheduler)
-    scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
-    request = SimpleNamespace(num_output_placeholders=2, async_tokens_to_discard=0)
-
-    monkeypatch.setattr(Scheduler, "_preempt_request", lambda *args: None)
-
-    scheduler._preempt_request(request, 0.0)
-
-    # The two tokens already in flight were computed against the freed KV
-    # blocks, so the base class must drop them when they come back.
-    assert request.async_tokens_to_discard == 2
-    assert request.num_output_placeholders == 0
-
-
-def test_preempt_leaves_outputs_alone_without_async_scheduling(monkeypatch):
-    scheduler = TTScheduler.__new__(TTScheduler)
-    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
-    request = SimpleNamespace(num_output_placeholders=2, async_tokens_to_discard=0)
-
-    monkeypatch.setattr(Scheduler, "_preempt_request", lambda *args: None)
-
-    scheduler._preempt_request(request, 0.0)
-
-    assert request.async_tokens_to_discard == 0
-    assert request.num_output_placeholders == 2
-
-
-def test_reset_prefix_cache_keeps_tt_preempt_discard_count(monkeypatch):
-    scheduler = TTScheduler.__new__(TTScheduler)
-    scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
-    scheduler.running = [
-        SimpleNamespace(num_output_placeholders=2, async_tokens_to_discard=0),
-        SimpleNamespace(num_output_placeholders=1, async_tokens_to_discard=0),
-    ]
-    scheduler.prev_step_scheduled_req_ids = {"req-1"}
-    scheduler.kv_cache_manager = SimpleNamespace(reset_prefix_cache=lambda: True)
-    scheduler.reset_connector_cache = lambda: True
-
-    monkeypatch.setattr(Scheduler, "_preempt_request", lambda *args: None)
-
-    requests = list(scheduler.running)
-    assert scheduler.reset_prefix_cache(reset_running_requests=True) is True
-
-    assert scheduler.running == []
-    assert scheduler.prev_step_scheduled_req_ids == set()
-    assert [request.async_tokens_to_discard for request in requests] == [2, 1]
-    assert [request.num_output_placeholders for request in requests] == [0, 0]
