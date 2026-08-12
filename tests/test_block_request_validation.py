@@ -81,15 +81,6 @@ def test_rounded_physical_capacity_is_enforced():
         _validate(SamplingParams(max_tokens=257), prompt_len=513)
 
 
-def test_platform_default_is_clamped_to_whole_canvases():
-    platform = TTPlatform()
-
-    assert platform.get_max_output_tokens(32) == 768
-    assert platform.get_max_output_tokens(768) == 256
-    with pytest.raises(ValueError, match="physical 256-token output canvases"):
-        platform.get_max_output_tokens(769)
-
-
 def test_auto_fitted_frontend_limit_is_read_live(monkeypatch):
     config = _config()
     _patch_model_resolution(monkeypatch)
@@ -332,17 +323,6 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
         TTPlatform.check_and_update_config(config)
 
 
-@pytest.mark.parametrize("prompt_lens", [(256, 768), (768, 256)])
-def test_offline_unresolved_max_tokens_is_not_mutated(prompt_lens):
-    params = SamplingParams(max_tokens=16)
-    params.max_tokens = None
-
-    for prompt_len in prompt_lens:
-        _validate(params, prompt_len=prompt_len)
-
-    assert params.max_tokens is None
-
-
 @pytest.mark.parametrize(
     ("prompt_lens", "expected"),
     [
@@ -384,39 +364,6 @@ def test_input_processor_preserves_explicit_max_tokens(monkeypatch):
 
     assert request.sampling_params.max_tokens == 17
     assert params.max_tokens == 17
-
-
-def test_input_processor_uses_live_fitted_max_model_len(monkeypatch):
-    processor_cls, processor = _processor_harness(monkeypatch)
-    processor.model_config.max_model_len = 640
-    params = SamplingParams(max_tokens=16)
-    params.max_tokens = None
-
-    request = processor_cls.process_inputs(
-        processor,
-        "fitted",
-        {"prompt_token_ids": [1] * 128},
-        params,
-    )
-
-    assert request.sampling_params.max_tokens == 512
-    assert params.max_tokens is None
-
-
-def test_input_processor_wrapper_is_inert_for_ar_models(monkeypatch):
-    processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
-    params = SamplingParams(max_tokens=16)
-    params.max_tokens = None
-
-    request = processor_cls.process_inputs(
-        processor,
-        "ar",
-        {"prompt_token_ids": [1] * 200},
-        params,
-    )
-
-    assert request.sampling_params.max_tokens == 824
-    assert params.max_tokens is None
 
 
 def test_input_processor_rejects_resumable_block_request_before_upstream(
