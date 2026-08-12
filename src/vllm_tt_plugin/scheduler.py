@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import time
 from enum import Enum
 from typing import cast
 
@@ -215,3 +216,40 @@ class TTScheduler(AsyncScheduler):
 
         request.async_tokens_to_discard += request.num_output_placeholders
         request.num_output_placeholders = 0
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Reset the KV prefix cache.
+
+        vLLM 0.24.0's base implementation already discards stale async outputs
+        for the reset-prefix-cache path *after* calling ``_preempt_request``.
+        TT broadens stale-output invalidation to every preemption inside
+        ``_preempt_request`` itself, so reusing the base method verbatim would
+        overwrite that discard count with zero.
+        """
+        if not (reset_running_requests and self.scheduler_config.async_scheduling):
+            return super().reset_prefix_cache(
+                reset_running_requests, reset_connector
+            )
+
+        timestamp = time.monotonic()
+        while self.running:
+            request = self.running.pop()
+            self._preempt_request(request, timestamp)
+
+        self.prev_step_scheduled_req_ids.clear()
+
+        reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if not reset_successful:
+            raise RuntimeError(
+                "Failed to reset KV cache even when all the running requests are "
+                "preempted and moved to the waiting queue. This is likely due to "
+                "the presence of running requests waiting for remote KV transfer, "
+                "which is not supported yet."
+            )
+
+        if reset_connector:
+            reset_successful = self.reset_connector_cache() and reset_successful
+
+        return reset_successful

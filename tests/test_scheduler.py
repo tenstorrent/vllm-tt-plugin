@@ -167,3 +167,25 @@ def test_preempt_leaves_outputs_alone_without_async_scheduling(monkeypatch):
 
     assert request.async_tokens_to_discard == 0
     assert request.num_output_placeholders == 2
+
+
+def test_reset_prefix_cache_keeps_tt_preempt_discard_count(monkeypatch):
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
+    scheduler.running = [
+        SimpleNamespace(num_output_placeholders=2, async_tokens_to_discard=0),
+        SimpleNamespace(num_output_placeholders=1, async_tokens_to_discard=0),
+    ]
+    scheduler.prev_step_scheduled_req_ids = {"req-1"}
+    scheduler.kv_cache_manager = SimpleNamespace(reset_prefix_cache=lambda: True)
+    scheduler.reset_connector_cache = lambda: True
+
+    monkeypatch.setattr(Scheduler, "_preempt_request", lambda *args: None)
+
+    requests = list(scheduler.running)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True) is True
+
+    assert scheduler.running == []
+    assert scheduler.prev_step_scheduled_req_ids == set()
+    assert [request.async_tokens_to_discard for request in requests] == [2, 1]
+    assert [request.num_output_placeholders for request in requests] == [0, 0]
