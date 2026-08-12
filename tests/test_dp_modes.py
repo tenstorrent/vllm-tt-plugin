@@ -20,6 +20,7 @@ from vllm_tt_plugin.platform import (
 )
 from vllm_tt_plugin.utils.dp_discovery import (
     _maybe_reorder_standard_dp_visible_device_groups,
+    _resolve_parent_mesh_grid,
 )
 from vllm_tt_plugin.worker import TTWorker, _resolve_mesh_grid
 
@@ -46,6 +47,9 @@ class TestDPModes:
                 data_parallel_backend="mp",
                 nnodes=1,
                 node_rank=0,
+                # Seeded with vLLM's own default so the assertions below catch a
+                # plugin-side override rather than the absence of one.
+                dp_engine_core_proc_cls="vllm.v1.engine.core.DPEngineCoreProc",
             ),
             model_config=SimpleNamespace(
                 model="dummy",
@@ -201,6 +205,15 @@ class TestDPModes:
         assert _resolve_mesh_grid("TG", 1, "0") == (1, 1)
         assert _resolve_mesh_grid("TG", 8, "0,1,2,3,4,5,6,7") == (1, 8)
         assert _resolve_mesh_grid("P150x8", 8, "3") == (1, 1)
+
+    def test_bh_galaxy_resolves_like_wh_galaxy(self) -> None:
+        assert _resolve_mesh_grid("BH-Galaxy", 32, None) == (8, 4)
+        assert _resolve_mesh_grid("BH-Galaxy", 32, None) == _resolve_mesh_grid(
+            "TG", 32, None
+        )
+        assert _resolve_parent_mesh_grid("BH-Galaxy", 32) == _resolve_parent_mesh_grid(
+            "TG", 32
+        )
 
     def test_visible_devices_use_discovered_submesh_shape(
         self,
@@ -492,7 +505,7 @@ class TestDPModes:
             world_size=1,
         ) == ["16,17,18,19,20,21,22,23"]
 
-    def test_legacy_gathered_override_is_ignored_by_platform(
+    def test_legacy_tt_dp_override_is_ignored_by_platform(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
@@ -720,7 +733,7 @@ class TestDPModes:
         with pytest.raises(RuntimeError, match="duplicate rank 0"):
             parse_tt_mpi_params(vllm_config)
 
-    def test_legacy_gathered_override_is_ignored_by_launcher(
+    def test_legacy_tt_dp_override_is_ignored_by_launcher(
         self,
         tmp_path: pathlib.Path,
         vllm_config: SimpleNamespace,

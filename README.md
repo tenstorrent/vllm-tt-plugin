@@ -24,7 +24,6 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- engine.py            # TT engine core and DP engine processes
 |   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.24)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
@@ -67,6 +66,15 @@ The script installs vLLM with
 `VLLM_TARGET_DEVICE=empty` because `tt` platform is provided by this plugin
 at runtime. It then installs the plugin with a few dependencies.
 Most dependencies come from the active tt-metal env.
+
+The script also installs vLLM's dependency list itself, fetched from
+`requirements/common.txt` at the pinned vLLM tag, and installs vLLM with
+`--no-deps`. Resolving them the usual way pulls vLLM's CUDA dependency set
+(torch pinned, `flashinfer`, `tilelang`, `nvidia-*`), which would fight the
+tt-metal env over `torch` and add several GB. This means the script needs network
+access to `raw.githubusercontent.com` beyond the package index. When installing
+inside a container, also set `UV_NO_CACHE=1` to keep the uv cache out of the
+image layer.
 
 To install or refresh only the plugin package:
 
@@ -163,7 +171,7 @@ python examples/offline_inference_tt.py --measure_perf
 ```
 
 To run a different text model, set `MESH_DEVICE` to `N150`, `N300`, `T3K`, `TG`,
-or a mesh shape such as `"(4,8)"`, then pass `--model`:
+`BH-Galaxy`, or a mesh shape such as `"(4,8)"`, then pass `--model`:
 
 - Llama 3.1 8B: `--model "meta-llama/Llama-3.1-8B"`
 - Llama 3.2 1B: `--model "meta-llama/Llama-3.2-1B"`
@@ -371,11 +379,9 @@ python examples/server_example_tt.py \
 ```
 
 `--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
-each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. For
-these single-execute Galaxy models this replaces the gathered DP=4 setup they
-used historically, so there is nothing to migrate. This conversion is specific
-to the Galaxy generators; other model families still run `--data_parallel_size`
-as multi-process DP.
+each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. This
+conversion is specific to the Galaxy generators and GPT-OSS; other model
+families still run `--data_parallel_size` as multi-process DP.
 At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
@@ -519,9 +525,10 @@ Models that do not opt in stay on the legacy `Generator` path: uniform
 single-group KV cache, one page table, and no behavioral change. The plugin only
 sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
 
-Hybrid models are not yet supported with `data_parallel_size > 1`; the DP
-merged-input gather path collapses to group 0 only. Use DP=1 with hybrid models
-until per-group DP gather lands.
+Hybrid models with `data_parallel_size > 1` have not been validated on
+hardware. Both DP modes carry the full per-group block tables (a standard-DP
+rank is an independent DP=1 engine, and lane-DP builds per-group tables for the
+merged batch), so there is no known blocker, but the combination is untested.
 
 
 ## Development Notes

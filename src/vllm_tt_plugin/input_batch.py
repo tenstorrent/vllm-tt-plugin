@@ -1342,8 +1342,8 @@ class TTLaneInputBatch(InputBatch):
         sampled: torch.Tensor,
         is_decode: bool,
     ) -> LogprobsLists | None:
-        """Build logprobs for device-sampled tokens, mirroring the gather-DP
-        device logprobs path but over the scheduled slot rows."""
+        """Build logprobs for device-sampled tokens over the scheduled slot
+        rows, mirroring the runner's device logprobs path."""
         n = len(scheduled_rows)
         assert isinstance(model_input.tt_sampling_params.enable_log_probs, torch.Tensor)
         enable = model_input.tt_sampling_params.enable_log_probs

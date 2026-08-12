@@ -62,7 +62,7 @@ def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
     the user "tt" namespace) so ``get_tt_data_parallel_size`` observes it both
     here and in the worker subprocess -- ``additional_config`` is a declared
     config field, so it survives the copy/pickle to that process. Internal
-    handoff from the Galaxy gather-DP-to-lanes conversion; not user-facing.
+    handoff from the Galaxy DP-to-lanes conversion; not user-facing.
     """
     if lanes < 1:
         raise ValueError(f"resolved TT lane count must be >= 1, got {lanes}")

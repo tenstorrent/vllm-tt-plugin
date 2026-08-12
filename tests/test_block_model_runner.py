@@ -65,26 +65,6 @@ def test_capacity_overrun_is_rejected_before_writes():
     assert output_tokens == []
 
 
-def test_dp_packing_preserves_block_width_for_empty_rank():
-    runner = SimpleNamespace(
-        tt_data_parallel_size=2,
-        tt_per_lane_max_num_seqs=1,
-        _output_tokens_per_step=16,
-    )
-    block = torch.arange(16, dtype=torch.int32).reshape(1, 16)
-
-    packed, logprobs = TTModelRunner.pack_dp_results(
-        runner,
-        [block, torch.empty((0, 16), dtype=torch.int32)],
-        [None, None],
-    )
-
-    assert packed.shape == (2, 1, 16)
-    assert packed[0, 0].tolist() == list(range(16))
-    assert not packed[1].any()
-    assert logprobs == [None, None]
-
-
 def test_ar_k1_output_shape_is_unchanged():
     runner, output_tokens = _runner(1)
     token = torch.tensor([[7]], dtype=torch.int32)
