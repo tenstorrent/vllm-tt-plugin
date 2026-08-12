@@ -239,6 +239,53 @@ def test_visible_devices_use_discovered_submesh_shape(
     assert _resolve_mesh_grid("TG", 4, "0,1,2,3") == (2, 2)
 
 
+def test_stored_groups_suppress_rediscovery_on_config_reapply(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config: SimpleNamespace,
+) -> None:
+    """``TTWorker.init_device`` re-applies the hook with one group bound.
+
+    Rediscovery there would resolve against the narrowed cluster: a Galaxy DP=2
+    rank sees 16 chips, so ``create_submeshes`` would split them again and the
+    real ``(2, 8)`` submesh shape would be replaced by two ``(1, 8)`` halves.
+    """
+    group_0 = ",".join(str(device_id) for device_id in range(16))
+    group_1 = ",".join(str(device_id) for device_id in range(16, 32))
+
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.additional_config = {
+        "_tt_standard_dp_visible_groups": [group_0, group_1],
+        "_tt_standard_dp_mesh_grids": {group_0: [2, 8], group_1: [2, 8]},
+    }
+
+    def _fail_discovery(_vllm_config):
+        raise AssertionError("discovery must only run where the whole machine is seen")
+
+    monkeypatch.setattr(TTPlatform, "_standard_dp_visible_device_groups", None)
+    monkeypatch.setattr(TTPlatform, "_standard_dp_mesh_grids", {})
+    monkeypatch.setattr(
+        "vllm_tt_plugin.platform._resolve_standard_dp_visible_device_groups",
+        _fail_discovery,
+    )
+    monkeypatch.setattr(
+        "vllm_tt_plugin.platform.register_tt_models", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.registry.ModelRegistry.get_supported_archs",
+        lambda: ["TTDummyModel"],
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _model_config: (type("DummyModel", (), {}), None),
+    )
+
+    TTPlatform.check_and_update_config(vllm_config)
+
+    assert TTPlatform._standard_dp_visible_device_groups == [group_0, group_1]
+    assert TTPlatform._standard_dp_mesh_grids == {group_0: (2, 8), group_1: (2, 8)}
+    assert _resolve_mesh_grid("TG", 16, group_1) == (2, 8)
+
+
 def test_standard_dp_visible_device_groups_feed_upstream_gpu_id_assignment(
     monkeypatch: pytest.MonkeyPatch,
     vllm_config: SimpleNamespace,

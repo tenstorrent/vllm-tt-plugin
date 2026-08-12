@@ -1011,18 +1011,30 @@ class TTPlatform(Platform):
 
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)
-            discovery_result = _resolve_standard_dp_visible_device_groups(vllm_config)
-            (
-                cls._standard_dp_visible_device_groups,
-                resolved_mesh_grids,
-            ) = _split_standard_dp_discovery_result(discovery_result)
-            if resolved_mesh_grids:
-                cls._standard_dp_mesh_grids = resolved_mesh_grids
-                _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
-            if cls._standard_dp_visible_device_groups is not None:
-                _store_standard_dp_visible_groups(
-                    vllm_config, cls._standard_dp_visible_device_groups
+            cls._standard_dp_visible_device_groups = _load_standard_dp_visible_groups(
+                vllm_config
+            )
+            # Discovery opens the parent mesh, so only a process that still sees
+            # the whole machine may run it. This hook also re-runs in the worker,
+            # after `TT_VISIBLE_DEVICES` is narrowed to one group; there it must
+            # consume what `VllmConfig` carries, or it would rediscover against
+            # the narrowed cluster and overwrite the real submesh shapes.
+            if cls._standard_dp_visible_device_groups is None:
+                discovery_result = _resolve_standard_dp_visible_device_groups(
+                    vllm_config
                 )
+                (
+                    cls._standard_dp_visible_device_groups,
+                    resolved_mesh_grids,
+                ) = _split_standard_dp_discovery_result(discovery_result)
+                if resolved_mesh_grids:
+                    cls._standard_dp_mesh_grids = resolved_mesh_grids
+                    _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
+                if cls._standard_dp_visible_device_groups is not None:
+                    _store_standard_dp_visible_groups(
+                        vllm_config, cls._standard_dp_visible_device_groups
+                    )
+
         if _uses_explicit_tt_mpi_launch(vllm_config):
             parallel_config.engine_core_launcher_cls = (
                 "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
