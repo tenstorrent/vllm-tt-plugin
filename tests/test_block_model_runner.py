@@ -85,17 +85,17 @@ def test_update_states_accepts_absent_preemption_metadata():
     assert scheduler_output.preempted_req_ids is None
 
     refreshed = []
-    runner = SimpleNamespace(
-        requests={},
-        encoder_cache={},
-        input_batch=SimpleNamespace(
-            req_id_to_index={},
-            refresh_logitsprocs=lambda: refreshed.append(True),
-        ),
-        _decode_layout_changed_since_last_decode=False,
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.requests = {}
+    runner.encoder_cache = {}
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={},
+        refresh_logitsprocs=lambda: refreshed.append(True),
     )
+    runner._decode_layout_changed_since_last_decode = False
+    runner._req_state_slot = {}
 
-    TTModelRunner._update_states(runner, scheduler_output)
+    runner._update_states(scheduler_output)
 
     assert refreshed == [True]
 
@@ -139,6 +139,7 @@ def test_update_states_releases_model_request_before_removing_row(
     runner.input_batch = input_batch
     runner.model = SimpleNamespace(release_request=release_request)
     runner._decode_layout_changed_since_last_decode = False
+    runner._req_state_slot = {"req-0": 3}
 
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.finished_req_ids = finished_req_ids
@@ -149,6 +150,7 @@ def test_update_states_releases_model_request_before_removing_row(
     assert events == [("release", 3), ("remove", "req-0")]
     assert "req-0" not in input_batch.req_id_to_index
     assert ("req-0" in runner.requests) is request_retained
+    assert runner._req_state_slot == {}
 
 
 def test_worker_wrapper_shutdown_releases_persistent_capture_once():
