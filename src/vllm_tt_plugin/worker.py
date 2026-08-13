@@ -96,7 +96,9 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
         if groups is None:
             return
 
-        # Same index space as the mesh selection in ``init_device``.
+        # Index the fallback the way upstream indexes the primary channel:
+        # device_id_to_physical_device_id(local_dp_rank) at world_size 1. Local
+        # equals global because discovery only runs on a single host.
         local_dp_rank = parallel_config.data_parallel_rank_local
         if local_dp_rank is None or not 0 <= local_dp_rank < len(groups):
             raise RuntimeError(

@@ -732,9 +732,13 @@ class TTPlatform(Platform):
     def device_id_to_physical_device_id(cls, device_id: int) -> str | int:
         """Map a DP rank to its whole comma-joined TT device group.
 
-        Deviates from upstream, where ``device_id`` is a device index and the
-        return is one physical id. ``assigned_physical_gpu_ids`` therefore holds
-        a single group string, not the ``list[int]`` upstream declares.
+        Deviates from upstream, where ``device_id`` is a logical device index and
+        the return is one physical id. Sound only because TT pins ``world_size``
+        to 1, so upstream asks for exactly one id per DP rank and keeps it as a
+        one-element list: ``assigned_physical_gpu_ids`` carries a group string,
+        not the ``list[int]`` it declares. Anything reading that list as
+        per-device, its length as a device count or its entries as ints, is
+        wrong for TT.
         """
         groups = cls._standard_dp_visible_device_groups
         if groups is not None:
