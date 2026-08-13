@@ -105,9 +105,8 @@ def _store_standard_dp_visible_groups(
 ) -> None:
     """Store the per-rank visible-device group list on the vLLM config.
 
-    Indexed by DP rank so worker subprocesses can recover
-    ``TT_VISIBLE_DEVICES`` from ``data_parallel_index`` when the
-    env-var does not propagate through the engine-core fork chain.
+    Indexed by DP rank, and kept on ``additional_config`` because that is a
+    declared config field and so survives pickling into the worker subprocess.
     """
     additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
@@ -119,14 +118,18 @@ def _store_standard_dp_visible_groups(
 def _load_standard_dp_visible_groups(
     vllm_config: "VllmConfig",
 ) -> list[str] | None:
-    """Load the per-rank visible-device group list from the vLLM config."""
+    """Load the per-rank visible-device group list from the vLLM config.
+
+    ``None`` means nothing was stored. An empty list means discovery stored
+    nothing usable, which callers must not treat as "keep the inherited value".
+    """
     additional_config = getattr(vllm_config, "additional_config", None) or {}
 
     if not isinstance(additional_config, dict):
         return None
 
     groups = additional_config.get(_STANDARD_DP_VISIBLE_GROUPS_KEY)
-    if not isinstance(groups, list) or not groups:
+    if not isinstance(groups, list):
         return None
 
     return [str(g) for g in groups]
@@ -797,7 +800,17 @@ class TTPlatform(Platform):
     simple_compile_backend: str = "eager"
 
     @classmethod
-    def device_id_to_physical_device_id(cls, device_id: int):
+    def device_id_to_physical_device_id(cls, device_id: int) -> str | int:
+        """Map a DP rank to its whole comma-joined TT device group.
+
+        Deviates from upstream, where ``device_id`` is a logical device index and
+        the return is one physical id. Sound only because TT pins ``world_size``
+        to 1, so upstream asks for exactly one id per DP rank and keeps it as a
+        one-element list: ``assigned_physical_gpu_ids`` carries a group string,
+        not the ``list[int]`` it declares. Anything reading that list as
+        per-device, its length as a device count or its entries as ints, is
+        wrong for TT.
+        """
         groups = cls._standard_dp_visible_device_groups
         if groups is not None:
             return groups[device_id]
@@ -1190,18 +1203,30 @@ class TTPlatform(Platform):
 
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)
-            discovery_result = _resolve_standard_dp_visible_device_groups(vllm_config)
-            (
-                cls._standard_dp_visible_device_groups,
-                resolved_mesh_grids,
-            ) = _split_standard_dp_discovery_result(discovery_result)
-            if resolved_mesh_grids:
-                cls._standard_dp_mesh_grids = resolved_mesh_grids
-                _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
-            if cls._standard_dp_visible_device_groups:
-                _store_standard_dp_visible_groups(
-                    vllm_config, cls._standard_dp_visible_device_groups
+            cls._standard_dp_visible_device_groups = _load_standard_dp_visible_groups(
+                vllm_config
+            )
+            # Discovery opens the parent mesh, so only a process that still sees
+            # the whole machine may run it. This hook also re-runs in the worker,
+            # after `TT_VISIBLE_DEVICES` is narrowed to one group; there it must
+            # consume what `VllmConfig` carries, or it would rediscover against
+            # the narrowed cluster and overwrite the real submesh shapes.
+            if cls._standard_dp_visible_device_groups is None:
+                discovery_result = _resolve_standard_dp_visible_device_groups(
+                    vllm_config
                 )
+                (
+                    cls._standard_dp_visible_device_groups,
+                    resolved_mesh_grids,
+                ) = _split_standard_dp_discovery_result(discovery_result)
+                if resolved_mesh_grids:
+                    cls._standard_dp_mesh_grids = resolved_mesh_grids
+                    _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
+                if cls._standard_dp_visible_device_groups is not None:
+                    _store_standard_dp_visible_groups(
+                        vllm_config, cls._standard_dp_visible_device_groups
+                    )
+
         if vllm_config.cache_config.enable_prefix_caching:
             # Check prefix caching support from capabilities (default to False)
             supports_prefix_caching = (

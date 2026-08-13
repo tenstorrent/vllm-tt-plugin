@@ -10,6 +10,11 @@ N`` is folded into ``N`` in-process TT lanes by
 
 from types import SimpleNamespace
 
+# ``vllm`` must finish importing before any plugin module, otherwise vllm's own
+# platform resolution re-enters the plugin against a partially initialized
+# ``vllm.platforms``. No other import here pulls ``vllm`` in first.
+import vllm  # noqa: F401  isort: skip
+
 from vllm_tt_plugin import config as tt_config
 from vllm_tt_plugin import platform as tt_platform
 
