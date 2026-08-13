@@ -829,10 +829,14 @@ class TTModelRunner:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
-                assert free, (
-                    f"no free device state slot for {len(row_req_ids)} prefill(s): "
-                    f"held={sorted(held)}, capacity={n_slots}"
-                )
+                if not free:
+                    # A raise, not an assert: the message is the only way to tell a
+                    # capacity shortfall from a leak in the ownership map, and ``-O``
+                    # would drop an assert and leave an opaque IndexError below.
+                    raise RuntimeError(
+                        f"no free device state slot for {len(row_req_ids)} prefill(s): "
+                        f"held={sorted(held)}, capacity={n_slots}"
+                    )
                 slot = free[0]
             held.add(slot)
             self._req_state_slot[req_id] = slot
@@ -887,8 +891,10 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether to pop and attach the input batch's
-                pending slot remap.
+            capture_slot_remap: Whether this build will carry the decode state
+                remap. False skips computing it, because building it also advances
+                the ownership map to the post-gather layout. Prefill slots are
+                attached either way.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling
@@ -1195,18 +1201,23 @@ class TTModelRunner:
 
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
-        # State follows the request, not the row (``self._req_state_slot``). That
-        # subsumes the batch's condense-move remap, so pop and discard it.
+        # State follows the request, not the row (``self._req_state_slot``), which
+        # subsumes the batch's condense-move remap. Drain it on every build: it is
+        # dead information now, and leaving it pending would let it accumulate moves
+        # the state map has already accounted for.
         input_batch.pop_slot_remap()
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        prefill_empty_slots = None
+        slot_remap = None
         if is_prompt:
+            # Not gated on ``capture_slot_remap``: a prefill always needs its slots,
+            # or the model falls back to ``range(N)`` over live state.
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
-            slot_remap = None
-        else:
-            prefill_empty_slots = None
+        elif capture_slot_remap:
+            # Only when the caller will carry the remap. Building it advances the
+            # ownership map to the post-gather layout, so computing it for a build
+            # that drops it would leave the map claiming a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
-        if not capture_slot_remap:
-            slot_remap = None
 
         return TTModelInput(
             input_tokens=input_tokens,

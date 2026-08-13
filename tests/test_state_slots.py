@@ -77,12 +77,29 @@ def test_state_follows_the_request_across_row_moves():
     )
 
 
+def test_building_the_decode_remap_advances_the_ownership_map():
+    """Not a pure query: it records the post-gather layout.
+
+    This is why ``_prepare_model_inputs`` computes it only when the build will carry
+    it. Computing it for a build that drops the remap would leave the map claiming a
+    move the device never performed, and every later step would then read the wrong
+    slot and see an identity remap.
+    """
+    r = _runner()
+    r._req_state_slot.update({"A": 3, "B": 1})
+    r.requests.update(dict.fromkeys(["A", "B"]))
+
+    assert _decode(r, ["A", "B"]) == [3, 1, 0, 2, 4, 5, 6, 7]
+    assert r._req_state_slot["A"] == 0 and r._req_state_slot["B"] == 1
+
+
 def test_capacity_and_slot_width_are_enforced():
     """More prefills than slots is a caller bug; rows past capacity are dropped."""
     r = _runner(slots=2)
     _prefill(r, ["A"])
     _decode(r, ["A"])
-    with pytest.raises(AssertionError, match="no free device state slot"):
+    # A raise, not an assert, so the diagnostic survives ``python -O``.
+    with pytest.raises(RuntimeError, match="no free device state slot"):
         _prefill(r, ["B", "C"])
 
     # Rows beyond the slot width are truncated, so an over-long batch still yields a
