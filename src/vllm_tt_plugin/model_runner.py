@@ -873,7 +873,6 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
-        capture_slot_remap: bool = True,
     ) -> TTModelInput:
         """Build a ``TTModelInput`` for one prefill or decode step.
 
@@ -891,10 +890,6 @@ class TTModelRunner:
                 structured-output bitmasks.
             grammar_output: Structured-output bitmasks for this step, or
                 ``None`` when no request uses guided decoding.
-            capture_slot_remap: Whether this build will carry the decode state
-                remap. False skips computing it, because building it also advances
-                the ownership map to the post-gather layout. Prefill slots are
-                attached either way.
 
         Returns:
             A ``TTModelInput`` with tokens, positions, block tables, sampling
@@ -1210,13 +1205,11 @@ class TTModelRunner:
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
-            # Not gated on ``capture_slot_remap``: a prefill always needs its slots,
-            # or the model falls back to ``range(N)`` over live state.
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
-        elif capture_slot_remap:
-            # Only when the caller will carry the remap. Building it advances the
-            # ownership map to the post-gather layout, so computing it for a build
-            # that drops it would leave the map claiming a move that never happened.
+        else:
+            # Advances the ownership map to the post-gather layout, so the returned
+            # remap has to reach the device: dropping it would leave the map claiming
+            # a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
         return TTModelInput(

@@ -80,10 +80,9 @@ def test_state_follows_the_request_across_row_moves():
 def test_building_the_decode_remap_advances_the_ownership_map():
     """Not a pure query: it records the post-gather layout.
 
-    This is why ``_prepare_model_inputs`` computes it only when the build will carry
-    it. Computing it for a build that drops the remap would leave the map claiming a
-    move the device never performed, and every later step would then read the wrong
-    slot and see an identity remap.
+    So the remap it returns has to reach the device. A caller that built it and then
+    dropped it would leave the map claiming a move that never happened, and every
+    later step would read the wrong slot behind an identity remap.
     """
     r = _runner()
     r._req_state_slot.update({"A": 3, "B": 1})
