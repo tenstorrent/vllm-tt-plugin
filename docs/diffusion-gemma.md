@@ -44,9 +44,14 @@ python -m vllm.entrypoints.openai.api_server \
   --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
   --no-async-scheduling \
-  --reasoning-parser diffusion_gemma \
+  --reasoning-parser gemma4 \
   --additional-config '{"tt":{"sample_on_device_mode":"all","enable_model_warmup":true,"trace_mode":"all"}}'
 ```
+
+Reasoning and tool-call parsing use the `gemma4` parsers that ship with vLLM
+0.24 (the same ones upstream's DiffusionGemma recipe uses); for tool calling
+add `--enable-auto-tool-choice --tool-call-parser gemma4`. The plugin
+registers no parsers of its own.
 
 The plugin pins `VLLM_USE_V2_MODEL_RUNNER=0` because vLLM 0.24 otherwise
 classifies any model with `canvas_length` as a Triton-only V2 diffusion runner.
