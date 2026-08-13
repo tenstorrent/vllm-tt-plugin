@@ -844,14 +844,16 @@ class TTLaneInputBatch(InputBatch):
     ) -> bool:
         """Apply one lane step plan to this batch and the runner's request map.
 
-        This is the lane-DP variant of ``TTModelRunner._update_states``. Unlike
-        the front-packed batch it does **not** evict merely-unscheduled
-        requests: a prefill step can leave running decodes unscheduled, and
-        freeing their stable device slot would disturb the on-device per-slot
-        seed RNG. Only requests whose slot content is no longer authoritative
-        release it: finished ones, and preempted ones (KV freed, so the resume
-        re-prefills from zero), whether the preemption is reported this step or
-        surfaces later as a resume. There is no condense.
+        This is the lane-DP variant of ``TTModelRunner._update_states``, which
+        frees the row of *every* request the step left unscheduled and re-places
+        it on a later step (harmless there: the front-packed layout is rebuilt
+        each step anyway, and the request's cached state is kept). Here a row is
+        the request's stable device slot, so it is held for the request's whole
+        lifetime and only released when its contents stop being authoritative:
+        on finish, and on preemption (KV freed, so the resume re-prefills from
+        zero), whether the preemption is reported this step or surfaces later as
+        a resume. A running decode left out of a prefill step keeps its row.
+        There is no condense.
 
         ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
         map) and ``encoder_cache`` are mutated in place. Placement rows come

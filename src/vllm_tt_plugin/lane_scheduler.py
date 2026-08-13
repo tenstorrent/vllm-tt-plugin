@@ -470,7 +470,7 @@ class TTLaneCoordinator(SchedulerInterface):
         # reset, so the resume re-prefills and rewrites whatever row it lands on.
         # The lane binding stays -- the request resumes in the lane whose KV
         # manager and queues still hold it. ``TTLaneInputBatch.apply_step_plan``
-        # evicts the same request from the batch in this same step, so the row is
+        # drops the same request from that row in this same step, so the row is
         # free on both sides before anything can be placed there.
         # ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         for req_id in merged.preempted_req_ids or ():
