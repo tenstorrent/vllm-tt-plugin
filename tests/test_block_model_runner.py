@@ -129,9 +129,8 @@ def test_update_states_releases_model_request_before_removing_row(
 
     input_batch = InputBatchSpy()
 
-    def release_request(row):
-        assert input_batch.req_id_to_index["req-0"] == row
-        events.append(("release", row))
+    def release_request(slot):
+        events.append(("release", slot))
 
     runner = TTModelRunner.__new__(TTModelRunner)
     runner.requests = {"req-0": object()}
@@ -139,7 +138,9 @@ def test_update_states_releases_model_request_before_removing_row(
     runner.input_batch = input_batch
     runner.model = SimpleNamespace(release_request=release_request)
     runner._decode_layout_changed_since_last_decode = False
-    runner._req_state_slot = {"req-0": 3}
+    # State parked at a slot different from the batch row: release must
+    # target the slot, not the row.
+    runner._req_state_slot = {"req-0": 5}
 
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.finished_req_ids = finished_req_ids
@@ -147,7 +148,7 @@ def test_update_states_releases_model_request_before_removing_row(
 
     runner._update_states(scheduler_output)
 
-    assert events == [("release", 3), ("remove", "req-0")]
+    assert events == [("release", 5), ("remove", "req-0")]
     assert "req-0" not in input_batch.req_id_to_index
     assert ("req-0" in runner.requests) is request_retained
     assert runner._req_state_slot == {}

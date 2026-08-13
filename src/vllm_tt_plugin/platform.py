@@ -441,8 +441,11 @@ def _install_block_output_input_processor_patch() -> None:
 
     vLLM 0.24 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
-    reject streaming-input sessions before EngineCore and validate with a
-    whole-canvas default without mutating the shared input.
+    validate with a whole-canvas default without mutating the shared input, and
+    reject resumable streaming-input chunks before EngineCore admits any.
+    (vLLM creates the streaming-input session wrapper without the ``resumable``
+    flag, so the session opens and the client sees the error on its first
+    chunk.)
 
     TODO: remove once vLLM exposes a platform hook for per-request defaults.
     """
@@ -475,9 +478,18 @@ def _install_block_output_input_processor_patch() -> None:
             and cloned_params is not None
             and cloned_params.max_tokens is not None
         ):
-            cloned_params.max_tokens = (
-                cloned_params.max_tokens // output_size * output_size
-            )
+            rounded = cloned_params.max_tokens // output_size * output_size
+            if rounded == 0:
+                # Re-validate the resolved default: inputs without
+                # prompt_token_ids (e.g. prompt embeds) skip the canvas check
+                # in validate_request, and a whole-canvas default of zero
+                # would otherwise be admitted.
+                raise ValueError(
+                    f"Request leaves fewer than one physical {output_size}"
+                    "-token output canvas within the max model length. Use a "
+                    "shorter prompt or a larger max model length."
+                )
+            cloned_params.max_tokens = rounded
         return request
 
     input_processor.InputProcessor.process_inputs = process_inputs_tt
@@ -1273,13 +1285,12 @@ class TTPlatform(Platform):
     def uses_host_device_handling(cls) -> bool:
         return True
 
-    def get_max_output_tokens(self, prompt_len: int) -> int:
-        """Clamp the platform default to complete physical output canvases."""
-        output_size = type(self).output_tokens_per_step
-        max_model_len = type(self)._get_block_model_max_len()
-        if output_size == 1 or max_model_len is None:
-            return super().get_max_output_tokens(prompt_len)
-
+    @classmethod
+    def _fit_whole_canvas_default(
+        cls, prompt_len: int, output_size: int, max_model_len: int
+    ) -> int:
+        """Largest whole-canvas output that fits after the prompt; raises if
+        not even one physical canvas fits."""
         remaining = max_model_len - prompt_len
         if remaining < output_size:
             raise ValueError(
@@ -1289,6 +1300,14 @@ class TTPlatform(Platform):
                 "prompt or a larger max model length."
             )
         return remaining // output_size * output_size
+
+    def get_max_output_tokens(self, prompt_len: int) -> int:
+        """Clamp the platform default to complete physical output canvases."""
+        output_size = type(self).output_tokens_per_step
+        max_model_len = type(self)._get_block_model_max_len()
+        if output_size == 1 or max_model_len is None:
+            return super().get_max_output_tokens(prompt_len)
+        return self._fit_whole_canvas_default(prompt_len, output_size, max_model_len)
 
     @classmethod
     def validate_request(
@@ -1320,17 +1339,9 @@ class TTPlatform(Platform):
                 # per-request default locally; mutating the caller-owned object
                 # here makes LLM.generate([...], one_params) prompt-order
                 # dependent because vLLM clones only after this hook.
-                remaining = max_model_len - prompt_len
-                if remaining < output_size:
-                    raise ValueError(
-                        f"Prompt length {prompt_len} leaves "
-                        f"{max(0, remaining)} tokens within "
-                        f"max_model_len={max_model_len}, but this model "
-                        f"commits physical {output_size}-token output "
-                        "canvases. Use a shorter prompt or a larger max "
-                        "model length."
-                    )
-                max_tokens = remaining // output_size * output_size
+                max_tokens = cls._fit_whole_canvas_default(
+                    prompt_len, output_size, max_model_len
+                )
             physical_output_tokens = (
                 (max_tokens + output_size - 1) // output_size
             ) * output_size
@@ -1343,6 +1354,40 @@ class TTPlatform(Platform):
                     f"max_model_len={max_model_len}. Reduce max_tokens or use a "
                     "shorter prompt."
                 )
+
+        # Reject unsupported response-contract controls before touching the
+        # caller-owned params, so a rejected request is not left mutated.
+        unsupported = []
+        if params.n != 1:
+            unsupported.append(f"n={params.n!r} (accepted: 1)")
+        if params.logprobs is not None:
+            unsupported.append(f"logprobs={params.logprobs!r} (accepted: None)")
+        if params.logprob_token_ids is not None:
+            unsupported.append("logprob_token_ids (accepted: omitted/None)")
+        if params.flat_logprobs:
+            unsupported.append("flat_logprobs=True (accepted: False)")
+        if params.bad_words:
+            unsupported.append("bad_words (accepted: omitted/empty)")
+        if params.structured_outputs is not None:
+            unsupported.append("structured_outputs (accepted: omitted/None)")
+        if params.logit_bias is not None:
+            unsupported.append("logit_bias (accepted: omitted/None)")
+        if params.allowed_token_ids is not None:
+            unsupported.append("allowed_token_ids (accepted: omitted/None)")
+        if params.min_tokens != 0:
+            unsupported.append(f"min_tokens={params.min_tokens!r} (accepted: 0)")
+        if params.thinking_token_budget is not None:
+            unsupported.append("thinking_token_budget (accepted: omitted/None)")
+        if params.repetition_detection is not None:
+            unsupported.append("repetition_detection (accepted: omitted/None)")
+        if params.extra_args:
+            unsupported.append("extra_args (accepted: omitted/empty)")
+
+        if unsupported:
+            raise ValueError(
+                "This block-output model owns its Gumbel sampling and does not "
+                "support these request parameters: " + "; ".join(unsupported)
+            )
 
         # The model owns its Gumbel sampler and temperature schedule. Common
         # OpenAI clients still send transport sampling controls, so accept and
@@ -1383,38 +1428,6 @@ class TTPlatform(Platform):
             logger.debug(
                 "Ignoring unsupported sampling controls for block-output model: %s",
                 "; ".join(ignored),
-            )
-
-        unsupported = []
-        if params.n != 1:
-            unsupported.append(f"n={params.n!r} (accepted: 1)")
-        if params.logprobs is not None:
-            unsupported.append(f"logprobs={params.logprobs!r} (accepted: None)")
-        if params.logprob_token_ids is not None:
-            unsupported.append("logprob_token_ids (accepted: omitted/None)")
-        if params.flat_logprobs:
-            unsupported.append("flat_logprobs=True (accepted: False)")
-        if params.bad_words:
-            unsupported.append("bad_words (accepted: omitted/empty)")
-        if params.structured_outputs is not None:
-            unsupported.append("structured_outputs (accepted: omitted/None)")
-        if params.logit_bias is not None:
-            unsupported.append("logit_bias (accepted: omitted/None)")
-        if params.allowed_token_ids is not None:
-            unsupported.append("allowed_token_ids (accepted: omitted/None)")
-        if params.min_tokens != 0:
-            unsupported.append(f"min_tokens={params.min_tokens!r} (accepted: 0)")
-        if params.thinking_token_budget is not None:
-            unsupported.append("thinking_token_budget (accepted: omitted/None)")
-        if params.repetition_detection is not None:
-            unsupported.append("repetition_detection (accepted: omitted/None)")
-        if params.extra_args:
-            unsupported.append("extra_args (accepted: omitted/empty)")
-
-        if unsupported:
-            raise ValueError(
-                "This block-output model owns its Gumbel sampling and does not "
-                "support these request parameters: " + "; ".join(unsupported)
             )
 
     @staticmethod

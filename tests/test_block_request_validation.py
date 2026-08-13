@@ -40,9 +40,8 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
         TTPlatform.validate_request(prompt, params)
         cloned_params = params.clone()
         if cloned_params.max_tokens is None:
-            cloned_params.max_tokens = self.model_config.max_model_len - len(
-                prompt["prompt_token_ids"]
-            )
+            seq_len = len(prompt.get("prompt_token_ids") or prompt["prompt_embeds"])
+            cloned_params.max_tokens = self.model_config.max_model_len - seq_len
         return SimpleNamespace(
             sampling_params=cloned_params,
             resumable=kwargs.get("resumable", False),
@@ -148,6 +147,15 @@ def test_non_neutral_sampling_controls_are_accepted_and_neutralized(field, value
 def test_contract_changing_controls_are_rejected(kwargs, field):
     with pytest.raises(ValueError, match=field):
         _validate(SamplingParams(max_tokens=16, **kwargs))
+
+
+def test_rejected_request_leaves_params_unmutated():
+    params = SamplingParams(max_tokens=16, temperature=0.5, n=2)
+
+    with pytest.raises(ValueError, match="n=2"):
+        _validate(params)
+
+    assert params.temperature == 0.5
 
 
 def test_ar_request_validation_is_unchanged(monkeypatch):
@@ -396,6 +404,24 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
 
     assert request.resumable is True
     assert processor.process_inputs_calls == [{"resumable": True}]
+
+
+def test_input_processor_rejects_zero_canvas_default_for_embeds(monkeypatch):
+    """Inputs without prompt_token_ids skip validate_request's canvas check;
+    the wrapper must still reject a whole-canvas default that rounds to 0."""
+    processor_cls, processor = _processor_harness(monkeypatch)
+    params = SamplingParams(max_tokens=16)
+    params.max_tokens = None
+
+    with pytest.raises(ValueError, match="fewer than one physical"):
+        processor_cls.process_inputs(
+            processor,
+            "embeds",
+            {"prompt_token_ids": None, "prompt_embeds": [0] * 900},
+            params,
+        )
+
+    assert params.max_tokens is None
 
 
 def test_input_processor_rejects_when_no_canvas_fits(monkeypatch):

@@ -36,6 +36,7 @@ from vllm_tt_plugin.async_decode import (
     CompletedDecodeStep,
     DeferredDecodeOutput,
     TTAsyncDecodeController,
+    model_accepts_kwarg,
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
@@ -112,6 +113,29 @@ class _SyncForward:
     batch_size_per_dp: list[int]
     perform_device_sampling: bool
     is_decode: bool
+
+
+def _coerce_output_block(
+    sampled_token_ids: torch.Tensor, num_reqs: int, width: int
+) -> torch.Tensor:
+    """Validate one step's sampled tokens against the output-width contract.
+
+    Returns the tensor shaped ``[num_reqs, width]`` (reshaping the empty
+    tensor) or raises when the model output violates the contract.
+    """
+    assert sampled_token_ids.shape[0] == num_reqs, (
+        f"Number of request outputs {sampled_token_ids.shape[0]} != "
+        f"number of requests in input batch {num_reqs}"
+    )
+    if num_reqs == 0 and sampled_token_ids.numel() == 0:
+        sampled_token_ids = sampled_token_ids.reshape(0, width)
+    if sampled_token_ids.dim() != 2 or sampled_token_ids.shape[1] != width:
+        raise ValueError(
+            "Model output width violates output_tokens_per_step: "
+            f"got shape {tuple(sampled_token_ids.shape)}, expected "
+            f"[num_requests, {width}]"
+        )
+    return sampled_token_ids
 
 
 class TTModelRunner:
@@ -621,11 +645,19 @@ class TTModelRunner:
         return per_layer  # type: ignore[return-value]
 
     def _release_model_request(self, req_id: str) -> None:
-        """Release optional row-owned state while the row mapping is valid."""
-        req_index = self.input_batch.req_id_to_index.get(req_id)
+        """Release model-owned state while the slot mapping is still valid.
+
+        State follows the request's ``_req_state_slot`` slot, not its batch
+        row: prefill can park a request at a slot other than its row when the
+        preferred row is held (``_alloc_prefill_state_slots``). The row is only
+        a fallback for requests that never went through slot allocation.
+        """
+        slot = self._req_state_slot.get(req_id)
+        if slot is None:
+            slot = self.input_batch.req_id_to_index.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
-        if req_index is not None and callable(release):
-            release(req_index)
+        if slot is not None and callable(release):
+            release(slot)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update the cached states and the persistent batch with the
@@ -639,7 +671,6 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-        self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -663,6 +694,10 @@ class TTModelRunner:
         # unscheduling does not: a request may simply be hidden for this step.
         for req_id in scheduler_output.preempted_req_ids or ():
             self._release_model_request(req_id)
+
+        # Only after the model released by slot: the release calls above read
+        # the request's slot from the ownership map before it is dropped.
+        self._release_dead_state_slots(scheduler_output)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -1721,6 +1756,8 @@ class TTModelRunner:
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
         # The slots go to the model whenever the build supplied them: a stateful
         # model's ``range(N)`` default clobbers live state, DP=1 included.
+        # Models whose prefill_forward has a strict signature (no **kwargs)
+        # never see the kwarg -- they carry no per-slot state to protect.
         empty_slots = model_input.prefill_empty_slots
         if empty_slots is None and len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
@@ -1730,7 +1767,9 @@ class TTModelRunner:
             for dp_rank, sz in enumerate(batch_size_per_dp):
                 for i in range(int(sz)):
                     empty_slots.append(dp_rank * stride + i)
-        if empty_slots is not None:
+        if empty_slots is not None and model_accepts_kwarg(
+            self.model.prefill_forward, "empty_slots"
+        ):
             kwargs["empty_slots"] = list(empty_slots)
 
         if self.request_specific_rope:
@@ -2081,23 +2120,9 @@ class TTModelRunner:
             if req_id_to_index is not None
             else {req_id: idx for idx, req_id in enumerate(output_req_ids)}
         )
-        assert sampled_token_ids.shape[0] == num_reqs, (
-            f"Number of request outputs {sampled_token_ids.shape[0]} != "
-            f"number of requests in input batch {num_reqs}"
+        sampled_token_ids = _coerce_output_block(
+            sampled_token_ids, num_reqs, self._output_tokens_per_step
         )
-        if num_reqs == 0 and sampled_token_ids.numel() == 0:
-            sampled_token_ids = sampled_token_ids.reshape(
-                0, self._output_tokens_per_step
-            )
-        if (
-            sampled_token_ids.dim() != 2
-            or sampled_token_ids.shape[1] != self._output_tokens_per_step
-        ):
-            raise ValueError(
-                "Model output width violates output_tokens_per_step: "
-                f"got shape {tuple(sampled_token_ids.shape)}, expected "
-                f"[num_requests, {self._output_tokens_per_step}]"
-            )
 
         sampled_token_ids_np = sampled_token_ids.numpy()
         if sampled_token_ids_np.dtype != np.int32:
@@ -2133,23 +2158,9 @@ class TTModelRunner:
         # single source of truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
-        assert sampled_token_ids.shape[0] == num_reqs, (
-            f"Number of request outputs {sampled_token_ids.shape[0]} != "
-            f"number of requests in input batch {num_reqs}"
+        sampled_token_ids = _coerce_output_block(
+            sampled_token_ids, num_reqs, self._output_tokens_per_step
         )
-        if num_reqs == 0 and sampled_token_ids.numel() == 0:
-            sampled_token_ids = sampled_token_ids.reshape(
-                0, self._output_tokens_per_step
-            )
-        if (
-            sampled_token_ids.dim() != 2
-            or sampled_token_ids.shape[1] != self._output_tokens_per_step
-        ):
-            raise ValueError(
-                "Model output width violates output_tokens_per_step: "
-                f"got shape {tuple(sampled_token_ids.shape)}, expected "
-                f"[num_requests, {self._output_tokens_per_step}]"
-            )
         num_out_tokens = self._output_tokens_per_step
 
         sampled_token_ids_np = sampled_token_ids.numpy()
