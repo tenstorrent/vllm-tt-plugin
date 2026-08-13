@@ -43,16 +43,18 @@ def test_gemma4_keeps_plugin_parsers_and_diffusion_gemma_uses_upstream():
     _register_tt_reasoning_parsers()
     _register_tt_tool_parsers()
 
-    assert ReasoningParserManager.get_reasoning_parser(
-        "gemma4"
-    ).__module__ == "vllm_tt_plugin.gemma4_reasoning_parser"
-    assert ToolParserManager.get_tool_parser(
-        "gemma4"
-    ).__module__ == "vllm_tt_plugin.gemma4_tool_parser"
+    assert (
+        ReasoningParserManager.get_reasoning_parser("gemma4").__module__
+        == "vllm_tt_plugin.gemma4_reasoning_parser"
+    )
+    assert (
+        ToolParserManager.get_tool_parser("gemma4").__module__
+        == "vllm_tt_plugin.gemma4_tool_parser"
+    )
 
     assert ReasoningParserManager.get_reasoning_parser(
         "diffusion_gemma"
     ).__module__.startswith("vllm.")
-    assert ToolParserManager.get_tool_parser(
-        "diffusion_gemma"
-    ).__module__.startswith("vllm.")
+    assert ToolParserManager.get_tool_parser("diffusion_gemma").__module__.startswith(
+        "vllm."
+    )
