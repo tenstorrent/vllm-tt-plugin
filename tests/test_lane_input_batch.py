@@ -168,13 +168,36 @@ def _new_req(req_id, prompt):
     )
 
 
-def _step_output(new_reqs=(), finished=(), plan_rows=None):
+def _step_output(new_reqs=(), finished=(), plan_rows=None, preempted=None, cached=None):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     out = SchedulerOutput.make_empty()
     out.scheduled_new_reqs = list(new_reqs)
     out.finished_req_ids = set(finished)
+    out.preempted_req_ids = None if preempted is None else set(preempted)
+    if cached is not None:
+        out.scheduled_cached_reqs = cached
     return out
+
+
+def _plan(req_id_to_row, *, is_decode=False, capacity=4, num_lanes=1):
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    rows = tuple(sorted(req_id_to_row.values()))
+    per_lane = capacity // num_lanes
+    per_lane_counts = [0] * num_lanes
+    for row in rows:
+        per_lane_counts[row // per_lane] += 1
+    return TTStepPlan(
+        is_decode=is_decode,
+        capacity=capacity,
+        scheduled_req_ids=tuple(sorted(req_id_to_row, key=req_id_to_row.get)),
+        scheduled_rows=rows,
+        input_rows=tuple(range(capacity)) if is_decode else rows,
+        req_id_to_row=dict(req_id_to_row),
+        batch_size_per_dp=tuple(per_lane_counts),
+        prefill_empty_slots=None if is_decode else rows,
+    )
 
 
 def test_apply_step_plan_places_new_requests_and_reports_layout_change():
@@ -284,6 +307,64 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
     assert model_input.intermediate_prefill_mask.tolist() == [True]
     # An intermediate chunk must not advance device RNG state.
     assert model_input.perform_device_sampling is False
+
+
+def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
+    from vllm.v1.core.sched.output import CachedRequestData
+
+    b = _lane_batch(num_lanes=1, per_lane=2)
+    requests: dict = {}
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("a", [1]), _new_req("b", [2])]),
+        _plan({"a": 0, "b": 1}, capacity=2),
+        requests,
+        {},
+    )
+    assert b.occupied_rows() == [0, 1]
+
+    # "a" is preempted: the coordinator hands its row back, so the batch must
+    # give the row up in the same step or the next placement would land on a
+    # live occupant. The request state survives -- the resume needs it.
+    changed = b.apply_step_plan(
+        _step_output(preempted=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=2),
+        requests,
+        {},
+    )
+
+    assert changed is True
+    assert "a" in requests
+    assert "a" not in b.req_id_to_index
+    assert b.occupied_rows() == [1]
+
+    # The freed row takes a newcomer without stacking it on the preempted one.
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("c", [3])]),
+        _plan({"c": 0}, capacity=2),
+        requests,
+        {},
+    )
+    assert b.req_id_to_index == {"c": 0, "b": 1}
+
+    # "c" finishes, and "a" resumes into the row it left: the resume re-prefills
+    # from the state kept above, so it never has to look the request up again.
+    resumed = CachedRequestData(
+        req_ids=["a"],
+        resumed_req_ids={"a"},
+        new_token_ids=[[]],
+        all_token_ids={"a": [1]},
+        new_block_ids=[([7],)],
+        num_computed_tokens=[0],
+        num_output_tokens=[0],
+    )
+    b.apply_step_plan(
+        _step_output(finished=["c"], cached=resumed),
+        _plan({"a": 0}, capacity=2),
+        requests,
+        {},
+    )
+    assert b.req_id_to_index == {"a": 0, "b": 1}
+    assert requests["a"].block_ids == ([7],)
 
 
 def test_lane_full_raises():

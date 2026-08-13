@@ -461,6 +461,21 @@ class TTLaneCoordinator(SchedulerInterface):
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
 
+        # A preempted request loses its row immediately, because it loses its
+        # running slot immediately: ``Scheduler._preempt_request`` pops it from
+        # ``running``, so its lane may admit a replacement on the next prefill
+        # step while the row is still claimed, and ``_assign_slot`` would then
+        # find no free slot and kill the engine core. Holding the row buys
+        # nothing: the preempted request's KV is freed and ``num_computed_tokens``
+        # reset, so the resume re-prefills and rewrites whatever row it lands on.
+        # The lane binding stays -- the request resumes in the lane whose KV
+        # manager and queues still hold it. ``TTLaneInputBatch.apply_step_plan``
+        # evicts the same request from the batch in this same step, so the row is
+        # free on both sides before anything can be placed there.
+        # ``preempted_req_ids`` is typed optional, hence the ``or ()``.
+        for req_id in merged.preempted_req_ids or ():
+            self._release_slot(req_id)
+
         resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
         for req_id in resumed_req_ids:
             self._release_slot(req_id)
@@ -524,7 +539,10 @@ class TTLaneCoordinator(SchedulerInterface):
         ):
             # The discarded prefill pass already drained each lane's
             # finished/freed-encoder bookkeeping; carry it onto the decode pass
-            # so the runner still releases that state.
+            # so the runner still releases that state. There is no preemption to
+            # carry: a lane's prefill-only pass hides ``running``, so the base
+            # scheduler's running loop -- the only place that preempts -- never
+            # iterates.
             carried_finished = merged.finished_req_ids
             carried_free_encoder = merged.free_encoder_mm_hashes
             forced_mode = TTSchedulingMode.DECODE_ONLY

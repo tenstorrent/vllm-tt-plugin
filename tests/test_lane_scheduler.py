@@ -94,6 +94,12 @@ def _scheduled_output(req_ids):
     return out
 
 
+def _preempting_output(preempted, scheduled=()):
+    out = _scheduled_output(scheduled)
+    out.preempted_req_ids = set(preempted)
+    return out
+
+
 def test_negotiate_prefill_when_any_lane_wants_prefill():
     # Lane 1 has a queued request and nothing running -> wants prefill.
     coordinator = _make_coordinator([FakeLane(running=2), FakeLane(waiting=1)])
@@ -356,6 +362,57 @@ def test_prefill_step_plan_exposes_empty_slots_without_lane_metadata():
     assert plan.input_rows == (4,)
     assert plan.batch_size_per_dp == (0, 1)
     assert plan.prefill_empty_slots == (4,)
+
+
+def test_preempted_request_releases_its_row_to_its_lane():
+    # Lane 0 is full (capacity 2) with "a" and "b", then preempts "a" under KV
+    # pressure while decoding "b". The preempted request is neither finished nor
+    # resumed, so without an explicit release it would hold row 0 until it
+    # resumes -- yet its running slot is already back, so the lane can admit a
+    # replacement. Under --scheduling-policy priority a higher-priority arrival
+    # is admitted ahead of the preempted request and hits the empty free list.
+    lane0 = FakeLane(running=2)
+    coordinator = _make_coordinator([lane0, FakeLane()], per_lane_max=2)
+    coordinator._req_to_lane = {"a": 0, "b": 0}
+    assert coordinator._assign_slot("a", 0) == 0
+    assert coordinator._assign_slot("b", 0) == 1
+
+    lane0.schedule = lambda: _preempting_output(["a"], scheduled=["b"])
+    coordinator.schedule()
+
+    assert "a" not in coordinator._req_to_row
+    assert coordinator._free_slots_by_lane[0] == [0]
+    # The lane binding survives: the request resumes in the lane whose KV cache
+    # manager and queues still hold it.
+    assert coordinator._req_to_lane["a"] == 0
+
+    # The freed row is handed to the newcomer instead of raising "no free slot".
+    lane0.schedule = lambda: _scheduled_output(["c"])
+    coordinator._req_to_lane["c"] = 0
+    plan = get_tt_step_plan(coordinator.schedule())
+
+    assert plan.req_id_to_row["c"] == 0
+    assert "a" not in plan.req_id_to_row
+
+
+def test_preempted_and_finished_in_one_step_frees_the_row_once():
+    # A preempted request aborted in the same step is in both sets. The row must
+    # come back exactly once, or the lane's free list would hand it out twice.
+    lane0 = FakeLane(running=1)
+    coordinator = _make_coordinator([lane0, FakeLane()], per_lane_max=2)
+    coordinator._req_to_lane = {"a": 0}
+    coordinator._assign_slot("a", 0)
+
+    def _schedule():
+        out = _preempting_output(["a"])
+        out.finished_req_ids = {"a"}
+        return out
+
+    lane0.schedule = _schedule
+    coordinator.schedule()
+
+    assert coordinator._free_slots_by_lane[0] == [0, 1]
+    assert coordinator._req_to_lane == {}
 
 
 def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():
