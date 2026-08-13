@@ -20,6 +20,14 @@ def parser() -> Gemma4ToolParser:
     return Gemma4ToolParser(tokenizer=None)
 
 
+def test_constructor_accepts_delegating_parser_tools():
+    # vLLM 0.24's DelegatingParser constructs tool parsers as
+    # (tokenizer, tools) positionally.
+    parser = Gemma4ToolParser(None, [])
+
+    assert parser.tools == []
+
+
 def test_no_tool_call_returns_content(parser: Gemma4ToolParser):
     out = "just a normal answer, no tools here"
     result = parser.extract_tool_calls(out, request=None)

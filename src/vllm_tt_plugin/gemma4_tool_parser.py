@@ -43,8 +43,10 @@ class Gemma4ToolParser(ToolParser):
     and normalizes arguments into a JSON string for the OpenAI tool-call schema.
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: TokenizerLike, tools: list[Any] | None = None):
+        # vLLM 0.24's DelegatingParser constructs tool parsers as
+        # (tokenizer, tools) positionally; accept and forward the tools.
+        super().__init__(tokenizer, tools)
 
         # Streaming state.
         self.current_tool_name_sent: bool = False
