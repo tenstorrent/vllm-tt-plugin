@@ -255,7 +255,7 @@ class TestDPModes:
         assert worker_instance.device_config.device is mesh_device
         assert worker_instance.model_runner is model_runner
 
-    def test_legacy_gathered_override_is_ignored_by_platform(
+    def test_legacy_tt_dp_override_is_ignored_by_platform(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,

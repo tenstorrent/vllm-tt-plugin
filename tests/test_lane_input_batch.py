@@ -559,5 +559,5 @@ def test_runner_is_lane_mode_property():
     assert _runner_with(data_parallel_size=1, tt_data_parallel_size=4)._is_lane_mode
     # Non-DP: one engine, one lane -> plain InputBatch.
     assert not _runner_with(data_parallel_size=1, tt_data_parallel_size=1)._is_lane_mode
-    # Gathered multi-process DP: each rank is its own engine -> plain InputBatch.
+    # Standard multi-process DP: each rank is its own engine -> plain InputBatch.
     assert not _runner_with(data_parallel_size=4, tt_data_parallel_size=4)._is_lane_mode

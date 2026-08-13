@@ -201,7 +201,7 @@ def test_rank_binding_rejects_duplicate_rank_ids(
         parse_tt_mpi_params(vllm_config)
 
 
-def test_legacy_gathered_override_is_ignored_by_launcher(
+def test_legacy_tt_dp_override_is_ignored_by_launcher(
     tmp_path: pathlib.Path,
     vllm_config: SimpleNamespace,
 ) -> None:

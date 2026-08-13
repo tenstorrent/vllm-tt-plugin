@@ -16,7 +16,7 @@ from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_tt_plugin.input_batch import CachedRequestState
     from vllm_tt_plugin.model_input import TTModelInput
@@ -165,44 +165,6 @@ class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
         return self._controller.build_runner_output_from_completed_step(completed)
 
 
-class AsyncTTDPGatherOutput(DeferredDecodeOutput):
-    """Wrap a non-blocking DP decode submission plus async read submit."""
-
-    def __init__(
-        self,
-        controller: TTAsyncDecodeController,
-        submission: TTDecodeSubmission,
-        model_input: TTModelInput,
-        completion_event: threading.Event,
-    ):
-        self._controller = controller
-        self._submission = submission
-        self._model_input = model_input
-        self._completion_event = completion_event
-        self._init_deferred()
-
-    def _get_output_impl(self) -> tuple[torch.Tensor, list]:
-        finalized = self._controller.finalize_decode(self._submission)
-        runner = self._controller.runner
-        if finalized is None:
-            return runner.pack_dp_results(
-                [torch.tensor([], dtype=torch.int32)]
-                * len(self._submission.batch_size_per_dp),
-                [None] * len(self._submission.batch_size_per_dp),
-            )
-
-        sampled_token_ids_per_dp, logprobs_per_dp = runner._get_output_tokens(
-            tt_out=finalized.tt_out,
-            tt_log_probs=finalized.tt_log_probs,
-            sampling_params=self._submission.sampling_params,
-            model_input=self._model_input,
-            batch_size_per_dp=self._submission.batch_size_per_dp,
-            perform_device_sampling=self._submission.perform_device_sampling,
-            is_decode=True,
-        )
-        return runner.pack_dp_results(sampled_token_ids_per_dp, logprobs_per_dp)
-
-
 class TTAsyncDecodeController:
     """Own the TT async decode lifecycle for a `TTModelRunner`."""
 
@@ -233,16 +195,12 @@ class TTAsyncDecodeController:
             submit_time_ns=time.perf_counter_ns(),
         )
 
-    def steady_decode_base_enabled(self, *, dp_gather: bool) -> bool:
+    def steady_decode_base_enabled(self) -> bool:
         runner = self.runner
-        if dp_gather:
-            if not runner.scheduler_config.async_scheduling:
-                return False
-        else:
-            if not runner.non_dp_async_scheduling:
-                return False
-            if runner.parallel_config.data_parallel_size != 1:
-                return False
+        if not runner.non_dp_async_scheduling:
+            return False
+        if runner.parallel_config.data_parallel_size != 1:
+            return False
         if runner.trace_mode == "none":  # noqa: SIM103
             return False
         return True
@@ -250,7 +208,6 @@ class TTAsyncDecodeController:
     def steady_decode_scheduler_invariants_met(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
         runner = self.runner
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -260,14 +217,11 @@ class TTAsyncDecodeController:
         if is_prompt or runner._decode_layout_changed_since_last_decode:
             return False
         # Structured outputs are detected from the scheduler state, not from a
-        # prepared bitmask: the non-DP/lane paths now defer grammar to sample
-        # time and pass ``grammar_output=None`` here, while gathered DP still
-        # passes a bitmask. Either signal disables steady decode so the grammar
-        # constraint is never skipped by an overlapped step.
-        if (
-            scheduler_output.pending_structured_output_tokens
-            or grammar_output is not None
-            or has_structured_outputs(runner.requests, scheduler_output, None)
+        # prepared bitmask: grammar is applied at sample time, so no bitmask
+        # exists yet when this runs. Either signal disables steady decode so the
+        # grammar constraint is never skipped by an overlapped step.
+        if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
+            runner.requests, scheduler_output, None
         ):
             return False
         input_batch = runner.input_batch
@@ -294,29 +248,29 @@ class TTAsyncDecodeController:
     def can_attempt_steady_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
-        if not self.steady_decode_base_enabled(dp_gather=False):
+        if not self.steady_decode_base_enabled():
             return False
-        return self.steady_decode_scheduler_invariants_met(
-            scheduler_output, grammar_output
-        )
+        return self.steady_decode_scheduler_invariants_met(scheduler_output)
 
-    def can_attempt_steady_dp_decode_from_scheduler(
+    def can_attempt_steady_lane_decode_from_scheduler(
         self,
         scheduler_output: SchedulerOutput | None,
-        grammar_output: GrammarOutput | None,
     ) -> bool:
-        if not self.steady_decode_base_enabled(dp_gather=True):
+        """Whether a merged lane-DP step can overlap steady decode.
+
+        Unlike the non-DP variant, ``scheduler_output=None`` or a zero-token
+        step counts as steady-eligible: the merged step still overlaps safely
+        when no lane has decode work of its own.
+        """
+        if not self.steady_decode_base_enabled():
             return False
         if scheduler_output is None or scheduler_output.total_num_scheduled_tokens == 0:
             return True
-        return self.steady_decode_scheduler_invariants_met(
-            scheduler_output, grammar_output
-        )
+        return self.steady_decode_scheduler_invariants_met(scheduler_output)
 
     def can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
-        if not self.steady_decode_base_enabled(dp_gather=False):
+        if not self.steady_decode_base_enabled():
             return False
         if model_input.prompt_lens is not None:
             return False
@@ -487,38 +441,6 @@ class TTAsyncDecodeController:
             context=context,
         )
         self.register_pending_async_step(step, overlap_ok=steady_decode_fast_path)
-        return step
-
-    def submit_async_dp_decode(
-        self,
-        model_input: TTModelInput,
-        *,
-        allow_decode_overlap: bool = True,
-    ) -> AsyncTTDPGatherOutput:
-        """Submit a non-blocking gathered-DP decode step.
-
-        ``allow_decode_overlap`` is the caller's veto on overlapping this step's
-        device work with the next scheduler step: it only sets ``overlap_ok``
-        when both it is True (the default) and ``can_use_steady_decode_fast_path``
-        holds. Passing False forces the next step to drain this one regardless of
-        the fast-path check.
-        """
-        overlap_ok = allow_decode_overlap and self.can_use_steady_decode_fast_path(
-            model_input
-        )
-        completion_event = threading.Event()
-        submission = self.submit_decode(
-            model_input, read_from_device=False, async_read=True
-        )
-        if submission.tt_out is None:
-            completion_event.set()
-        step = AsyncTTDPGatherOutput(
-            controller=self,
-            submission=submission,
-            model_input=model_input,
-            completion_event=completion_event,
-        )
-        self.register_pending_async_step(step, overlap_ok=overlap_ok)
         return step
 
     def submit_async_lane_decode(

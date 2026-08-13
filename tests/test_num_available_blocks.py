@@ -97,7 +97,7 @@ def test_default_branch_no_sliding(cfg):
     assert n == 2080
 
 
-def test_lane_mode_kv_shape_matches_per_lane_gathered_dp(cfg):
+def test_lane_mode_kv_shape_matches_per_lane_standard_dp(cfg):
     """Enabling single-process lanes must not change ``num_blocks``.
 
     ``num_blocks`` is applied to each submesh KV cache un-divided, so the
@@ -105,7 +105,7 @@ def test_lane_mode_kv_shape_matches_per_lane_gathered_dp(cfg):
     regardless of parallelism mode. A submesh serves only its *per-lane* slice
     of requests, so the batch padding uses ``max_num_seqs // lanes``. Padding
     with the global batch size would inflate ``num_blocks`` and give the model
-    a different KV shape from a gathered-DP rank with the same per-lane
+    a different KV shape from a standard-DP rank with the same per-lane
     capacity."""
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 

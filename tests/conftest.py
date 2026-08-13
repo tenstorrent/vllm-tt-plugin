@@ -7,7 +7,7 @@ import pytest
 
 # `TTPlatform.check_and_update_config` records its results on the class rather
 # than on the config it is handed, so one test that calls it configures every
-# test that runs after it,  across files.
+# test that runs after it, across files.
 _TT_PLATFORM_CONFIG_ATTRS = (
     "_standard_dp_visible_device_groups",
     "_standard_dp_mesh_grids",
@@ -58,6 +58,9 @@ def vllm_config() -> SimpleNamespace:
             data_parallel_backend="mp",
             nnodes=1,
             node_rank=0,
+            # Seeded with vLLM's own default so the assertions below catch a
+            # plugin-side override rather than the absence of one.
+            dp_engine_core_proc_cls="vllm.v1.engine.core.DPEngineCoreProc",
         ),
         model_config=SimpleNamespace(
             model="dummy",
