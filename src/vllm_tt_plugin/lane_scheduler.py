@@ -461,17 +461,16 @@ class TTLaneCoordinator(SchedulerInterface):
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
 
-        # A preempted request loses its row immediately, because it loses its
-        # running slot immediately: ``Scheduler._preempt_request`` pops it from
-        # ``running``, so its lane may admit a replacement on the next prefill
-        # step while the row is still claimed, and ``_assign_slot`` would then
-        # find no free slot and kill the engine core. Holding the row buys
-        # nothing: the preempted request's KV is freed and ``num_computed_tokens``
-        # reset, so the resume re-prefills and rewrites whatever row it lands on.
-        # The lane binding stays -- the request resumes in the lane whose KV
-        # manager and queues still hold it. ``TTLaneInputBatch.apply_step_plan``
-        # drops the same request from that row in this same step, so the row is
-        # free on both sides before anything can be placed there.
+        # A preempted request gives its row back at once, because its running
+        # slot is already back: ``Scheduler._preempt_request`` pops it from
+        # ``running``, so the lane admits a replacement on the next prefill step
+        # and ``_assign_slot`` finds no free row, killing the engine core.
+        # Holding the row buys nothing, its KV having been freed and
+        # ``num_computed_tokens`` reset, so the resume re-prefills and rewrites
+        # whatever row it lands on. The lane binding stays: the request resumes
+        # in the lane whose KV cache manager and queues still hold it.
+        # ``TTLaneInputBatch.apply_step_plan`` releases the same row in this same
+        # step, so the row is free on both sides before anything is placed there.
         # ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         for req_id in merged.preempted_req_ids or ():
             self._release_slot(req_id)
