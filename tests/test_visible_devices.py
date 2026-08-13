@@ -303,7 +303,7 @@ def test_standard_dp_visible_device_groups_feed_upstream_gpu_id_assignment(
 
 
 @pytest.mark.parametrize("inherited", [None, "", "0,1,2,3,4,5,6,7", "9,9"])
-def test_assigned_physical_gpu_ids_override_inherited_visible_devices(
+def test_matching_assigned_group_overrides_inherited_visible_devices(
     monkeypatch: pytest.MonkeyPatch,
     inherited: str | None,
 ) -> None:
@@ -317,12 +317,39 @@ def test_assigned_physical_gpu_ids_override_inherited_visible_devices(
         _discovered_groups_config(
             "0,1,2,3",
             "4,5,6,7",
-            local_dp_rank=0,
+            local_dp_rank=1,
             assigned_physical_gpu_ids=["4,5,6,7"],
         )
     )
 
     assert os.environ[EVAR] == "4,5,6,7"
+
+
+@pytest.mark.parametrize(
+    ("local_dp_rank", "assigned_physical_gpu_ids"),
+    [(0, ["0"]), (1, ["1"])],
+)
+def test_flat_assigned_device_ids_are_rejected_for_standard_dp(
+    monkeypatch: pytest.MonkeyPatch,
+    local_dp_rank: int,
+    assigned_physical_gpu_ids: list[str],
+) -> None:
+    monkeypatch.setenv(EVAR, "0,1,2,3,4,5,6,7")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"TT standard data parallelism does not support --device-ids",
+    ):
+        _bind_visible_devices_env(
+            _discovered_groups_config(
+                "0,1,2,3",
+                "4,5,6,7",
+                local_dp_rank=local_dp_rank,
+                assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+            )
+        )
+
+    assert os.environ[EVAR] == "0,1,2,3,4,5,6,7"
 
 
 def test_discovered_group_binds_when_upstream_left_ids_unset(

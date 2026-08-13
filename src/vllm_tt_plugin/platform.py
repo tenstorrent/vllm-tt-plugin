@@ -116,8 +116,7 @@ def _load_standard_dp_visible_groups(
     ``None`` means nothing was stored. An empty list means discovery stored
     nothing usable, which callers must not treat as "keep the inherited value".
     """
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
-
+    additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
         return None
 
@@ -132,7 +131,7 @@ def _load_standard_dp_mesh_grids(
     vllm_config: "VllmConfig",
 ) -> dict[str, tuple[int, int]]:
     """Load stored mesh-grid hints from the vLLM config."""
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
         return {}
 
