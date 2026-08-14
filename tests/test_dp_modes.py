@@ -248,12 +248,16 @@ class TestDPModes:
         )
         monkeypatch.setattr(worker, "TTModelRunner", lambda **_kwargs: model_runner)
 
-        TTWorker.init_device(worker_instance)
+        try:
+            TTWorker.init_device(worker_instance)
 
-        assert worker_instance.mesh_device is mesh_device
-        assert worker_instance.device is mesh_device
-        assert worker_instance.device_config.device is mesh_device
-        assert worker_instance.model_runner is model_runner
+            assert worker_instance.mesh_device is mesh_device
+            assert worker_instance.device is mesh_device
+            assert worker_instance.device_config.device is mesh_device
+            assert worker_instance.model_runner is model_runner
+        finally:
+            # The test double cannot be passed to TT device cleanup.
+            worker_instance.mesh_device = None
 
     def test_legacy_tt_dp_override_is_ignored_by_platform(
         self,

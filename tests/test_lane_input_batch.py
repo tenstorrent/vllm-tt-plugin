@@ -18,10 +18,14 @@ No device / ttnn execution required.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.utils import torch_utils
+from vllm.v1.sample import sampler as sampler_module
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops import penalties as penalties_module
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -31,6 +35,13 @@ from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 VOCAB = 64
 BLOCK = 16
 MAX_MODEL_LEN = 256
+
+
+@pytest.fixture(autouse=True)
+def _disable_pinned_memory(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    monkeypatch.setattr(sampler_module, "PIN_MEMORY", False)
+    monkeypatch.setattr(penalties_module, "PIN_MEMORY", False)
 
 
 class FirstPromptTokenBoost(AdapterLogitsProcessor):
