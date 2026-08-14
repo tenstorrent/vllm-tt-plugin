@@ -20,8 +20,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
-    _run_standard_dp_visible_device_group_discovery,
-    _split_standard_dp_discovery_result,
+    run_standard_dp_visible_device_group_discovery,
+    split_standard_dp_discovery_result,
 )
 
 if TYPE_CHECKING:
@@ -197,7 +197,7 @@ def _resolve_standard_dp_visible_device_groups(
     mp_ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
     proc = mp_ctx.Process(
-        target=_run_standard_dp_visible_device_group_discovery,
+        target=run_standard_dp_visible_device_group_discovery,
         args=(
             child_conn,
             os.environ.get("MESH_DEVICE"),
@@ -1025,7 +1025,7 @@ class TTPlatform(Platform):
                 (
                     cls._standard_dp_visible_device_groups,
                     resolved_mesh_grids,
-                ) = _split_standard_dp_discovery_result(discovery_result)
+                ) = split_standard_dp_discovery_result(discovery_result)
                 if resolved_mesh_grids:
                     cls._standard_dp_mesh_grids = resolved_mesh_grids
                     _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)

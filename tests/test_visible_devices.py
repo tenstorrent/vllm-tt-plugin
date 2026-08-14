@@ -23,6 +23,7 @@ from vllm_tt_plugin.platform import (
 from vllm_tt_plugin.utils.dp_discovery import (
     _maybe_reorder_standard_dp_visible_device_groups,
     _resolve_parent_mesh_grid,
+    format_tt_visible_devices,
 )
 from vllm_tt_plugin.worker import _bind_visible_devices_env, _resolve_mesh_grid
 
@@ -57,9 +58,20 @@ def _discovered_groups_config(
 def test_standard_dp_discovery_target_uses_helper_module() -> None:
     """Keep the spawned discovery target outside the platform module."""
     assert (
-        tt_platform._run_standard_dp_visible_device_group_discovery.__module__
+        tt_platform.run_standard_dp_visible_device_group_discovery.__module__
         == "vllm_tt_plugin.utils.dp_discovery"
     )
+
+
+@pytest.mark.parametrize(
+    ("device_ids", "expected"),
+    [([0, 1, 2, 3], "0,1,2,3"), (["4,5,6,7"], "4,5,6,7")],
+)
+def test_format_tt_visible_devices_supports_device_ids_and_group_strings(
+    device_ids: list[int] | list[str],
+    expected: str,
+) -> None:
+    assert format_tt_visible_devices(device_ids) == expected
 
 
 def test_standard_dp_discovery_timeout_terminates_subprocess(

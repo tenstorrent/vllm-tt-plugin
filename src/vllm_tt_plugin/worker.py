@@ -55,7 +55,10 @@ from vllm_tt_plugin.platform import (
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
-from vllm_tt_plugin.utils.dp_discovery import _parse_mesh_grid
+from vllm_tt_plugin.utils.dp_discovery import (
+    format_tt_visible_devices,
+    parse_mesh_grid,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -103,8 +106,8 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
 
         visible_devices = groups[local_dp_rank]
         if assigned_physical_gpu_ids:
-            assigned_visible_devices = ",".join(
-                str(device_id) for device_id in assigned_physical_gpu_ids
+            assigned_visible_devices = format_tt_visible_devices(
+                assigned_physical_gpu_ids
             )
             if assigned_visible_devices != visible_devices:
                 raise RuntimeError(
@@ -116,9 +119,7 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
                     "MPI rank binding."
                 )
     elif assigned_physical_gpu_ids:
-        visible_devices = ",".join(
-            str(device_id) for device_id in assigned_physical_gpu_ids
-        )
+        visible_devices = format_tt_visible_devices(assigned_physical_gpu_ids)
     else:
         return
 
@@ -140,7 +141,7 @@ def _resolve_mesh_grid(
     num_devices_available: int,
     visible_devices_env: str | None,
 ) -> tuple[int, int]:
-    mesh_grid = _parse_mesh_grid(
+    mesh_grid = parse_mesh_grid(
         mesh_device_env,
         num_devices_available,
         tg_mesh_grid=(8, 4),
