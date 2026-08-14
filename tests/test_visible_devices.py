@@ -315,7 +315,7 @@ def test_standard_dp_visible_device_groups_feed_upstream_gpu_id_assignment(
 
 
 @pytest.mark.parametrize("inherited", [None, "", "0,1,2,3,4,5,6,7", "9,9"])
-def test_matching_assigned_group_overrides_inherited_visible_devices(
+def test_matching_internal_assignment_binds_discovered_group(
     monkeypatch: pytest.MonkeyPatch,
     inherited: str | None,
 ) -> None:
@@ -341,7 +341,7 @@ def test_matching_assigned_group_overrides_inherited_visible_devices(
     ("local_dp_rank", "assigned_physical_gpu_ids"),
     [(0, ["0"]), (1, ["1"])],
 )
-def test_flat_assigned_device_ids_are_rejected_for_standard_dp(
+def test_conflicting_internal_assignment_fails_loudly(
     monkeypatch: pytest.MonkeyPatch,
     local_dp_rank: int,
     assigned_physical_gpu_ids: list[str],
@@ -350,7 +350,7 @@ def test_flat_assigned_device_ids_are_rejected_for_standard_dp(
 
     with pytest.raises(
         RuntimeError,
-        match=r"TT standard data parallelism does not support `--device-ids`",
+        match=r"TT standard-DP assignment conflicts with discovery",
     ):
         _bind_visible_devices_env(
             _discovered_groups_config(

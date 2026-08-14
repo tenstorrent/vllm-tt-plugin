@@ -343,10 +343,10 @@ The execution model matches TT hardware characteristics:
 - For other models, `--data_parallel_size N` uses standard multi-process DP:
   each DP rank runs an independent engine core with its own TT submesh,
   scheduler, and KV cache. Device groups are discovered at startup and assigned
-  via `TT_VISIBLE_DEVICES`. Do not pass `--device-ids`: its flat GPU-style
-  syntax cannot represent TT multi-chip groups and is rejected for standard
-  TT DP. This is upstream vLLM's standard DP mechanism (no gather/scatter;
-  ranks are fully independent).
+  via `TT_VISIBLE_DEVICES`. A per-rank assignment is accepted only when it
+  exactly matches the discovered group; a conflicting GPU-style `--device-ids`
+  assignment fails before mesh creation. This is upstream vLLM's standard DP
+  mechanism (no gather/scatter; ranks are fully independent).
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.

@@ -75,14 +75,15 @@ register_tt_models(register_test_models=_should_pre_register_tt_test_models_from
 def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
     """Bind ``TT_VISIBLE_DEVICES`` to this rank's device group.
 
-    As of vLLM v0.24, ``set_assigned_physical_gpu_ids_for_dp_rank`` writes
-    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a per-rank
-    env var. tt-metal reads only the env var, so the worker materializes it here;
-    otherwise every rank keeps the launcher's value and they share chips.
+    As of vLLM v0.24, the engine-core launcher writes
+    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a
+    per-rank env var. tt-metal reads only the env var, so the worker
+    materializes it here; otherwise every rank keeps the launcher's value and
+    they share chips.
 
-    Standard-DP discovery owns the rank-to-submesh topology. An upstream
-    assignment may only carry the exact discovered group for the local rank.
-    MPI launches populate neither and keep the inherited value.
+    Standard-DP discovery owns the rank-to-submesh topology. A nonempty
+    assignment must agree with the discovered group for the local rank. MPI
+    launches populate neither and keep the inherited value.
 
     Raises:
         RuntimeError: discovery holds no group for this rank or an assignment
@@ -111,12 +112,10 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
             )
             if assigned_visible_devices != visible_devices:
                 raise RuntimeError(
-                    "TT standard data parallelism does not support `--device-ids`: "
+                    "TT standard-DP assignment conflicts with discovery: "
                     f"local DP rank {local_dp_rank} was assigned "
                     f"{assigned_visible_devices!r}, but discovery requires "
-                    f"{visible_devices!r}. Remove `--device-ids` and use "
-                    "`MESH_DEVICE` with `--data-parallel-size`, or use explicit "
-                    "MPI rank binding."
+                    f"{visible_devices!r}."
                 )
     elif assigned_physical_gpu_ids:
         visible_devices = format_tt_visible_devices(assigned_physical_gpu_ids)
