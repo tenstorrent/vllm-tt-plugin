@@ -49,6 +49,7 @@ from vllm_tt_plugin.input_batch import (
     TTLaneInputBatch,
     apply_cached_req_state_update,
     build_cached_request_state,
+    clone_torch_generator,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -141,9 +142,6 @@ class TTModelRunner:
         self.request_specific_rope = bool(self.model_config.uses_mrope)
         if self.request_specific_rope:
             self.previous_req_ids: set[str] = set()
-
-        # Currently, TT model runner doesn't support chunked prefill.
-        assert self.scheduler_config.enable_chunked_prefill is False
 
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
@@ -891,6 +889,43 @@ class TTModelRunner:
             return None
         return torch.tensor(remap, dtype=torch.int32)
 
+    @staticmethod
+    def _build_host_generators(
+        input_batch: InputBatch,
+        req_indices: list[int],
+        intermediate_prefill_mask: torch.Tensor | None,
+    ) -> dict[int, torch.Generator]:
+        """Re-key generators (batch row -> Generator) to this build's rows.
+
+        The host sampler draws once per generator it is handed, so each request
+        must appear exactly once per step: this build's generators are advanced
+        here, and lane builds pass only their own ``req_indices`` so a generator
+        advances once per step rather than once per lane.
+
+        An intermediate-prefill row's token is discarded, so it gets a clone
+        and its request's real RNG state is left untouched.
+        """
+        intermediate_rows = (
+            set(intermediate_prefill_mask.nonzero().view(-1).tolist())
+            if intermediate_prefill_mask is not None
+            else set()
+        )
+        generators: dict[int, torch.Generator] = {}
+        rows_to_advance: list[int] = []
+        for local_row, batch_row in enumerate(req_indices):
+            generator = input_batch.sampling.generators.get(batch_row)
+            if generator is None:
+                continue
+            if local_row in intermediate_rows:
+                generators[local_row] = clone_torch_generator(generator)
+            else:
+                generators[local_row] = generator
+                rows_to_advance.append(batch_row)
+        # Technically this advances the generator before it is copied, but it's
+        # ok because this happens consistently.
+        input_batch.advance_generators(rows_to_advance)
+        return generators
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -953,24 +988,46 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
+        num_scheduled = scheduler_output.num_scheduled_tokens
+
+        def _is_still_prefilling(req_id: str) -> bool:
+            row = input_batch.req_id_to_index[req_id]
+            return (
+                input_batch.num_computed_tokens_cpu[row]
+                < input_batch.num_prompt_tokens[row]
+            )
+
         # A "prefill" step can contain:
         # - brand new requests (scheduled_new_reqs), and/or
         # - resumed-from-preemption requests (scheduled_cached_reqs with
-        #   resumed_req_ids set) that need to replay tokens to rebuild KV.
-        is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
-            cached_reqs.resumed_req_ids
+        #   resumed_req_ids set) that need to replay tokens to rebuild KV,
+        #   and/or
+        # - chunked-prefill continuations: cached requests that have not
+        #   computed all their prompt tokens yet.
+        has_chunked_continuation = any(
+            _is_still_prefilling(req_id)
+            for req_id in cached_reqs.req_ids
+            if req_id not in cached_reqs.resumed_req_ids
+        )
+        is_prompt = (
+            len(scheduler_output.scheduled_new_reqs) > 0
+            or bool(cached_reqs.resumed_req_ids)
+            or has_chunked_continuation
         )
         sample_params = input_batch.sampling
+        intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
             # cached on the worker", not necessarily "decode". During a prefill
             # step we can legitimately see cached requests if they are resumed
-            # from preemption (still prefill work).
+            # from preemption or are chunked-prefill continuations (both still
+            # prefill work).
             if cached_reqs.num_reqs > 0:
                 running_req_ids = {
                     req_id
                     for req_id in cached_reqs.req_ids
                     if req_id not in cached_reqs.resumed_req_ids
+                    and not _is_still_prefilling(req_id)
                 }
                 if running_req_ids:
                     # Mixed prefill+decode batch detected. This should not
@@ -1002,13 +1059,24 @@ class TTModelRunner:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[req_indices]
-            # Prefill length in tokens for each request:
-            # - For new requests: equals prompt length.
-            # - For resumed-from-preemption requests: includes any generated
-            #   output tokens so far, so we can replay the full sequence to
-            #   rebuild KV after preemption freed the cache blocks.
-            prompt_lens = input_batch.num_tokens[req_indices]
-            max_prefill_tokens = max(prompt_lens)
+            # The generator slices ``tokens[start_pos:prompt_lens]``, so
+            # ``prompt_lens`` is the end position of the chunk scheduled this
+            # step, not the sequence length:
+            # - Full prefill: start_pos=0, chunk=prompt_len => prompt_len.
+            # - APC hit: start_pos=cached, chunk=prompt_len-cached => prompt_len.
+            # - Resumed from preemption: the chunk spans the generated output
+            #   tokens too, so the full sequence is replayed to rebuild KV.
+            # - Chunked continuation: start_pos=computed, chunk=budget =>
+            #   computed + budget, i.e. this chunk's end.
+            chunk_lens = np.array(
+                [num_scheduled[input_batch.req_ids[i]] for i in req_indices],
+                dtype=np.int64,
+            )
+            prompt_lens = input_positions + chunk_lens
+            intermediate_prefill_mask = torch.from_numpy(
+                prompt_lens < input_batch.num_tokens[req_indices]
+            )
+            max_prefill_tokens = int(prompt_lens.max())
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
@@ -1103,6 +1171,11 @@ class TTModelRunner:
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
         )
+        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
+            # Device sampling advances device RNG state for every row it reads,
+            # which an intermediate chunk must not do. Host sampling can hand
+            # those rows a generator clone instead.
+            perform_device_sampling = False
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only).
@@ -1171,27 +1244,11 @@ class TTModelRunner:
         # local batch, so the host sampler reuses them as-is.
         logitsprocs = input_batch.sampling.logitsprocs
 
-        generators = dict()
+        generators: dict[int, torch.Generator] = {}
         if not perform_device_sampling:
-            # Re-key generators (req_index -> Generator) to lane-local rows.
-            # The values are the same Generator objects advanced just below, so
-            # advancing via the shared ``input_batch`` keeps them in step.
-            src_generators = input_batch.sampling.generators
-            generators = {
-                local: src_generators[g]
-                for local, g in enumerate(req_indices)
-                if g in src_generators
-            }
-            # Technically this advances the generator before it is copied,
-            # but it's ok because this happens consistently.
-            #
-            # Each generator belongs to exactly one request (one lane), so we
-            # advance only this build's generators. Non-lane builds take the
-            # whole batch once per step, so all generators advance exactly
-            # once; lane builds run once per lane, and passing the lane's
-            # ``req_indices`` keeps each generator advancing exactly once per
-            # step instead of once per lane.
-            input_batch.advance_generators(req_indices)
+            generators = self._build_host_generators(
+                input_batch, req_indices, intermediate_prefill_mask
+            )
             # NOTE: Our sampling paths are different between host and device.
             # Whether a request is sampled on device or host
             # depends also on other requests in the batch.
@@ -1242,6 +1299,7 @@ class TTModelRunner:
             # back to ``range(N)`` and a prefill overwrites a decoding request's
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
+            intermediate_prefill_mask=intermediate_prefill_mask,
         )
 
     def build_model_input(
@@ -1424,6 +1482,23 @@ class TTModelRunner:
         # ``scheduled_rows`` are persistent slots; their req_ids in row order are
         # the canonical merged output order.
         req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+
+        if not is_decode and model_input.prompt_lens is not None:
+            lane_batch = self.lane_batch
+            prompt_lens = np.asarray(model_input.prompt_lens)
+            num_tokens = np.array(
+                [lane_batch.num_tokens[row] for row in scheduled_rows],
+                dtype=np.int64,
+            )
+            intermediate_mask = prompt_lens < num_tokens
+            if intermediate_mask.any():
+                return self._build_chunked_prefill_output(
+                    req_ids=req_ids,
+                    sampled_token_ids=sampled,
+                    logprobs=logprobs,
+                    intermediate_mask=intermediate_mask,
+                )
+
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
@@ -1567,7 +1642,66 @@ class TTModelRunner:
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+
+        if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
+            num_reqs = self.input_batch.num_reqs
+            prompt_lens = np.asarray(fwd.model_input.prompt_lens)
+            # A row-count mismatch means the forward ran on a filtered subset;
+            # leave it to the output builder below to report.
+            if len(prompt_lens) == num_reqs:
+                intermediate_mask = prompt_lens < self.input_batch.num_tokens[:num_reqs]
+                if intermediate_mask.any():
+                    return self._build_chunked_prefill_output(
+                        req_ids=list(self.input_batch.req_ids[:num_reqs]),
+                        sampled_token_ids=sampled_token_ids,
+                        logprobs=logprobs,
+                        intermediate_mask=intermediate_mask,
+                    )
+
         return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+
+    def _build_chunked_prefill_output(
+        self,
+        req_ids: list[str],
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None,
+        intermediate_mask: np.ndarray,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        """Build a prefill output that emits no token for intermediate chunks.
+
+        A request mid-prompt gets ``[]`` so the engine advances its computed
+        tokens without appending output; only rows whose chunk ended the prompt
+        emit a token and are applied to runner state.
+        """
+        final_idx_np = np.where(~intermediate_mask)[0]
+        if final_idx_np.shape[0] > 0:
+            final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
+            final_tokens = sampled_token_ids[final_idx_tensor]
+            final_req_ids = [req_ids[int(i)] for i in final_idx_np]
+            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+
+        num_reqs = len(req_ids)
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if sampled_token_ids_np.dtype != np.int32:
+            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+        sampled_token_id_lists = [
+            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            for i in range(num_reqs)
+        ]
+
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index=(
+                dict(req_id_to_index)
+                if req_id_to_index is not None
+                else {req_id: idx for idx, req_id in enumerate(req_ids)}
+            ),
+            sampled_token_ids=sampled_token_id_lists,
+            logprobs=logprobs,
+            prompt_logprobs_dict=dict.fromkeys(req_ids, None),
+            pooler_output=[],
+        )
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -1822,7 +1956,16 @@ class TTModelRunner:
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
 
-            if not perform_device_sampling:
+            if (
+                not is_decode
+                and model_input.intermediate_prefill_mask is not None
+                and bool(model_input.intermediate_prefill_mask[rows].all())
+            ):
+                # Every row is mid-prompt; there is nothing to sample and the
+                # placeholders are dropped when the output is built.
+                next_token_ids = torch.zeros(sz, dtype=torch.int32)
+                logprobs_per_dp.append(None)
+            elif not perform_device_sampling:
                 logits = tt_out[rows, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
