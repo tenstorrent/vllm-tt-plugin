@@ -193,6 +193,37 @@ def test_no_decode_fallback_when_only_continuations_are_running():
     assert lane.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
 
 
+def test_preemption_in_a_discarded_prefill_pass_is_carried_to_the_decode_step():
+    # A prefill pass keeps partial prefills in ``running``, so its running loop
+    # can preempt one -- and that preemption stands even when the pass's
+    # schedule is thrown away for the decode fallback, because
+    # ``_preempt_request`` already freed the KV. Dropping the report would
+    # leave the row claimed by a request the lane has put back in its queue.
+    lane = FakeLane(running=1, partial_prefills=1)
+    coordinator = _make_coordinator([lane], per_lane_max=2)
+    coordinator._req_to_lane = {"p": 0}
+    coordinator._assign_slot("p", 0)
+    lane_schedule = lane.schedule
+
+    def _schedule():
+        out = lane_schedule()
+        if lane.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY:
+            out.preempted_req_ids = {"p"}
+        return out
+
+    lane.schedule = _schedule
+
+    output = coordinator.schedule()
+
+    assert lane.scheduled_modes == [
+        TTSchedulingMode.PREFILL_ONLY,
+        TTSchedulingMode.DECODE_ONLY,
+    ]
+    assert output.preempted_req_ids == {"p"}
+    assert "p" not in coordinator._req_to_row
+    assert "p" not in get_tt_step_plan(output).req_id_to_row
+
+
 def test_update_from_output_routes_and_merges_per_lane():
     lane0 = FakeLane()
     lane1 = FakeLane()
