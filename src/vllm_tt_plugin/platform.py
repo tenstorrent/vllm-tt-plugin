@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import inspect
 import json
 import multiprocessing
 import os
@@ -436,13 +437,49 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
 
 
+def _neutralize_model_owned_sampling(params) -> list[str]:
+    """Reset HTTP sampling controls on the cloned per-request SamplingParams.
+
+    The model owns its Gumbel sampler and temperature schedule, but common
+    OpenAI clients still send transport sampling controls, so they are
+    accepted and ignored. Returns the neutralized fields for logging.
+    """
+    ignored = []
+    if params.temperature != 1.0:
+        ignored.append(f"temperature={params.temperature!r}")
+        params.temperature = 1.0
+    if params.top_p != 1.0:
+        ignored.append(f"top_p={params.top_p!r}")
+        params.top_p = 1.0
+    if params.top_k not in (0, -1):
+        ignored.append(f"top_k={params.top_k!r}")
+        params.top_k = 0
+    if params.min_p != 0.0:
+        ignored.append(f"min_p={params.min_p!r}")
+        params.min_p = 0.0
+    if params.seed is not None:
+        ignored.append(f"seed={params.seed!r}")
+        params.seed = None
+    if params.presence_penalty != 0.0:
+        ignored.append(f"presence_penalty={params.presence_penalty!r}")
+        params.presence_penalty = 0.0
+    if params.frequency_penalty != 0.0:
+        ignored.append(f"frequency_penalty={params.frequency_penalty!r}")
+        params.frequency_penalty = 0.0
+    if params.repetition_penalty != 1.0:
+        ignored.append(f"repetition_penalty={params.repetition_penalty!r}")
+        params.repetition_penalty = 1.0
+    return ignored
+
+
 def _install_block_output_input_processor_patch() -> None:
-    """Reject unsupported resumable requests and round block-output defaults.
+    """Reject unsupported resumable requests and own block-output defaults.
 
     vLLM 0.24 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
-    validate with a whole-canvas default without mutating the shared input, and
-    reject resumable streaming-input chunks before EngineCore admits any.
+    reject resumable streaming-input chunks before EngineCore admits any, and
+    neutralize model-owned sampling controls and round the whole-canvas default
+    on the clone, without mutating the shared caller-owned input.
     (vLLM creates the streaming-input session wrapper without the ``resumable``
     flag, so the session opens and the client sees the error on its first
     chunk.)
@@ -458,14 +495,29 @@ def _install_block_output_input_processor_patch() -> None:
     original = input_processor.InputProcessor.process_inputs
     input_processor._tt_original_process_inputs = original
 
+    # ``resumable`` is positional-or-keyword in vLLM 0.24, so a positional
+    # caller lands it in the wrapper's ``*args``; locate it in the original
+    # signature once. The wrapper binds self/request_id/prompt/params itself.
+    original_parameters = list(inspect.signature(original).parameters)
+    resumable_args_index = (
+        original_parameters.index("resumable") - 4
+        if "resumable" in original_parameters
+        else None
+    )
+
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
-        resumable = kwargs.get("resumable", args[7] if len(args) > 7 else False)
-        if output_size > 1 and resumable:
-            raise ValueError(
-                "TT block-output models do not support resumable streaming-input "
-                "requests"
+        if output_size > 1:
+            resumable = (
+                args[resumable_args_index]
+                if resumable_args_index is not None and len(args) > resumable_args_index
+                else kwargs.get("resumable", False)
             )
+            if resumable:
+                raise ValueError(
+                    "TT block-output models do not support resumable "
+                    "streaming-input requests"
+                )
 
         unresolved_max_tokens = (
             isinstance(params, SamplingParams) and params.max_tokens is None
@@ -473,12 +525,21 @@ def _install_block_output_input_processor_patch() -> None:
         request = original(self, request_id, prompt, params, *args, **kwargs)
 
         cloned_params = request.sampling_params
-        if (
-            unresolved_max_tokens
-            and output_size > 1
-            and cloned_params is not None
-            and cloned_params.max_tokens is not None
-        ):
+        if output_size == 1 or cloned_params is None:
+            return request
+
+        ignored = _neutralize_model_owned_sampling(cloned_params)
+        if ignored:
+            logger.warning_once(
+                "This block-output model uses its model-owned sampler; HTTP "
+                "sampling controls are accepted but ignored."
+            )
+            logger.debug(
+                "Ignoring unsupported sampling controls for block-output model: %s",
+                "; ".join(ignored),
+            )
+
+        if unresolved_max_tokens and cloned_params.max_tokens is not None:
             rounded = cloned_params.max_tokens // output_size * output_size
             if rounded == 0:
                 # Re-validate the resolved default: inputs without
@@ -1356,8 +1417,9 @@ class TTPlatform(Platform):
                     "shorter prompt."
                 )
 
-        # Reject unsupported response-contract controls before touching the
-        # caller-owned params, so a rejected request is not left mutated.
+        # Reject unsupported response-contract controls. Model-owned sampling
+        # controls (temperature etc.) are instead accepted and neutralized on
+        # the per-request clone in _install_block_output_input_processor_patch.
         unsupported = []
         if params.n != 1:
             unsupported.append(f"n={params.n!r} (accepted: 1)")
@@ -1388,47 +1450,6 @@ class TTPlatform(Platform):
             raise ValueError(
                 "This block-output model owns its Gumbel sampling and does not "
                 "support these request parameters: " + "; ".join(unsupported)
-            )
-
-        # The model owns its Gumbel sampler and temperature schedule. Common
-        # OpenAI clients still send transport sampling controls, so accept and
-        # neutralize those values before InputProcessor clones SamplingParams.
-        # This intentionally mutates the caller-owned object; server requests
-        # construct a fresh object, while offline callers should not reuse it
-        # across block-output and autoregressive models.
-        ignored = []
-        if params.temperature != 1.0:
-            ignored.append(f"temperature={params.temperature!r}")
-            params.temperature = 1.0
-        if params.top_p != 1.0:
-            ignored.append(f"top_p={params.top_p!r}")
-            params.top_p = 1.0
-        if params.top_k not in (0, -1):
-            ignored.append(f"top_k={params.top_k!r}")
-            params.top_k = 0
-        if params.min_p != 0.0:
-            ignored.append(f"min_p={params.min_p!r}")
-            params.min_p = 0.0
-        if params.seed is not None:
-            ignored.append(f"seed={params.seed!r}")
-            params.seed = None
-        if params.presence_penalty != 0.0:
-            ignored.append(f"presence_penalty={params.presence_penalty!r}")
-            params.presence_penalty = 0.0
-        if params.frequency_penalty != 0.0:
-            ignored.append(f"frequency_penalty={params.frequency_penalty!r}")
-            params.frequency_penalty = 0.0
-        if params.repetition_penalty != 1.0:
-            ignored.append(f"repetition_penalty={params.repetition_penalty!r}")
-            params.repetition_penalty = 1.0
-        if ignored:
-            logger.warning_once(
-                "This block-output model uses its model-owned sampler; HTTP "
-                "sampling controls are accepted but ignored."
-            )
-            logger.debug(
-                "Ignoring unsupported sampling controls for block-output model: %s",
-                "; ".join(ignored),
             )
 
     @staticmethod

@@ -35,8 +35,23 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     """Install the vLLM 0.24 validate -> clone -> default boundary."""
     import vllm.v1.engine.input_processor as input_processor
 
-    def process_inputs(self, request_id, prompt, params, *args, **kwargs):
-        self.process_inputs_calls.append(kwargs)
+    # Mirrors vLLM 0.24's process_inputs signature, where ``resumable`` is
+    # positional-or-keyword, so the patch's positional handling is exercised.
+    def process_inputs(
+        self,
+        request_id,
+        prompt,
+        params,
+        supported_tasks=None,
+        arrival_time=None,
+        lora_request=None,
+        tokenization_kwargs=None,
+        trace_headers=None,
+        priority=0,
+        data_parallel_rank=None,
+        resumable=False,
+    ):
+        self.process_inputs_calls.append({"resumable": resumable})
         TTPlatform.validate_request(prompt, params)
         cloned_params = params.clone()
         if cloned_params.max_tokens is None:
@@ -44,7 +59,7 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
             cloned_params.max_tokens = self.model_config.max_model_len - seq_len
         return SimpleNamespace(
             sampling_params=cloned_params,
-            resumable=kwargs.get("resumable", False),
+            resumable=resumable,
         )
 
     monkeypatch.setattr(
@@ -110,12 +125,20 @@ def test_auto_fitted_frontend_limit_is_read_live(monkeypatch):
         ("repetition_penalty", 1.1),
     ],
 )
-def test_non_neutral_sampling_controls_are_accepted_and_neutralized(field, value):
+def test_non_neutral_sampling_controls_neutralized_on_clone_only(
+    monkeypatch, field, value
+):
+    processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16, **{field: value})
 
-    _validate(params)
+    request = processor_cls.process_inputs(
+        processor,
+        f"sampling-{field}",
+        {"prompt_token_ids": [1] * 200},
+        params,
+    )
 
-    expected = {
+    neutral = {
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": 0,
@@ -125,7 +148,12 @@ def test_non_neutral_sampling_controls_are_accepted_and_neutralized(field, value
         "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
     }
-    assert getattr(params, field) == expected[field]
+    assert getattr(request.sampling_params, field) == neutral[field]
+    assert getattr(params, field) == value
+
+
+def test_sampling_controls_are_accepted_by_validation():
+    _validate(SamplingParams(max_tokens=16, temperature=0.5, seed=42))
 
 
 @pytest.mark.parametrize(
@@ -391,6 +419,30 @@ def test_input_processor_rejects_resumable_block_request_before_upstream(
     assert processor.process_inputs_calls == []
 
 
+def test_input_processor_rejects_positional_resumable_block_request(monkeypatch):
+    """vLLM 0.24's ``resumable`` is positional-or-keyword; a positional caller
+    must be rejected the same way as a keyword one."""
+    processor_cls, processor = _processor_harness(monkeypatch)
+
+    with pytest.raises(ValueError, match="do not support resumable streaming-input"):
+        processor_cls.process_inputs(
+            processor,
+            "streaming-input-positional",
+            {"prompt_token_ids": [1] * 200},
+            SamplingParams(max_tokens=256),
+            None,  # supported_tasks
+            None,  # arrival_time
+            None,  # lora_request
+            None,  # tokenization_kwargs
+            None,  # trace_headers
+            0,  # priority
+            None,  # data_parallel_rank
+            True,  # resumable
+        )
+
+    assert processor.process_inputs_calls == []
+
+
 def test_input_processor_preserves_resumable_ar_request(monkeypatch):
     processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
 
@@ -398,12 +450,15 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
         processor,
         "streaming-input-ar",
         {"prompt_token_ids": [1] * 200},
-        SamplingParams(max_tokens=16),
+        SamplingParams(max_tokens=16, temperature=0.5),
         resumable=True,
     )
 
     assert request.resumable is True
     assert processor.process_inputs_calls == [{"resumable": True}]
+    # AR requests keep their sampling controls; neutralization is
+    # block-output only.
+    assert request.sampling_params.temperature == 0.5
 
 
 def test_input_processor_rejects_zero_canvas_default_for_embeds(monkeypatch):

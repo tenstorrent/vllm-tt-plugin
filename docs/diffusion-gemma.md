@@ -16,13 +16,9 @@ canvases and trims the final canvas to the request's logical `max_tokens`.
 
 ## Installation
 
-Install vLLM 0.24.0 into an activated tt-metal environment, then install this
-plugin. Do not install a CUDA vLLM wheel over that environment.
-
-```bash
-VLLM_TARGET_DEVICE=empty uv pip install --no-binary vllm vllm==0.24.0
-uv pip install -e .
-```
+Follow [Environment Setup in the main README](../README.md#environment-setup):
+activate the tt-metal environment, then run `source docs/install-vllm-tt.sh`
+to install the pinned vLLM 0.24.0 build and this plugin.
 
 ## Launch
 
@@ -78,9 +74,9 @@ HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 - presence, frequency, and repetition penalties
 
 The model-owned denoise loop always uses its internal temperature schedule and
-Gumbel sampler, so these fields do not alter generation. Validation neutralizes
-them in place before vLLM clones `SamplingParams`; offline callers must not
-reuse the same object for a later autoregressive request. Response-contract
+Gumbel sampler, so these fields do not alter generation. The plugin neutralizes
+them on the per-request `SamplingParams` clone after vLLM admits the request;
+the caller-owned object is never modified. Response-contract
 controls such as `n>1`, logprobs, structured outputs, bad words, logit bias,
 allowed token IDs, nonzero minimum tokens, and custom sampling `extra_args`
 remain rejected before EngineCore.
