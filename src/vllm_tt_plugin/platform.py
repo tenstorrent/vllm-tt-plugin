@@ -460,7 +460,8 @@ def _install_block_output_input_processor_patch() -> None:
 
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
-        if output_size > 1 and kwargs.get("resumable", False):
+        resumable = kwargs.get("resumable", args[7] if len(args) > 7 else False)
+        if output_size > 1 and resumable:
             raise ValueError(
                 "TT block-output models do not support resumable streaming-input "
                 "requests"
