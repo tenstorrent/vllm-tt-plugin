@@ -461,6 +461,20 @@ class TTLaneCoordinator(SchedulerInterface):
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
 
+        # A preempted request gives its row back at once, because its running
+        # slot is already back: ``Scheduler._preempt_request`` pops it from
+        # ``running``, so the lane admits a replacement on the next prefill step
+        # and ``_assign_slot`` finds no free row, killing the engine core.
+        # Holding the row buys nothing, its KV having been freed and
+        # ``num_computed_tokens`` reset, so the resume re-prefills and rewrites
+        # whatever row it lands on. The lane binding stays: the request resumes
+        # in the lane whose KV cache manager and queues still hold it.
+        # ``TTLaneInputBatch.apply_step_plan`` releases the same row in this same
+        # step, so the row is free on both sides before anything is placed there.
+        # ``preempted_req_ids`` is typed optional, hence the ``or ()``.
+        for req_id in merged.preempted_req_ids or ():
+            self._release_slot(req_id)
+
         resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
         for req_id in resumed_req_ids:
             self._release_slot(req_id)
@@ -523,10 +537,14 @@ class TTLaneCoordinator(SchedulerInterface):
             )
         ):
             # The discarded prefill pass already drained each lane's
-            # finished/freed-encoder bookkeeping; carry it onto the decode pass
-            # so the runner still releases that state.
+            # finished/freed-encoder bookkeeping and may have preempted a
+            # partial prefill (which a prefill pass keeps in ``running``, and
+            # ``_preempt_request`` frees the KV of before this pass is thrown
+            # away); carry all of it onto the decode pass so the runner still
+            # releases that state and the preempted row.
             carried_finished = merged.finished_req_ids
             carried_free_encoder = merged.free_encoder_mm_hashes
+            carried_preempted = merged.preempted_req_ids
             forced_mode = TTSchedulingMode.DECODE_ONLY
             lane_outputs = self._schedule_all_lanes(forced_mode)
             merged = merge_lane_scheduler_outputs(lane_outputs)
@@ -534,6 +552,10 @@ class TTLaneCoordinator(SchedulerInterface):
             merged.free_encoder_mm_hashes = (
                 carried_free_encoder + merged.free_encoder_mm_hashes
             )
+            if carried_preempted:
+                merged.preempted_req_ids = (
+                    merged.preempted_req_ids or set()
+                ) | carried_preempted
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
         plan = self._build_step_plan(lane_outputs, merged, is_decode)

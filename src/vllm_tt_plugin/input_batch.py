@@ -844,12 +844,15 @@ class TTLaneInputBatch(InputBatch):
     ) -> bool:
         """Apply one lane step plan to this batch and the runner's request map.
 
-        This is the lane-DP variant of ``TTModelRunner._update_states``. Unlike
-        the front-packed batch it does **not** evict merely-unscheduled
-        requests: a prefill step can leave running decodes unscheduled, and
-        freeing their stable device slot would disturb the on-device per-slot
-        seed RNG. Only finished requests, and requests resumed from preemption
-        (whose KV was rebuilt), release their slot. There is no condense.
+        The lane-DP counterpart of ``TTModelRunner._update_states``. Here a row
+        is the request's device state slot, so the request holds it for its
+        whole lifetime: being left out of a step -- as every running decode is
+        on a prefill step -- changes nothing, and ``condense`` is a no-op. A row
+        comes back only when its contents stop being authoritative: on finish,
+        and on preemption, which freed the KV and reset ``num_computed_tokens``
+        so the resume re-prefills from zero into whatever row it is given then.
+        A preempted request's ``CachedRequestState`` stays in ``requests`` for
+        that resume.
 
         ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
         map) and ``encoder_cache`` are mutated in place. Placement rows come
@@ -863,6 +866,16 @@ class TTLaneInputBatch(InputBatch):
         # Finished requests release their slot.
         for req_id in scheduler_output.finished_req_ids:
             requests.pop(req_id, None)
+            if self.remove_request(req_id) is not None:
+                layout_changed = True
+
+        # Preempted requests release their row, in the same step as the
+        # coordinator returns it to the lane's free list
+        # (``TTLaneCoordinator._build_step_plan``). Both must give it up
+        # together, or the next ``add_request_to_row`` places a newcomer on top
+        # of the occupant still sitting here. ``preempted_req_ids`` is typed
+        # optional, hence the ``or ()``.
+        for req_id in scheduler_output.preempted_req_ids or ():
             if self.remove_request(req_id) is not None:
                 layout_changed = True
 
@@ -887,10 +900,11 @@ class TTLaneInputBatch(InputBatch):
                 req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
             )
             if resumed_from_preemption:
-                # KV was freed and is being rebuilt; re-add fresh (drop the
-                # stale slot first). The slot may differ afterwards --
-                # acceptable under the exceptional preemption path, which
-                # re-prefills the request anyway.
+                # A resume re-places the request wherever the coordinator's free
+                # list sent it, which is rarely the row it left. That row went
+                # back when the preemption was reported, so this removal only
+                # covers a resume whose preemption never was, keeping the
+                # request off two rows at once.
                 if self.remove_request(req_id) is not None:
                     layout_changed = True
                 req_ids_to_add.append(req_id)
