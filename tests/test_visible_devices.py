@@ -23,6 +23,7 @@ from vllm_tt_plugin.platform import (
 from vllm_tt_plugin.utils.dp_discovery import (
     _maybe_reorder_standard_dp_visible_device_groups,
     _resolve_parent_mesh_grid,
+    format_tt_visible_devices,
 )
 from vllm_tt_plugin.worker import _bind_visible_devices_env, _resolve_mesh_grid
 
@@ -57,9 +58,20 @@ def _discovered_groups_config(
 def test_standard_dp_discovery_target_uses_helper_module() -> None:
     """Keep the spawned discovery target outside the platform module."""
     assert (
-        tt_platform._run_standard_dp_visible_device_group_discovery.__module__
+        tt_platform.run_standard_dp_visible_device_group_discovery.__module__
         == "vllm_tt_plugin.utils.dp_discovery"
     )
+
+
+@pytest.mark.parametrize(
+    ("device_ids", "expected"),
+    [([0, 1, 2, 3], "0,1,2,3"), (["4,5,6,7"], "4,5,6,7")],
+)
+def test_format_tt_visible_devices_supports_device_ids_and_group_strings(
+    device_ids: list[int] | list[str],
+    expected: str,
+) -> None:
+    assert format_tt_visible_devices(device_ids) == expected
 
 
 def test_standard_dp_discovery_timeout_terminates_subprocess(
@@ -303,7 +315,7 @@ def test_standard_dp_visible_device_groups_feed_upstream_gpu_id_assignment(
 
 
 @pytest.mark.parametrize("inherited", [None, "", "0,1,2,3,4,5,6,7", "9,9"])
-def test_assigned_physical_gpu_ids_override_inherited_visible_devices(
+def test_matching_internal_assignment_binds_discovered_group(
     monkeypatch: pytest.MonkeyPatch,
     inherited: str | None,
 ) -> None:
@@ -317,12 +329,39 @@ def test_assigned_physical_gpu_ids_override_inherited_visible_devices(
         _discovered_groups_config(
             "0,1,2,3",
             "4,5,6,7",
-            local_dp_rank=0,
+            local_dp_rank=1,
             assigned_physical_gpu_ids=["4,5,6,7"],
         )
     )
 
     assert os.environ[EVAR] == "4,5,6,7"
+
+
+@pytest.mark.parametrize(
+    ("local_dp_rank", "assigned_physical_gpu_ids"),
+    [(0, ["0"]), (1, ["1"])],
+)
+def test_conflicting_internal_assignment_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+    local_dp_rank: int,
+    assigned_physical_gpu_ids: list[str],
+) -> None:
+    monkeypatch.setenv(EVAR, "0,1,2,3,4,5,6,7")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"TT standard-DP assignment conflicts with discovery",
+    ):
+        _bind_visible_devices_env(
+            _discovered_groups_config(
+                "0,1,2,3",
+                "4,5,6,7",
+                local_dp_rank=local_dp_rank,
+                assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+            )
+        )
+
+    assert os.environ[EVAR] == "0,1,2,3,4,5,6,7"
 
 
 def test_discovered_group_binds_when_upstream_left_ids_unset(
