@@ -666,16 +666,34 @@ def get_reliability_mode(tt_config):
 # Set fabric config to passed in value
 # Do nothing if not set
 # Must be called before creating the mesh device
+def get_fabric_router_config(tt_config):
+    # Override the router's max packet payload if specified in TT plugin config.
+    if not tt_config or "fabric_packet_payload_bytes" not in tt_config:
+        return None
+    payload = int(tt_config["fabric_packet_payload_bytes"])
+    assert payload > 0, f"fabric_packet_payload_bytes must be positive, got {payload}"
+    router_config = ttnn.FabricRouterConfig()
+    router_config.max_packet_payload_size_bytes = payload
+    return router_config
+
+
 def set_fabric(tt_config, num_devices):
     fabric_config = get_fabric_config(tt_config, num_devices)
     if fabric_config:
         reliability_mode = get_reliability_mode(tt_config)
+        router_config = get_fabric_router_config(tt_config)
         logger.info(
-            "Setting fabric config: %s, reliability mode: %s",
+            "Setting fabric config: %s, reliability mode: %s, router config: %s",
             fabric_config,
             reliability_mode,
+            router_config,
         )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+        if router_config is not None:
+            ttnn.set_fabric_config(
+                fabric_config, reliability_mode, router_config=router_config
+            )
+        else:
+            ttnn.set_fabric_config(fabric_config, reliability_mode)
 
 
 # From tt-metal/conftest.py:

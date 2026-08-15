@@ -715,6 +715,23 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
+    # Muse-Glimmer — text-only TT bridge. Same nested-config resolution problem as
+    # Gemma4 above: nested text/vision configs mean upstream resolves to
+    # ``TransformersMultiModalForCausalLM`` before the ``TT``-prefix logic runs, so we
+    # register the plain HF arch names too. The TT class is text-only and does not use
+    # ``SupportsMultiModal``, so the request path stays text-only.
+    _muse_glimmer_target = (
+        "models.autoports.meta_models_muse_glimmer_30b.tt.generator_vllm"
+        ":MuseGlimmerForConditionalGeneration"
+    )
+    for arch in (
+        "MuseGlimmerForConditionalGeneration",
+        "MuseGlimmerForCausalLM",
+        "TTMuseGlimmerForConditionalGeneration",
+        "TTMuseGlimmerForCausalLM",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _muse_glimmer_target)
+
     # DeepseekV3
     _register_model_if_missing(
         ModelRegistry,
