@@ -3,7 +3,16 @@
 
 import logging
 
-from vllm_tt_plugin.logger import init_tt_logger
+import pytest
+
+from vllm_tt_plugin.logger import _log_once, init_tt_logger
+
+
+@pytest.fixture(autouse=True)
+def clear_log_once_cache():
+    _log_once.cache_clear()
+    yield
+    _log_once.cache_clear()
 
 
 def test_tt_logger_provides_all_once_methods():

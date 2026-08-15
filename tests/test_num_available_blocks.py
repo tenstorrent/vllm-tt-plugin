@@ -125,6 +125,37 @@ def test_lane_mode_kv_shape_matches_per_lane_standard_dp(cfg):
     assert n == 2056
 
 
+def test_block_output_budget_includes_one_physical_canvas(cfg):
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.model_config.max_model_len = 1024
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _model_budget(1024),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    assert n * cfg.cache_config.block_size == 1024 + 256
+
+
+def test_block_output_rejects_fallback_budget_below_served_length(cfg):
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.model_config.max_model_len = 200_000
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+        pytest.raises(ValueError, match="Block-output KV budget is too small"),
+    ):
+        get_num_available_blocks_tt(cfg)
+
+
 def test_sliding_window_adds_headroom(cfg):
     """Hybrid models declare a sliding_window; with hybrid KV groups
     enabled the heuristic adds headroom proportional to

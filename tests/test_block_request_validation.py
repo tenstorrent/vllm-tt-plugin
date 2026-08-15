@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+from functools import cached_property
 from types import SimpleNamespace
 
 import pytest
@@ -35,8 +36,6 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     """Install the vLLM 0.24 validate -> clone -> default boundary."""
     import vllm.v1.engine.input_processor as input_processor
 
-    # Mirrors vLLM 0.24's process_inputs signature, where ``resumable`` is
-    # positional-or-keyword, so the patch's positional handling is exercised.
     def process_inputs(
         self,
         request_id,
@@ -60,6 +59,8 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
         return SimpleNamespace(
             sampling_params=cloned_params,
             resumable=resumable,
+            prompt_token_ids=prompt.get("prompt_token_ids"),
+            prompt_embeds=prompt.get("prompt_embeds"),
         )
 
     monkeypatch.setattr(
@@ -196,14 +197,21 @@ def test_ar_request_validation_is_unchanged(monkeypatch):
     assert params.n == 2
 
 
+class _ModelConfig(SimpleNamespace):
+    @cached_property
+    def is_diffusion(self) -> bool:
+        return getattr(self.hf_config, "canvas_length", None) is not None
+
+
 def _config(*, max_num_seqs=1, data_parallel_size=1, async_scheduling=False):
     return SimpleNamespace(
         additional_config={"tt": {"sample_on_device_mode": "all"}},
-        model_config=SimpleNamespace(
+        model_config=_ModelConfig(
             model="test-model",
             hf_config=SimpleNamespace(
                 architectures=["FutureBlockModel"],
                 model_type="gemma4",
+                canvas_length=256,
             ),
             max_model_len=1024,
             original_max_model_len=None,
@@ -275,6 +283,7 @@ def _patch_model_resolution(monkeypatch, model_class=BlockModel):
 def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     config = _config()
     _patch_model_resolution(monkeypatch)
+    assert config.model_config.is_diffusion is True
 
     TTPlatform.check_and_update_config(config)
 
@@ -283,6 +292,8 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.model_config.generation_config == "vllm"
     assert config.diffusion_config is None
+    assert not hasattr(config.model_config.hf_config, "canvas_length")
+    assert config.model_config.is_diffusion is False
 
 
 @pytest.mark.parametrize(
@@ -304,7 +315,11 @@ def test_startup_installs_input_processor_patch_only_for_block_models(
             cloned_params.max_tokens = self.model_config.max_model_len - len(
                 prompt["prompt_token_ids"]
             )
-        return SimpleNamespace(sampling_params=cloned_params)
+        return SimpleNamespace(
+            sampling_params=cloned_params,
+            prompt_token_ids=prompt.get("prompt_token_ids"),
+            prompt_embeds=prompt.get("prompt_embeds"),
+        )
 
     monkeypatch.setattr(
         input_processor.InputProcessor,
@@ -419,30 +434,6 @@ def test_input_processor_rejects_resumable_block_request_before_upstream(
     assert processor.process_inputs_calls == []
 
 
-def test_input_processor_rejects_positional_resumable_block_request(monkeypatch):
-    """vLLM 0.24's ``resumable`` is positional-or-keyword; a positional caller
-    must be rejected the same way as a keyword one."""
-    processor_cls, processor = _processor_harness(monkeypatch)
-
-    with pytest.raises(ValueError, match="do not support resumable streaming-input"):
-        processor_cls.process_inputs(
-            processor,
-            "streaming-input-positional",
-            {"prompt_token_ids": [1] * 200},
-            SamplingParams(max_tokens=256),
-            None,  # supported_tasks
-            None,  # arrival_time
-            None,  # lora_request
-            None,  # tokenization_kwargs
-            None,  # trace_headers
-            0,  # priority
-            None,  # data_parallel_rank
-            True,  # resumable
-        )
-
-    assert processor.process_inputs_calls == []
-
-
 def test_input_processor_preserves_resumable_ar_request(monkeypatch):
     processor_cls, processor = _processor_harness(monkeypatch, output_size=1)
 
@@ -461,14 +452,20 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
     assert request.sampling_params.temperature == 0.5
 
 
+def test_explicit_embeds_request_enforces_physical_capacity():
+    with pytest.raises(ValueError, match=r"requires 512 physical.*exceeding"):
+        TTPlatform.validate_request(
+            {"prompt_token_ids": None, "prompt_embeds": [0] * 513},
+            SamplingParams(max_tokens=257),
+        )
+
+
 def test_input_processor_rejects_zero_canvas_default_for_embeds(monkeypatch):
-    """Inputs without prompt_token_ids skip validate_request's canvas check;
-    the wrapper must still reject a whole-canvas default that rounds to 0."""
     processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
-    with pytest.raises(ValueError, match="fewer than one physical"):
+    with pytest.raises(ValueError, match=r"requires 256 physical.*exceeding"):
         processor_cls.process_inputs(
             processor,
             "embeds",
@@ -484,7 +481,7 @@ def test_input_processor_rejects_when_no_canvas_fits(monkeypatch):
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
-    with pytest.raises(ValueError, match="physical 256-token output canvases"):
+    with pytest.raises(ValueError, match="physical 256-token canvases"):
         processor_cls.process_inputs(
             processor,
             "too-long",

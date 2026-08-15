@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover - older vLLM without the timing contract
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.model_runner import TTModelRunner
@@ -450,10 +451,6 @@ class TTWorker(WorkerBase):
         assert self.is_driver_worker, "There should only be one Worker for TT"
         return self.model_runner.execute_model(scheduler_output)
 
-    def take_draft_token_ids(self) -> None:
-        """Diffusion models trigger this vLLM 0.24 worker RPC but TT has no drafter."""
-        return None
-
     def sample_tokens(
         self,
         grammar_output: "GrammarOutput | None",
@@ -542,9 +539,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # endregion
 
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
-    # allocate an extra block_size per user since vLLM uses a worst-case
-    # heuristic and assumes each touched block will require a new
-    # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
+    # allocate one worst-case output reservation per user. AR models need one
+    # extra cache block; block-output models commit their entire output canvas
+    # atomically and therefore need at least one full canvas of headroom.
     #
     # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
     # padding must use the *per-lane/per-rank* batch -- the number of requests
@@ -554,7 +551,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # Both reduce to the same per-submesh value, keeping the KV shape identical
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
-    max_tokens_all_users += cache_config.block_size * max_batch
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    per_user_output_reservation = max(cache_config.block_size, output_tokens_per_step)
+    max_tokens_all_users += per_user_output_reservation * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers
     # into multiple kv_cache_groups: a full-attention group plus several
@@ -589,6 +588,18 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+    if output_tokens_per_step > 1:
+        resolved_kv_tokens = num_tt_blocks * cache_config.block_size
+        required_kv_tokens = model_config.max_model_len + output_tokens_per_step
+        if resolved_kv_tokens < required_kv_tokens:
+            raise ValueError(
+                "Block-output KV budget is too small: resolved "
+                f"{resolved_kv_tokens} tokens, but max_model_len="
+                f"{model_config.max_model_len} plus output_tokens_per_step="
+                f"{output_tokens_per_step} requires at least "
+                f"{required_kv_tokens}. Fix the model's "
+                "get_max_tokens_all_users budget."
+            )
 
     return num_tt_blocks
 

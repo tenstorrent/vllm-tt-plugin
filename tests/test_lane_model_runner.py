@@ -227,6 +227,38 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
     assert captured["empty_slots"] == [4]
 
 
+def test_submit_decode_forwards_computed_slot_remap_to_model():
+    captured = {}
+
+    class FakeModel:
+        def decode_forward(self, *, slot_remap, **kwargs):
+            captured["slot_remap"] = slot_remap
+            return torch.zeros((1, 1))
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        request_specific_rope=False,
+        trace_mode="none",
+        model=FakeModel(),
+    )
+    controller = TTAsyncDecodeController(runner)
+    slot_remap = torch.tensor([3, 1, 2, 0], dtype=torch.int32)
+    model_input = SimpleNamespace(
+        unpadded_batch_size=1,
+        tt_sampling_params=None,
+        perform_device_sampling=False,
+        input_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        input_positions=torch.zeros((1,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        slot_remap=slot_remap,
+    )
+
+    controller.submit_decode(model_input, read_from_device=True)
+
+    assert captured["slot_remap"] is slot_remap
+
+
 def test_async_lane_decode_uses_batch_extraction():
     calls = []
 

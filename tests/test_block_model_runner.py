@@ -76,10 +76,6 @@ def test_ar_k1_output_shape_is_unchanged():
     assert output.sampled_token_ids == [[7]]
 
 
-def test_worker_024_draft_token_rpc_returns_none():
-    assert TTWorker.take_draft_token_ids(TTWorker.__new__(TTWorker)) is None
-
-
 def test_update_states_accepts_absent_preemption_metadata():
     scheduler_output = SchedulerOutput.make_empty()
     assert scheduler_output.preempted_req_ids is None
@@ -152,6 +148,18 @@ def test_update_states_releases_model_request_before_removing_row(
     assert "req-0" not in input_batch.req_id_to_index
     assert ("req-0" in runner.requests) is request_retained
     assert runner._req_state_slot == {}
+
+
+def test_release_model_request_never_falls_back_to_batch_row():
+    released = []
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner._req_state_slot = {}
+    runner.input_batch = SimpleNamespace(req_id_to_index={"req-0": 3})
+    runner.model = SimpleNamespace(release_request=released.append)
+
+    runner._release_model_request("req-0")
+
+    assert released == []
 
 
 def test_worker_wrapper_shutdown_releases_persistent_capture_once():

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-import inspect
 import json
 import multiprocessing
 import os
@@ -10,6 +9,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
 import torch
 from vllm.platforms.interface import Platform, PlatformEnum
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
     get_tt_config,
@@ -495,29 +495,13 @@ def _install_block_output_input_processor_patch() -> None:
     original = input_processor.InputProcessor.process_inputs
     input_processor._tt_original_process_inputs = original
 
-    # ``resumable`` is positional-or-keyword in vLLM 0.24, so a positional
-    # caller lands it in the wrapper's ``*args``; locate it in the original
-    # signature once. The wrapper binds self/request_id/prompt/params itself.
-    original_parameters = list(inspect.signature(original).parameters)
-    resumable_args_index = (
-        original_parameters.index("resumable") - 4
-        if "resumable" in original_parameters
-        else None
-    )
-
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
-        if output_size > 1:
-            resumable = (
-                args[resumable_args_index]
-                if resumable_args_index is not None and len(args) > resumable_args_index
-                else kwargs.get("resumable", False)
+        if output_size > 1 and kwargs.get("resumable", False):
+            raise ValueError(
+                "TT block-output models do not support resumable "
+                "streaming-input requests"
             )
-            if resumable:
-                raise ValueError(
-                    "TT block-output models do not support resumable "
-                    "streaming-input requests"
-                )
 
         unresolved_max_tokens = (
             isinstance(params, SamplingParams) and params.max_tokens is None
@@ -539,19 +523,16 @@ def _install_block_output_input_processor_patch() -> None:
                 "; ".join(ignored),
             )
 
-        if unresolved_max_tokens and cloned_params.max_tokens is not None:
-            rounded = cloned_params.max_tokens // output_size * output_size
-            if rounded == 0:
-                # Re-validate the resolved default: inputs without
-                # prompt_token_ids (e.g. prompt embeds) skip the canvas check
-                # in validate_request, and a whole-canvas default of zero
-                # would otherwise be admitted.
-                raise ValueError(
-                    f"Request leaves fewer than one physical {output_size}"
-                    "-token output canvas within the max model length. Use a "
-                    "shorter prompt or a larger max model length."
-                )
-            cloned_params.max_tokens = rounded
+        if unresolved_max_tokens:
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                request.prompt_token_ids, request.prompt_embeds
+            )
+            cloned_params.max_tokens = TTPlatform._resolve_block_output_max_tokens(
+                prompt_len=prompt_len,
+                requested_max_tokens=None,
+                output_size=output_size,
+                max_model_len=self.model_config.max_model_len,
+            )
         return request
 
     input_processor.InputProcessor.process_inputs = process_inputs_tt
@@ -971,12 +952,6 @@ class TTPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        # The standalone TT plugin implements the vLLM V1 runner only. vLLM
-        # 0.24 otherwise force-selects its Triton-only V2 runner for every HF
-        # config with ``canvas_length`` before applying the normal no-Triton
-        # fallback. Pinning this in the platform hook keeps diffusion models on
-        # the runner the TT worker actually implements.
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         _install_tt_harmony_truncation_patch()
         cls._standard_dp_visible_device_groups = None
         cls._standard_dp_mesh_grids = {}
@@ -1141,12 +1116,20 @@ class TTPlatform(Platform):
                 "in model_capabilities"
             )
         if is_block_output_model:
-            # Upstream 0.24 recognizes DiffusionGemma's original HF
-            # architecture before this platform hook runs and injects a
-            # DiffusionConfig(canvas_length=256). Scheduler interprets that
-            # canvas as speculative draft tokens, while this plugin separately
-            # reserves the model-owned output block. Clear the upstream
-            # diffusion path so one physical canvas is accounted exactly once.
+            # Upstream 0.24 detects diffusion from ``hf_config.canvas_length``.
+            # TT block models own their canvas lifecycle, so remove that marker
+            # and invalidate the cached property before vLLM selects a model
+            # runner or constructs the scheduler. This keeps every downstream
+            # view of ModelConfig.is_diffusion uniformly false.
+            hf_config = model_config.hf_config
+            if hasattr(hf_config, "canvas_length"):
+                delattr(hf_config, "canvas_length")
+                model_config.__dict__.pop("is_diffusion", None)
+
+            # ModelConfig may already have caused vLLM to create this config
+            # before the platform hook ran. It represents the same canvas as
+            # output_tokens_per_step, so retaining it double-books the block as
+            # speculative draft tokens.
             if vllm_config.diffusion_config is not None:
                 logger.info(
                     "Block-output model owns diffusion scheduling; disabling "
@@ -1348,20 +1331,36 @@ class TTPlatform(Platform):
         return True
 
     @classmethod
-    def _fit_whole_canvas_default(
-        cls, prompt_len: int, output_size: int, max_model_len: int
+    def _resolve_block_output_max_tokens(
+        cls,
+        prompt_len: int,
+        requested_max_tokens: int | None,
+        output_size: int,
+        max_model_len: int,
     ) -> int:
-        """Largest whole-canvas output that fits after the prompt; raises if
-        not even one physical canvas fits."""
+        """Resolve one logical limit and enforce its physical canvas capacity."""
         remaining = max_model_len - prompt_len
-        if remaining < output_size:
-            raise ValueError(
-                f"Prompt length {prompt_len} leaves {max(0, remaining)} tokens "
-                f"within max_model_len={max_model_len}, but this model commits "
-                f"physical {output_size}-token output canvases. Use a shorter "
-                "prompt or a larger max model length."
+        max_tokens = requested_max_tokens
+        if max_tokens is None:
+            max_tokens = max(0, remaining // output_size * output_size)
+
+        physical_output_tokens = max(
+            output_size, (max_tokens + output_size - 1) // output_size * output_size
+        )
+        if physical_output_tokens > remaining:
+            request_limit = (
+                "the default max_tokens"
+                if requested_max_tokens is None
+                else f"max_tokens={requested_max_tokens}"
             )
-        return remaining // output_size * output_size
+            raise ValueError(
+                "Block output is committed in physical "
+                f"{output_size}-token canvases: prompt length {prompt_len} plus "
+                f"{request_limit} requires {physical_output_tokens} physical "
+                f"output tokens, exceeding max_model_len={max_model_len}. "
+                "Reduce max_tokens or use a shorter prompt."
+            )
+        return max_tokens
 
     def get_max_output_tokens(self, prompt_len: int) -> int:
         """Clamp the platform default to complete physical output canvases."""
@@ -1369,7 +1368,9 @@ class TTPlatform(Platform):
         max_model_len = type(self)._get_block_model_max_len()
         if output_size == 1 or max_model_len is None:
             return super().get_max_output_tokens(prompt_len)
-        return self._fit_whole_canvas_default(prompt_len, output_size, max_model_len)
+        return self._resolve_block_output_max_tokens(
+            prompt_len, None, output_size, max_model_len
+        )
 
     @classmethod
     def validate_request(
@@ -1389,33 +1390,18 @@ class TTPlatform(Platform):
         if not isinstance(params, SamplingParams) or output_size == 1:
             return
 
-        prompt_token_ids = processed_inputs.get("prompt_token_ids")
         max_model_len = cls._get_block_model_max_len()
-        if prompt_token_ids is not None and max_model_len is not None:
-            prompt_len = len(prompt_token_ids)
-            max_tokens = params.max_tokens
-            if max_tokens is None:
-                # OpenAI serving resolves max_tokens before this hook, but
-                # offline callers can pass max_tokens=None (the processor
-                # defaults it only after validation). Validate that eventual
-                # per-request default locally; mutating the caller-owned object
-                # here makes LLM.generate([...], one_params) prompt-order
-                # dependent because vLLM clones only after this hook.
-                max_tokens = cls._fit_whole_canvas_default(
-                    prompt_len, output_size, max_model_len
-                )
-            physical_output_tokens = (
-                (max_tokens + output_size - 1) // output_size
-            ) * output_size
-            if prompt_len + physical_output_tokens > max_model_len:
-                raise ValueError(
-                    "Block output is committed in physical "
-                    f"{output_size}-token canvases: prompt length {prompt_len} "
-                    f"plus max_tokens={max_tokens} requires "
-                    f"{physical_output_tokens} physical output tokens, exceeding "
-                    f"max_model_len={max_model_len}. Reduce max_tokens or use a "
-                    "shorter prompt."
-                )
+        if max_model_len is not None:
+            prompt_len = length_from_prompt_token_ids_or_embeds(
+                processed_inputs.get("prompt_token_ids"),
+                processed_inputs.get("prompt_embeds"),
+            )
+            cls._resolve_block_output_max_tokens(
+                prompt_len,
+                params.max_tokens,
+                output_size,
+                max_model_len,
+            )
 
         # Reject unsupported response-contract controls. Model-owned sampling
         # controls (temperature etc.) are instead accepted and neutralized on

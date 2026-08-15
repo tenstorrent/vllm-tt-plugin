@@ -32,11 +32,7 @@ def test_diffusion_gemma_model_architecture_aliases(monkeypatch):
         assert registered[arch] == expected_target
 
 
-def test_gemma4_keeps_plugin_parsers_and_diffusion_gemma_uses_upstream():
-    """``gemma4`` must keep the plugin parsers (autoregressive Gemma 4 serving
-    is unchanged), while ``diffusion_gemma`` resolves to the engine-based
-    parser that ships with vLLM 0.24, matching upstream's DiffusionGemma
-    serving recipe."""
+def test_gemma4_parser_registration_is_unchanged():
     from vllm.reasoning import ReasoningParserManager
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
@@ -52,9 +48,38 @@ def test_gemma4_keeps_plugin_parsers_and_diffusion_gemma_uses_upstream():
         == "vllm_tt_plugin.gemma4_tool_parser"
     )
 
-    assert ReasoningParserManager.get_reasoning_parser(
-        "diffusion_gemma"
-    ).__module__.startswith("vllm.")
-    assert ToolParserManager.get_tool_parser("diffusion_gemma").__module__.startswith(
-        "vllm."
+
+def test_diffusion_gemma_does_not_add_parser_aliases(monkeypatch):
+    from vllm.reasoning import ReasoningParserManager
+    from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+
+    reasoning_registrations = []
+    tool_registrations = []
+    monkeypatch.setattr(
+        ReasoningParserManager,
+        "register_lazy_module",
+        staticmethod(lambda *args: reasoning_registrations.append(args)),
     )
+    monkeypatch.setattr(
+        ToolParserManager,
+        "register_lazy_module",
+        staticmethod(lambda *args: tool_registrations.append(args)),
+    )
+
+    _register_tt_reasoning_parsers()
+    _register_tt_tool_parsers()
+
+    assert reasoning_registrations == [
+        (
+            "gemma4",
+            "vllm_tt_plugin.gemma4_reasoning_parser",
+            "Gemma4ReasoningParser",
+        )
+    ]
+    assert tool_registrations == [
+        (
+            "gemma4",
+            "vllm_tt_plugin.gemma4_tool_parser",
+            "Gemma4ToolParser",
+        )
+    ]

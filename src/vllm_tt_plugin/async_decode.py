@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 import threading
 import time
 from dataclasses import dataclass, fields, replace
@@ -41,21 +40,6 @@ class TTFinalizedDecode:
 
     tt_out: torch.Tensor
     tt_log_probs: torch.Tensor | None
-
-
-def model_accepts_kwarg(fn: Any, name: str) -> bool:
-    """True if ``fn`` takes ``name`` as a named parameter or via ``**kwargs``.
-
-    Gates optional state-slot kwargs so model bundles with strict forward
-    signatures (no ``**kwargs``) never receive arguments they cannot take.
-    """
-    try:
-        parameters = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return True
-    return name in parameters or any(
-        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-    )
 
 
 def _is_host_decode_output(tt_out: Any) -> bool:
@@ -539,13 +523,10 @@ class TTAsyncDecodeController:
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
             kwargs["reset_batch"] = model_input.reset_batch
-        # State follows the request, so the remap must reach a stateful model on
-        # every step -- host sampling included: the ownership map has already
-        # advanced to the post-gather layout when the remap was built. Models
-        # without state slots never see the kwarg.
-        if model_input.slot_remap is not None and model_accepts_kwarg(
-            runner.model.decode_forward, "slot_remap"
-        ):
+        # State follows the request, so every computed remap must reach the
+        # model -- host sampling included: the ownership map has already
+        # advanced to the post-gather layout when the remap was built.
+        if model_input.slot_remap is not None:
             kwargs["slot_remap"] = model_input.slot_remap
 
         enc_dec_kwargs: dict[str, Any] = {}

@@ -36,7 +36,6 @@ from vllm_tt_plugin.async_decode import (
     CompletedDecodeStep,
     DeferredDecodeOutput,
     TTAsyncDecodeController,
-    model_accepts_kwarg,
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
@@ -649,12 +648,9 @@ class TTModelRunner:
 
         State follows the request's ``_req_state_slot`` slot, not its batch
         row: prefill can park a request at a slot other than its row when the
-        preferred row is held (``_alloc_prefill_state_slots``). The row is only
-        a fallback for requests that never went through slot allocation.
+        preferred row is held (``_alloc_prefill_state_slots``).
         """
         slot = self._req_state_slot.get(req_id)
-        if slot is None:
-            slot = self.input_batch.req_id_to_index.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
         if slot is not None and callable(release):
             release(slot)
@@ -1756,8 +1752,6 @@ class TTModelRunner:
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
         # The slots go to the model whenever the build supplied them: a stateful
         # model's ``range(N)`` default clobbers live state, DP=1 included.
-        # Models whose prefill_forward has a strict signature (no **kwargs)
-        # never see the kwarg -- they carry no per-slot state to protect.
         empty_slots = model_input.prefill_empty_slots
         if empty_slots is None and len(batch_size_per_dp) > 1:
             # TODO: the model should only require DP ranks, but passing
@@ -1767,9 +1761,7 @@ class TTModelRunner:
             for dp_rank, sz in enumerate(batch_size_per_dp):
                 for i in range(int(sz)):
                     empty_slots.append(dp_rank * stride + i)
-        if empty_slots is not None and model_accepts_kwarg(
-            self.model.prefill_forward, "empty_slots"
-        ):
+        if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
 
         if self.request_specific_rope:

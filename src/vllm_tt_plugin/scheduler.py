@@ -179,26 +179,23 @@ class TTScheduler(AsyncScheduler):
     ) -> bool:
         """Avoid a stale-canvas resume that vLLM's AR reset cannot represent."""
         if self._is_block_output_model and reset_running_requests and self.running:
-            logger.error(
+            raise RuntimeError(
                 "Cannot reset prefix cache while a block-output request is "
                 "running; finish or abort the request first."
             )
-            return False
         return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Reserve the complete physical output emitted by each block step.
 
-        vLLM 0.24 reserves zero sampled tokens for models detected as
-        diffusion. The TT adapter nevertheless returns one K-token canvas, so
-        reserve K positions after the normal scheduled-input accounting.
+        The platform removes the upstream diffusion marker, so vLLM reserves
+        its normal one sampled-token placeholder. The TT adapter returns one
+        K-token canvas; reserve the remaining K-1 positions.
         """
         super()._update_after_schedule(scheduler_output)
         if not self._is_block_output_model:
             return
-        extra_placeholders = (
-            self._output_tokens_per_step - self.num_sampled_tokens_per_step
-        )
+        extra_placeholders = self._output_tokens_per_step - 1
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if not request.is_prefill_chunk:
