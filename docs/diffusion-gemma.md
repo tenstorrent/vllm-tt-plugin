@@ -3,7 +3,7 @@
 DiffusionGemma is a block-output model. One model invocation commits a complete
 256-token canvas, not one autoregressive token. The paired implementation is
 `tenstorrent/tt-metal` commit
-`e37613fd2973d969c362a127b2d0c401a5e145d6`. Its adapter declares:
+`5fec49388893120148e189ef2602de429f214096`. Its adapter declares:
 
 - `output_tokens_per_step=256`
 - `supports_sample_on_device=True`
@@ -28,20 +28,26 @@ Run from the paired tt-metal checkout so the registered model target under
 ```bash
 export PYTHONPATH=/path/to/tt-metal
 export MESH_DEVICE=P150x4
+export VLLM_RPC_TIMEOUT=1800000
+export DG_UPFRONT_CAPTURE=1
+export DG_VLLM_GUMBEL_MODE=device
+export DG_DENOISE_REVEAL_PMAX=262144
+export DG_UPFRONT_PREFILL_WARMUP_LENS=32,64,96
+export DG_TRACE_REGION_SIZE=3758096384
 
 python -m vllm.entrypoints.openai.api_server \
-  --model <diffusion-gemma-checkpoint> \
+  --model google/diffusiongemma-26B-A4B-it \
   --served-model-name diffusiongemma-26B-A4B-it \
   --generation-config vllm \
-  --max-model-len <served-context-limit> \
-  --max-num-batched-tokens <served-context-limit> \
+  --max-model-len 262144 \
+  --max-num-batched-tokens 262144 \
   --max-num-seqs 1 \
   --block-size 64 \
   --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
   --no-async-scheduling \
   --reasoning-parser diffusion_gemma \
-  --additional-config '{"tt":{"sample_on_device_mode":"all","enable_model_warmup":true,"trace_mode":"all"}}'
+  --additional-config '{"tt":{"sample_on_device_mode":"all","enable_model_warmup":true,"trace_mode":"all","trace_region_size":3758096384}}'
 ```
 
 The `diffusion_gemma` parser names alias the engine-based Gemma4 parsers that
@@ -52,8 +58,11 @@ autoregressive Gemma 4 serving. For tool calling add
 
 `--max-num-batched-tokens` concerns scheduler prompt admission. It does not
 disable DiffusionGemma's model-internal ragged and chunked prompt processing.
-Set the trace-region and DiffusionGemma capture environment variables required
-by the paired tt-metal model for the target context and mesh.
+The `DG_TRACE_REGION_SIZE` environment value must match
+`tt.trace_region_size`; the values above are the P300X2 release configuration
+validated by tt-shield. If the served context or expected aligned prompt
+lengths change, update `DG_DENOISE_REVEAL_PMAX` and
+`DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly.
 
 ## Request Contract
 
@@ -76,10 +85,13 @@ controls such as `n>1`, logprobs, structured outputs, bad words, logit bias,
 allowed token IDs, nonzero minimum tokens, and custom sampling `extra_args`
 remain rejected before EngineCore.
 
-Physical admission rounds logical output up to complete canvases:
+Physical admission rounds the prompt to a TT tile, rounds the configured limit
+down to a TT tile, and rounds logical output up to complete canvases:
 
 ```text
-prompt_tokens + ceil(max_tokens / 256) * 256 <= max_model_len
+ceil(prompt_tokens / 32) * 32
+  + ceil(max_tokens / 256) * 256
+  <= floor(max_model_len / 32) * 32
 ```
 
 The historical `/v1/completions` default `max_tokens=16` remains valid. It

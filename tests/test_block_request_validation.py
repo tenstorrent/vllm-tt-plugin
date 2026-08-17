@@ -460,6 +460,23 @@ def test_explicit_embeds_request_enforces_physical_capacity():
         )
 
 
+def test_explicit_request_uses_tile_aligned_physical_capacity(monkeypatch):
+    monkeypatch.setattr(
+        TTPlatform,
+        "block_model_config",
+        SimpleNamespace(max_model_len=1000),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"prompt length 737 \(aligned to 768\).*aligned max_model_len=992",
+    ):
+        _validate(SamplingParams(max_tokens=1), prompt_len=737)
+
+    # The neighboring aligned prompt fits one complete 256-token canvas.
+    _validate(SamplingParams(max_tokens=1), prompt_len=736)
+
+
 def test_input_processor_rejects_zero_canvas_default_for_embeds(monkeypatch):
     processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16)

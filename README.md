@@ -338,7 +338,9 @@ selects the TT-owned runtime classes through vLLM's extension points:
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
-- Chunked prefill is not (yet) used.
+- Token-chunked prefill is available for Gemma 4: a long prompt is split across
+  prefill steps and only the chunk that completes the prompt emits a token.
+  Every other model type keeps prefill unsplit.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -348,8 +350,10 @@ The execution model matches TT hardware characteristics:
 - For other models, `--data_parallel_size N` uses standard multi-process DP:
   each DP rank runs an independent engine core with its own TT submesh,
   scheduler, and KV cache. Device groups are discovered at startup and assigned
-  via `TT_VISIBLE_DEVICES`. This is upstream vLLM's standard DP mechanism
-  (no gather/scatter; ranks are fully independent).
+  via `TT_VISIBLE_DEVICES`. A per-rank assignment is accepted only when it
+  exactly matches the discovered group; a conflicting GPU-style `--device-ids`
+  assignment fails before mesh creation. This is upstream vLLM's standard DP
+  mechanism (no gather/scatter; ranks are fully independent).
 
 For a deeper walk-through of the scheduling and execution model, read
 `docs/SCHEDULING.md`.
@@ -434,7 +438,10 @@ clear error before anything reaches the device:
 - Tensor parallel and pipeline parallel execution are not supported.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
-- Chunked prefill is disabled.
+- Chunked prefill is disabled for every model type except Gemma 4, and
+  `max_num_batched_tokens` is bumped to `max_model_len` when it is disabled.
+- Where chunked prefill is active, multimodal inputs are never split across a
+  chunk boundary.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.

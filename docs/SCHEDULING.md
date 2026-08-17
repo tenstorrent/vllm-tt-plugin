@@ -20,7 +20,9 @@ The current TT path is more specialized than upstream vLLM:
 
 - A TT step is treated as either all-prefill or all-decode.
 - TT does not support mixed prefill+decode batches.
-- TT does not support chunked prefill at the scheduling level.
+- Token-chunked prefill is supported, but only for model types whose tt-metal
+  generator can resume a prefill; a chunk continuation is prefill work and only
+  ever runs in a prefill step.
 - CPU-device work overlap is a decode optimization.
 - Standard multi-process DP runs independent per-rank engines.
 - Single-process lane-DP coordinates lanes within one process and executes one
@@ -43,14 +45,18 @@ There are three important scheduler-side collections:
 - `running`: requests already admitted and holding active scheduler state
 
 TT treats `waiting` and `skipped_waiting` together when checking for pending
-prefill work. What TT changes is not the existence of these collections, but
-the rules for choosing what kind of work a step may contain and how that
-scheduled work is executed afterward.
+prefill work. A partly prefilled request sits in `running` with
+`is_prefill_chunk` set; TT counts it as pending prefill work too, because only
+a prefill step can advance it. What TT changes is not the existence of these
+collections, but the rules for choosing what kind of work a step may contain
+and how that scheduled work is executed afterward.
 
 For TT, it is useful to think in terms of two batch types:
 
-- prefill batch: admits ready work from the pending prefill queues
-- decode batch: advances already-running work from `running`
+- prefill batch: admits ready work from the pending prefill queues and advances
+  partial-prefill continuations from `running`
+- decode batch: advances already-running work from `running`, with partial
+  prefills hidden
 
 That is a simplification compared with upstream vLLM, but it matches how the TT path is intentionally organized today.
 
@@ -58,8 +64,7 @@ TT still performs continuous batching in the broad sense: requests arrive in
 `waiting`, may be held in `skipped_waiting`, are admitted while other requests
 remain active, can be preempted back to `waiting`, and leave independently as
 they finish. The restriction is within each device step: TT does not mix
-prefill and decode work or make incremental chunked-prefill progress in the
-same way as upstream.
+prefill and decode work in the same batch.
 
 ## Current TT Execution Flow
 
@@ -71,10 +76,9 @@ The TT scheduler prefers to admit waiting work first, because TT wants to form a
 
 ### 2. Scheduler decision
 
-The current TT scheduler enforces two important rules:
-
-- no mixed prefill+decode batch
-- no chunked prefill
+The current TT scheduler enforces one important rule: no mixed prefill+decode
+batch. A chunked prefill stays on the prefill side of that split, so its
+continuations are scheduled by prefill steps only.
 
 So each TT scheduling step picks one of:
 
@@ -140,17 +144,45 @@ That lag is intentional and is what creates host/device overlap.
 
 The TT scheduler behaves like this:
 
-- if `waiting` or `skipped_waiting` contains pending prefill work, run the prefill scheduling pass so newly ready requests can be promoted and admitted.
+- if `waiting` or `skipped_waiting` contains pending prefill work, or any
+  running request is a partial-prefill continuation, run the prefill scheduling
+  pass so newly ready requests can be promoted and admitted and continuations
+  can advance.
 - otherwise, advance decode work
 - if pending prefill work cannot be admitted, fall back to decode to free
-  capacity
+  capacity. Partial prefills do not make this fallback viable: a decode step
+  cannot advance them, so only genuine running decodes count.
 
-The reason for this policy is simple: TT currently wants a homogeneous batch type per step, and it wants full-prefill admission rather than upstream-style incremental prefill progress.
+The reason for this policy is simple: TT wants a homogeneous batch type per
+step.
 
-At configuration time the platform turns requested chunked prefill off. If
-`max_num_batched_tokens` is then smaller than `max_model_len`, it raises that
-token budget to `max_model_len` so a full prompt can be admitted instead of
-leaving an unschedulable request in `waiting`.
+At configuration time the platform turns requested chunked prefill off for
+every model type whose tt-metal generator cannot resume a prefill, and zeroes
+`long_prefill_token_threshold` (the base scheduler applies that cap before it
+consults `enable_chunked_prefill`, so leaving it set would still split a
+prefill). When chunked prefill is off and `max_num_batched_tokens` is smaller
+than `max_model_len`, it raises that token budget to `max_model_len` so a full
+prompt can be admitted instead of leaving an unschedulable request in
+`waiting`.
+
+### Chunked prefill
+
+For a model type that supports it, the base scheduler may give a long prompt
+only part of the token budget. The request then moves to `running` with
+`is_prefill_chunk` set, and later prefill steps schedule the next chunk until
+the prompt is fully computed.
+
+Two things follow for the TT execution path:
+
+- The value handed to the generator as `prompt_lens` is the *end position of
+  the scheduled chunk* (`num_computed_tokens + num_scheduled_tokens`), not the
+  sequence length. The generator processes `tokens[start_pos:prompt_lens]`.
+- A chunk that does not finish the prompt is *intermediate*: its forward writes
+  KV state but emits no token. Those rows are marked in
+  `TTModelInput.intermediate_prefill_mask`, force the step onto host sampling
+  (device sampling would advance device RNG state for them), get a generator
+  clone so the request's RNG does not drift, and report `[]` in the
+  `ModelRunnerOutput` instead of a sampled token.
 
 ### Why TT uses an async-style scheduler even in TT-specific flows
 
@@ -413,7 +445,8 @@ The current TT path is more constrained:
 
 - it treats prefill and decode as separate batch modes
 - it avoids mixed prefill+decode batches
-- it avoids chunked prefill
+- it allows chunked prefill only for model types validated for it, and always
+  on the prefill side of the split
 
 ### 2. Async queueing model
 

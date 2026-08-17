@@ -18,10 +18,14 @@ No device / ttnn execution required.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.utils import torch_utils
+from vllm.v1.sample import sampler as sampler_module
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops import penalties as penalties_module
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -31,6 +35,13 @@ from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 VOCAB = 64
 BLOCK = 16
 MAX_MODEL_LEN = 256
+
+
+@pytest.fixture(autouse=True)
+def _disable_pinned_memory(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    monkeypatch.setattr(sampler_module, "PIN_MEMORY", False)
+    monkeypatch.setattr(penalties_module, "PIN_MEMORY", False)
 
 
 class FirstPromptTokenBoost(AdapterLogitsProcessor):
@@ -168,13 +179,36 @@ def _new_req(req_id, prompt):
     )
 
 
-def _step_output(new_reqs=(), finished=(), plan_rows=None):
+def _step_output(new_reqs=(), finished=(), plan_rows=None, preempted=None, cached=None):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     out = SchedulerOutput.make_empty()
     out.scheduled_new_reqs = list(new_reqs)
     out.finished_req_ids = set(finished)
+    out.preempted_req_ids = None if preempted is None else set(preempted)
+    if cached is not None:
+        out.scheduled_cached_reqs = cached
     return out
+
+
+def _plan(req_id_to_row, *, is_decode=False, capacity=4, num_lanes=1):
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    rows = tuple(sorted(req_id_to_row.values()))
+    per_lane = capacity // num_lanes
+    per_lane_counts = [0] * num_lanes
+    for row in rows:
+        per_lane_counts[row // per_lane] += 1
+    return TTStepPlan(
+        is_decode=is_decode,
+        capacity=capacity,
+        scheduled_req_ids=tuple(sorted(req_id_to_row, key=req_id_to_row.get)),
+        scheduled_rows=rows,
+        input_rows=tuple(range(capacity)) if is_decode else rows,
+        req_id_to_row=dict(req_id_to_row),
+        batch_size_per_dp=tuple(per_lane_counts),
+        prefill_empty_slots=None if is_decode else rows,
+    )
 
 
 def test_apply_step_plan_places_new_requests_and_reports_layout_change():
@@ -241,6 +275,107 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert changed is True
     assert "a" not in requests
     assert b.occupied_rows() == []
+
+
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    batch = _lane_batch(num_lanes=1, per_lane=1)
+    request = _make_req("request", list(range(8)), [], dict(temperature=0.0))
+    row = _add_to_lane(batch, request, lane=0)
+    # Two prompt tokens already computed; this step schedules one more, so the
+    # chunk ends at position 3 while the prompt runs to 8.
+    batch.num_computed_tokens_cpu[row] = 2
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"request": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    plan = TTStepPlan(
+        is_decode=False,
+        capacity=1,
+        scheduled_req_ids=("request",),
+        scheduled_rows=(row,),
+        input_rows=(row,),
+        req_id_to_row={"request": row},
+        batch_size_per_dp=(1,),
+        prefill_empty_slots=(row,),
+    )
+    runner = SimpleNamespace(
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _block_tables_per_layer=lambda _: None,
+        check_perform_device_sampling=lambda **_: True,
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        requests={"request": request},
+    )
+
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+
+    assert model_input.input_positions.tolist() == [2]
+    assert model_input.prompt_lens.tolist() == [3]
+    assert model_input.input_tokens.tolist() == [[0, 1, 2]]
+    assert model_input.intermediate_prefill_mask.tolist() == [True]
+    # An intermediate chunk must not advance device RNG state.
+    assert model_input.perform_device_sampling is False
+
+
+def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
+    from vllm.v1.core.sched.output import CachedRequestData
+
+    b = _lane_batch(num_lanes=1, per_lane=2)
+    requests: dict = {}
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("a", [1]), _new_req("b", [2])]),
+        _plan({"a": 0, "b": 1}, capacity=2),
+        requests,
+        {},
+    )
+    assert b.occupied_rows() == [0, 1]
+
+    # "a" is preempted: the coordinator hands its row back, so the batch must
+    # give the row up in the same step or the next placement would land on a
+    # live occupant. The request state survives -- the resume needs it.
+    changed = b.apply_step_plan(
+        _step_output(preempted=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=2),
+        requests,
+        {},
+    )
+
+    assert changed is True
+    assert "a" in requests
+    assert "a" not in b.req_id_to_index
+    assert b.occupied_rows() == [1]
+
+    # The freed row takes a newcomer without stacking it on the preempted one.
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("c", [3])]),
+        _plan({"c": 0}, capacity=2),
+        requests,
+        {},
+    )
+    assert b.req_id_to_index == {"c": 0, "b": 1}
+
+    # "c" finishes, and "a" resumes into the row it left: the resume re-prefills
+    # from the state kept above, so it never has to look the request up again.
+    resumed = CachedRequestData(
+        req_ids=["a"],
+        resumed_req_ids={"a"},
+        new_token_ids=[[]],
+        all_token_ids={"a": [1]},
+        new_block_ids=[([7],)],
+        num_computed_tokens=[0],
+        num_output_tokens=[0],
+    )
+    b.apply_step_plan(
+        _step_output(finished=["c"], cached=resumed),
+        _plan({"a": 0}, capacity=2),
+        requests,
+        {},
+    )
+    assert b.req_id_to_index == {"a": 0, "b": 1}
+    assert requests["a"].block_ids == ([7],)
 
 
 def test_lane_full_raises():
@@ -475,6 +610,24 @@ def test_merged_sampling_metadata_filters_generators_to_scheduled_rows():
 
     assert set(metadata.generators) == {row4}
     assert metadata.generators[row4] is b.sampling.generators[row4]
+
+
+def test_merged_sampling_metadata_clones_intermediate_generators():
+    # A scheduled intermediate-prefill row must keep its slot in the sampler's
+    # fixed layout without spending one of the request's RNG draws.
+    b = _lane_batch(num_lanes=1, per_lane=1, with_custom=False)
+    row = _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.7), seed=11), 0)
+    generator = b.sampling.generators[row]
+    before = generator.get_state().clone()
+
+    metadata = b.build_merged_sampling_metadata(
+        scheduled_rows=[row], non_sampling_rows=[row]
+    )
+
+    assert metadata.generators[row] is not generator
+    assert torch.equal(metadata.generators[row].get_state(), before)
+    Sampler()(torch.randn(1, VOCAB), metadata)
+    assert torch.equal(generator.get_state(), before)
 
 
 def test_scheduled_seeded_row_isolated_from_unscheduled_random_row():

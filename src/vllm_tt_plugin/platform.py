@@ -23,8 +23,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
-    _run_standard_dp_visible_device_group_discovery,
-    _split_standard_dp_discovery_result,
+    run_standard_dp_visible_device_group_discovery,
+    split_standard_dp_discovery_result,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +45,7 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
+_TT_TOKEN_TILE_SIZE = 32
 
 
 class _MaxModelLenConfig(Protocol):
@@ -59,6 +60,58 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_LLAMA_TEXT_VER": "llama3_70b_galaxy",
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
+
+# HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
+# prefill, i.e. the ones token-chunked prefill has been validated against.
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+
+
+def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
+    """Disable split prefills and restore a full-prompt scheduler budget."""
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+
+    if scheduler_config.enable_chunked_prefill:
+        logger.info(
+            "Chunked prefill is not supported for %s; disabling it.",
+            reason,
+        )
+        scheduler_config.enable_chunked_prefill = False
+
+        # vLLM does this bump silently earlier if chunked prefill is already
+        # disabled and max_num_batched_tokens is not explicitly set. We can't
+        # know if it was specified or the default, hence the warning.
+        max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        max_model_len = model_config.max_model_len
+        if max_num_batched_tokens < max_model_len:
+            logger.warning(
+                "max_num_batched_tokens=%d < max_model_len=%d with chunked "
+                "prefill disabled, bumping max_num_batched_tokens to match.",
+                max_num_batched_tokens,
+                max_model_len,
+            )
+            scheduler_config.max_num_batched_tokens = max_model_len
+
+    # The base scheduler caps a prefill at this threshold before it consults
+    # ``enable_chunked_prefill``, so leaving it nonzero still splits prefills
+    # for a model that cannot resume one.
+    scheduler_config.long_prefill_token_threshold = 0
+
+
+def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
+    """Restrict token-chunked prefill to the model types that support it."""
+    scheduler_config = vllm_config.scheduler_config
+    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+
+    if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
+        # A chunk boundary inside a multimodal item would split its embeddings
+        # from their positions. Only meaningful while prefill can be split, and
+        # vLLM rejects the flag outright when one item exceeds the token budget,
+        # so it stays off for every model type below.
+        scheduler_config.disable_chunked_mm_input = True
+        return
+
+    _disable_chunked_prefill(vllm_config, f"`model_type={model_type}`")
 
 
 def _galaxy_generator_version() -> str | None:
@@ -124,8 +177,7 @@ def _load_standard_dp_visible_groups(
     ``None`` means nothing was stored. An empty list means discovery stored
     nothing usable, which callers must not treat as "keep the inherited value".
     """
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
-
+    additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
         return None
 
@@ -140,7 +192,7 @@ def _load_standard_dp_mesh_grids(
     vllm_config: "VllmConfig",
 ) -> dict[str, tuple[int, int]]:
     """Load stored mesh-grid hints from the vLLM config."""
-    additional_config = getattr(vllm_config, "additional_config", None) or {}
+    additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
         return {}
 
@@ -206,7 +258,7 @@ def _resolve_standard_dp_visible_device_groups(
     mp_ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
     proc = mp_ctx.Process(
-        target=_run_standard_dp_visible_device_group_discovery,
+        target=run_standard_dp_visible_device_group_discovery,
         args=(
             child_conn,
             os.environ.get("MESH_DEVICE"),
@@ -962,27 +1014,7 @@ class TTPlatform(Platform):
                 "CoreEngineLauncher extension required to start tt-run. "
                 "Remove tt.rank_binding/tt.mpi_args and multinode settings."
             )
-        if vllm_config.scheduler_config.enable_chunked_prefill:
-            logger.info("Chunked prefill is not yet supported for TT backend")
-            vllm_config.scheduler_config.enable_chunked_prefill = False
-            # vLLM does this bump silently earlier
-            # if chunked prefill is already disabled,
-            # and max_num_batched_tokens is not explicitly set.
-            # We can't know if it was specified
-            # or the default, hence the warning.
-            if (
-                vllm_config.scheduler_config.max_num_batched_tokens
-                < vllm_config.model_config.max_model_len
-            ):
-                logger.warning(
-                    "max_num_batched_tokens=%d < max_model_len=%d with chunked prefill "
-                    "disabled, bumping max_num_batched_tokens to match.",
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    vllm_config.model_config.max_model_len,
-                )
-                vllm_config.scheduler_config.max_num_batched_tokens = (
-                    vllm_config.model_config.max_model_len
-                )
+        _apply_chunked_prefill_policy(vllm_config)
 
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
@@ -1116,6 +1148,11 @@ class TTPlatform(Platform):
                 "in model_capabilities"
             )
         if is_block_output_model:
+            # Gemma4 autoregressive models support token-chunked prefill, but
+            # block-output models cannot resume a split prompt. Capability wins
+            # over the model-type policy once the output width is known.
+            _disable_chunked_prefill(vllm_config, "block-output models")
+
             # Upstream 0.24 detects diffusion from ``hf_config.canvas_length``.
             # TT block models own their canvas lifecycle, so remove that marker
             # and invalidate the cached property before vLLM selects a model
@@ -1275,7 +1312,7 @@ class TTPlatform(Platform):
                 (
                     cls._standard_dp_visible_device_groups,
                     resolved_mesh_grids,
-                ) = _split_standard_dp_discovery_result(discovery_result)
+                ) = split_standard_dp_discovery_result(discovery_result)
                 if resolved_mesh_grids:
                     cls._standard_dp_mesh_grids = resolved_mesh_grids
                     _store_standard_dp_mesh_grids(vllm_config, resolved_mesh_grids)
@@ -1338,8 +1375,16 @@ class TTPlatform(Platform):
         output_size: int,
         max_model_len: int,
     ) -> int:
-        """Resolve one logical limit and enforce its physical canvas capacity."""
-        remaining = max_model_len - prompt_len
+        """Resolve one logical limit and enforce its aligned physical capacity."""
+        aligned_prompt_len = (
+            (prompt_len + _TT_TOKEN_TILE_SIZE - 1)
+            // _TT_TOKEN_TILE_SIZE
+            * _TT_TOKEN_TILE_SIZE
+        )
+        aligned_max_model_len = (
+            max_model_len // _TT_TOKEN_TILE_SIZE * _TT_TOKEN_TILE_SIZE
+        )
+        remaining = aligned_max_model_len - aligned_prompt_len
         max_tokens = requested_max_tokens
         if max_tokens is None:
             max_tokens = max(0, remaining // output_size * output_size)
@@ -1355,9 +1400,12 @@ class TTPlatform(Platform):
             )
             raise ValueError(
                 "Block output is committed in physical "
-                f"{output_size}-token canvases: prompt length {prompt_len} plus "
+                f"{output_size}-token canvases: prompt length {prompt_len} "
+                f"(aligned to {aligned_prompt_len}) plus "
                 f"{request_limit} requires {physical_output_tokens} physical "
-                f"output tokens, exceeding max_model_len={max_model_len}. "
+                "output tokens, exceeding aligned "
+                f"max_model_len={aligned_max_model_len} "
+                f"(configured {max_model_len}). "
                 "Reduce max_tokens or use a shorter prompt."
             )
         return max_tokens

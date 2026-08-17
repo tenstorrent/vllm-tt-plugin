@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-"""DP discovery utilities to support upstream vLLM's standard multi-process DP mode."""
+"""Spawn-safe topology discovery for vLLM standard multi-process DP."""
+
+__all__ = (
+    "format_tt_visible_devices",
+    "parse_mesh_grid",
+    "run_standard_dp_visible_device_group_discovery",
+    "split_standard_dp_discovery_result",
+    "StandardDPAssignmentT",
+)
 
 import ast
 import logging
+from collections.abc import Sequence
 from contextlib import suppress
 
 logger = logging.getLogger(__name__)
@@ -26,7 +35,7 @@ _MESH_GRID_PRESETS = {
 }
 
 
-def _parse_mesh_grid(
+def parse_mesh_grid(
     mesh_device_env: str | None,
     num_devices_available: int,
     *,
@@ -36,9 +45,9 @@ def _parse_mesh_grid(
 
     Examples
     --------
-    >>> _parse_mesh_grid("T3K", 8, tg_mesh_grid=(4, 8))
+    >>> parse_mesh_grid("T3K", 8, tg_mesh_grid=(4, 8))
     (1, 8)
-    >>> _parse_mesh_grid("(2, 4)", 8, tg_mesh_grid=(4, 8))
+    >>> parse_mesh_grid("(2, 4)", 8, tg_mesh_grid=(4, 8))
     (2, 4)
     """
     mesh_grid_dict = dict(_MESH_GRID_PRESETS)
@@ -77,7 +86,7 @@ def _resolve_parent_mesh_grid(
     >>> _resolve_parent_mesh_grid("T3K", 8)
     (1, 8)
     """
-    mesh_grid = _parse_mesh_grid(
+    mesh_grid = parse_mesh_grid(
         mesh_device_env,
         num_devices_available,
         tg_mesh_grid=(4, 8),
@@ -135,16 +144,16 @@ def _maybe_reorder_standard_dp_visible_device_groups(
     return device_groups
 
 
-def _split_standard_dp_discovery_result(
+def split_standard_dp_discovery_result(
     discovery_result: list[str] | list[StandardDPAssignmentT] | None,
 ) -> tuple[list[str] | None, dict[str, tuple[int, int]]]:
     """Splits discovery output into visible-device and mesh-grid views.
 
     Examples
     --------
-    >>> _split_standard_dp_discovery_result(None)
+    >>> split_standard_dp_discovery_result(None)
     (None, {})
-    >>> _split_standard_dp_discovery_result([("0,1", (1, 2))])
+    >>> split_standard_dp_discovery_result([("0,1", (1, 2))])
     (["0,1"], {"0,1": (1, 2)})
     """
     if discovery_result is None:
@@ -202,7 +211,7 @@ def _discover_standard_dp_visible_device_groups(
                 raise RuntimeError(f"TT DP rank {dp_rank} resolved to an empty submesh")
             device_groups.append(
                 (
-                    ",".join(str(device_id) for device_id in device_ids),
+                    format_tt_visible_devices(device_ids),
                     tuple(int(dim) for dim in submesh.shape),
                 )
             )
@@ -232,7 +241,12 @@ def _discover_standard_dp_visible_device_groups(
                 ttnn.close_mesh_device(mesh_device)
 
 
-def _run_standard_dp_visible_device_group_discovery(
+def format_tt_visible_devices(device_ids: Sequence[int | str]) -> str:
+    """Serialize device identifiers for ``TT_VISIBLE_DEVICES``."""
+    return ",".join(str(device_id) for device_id in device_ids)
+
+
+def run_standard_dp_visible_device_group_discovery(
     conn,
     mesh_device_env: str | None,
     data_parallel_size: int,

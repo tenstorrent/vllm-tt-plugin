@@ -50,9 +50,9 @@ def test_gemma4_parser_registration_is_unchanged_and_diffusion_uses_upstream():
     assert ReasoningParserManager.get_reasoning_parser(
         "diffusion_gemma"
     ).__module__.startswith("vllm.")
-    assert ToolParserManager.get_tool_parser(
-        "diffusion_gemma"
-    ).__module__.startswith("vllm.")
+    assert ToolParserManager.get_tool_parser("diffusion_gemma").__module__.startswith(
+        "vllm."
+    )
 
 
 def test_diffusion_gemma_registers_upstream_parser_aliases(monkeypatch):

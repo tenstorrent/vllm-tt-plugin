@@ -56,7 +56,10 @@ from vllm_tt_plugin.platform import (
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
-from vllm_tt_plugin.utils.dp_discovery import _parse_mesh_grid
+from vllm_tt_plugin.utils.dp_discovery import (
+    format_tt_visible_devices,
+    parse_mesh_grid,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -73,33 +76,28 @@ register_tt_models(register_test_models=_should_pre_register_tt_test_models_from
 def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
     """Bind ``TT_VISIBLE_DEVICES`` to this rank's device group.
 
-    As of vLLM v0.24, ``set_assigned_physical_gpu_ids_for_dp_rank`` writes
-    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a per-rank
-    env var. tt-metal reads only the env var, so the worker materializes it here;
-    otherwise every rank keeps the launcher's value and they share chips.
+    As of vLLM v0.24, the engine-core launcher writes
+    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a
+    per-rank env var. tt-metal reads only the env var, so the worker
+    materializes it here; otherwise every rank keeps the launcher's value and
+    they share chips.
 
-    Discovery's stored groups are the fallback. MPI launches populate neither and
-    keep the inherited value.
+    Standard-DP discovery owns the rank-to-submesh topology. A nonempty
+    assignment must agree with the discovered group for the local rank. MPI
+    launches populate neither and keep the inherited value.
 
     Raises:
-        RuntimeError: the fallback holds no group for this rank.
+        RuntimeError: discovery holds no group for this rank or an assignment
+            conflicts with its discovered group.
     """
     parallel_config = vllm_config.parallel_config
     # Absent on the fork vLLM that the explicit MPI launcher targets.
     assigned_physical_gpu_ids = getattr(
         parallel_config, "assigned_physical_gpu_ids", None
     )
+    groups = _load_standard_dp_visible_groups(vllm_config)
 
-    if assigned_physical_gpu_ids:
-        visible_devices = ",".join(str(d) for d in assigned_physical_gpu_ids)
-    else:
-        groups = _load_standard_dp_visible_groups(vllm_config)
-        if groups is None:
-            return
-
-        # Index the fallback the way upstream indexes the primary channel:
-        # device_id_to_physical_device_id(local_dp_rank) at world_size 1. Local
-        # equals global because discovery only runs on a single host.
+    if groups is not None:
         local_dp_rank = parallel_config.data_parallel_rank_local
         if local_dp_rank is None or not 0 <= local_dp_rank < len(groups):
             raise RuntimeError(
@@ -109,6 +107,21 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
             )
 
         visible_devices = groups[local_dp_rank]
+        if assigned_physical_gpu_ids:
+            assigned_visible_devices = format_tt_visible_devices(
+                assigned_physical_gpu_ids
+            )
+            if assigned_visible_devices != visible_devices:
+                raise RuntimeError(
+                    "TT standard-DP assignment conflicts with discovery: "
+                    f"local DP rank {local_dp_rank} was assigned "
+                    f"{assigned_visible_devices!r}, but discovery requires "
+                    f"{visible_devices!r}."
+                )
+    elif assigned_physical_gpu_ids:
+        visible_devices = format_tt_visible_devices(assigned_physical_gpu_ids)
+    else:
+        return
 
     evar = TTPlatform.device_control_env_var
     inherited = os.environ.get(evar)
@@ -128,7 +141,7 @@ def _resolve_mesh_grid(
     num_devices_available: int,
     visible_devices_env: str | None,
 ) -> tuple[int, int]:
-    mesh_grid = _parse_mesh_grid(
+    mesh_grid = parse_mesh_grid(
         mesh_device_env,
         num_devices_available,
         tg_mesh_grid=(8, 4),
