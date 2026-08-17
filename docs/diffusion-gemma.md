@@ -27,9 +27,6 @@ Run from the paired tt-metal checkout so the registered model target under
 export PYTHONPATH=/path/to/tt-metal
 export MESH_DEVICE=P150x4
 export VLLM_RPC_TIMEOUT=1800000
-export DG_UPFRONT_CAPTURE=1
-export DG_VLLM_GUMBEL_MODE=device
-export DG_DENOISE_REVEAL_PMAX=262144
 export DG_UPFRONT_PREFILL_WARMUP_LENS=32,64,96
 export DG_TRACE_REGION_SIZE=3758096384
 
@@ -55,17 +52,16 @@ calling add `--enable-auto-tool-choice --tool-call-parser gemma4`.
 `--max-num-batched-tokens` concerns scheduler prompt admission. It does not
 disable DiffusionGemma's model-internal ragged and chunked prompt processing.
 The `DG_TRACE_REGION_SIZE` environment value must match
-`tt.trace_region_size`; the values above are the P300X2 release configuration
-validated by tt-shield. If the served context or expected aligned prompt
-lengths change, update `DG_DENOISE_REVEAL_PMAX` and
-`DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly.
+`tt.trace_region_size`; the values above are the QB2 (`MESH_DEVICE=P150x4`)
+release configuration validated by tt-shield. If the expected aligned prompt
+lengths change, update `DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly.
 
 ## Request Contract
 
 Current support is synchronous, DP=1, one active sequence, on-device sampling
 for all model calls, and no vLLM automatic prefix caching or scheduler chunked
-prefill. Async scheduling, structured output, vLLM logprobs, host sampling,
-custom logits processors, and multiple responses are rejected.
+prefill. Async scheduling, host sampling, and custom logits processors are
+rejected at launch; unsupported per-request controls are listed below.
 
 HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 
@@ -74,12 +70,11 @@ HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 - presence, frequency, and repetition penalties
 
 The model-owned denoise loop always uses its internal temperature schedule and
-Gumbel sampler, so these fields do not alter generation. The plugin neutralizes
-them on the per-request `SamplingParams` clone after vLLM admits the request;
-the caller-owned object is never modified. Response-contract
-controls such as `n>1`, logprobs, structured outputs, bad words, logit bias,
-allowed token IDs, nonzero minimum tokens, and custom sampling `extra_args`
-remain rejected before EngineCore.
+Gumbel sampler, so these fields do not alter generation. The plugin ignores
+them and logs a one-time warning. Controls that would change the response
+contract, such as `n>1`, logprobs, structured outputs, bad words, logit bias,
+allowed token IDs, nonzero minimum tokens, and custom sampling `extra_args`,
+are rejected.
 
 Physical admission rounds the prompt to a TT tile, rounds the configured limit
 down to a TT tile, and rounds logical output up to complete canvases:
@@ -111,10 +106,8 @@ Do not report autoregressive TPOT for this model.
 
 ## Current Limitations
 
-- One request at a time (`max_num_seqs=1`) and DP=1.
-- No generic async block scheduling or preemption overlap.
-- No vLLM APC, scheduler chunked prefill, speculative decoding, or host-side
-  sampling controls.
+- The serving constraints in [Request Contract](#request-contract) apply;
+  speculative decoding and preemption overlap are additionally unsupported.
 - A running block request prevents forced prefix-cache reset; finish or abort
   it first. A deferred `pause_generation(mode="keep")` reset returns `False`
   without preempting the request.

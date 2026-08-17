@@ -21,8 +21,8 @@ The current TT path is more specialized than upstream vLLM:
 - A TT step is treated as either all-prefill or all-decode.
 - TT does not support mixed prefill+decode batches.
 - Token-chunked prefill is supported, but only for model types whose tt-metal
-  generator can resume a prefill; a chunk continuation is prefill work and only
-  ever runs in a prefill step.
+  generator can resume a prefill (never for block-output models); a chunk
+  continuation is prefill work and only ever runs in a prefill step.
 - CPU-device work overlap is a decode optimization.
 - Standard multi-process DP runs independent per-rank engines.
 - Single-process lane-DP coordinates lanes within one process and executes one
@@ -107,7 +107,8 @@ choice depends on:
 
 vLLM normally enables async scheduling when the configuration is compatible.
 The TT platform turns it off when the selected model does not declare
-`supports_async_decode`.
+`supports_async_decode`. Block-output models are stricter: the platform
+refuses to start unless `--no-async-scheduling` is passed.
 
 With standard DP there is no global prefill/decode decision. One rank can run
 prefill while another runs decode.
@@ -157,7 +158,8 @@ The reason for this policy is simple: TT wants a homogeneous batch type per
 step.
 
 At configuration time the platform turns requested chunked prefill off for
-every model type whose tt-metal generator cannot resume a prefill, and zeroes
+every model type whose tt-metal generator cannot resume a prefill — and for
+every block-output model, which cannot resume a split prompt — and zeroes
 `long_prefill_token_threshold` (the base scheduler applies that cap before it
 consults `enable_chunked_prefill`, so leaving it set would still split a
 prefill). When chunked prefill is off and `max_num_batched_tokens` is smaller
@@ -186,10 +188,9 @@ Two things follow for the TT execution path:
 
 ### Block-output reservation
 
-Output placeholders have two independent users. Async autoregressive decode
-uses lookahead placeholders so the next token can be scheduled before the
-previous result is applied on the host. A synchronous block-output model uses
-the same accounting mechanism to reserve one complete output block even though
+Output placeholders (see "Why TT uses an async-style scheduler even in
+TT-specific flows" below) have a second user: a synchronous block-output model
+reserves one complete output block through the same accounting, even though
 there is no decode lookahead.
 
 When `output_tokens_per_step > 1`, the base scheduler reserves its normal
