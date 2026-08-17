@@ -44,8 +44,21 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.24.0` from source with
+The installation script builds vLLM `0.25.1` from source with
 `VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
+
+### Unsupported on upstream vLLM
+
+- **Multi-host MPI data parallelism** (`tt.rank_binding`, `tt.mpi_args`,
+  `--nnodes > 1`). It needs an engine-core launcher hook
+  (`ParallelConfig.engine_core_launcher_cls` and
+  `vllm.v1.engine.utils.CoreEngineLauncher`) that upstream vLLM does not define.
+  Requesting it raises `NotImplementedError` rather than silently
+  single-hosting the run. Single-host data parallelism is unaffected.
+- **vLLM's V2 model runner.** The plugin implements only the V1 model-runner
+  contract and pins `VLLM_USE_V2_MODEL_RUNNER=0`; setting it to `1` is refused.
+  Under V2 the scheduler reports preemption-resumed requests differently, and
+  honoring it would silently drop generated tokens on resume.
 
 ## Environment Setup
 

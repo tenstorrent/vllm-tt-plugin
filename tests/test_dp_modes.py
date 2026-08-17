@@ -87,22 +87,20 @@ class TestDPModes:
 
         assert worker_instance.model_config.max_model_len == 131_072
 
-    def test_upstream_dp_engine_core_is_default(
+    def test_engine_core_classes_are_left_to_upstream(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
+        # ``ParallelConfig`` accepts arbitrary attribute writes, so naming an
+        # engine-core class upstream does not define reads as configuration but
+        # does nothing. The plugin selects a worker and a scheduler; engine-core
+        # selection is upstream's.
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
-        assert (
-            vllm_config.parallel_config.engine_core_cls
-            == "vllm.v1.engine.core.EngineCore"
-        )
-        assert (
-            vllm_config.parallel_config.engine_core_proc_cls
-            == "vllm.v1.engine.core.EngineCoreProc"
-        )
+        assert not hasattr(vllm_config.parallel_config, "engine_core_cls")
+        assert not hasattr(vllm_config.parallel_config, "engine_core_proc_cls")
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
@@ -119,14 +117,8 @@ class TestDPModes:
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
-        assert (
-            vllm_config.parallel_config.engine_core_cls
-            == "vllm.v1.engine.core.EngineCore"
-        )
-        assert (
-            vllm_config.parallel_config.engine_core_proc_cls
-            == "vllm.v1.engine.core.EngineCoreProc"
-        )
+        assert not hasattr(vllm_config.parallel_config, "engine_core_cls")
+        assert not hasattr(vllm_config.parallel_config, "engine_core_proc_cls")
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
@@ -150,7 +142,7 @@ class TestDPModes:
         assert warmup_calls == ["warmup"]
         assert timings.language_model >= 0.0
 
-    def test_single_host_standard_dp_uses_upstream_launcher(
+    def test_single_host_standard_dp_leaves_the_launcher_to_upstream(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
@@ -165,10 +157,7 @@ class TestDPModes:
             visible_device_groups=["24,25", "26,27", "3,2", "1,0"],
         )
 
-        assert (
-            vllm_config.parallel_config.engine_core_launcher_cls
-            == "vllm.v1.engine.utils.CoreEngineLauncher"
-        )
+        assert not hasattr(vllm_config.parallel_config, "engine_core_launcher_cls")
         assert TTPlatform._standard_dp_visible_device_groups == [
             "24,25",
             "26,27",
@@ -176,13 +165,31 @@ class TestDPModes:
             "1,0",
         ]
 
-    def test_rank_binding_keeps_tt_launcher(
+    def test_rank_binding_is_rejected_without_the_launcher_hook(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        # Upstream vLLM defines no ``engine_core_launcher_cls``, and writing one
+        # anyway is silently ignored, which would quietly single-host a run the
+        # user asked to spread over several nodes.
+        vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.additional_config = {
+            "tt": {"rank_binding": "/tmp/rank_binding.yaml"}
+        }
+
+        with pytest.raises(NotImplementedError, match="engine-core launcher hook"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+    def test_rank_binding_selects_the_tt_launcher_when_the_hook_exists(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
         vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.parallel_config.engine_core_launcher_cls = "auto"
         vllm_config.additional_config = {
             "tt": {"rank_binding": "/tmp/rank_binding.yaml"}
         }
