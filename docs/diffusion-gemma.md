@@ -40,12 +40,15 @@ python -m vllm.entrypoints.openai.api_server \
   --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
   --no-async-scheduling \
-  --reasoning-parser gemma4 \
+  --reasoning-parser diffusion_gemma \
   --additional-config '{"tt":{"sample_on_device_mode":"all","enable_model_warmup":true,"trace_mode":"all"}}'
 ```
 
-Reasoning and tool-call parsing use the plugin's existing `gemma4` parsers.
-For tool calling add `--enable-auto-tool-choice --tool-call-parser gemma4`.
+The `diffusion_gemma` parser names alias the engine-based Gemma4 parsers that
+ship with vLLM 0.24. This keeps block-serving parsing on the upstream state
+machine while leaving the plugin's existing `gemma4` parsers unchanged for
+autoregressive Gemma 4 serving. For tool calling add
+`--enable-auto-tool-choice --tool-call-parser diffusion_gemma`.
 
 `--max-num-batched-tokens` concerns scheduler prompt admission. It does not
 disable DiffusionGemma's model-internal ragged and chunked prompt processing.

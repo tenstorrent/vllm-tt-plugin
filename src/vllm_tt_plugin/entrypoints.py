@@ -22,6 +22,10 @@ def _register_tt_reasoning_parsers() -> None:
     carries over unchanged when switching to upstream vLLM. Registered lazily so
     the parser module is only imported when ``--reasoning-parser`` selects it.
 
+    ``gemma4`` keeps the plugin parser so autoregressive Gemma 4 serving is
+    unchanged. ``diffusion_gemma`` aliases the engine-based Gemma4 parser that
+    ships with vLLM 0.24 so block serving uses the upstream parser without
+    changing the existing ``gemma4`` behavior.
     """
     from vllm.reasoning import ReasoningParserManager
 
@@ -29,6 +33,11 @@ def _register_tt_reasoning_parsers() -> None:
         "gemma4",
         "vllm_tt_plugin.gemma4_reasoning_parser",
         "Gemma4ReasoningParser",
+    )
+    ReasoningParserManager.register_lazy_module(
+        "diffusion_gemma",
+        "vllm.reasoning.gemma4_engine_reasoning_parser",
+        "Gemma4ParserReasoningAdapter",
     )
 
 
@@ -39,6 +48,8 @@ def _register_tt_tool_parsers() -> None:
     carries over unchanged when switching to upstream vLLM. Registered lazily so
     the parser module is only imported when ``--tool-call-parser`` selects it.
 
+    ``gemma4`` keeps the plugin parser; ``diffusion_gemma`` aliases vLLM 0.24's
+    engine-based Gemma4 tool parser (see ``_register_tt_reasoning_parsers``).
     """
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
@@ -46,6 +57,11 @@ def _register_tt_tool_parsers() -> None:
         "gemma4",
         "vllm_tt_plugin.gemma4_tool_parser",
         "Gemma4ToolParser",
+    )
+    ToolParserManager.register_lazy_module(
+        "diffusion_gemma",
+        "vllm.tool_parsers.gemma4_engine_tool_parser",
+        "Gemma4EngineToolParser",
     )
 
 

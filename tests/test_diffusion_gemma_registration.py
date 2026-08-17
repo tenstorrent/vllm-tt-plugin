@@ -32,7 +32,7 @@ def test_diffusion_gemma_model_architecture_aliases(monkeypatch):
         assert registered[arch] == expected_target
 
 
-def test_gemma4_parser_registration_is_unchanged():
+def test_gemma4_parser_registration_is_unchanged_and_diffusion_uses_upstream():
     from vllm.reasoning import ReasoningParserManager
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
@@ -47,9 +47,15 @@ def test_gemma4_parser_registration_is_unchanged():
         ToolParserManager.get_tool_parser("gemma4").__module__
         == "vllm_tt_plugin.gemma4_tool_parser"
     )
+    assert ReasoningParserManager.get_reasoning_parser(
+        "diffusion_gemma"
+    ).__module__.startswith("vllm.")
+    assert ToolParserManager.get_tool_parser(
+        "diffusion_gemma"
+    ).__module__.startswith("vllm.")
 
 
-def test_diffusion_gemma_does_not_add_parser_aliases(monkeypatch):
+def test_diffusion_gemma_registers_upstream_parser_aliases(monkeypatch):
     from vllm.reasoning import ReasoningParserManager
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 
@@ -74,12 +80,22 @@ def test_diffusion_gemma_does_not_add_parser_aliases(monkeypatch):
             "gemma4",
             "vllm_tt_plugin.gemma4_reasoning_parser",
             "Gemma4ReasoningParser",
-        )
+        ),
+        (
+            "diffusion_gemma",
+            "vllm.reasoning.gemma4_engine_reasoning_parser",
+            "Gemma4ParserReasoningAdapter",
+        ),
     ]
     assert tool_registrations == [
         (
             "gemma4",
             "vllm_tt_plugin.gemma4_tool_parser",
             "Gemma4ToolParser",
-        )
+        ),
+        (
+            "diffusion_gemma",
+            "vllm.tool_parsers.gemma4_engine_tool_parser",
+            "Gemma4EngineToolParser",
+        ),
     ]
