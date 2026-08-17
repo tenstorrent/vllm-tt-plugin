@@ -108,8 +108,10 @@ Do not report autoregressive TPOT for this model.
 
 - The serving constraints in [Request Contract](#request-contract) apply;
   speculative decoding and preemption overlap are additionally unsupported.
-- A running block request prevents forced prefix-cache reset; finish or abort
-  it first. A deferred `pause_generation(mode="keep")` reset returns `False`
-  without preempting the request.
+- A forced prefix-cache reset aborts running block requests instead of
+  resuming them: a half-generated canvas cannot resume, so the engine finishes
+  those requests with an abort before resetting. A deferred
+  `pause_generation(mode="keep")` reset returns `False` without touching the
+  retained requests.
 - Device server validation requires the paired tt-metal checkout and model
   artifacts. Host plugin tests do not prove model correctness or performance.

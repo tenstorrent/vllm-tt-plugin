@@ -222,7 +222,13 @@ class TTScheduler(AsyncScheduler):
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        """Avoid a stale-canvas resume that vLLM's AR reset cannot represent."""
+        """Backstop against a stale-canvas resume vLLM's AR reset cannot represent.
+
+        The engine layer (``_install_block_output_reset_abort_patch``) aborts
+        running block requests and notifies their clients before delegating,
+        so a reset requested through ``EngineCore`` succeeds. Reaching this
+        guard with live block requests means a caller bypassed that layer.
+        """
         if self._is_block_output_model and reset_running_requests and self.running:
             message = (
                 "Cannot reset prefix cache while a block-output request is "

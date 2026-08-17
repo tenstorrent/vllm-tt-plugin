@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -191,6 +192,8 @@ def test_eos_trims_canvas_and_consumes_physical_reservation():
 
 
 def test_running_block_request_rejects_prefix_cache_reset():
+    # Direct scheduler-level backstop: the engine-layer patch aborts running
+    # block requests first, so reaching this guard means it was bypassed.
     scheduler = _scheduler()
     request = _request(CANVAS * 2)
     scheduler.add_request(request)
@@ -204,6 +207,56 @@ def test_running_block_request_rejects_prefix_cache_reset():
         )
     assert scheduler.running == [request]
     assert request.status == RequestStatus.RUNNING
+
+
+def _patched_engine(scheduler: TTScheduler, sent: list) -> SimpleNamespace:
+    from vllm_tt_plugin.platform import _install_block_output_reset_abort_patch
+
+    _install_block_output_reset_abort_patch()
+    return SimpleNamespace(scheduler=scheduler, _send_abort_outputs=sent.append)
+
+
+def test_engine_level_reset_aborts_running_block_requests():
+    from vllm.v1.engine.core import EngineCore
+
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    sent: list = []
+    engine = _patched_engine(scheduler, sent)
+
+    assert (
+        EngineCore.reset_prefix_cache(
+            engine, reset_running_requests=True, reset_connector=False
+        )
+        is True
+    )
+    assert scheduler.running == []
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    assert sent == [[("req-0", 0)]]
+
+
+def test_engine_level_keep_pause_reset_preserves_block_requests():
+    from vllm.v1.engine.core import EngineCore
+
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    sent: list = []
+    engine = _patched_engine(scheduler, sent)
+
+    assert (
+        EngineCore.reset_prefix_cache(
+            engine, reset_running_requests=True, reset_connector=False
+        )
+        is False
+    )
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
+    assert sent == []
 
 
 def test_deferred_keep_reset_returns_false_without_preempting_block_request():
