@@ -605,14 +605,32 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
         if resolved_kv_tokens < required_kv_tokens:
-            raise ValueError(
-                "Block-output KV budget is too small: resolved "
-                f"{resolved_kv_tokens} tokens, but max_model_len="
-                f"{model_config.max_model_len} plus output_tokens_per_step="
-                f"{output_tokens_per_step} requires at least "
-                f"{required_kv_tokens}. Fix the model's "
-                "get_max_tokens_all_users budget."
-            )
+            fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
+            if (
+                getattr(model_config, "original_max_model_len", None) == -1
+                and fitted_max_model_len >= output_tokens_per_step
+            ):
+                # ``--max-model-len -1``: upstream's auto-fit only runs after
+                # this budget is reported, so fit here where the TT pool is
+                # known, keeping one full output canvas of headroom. The engine
+                # snapshots max_model_len after this call, so the fitted value
+                # reaches the workers and the frontend ready-response sync.
+                logger.info(
+                    "Auto-fitting block-output max_model_len from %d to %d so "
+                    "the KV budget covers one full output canvas.",
+                    model_config.max_model_len,
+                    fitted_max_model_len,
+                )
+                model_config.max_model_len = fitted_max_model_len
+            else:
+                raise ValueError(
+                    "Block-output KV budget is too small: resolved "
+                    f"{resolved_kv_tokens} tokens, but max_model_len="
+                    f"{model_config.max_model_len} plus output_tokens_per_step="
+                    f"{output_tokens_per_step} requires at least "
+                    f"{required_kv_tokens}. Fix the model's "
+                    "get_max_tokens_all_users budget."
+                )
 
     return num_tt_blocks
 

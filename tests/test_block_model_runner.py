@@ -182,3 +182,121 @@ def test_worker_wrapper_shutdown_releases_persistent_capture_once():
 
     wrapper.shutdown()
     assert releases == ["released"]
+
+
+# --------------------------------------------------------------------------
+# K>1 device-sampling extraction (_get_output_tokens)
+# --------------------------------------------------------------------------
+
+
+def _extraction_runner(width: int):
+    return SimpleNamespace(
+        _output_tokens_per_step=width,
+        _is_block_output_model=width > 1,
+        tt_per_lane_max_num_seqs=1,
+    )
+
+
+def _extraction_input(*, enable_log_probs: bool = False):
+    sampling_params = SimpleNamespace(
+        enable_log_probs=torch.tensor([enable_log_probs]),
+    )
+    model_input = SimpleNamespace(
+        intermediate_prefill_mask=None,
+        max_num_logprobs=[None],
+    )
+    return sampling_params, model_input
+
+
+def test_get_output_tokens_extracts_full_canvas_per_request():
+    runner = _extraction_runner(4)
+    sampling_params, model_input = _extraction_input()
+    tt_out = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+
+    sampled, logprobs = TTModelRunner._get_output_tokens(
+        runner,
+        tt_out,
+        None,
+        sampling_params,
+        model_input,
+        [1],
+        perform_device_sampling=True,
+        is_decode=False,
+    )
+
+    assert len(sampled) == 1
+    assert sampled[0].shape == (1, 4)
+    assert sampled[0][0].tolist() == [0, 1, 2, 3]
+    assert logprobs == [None]
+
+
+def test_get_output_tokens_rejects_wrong_canvas_width():
+    runner = _extraction_runner(4)
+    sampling_params, model_input = _extraction_input()
+    tt_out = torch.zeros((1, 3), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="violates output_tokens_per_step"):
+        TTModelRunner._get_output_tokens(
+            runner,
+            tt_out,
+            None,
+            sampling_params,
+            model_input,
+            [1],
+            perform_device_sampling=True,
+            is_decode=False,
+        )
+
+
+def test_get_output_tokens_empty_rank_keeps_canvas_width():
+    runner = _extraction_runner(4)
+    sampling_params, model_input = _extraction_input()
+
+    sampled, logprobs = TTModelRunner._get_output_tokens(
+        runner,
+        torch.zeros((0,), dtype=torch.int32),
+        None,
+        sampling_params,
+        model_input,
+        [0],
+        perform_device_sampling=True,
+        is_decode=True,
+    )
+
+    assert sampled[0].shape == (0, 4)
+    assert logprobs == [None]
+
+
+def test_get_output_tokens_rejects_host_sampling_for_block_models():
+    runner = _extraction_runner(4)
+    sampling_params, model_input = _extraction_input()
+
+    with pytest.raises(ValueError, match="host sampling cannot construct"):
+        TTModelRunner._get_output_tokens(
+            runner,
+            torch.zeros((1, 1, 8), dtype=torch.float32),
+            None,
+            sampling_params,
+            model_input,
+            [1],
+            perform_device_sampling=False,
+            is_decode=True,
+        )
+
+
+def test_get_output_tokens_rejects_device_logprobs_for_block_models():
+    runner = _extraction_runner(4)
+    sampling_params, model_input = _extraction_input(enable_log_probs=True)
+    tt_out = torch.zeros((1, 4), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="one output token per step"):
+        TTModelRunner._get_output_tokens(
+            runner,
+            tt_out,
+            None,
+            sampling_params,
+            model_input,
+            [1],
+            perform_device_sampling=True,
+            is_decode=False,
+        )

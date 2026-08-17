@@ -21,14 +21,6 @@ def _warning_once(self: logging.Logger, msg: str, *args, **_kwargs) -> None:
     _log_once(self, logging.WARNING, msg, args)
 
 
-def _info_once(self: logging.Logger, msg: str, *args, **_kwargs) -> None:
-    _log_once(self, logging.INFO, msg, args)
-
-
-def _debug_once(self: logging.Logger, msg: str, *args, **_kwargs) -> None:
-    _log_once(self, logging.DEBUG, msg, args)
-
-
 class _TTFileTag(logging.Filter):
     """Marks records so TT lines are distinguishable in vLLM's output."""
 
@@ -55,14 +47,10 @@ def init_tt_logger(name: str) -> logging.Logger:
     )
     if not any(isinstance(f, _TTFileTag) for f in logger.filters):
         logger.addFilter(_TTFileTag())
-    # vLLM patches warning_once/info_once/debug_once per instance in
-    # init_logger; this stdlib logger needs its own so *_once call sites work
-    # on every model. Guard each method independently: another library (e.g.
-    # transformers) may have already supplied a subset on logging.Logger.
+    # vLLM patches warning_once per instance in init_logger; this stdlib
+    # logger needs its own so warning_once call sites work on every model.
+    # Guarded: another library (e.g. transformers) may have already supplied
+    # it on logging.Logger.
     if not hasattr(logger, "warning_once"):
         logger.warning_once = MethodType(_warning_once, logger)
-    if not hasattr(logger, "info_once"):
-        logger.info_once = MethodType(_info_once, logger)
-    if not hasattr(logger, "debug_once"):
-        logger.debug_once = MethodType(_debug_once, logger)
     return logger

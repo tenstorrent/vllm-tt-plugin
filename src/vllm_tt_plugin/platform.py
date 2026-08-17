@@ -1233,7 +1233,6 @@ class TTPlatform(Platform):
                     "Block-output models currently support synchronous serving "
                     "only; launch with --no-async-scheduling"
                 )
-            vllm_config.scheduler_config.long_prefill_token_threshold = 0
             if model_config.generation_config == "auto":
                 logger.info(
                     "Block-output model owns generation defaults; normalizing "

@@ -9,6 +9,7 @@ fake runner/model collaborators. Lane-specific input/output shaping lives on
 environment because importing the plugin modules pulls in ttnn.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,7 @@ from vllm_tt_plugin.async_decode import (
     TTDecodeSubmission,
     TTFinalizedDecode,
 )
-from vllm_tt_plugin.input_batch import TTLaneInputBatch
+from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL, TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -358,13 +359,59 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
     assert captured["empty_slots"] == [4]
 
 
-def test_submit_decode_forwards_computed_slot_remap_to_model():
+def test_submit_decode_omits_slot_remap_for_host_sampling():
+    captured = {}
+
+    class RigidModel:
+        # Mirrors legacy host-sampled generators (e.g. Qwen2.5-VL) whose
+        # decode_forward has a fixed signature: an unexpected ``slot_remap``
+        # kwarg would raise TypeError here.
+        def decode_forward(
+            self,
+            tokens,
+            page_table,
+            kv_cache,
+            start_pos,
+            enable_trace,
+            read_from_device,
+        ):
+            captured["called"] = True
+            return torch.zeros((1, 1))
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        request_specific_rope=False,
+        trace_mode="none",
+        model=RigidModel(),
+    )
+    controller = TTAsyncDecodeController(runner)
+    model_input = SimpleNamespace(
+        unpadded_batch_size=1,
+        tt_sampling_params=None,
+        perform_device_sampling=False,
+        input_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        input_positions=torch.zeros((1,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        slot_remap=torch.tensor([3, 1, 2, 0], dtype=torch.int32),
+    )
+
+    controller.submit_decode(model_input, read_from_device=True)
+
+    assert captured["called"]
+
+
+def test_submit_decode_forwards_slot_remap_with_device_sampling():
     captured = {}
 
     class FakeModel:
         def decode_forward(self, *, slot_remap, **kwargs):
             captured["slot_remap"] = slot_remap
             return torch.zeros((1, 1))
+
+    @dataclass
+    class FakeSamplingParams:
+        seed: torch.Tensor | None
 
     runner = SimpleNamespace(
         kv_caches=object(),
@@ -376,12 +423,14 @@ def test_submit_decode_forwards_computed_slot_remap_to_model():
     slot_remap = torch.tensor([3, 1, 2, 0], dtype=torch.int32)
     model_input = SimpleNamespace(
         unpadded_batch_size=1,
-        tt_sampling_params=None,
-        perform_device_sampling=False,
+        tt_sampling_params=FakeSamplingParams(seed=torch.tensor([SEED_NONE_SENTINEL])),
+        perform_device_sampling=True,
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
         block_tables=torch.zeros((1, 1), dtype=torch.int32),
         input_positions=torch.zeros((1,), dtype=torch.int32),
         block_tables_per_layer=None,
+        prompt_tokens=None,
+        reset_batch=False,
         slot_remap=slot_remap,
     )
 

@@ -145,6 +145,7 @@ def test_block_output_rejects_fallback_budget_below_served_length(cfg):
     from vllm_tt_plugin.worker import get_num_available_blocks_tt
 
     cfg.model_config.max_model_len = 200_000
+    cfg.model_config.original_max_model_len = 200_000
     cfg.scheduler_config.max_num_seqs = 1
     tt_config.store_tt_output_tokens_per_step(cfg, 256)
 
@@ -154,6 +155,31 @@ def test_block_output_rejects_fallback_budget_below_served_length(cfg):
         pytest.raises(ValueError, match="Block-output KV budget is too small"),
     ):
         get_num_available_blocks_tt(cfg)
+
+
+def test_block_output_auto_fit_shrinks_max_model_len_instead_of_raising(cfg):
+    """``--max-model-len -1`` must not die on the pre-auto-fit budget check.
+
+    Upstream's ``_auto_fit_max_model_len`` only runs after
+    ``determine_available_memory`` returns, so the worker fits the length
+    itself, keeping one full output canvas of headroom in the pool."""
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.model_config.max_model_len = 200_000  # HF-derived full context
+    cfg.model_config.original_max_model_len = -1
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    resolved_kv_tokens = n * cfg.cache_config.block_size
+    # Fallback budget 131072 + one 256-token canvas of padding.
+    assert resolved_kv_tokens == 131_072 + 256
+    assert cfg.model_config.max_model_len == resolved_kv_tokens - 256
 
 
 def test_sliding_window_adds_headroom(cfg):

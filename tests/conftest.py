@@ -22,8 +22,6 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.
-    import os
-
     import vllm.v1.engine.input_processor as input_processor
 
     from vllm_tt_plugin.platform import TTPlatform
@@ -36,7 +34,6 @@ def reset_tt_platform_class_state():
     saved_original_process_inputs = input_processor.__dict__.get(
         "_tt_original_process_inputs", unset
     )
-    saved_v2_runner = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", unset)
 
     yield
 
@@ -45,11 +42,6 @@ def reset_tt_platform_class_state():
         input_processor.__dict__.pop("_tt_original_process_inputs", None)
     else:
         input_processor._tt_original_process_inputs = saved_original_process_inputs
-
-    if saved_v2_runner is unset:
-        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
-    else:
-        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = saved_v2_runner
 
     for name, value in saved.items():
         if value is unset:
