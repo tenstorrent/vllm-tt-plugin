@@ -825,6 +825,12 @@ class TTModelRunner:
           per-slot seed RNG does not need the hold either: the device seed is derived
           from the absolute decode position, not from slot residency.
 
+        Both of ``_preempt_request``'s callers reach here: the scheduler's own
+        running-loop, and the wholesale ``reset_prefix_cache(reset_running_requests
+        =True)`` teardown, whose preemptions surface because the scheduler keeps
+        ``preempted_req_ids`` across the step boundary rather than rebuilding it
+        per call.
+
         ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         """
         for req_id in scheduler_output.finished_req_ids:
