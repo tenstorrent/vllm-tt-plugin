@@ -252,6 +252,14 @@ class BlockModel:
         "supports_prefix_caching": False,
     }
 
+    @staticmethod
+    def release_request(_slot):
+        pass
+
+    @staticmethod
+    def release_persistent_capture():
+        pass
+
 
 class ARModel:
     model_capabilities = {
@@ -294,6 +302,29 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.diffusion_config is None
     assert not hasattr(config.model_config.hf_config, "canvas_length")
     assert config.model_config.is_diffusion is False
+
+
+def test_startup_rejects_mismatched_diffusion_canvas(monkeypatch):
+    config = _config()
+    config.model_config.hf_config.canvas_length = 128
+    _patch_model_resolution(monkeypatch)
+
+    with pytest.raises(ValueError, match=r"128 != 256"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_startup_requires_block_model_lifecycle_hooks(monkeypatch):
+    class BlockModelWithoutLifecycle:
+        model_capabilities = BlockModel.model_capabilities
+
+    config = _config()
+    _patch_model_resolution(monkeypatch, BlockModelWithoutLifecycle)
+
+    with pytest.raises(
+        ValueError,
+        match=r"release_request, release_persistent_capture",
+    ):
+        TTPlatform.check_and_update_config(config)
 
 
 @pytest.mark.parametrize(

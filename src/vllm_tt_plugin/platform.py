@@ -1148,6 +1148,22 @@ class TTPlatform(Platform):
                 "in model_capabilities"
             )
         if is_block_output_model:
+            required_lifecycle_hooks = (
+                "release_request",
+                "release_persistent_capture",
+            )
+            missing_hooks = [
+                hook
+                for hook in required_lifecycle_hooks
+                if not callable(getattr(model_class, hook, None))
+            ]
+            if missing_hooks:
+                raise ValueError(
+                    f"Block-output model {model_class.__module__}."
+                    f"{model_class.__name__} must implement lifecycle hooks: "
+                    + ", ".join(missing_hooks)
+                )
+
             # Gemma4 autoregressive models support token-chunked prefill, but
             # block-output models cannot resume a split prompt. Capability wins
             # over the model-type policy once the output width is known.
@@ -1159,9 +1175,20 @@ class TTPlatform(Platform):
             # runner or constructs the scheduler. This keeps every downstream
             # view of ModelConfig.is_diffusion uniformly false.
             hf_config = model_config.hf_config
-            if hasattr(hf_config, "canvas_length"):
-                delattr(hf_config, "canvas_length")
-                model_config.__dict__.pop("is_diffusion", None)
+            declared_canvas_length = hf_config.__dict__.pop("canvas_length", None)
+            if (
+                declared_canvas_length is not None
+                and declared_canvas_length != output_tokens_per_step
+            ):
+                raise ValueError(
+                    "Diffusion canvas_length must match the TT block-output "
+                    "capability: "
+                    f"{declared_canvas_length} != {output_tokens_per_step}"
+                )
+            model_config.__dict__.pop("is_diffusion", None)
+            assert not model_config.is_diffusion, (
+                "Block-output setup failed to clear upstream diffusion detection"
+            )
 
             # ModelConfig may already have caused vLLM to create this config
             # before the platform hook ran. It represents the same canvas as

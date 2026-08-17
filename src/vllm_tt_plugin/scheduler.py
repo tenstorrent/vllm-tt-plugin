@@ -5,6 +5,7 @@ from enum import Enum
 from typing import cast
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -85,6 +86,15 @@ class TTScheduler(AsyncScheduler):
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = self._output_tokens_per_step > 1
+        if self._is_block_output_model:
+            assert self.num_sampled_tokens_per_step == 1, (
+                "Block-output accounting requires upstream to reserve exactly "
+                "one sampled-token placeholder"
+            )
+            assert not self.kv_cache_manager.enable_caching, (
+                "Block-output models bypass AsyncScheduler.cache_blocks and "
+                "must disable prefix caching"
+            )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -214,10 +224,18 @@ class TTScheduler(AsyncScheduler):
     ) -> bool:
         """Avoid a stale-canvas resume that vLLM's AR reset cannot represent."""
         if self._is_block_output_model and reset_running_requests and self.running:
-            raise RuntimeError(
+            message = (
                 "Cannot reset prefix cache while a block-output request is "
                 "running; finish or abort the request first."
             )
+            # pause_generation(mode="keep") reaches this through an unguarded
+            # idle-state callback while intentionally retaining live requests.
+            # Returning False preserves them without letting an exception
+            # escape EngineCore and strand the callback's Future.
+            if self.pause_state == PauseState.PAUSED_ALL:
+                logger.error("%s", message)
+                return False
+            raise RuntimeError(message)
         return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
@@ -230,7 +248,9 @@ class TTScheduler(AsyncScheduler):
         super()._update_after_schedule(scheduler_output)
         if not self._is_block_output_model:
             return
-        extra_placeholders = self._output_tokens_per_step - 1
+        extra_placeholders = (
+            self._output_tokens_per_step - self.num_sampled_tokens_per_step
+        )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if not request.is_prefill_chunk:
@@ -257,6 +277,9 @@ class TTScheduler(AsyncScheduler):
         # Scheduler appends token-by-token and trims at EOS, stop tokens,
         # max_tokens, or max_model_len. The reservation is physical, so consume
         # all K placeholders even when the client-visible block is trimmed.
+        # Calling Scheduler directly intentionally skips AsyncScheduler's
+        # cache_blocks hook. Platform validation disables prefix caching for
+        # block-output models, and __init__ asserts that invariant.
         new_token_ids, stopped = Scheduler._update_request_with_output(
             self, request, new_token_ids
         )

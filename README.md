@@ -240,8 +240,7 @@ python examples/server_example_tt.py
 
 DiffusionGemma uses a 256-token block-serving contract with stricter launch and
 request constraints. See [DiffusionGemma block serving](docs/diffusion-gemma.md)
-for the exact vLLM 0.24 command, paired tt-metal commit, request validation, and
-block metrics.
+for the exact vLLM 0.24 command, request validation, and block metrics.
 
 Send a completion request:
 
@@ -403,6 +402,8 @@ implementations. Current families:
 - Gemma 4 text-only models (`TTGemma4ForCausalLM`,
   `TTGemma4ForConditionalGeneration`,
   `TTGemma4UnifiedForConditionalGeneration`)
+- DiffusionGemma block-output models (`TTDiffusionGemmaForBlockDiffusion`,
+  `TTDiffusionGemmaForCausalLM`)
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 

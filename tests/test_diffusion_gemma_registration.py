@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+import pytest
+
 from vllm_tt_plugin import platform
-from vllm_tt_plugin.entrypoints import (
-    _register_tt_reasoning_parsers,
-    _register_tt_tool_parsers,
-)
 
 
 def test_diffusion_gemma_model_architecture_aliases(monkeypatch):
@@ -32,70 +30,20 @@ def test_diffusion_gemma_model_architecture_aliases(monkeypatch):
         assert registered[arch] == expected_target
 
 
-def test_gemma4_parser_registration_is_unchanged_and_diffusion_uses_upstream():
+def test_gemma4_parsers_are_owned_by_upstream_vllm():
     from vllm.reasoning import ReasoningParserManager
+    from vllm.reasoning.gemma4_engine_reasoning_parser import (
+        Gemma4ParserReasoningAdapter,
+    )
     from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-
-    _register_tt_reasoning_parsers()
-    _register_tt_tool_parsers()
+    from vllm.tool_parsers.gemma4_engine_tool_parser import Gemma4EngineToolParser
 
     assert (
-        ReasoningParserManager.get_reasoning_parser("gemma4").__module__
-        == "vllm_tt_plugin.gemma4_reasoning_parser"
+        ReasoningParserManager.get_reasoning_parser("gemma4")
+        is Gemma4ParserReasoningAdapter
     )
-    assert (
-        ToolParserManager.get_tool_parser("gemma4").__module__
-        == "vllm_tt_plugin.gemma4_tool_parser"
-    )
-    assert ReasoningParserManager.get_reasoning_parser(
-        "diffusion_gemma"
-    ).__module__.startswith("vllm.")
-    assert ToolParserManager.get_tool_parser("diffusion_gemma").__module__.startswith(
-        "vllm."
-    )
-
-
-def test_diffusion_gemma_registers_upstream_parser_aliases(monkeypatch):
-    from vllm.reasoning import ReasoningParserManager
-    from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-
-    reasoning_registrations = []
-    tool_registrations = []
-    monkeypatch.setattr(
-        ReasoningParserManager,
-        "register_lazy_module",
-        staticmethod(lambda *args: reasoning_registrations.append(args)),
-    )
-    monkeypatch.setattr(
-        ToolParserManager,
-        "register_lazy_module",
-        staticmethod(lambda *args: tool_registrations.append(args)),
-    )
-
-    _register_tt_reasoning_parsers()
-    _register_tt_tool_parsers()
-
-    assert reasoning_registrations == [
-        (
-            "gemma4",
-            "vllm_tt_plugin.gemma4_reasoning_parser",
-            "Gemma4ReasoningParser",
-        ),
-        (
-            "diffusion_gemma",
-            "vllm.reasoning.gemma4_engine_reasoning_parser",
-            "Gemma4ParserReasoningAdapter",
-        ),
-    ]
-    assert tool_registrations == [
-        (
-            "gemma4",
-            "vllm_tt_plugin.gemma4_tool_parser",
-            "Gemma4ToolParser",
-        ),
-        (
-            "diffusion_gemma",
-            "vllm.tool_parsers.gemma4_engine_tool_parser",
-            "Gemma4EngineToolParser",
-        ),
-    ]
+    assert ToolParserManager.get_tool_parser("gemma4") is Gemma4EngineToolParser
+    with pytest.raises(KeyError):
+        ReasoningParserManager.get_reasoning_parser("diffusion_gemma")
+    with pytest.raises(KeyError):
+        ToolParserManager.get_tool_parser("diffusion_gemma")

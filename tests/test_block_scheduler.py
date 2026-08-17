@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+from pathlib import Path
+
 import pytest
 import torch
 from vllm.config import (
@@ -14,6 +16,7 @@ from vllm.config import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -30,13 +33,14 @@ from vllm_tt_plugin.scheduler import TTScheduler
 BLOCK_SIZE = 16
 CANVAS = 16
 MAX_MODEL_LEN = 256
+LOCAL_MODEL_CONFIG = Path(__file__).parent / "model_configs" / "qwen2"
 
 
 def _scheduler(
     output_width: int = CANVAS, *, diffusion_checkpoint: bool = False
 ) -> TTScheduler:
     model_config = ModelConfig(
-        model="Qwen/Qwen2-0.5B-Instruct",
+        model=str(LOCAL_MODEL_CONFIG),
         dtype="float16",
         seed=42,
     )
@@ -67,6 +71,7 @@ def _scheduler(
         # Reproduce the platform hook's post-update state, including
         # invalidation of ModelConfig.is_diffusion's cached True value.
         config.model_config.hf_config.canvas_length = output_width
+        config.model_config.__dict__.pop("is_diffusion", None)
         assert config.model_config.is_diffusion is True
         delattr(config.model_config.hf_config, "canvas_length")
         config.model_config.__dict__.pop("is_diffusion", None)
@@ -139,11 +144,14 @@ def test_scheduler_reserves_and_reconciles_full_canvas():
     assert request.num_output_placeholders == CANVAS
     assert request.num_computed_tokens == 32
 
+    cache_calls = []
+    scheduler.kv_cache_manager.cache_blocks = lambda *args: cache_calls.append(args)
     outputs = scheduler.update_from_output(
         prefill, _runner_output(prefill, list(range(CANVAS)))
     )
     assert outputs[0].outputs[0].new_token_ids == list(range(CANVAS))
     assert request.num_output_placeholders == 0
+    assert cache_calls == []
 
     decode = scheduler.schedule()
     assert decode.num_scheduled_tokens == {"req-0": CANVAS}
@@ -196,6 +204,41 @@ def test_running_block_request_rejects_prefix_cache_reset():
         )
     assert scheduler.running == [request]
     assert request.status == RequestStatus.RUNNING
+
+
+def test_deferred_keep_reset_returns_false_without_preempting_block_request():
+    scheduler = _scheduler()
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+
+    assert (
+        scheduler.reset_prefix_cache(
+            reset_running_requests=True,
+            reset_connector=False,
+        )
+        is False
+    )
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
+    assert request.async_tokens_to_discard == 0
+
+
+def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
+    scheduler = _scheduler(output_width=1)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    scheduler.schedule()
+
+    assert scheduler.reset_prefix_cache(
+        reset_running_requests=True,
+        reset_connector=False,
+    )
+    assert scheduler.running == []
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.async_tokens_to_discard == 1
+    assert request.num_output_placeholders == 0
 
 
 def test_block_output_rejects_stale_async_frame():

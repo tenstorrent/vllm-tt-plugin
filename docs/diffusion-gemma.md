@@ -1,9 +1,7 @@
 # DiffusionGemma Block Serving
 
 DiffusionGemma is a block-output model. One model invocation commits a complete
-256-token canvas, not one autoregressive token. The paired implementation is
-`tenstorrent/tt-metal` commit
-`5fec49388893120148e189ef2602de429f214096`. Its adapter declares:
+256-token canvas, not one autoregressive token. Its tt-metal adapter declares:
 
 - `output_tokens_per_step=256`
 - `supports_sample_on_device=True`
@@ -46,15 +44,13 @@ python -m vllm.entrypoints.openai.api_server \
   --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
   --no-async-scheduling \
-  --reasoning-parser diffusion_gemma \
+  --reasoning-parser gemma4 \
   --additional-config '{"tt":{"sample_on_device_mode":"all","enable_model_warmup":true,"trace_mode":"all","trace_region_size":3758096384}}'
 ```
 
-The `diffusion_gemma` parser names alias the engine-based Gemma4 parsers that
-ship with vLLM 0.24. This keeps block-serving parsing on the upstream state
-machine while leaving the plugin's existing `gemma4` parsers unchanged for
-autoregressive Gemma 4 serving. For tool calling add
-`--enable-auto-tool-choice --tool-call-parser diffusion_gemma`.
+DiffusionGemma uses the `gemma4` reasoning and tool parsers shipped by vLLM
+0.24. The plugin does not override or alias upstream parser names. For tool
+calling add `--enable-auto-tool-choice --tool-call-parser gemma4`.
 
 `--max-num-batched-tokens` concerns scheduler prompt admission. It does not
 disable DiffusionGemma's model-internal ragged and chunked prompt processing.
@@ -120,6 +116,7 @@ Do not report autoregressive TPOT for this model.
 - No vLLM APC, scheduler chunked prefill, speculative decoding, or host-side
   sampling controls.
 - A running block request prevents forced prefix-cache reset; finish or abort
-  it first.
+  it first. A deferred `pause_generation(mode="keep")` reset returns `False`
+  without preempting the request.
 - Device server validation requires the paired tt-metal checkout and model
   artifacts. Host plugin tests do not prove model correctness or performance.

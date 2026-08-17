@@ -1743,6 +1743,10 @@ class TTModelRunner:
         tokens without appending output; only rows whose chunk ended the prompt
         emit a token and are applied to runner state.
         """
+        assert self._output_tokens_per_step == 1, (
+            "Chunked-prefill output suppression assumes one sampled token per "
+            "request; block-output models must disable chunked prefill"
+        )
         final_idx_np = np.where(~intermediate_mask)[0]
         if final_idx_np.shape[0] > 0:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
@@ -2040,6 +2044,10 @@ class TTModelRunner:
             ):
                 # Every row is mid-prompt; there is nothing to sample and the
                 # placeholders are dropped when the output is built.
+                assert self._output_tokens_per_step == 1, (
+                    "Intermediate-prefill suppression assumes one sampled token "
+                    "per request"
+                )
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
             elif not perform_device_sampling:

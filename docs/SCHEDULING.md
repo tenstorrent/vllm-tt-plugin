@@ -184,6 +184,21 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+### Block-output reservation
+
+Output placeholders have two independent users. Async autoregressive decode
+uses lookahead placeholders so the next token can be scheduled before the
+previous result is applied on the host. A synchronous block-output model uses
+the same accounting mechanism to reserve one complete output block even though
+there is no decode lookahead.
+
+When `output_tokens_per_step > 1`, the base scheduler reserves its normal
+sampled-token placeholder and `TTScheduler` reserves the remaining physical
+block width. All placeholders are consumed when that block result is applied;
+client-visible output is still trimmed at EOS, stop tokens, and `max_tokens`.
+See [DiffusionGemma block serving](diffusion-gemma.md) for the current
+256-token block contract.
+
 ### Why TT uses an async-style scheduler even in TT-specific flows
 
 TT uses an async-capable scheduler base because decode overlap needs output placeholders: a request can be scheduled one step ahead before the previous step's output has been fully applied on the host.
