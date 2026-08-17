@@ -572,10 +572,14 @@ class TTLaneCoordinator(SchedulerInterface):
         requests: dict[str, Request] = {}
         for sched in self.lanes:
             requests.update(sched.requests)
+        # An intermediate chunked-prefill row samples no token, so it must not
+        # consume a bitmask row.
         structured_output_request_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
-            if (req := requests.get(req_id)) and req.use_structured_output
+            if (req := requests.get(req_id))
+            and req.use_structured_output
+            and not req.is_prefill_chunk
         ]
         if not structured_output_request_ids:
             return None
