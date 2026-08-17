@@ -7,8 +7,9 @@ on:
 
 # Only lint runs here. The unit tests import vllm_tt_plugin, which imports the
 # locally built TT vLLM (`empty` target) that is not installable on a stock
-# GitHub runner, so pytest belongs on a TT environment (see tt-metal's
-# vllm-nightly-tests), not in this workflow.
+# GitHub runner. Pull requests from this repository call TT-metal's
+# artifact-backed host-test workflow, which provides the TTNN wheel without
+# allocating a device.
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
@@ -18,3 +19,14 @@ jobs:
         with:
           python-version: "3.10"
       - uses: pre-commit/action@v3.0.1
+  host-unit-tests:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    uses: tenstorrent/tt-metal/.github/workflows/vllm-plugin-host-tests.yaml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      plugin-repository: ${{ github.repository }}
+      plugin-ref: ${{ github.event.pull_request.head.sha }}
