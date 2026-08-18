@@ -32,47 +32,45 @@ def _validate(params: SamplingParams, prompt_len: int = 32) -> None:
     TTPlatform.validate_request(prompt, params)
 
 
-def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
-    """Install the vLLM 0.24 validate -> clone -> default boundary."""
-    import vllm.v1.engine.input_processor as input_processor
+def _upstream_process_inputs(
+    self, request_id, prompt, params, *args, resumable=False, **kwargs
+):
+    """The vLLM 0.24 validate -> clone -> resolve-default boundary."""
+    calls = getattr(self, "process_inputs_calls", None)
+    if calls is not None:
+        calls.append({"resumable": resumable})
+    TTPlatform.validate_request(prompt, params)
+    cloned_params = params.clone()
+    if cloned_params.max_tokens is None:
+        seq_len = len(prompt.get("prompt_token_ids") or prompt["prompt_embeds"])
+        cloned_params.max_tokens = self.model_config.max_model_len - seq_len
+    return SimpleNamespace(
+        sampling_params=cloned_params,
+        resumable=resumable,
+        prompt_token_ids=prompt.get("prompt_token_ids"),
+        prompt_embeds=prompt.get("prompt_embeds"),
+    )
 
-    def process_inputs(
-        self,
-        request_id,
-        prompt,
-        params,
-        supported_tasks=None,
-        arrival_time=None,
-        lora_request=None,
-        tokenization_kwargs=None,
-        trace_headers=None,
-        priority=0,
-        data_parallel_rank=None,
-        resumable=False,
-    ):
-        self.process_inputs_calls.append({"resumable": resumable})
-        TTPlatform.validate_request(prompt, params)
-        cloned_params = params.clone()
-        if cloned_params.max_tokens is None:
-            seq_len = len(prompt.get("prompt_token_ids") or prompt["prompt_embeds"])
-            cloned_params.max_tokens = self.model_config.max_model_len - seq_len
-        return SimpleNamespace(
-            sampling_params=cloned_params,
-            resumable=resumable,
-            prompt_token_ids=prompt.get("prompt_token_ids"),
-            prompt_embeds=prompt.get("prompt_embeds"),
-        )
+
+def _patch_upstream_boundary(monkeypatch):
+    import vllm.v1.engine.input_processor as input_processor
 
     monkeypatch.setattr(
         input_processor.InputProcessor,
         "process_inputs",
-        process_inputs,
+        _upstream_process_inputs,
     )
     monkeypatch.delattr(
         input_processor,
         "_tt_original_process_inputs",
         raising=False,
     )
+    return input_processor
+
+
+def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
+    """Install the vLLM 0.24 validate -> clone -> default boundary."""
+    input_processor = _patch_upstream_boundary(monkeypatch)
     _install_block_output_input_processor_patch()
 
     model_config = SimpleNamespace(max_model_len=max_model_len)
@@ -114,20 +112,20 @@ def test_auto_fitted_frontend_limit_is_read_live(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "neutral"),
     [
-        ("temperature", 0.5),
-        ("top_p", 0.9),
-        ("top_k", 10),
-        ("min_p", 0.1),
-        ("seed", 42),
-        ("presence_penalty", 0.5),
-        ("frequency_penalty", 0.5),
-        ("repetition_penalty", 1.1),
+        ("temperature", 0.5, 1.0),
+        ("top_p", 0.9, 1.0),
+        ("top_k", 10, 0),
+        ("min_p", 0.1, 0.0),
+        ("seed", 42, None),
+        ("presence_penalty", 0.5, 0.0),
+        ("frequency_penalty", 0.5, 0.0),
+        ("repetition_penalty", 1.1, 1.0),
     ],
 )
 def test_non_neutral_sampling_controls_neutralized_on_clone_only(
-    monkeypatch, field, value
+    monkeypatch, field, value, neutral
 ):
     processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16, **{field: value})
@@ -139,17 +137,7 @@ def test_non_neutral_sampling_controls_neutralized_on_clone_only(
         params,
     )
 
-    neutral = {
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "top_k": 0,
-        "min_p": 0.0,
-        "seed": None,
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-        "repetition_penalty": 1.0,
-    }
-    assert getattr(request.sampling_params, field) == neutral[field]
+    assert getattr(request.sampling_params, field) == neutral
     assert getattr(params, field) == value
 
 
@@ -337,38 +325,14 @@ def test_startup_requires_block_model_lifecycle_hooks(monkeypatch):
 def test_startup_installs_input_processor_patch_only_for_block_models(
     monkeypatch, model_class, expected_max_tokens, expected_wrapped
 ):
-    import vllm.v1.engine.input_processor as input_processor
-
-    def process_inputs(self, request_id, prompt, params, *args, **kwargs):
-        TTPlatform.validate_request(prompt, params)
-        cloned_params = params.clone()
-        if cloned_params.max_tokens is None:
-            cloned_params.max_tokens = self.model_config.max_model_len - len(
-                prompt["prompt_token_ids"]
-            )
-        return SimpleNamespace(
-            sampling_params=cloned_params,
-            prompt_token_ids=prompt.get("prompt_token_ids"),
-            prompt_embeds=prompt.get("prompt_embeds"),
-        )
-
-    monkeypatch.setattr(
-        input_processor.InputProcessor,
-        "process_inputs",
-        process_inputs,
-    )
-    monkeypatch.delattr(
-        input_processor,
-        "_tt_original_process_inputs",
-        raising=False,
-    )
+    input_processor = _patch_upstream_boundary(monkeypatch)
     config = _config()
     _patch_model_resolution(monkeypatch, model_class)
 
     TTPlatform.check_and_update_config(config)
 
     assert (
-        input_processor.InputProcessor.process_inputs is not process_inputs
+        input_processor.InputProcessor.process_inputs is not _upstream_process_inputs
     ) is expected_wrapped
     assert hasattr(input_processor, "_tt_original_process_inputs") is expected_wrapped
 
@@ -508,33 +472,25 @@ def test_explicit_request_uses_tile_aligned_physical_capacity(monkeypatch):
     _validate(SamplingParams(max_tokens=1), prompt_len=736)
 
 
-def test_input_processor_rejects_zero_canvas_default_for_embeds(monkeypatch):
-    processor_cls, processor = _processor_harness(monkeypatch)
-    params = SamplingParams(max_tokens=16)
-    params.max_tokens = None
-
-    with pytest.raises(ValueError, match=r"requires 256 physical.*exceeding"):
-        processor_cls.process_inputs(
-            processor,
-            "embeds",
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        pytest.param({"prompt_token_ids": [1] * 1000}, id="token-ids-no-room"),
+        pytest.param(
             {"prompt_token_ids": None, "prompt_embeds": [0] * 900},
-            params,
-        )
-
-    assert params.max_tokens is None
-
-
-def test_input_processor_rejects_when_no_canvas_fits(monkeypatch):
+            id="embeds-partial-tile",
+        ),
+    ],
+)
+def test_input_processor_rejects_default_without_whole_canvas(monkeypatch, prompt):
     processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
-    with pytest.raises(ValueError, match="physical 256-token canvases"):
-        processor_cls.process_inputs(
-            processor,
-            "too-long",
-            {"prompt_token_ids": [1] * 1000},
-            params,
-        )
+    with pytest.raises(
+        ValueError,
+        match=r"physical 256-token canvases.*requires 256 physical.*exceeding",
+    ):
+        processor_cls.process_inputs(processor, "no-canvas", prompt, params)
 
     assert params.max_tokens is None

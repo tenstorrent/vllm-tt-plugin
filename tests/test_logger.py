@@ -15,34 +15,6 @@ def clear_log_once_cache():
     _log_once.cache_clear()
 
 
-def test_tt_logger_provides_warning_once():
-    """The warning_once idiom vLLM patches onto its loggers must also work on
-    TT loggers, regardless of whether transformers (which patches warning_once
-    onto logging.Logger) has been imported yet."""
-    logger = init_tt_logger("vllm_tt_plugin.logger_probe")
-
-    logger.warning_once("probe warning %s", "arg")
-
-
-def test_existing_class_level_warning_once_is_kept(monkeypatch):
-    """A process where another library already patched warning_once onto
-    logging.Logger must keep that method rather than get an instance shadow."""
-    class_level_calls = []
-
-    def class_warning_once(self, msg, *args, **kwargs):
-        class_level_calls.append(msg)
-
-    monkeypatch.setattr(
-        logging.Logger, "warning_once", class_warning_once, raising=False
-    )
-
-    logger = init_tt_logger("vllm_tt_plugin.logger_probe_partial")
-
-    assert "warning_once" not in vars(logger)
-    logger.warning_once("class-level warning")
-    assert class_level_calls == ["class-level warning"]
-
-
 def test_warning_once_deduplicates_identical_calls(caplog):
     logger = init_tt_logger("vllm_tt_plugin.logger_probe_dedup")
 

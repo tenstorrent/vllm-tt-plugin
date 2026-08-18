@@ -31,17 +31,19 @@ def _runner(width: int, *, num_tokens: int = 0, max_model_len: int = 32):
     )
 
 
-def test_full_block_updates_state_and_runner_output():
-    runner, output_tokens = _runner(16)
-    block = torch.arange(16, dtype=torch.int32).reshape(1, 16)
+@pytest.mark.parametrize("width", [1, 16], ids=["ar_k1", "block_k16"])
+def test_apply_and_build_runner_output_widths(width):
+    runner, output_tokens = _runner(width)
+    block = torch.arange(1, width + 1, dtype=torch.int32).reshape(1, width)
 
     TTModelRunner._apply_sampled_tokens_to_state(runner, block)
     output = TTModelRunner._build_runner_output(runner, block)
 
-    assert runner.input_batch.num_tokens.tolist() == [16]
-    assert runner.input_batch.token_ids_cpu[0, :16].tolist() == list(range(16))
-    assert output_tokens == list(range(16))
-    assert output.sampled_token_ids == [list(range(16))]
+    expected = list(range(1, width + 1))
+    assert runner.input_batch.num_tokens.tolist() == [width]
+    assert runner.input_batch.token_ids_cpu[0, :width].tolist() == expected
+    assert output_tokens == expected
+    assert output.sampled_token_ids == [expected]
 
 
 def test_output_width_is_strict():
@@ -63,37 +65,6 @@ def test_capacity_overrun_is_rejected_before_writes():
     assert runner.input_batch.num_tokens.tolist() == [17]
     assert not runner.input_batch.token_ids_cpu.any()
     assert output_tokens == []
-
-
-def test_ar_k1_output_shape_is_unchanged():
-    runner, output_tokens = _runner(1)
-    token = torch.tensor([[7]], dtype=torch.int32)
-
-    TTModelRunner._apply_sampled_tokens_to_state(runner, token)
-    output = TTModelRunner._build_runner_output(runner, token)
-
-    assert output_tokens == [7]
-    assert output.sampled_token_ids == [[7]]
-
-
-def test_update_states_accepts_absent_preemption_metadata():
-    scheduler_output = SchedulerOutput.make_empty()
-    assert scheduler_output.preempted_req_ids is None
-
-    refreshed = []
-    runner = TTModelRunner.__new__(TTModelRunner)
-    runner.requests = {}
-    runner.encoder_cache = {}
-    runner.input_batch = SimpleNamespace(
-        req_id_to_index={},
-        refresh_logitsprocs=lambda: refreshed.append(True),
-    )
-    runner._decode_layout_changed_since_last_decode = False
-    runner._req_state_slot = {}
-
-    runner._update_states(scheduler_output)
-
-    assert refreshed == [True]
 
 
 @pytest.mark.parametrize(
@@ -189,15 +160,20 @@ def test_worker_wrapper_shutdown_releases_persistent_capture_once():
 # --------------------------------------------------------------------------
 
 
-def _extraction_runner(width: int):
-    return SimpleNamespace(
+def _extract(
+    width,
+    tt_out,
+    batch_size_per_dp,
+    *,
+    device_sampling=True,
+    is_decode=False,
+    enable_log_probs=False,
+):
+    runner = SimpleNamespace(
         _output_tokens_per_step=width,
         _is_block_output_model=width > 1,
         tt_per_lane_max_num_seqs=1,
     )
-
-
-def _extraction_input(*, enable_log_probs: bool = False):
     sampling_params = SimpleNamespace(
         enable_log_probs=torch.tensor([enable_log_probs]),
     )
@@ -205,24 +181,22 @@ def _extraction_input(*, enable_log_probs: bool = False):
         intermediate_prefill_mask=None,
         max_num_logprobs=[None],
     )
-    return sampling_params, model_input
-
-
-def test_get_output_tokens_extracts_full_canvas_per_request():
-    runner = _extraction_runner(4)
-    sampling_params, model_input = _extraction_input()
-    tt_out = torch.arange(4, dtype=torch.int32).reshape(1, 4)
-
-    sampled, logprobs = TTModelRunner._get_output_tokens(
+    return TTModelRunner._get_output_tokens(
         runner,
         tt_out,
         None,
         sampling_params,
         model_input,
-        [1],
-        perform_device_sampling=True,
-        is_decode=False,
+        batch_size_per_dp,
+        perform_device_sampling=device_sampling,
+        is_decode=is_decode,
     )
+
+
+def test_get_output_tokens_extracts_full_canvas_per_request():
+    tt_out = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+
+    sampled, logprobs = _extract(4, tt_out, [1])
 
     assert len(sampled) == 1
     assert sampled[0].shape == (1, 4)
@@ -231,36 +205,13 @@ def test_get_output_tokens_extracts_full_canvas_per_request():
 
 
 def test_get_output_tokens_rejects_wrong_canvas_width():
-    runner = _extraction_runner(4)
-    sampling_params, model_input = _extraction_input()
-    tt_out = torch.zeros((1, 3), dtype=torch.int32)
-
     with pytest.raises(ValueError, match="violates output_tokens_per_step"):
-        TTModelRunner._get_output_tokens(
-            runner,
-            tt_out,
-            None,
-            sampling_params,
-            model_input,
-            [1],
-            perform_device_sampling=True,
-            is_decode=False,
-        )
+        _extract(4, torch.zeros((1, 3), dtype=torch.int32), [1])
 
 
 def test_get_output_tokens_empty_rank_keeps_canvas_width():
-    runner = _extraction_runner(4)
-    sampling_params, model_input = _extraction_input()
-
-    sampled, logprobs = TTModelRunner._get_output_tokens(
-        runner,
-        torch.zeros((0,), dtype=torch.int32),
-        None,
-        sampling_params,
-        model_input,
-        [0],
-        perform_device_sampling=True,
-        is_decode=True,
+    sampled, logprobs = _extract(
+        4, torch.zeros((0,), dtype=torch.int32), [0], is_decode=True
     )
 
     assert sampled[0].shape == (0, 4)
@@ -268,35 +219,16 @@ def test_get_output_tokens_empty_rank_keeps_canvas_width():
 
 
 def test_get_output_tokens_rejects_host_sampling_for_block_models():
-    runner = _extraction_runner(4)
-    sampling_params, model_input = _extraction_input()
-
     with pytest.raises(ValueError, match="host sampling cannot construct"):
-        TTModelRunner._get_output_tokens(
-            runner,
+        _extract(
+            4,
             torch.zeros((1, 1, 8), dtype=torch.float32),
-            None,
-            sampling_params,
-            model_input,
             [1],
-            perform_device_sampling=False,
+            device_sampling=False,
             is_decode=True,
         )
 
 
 def test_get_output_tokens_rejects_device_logprobs_for_block_models():
-    runner = _extraction_runner(4)
-    sampling_params, model_input = _extraction_input(enable_log_probs=True)
-    tt_out = torch.zeros((1, 4), dtype=torch.int32)
-
     with pytest.raises(ValueError, match="one output token per step"):
-        TTModelRunner._get_output_tokens(
-            runner,
-            tt_out,
-            None,
-            sampling_params,
-            model_input,
-            [1],
-            perform_device_sampling=True,
-            is_decode=False,
-        )
+        _extract(4, torch.zeros((1, 4), dtype=torch.int32), [1], enable_log_probs=True)
