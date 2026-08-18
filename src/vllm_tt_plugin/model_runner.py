@@ -904,8 +904,19 @@ class TTModelRunner:
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing."""
+        steady state moves nothing.
+
+        Exhaustion is unreachable: holders and prefills are disjoint and both count
+        against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
+        stopped describing the device, and nothing on the host can recover it, so fail
+        rather than guess and return plausible, wrong text.
+        """
         n_slots = self.tt_per_lane_max_num_seqs
+        if len(row_req_ids) > n_slots:
+            raise RuntimeError(
+                f"{len(row_req_ids)} prefill(s) exceed the {n_slots} device state "
+                "slots; admission is the scheduler's job, not this function's"
+            )
         prefilling = set(row_req_ids)
         held = {
             slot
@@ -914,7 +925,7 @@ class TTModelRunner:
         }
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row < n_slots and row not in held:
+            if row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]
@@ -924,7 +935,8 @@ class TTModelRunner:
                     # would drop an assert and leave an opaque IndexError below.
                     raise RuntimeError(
                         f"no free device state slot for {len(row_req_ids)} prefill(s): "
-                        f"held={sorted(held)}, capacity={n_slots}"
+                        f"held={sorted(held)}, capacity={n_slots}, "
+                        f"map={self._req_state_slot}"
                     )
                 slot = free[0]
             held.add(slot)
@@ -935,25 +947,48 @@ class TTModelRunner:
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
-        means identity, so skip it."""
+        means identity, so skip it. Commits the move to ``self._req_state_slot`` for
+        every request the permutation touches, off-batch holders included."""
         n_slots = self.tt_per_lane_max_num_seqs
-        row_req_ids = row_req_ids[:n_slots]
-        want = [self._req_state_slot.get(r, row) for row, r in enumerate(row_req_ids)]
-        # post-gather: state sits at its row
-        settled = {r: row for row, r in enumerate(row_req_ids)}
-        if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
-            # Never hand a non-permutation to a gather: one incoherent response beats
-            # an out-of-bounds device read.
-            logger.warning(
-                "TT decode state slots are not a permutation (%s); skipping the state "
-                "remap for this step -- one response may be incoherent.",
-                want,
+        # More decode rows than slots means the batch cannot be described at all, so
+        # truncating would just drop a request's state silently.
+        if len(row_req_ids) > n_slots:
+            raise RuntimeError(
+                f"{len(row_req_ids)} decode row(s) exceed the {n_slots} device state "
+                "slots"
             )
-            self._req_state_slot.update(settled)
-            return None
+        want: list[int] = []
+        for req_id in row_req_ids:
+            slot = self._req_state_slot.get(req_id)
+            # Every decoding request got a slot at prefill. Inventing one here is how
+            # a second request ends up recorded at an owned slot.
+            if slot is None:
+                raise RuntimeError(
+                    f"decoding request {req_id!r} has no device state slot: "
+                    f"map={self._req_state_slot}"
+                )
+            want.append(slot)
+        if len(set(want)) != len(want) or any(not 0 <= s < n_slots for s in want):
+            # Refusing the remap is not the safe option: no gather goes out for the
+            # WHOLE batch, so every off-row request reads another's state.
+            duplicates = sorted({s for s in want if want.count(s) > 1})
+            raise RuntimeError(
+                f"TT decode state slots are not a permutation: want={want}, "
+                f"duplicated={duplicates}, capacity={n_slots}, "
+                f"map={self._req_state_slot}"
+            )
         taken = set(want)
         remap = want + [s for s in range(n_slots) if s not in taken]
-        self._req_state_slot.update(settled)
+        # The gather moves every slot, not just the batch rows: ownership must follow.
+        # Build the new map whole and swap it in, so no read sees it half-written.
+        by_slot: dict[int, list[str]] = {}
+        for req_id, slot in self._req_state_slot.items():
+            by_slot.setdefault(slot, []).append(req_id)
+        moved = dict(self._req_state_slot)
+        for row, slot in enumerate(remap):
+            for req_id in by_slot.get(slot, ()):
+                moved[req_id] = row
+        self._req_state_slot = moved
         if all(remap[i] == i for i in range(n_slots)):
             return None
         return torch.tensor(remap, dtype=torch.int32)
@@ -1327,10 +1362,8 @@ class TTModelRunner:
         block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
         block_tables = block_tables_per_group[0]
         # State follows the request, not the row (``self._req_state_slot``), which
-        # subsumes the batch's condense-move remap. Drain it on every build: it is
-        # dead information now, and leaving it pending would let it accumulate moves
-        # the state map has already accounted for.
-        input_batch.pop_slot_remap()
+        # subsumes the batch's condense-move remap.
+        input_batch.reset_slot_remap()
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
         prefill_empty_slots = None
         slot_remap = None
