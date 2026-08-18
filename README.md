@@ -47,19 +47,6 @@ Ubuntu 22.04.
 The installation script builds vLLM `0.25.1` from source with
 `VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
 
-### Unsupported on upstream vLLM
-
-- **Multi-host MPI data parallelism** (`tt.rank_binding`, `tt.mpi_args`,
-  `--nnodes > 1`). It needs an engine-core launcher hook
-  (`ParallelConfig.engine_core_launcher_cls` and
-  `vllm.v1.engine.utils.CoreEngineLauncher`) that upstream vLLM does not define.
-  Requesting it raises `NotImplementedError` rather than silently
-  single-hosting the run. Single-host data parallelism is unaffected.
-- **vLLM's V2 model runner.** The plugin implements only the V1 model-runner
-  contract and pins `VLLM_USE_V2_MODEL_RUNNER=0`; setting it to `1` is refused.
-  Under V2 the scheduler reports preemption-resumed requests differently, and
-  honoring it would silently drop generated tokens on resume.
-
 ## Environment Setup
 
 Install tt-metal first by following
@@ -443,7 +430,8 @@ source edit to the plugin. The built-in map above stays enabled by default; set
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a
 clear error before anything reaches the device:
 
-- Tensor parallel and pipeline parallel execution are not supported.
+- Tensor parallel and pipeline parallel execution are provided by the models
+  internal implementation, not exposed at the vLLM level.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
 - Chunked prefill is disabled for every model type except Gemma 4, and
@@ -453,6 +441,9 @@ clear error before anything reaches the device:
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
+- Multi-host MPI data parallelism is not supported.
+- vLLM's V2 model runner. The plugin implements only the V1 model-runner
+  contract and pins `VLLM_USE_V2_MODEL_RUNNER=0`; setting it to `1` is refused.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 
