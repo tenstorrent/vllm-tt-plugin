@@ -91,12 +91,13 @@ output limit is clamped to the largest whole-canvas capacity that fits.
 
 ## Metrics
 
-vLLM request metrics count client-visible logical output tokens after EOS,
-stop, and `max_tokens` trimming. DiffusionGemma model telemetry is physical:
-one block is 256 committed tokens. Use the adapter's `prefill_block0`,
-`decode_block`, `block_ids`, `committed_tokens`, `denoise_steps`, and
-block-latency events for
-device performance. Report block throughput as:
+vLLM request metrics count logical output tokens after EOS, stop-token, and
+`max_tokens` trimming. A stop *string* truncates only the returned text: the
+full committed canvas still counts toward token metrics, up to 255 tokens
+past the match. DiffusionGemma model telemetry is physical: one block is 256
+committed tokens. Use the adapter's `prefill_block0`, `decode_block`,
+`block_ids`, `committed_tokens`, `denoise_steps`, and block-latency events
+for device performance. Report block throughput as:
 
 ```text
 physical tokens per block second = 256 / block_latency_seconds
