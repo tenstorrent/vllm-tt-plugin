@@ -598,10 +598,13 @@ def _install_block_output_reset_abort_patch() -> None:
     half-generated canvas cannot resume, so ``TTScheduler`` refuses the reset
     while block requests run. The engine layer owns client notification
     (``_send_abort_outputs``), so abort the running requests here before the
-    scheduler delegates upstream. ``pause_generation(mode="keep")`` reaches the
-    same method from its deferred idle callback while intentionally retaining
-    live requests; that path is left to the scheduler guard, which refuses the
-    reset without raising.
+    scheduler delegates upstream -- but ONLY when that notifier exists: a bare
+    in-process ``EngineCore`` has no output path, and silently removing a
+    running request would leave its caller waiting forever, so those engines
+    fall through to the scheduler guard's raise instead.
+    ``pause_generation(mode="keep")`` reaches the same method from its deferred
+    idle callback while intentionally retaining live requests; that path is
+    left to the scheduler guard, which refuses the reset without raising.
     """
     import vllm.v1.engine.core as engine_core
     from vllm.v1.core.sched.interface import PauseState
@@ -617,8 +620,15 @@ def _install_block_output_reset_abort_patch() -> None:
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
         scheduler = self.scheduler
+        # Aborting is only legal when the engine can tell the owning clients
+        # (EngineCoreProc._send_abort_outputs finishes their streams).
+        # ``finish_requests`` emits no output itself -- upstream assumes the
+        # client initiated the abort -- so without a notifier the request
+        # would vanish and its caller would wait forever.
+        send_abort_outputs = getattr(self, "_send_abort_outputs", None)
         if (
             reset_running_requests
+            and send_abort_outputs is not None
             and getattr(scheduler, "_is_block_output_model", False)
             and scheduler.running
             and scheduler.pause_state != PauseState.PAUSED_ALL
@@ -632,11 +642,7 @@ def _install_block_output_reset_abort_patch() -> None:
                 "request(s); a half-generated canvas cannot resume.",
                 len(aborted),
             )
-            # EngineCoreProc finishes the owning clients' streams; a bare
-            # in-process EngineCore has no output queue to notify through.
-            send_abort_outputs = getattr(self, "_send_abort_outputs", None)
-            if send_abort_outputs is not None:
-                send_abort_outputs(aborted)
+            send_abort_outputs(aborted)
         return original(self, reset_running_requests, reset_connector)
 
     engine_core.EngineCore.reset_prefix_cache = reset_prefix_cache_tt

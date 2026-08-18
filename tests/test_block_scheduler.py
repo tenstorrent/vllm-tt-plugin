@@ -212,6 +212,24 @@ def test_engine_level_reset_aborts_running_block_requests():
     assert sent == [[("req-0", 0)]]
 
 
+def test_engine_without_abort_notifier_refuses_reset():
+    # A bare in-process EngineCore lacks _send_abort_outputs: aborting there
+    # would silently remove a request its caller is still waiting on, so the
+    # reset must fall through to the scheduler guard's raise instead.
+    scheduler, request, _ = _scheduled()
+    from vllm_tt_plugin.platform import _install_block_output_reset_abort_patch
+
+    _install_block_output_reset_abort_patch()
+    engine = SimpleNamespace(scheduler=scheduler)
+
+    with pytest.raises(RuntimeError, match="Cannot reset prefix cache"):
+        EngineCore.reset_prefix_cache(
+            engine, reset_running_requests=True, reset_connector=False
+        )
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
+
+
 def test_engine_level_keep_pause_reset_preserves_block_requests():
     scheduler, request, _ = _scheduled()
     scheduler.set_pause_state(PauseState.PAUSED_ALL)

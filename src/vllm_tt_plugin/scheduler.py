@@ -226,8 +226,11 @@ class TTScheduler(AsyncScheduler):
 
         The engine layer (``_install_block_output_reset_abort_patch``) aborts
         running block requests and notifies their clients before delegating,
-        so a reset requested through ``EngineCore`` succeeds. Reaching this
-        guard with live block requests means a caller bypassed that layer.
+        so a reset requested through ``EngineCoreProc`` succeeds. Live block
+        requests reach this guard only from engines that cannot notify the
+        owning clients (a bare in-process ``EngineCore``) or callers that
+        bypassed the engine layer; refusing here beats silently removing a
+        request someone is still waiting on.
         """
         if self._is_block_output_model and reset_running_requests and self.running:
             message = (
