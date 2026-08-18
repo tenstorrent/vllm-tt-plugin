@@ -26,7 +26,7 @@ jobs:
     uses: tenstorrent/tt-metal/.github/workflows/vllm-plugin-host-tests.yaml@sanjaradylov/ci.unit-test-events
     permissions:
       contents: read
-      packages: read
+      packages: write
     with:
       plugin-repository: ${{ github.repository }}
       plugin-ref: ${{ github.event.pull_request.head.sha }}
