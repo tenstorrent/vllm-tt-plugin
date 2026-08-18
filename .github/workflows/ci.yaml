@@ -23,7 +23,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
-    uses: tenstorrent/tt-metal/.github/workflows/vllm-plugin-host-tests.yaml
+    uses: tenstorrent/tt-metal/.github/workflows/vllm-plugin-host-tests.yaml@sanjaradylov/ci.unit-test-events
     permissions:
       contents: read
       packages: read
