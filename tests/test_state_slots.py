@@ -11,13 +11,20 @@ decode trace's token/position buffers) does not follow, so
 request's state is, and ``_release_dead_state_slots`` says when a request stops
 owning one. No device execution: all three are pure index bookkeeping, run here
 against a fake runner.
+
+The last group covers the other half of the same contract: building the decode remap
+advances the ownership map, so ``submit_decode`` has to put it on the wire. That runs
+the real ``submit_decode`` against a fake model that records its kwargs.
 """
 
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_tt_plugin import model_runner as model_runner_module
+from vllm_tt_plugin.async_decode import TTAsyncDecodeController
+from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 SLOTS = 8
@@ -203,3 +210,113 @@ def test_non_permutation_is_refused_and_a_clean_map_is_silent(monkeypatch):
     assert any("not a permutation" in w for w in warned), warned
     # The map is still repaired to the rows, so the next step is consistent.
     assert r._req_state_slot == {"X": 0, "Y": 1}
+
+
+# --------------------------------------------------------------------------
+# The other half: the remap the build advanced has to reach the model
+# --------------------------------------------------------------------------
+
+
+def _sampling_params(n_rows):
+    """Real ``TTSamplingParams``: the device-sampling branch reflects over its fields
+    and calls ``.tolist()`` on each, so plain stand-ins do not survive it."""
+    return TTSamplingParams(
+        temperature=torch.ones(n_rows),
+        top_k=torch.ones(n_rows, dtype=torch.int32),
+        top_p=torch.ones(n_rows),
+        presence_penalty=torch.zeros(n_rows),
+        frequency_penalty=torch.zeros(n_rows),
+        repetition_penalty=torch.ones(n_rows),
+        seed=torch.zeros(n_rows, dtype=torch.int64),
+        num_logprobs=torch.full((n_rows,), -2, dtype=torch.int32),
+        enable_log_probs=torch.zeros(n_rows, dtype=torch.bool),
+    )
+
+
+def _decode_input(slot_remap, *, device_sampling, n_rows=2):
+    base = dict(
+        input_tokens=torch.zeros((1, n_rows), dtype=torch.int32),
+        input_positions=torch.zeros((n_rows,), dtype=torch.int32),
+        prompt_lens=None,
+        block_tables=torch.zeros((n_rows, 1), dtype=torch.int32),
+        block_tables_per_group=[torch.zeros((n_rows, 1), dtype=torch.int32)],
+        block_tables_per_layer=None,
+        unpadded_batch_size=n_rows,
+        tt_sampling_params=_sampling_params(n_rows),
+        multi_modal_kwargs={},
+        perform_device_sampling=device_sampling,
+        grammar_bitmask=[None],
+        logitsprocs_list=[None],
+        bad_words_token_ids_list=[{}],
+        allowed_token_ids_mask_list=[None],
+        generators_list=[{}],
+        max_num_logprobs=[None],
+        slot_remap=slot_remap,
+    )
+    return TTModelInput(**base)
+
+
+def _submit_decode(model_input):
+    """Run the real ``submit_decode`` against a fake model and return the kwargs it
+    handed to ``decode_forward``."""
+    seen: dict = {}
+
+    def decode_forward(**kwargs):
+        seen.update(kwargs)
+        return torch.zeros((1, 1), dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        kv_caches=[],
+        model=SimpleNamespace(decode_forward=decode_forward),
+        request_specific_rope=False,
+        trace_mode="none",
+    )
+    TTAsyncDecodeController.submit_decode(
+        SimpleNamespace(runner=runner), model_input, read_from_device=True
+    )
+    return seen
+
+
+def test_host_sampling_decode_still_carries_the_state_remap():
+    """THE BUG. Host sampling is the default and also flips on per batch (a request
+    with ``min_p``, or logprobs on a 1-2 device setup). The state move is a device
+    fact, not a sampling one: dropping it there leaves row i reading slot i while the
+    request's state is still at its old slot, and the ownership map -- already
+    advanced -- never notices.
+    """
+    # The issue's scenario, built through the real remap so the two halves are pinned
+    # against one another: A and B decode at rows 0 and 1, A finishes, condense moves
+    # B down to row 0.
+    r = _runner()
+    assert _prefill(r, ["A", "B"]) == [0, 1]
+    _release(r, finished={"A"})
+    remap = TTModelRunner._decode_state_slot_remap(r, ["B"])
+    assert remap is not None and remap.tolist()[0] == 1, remap
+    assert r._req_state_slot["B"] == 0, "the map already claims the move happened"
+
+    kwargs = _submit_decode(_decode_input(remap, device_sampling=False))
+
+    assert "slot_remap" in kwargs, (
+        "a host-sampling decode dropped the remap the build already committed to"
+    )
+    assert torch.equal(kwargs["slot_remap"], remap)
+
+
+def test_device_sampling_decode_still_carries_the_state_remap():
+    r = _runner()
+    _prefill(r, ["A", "B"])
+    _release(r, finished={"A"})
+    remap = TTModelRunner._decode_state_slot_remap(r, ["B"])
+
+    kwargs = _submit_decode(_decode_input(remap, device_sampling=True))
+
+    assert torch.equal(kwargs["slot_remap"], remap)
+
+
+def test_an_identity_remap_puts_no_kwarg_on_the_wire():
+    """``_decode_state_slot_remap`` returns None when nothing moved, which is the
+    steady state and every step of a stateless model. The model must not start seeing
+    a kwarg it never saw before."""
+    for device_sampling in (False, True):
+        kwargs = _submit_decode(_decode_input(None, device_sampling=device_sampling))
+        assert "slot_remap" not in kwargs, device_sampling

@@ -504,6 +504,12 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        # The remap goes to the model whenever the build supplied one: building it
+        # already advanced the ownership map to the post-gather layout, so dropping it
+        # here would leave the map claiming a move that never happened. Identity
+        # remaps arrive as None, so a stateless model still sees no new kwarg.
+        if model_input.slot_remap is not None:
+            kwargs["slot_remap"] = model_input.slot_remap
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -523,8 +529,6 @@ class TTAsyncDecodeController:
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
                 kwargs["output_tokens"] = model_input.output_tokens
             kwargs["reset_batch"] = model_input.reset_batch
-            if model_input.slot_remap is not None:
-                kwargs["slot_remap"] = model_input.slot_remap
 
         enc_dec_kwargs: dict[str, Any] = {}
         if runner.request_specific_rope:
