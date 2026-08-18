@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_tt_plugin import model_runner as model_runner_module
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 SLOTS = 8
@@ -39,6 +38,33 @@ def _prefill(runner, row_req_ids):
 def _decode(runner, row_req_ids):
     remap = TTModelRunner._decode_state_slot_remap(runner, list(row_req_ids))
     return None if remap is None else remap.tolist()
+
+
+def _scheduler_output(*, preempted=None, scheduled=("KEEP",)):
+    """Just the SchedulerOutput fields ``_update_states`` reads on a quiet step."""
+    return SimpleNamespace(
+        finished_req_ids=[],
+        preempted_req_ids=preempted,
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens=dict.fromkeys(scheduled, 1),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+    )
+
+
+def _gather(state, remap):
+    """What the device does with a remap: row ``i`` reads slot ``remap[i]``."""
+    return list(state) if remap is None else [state[s] for s in remap]
+
+
+def _assert_state_found(runner, state):
+    """The invariant: a request's recorded slot is where its state actually sits."""
+    for req_id in runner.requests:
+        slot = runner._req_state_slot[req_id]
+        assert state[slot] == req_id, (
+            f"{req_id} thinks its state is in slot {slot}, which holds "
+            f"{state[slot]!r} (device state: {state})"
+        )
 
 
 def _release(runner, finished=(), preempted=None):
@@ -162,44 +188,99 @@ def test_a_resumed_preempted_request_gets_a_slot_and_a_valid_remap():
     assert _decode(r, decode_rows) is None
 
 
-def test_capacity_and_slot_width_are_enforced():
-    """More prefills than slots is a caller bug; rows past capacity are dropped."""
-    r = _runner(slots=2)
-    _prefill(r, ["A"])
-    _decode(r, ["A"])
-    # A raise, not an assert, so the diagnostic survives ``python -O``.
-    with pytest.raises(RuntimeError, match="no free device state slot"):
-        _prefill(r, ["B", "C"])
+def test_remap_carries_off_batch_state():
+    """A non-identity remap permutes ALL slots, live off-batch holders' included."""
+    r = _runner()
+    state: list[str | None] = [None] * SLOTS
+    for row, slot in enumerate(_prefill(r, ["A", "B"])):
+        state[slot] = ["A", "B"][row]
+    assert r._req_state_slot == {"A": 0, "B": 1}
 
-    # Rows beyond the slot width are truncated, so an over-long batch still yields a
-    # permutation of the real slots instead of an out-of-range source index.
+    # Only B decodes; pulling it to row 0 pushes live off-batch A out of slot 0.
+    remap = _decode(r, ["B"])
+    assert remap is not None and remap[0] == 1, f"row 0 must read B's slot 1: {remap}"
+    state = _gather(state, remap)
+    assert state[0] == "B"
+    assert state[1] == "A", "A's state was displaced by the gather"
+    _assert_state_found(r, state)
+
+    # A is rescheduled: its recorded slot must be the one it landed in.
+    remap = _decode(r, ["B", "A"])
+    state = _gather(state, remap)
+    _assert_state_found(r, state)
+    assert state[:2] == ["B", "A"], f"state must sit at each request's row: {state}"
+
+
+def test_preemption_releases_its_state_slot():
+    """The wiring: ``_update_states`` must actually call the release pass. The tests
+    above drive ``_release_dead_state_slots`` directly and would not notice its loss."""
+    r = _runner()
+    r.encoder_cache = {}
+    r._decode_layout_changed_since_last_decode = False
+    r.input_batch = SimpleNamespace(
+        req_id_to_index={"KEEP": 0}, refresh_logitsprocs=lambda: None
+    )
+    r._release_dead_state_slots = lambda so: _release(
+        r, finished=so.finished_req_ids, preempted=so.preempted_req_ids
+    )
+    r._req_state_slot.update({"P": 0, "KEEP": 1})
+    r.requests.update(dict.fromkeys(["P", "KEEP"]))
+
+    TTModelRunner._update_states(r, _scheduler_output(preempted={"P"}))
+
+    assert r._req_state_slot == {"KEEP": 1}, "only the preempted request releases"
+    assert "P" in r.requests, "the request is still live, it just re-prefills"
+
+    # Which is the point: the freed slot is available to the incoming prefill.
+    assert _prefill(r, ["NEW"]) == [0]
+
+
+def test_slot_exhaustion_fails_instead_of_guessing():
+    """Exhaustion means the map has stopped describing the device, and it is the only
+    record of slot ownership. Guessing returns plausible, wrong text. A raise, not an
+    assert, so the diagnostic survives ``python -O``."""
+    r = _runner(slots=2)
+    _prefill(r, ["A", "B"])  # both slots held by live requests
+    with pytest.raises(RuntimeError, match="no free device state slot"):
+        _prefill(r, ["C"])
+
+    # Over-capacity is the scheduler's decision to make, not this function's.
+    with pytest.raises(RuntimeError, match="exceed the 2 device state slots"):
+        _prefill(_runner(slots=2), ["A", "B", "C"])
+
+
+def test_more_decode_rows_than_slots_raises():
+    """Truncating to the slot width would silently drop C's state instead of saying
+    the batch cannot be described."""
     r = _runner(slots=2)
     r._req_state_slot.update({"A": 1, "B": 0})
-    assert _decode(r, ["A", "B", "C"]) == [1, 0]
+    assert _decode(r, ["A", "B"]) == [1, 0], "at capacity is still fine"
+    with pytest.raises(RuntimeError, match="3 decode row"):
+        _decode(r, ["A", "B", "C"])
 
 
-def test_non_permutation_is_refused_and_a_clean_map_is_silent(monkeypatch):
+def test_a_clean_map_is_silent_and_a_broken_one_raises():
     """A duplicated source slot would make a device gather read one slot twice.
-
-    The warning is captured by replacing the module logger; the plugin's logger does not
-    propagate to pytest's root handler.
-    """
-    warned: list[str] = []
-    monkeypatch.setattr(
-        model_runner_module.logger,
-        "warning",
-        lambda msg, *a, **k: warned.append(str(msg)),
-    )
-
-    # A request the allocator never saw is assumed to sit at its own row, which keeps
-    # the remap the identity instead of guessing. Nothing wrong, so nothing logged.
+    Refusing sends no gather at all, which corrupts every off-row request instead."""
+    # Steady state: everyone already sits at their own row, so nothing moves.
     r = _runner()
+    _prefill(r, ["X", "Y"])
     assert _decode(r, ["X", "Y"]) is None
-    assert not warned, f"the clean path must not warn: {warned}"
 
-    # Skip the move -- one incoherent response beats an OOB device read -- and say so.
-    r._req_state_slot.update({"X": 3, "Y": 3})
-    assert _decode(r, ["X", "Y"]) is None
-    assert any("not a permutation" in w for w in warned), warned
-    # The map is still repaired to the rows, so the next step is consistent.
-    assert r._req_state_slot == {"X": 0, "Y": 1}
+    # A duplicate is an impossible state, and Z's entry says who else is affected.
+    r._req_state_slot.update({"X": 3, "Y": 3, "Z": 5})
+    with pytest.raises(RuntimeError, match="not a permutation") as exc:
+        _decode(r, ["X", "Y"])
+    assert "duplicated=[3]" in str(exc.value)
+    assert "'Z': 5" in str(exc.value), "the whole map is the diagnostic"
+    # It fails before writing, so off-batch entries like Z are left alone.
+    assert r._req_state_slot == {"X": 3, "Y": 3, "Z": 5}
+
+
+def test_a_decoding_request_without_a_slot_raises():
+    """Inventing ownership records a second request at a slot a live one owns. It is
+    the hole both corruptions travel through."""
+    r = _runner()
+    _prefill(r, ["A"])
+    with pytest.raises(RuntimeError, match="'GHOST' has no device state slot"):
+        _decode(r, ["A", "GHOST"])
