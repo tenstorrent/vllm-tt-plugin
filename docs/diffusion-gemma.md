@@ -111,8 +111,8 @@ Do not report autoregressive TPOT for this model.
   speculative decoding and preemption overlap are additionally unsupported.
 - A forced prefix-cache reset aborts running block requests instead of
   resuming them: a half-generated canvas cannot resume, so the engine finishes
-  those requests with an abort before resetting. A deferred
-  `pause_generation(mode="keep")` reset returns `False` without touching the
-  retained requests.
+  those requests with an abort before resetting.
+  `pause_generation(mode="keep", clear_cache=True)` is refused while a block
+  request is live; pausing without `clear_cache` works.
 - Device server validation requires the paired tt-metal checkout and model
   artifacts. Host plugin tests do not prove model correctness or performance.

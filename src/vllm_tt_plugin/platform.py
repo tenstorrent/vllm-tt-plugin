@@ -648,6 +648,54 @@ def _install_block_output_reset_abort_patch() -> None:
     engine_core.EngineCore.reset_prefix_cache = reset_prefix_cache_tt
 
 
+def _install_block_output_pause_guard_patch() -> None:
+    """Refuse ``pause_generation(mode="keep", clear_cache=True)`` with live
+    block requests.
+
+    The keep-mode cache reset runs from the engine's deferred idle callback,
+    whose result upstream discards: ``EngineCore._reset_caches`` ignores the
+    scheduler's ``False`` and the pause Future resolves regardless, so the
+    caller would be told the pause succeeded with a cleared cache while the
+    retained canvases kept their state. Refusing here, before any pause state
+    changes, surfaces the conflict synchronously — the raise is caught by
+    ``_invoke_utility_method`` and returned to the client as a failed call.
+    ``EngineCoreProc`` overrides ``pause_scheduler``, so both classes are
+    wrapped.
+    """
+    import vllm.v1.engine.core as engine_core
+
+    if hasattr(engine_core, "_tt_original_pause_scheduler"):
+        return
+
+    originals = {
+        cls: cls.pause_scheduler
+        for cls in (engine_core.EngineCore, engine_core.EngineCoreProc)
+    }
+    engine_core._tt_original_pause_scheduler = originals[engine_core.EngineCore]
+
+    def _wrap(original):
+        def pause_scheduler_tt(self, mode="abort", clear_cache=True):
+            scheduler = self.scheduler
+            if (
+                mode == "keep"
+                and clear_cache
+                and getattr(scheduler, "_is_block_output_model", False)
+                and scheduler.running
+            ):
+                raise ValueError(
+                    "pause_generation(mode='keep', clear_cache=True) cannot "
+                    "clear the cache of a live block-output request: a "
+                    "half-generated canvas cannot be preempted and resumed. "
+                    "Retry with clear_cache=False or mode='abort'."
+                )
+            return original(self, mode, clear_cache)
+
+        return pause_scheduler_tt
+
+    for cls, original in originals.items():
+        cls.pause_scheduler = _wrap(original)
+
+
 def _iter_extra_model_bundles():
     """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
 
@@ -1303,6 +1351,7 @@ class TTPlatform(Platform):
         if is_block_output_model:
             _install_block_output_input_processor_patch()
             _install_block_output_reset_abort_patch()
+            _install_block_output_pause_guard_patch()
         # vLLM 0.24 syncs an auto-fitted max_model_len back into this same
         # frontend ModelConfig object through EngineCoreReadyResponse. Retain
         # the object rather than snapshotting its pre-fit integer.

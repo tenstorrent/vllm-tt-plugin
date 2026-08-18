@@ -19,7 +19,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -245,6 +245,50 @@ def test_engine_level_keep_pause_reset_preserves_block_requests():
     assert scheduler.running == [request]
     assert request.status == RequestStatus.RUNNING
     assert sent == []
+
+
+def _pause_guarded_engine(scheduler: TTScheduler) -> SimpleNamespace:
+    from vllm_tt_plugin.platform import _install_block_output_pause_guard_patch
+
+    _install_block_output_pause_guard_patch()
+    return SimpleNamespace(scheduler=scheduler)
+
+
+def test_keep_pause_with_clear_cache_is_refused_up_front():
+    # The keep-mode reset runs from an idle callback whose result upstream
+    # discards, so the only honest failure is a synchronous one before any
+    # pause state changes.
+    scheduler, request, _ = _scheduled()
+    engine = _pause_guarded_engine(scheduler)
+
+    with pytest.raises(ValueError, match="clear_cache=False or mode='abort'"):
+        EngineCore.pause_scheduler(engine, mode="keep", clear_cache=True)
+
+    assert scheduler.pause_state == PauseState.UNPAUSED
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
+
+
+def test_keep_pause_guard_covers_engine_core_proc():
+    # EngineCoreProc overrides pause_scheduler, so the guard must wrap it too.
+    scheduler, request, _ = _scheduled()
+    engine = _pause_guarded_engine(scheduler)
+
+    with pytest.raises(ValueError, match="live block-output request"):
+        EngineCoreProc.pause_scheduler(engine, mode="keep", clear_cache=True)
+
+    assert scheduler.running == [request]
+
+
+def test_keep_pause_without_clear_cache_pauses_block_requests():
+    scheduler, request, _ = _scheduled()
+    engine = _pause_guarded_engine(scheduler)
+
+    assert EngineCore.pause_scheduler(engine, mode="keep", clear_cache=False) is None
+
+    assert scheduler.pause_state == PauseState.PAUSED_ALL
+    assert scheduler.running == [request]
+    assert request.status == RequestStatus.RUNNING
 
 
 def test_deferred_keep_reset_returns_false_without_preempting_block_request():
