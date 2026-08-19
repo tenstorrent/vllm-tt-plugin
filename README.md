@@ -503,6 +503,18 @@ under `tests/`, for example:
 pytest tests/test_lane_scheduler.py
 ```
 
+These need no Tenstorrent hardware, only an importable `ttnn`. On a host without
+tt-metal, put the CI stub on the path instead — this is what the `unit-tests`
+workflow job runs:
+
+```bash
+PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
+```
+
+The stub answers only the `ttnn` names the plugin touches and raises from
+anything that would reach a device, so a test that starts depending on real
+hardware fails loudly rather than passing against a fake.
+
 ## Hybrid Attention Models
 
 Hybrid attention models have mixed sliding-window and full-attention layers

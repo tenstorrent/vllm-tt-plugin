@@ -28,6 +28,9 @@ def test_warning_once_deduplicates_identical_calls(caplog):
     finally:
         logger.removeHandler(caplog.handler)
 
-    records = [r for r in caplog.records if "dedup probe" in r.getMessage()]
+    # Dedup by record identity: the assertion is about EMISSIONS, and pytest 9
+    # attaches its own capture handler to the non-propagating logger, so the
+    # one emitted record can appear in caplog twice (once per handler).
+    records = {id(r): r for r in caplog.records if "dedup probe" in r.getMessage()}
     assert len(records) == 1
-    assert records[0].getMessage() == "dedup probe arg"
+    assert next(iter(records.values())).getMessage() == "dedup probe arg"
