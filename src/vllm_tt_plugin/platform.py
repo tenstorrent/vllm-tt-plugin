@@ -50,6 +50,49 @@ TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 _TT_TOKEN_TILE_SIZE = 32
 
 
+def _aligned_block_output_remaining(
+    prompt_len: int, max_model_len: int
+) -> tuple[int, int, int]:
+    """Tile-align the prompt and context; return those lengths and the remainder."""
+    aligned_prompt_len = (
+        (prompt_len + _TT_TOKEN_TILE_SIZE - 1)
+        // _TT_TOKEN_TILE_SIZE
+        * _TT_TOKEN_TILE_SIZE
+    )
+    aligned_max_model_len = max_model_len // _TT_TOKEN_TILE_SIZE * _TT_TOKEN_TILE_SIZE
+    return (
+        aligned_prompt_len,
+        aligned_max_model_len,
+        aligned_max_model_len - aligned_prompt_len,
+    )
+
+
+def _physical_block_output_tokens(max_tokens: int, output_size: int) -> int:
+    return max(output_size, (max_tokens + output_size - 1) // output_size * output_size)
+
+
+def _fit_block_output_max_tokens(
+    prompt_len: int,
+    requested_max_tokens: int | None,
+    output_size: int,
+    max_model_len: int,
+) -> int:
+    """Logical max_tokens whose physical canvases fit, never above the request.
+
+    Unlike ``TTPlatform._resolve_block_output_max_tokens``, this never raises: a
+    prebuilt EngineCoreRequest that skipped frontend validation must not kill
+    the engine on the last canvas. Oversized limits are clamped down to the
+    largest whole-canvas budget that still fits.
+    """
+    _, _, remaining = _aligned_block_output_remaining(prompt_len, max_model_len)
+    max_fit = max(0, remaining // output_size * output_size)
+    if requested_max_tokens is None:
+        return max_fit
+    if _physical_block_output_tokens(requested_max_tokens, output_size) <= remaining:
+        return requested_max_tokens
+    return max_fit
+
+
 def _min_block_output_max_model_len(output_tokens_per_step: int) -> int:
     """Smallest ``max_model_len`` that can serve one block-output request.
 
@@ -1625,22 +1668,14 @@ class TTPlatform(Platform):
         max_model_len: int,
     ) -> int:
         """Resolve one logical limit and enforce its aligned physical capacity."""
-        aligned_prompt_len = (
-            (prompt_len + _TT_TOKEN_TILE_SIZE - 1)
-            // _TT_TOKEN_TILE_SIZE
-            * _TT_TOKEN_TILE_SIZE
+        aligned_prompt_len, aligned_max_model_len, remaining = (
+            _aligned_block_output_remaining(prompt_len, max_model_len)
         )
-        aligned_max_model_len = (
-            max_model_len // _TT_TOKEN_TILE_SIZE * _TT_TOKEN_TILE_SIZE
-        )
-        remaining = aligned_max_model_len - aligned_prompt_len
         max_tokens = requested_max_tokens
         if max_tokens is None:
             max_tokens = max(0, remaining // output_size * output_size)
 
-        physical_output_tokens = max(
-            output_size, (max_tokens + output_size - 1) // output_size * output_size
-        )
+        physical_output_tokens = _physical_block_output_tokens(max_tokens, output_size)
         if physical_output_tokens > remaining:
             request_limit = (
                 "the default max_tokens"

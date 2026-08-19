@@ -16,7 +16,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.interface import PauseState
@@ -204,6 +204,56 @@ def test_trimmed_canvas_consumes_physical_reservation(
     assert list(request.output_token_ids) == kept
     assert request.num_output_placeholders == 0
     assert request.status == status
+
+
+def test_add_request_clamps_max_tokens_that_would_overshoot_max_model_len():
+    """A prebuilt request's leftover max_tokens must not schedule a canvas
+    past max_model_len; that path raises in the runner and kills the engine."""
+    scheduler = _scheduler()
+    request = _request(max_tokens=MAX_MODEL_LEN)
+
+    scheduler.add_request(request)
+
+    # prompt=32, max_model_len=256, canvas=16 → 224 tokens of whole canvases.
+    assert request.max_tokens == 224
+    assert request.sampling_params.max_tokens == 224
+
+
+def test_add_request_strips_host_sampling_controls_from_bypassed_request():
+    """A prebuilt EngineCoreRequest skips frontend validation; any of these
+    controls flips the step onto host sampling, which cannot construct a
+    multi-token canvas and would kill the engine."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(
+        max_tokens=CANVAS,
+        ignore_eos=True,
+        min_p=0.2,
+        min_tokens=1,
+        logit_bias={2: 1.0},
+        allowed_token_ids=[1, 2],
+        bad_words=["bad"],
+        structured_outputs=StructuredOutputsParams(json_object=True),
+    )
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="bypass-0",
+        prompt_token_ids=[1] * 32,
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+    assert request.use_structured_output
+
+    scheduler.add_request(request)
+
+    assert not request.use_structured_output
+    assert params.structured_outputs is None
+    assert params.min_p == 0.0
+    assert params.min_tokens == 0
+    assert params.logit_bias is None
+    assert params.allowed_token_ids is None
+    assert params.bad_words is None
 
 
 def test_running_block_request_rejects_prefix_cache_reset():

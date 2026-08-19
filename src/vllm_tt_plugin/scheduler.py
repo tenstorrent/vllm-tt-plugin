@@ -102,6 +102,86 @@ class TTScheduler(AsyncScheduler):
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
 
+    # Host-only sampling controls and their neutral values: any of these
+    # forces the step onto host sampling (check_perform_device_sampling),
+    # which cannot construct a multi-token canvas and kills the engine.
+    _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
+        ("min_p", 0.0),
+        ("min_tokens", 0),
+        ("logit_bias", None),
+        ("allowed_token_ids", None),
+        ("bad_words", None),
+        ("_bad_words_token_ids", None),
+    )
+
+    def add_request(self, request: Request) -> None:
+        if self._is_block_output_model:
+            self._align_block_output_max_tokens(request)
+            self._neutralize_block_output_host_sampling(request)
+        super().add_request(request)
+
+    def _align_block_output_max_tokens(self, request: Request) -> None:
+        """Clamp max_tokens so a bypassed EngineCoreRequest cannot overshoot.
+
+        Frontend validation rejects an oversized limit. Prebuilt requests skip
+        that path; the last canvas would then be applied past max_model_len and
+        kill the engine. Shrink the logical cap to the largest whole-canvas
+        budget that still fits. Lane mode reaches this through each lane.
+        """
+        from vllm_tt_plugin.platform import _fit_block_output_max_tokens
+
+        prompt_ids = request.prompt_token_ids
+        if prompt_ids is None or request.sampling_params is None:
+            return
+        fitted = _fit_block_output_max_tokens(
+            len(prompt_ids),
+            request.max_tokens,
+            self._output_tokens_per_step,
+            int(self.vllm_config.model_config.max_model_len),
+        )
+        if fitted == request.max_tokens:
+            return
+        logger.debug(
+            "Clamping block-output max_tokens from %s to %s for request %s "
+            "so physical canvases fit max_model_len",
+            request.max_tokens,
+            fitted,
+            request.request_id,
+        )
+        request.max_tokens = fitted
+        request.sampling_params.max_tokens = fitted
+
+    def _neutralize_block_output_host_sampling(self, request: Request) -> None:
+        """Strip host-sampling-forcing controls from a bypassed request.
+
+        Frontend validation rejects these; a prebuilt EngineCoreRequest skips
+        it, and any of them flips the step to host sampling mid-flight, which
+        cannot construct a multi-token canvas and would kill the engine.
+        Raising here is no safer: an add_request exception also tears down
+        EngineCore, so neutralize instead, the way the sampling controls are
+        neutralized at the frontend.
+        """
+        params = request.sampling_params
+        if params is None:
+            return
+        stripped = []
+        if request.structured_output_request is not None:
+            request.structured_output_request = None
+            stripped.append("structured_outputs")
+        if params.structured_outputs is not None:
+            params.structured_outputs = None
+        for field, neutral in self._BLOCK_HOST_ONLY_SAMPLING_NEUTRAL:
+            if getattr(params, field, neutral) not in (neutral, [], {}):
+                setattr(params, field, neutral)
+                stripped.append(field.lstrip("_"))
+        if stripped:
+            logger.warning(
+                "Request %s bypassed frontend validation; stripped "
+                "host-sampling controls unsupported by block-output models: %s",
+                request.request_id,
+                ", ".join(stripped),
+            )
+
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 

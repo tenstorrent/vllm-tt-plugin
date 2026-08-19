@@ -386,6 +386,7 @@ class TTModelRunner:
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
+                output_tokens_per_step=self._output_tokens_per_step,
             )
         else:
             self.input_batch = InputBatch(
@@ -397,6 +398,7 @@ class TTModelRunner:
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
+                output_tokens_per_step=self._output_tokens_per_step,
             )
 
         # The block tables in the persistent input batch have

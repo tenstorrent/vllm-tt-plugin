@@ -14,6 +14,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.platform import (
     TTPlatform,
+    _fit_block_output_max_tokens,
     _install_block_output_input_processor_patch,
     _install_block_output_streaming_input_patch,
 )
@@ -493,6 +494,32 @@ def test_startup_admits_exactly_the_lengths_a_request_can_use(
         serves = False
 
     assert starts == serves
+
+
+def test_fit_clamps_leftover_max_tokens_that_resolve_rejects():
+    """Natural leftover max_tokens = max_model_len - prompt_len needs four
+    256-token canvases after a 32-tile prompt, which overshoots 1024."""
+    prompt_len = 100
+    max_model_len = 1024
+    output_size = 256
+    leftover = max_model_len - prompt_len
+
+    with pytest.raises(ValueError, match=r"requires 1024 physical"):
+        TTPlatform._resolve_block_output_max_tokens(
+            prompt_len, leftover, output_size, max_model_len
+        )
+
+    assert (
+        _fit_block_output_max_tokens(prompt_len, leftover, output_size, max_model_len)
+        == 768
+    )
+    assert (
+        _fit_block_output_max_tokens(prompt_len, 16, output_size, max_model_len) == 16
+    )
+    assert (
+        _fit_block_output_max_tokens(prompt_len, None, output_size, max_model_len)
+        == 768
+    )
 
 
 def test_startup_auto_disables_prefix_caching_for_block_models(monkeypatch):

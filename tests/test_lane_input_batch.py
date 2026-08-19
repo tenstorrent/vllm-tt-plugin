@@ -444,7 +444,9 @@ def _ref_sampling_metadata(batch, n):
     )
 
 
-def _plain_batch_of_one(req, with_custom=True, disable_logprobs=False):
+def _plain_batch_of_one(
+    req, with_custom=True, disable_logprobs=False, output_tokens_per_step=1
+):
     b = InputBatch(
         max_num_reqs=1,
         max_model_len=MAX_MODEL_LEN,
@@ -454,6 +456,7 @@ def _plain_batch_of_one(req, with_custom=True, disable_logprobs=False):
         kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(1, with_custom=with_custom),
         disable_logprobs=disable_logprobs,
+        output_tokens_per_step=output_tokens_per_step,
     )
     b.add_request(req)
     b.refresh_logitsprocs()
@@ -466,6 +469,24 @@ def test_worker_guard_neutralizes_logprobs_for_block_output():
     batch = _plain_batch_of_one(req, disable_logprobs=True)
 
     assert batch.max_num_logprobs is None
+
+
+def test_worker_guard_clamps_max_tokens_for_block_output():
+    leftover = MAX_MODEL_LEN - 1
+    req = _make_req("block", [1], [], dict(temperature=0.0, max_tokens=leftover))
+
+    _plain_batch_of_one(req, output_tokens_per_step=16)
+
+    # prompt=1 tiles to 32; remaining 224 of 16-token canvases.
+    assert req.sampling_params.max_tokens == 224
+
+
+def test_worker_guard_preserves_max_tokens_that_already_fit():
+    req = _make_req("block", [1], [], dict(temperature=0.0, max_tokens=16))
+
+    _plain_batch_of_one(req, output_tokens_per_step=16)
+
+    assert req.sampling_params.max_tokens == 16
 
 
 def test_lane_batch_forwards_the_logprobs_guard():

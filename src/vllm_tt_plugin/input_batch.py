@@ -209,10 +209,13 @@ class InputBatch:
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
     ):
         self.max_num_reqs = max_num_reqs
+        self.max_model_len = max_model_len
         self.vocab_size = vocab_size
         self.disable_logprobs = disable_logprobs
+        self.output_tokens_per_step = output_tokens_per_step
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -330,6 +333,23 @@ class InputBatch:
         # Sampling-related.
         sampling_params = request.sampling_params
         assert sampling_params is not None, "pooling requests not supported yet"
+
+        # Block-output models commit a full canvas per step. Keep this
+        # worker-side clamp even if a prebuilt EngineCoreRequest bypasses the
+        # frontend validation: an unaligned leftover max_tokens (for example
+        # max_model_len - prompt_len) would apply the last canvas past
+        # max_model_len and kill the engine.
+        if self.output_tokens_per_step > 1:
+            from vllm_tt_plugin.platform import _fit_block_output_max_tokens
+
+            fitted = _fit_block_output_max_tokens(
+                num_prompt_tokens,
+                sampling_params.max_tokens,
+                self.output_tokens_per_step,
+                self.max_model_len,
+            )
+            if sampling_params.max_tokens != fitted:
+                sampling_params.max_tokens = fitted
 
         # Register with batch update builder for logits processors
         self.sampling.batch_update_builder.added.append(
@@ -746,6 +766,7 @@ class TTLaneInputBatch(InputBatch):
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
+        output_tokens_per_step: int = 1,
     ):
         if num_lanes < 1 or per_lane < 1:
             raise ValueError(
@@ -763,6 +784,7 @@ class TTLaneInputBatch(InputBatch):
             kernel_block_sizes=kernel_block_sizes,
             logitsprocs=logitsprocs,
             disable_logprobs=disable_logprobs,
+            output_tokens_per_step=output_tokens_per_step,
         )
         # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
         # pre-size so a request can occupy any slot in its lane's chunk, with
