@@ -313,7 +313,7 @@ sizes and validates the KV cache against it, the two must be chosen together:
 | --- | --- |
 | numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
 | numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. |
-| `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. |
+| `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. For block-output models the TT worker fits `max_model_len` to the pool minus one output canvas before vLLM's auto-fit runs. |
 | omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
 
 Explicit `-1` auto-fit picks the largest length that fits **one** request, so it

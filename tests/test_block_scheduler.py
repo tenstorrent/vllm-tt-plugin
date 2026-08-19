@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -38,6 +40,34 @@ MAX_MODEL_LEN = 256
 LOCAL_MODEL_CONFIG = Path(__file__).parent / "model_configs" / "qwen2"
 
 
+class _StubModel:
+    """No model_capabilities: the platform hook resolves
+    output_tokens_per_step=1; tests inject the block width afterwards."""
+
+
+@contextmanager
+def _stub_model_resolution():
+    """Resolve the stub instead of tt-metal's TTQwen2ForCausalLM while the
+    platform hook runs inside VllmConfig.__post_init__ (mirrors
+    test_block_request_validation._patch_model_resolution)."""
+    with (
+        patch("vllm_tt_plugin.platform.register_tt_models"),
+        patch(
+            "vllm_tt_plugin.platform._resolve_standard_dp_visible_device_groups",
+            return_value=None,
+        ),
+        patch(
+            "vllm.model_executor.models.registry.ModelRegistry.get_supported_archs",
+            return_value=["TTQwen2ForCausalLM"],
+        ),
+        patch(
+            "vllm.model_executor.model_loader.utils.get_model_architecture",
+            return_value=(_StubModel, None),
+        ),
+    ):
+        yield
+
+
 def _scheduler(
     output_width: int = CANVAS, *, diffusion_checkpoint: bool = False
 ) -> TTScheduler:
@@ -45,6 +75,7 @@ def _scheduler(
         model=str(LOCAL_MODEL_CONFIG),
         dtype="float16",
         seed=42,
+        skip_tokenizer_init=True,
     )
     model_config.max_model_len = MAX_MODEL_LEN
     scheduler_config = SchedulerConfig(
@@ -61,13 +92,14 @@ def _scheduler(
         cache_dtype="auto",
         enable_prefix_caching=False,
     )
-    config = VllmConfig(
-        scheduler_config=scheduler_config,
-        model_config=model_config,
-        cache_config=cache_config,
-        parallel_config=ParallelConfig(),
-        device_config=DeviceConfig(device="cpu"),
-    )
+    with _stub_model_resolution():
+        config = VllmConfig(
+            scheduler_config=scheduler_config,
+            model_config=model_config,
+            cache_config=cache_config,
+            parallel_config=ParallelConfig(),
+            device_config=DeviceConfig(device="cpu"),
+        )
     config.scheduler_config.async_scheduling = False
     if diffusion_checkpoint:
         # Reproduce the platform hook's post-update state, including

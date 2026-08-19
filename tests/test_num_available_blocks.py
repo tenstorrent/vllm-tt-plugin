@@ -160,10 +160,14 @@ def test_block_output_rejects_fallback_budget_below_served_length(cfg):
 def test_block_output_auto_fit_shrinks_max_model_len_instead_of_raising(cfg):
     """``--max-model-len -1`` must not die on the pre-auto-fit budget check.
 
-    Upstream's ``_auto_fit_max_model_len`` only runs after
-    ``determine_available_memory`` returns, so the worker fits the length
-    itself, keeping one full output canvas of headroom in the pool."""
-    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+    The sizing query stays pure; the worker fits the length in a separate
+    step (``determine_available_memory`` calls
+    ``_fit_block_output_max_model_len``), keeping one full output canvas of
+    headroom in the pool."""
+    from vllm_tt_plugin.worker import (
+        _fit_block_output_max_model_len,
+        get_num_available_blocks_tt,
+    )
 
     cfg.model_config.max_model_len = 200_000  # HF-derived full context
     cfg.model_config.original_max_model_len = -1
@@ -179,6 +183,9 @@ def test_block_output_auto_fit_shrinks_max_model_len_instead_of_raising(cfg):
     resolved_kv_tokens = n * cfg.cache_config.block_size
     # Fallback budget 131072 + one 256-token canvas of padding.
     assert resolved_kv_tokens == 131_072 + 256
+    assert cfg.model_config.max_model_len == 200_000
+
+    _fit_block_output_max_model_len(cfg, n)
     assert cfg.model_config.max_model_len == resolved_kv_tokens - 256
 
 

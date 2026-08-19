@@ -26,7 +26,11 @@ Run from the paired tt-metal checkout so the registered model target under
 ```bash
 export PYTHONPATH=/path/to/tt-metal
 export MESH_DEVICE=P150x4
-export VLLM_RPC_TIMEOUT=1800000
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export DG_UPFRONT_COARSE_PREFILL_BUCKETS=1
+export DG_UPFRONT_LAZY_PREFILL_RECAPTURE=1
+export DG_PREFILL_FIXED_CHUNKS=1
+export DG_PREFILL_RAGGED_CHUNK=1024
 export DG_UPFRONT_PREFILL_WARMUP_LENS=32,64,96
 export DG_TRACE_REGION_SIZE=3758096384
 
@@ -38,7 +42,6 @@ python -m vllm.entrypoints.openai.api_server \
   --max-num-batched-tokens 262144 \
   --max-num-seqs 1 \
   --block-size 64 \
-  --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
   --no-async-scheduling \
   --reasoning-parser gemma4 \
@@ -52,16 +55,24 @@ calling add `--enable-auto-tool-choice --tool-call-parser gemma4`.
 `--max-num-batched-tokens` concerns scheduler prompt admission. It does not
 disable DiffusionGemma's model-internal ragged and chunked prompt processing.
 The `DG_TRACE_REGION_SIZE` environment value must match
-`tt.trace_region_size`; the values above are the QB2 (`MESH_DEVICE=P150x4`)
-release configuration validated by tt-shield. If the expected aligned prompt
-lengths change, update `DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly.
+`tt.trace_region_size`. The values above are the QB2 (`MESH_DEVICE=P150x4`)
+release configuration validated by tt-shield; variables whose validated value
+matches the tt-metal default are omitted. `VLLM_ENABLE_V1_MULTIPROCESSING=0`
+keeps the engine core in the API-server process. The
+`DG_UPFRONT_COARSE_PREFILL_BUCKETS`, `DG_UPFRONT_LAZY_PREFILL_RECAPTURE`, and
+`DG_PREFILL_FIXED_CHUNKS` gates (all default off) are required to serve
+arbitrary prompt lengths; without them only prompts whose execution length is
+in `DG_UPFRONT_PREFILL_WARMUP_LENS` are served, and any other prompt returns
+an empty completion. If the expected aligned prompt lengths change, update
+`DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly.
 
 ## Request Contract
 
 Current support is synchronous, DP=1, one active sequence, on-device sampling
-for all model calls, and no vLLM automatic prefix caching or scheduler chunked
-prefill. Async scheduling, host sampling, and custom logits processors are
-rejected at launch; unsupported per-request controls are listed below.
+for all model calls, and no scheduler chunked prefill; vLLM automatic prefix
+caching is disabled by the platform. Async scheduling, host sampling, and
+custom logits processors are rejected at launch; unsupported per-request
+controls are listed below.
 
 HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 

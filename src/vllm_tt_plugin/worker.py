@@ -402,6 +402,7 @@ class TTWorker(WorkerBase):
               process.
         """
         num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
+        _fit_block_output_max_model_len(self.vllm_config, num_tt_blocks)
         kv_cache_spec = self.get_kv_cache_spec()
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return _available_kv_cache_memory_bytes_for_num_blocks(
@@ -509,6 +510,10 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
 
+    Pure sizing query: validates the budget (raising when a block-output
+    pool cannot hold even one canvas) but never mutates the config; the
+    ``--max-model-len -1`` fit lives in ``_fit_block_output_max_model_len``.
+
     ``num_devices`` is the runtime-discovered physical device count.
     """
 
@@ -606,23 +611,13 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
         if resolved_kv_tokens < required_kv_tokens:
             fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
+            # ``--max-model-len -1`` is fitted to the pool afterwards by
+            # ``_fit_block_output_max_model_len``, provided at least one
+            # output canvas survives the fit.
             if (
-                getattr(model_config, "original_max_model_len", None) == -1
-                and fitted_max_model_len >= output_tokens_per_step
+                getattr(model_config, "original_max_model_len", None) != -1
+                or fitted_max_model_len < output_tokens_per_step
             ):
-                # ``--max-model-len -1``: upstream's auto-fit only runs after
-                # this budget is reported, so fit here where the TT pool is
-                # known, keeping one full output canvas of headroom. The engine
-                # snapshots max_model_len after this call, so the fitted value
-                # reaches the workers and the frontend ready-response sync.
-                logger.info(
-                    "Auto-fitting block-output max_model_len from %d to %d so "
-                    "the KV budget covers one full output canvas.",
-                    model_config.max_model_len,
-                    fitted_max_model_len,
-                )
-                model_config.max_model_len = fitted_max_model_len
-            else:
                 raise ValueError(
                     "Block-output KV budget is too small: resolved "
                     f"{resolved_kv_tokens} tokens, but max_model_len="
@@ -633,6 +628,43 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
                 )
 
     return num_tt_blocks
+
+
+def _fit_block_output_max_model_len(
+    vllm_config: VllmConfig, num_tt_blocks: int
+) -> None:
+    """Fit ``--max-model-len -1`` to the block-output KV pool.
+
+    Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
+    (vllm/v1/core/kv_cache_utils.py:2092): the TT pool is a fixed budget
+    rather than profiled memory, and the upstream fit would hand the whole
+    pool to ``max_model_len``, while a block-output request also needs one
+    full output canvas of headroom. The engine snapshots ``max_model_len``
+    only after ``determine_available_memory`` returns
+    (``EngineCore._initialize_kv_caches``), so upstream's fit sees the
+    fitted value as its baseline and, since it only ever shrinks, keeps it.
+
+    ``get_num_available_blocks_tt`` has already rejected pools smaller than
+    one canvas, so the fitted length is always positive here.
+    """
+    model_config = vllm_config.model_config
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    if (
+        getattr(model_config, "original_max_model_len", None) != -1
+        or output_tokens_per_step <= 1
+    ):
+        return
+    resolved_kv_tokens = num_tt_blocks * vllm_config.cache_config.block_size
+    fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
+    if fitted_max_model_len >= model_config.max_model_len:
+        return
+    logger.info(
+        "Auto-fitting block-output max_model_len from %d to %d so "
+        "the KV budget covers one full output canvas.",
+        model_config.max_model_len,
+        fitted_max_model_len,
+    )
+    model_config.max_model_len = fitted_max_model_len
 
 
 # TT-NN utilities

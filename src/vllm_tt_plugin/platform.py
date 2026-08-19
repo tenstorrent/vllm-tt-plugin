@@ -629,7 +629,7 @@ def _install_block_output_reset_abort_patch() -> None:
         if (
             reset_running_requests
             and send_abort_outputs is not None
-            and getattr(scheduler, "_is_block_output_model", False)
+            and get_tt_output_tokens_per_step(scheduler.vllm_config) > 1
             and scheduler.running
             and scheduler.pause_state != PauseState.PAUSED_ALL
         ):
@@ -679,7 +679,7 @@ def _install_block_output_pause_guard_patch() -> None:
             if (
                 mode == "keep"
                 and clear_cache
-                and getattr(scheduler, "_is_block_output_model", False)
+                and get_tt_output_tokens_per_step(scheduler.vllm_config) > 1
                 and scheduler.running
             ):
                 raise ValueError(
@@ -1253,6 +1253,41 @@ class TTPlatform(Platform):
                 "DiffusionGemma must declare output_tokens_per_step > 1 "
                 "in model_capabilities"
             )
+
+        # Prefix caching is capability-gated per model: unless the model class
+        # declares supports_prefix_caching, the platform switches vLLM
+        # automatic prefix caching off instead of requiring an operator flag.
+        supports_prefix_caching = (
+            model_capabilities.get("supports_prefix_caching", False)
+            if model_capabilities
+            else False
+        )
+        if is_block_output_model and supports_prefix_caching:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['supports_prefix_caching']=True, "
+                "but block-output models (output_tokens_per_step > 1) bypass "
+                "the vLLM prefix cache; fix the model's capability declaration"
+            )
+        if vllm_config.cache_config.enable_prefix_caching:
+            if not supports_prefix_caching:
+                vllm_config.cache_config.enable_prefix_caching = False
+                logger.warning(
+                    "Prefix caching is not supported in TT backend for %s, "
+                    "disabling it",
+                    model_class.__module__,
+                )
+            elif model_config.get_sliding_window() is not None:
+                vllm_config.cache_config.enable_prefix_caching = False
+                logger.warning(
+                    "Prefix caching is not supported in TT backend for "
+                    "models with sliding window, disabling it"
+                )
+        logger.info(
+            "Automatic prefix caching is %s",
+            "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
+        )
+
         if is_block_output_model:
             required_lifecycle_hooks = (
                 "release_request",
@@ -1323,11 +1358,6 @@ class TTPlatform(Platform):
                 raise ValueError(
                     "Block-output models do not yet support data parallelism; "
                     "use --data-parallel-size 1"
-                )
-            if vllm_config.cache_config.enable_prefix_caching:
-                raise ValueError(
-                    "Block-output models do not support vLLM automatic prefix "
-                    "caching; disable prefix caching"
                 )
             if model_config.logits_processors:
                 raise ValueError(
@@ -1455,37 +1485,6 @@ class TTPlatform(Platform):
                         vllm_config, cls._standard_dp_visible_device_groups
                     )
 
-        if vllm_config.cache_config.enable_prefix_caching:
-            # Check prefix caching support from capabilities (default to False)
-            supports_prefix_caching = (
-                model_capabilities.get("supports_prefix_caching", False)
-                if model_capabilities
-                else False
-            )
-
-            if not supports_prefix_caching:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported in TT backend for %s, "
-                    "disabling it",
-                    model_class.__module__,
-                )
-            else:
-                # Check if the model architecture uses sliding window
-                uses_sliding_window = (
-                    vllm_config.model_config.get_sliding_window() is not None
-                )
-                if uses_sliding_window:
-                    vllm_config.cache_config.enable_prefix_caching = False
-                    logger.warning(
-                        "Prefix caching is not supported in TT backend for "
-                        "models with sliding window, disabling it"
-                    )
-
-        logger.info(
-            "Automatic prefix caching is %s",
-            "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
-        )
         # Check that all invariants are satisfied after all rewriting
         vllm_config.scheduler_config.verify_max_model_len(
             vllm_config.model_config.max_model_len

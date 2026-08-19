@@ -369,6 +369,33 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
         TTPlatform.check_and_update_config(config)
 
 
+def test_startup_auto_disables_prefix_caching_for_block_models(monkeypatch):
+    config = _config()
+    config.cache_config.enable_prefix_caching = True
+    _patch_model_resolution(monkeypatch)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching is False
+
+
+def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
+    class BlockModelClaimingPrefixCaching(BlockModel):
+        model_capabilities = {
+            **BlockModel.model_capabilities,
+            "supports_prefix_caching": True,
+        }
+
+    config = _config()
+    _patch_model_resolution(monkeypatch, BlockModelClaimingPrefixCaching)
+
+    with pytest.raises(
+        ValueError,
+        match=r"supports_prefix_caching.*capability declaration",
+    ):
+        TTPlatform.check_and_update_config(config)
+
+
 @pytest.mark.parametrize(
     ("prompt_lens", "expected"),
     [
