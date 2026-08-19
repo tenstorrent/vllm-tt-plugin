@@ -22,6 +22,7 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.
+    import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.input_processor as input_processor
 
     from vllm_tt_plugin.platform import TTPlatform
@@ -34,8 +35,20 @@ def reset_tt_platform_class_state():
     saved_original_process_inputs = input_processor.__dict__.get(
         "_tt_original_process_inputs", unset
     )
+    saved_add_streaming_input_request = async_llm.AsyncLLM._add_streaming_input_request
+    saved_original_add_streaming_input_request = async_llm.__dict__.get(
+        "_tt_original_add_streaming_input_request", unset
+    )
 
     yield
+
+    async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
+    if saved_original_add_streaming_input_request is unset:
+        async_llm.__dict__.pop("_tt_original_add_streaming_input_request", None)
+    else:
+        async_llm._tt_original_add_streaming_input_request = (
+            saved_original_add_streaming_input_request
+        )
 
     input_processor.InputProcessor.process_inputs = saved_process_inputs
     if saved_original_process_inputs is unset:

@@ -443,7 +443,7 @@ def _ref_sampling_metadata(batch, n):
     )
 
 
-def _plain_batch_of_one(req, with_custom=True):
+def _plain_batch_of_one(req, with_custom=True, disable_logprobs=False):
     b = InputBatch(
         max_num_reqs=1,
         max_model_len=MAX_MODEL_LEN,
@@ -452,10 +452,19 @@ def _plain_batch_of_one(req, with_custom=True):
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(1, with_custom=with_custom),
+        disable_logprobs=disable_logprobs,
     )
     b.add_request(req)
     b.refresh_logitsprocs()
     return b
+
+
+def test_worker_guard_neutralizes_logprobs_for_block_output():
+    req = _make_req("block", [1], [], dict(temperature=0.0, logprobs=0))
+
+    batch = _plain_batch_of_one(req, disable_logprobs=True)
+
+    assert batch.max_num_logprobs is None
 
 
 def _feature_specs():

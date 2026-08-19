@@ -531,10 +531,9 @@ def _install_block_output_input_processor_patch() -> None:
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
     reject resumable streaming-input chunks before EngineCore admits any, and
     neutralize model-owned sampling controls and round the whole-canvas default
-    on the clone, without mutating the shared caller-owned input.
-    (vLLM creates the streaming-input session wrapper without the ``resumable``
-    flag, so the session opens and the client sees the error on its first
-    chunk.)
+    on the clone, without mutating the shared caller-owned input. The separate
+    AsyncLLM entry-point guard rejects streaming-input sessions before their
+    synthetic final request can be created; this remains a chunk-level backstop.
 
     TODO: remove once vLLM exposes a platform hook for per-request defaults.
     """
@@ -588,6 +587,27 @@ def _install_block_output_input_processor_patch() -> None:
         return request
 
     input_processor.InputProcessor.process_inputs = process_inputs_tt
+
+
+def _install_block_output_streaming_input_patch() -> None:
+    """Reject streaming-input sessions before vLLM creates a final request."""
+    import vllm.v1.engine.async_llm as async_llm
+
+    if hasattr(async_llm, "_tt_original_add_streaming_input_request"):
+        return
+
+    original = async_llm.AsyncLLM._add_streaming_input_request
+    async_llm._tt_original_add_streaming_input_request = original
+
+    async def add_streaming_input_request_tt(self, *args, **kwargs):
+        if get_tt_output_tokens_per_step(self.vllm_config) > 1:
+            raise ValueError(
+                "TT block-output models do not support resumable "
+                "streaming-input requests"
+            )
+        return await original(self, *args, **kwargs)
+
+    async_llm.AsyncLLM._add_streaming_input_request = add_streaming_input_request_tt
 
 
 def _install_block_output_reset_abort_patch() -> None:
@@ -1289,6 +1309,15 @@ class TTPlatform(Platform):
         )
 
         if is_block_output_model:
+            distributed_executor_backend = getattr(
+                parallel_config, "distributed_executor_backend", None
+            )
+            if distributed_executor_backend not in (None, "uni"):
+                raise ValueError(
+                    "Block-output models require the uniproc executor; "
+                    f"got distributed_executor_backend="
+                    f"{distributed_executor_backend!r}"
+                )
             required_lifecycle_hooks = (
                 "release_request",
                 "release_persistent_capture",
@@ -1380,6 +1409,7 @@ class TTPlatform(Platform):
         cls.output_tokens_per_step = output_tokens_per_step
         if is_block_output_model:
             _install_block_output_input_processor_patch()
+            _install_block_output_streaming_input_patch()
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()
         # vLLM 0.24 syncs an auto-fitted max_model_len back into this same
@@ -1563,6 +1593,9 @@ class TTPlatform(Platform):
         from vllm.sampling_params import SamplingParams
 
         dev = cls.device_name
+
+        if processed_inputs.get("prompt_embeds") is not None:
+            raise ValueError(f"prompt_embeds are not supported on {dev}")
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")

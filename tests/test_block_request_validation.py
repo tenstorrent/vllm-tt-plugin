@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+import asyncio
 from functools import cached_property
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _install_block_output_input_processor_patch,
+    _install_block_output_streaming_input_patch,
 )
 
 
@@ -191,7 +193,13 @@ class _ModelConfig(SimpleNamespace):
         return getattr(self.hf_config, "canvas_length", None) is not None
 
 
-def _config(*, max_num_seqs=1, data_parallel_size=1, async_scheduling=False):
+def _config(
+    *,
+    max_num_seqs=1,
+    data_parallel_size=1,
+    async_scheduling=False,
+    distributed_executor_backend=None,
+):
     return SimpleNamespace(
         additional_config={"tt": {"sample_on_device_mode": "all"}},
         model_config=_ModelConfig(
@@ -225,6 +233,7 @@ def _config(*, max_num_seqs=1, data_parallel_size=1, async_scheduling=False):
             pipeline_parallel_size=1,
             data_parallel_size=data_parallel_size,
             worker_cls="auto",
+            distributed_executor_backend=distributed_executor_backend,
         ),
         diffusion_config=SimpleNamespace(canvas_length=256),
         speculative_config=None,
@@ -358,6 +367,7 @@ def test_startup_installs_input_processor_patch_only_for_block_models(
     [
         ({"max_num_seqs": 2}, "max-num-seqs 1"),
         ({"data_parallel_size": 2}, "data parallelism"),
+        ({"distributed_executor_backend": "mp"}, "uniproc executor"),
         ({"async_scheduling": True}, "synchronous serving only"),
     ],
 )
@@ -474,12 +484,53 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
     assert request.sampling_params.temperature == 0.5
 
 
-def test_explicit_embeds_request_enforces_physical_capacity():
-    with pytest.raises(ValueError, match=r"requires 512 physical.*exceeding"):
+@pytest.mark.parametrize("output_size", [1, 256], ids=["ar", "block"])
+def test_prompt_embeds_are_rejected_for_every_tt_model(monkeypatch, output_size):
+    monkeypatch.setattr(TTPlatform, "output_tokens_per_step", output_size)
+
+    with pytest.raises(ValueError, match=r"prompt_embeds are not supported"):
         TTPlatform.validate_request(
             {"prompt_token_ids": None, "prompt_embeds": [0] * 513},
             SamplingParams(max_tokens=257),
         )
+
+
+@pytest.mark.parametrize("output_size", [1, 256], ids=["ar", "block"])
+def test_streaming_input_session_is_rejected_only_for_block_models(
+    monkeypatch, output_size
+):
+    import vllm.v1.engine.async_llm as async_llm
+
+    calls = []
+
+    async def original(_self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return "accepted"
+
+    monkeypatch.setattr(async_llm.AsyncLLM, "_add_streaming_input_request", original)
+    monkeypatch.delattr(
+        async_llm,
+        "_tt_original_add_streaming_input_request",
+        raising=False,
+    )
+    _install_block_output_streaming_input_patch()
+
+    config = SimpleNamespace(additional_config={})
+    store_tt_output_tokens_per_step(config, output_size)
+    engine = SimpleNamespace(vllm_config=config)
+
+    if output_size > 1:
+        with pytest.raises(
+            ValueError, match="do not support resumable streaming-input"
+        ):
+            asyncio.run(async_llm.AsyncLLM._add_streaming_input_request(engine))
+        assert calls == []
+    else:
+        result = asyncio.run(
+            async_llm.AsyncLLM._add_streaming_input_request(engine, "request")
+        )
+        assert result == "accepted"
+        assert calls == [(("request",), {})]
 
 
 def test_explicit_request_uses_tile_aligned_physical_capacity(monkeypatch):
@@ -500,24 +551,28 @@ def test_explicit_request_uses_tile_aligned_physical_capacity(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "prompt",
+    ("prompt", "error"),
     [
-        pytest.param({"prompt_token_ids": [1] * 1000}, id="token-ids-no-room"),
+        pytest.param(
+            {"prompt_token_ids": [1] * 1000},
+            r"physical 256-token canvases.*requires 256 physical.*exceeding",
+            id="token-ids-no-room",
+        ),
         pytest.param(
             {"prompt_token_ids": None, "prompt_embeds": [0] * 900},
+            r"prompt_embeds are not supported",
             id="embeds-partial-tile",
         ),
     ],
 )
-def test_input_processor_rejects_default_without_whole_canvas(monkeypatch, prompt):
+def test_input_processor_rejects_default_without_whole_canvas(
+    monkeypatch, prompt, error
+):
     processor_cls, processor = _processor_harness(monkeypatch)
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
-    with pytest.raises(
-        ValueError,
-        match=r"physical 256-token canvases.*requires 256 physical.*exceeding",
-    ):
+    with pytest.raises(ValueError, match=error):
         processor_cls.process_inputs(processor, "no-canvas", prompt, params)
 
     assert params.max_tokens is None

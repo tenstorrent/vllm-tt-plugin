@@ -208,9 +208,11 @@ class InputBatch:
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
+        self.disable_logprobs = disable_logprobs
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -393,8 +395,13 @@ class InputBatch:
         if request.generator is not None:
             self.sampling.generators[req_index] = request.generator
 
+        # Block-output models cannot return per-token logprobs. Keep this
+        # worker-side guard even if a prebuilt EngineCoreRequest bypasses the
+        # frontend validation.
+        if self.disable_logprobs:
+            self.sampling.num_logprobs[req_index] = LOGPROBS_NONE_SENTINEL
         # Logprobs (-1 means all vocab logprobs, remap to vocab_size)
-        if sampling_params.logprobs is not None:
+        elif sampling_params.logprobs is not None:
             self.sampling.num_logprobs[req_index] = (
                 self.vocab_size
                 if sampling_params.logprobs == -1

@@ -234,7 +234,7 @@ deterministic, but it is not compatible with DP models.
 Start the OpenAI-compatible server:
 
 ```bash
-VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K \
+MESH_DEVICE=T3K \
 python examples/server_example_tt.py
 ```
 
@@ -372,7 +372,6 @@ changes are needed:
 ```bash
 MESH_DEVICE=TG \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
-VLLM_RPC_TIMEOUT=900000 \
 python examples/server_example_tt.py \
   --model "meta-llama/Llama-3.3-70B-Instruct" \
   --data_parallel_size 4 \
