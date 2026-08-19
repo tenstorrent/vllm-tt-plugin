@@ -116,6 +116,20 @@ class TTScheduler(AsyncScheduler):
 
     def add_request(self, request: Request) -> None:
         if self._is_block_output_model:
+            existing = self.requests.get(request.request_id)
+            if existing is not None and existing.streaming_queue is None:
+                # A continuation (next input chunk or the closing sentinel) of
+                # a session whose resumable flag the neutralization below
+                # scrubbed. The base scheduler asserts on the missing
+                # streaming_queue, which would tear down EngineCore. The
+                # session cannot accept more input, so drop the message; the
+                # live request finishes and notifies its client on its own.
+                logger.warning(
+                    "Dropping streaming-input continuation for request %s: "
+                    "block-output models do not support resumable sessions",
+                    request.request_id,
+                )
+                return
             self._align_block_output_max_tokens(request)
             self._neutralize_block_output_host_sampling(request)
         super().add_request(request)

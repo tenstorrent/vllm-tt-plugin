@@ -269,6 +269,43 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
 
 
+def test_continuation_of_scrubbed_resumable_session_is_dropped():
+    """Scrubbing resumable admits the first chunk with streaming_queue=None,
+    and the streaming protocol always sends a same-id follow-up (the next
+    chunk or the closing sentinel); the base scheduler's duplicate-id assert
+    on the missing queue would tear down EngineCore."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=CANVAS, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    first = Request(
+        request_id="stream-0",
+        prompt_token_ids=[1] * 32,
+        sampling_params=params,
+        pooling_params=None,
+        resumable=True,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+    scheduler.add_request(first)
+    assert first.resumable is False
+    assert first.streaming_queue is None
+
+    sentinel_params = SamplingParams(max_tokens=1)
+    sentinel_params.update_from_generation_config({}, eos_token_id=2)
+    sentinel = Request(
+        request_id="stream-0",
+        prompt_token_ids=[0],
+        sampling_params=sentinel_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+    scheduler.add_request(sentinel)  # must not raise
+
+    assert scheduler.requests["stream-0"] is first
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"stream-0": 32}
+
+
 def test_dead_zone_prompt_finishes_length_capped_instead_of_killing_engine():
     """A bypassed prompt that leaves no room for a whole canvas is clamped to
     max_tokens=0 and must finish length-capped on its first canvas. The old
