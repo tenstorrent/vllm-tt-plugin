@@ -273,6 +273,10 @@ class ARModel:
 
 
 def _patch_model_resolution(monkeypatch, model_class=BlockModel):
+    # Simulate a fresh process: the autouse block_contract fixture pre-seeds
+    # the class handle, which the hook's one-engine-per-process guard would
+    # otherwise mistake for a live engine.
+    monkeypatch.setattr(TTPlatform, "_tt_vllm_config", None)
     monkeypatch.setattr(
         "vllm_tt_plugin.platform.register_tt_models", lambda *_args, **_kwargs: None
     )
@@ -383,6 +387,37 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
 
     with pytest.raises(ValueError, match=message):
         TTPlatform.check_and_update_config(config)
+
+
+def test_startup_rejects_the_rust_frontend_for_block_models(monkeypatch):
+    # The Rust frontend serves HTTP outside Python, bypassing validate_request
+    # and the InputProcessor patch entirely.
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+
+    ar_config = _config()
+    _patch_model_resolution(monkeypatch, ARModel)
+    TTPlatform.check_and_update_config(ar_config)
+
+    config = _config()
+    _patch_model_resolution(monkeypatch)
+    with pytest.raises(ValueError, match="Rust frontend"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_second_engine_config_is_rejected_when_a_block_model_is_involved(
+    monkeypatch,
+):
+    """The platform keeps process-level admission state (one config handle);
+    a second engine with a different contract would silently corrupt it. The
+    same object re-running the hook (EngineCore re-runs __post_init__) passes."""
+    _patch_model_resolution(monkeypatch)
+    config = _config()
+    TTPlatform.check_and_update_config(config)
+    TTPlatform.check_and_update_config(config)  # same object: fine
+
+    other = _config()
+    with pytest.raises(ValueError, match="One TT engine per process"):
+        TTPlatform.check_and_update_config(other)
 
 
 @pytest.mark.parametrize("max_model_len", [256, 280, 288, 512])

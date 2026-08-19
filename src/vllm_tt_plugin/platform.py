@@ -1153,6 +1153,23 @@ class TTPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
+        # The class carries process-level admission state, so a live
+        # block-output engine cannot share the process with a second engine:
+        # the reset below (and every class write after it) would corrupt the
+        # contract the first engine validates against. Raise before touching
+        # anything. Re-running the hook on the same config (EngineCore re-runs
+        # __post_init__ in-process) is fine.
+        previous_tt_vllm_config = cls._tt_vllm_config
+        if (
+            previous_tt_vllm_config is not None
+            and previous_tt_vllm_config is not vllm_config
+            and is_tt_block_output_model(previous_tt_vllm_config)
+        ):
+            raise ValueError(
+                "One TT engine per process when a block-output model is "
+                "involved: TTPlatform keeps process-level admission state "
+                "that a second engine configuration would overwrite"
+            )
         cls._standard_dp_visible_device_groups = None
         cls._standard_dp_mesh_grids = {}
         cls._tt_vllm_config = None
@@ -1420,6 +1437,16 @@ class TTPlatform(Platform):
                     f"got distributed_executor_backend="
                     f"{distributed_executor_backend!r}"
                 )
+            # The Rust frontend handles HTTP outside Python, so nothing runs
+            # TTPlatform.validate_request or the InputProcessor patch: block
+            # contract violations (structured output, logit bias, oversized
+            # prompts) would reach the engine unchecked and kill it mid-step.
+            if bool(int(os.environ.get("VLLM_USE_RUST_FRONTEND", "0"))):
+                raise ValueError(
+                    "Block-output models require the Python frontend: the "
+                    "Rust frontend bypasses the TT request validation; unset "
+                    "VLLM_USE_RUST_FRONTEND"
+                )
             if model_config.logits_processors:
                 raise ValueError(
                     "Block-output models do not support --logits-processors "
@@ -1548,6 +1575,20 @@ class TTPlatform(Platform):
         # vLLM 0.24 syncs an auto-fitted max_model_len back into this same
         # frontend config through EngineCoreReadyResponse. Retain one config
         # handle rather than snapshotting either the width or the length.
+        # The entry check above protects a live block engine; this one refuses
+        # to START a block engine in a process another engine already
+        # configured (AR engines may share a process freely: neither reads the
+        # block contract from the handle).
+        if (
+            previous_tt_vllm_config is not None
+            and previous_tt_vllm_config is not vllm_config
+            and is_block_output_model
+        ):
+            raise ValueError(
+                "One TT engine per process when a block-output model is "
+                "involved: TTPlatform keeps process-level admission state "
+                "that a second engine configuration would overwrite"
+            )
         cls._tt_vllm_config = vllm_config
 
     @classmethod
