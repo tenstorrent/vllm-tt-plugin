@@ -269,6 +269,39 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
 
 
+def test_oversized_bypassed_prompt_is_truncated_and_finishes_length_capped():
+    """A bypassed prompt at least as long as max_model_len is otherwise
+    unservable: parked in WAITING forever when it exceeds the token budget
+    (head-of-line blocking everything), or scheduled in full and overflowing
+    the worker's max_model_len-wide token buffer, killing the engine."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=64, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="oversized-0",
+        prompt_token_ids=[1] * (MAX_MODEL_LEN + 40),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.num_prompt_tokens == MAX_MODEL_LEN - 1
+    assert len(request.prompt_token_ids) == MAX_MODEL_LEN - 1
+    assert request.num_tokens == MAX_MODEL_LEN - 1
+    assert request.max_tokens == 0
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"oversized-0": MAX_MODEL_LEN - 1}
+
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.running == []
+
+
 def test_continuation_of_scrubbed_resumable_session_is_dropped():
     """Scrubbing resumable admits the first chunk with streaming_queue=None,
     and the streaming protocol always sends a same-id follow-up (the next

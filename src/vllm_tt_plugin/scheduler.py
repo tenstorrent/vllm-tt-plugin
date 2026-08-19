@@ -130,9 +130,43 @@ class TTScheduler(AsyncScheduler):
                     request.request_id,
                 )
                 return
+            self._truncate_unservable_block_prompt(request)
             self._align_block_output_max_tokens(request)
             self._neutralize_block_output_host_sampling(request)
         super().add_request(request)
+
+    def _truncate_unservable_block_prompt(self, request: Request) -> None:
+        """Contain a bypassed prompt at least as long as max_model_len.
+
+        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
+        skips it, and neither upstream EngineCore.add_request nor the base
+        scheduler re-checks prompt length. Admitted whole, the prompt either
+        can never be scheduled (chunked prefill is disabled and the prompt
+        exceeds the token budget: parked in WAITING forever, head-of-line
+        blocking every later request) or is scheduled in full and overflows
+        the worker's max_model_len-wide token buffer, killing the engine.
+        Truncate so one output token still fits; the zero-canvas clamp then
+        finishes the request length-capped through the normal notifying path.
+        Prefix caching is disabled for block models (__init__ asserts it), so
+        the request's stale block hashes stay inert.
+        """
+        keep = int(self.vllm_config.model_config.max_model_len) - 1
+        if request.num_prompt_tokens <= keep:
+            return
+        logger.warning(
+            "Request %s bypassed frontend validation with a %d-token prompt "
+            "that cannot fit max_model_len; truncating to %d tokens so the "
+            "request can finish length-capped",
+            request.request_id,
+            request.num_prompt_tokens,
+            keep,
+        )
+        if request.prompt_token_ids is not None:
+            request.prompt_token_ids = request.prompt_token_ids[:keep]
+        if getattr(request, "prompt_embeds", None) is not None:
+            request.prompt_embeds = request.prompt_embeds[:keep]
+        del request._all_token_ids[keep:]
+        request.num_prompt_tokens = keep
 
     def _align_block_output_max_tokens(self, request: Request) -> None:
         """Clamp max_tokens so a bypassed EngineCoreRequest cannot overshoot.
