@@ -28,6 +28,7 @@ to ``False``), so the sliding tests pass ``hybrid_enabled=True`` to
 exercise the headroom formula.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -231,6 +232,44 @@ def test_block_output_auto_fit_requires_room_for_a_prompt_tile(cfg, budget, fitt
     else:
         _fit_block_output_max_model_len(cfg, n)
         assert cfg.model_config.max_model_len == fitted
+
+
+def test_determine_available_memory_reports_the_count_sized_before_load(monkeypatch):
+    """The engine must be told the pool the model was already loaded against.
+
+    ``get_max_tokens_all_users`` derives the budget from ``max_model_len``, so
+    recomputing here -- after ``init_device`` fitted that length down -- would
+    report a different pool than the one the model sized itself to."""
+    from vllm_tt_plugin import worker as worker_mod
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("the block count must not be recomputed")
+
+    monkeypatch.setattr(worker_mod, "get_num_available_blocks_tt", fail_if_called)
+    monkeypatch.setattr(
+        worker_mod,
+        "_available_kv_cache_memory_bytes_for_num_blocks",
+        lambda _cfg, _spec, num_blocks: num_blocks * 1024,
+    )
+
+    w = worker_mod.TTWorker.__new__(worker_mod.TTWorker)
+    w._num_tt_blocks = 11
+    w.vllm_config = SimpleNamespace()
+    w.cache_config = SimpleNamespace(num_gpu_blocks_override=None)
+    w.get_kv_cache_spec = dict
+
+    assert worker_mod.TTWorker.determine_available_memory(w) == 11 * 1024
+    assert w.cache_config.num_gpu_blocks_override == 11
+
+
+def test_determine_available_memory_requires_a_sized_pool():
+    from vllm_tt_plugin import worker as worker_mod
+
+    w = worker_mod.TTWorker.__new__(worker_mod.TTWorker)
+    w._num_tt_blocks = None
+
+    with pytest.raises(RuntimeError, match="has not been sized"):
+        worker_mod.TTWorker.determine_available_memory(w)
 
 
 def test_sliding_window_adds_headroom(cfg):

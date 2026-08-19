@@ -210,6 +210,7 @@ class TTWorker(WorkerBase):
 
         # Initialized by init_device
         self.mesh_device = None
+        self._num_tt_blocks: int | None = None
 
         # Whether to use ttnn tracing for model execution
         tt_config = get_tt_config(self.vllm_config)
@@ -259,6 +260,21 @@ class TTWorker(WorkerBase):
         self.device_config.device = self.mesh_device
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
+
+        # Size the KV pool and settle --max-model-len here, not in
+        # determine_available_memory: upstream runs the whole executor init
+        # (init_device, then load_model) before it asks for available memory
+        # (EngineCore.__init__ -> _initialize_kv_caches), so a model that sizes
+        # its own KV state at load time would otherwise see the unfitted
+        # length -- for --max-model-len -1 that is the full HF context.
+        # The count is cached rather than recomputed later because
+        # get_max_tokens_all_users derives the budget from max_model_len,
+        # which the fit below may have shrunk.
+        self._num_tt_blocks = get_num_available_blocks_tt(
+            self.vllm_config, self.num_devices
+        )
+        _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
+
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -399,13 +415,17 @@ class TTWorker(WorkerBase):
         in conjunction with the output of get_kv_cache_spec to determine
         the number of kv cache blocks (total memory / page_size / num layers).
 
-        NOTE: TT does not profile device memory yet. Instead, it computes the target
-              TT KV block count, then returns a synthetic byte budget that makes the
-              upstream KV planner reconstruct that same block count in the engine
-              process.
+        NOTE: TT does not profile device memory yet. ``init_device`` computed the
+              target TT KV block count before the model loaded; this returns a
+              synthetic byte budget that makes the upstream KV planner
+              reconstruct that same block count in the engine process.
         """
-        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
-        _fit_block_output_max_model_len(self.vllm_config, num_tt_blocks)
+        if self._num_tt_blocks is None:
+            raise RuntimeError(
+                "The TT KV pool has not been sized; determine_available_memory "
+                "ran before init_device"
+            )
+        num_tt_blocks = self._num_tt_blocks
         kv_cache_spec = self.get_kv_cache_spec()
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return _available_kv_cache_memory_bytes_for_num_blocks(

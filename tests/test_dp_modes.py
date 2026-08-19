@@ -252,7 +252,27 @@ class TestDPModes:
             "open_mesh_device",
             lambda _tt_config, _trace_mode, _local_dp_rank: mesh_device,
         )
-        monkeypatch.setattr(worker, "TTModelRunner", lambda **_kwargs: model_runner)
+
+        # The KV pool is sized and --max-model-len settled during init_device so
+        # the model sees the fitted length when load_model runs next.
+        steps: list[str] = []
+
+        def size_pool(_cfg, _num_devices):
+            steps.append("size")
+            return 7
+
+        def fit_max_model_len(_cfg, _num_tt_blocks):
+            steps.append("fit")
+
+        def build_runner(**_kwargs):
+            steps.append("runner")
+            return model_runner
+
+        monkeypatch.setattr(worker, "get_num_available_blocks_tt", size_pool)
+        monkeypatch.setattr(
+            worker, "_fit_block_output_max_model_len", fit_max_model_len
+        )
+        monkeypatch.setattr(worker, "TTModelRunner", build_runner)
 
         try:
             TTWorker.init_device(worker_instance)
@@ -261,6 +281,8 @@ class TestDPModes:
             assert worker_instance.device is mesh_device
             assert worker_instance.device_config.device is mesh_device
             assert worker_instance.model_runner is model_runner
+            assert steps == ["size", "fit", "runner"]
+            assert worker_instance._num_tt_blocks == 7
         finally:
             # The test double cannot be passed to TT device cleanup.
             worker_instance.mesh_device = None
