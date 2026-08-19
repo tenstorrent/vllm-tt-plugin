@@ -390,6 +390,40 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
         TTPlatform.check_and_update_config(config)
 
 
+@pytest.mark.parametrize(
+    ("tt_overrides", "warns"),
+    [
+        ({}, False),
+        ({"trace_mode": "decode_only"}, True),
+        ({"enable_model_warmup": False}, True),
+    ],
+    ids=["defaults", "trace-mode", "warmup-off"],
+)
+def test_startup_warns_when_block_capture_prerequisites_are_off(
+    monkeypatch, tt_overrides, warns
+):
+    """A capture-based block model needs trace_mode='all' and warmup on;
+    without them the failure would otherwise surface only on the first
+    request, engine-fatally. Eager serving is legitimate, so this warns."""
+    import vllm_tt_plugin.platform as platform_module
+
+    config = _config()
+    config.additional_config["tt"].update(tt_overrides)
+    _patch_model_resolution(monkeypatch)
+    warnings: list[str] = []
+    original_warning = platform_module.logger.warning
+    monkeypatch.setattr(
+        platform_module.logger,
+        "warning",
+        lambda msg, *args: warnings.append(msg % args) or original_warning(msg, *args),
+    )
+
+    TTPlatform.check_and_update_config(config)
+
+    matched = [w for w in warnings if "Block-output serving is validated" in w]
+    assert bool(matched) is warns
+
+
 def test_startup_rejects_the_rust_frontend_for_block_models(monkeypatch):
     # The Rust frontend serves HTTP outside Python, bypassing validate_request
     # and the InputProcessor patch entirely.

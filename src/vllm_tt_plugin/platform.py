@@ -1515,6 +1515,22 @@ class TTPlatform(Platform):
                     "Block-output models currently support synchronous serving "
                     "only; launch with --no-async-scheduling"
                 )
+            # Worker knobs the launch gates cannot hard-require: eager serving
+            # without upfront capture is legitimate. But a capture-based model
+            # (e.g. DiffusionGemma's default DG_UPFRONT_CAPTURE mode) defers
+            # the failure to its first request, so surface the mismatch now.
+            tt_trace_mode = (tt_config or {}).get("trace_mode", "all")
+            tt_enable_warmup = (tt_config or {}).get("enable_model_warmup", True)
+            if tt_trace_mode != "all" or tt_enable_warmup is not True:
+                logger.warning(
+                    "Block-output serving is validated with trace_mode='all' "
+                    "and enable_model_warmup=true; got trace_mode=%r, "
+                    "enable_model_warmup=%r. A model that requires upfront "
+                    "capture will fail on its first request instead of at "
+                    "startup.",
+                    tt_trace_mode,
+                    tt_enable_warmup,
+                )
             if model_config.generation_config == "auto":
                 logger.info(
                     "Block-output model owns generation defaults; normalizing "

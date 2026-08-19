@@ -9,7 +9,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
@@ -141,22 +141,37 @@ class TTScheduler(AsyncScheduler):
         )
         if fitted == request.max_tokens:
             return
-        logger.debug(
-            "Clamping block-output max_tokens from %s to %s for request %s "
-            "so physical canvases fit max_model_len",
-            request.max_tokens,
-            fitted,
-            request.request_id,
-        )
+        if fitted == 0:
+            # The prompt leaves no room for a whole canvas. The request is
+            # still admitted: its first canvas is clipped by the runner and
+            # the stop check finishes it length-capped through the normal
+            # output path, which is the only way its client gets notified.
+            logger.warning(
+                "Request %s bypassed frontend validation and its prompt "
+                "leaves no room for a whole %d-token canvas within "
+                "max_model_len; it will finish length-capped after one canvas",
+                request.request_id,
+                self._output_tokens_per_step,
+            )
+        else:
+            logger.debug(
+                "Clamping block-output max_tokens from %s to %s for request %s "
+                "so physical canvases fit max_model_len",
+                request.max_tokens,
+                fitted,
+                request.request_id,
+            )
         request.max_tokens = fitted
         request.sampling_params.max_tokens = fitted
 
     def _neutralize_block_output_host_sampling(self, request: Request) -> None:
-        """Strip host-sampling-forcing controls from a bypassed request.
+        """Strip controls a block-output model cannot honor from a bypassed
+        request: host-sampling forcers, structured outputs, and resumable
+        streaming-input sessions.
 
         Frontend validation rejects these; a prebuilt EngineCoreRequest skips
-        it, and any of them flips the step to host sampling mid-flight, which
-        cannot construct a multi-token canvas and would kill the engine.
+        it, and any of them flips the step to host sampling mid-flight (which
+        cannot construct a multi-token canvas) or parks the request forever.
         Raising here is no safer: an add_request exception also tears down
         EngineCore, so neutralize instead, the way the sampling controls are
         neutralized at the frontend.
@@ -168,8 +183,19 @@ class TTScheduler(AsyncScheduler):
         if request.structured_output_request is not None:
             request.structured_output_request = None
             stripped.append("structured_outputs")
+            # Request.__init__ parked the request on grammar compilation; with
+            # the structured-output request gone nothing would ever promote it
+            # out of skipped_waiting, so restore schedulability.
+            if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                request.status = RequestStatus.WAITING
         if params.structured_outputs is not None:
             params.structured_outputs = None
+        if request.resumable:
+            # A resumable session parks the stopped request to wait for more
+            # input instead of finishing it, permanently leaking the
+            # model-owned state slot. The frontend rejects it for block models.
+            request.resumable = False
+            stripped.append("resumable")
         for field, neutral in self._BLOCK_HOST_ONLY_SAMPLING_NEUTRAL:
             if getattr(params, field, neutral) not in (neutral, [], {}):
                 setattr(params, field, neutral)
@@ -177,7 +203,7 @@ class TTScheduler(AsyncScheduler):
         if stripped:
             logger.warning(
                 "Request %s bypassed frontend validation; stripped "
-                "host-sampling controls unsupported by block-output models: %s",
+                "controls unsupported by block-output models: %s",
                 request.request_id,
                 ", ".join(stripped),
             )

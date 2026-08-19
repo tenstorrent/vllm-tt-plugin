@@ -2349,24 +2349,42 @@ class TTModelRunner:
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
+        max_model_len = self.model_config.max_model_len
+
         if not use_captured_req_ids:
             rows = np.arange(num_reqs)
             start_idxs = self.input_batch.num_tokens[rows]
             end_idxs = start_idxs + num_out_tokens
             max_end = int(end_idxs.max()) if num_reqs > 0 else 0
-            if max_end > self.model_config.max_model_len:
-                raise ValueError(
-                    "Sampled token IDs exceed the max model length. "
-                    f"Total number of tokens: {max_end} > max_model_len: "
-                    f"{self.model_config.max_model_len}"
+            if max_end > max_model_len:
+                if num_out_tokens == 1:
+                    raise ValueError(
+                        "Sampled token IDs exceed the max model length. "
+                        f"Total number of tokens: {max_end} > max_model_len: "
+                        f"{max_model_len}"
+                    )
+                # A block canvas is physical: a bypassed request admitted with
+                # a zero-canvas budget still gets one full canvas back. Keep
+                # only the slice that fits; the scheduler's stop check then
+                # finishes the request length-capped through the normal output
+                # path instead of this raise killing the engine.
+                logger.warning(
+                    "Block canvas exceeds max_model_len=%d for request(s) %s; "
+                    "keeping only the slice that fits",
+                    max_model_len,
+                    ", ".join(
+                        self.input_batch.req_ids[i]
+                        for i in range(num_reqs)
+                        if int(end_idxs[i]) > max_model_len
+                    ),
                 )
+                end_idxs = np.maximum(np.minimum(end_idxs, max_model_len), start_idxs)
 
             for req_idx in range(num_reqs):
                 start_idx = int(start_idxs[req_idx])
-                block = sampled_token_ids_np[req_idx]
-                self.input_batch.token_ids_cpu[
-                    req_idx, start_idx : start_idx + num_out_tokens
-                ] = block
+                end_idx = int(end_idxs[req_idx])
+                block = sampled_token_ids_np[req_idx][: end_idx - start_idx]
+                self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = block
                 output_token_ids = self.input_batch.req_output_token_ids[req_idx]
                 assert output_token_ids is not None
                 output_token_ids.extend(int(token_id) for token_id in block)
@@ -2375,23 +2393,31 @@ class TTModelRunner:
 
         assert req_ids is not None
         captured_req_ids = req_ids
-        # Validate every live row before mutating any of them, so an oversized
-        # block never leaves a partially applied batch.
-        for req_idx, req_id in enumerate(captured_req_ids):
-            req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            if request_states is not None and req_state is not request_states[req_idx]:
-                continue
-            current_row = self.input_batch.req_id_to_index.get(req_id)
-            if current_row is not None:
-                end_idx = int(self.input_batch.num_tokens[current_row]) + num_out_tokens
-                if end_idx > self.model_config.max_model_len:
-                    raise ValueError(
-                        "Sampled token IDs exceed the max model length. "
-                        f"Total number of tokens: {end_idx} > max_model_len: "
-                        f"{self.model_config.max_model_len}"
+        if num_out_tokens == 1:
+            # Autoregressive overflow means scheduler accounting corrupted;
+            # validate every live row before mutating any of them, so the
+            # raise never leaves a partially applied batch. Block canvases
+            # are clipped below instead of raising.
+            for req_idx, req_id in enumerate(captured_req_ids):
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    continue
+                if (
+                    request_states is not None
+                    and req_state is not request_states[req_idx]
+                ):
+                    continue
+                current_row = self.input_batch.req_id_to_index.get(req_id)
+                if current_row is not None:
+                    end_idx = (
+                        int(self.input_batch.num_tokens[current_row]) + num_out_tokens
                     )
+                    if end_idx > max_model_len:
+                        raise ValueError(
+                            "Sampled token IDs exceed the max model length. "
+                            f"Total number of tokens: {end_idx} > max_model_len: "
+                            f"{max_model_len}"
+                        )
 
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
@@ -2404,7 +2430,15 @@ class TTModelRunner:
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
                 end_idx = start_idx + num_out_tokens
-                block = sampled_token_ids_np[req_idx]
+                if end_idx > max_model_len:
+                    logger.warning(
+                        "Block canvas exceeds max_model_len=%d for request %s; "
+                        "keeping only the slice that fits",
+                        max_model_len,
+                        req_id,
+                    )
+                    end_idx = max(start_idx, max_model_len)
+                block = sampled_token_ids_np[req_idx][: end_idx - start_idx]
                 self.input_batch.token_ids_cpu[current_row, start_idx:end_idx] = block
                 self.input_batch.num_tokens[current_row] = end_idx
             else:

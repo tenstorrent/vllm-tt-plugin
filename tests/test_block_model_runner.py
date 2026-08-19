@@ -55,9 +55,7 @@ def test_output_width_is_strict():
         )
 
 
-def test_captured_path_capacity_overrun_leaves_batch_unmutated():
-    """The deferred-apply path validates every live row before mutating any:
-    an oversized block on a later row must not leave earlier rows applied."""
+def _captured_runner(width: int, num_tokens: tuple[int, int]):
     outputs_a: list[int] = []
     outputs_b: list[int] = []
     state_a, state_b = (
@@ -65,38 +63,77 @@ def test_captured_path_capacity_overrun_leaves_batch_unmutated():
         SimpleNamespace(output_token_ids=outputs_b),
     )
     runner = SimpleNamespace(
-        _output_tokens_per_step=16,
+        _output_tokens_per_step=width,
         requests={"a": state_a, "b": state_b},
         input_batch=SimpleNamespace(
             req_id_to_index={"a": 0, "b": 1},
-            num_tokens=np.array([0, 17], dtype=np.int32),
+            num_tokens=np.array(num_tokens, dtype=np.int32),
             token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
         ),
         model_config=SimpleNamespace(max_model_len=32),
     )
-    blocks = torch.arange(32, dtype=torch.int32).reshape(2, 16)
+    return runner, (state_a, state_b), (outputs_a, outputs_b)
+
+
+def test_captured_ar_capacity_overrun_leaves_batch_unmutated():
+    """The deferred-apply path validates every live row before mutating any:
+    an oversized AR step on a later row must not leave earlier rows applied."""
+    runner, states, (outputs_a, outputs_b) = _captured_runner(1, (0, 32))
+    tokens = torch.arange(2, dtype=torch.int32).reshape(2, 1)
 
     with pytest.raises(ValueError, match="exceed the max model length"):
         TTModelRunner._apply_sampled_tokens_to_state(
-            runner, blocks, req_ids=["a", "b"], request_states=(state_a, state_b)
+            runner, tokens, req_ids=["a", "b"], request_states=states
         )
 
     # Row 0 fit, but must not have been applied before row 1's rejection.
-    assert runner.input_batch.num_tokens.tolist() == [0, 17]
+    assert runner.input_batch.num_tokens.tolist() == [0, 32]
     assert not runner.input_batch.token_ids_cpu.any()
     assert outputs_a == [] and outputs_b == []
 
 
-def test_capacity_overrun_is_rejected_before_writes():
-    runner, output_tokens = _runner(16, num_tokens=17)
-    block = torch.arange(16, dtype=torch.int32).reshape(1, 16)
+def test_captured_block_overrun_clips_only_the_overflowing_row():
+    """A block canvas past max_model_len must not kill the engine: the
+    deferred-apply path keeps only the slice that fits for that row and
+    applies the others in full."""
+    runner, states, (outputs_a, outputs_b) = _captured_runner(16, (0, 17))
+    blocks = torch.arange(32, dtype=torch.int32).reshape(2, 16)
+
+    TTModelRunner._apply_sampled_tokens_to_state(
+        runner, blocks, req_ids=["a", "b"], request_states=states
+    )
+
+    assert runner.input_batch.num_tokens.tolist() == [16, 32]
+    assert runner.input_batch.token_ids_cpu[0, :16].tolist() == list(range(16))
+    assert runner.input_batch.token_ids_cpu[1, 17:32].tolist() == list(range(16, 31))
+    assert outputs_a == list(range(16))
+    assert outputs_b == list(range(16, 31))
+
+
+def test_ar_capacity_overrun_is_rejected_before_writes():
+    runner, output_tokens = _runner(1, num_tokens=32)
+    token = torch.tensor([[7]], dtype=torch.int32)
 
     with pytest.raises(ValueError, match="exceed the max model length"):
-        TTModelRunner._apply_sampled_tokens_to_state(runner, block)
+        TTModelRunner._apply_sampled_tokens_to_state(runner, token)
 
-    assert runner.input_batch.num_tokens.tolist() == [17]
+    assert runner.input_batch.num_tokens.tolist() == [32]
     assert not runner.input_batch.token_ids_cpu.any()
     assert output_tokens == []
+
+
+def test_block_capacity_overrun_clips_to_the_slice_that_fits():
+    """A bypassed zero-canvas request still gets one full physical canvas
+    back; the runner keeps the fitting slice so the scheduler's stop check
+    can finish the request length-capped instead of the engine dying."""
+    runner, output_tokens = _runner(16, num_tokens=17)
+    block = torch.arange(1, 17, dtype=torch.int32).reshape(1, 16)
+
+    TTModelRunner._apply_sampled_tokens_to_state(runner, block)
+
+    assert runner.input_batch.num_tokens.tolist() == [32]
+    assert runner.input_batch.token_ids_cpu[0, 17:32].tolist() == list(range(1, 16))
+    assert output_tokens == list(range(1, 16))
 
 
 @pytest.mark.parametrize(

@@ -99,8 +99,10 @@ ceil(prompt_tokens / 32) * 32
 ```
 
 The historical `/v1/completions` default `max_tokens=16` remains valid. It
-runs one physical canvas and returns at most 16 logical tokens. An omitted
-output limit is clamped to the largest whole-canvas capacity that fits.
+runs one physical canvas and returns at most 16 logical tokens. Over the
+OpenAI endpoints any output limit — omitted or explicit — is capped to the
+largest whole-canvas capacity that fits; the formula rejects an oversized
+`max_tokens` only for offline `SamplingParams` callers.
 
 ## Metrics
 

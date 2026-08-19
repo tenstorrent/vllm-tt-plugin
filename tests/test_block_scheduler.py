@@ -244,9 +244,11 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         prompt_token_ids=[1] * 32,
         sampling_params=params,
         pooling_params=None,
+        resumable=True,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
     )
     assert request.use_structured_output
+    assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
     scheduler.add_request(request)
 
@@ -257,6 +259,50 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert params.logit_bias is None
     assert params.allowed_token_ids is None
     assert params.bad_words is None
+    # A resumable session would park the stopped request forever and leak the
+    # model-owned state slot.
+    assert request.resumable is False
+    # With the structured-output request gone, nothing could ever promote the
+    # request out of skipped_waiting; it must be schedulable immediately.
+    assert request.status == RequestStatus.WAITING
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
+
+
+def test_dead_zone_prompt_finishes_length_capped_instead_of_killing_engine():
+    """A bypassed prompt that leaves no room for a whole canvas is clamped to
+    max_tokens=0 and must finish length-capped on its first canvas. The old
+    path applied the full canvas past max_model_len and killed the engine."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=64, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    # 241 tile-aligns to 256 == aligned max_model_len: zero canvases fit.
+    request = Request(
+        request_id="dead-zone-0",
+        prompt_token_ids=[1] * 241,
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+    assert request.max_tokens == 0
+    assert params.max_tokens == 0
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"dead-zone-0": 241}
+
+    outputs = scheduler.update_from_output(
+        prefill, _runner_output(prefill, list(range(CANVAS)))
+    )
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    # The stopping token is the only client-visible overshoot of the zero
+    # budget; the request finishes through the normal output path.
+    assert outputs[0].outputs[0].new_token_ids == [0]
+    assert request.num_output_placeholders == 0
+    assert scheduler.running == []
 
 
 def test_running_block_request_rejects_prefix_cache_reset():
