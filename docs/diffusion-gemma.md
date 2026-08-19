@@ -123,10 +123,11 @@ Do not report autoregressive TPOT for this model.
 - The serving constraints in [Request Contract](#request-contract) apply;
   speculative decoding and preemption overlap are additionally unsupported.
 - A forced prefix-cache reset aborts running block requests instead of
-  resuming them: a half-generated canvas cannot resume, so the served engine
-  (a background `EngineCoreProc`) finishes those requests with an abort before
-  resetting. An in-process engine (the offline `LLM` entrypoint) has no client
-  stream to send the aborts to and refuses the reset with an error instead.
+  resuming them: a half-generated canvas cannot resume, so the engine — a
+  background `EngineCoreProc` for the api_server and the default offline
+  `LLM` alike — finishes those requests with an abort before resetting. Only
+  an in-process engine (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) has no client
+  stream to notify and refuses the reset with an error instead.
   `pause_generation(mode="keep", clear_cache=True)` is refused while a block
   request is live; pausing without `clear_cache` works.
 - Device server validation requires the paired tt-metal checkout and model

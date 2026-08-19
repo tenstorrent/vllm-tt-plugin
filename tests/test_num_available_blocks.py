@@ -162,9 +162,9 @@ def test_block_output_auto_fit_shrinks_max_model_len_instead_of_raising(cfg):
     """``--max-model-len -1`` must not die on the pre-auto-fit budget check.
 
     The sizing query stays pure; the worker fits the length in a separate
-    step (``determine_available_memory`` calls
-    ``_fit_block_output_max_model_len``), keeping one full output canvas of
-    headroom in the pool."""
+    step (``init_device`` calls ``_fit_block_output_max_model_len`` before
+    the model loads), keeping one full output canvas of headroom in the
+    pool."""
     from vllm_tt_plugin.worker import (
         _fit_block_output_max_model_len,
         get_num_available_blocks_tt,

@@ -51,6 +51,9 @@ def _stub_model_resolution():
     platform hook runs inside VllmConfig.__post_init__ (mirrors
     test_block_request_validation._patch_model_resolution)."""
     with (
+        # Fresh-process semantics: don't leave this file's configs as the
+        # platform's process-level admission handle across tests.
+        patch("vllm_tt_plugin.platform.TTPlatform._tt_vllm_config", None),
         patch("vllm_tt_plugin.platform.register_tt_models"),
         patch(
             "vllm_tt_plugin.platform._resolve_standard_dp_visible_device_groups",

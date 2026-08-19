@@ -2071,7 +2071,7 @@ class TTModelRunner:
 
             if not perform_device_sampling and self._is_block_output_model:
                 raise ValueError(
-                    "Block-output models require sample_on_device_mode='all'; "
+                    "Block-output step fell back to host sampling; "
                     "host sampling cannot construct a multi-token canvas"
                 )
 

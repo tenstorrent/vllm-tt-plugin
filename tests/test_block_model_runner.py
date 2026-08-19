@@ -55,6 +55,38 @@ def test_output_width_is_strict():
         )
 
 
+def test_captured_path_capacity_overrun_leaves_batch_unmutated():
+    """The deferred-apply path validates every live row before mutating any:
+    an oversized block on a later row must not leave earlier rows applied."""
+    outputs_a: list[int] = []
+    outputs_b: list[int] = []
+    state_a, state_b = (
+        SimpleNamespace(output_token_ids=outputs_a),
+        SimpleNamespace(output_token_ids=outputs_b),
+    )
+    runner = SimpleNamespace(
+        _output_tokens_per_step=16,
+        requests={"a": state_a, "b": state_b},
+        input_batch=SimpleNamespace(
+            req_id_to_index={"a": 0, "b": 1},
+            num_tokens=np.array([0, 17], dtype=np.int32),
+            token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
+        ),
+        model_config=SimpleNamespace(max_model_len=32),
+    )
+    blocks = torch.arange(32, dtype=torch.int32).reshape(2, 16)
+
+    with pytest.raises(ValueError, match="exceed the max model length"):
+        TTModelRunner._apply_sampled_tokens_to_state(
+            runner, blocks, req_ids=["a", "b"], request_states=(state_a, state_b)
+        )
+
+    # Row 0 fit, but must not have been applied before row 1's rejection.
+    assert runner.input_batch.num_tokens.tolist() == [0, 17]
+    assert not runner.input_batch.token_ids_cpu.any()
+    assert outputs_a == [] and outputs_b == []
+
+
 def test_capacity_overrun_is_rejected_before_writes():
     runner, output_tokens = _runner(16, num_tokens=17)
     block = torch.arange(16, dtype=torch.int32).reshape(1, 16)
