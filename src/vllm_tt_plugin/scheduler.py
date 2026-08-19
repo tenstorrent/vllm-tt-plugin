@@ -11,7 +11,10 @@ from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
-from vllm_tt_plugin.config import get_tt_output_tokens_per_step
+from vllm_tt_plugin.config import (
+    get_tt_output_tokens_per_step,
+    is_tt_block_output_model,
+)
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
@@ -85,7 +88,7 @@ class TTScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
-        self._is_block_output_model = self._output_tokens_per_step > 1
+        self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         if self._is_block_output_model:
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "

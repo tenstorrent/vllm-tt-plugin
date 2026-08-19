@@ -47,6 +47,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_block_output_model,
 )
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
@@ -606,7 +607,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
-    if output_tokens_per_step > 1:
+    if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
         if resolved_kv_tokens < required_kv_tokens:
@@ -649,10 +650,8 @@ def _fit_block_output_max_model_len(
     """
     model_config = vllm_config.model_config
     output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
-    if (
-        getattr(model_config, "original_max_model_len", None) != -1
-        or output_tokens_per_step <= 1
-    ):
+    auto_fit_requested = getattr(model_config, "original_max_model_len", None) == -1
+    if not auto_fit_requested or not is_tt_block_output_model(vllm_config):
         return
     resolved_kv_tokens = num_tt_blocks * vllm_config.cache_config.block_size
     fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step

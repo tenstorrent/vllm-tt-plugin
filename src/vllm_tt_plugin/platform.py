@@ -5,7 +5,7 @@ import json
 import multiprocessing
 import os
 import sys
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -15,6 +15,8 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
+    is_tt_block_output_model,
+    require_tt_output_tokens_per_step,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
     uses_tt_lane_coordinator,
@@ -46,10 +48,6 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 _TT_TOKEN_TILE_SIZE = 32
-
-
-class _MaxModelLenConfig(Protocol):
-    max_model_len: int
 
 
 # TT model versions backed by the single-execute Galaxy generator
@@ -548,7 +546,8 @@ def _install_block_output_input_processor_patch() -> None:
 
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
-        if output_size > 1 and kwargs.get("resumable", False):
+        is_block_output_model = is_tt_block_output_model(self.vllm_config)
+        if is_block_output_model and kwargs.get("resumable", False):
             raise ValueError(
                 "TT block-output models do not support resumable "
                 "streaming-input requests"
@@ -560,7 +559,7 @@ def _install_block_output_input_processor_patch() -> None:
         request = original(self, request_id, prompt, params, *args, **kwargs)
 
         cloned_params = request.sampling_params
-        if output_size == 1 or cloned_params is None:
+        if not is_block_output_model or cloned_params is None:
             return request
 
         ignored = _neutralize_model_owned_sampling(cloned_params)
@@ -600,7 +599,7 @@ def _install_block_output_streaming_input_patch() -> None:
     async_llm._tt_original_add_streaming_input_request = original
 
     async def add_streaming_input_request_tt(self, *args, **kwargs):
-        if get_tt_output_tokens_per_step(self.vllm_config) > 1:
+        if is_tt_block_output_model(self.vllm_config):
             raise ValueError(
                 "TT block-output models do not support resumable "
                 "streaming-input requests"
@@ -640,6 +639,8 @@ def _install_block_output_reset_abort_patch() -> None:
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
         scheduler = self.scheduler
+        require_tt_output_tokens_per_step(scheduler.vllm_config)
+        is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
         # Aborting is only legal when the engine can tell the owning clients
         # (EngineCoreProc._send_abort_outputs finishes their streams).
         # ``finish_requests`` emits no output itself -- upstream assumes the
@@ -649,7 +650,7 @@ def _install_block_output_reset_abort_patch() -> None:
         if (
             reset_running_requests
             and send_abort_outputs is not None
-            and get_tt_output_tokens_per_step(scheduler.vllm_config) > 1
+            and is_block_output_model
             and scheduler.running
             and scheduler.pause_state != PauseState.PAUSED_ALL
         ):
@@ -696,10 +697,12 @@ def _install_block_output_pause_guard_patch() -> None:
     def _wrap(original):
         def pause_scheduler_tt(self, mode="abort", clear_cache=True):
             scheduler = self.scheduler
+            require_tt_output_tokens_per_step(scheduler.vllm_config)
+            is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
             if (
                 mode == "keep"
                 and clear_cache
-                and get_tt_output_tokens_per_step(scheduler.vllm_config) > 1
+                and is_block_output_model
                 and scheduler.running
             ):
                 raise ValueError(
@@ -1026,8 +1029,7 @@ class TTPlatform(Platform):
     _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
     _standard_dp_mesh_grids: ClassVar[dict[str, tuple[int, int]]] = {}
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
-    output_tokens_per_step: ClassVar[int] = 1
-    block_model_config: ClassVar[_MaxModelLenConfig | None] = None
+    _tt_vllm_config: ClassVar["VllmConfig | None"] = None
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
@@ -1121,18 +1123,22 @@ class TTPlatform(Platform):
         return output_tokens_per_step
 
     @classmethod
-    def _get_block_model_max_len(cls) -> int | None:
-        """Read the live frontend limit, including vLLM auto-fit updates."""
-        model_config = cls.block_model_config
-        if model_config is None:
+    def _get_block_output_contract(cls) -> tuple[int, int] | None:
+        """Read the live block width and frontend max-model-length limit."""
+        vllm_config = cls._tt_vllm_config
+        if vllm_config is None or not is_tt_block_output_model(vllm_config):
             return None
-        return int(model_config.max_model_len)
+        return (
+            get_tt_output_tokens_per_step(vllm_config),
+            int(vllm_config.model_config.max_model_len),
+        )
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _install_tt_harmony_truncation_patch()
         cls._standard_dp_visible_device_groups = None
         cls._standard_dp_mesh_grids = {}
+        cls._tt_vllm_config = None
         if _uses_explicit_tt_mpi_launch(vllm_config):
             raise RuntimeError(
                 "Explicit TT MPI/rank-binding/multinode launch is unsupported "
@@ -1267,7 +1273,8 @@ class TTPlatform(Platform):
             model_class, "model_capabilities", None
         )
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
-        is_block_output_model = output_tokens_per_step > 1
+        store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
+        is_block_output_model = is_tt_block_output_model(vllm_config)
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
                 "DiffusionGemma must declare output_tokens_per_step > 1 "
@@ -1405,17 +1412,11 @@ class TTPlatform(Platform):
                 )
                 model_config.generation_config = "vllm"
 
-        store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
-        cls.output_tokens_per_step = output_tokens_per_step
         if is_block_output_model:
             _install_block_output_input_processor_patch()
             _install_block_output_streaming_input_patch()
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()
-        # vLLM 0.24 syncs an auto-fitted max_model_len back into this same
-        # frontend ModelConfig object through EngineCoreReadyResponse. Retain
-        # the object rather than snapshotting its pre-fit integer.
-        cls.block_model_config = model_config if is_block_output_model else None
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
@@ -1519,6 +1520,10 @@ class TTPlatform(Platform):
         vllm_config.scheduler_config.verify_max_model_len(
             vllm_config.model_config.max_model_len
         )
+        # vLLM 0.24 syncs an auto-fitted max_model_len back into this same
+        # frontend config through EngineCoreReadyResponse. Retain one config
+        # handle rather than snapshotting either the width or the length.
+        cls._tt_vllm_config = vllm_config
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
@@ -1575,10 +1580,10 @@ class TTPlatform(Platform):
 
     def get_max_output_tokens(self, prompt_len: int) -> int:
         """Clamp the platform default to complete physical output canvases."""
-        output_size = type(self).output_tokens_per_step
-        max_model_len = type(self)._get_block_model_max_len()
-        if output_size == 1 or max_model_len is None:
+        block_contract = type(self)._get_block_output_contract()
+        if block_contract is None:
             return super().get_max_output_tokens(prompt_len)
+        output_size, max_model_len = block_contract
         return self._resolve_block_output_max_tokens(
             prompt_len, None, output_size, max_model_len
         )
@@ -1600,22 +1605,21 @@ class TTPlatform(Platform):
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
 
-        output_size = cls.output_tokens_per_step
-        if not isinstance(params, SamplingParams) or output_size == 1:
+        block_contract = cls._get_block_output_contract()
+        if not isinstance(params, SamplingParams) or block_contract is None:
             return
 
-        max_model_len = cls._get_block_model_max_len()
-        if max_model_len is not None:
-            prompt_len = length_from_prompt_token_ids_or_embeds(
-                processed_inputs.get("prompt_token_ids"),
-                processed_inputs.get("prompt_embeds"),
-            )
-            cls._resolve_block_output_max_tokens(
-                prompt_len,
-                params.max_tokens,
-                output_size,
-                max_model_len,
-            )
+        output_size, max_model_len = block_contract
+        prompt_len = length_from_prompt_token_ids_or_embeds(
+            processed_inputs.get("prompt_token_ids"),
+            processed_inputs.get("prompt_embeds"),
+        )
+        cls._resolve_block_output_max_tokens(
+            prompt_len,
+            params.max_tokens,
+            output_size,
+            max_model_len,
+        )
 
         # Reject unsupported response-contract controls. Model-owned sampling
         # controls (temperature etc.) are instead accepted and neutralized on

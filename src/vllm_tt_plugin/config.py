@@ -84,6 +84,24 @@ def get_tt_output_tokens_per_step(vllm_config: "VllmConfig") -> int:
     return int(additional.get(_OUTPUT_TOKENS_PER_STEP_KEY, 1))
 
 
+def require_tt_output_tokens_per_step(vllm_config: "VllmConfig") -> int:
+    """Return the resolved output width, failing if setup did not store it."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if (
+        not isinstance(additional, dict)
+        or _OUTPUT_TOKENS_PER_STEP_KEY not in additional
+    ):
+        raise RuntimeError(
+            "TT output_tokens_per_step was not initialized on VllmConfig"
+        )
+    return int(additional[_OUTPUT_TOKENS_PER_STEP_KEY])
+
+
+def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
+    """Whether this config describes a model that commits multi-token blocks."""
+    return get_tt_output_tokens_per_step(vllm_config) > 1
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:

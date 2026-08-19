@@ -19,14 +19,17 @@ from vllm_tt_plugin.platform import (
 )
 
 
+def _set_platform_contract(monkeypatch, *, output_size=256, max_model_len=1024):
+    model_config = SimpleNamespace(max_model_len=max_model_len)
+    config = SimpleNamespace(additional_config={}, model_config=model_config)
+    store_tt_output_tokens_per_step(config, output_size)
+    monkeypatch.setattr(TTPlatform, "_tt_vllm_config", config)
+    return config
+
+
 @pytest.fixture(autouse=True)
 def block_contract(monkeypatch):
-    monkeypatch.setattr(TTPlatform, "output_tokens_per_step", 256)
-    monkeypatch.setattr(
-        TTPlatform,
-        "block_model_config",
-        SimpleNamespace(max_model_len=1024),
-    )
+    _set_platform_contract(monkeypatch)
 
 
 def _validate(params: SamplingParams, prompt_len: int = 32) -> None:
@@ -75,11 +78,12 @@ def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     input_processor = _patch_upstream_boundary(monkeypatch)
     _install_block_output_input_processor_patch()
 
-    model_config = SimpleNamespace(max_model_len=max_model_len)
-    config = SimpleNamespace(additional_config={}, model_config=model_config)
-    store_tt_output_tokens_per_step(config, output_size)
-    monkeypatch.setattr(TTPlatform, "output_tokens_per_step", output_size)
-    monkeypatch.setattr(TTPlatform, "block_model_config", model_config)
+    config = _set_platform_contract(
+        monkeypatch,
+        output_size=output_size,
+        max_model_len=max_model_len,
+    )
+    model_config = config.model_config
     return input_processor.InputProcessor, SimpleNamespace(
         vllm_config=config,
         model_config=model_config,
@@ -178,7 +182,7 @@ def test_rejected_request_leaves_params_unmutated():
 
 
 def test_ar_request_validation_is_unchanged(monkeypatch):
-    monkeypatch.setattr(TTPlatform, "output_tokens_per_step", 1)
+    _set_platform_contract(monkeypatch, output_size=1)
     params = SamplingParams(max_tokens=16, temperature=0.5, n=2)
 
     _validate(params)
@@ -293,6 +297,7 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     TTPlatform.check_and_update_config(config)
 
     assert get_tt_output_tokens_per_step(config) == 256
+    assert TTPlatform._tt_vllm_config is config
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.model_config.generation_config == "vllm"
@@ -486,7 +491,7 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
 
 @pytest.mark.parametrize("output_size", [1, 256], ids=["ar", "block"])
 def test_prompt_embeds_are_rejected_for_every_tt_model(monkeypatch, output_size):
-    monkeypatch.setattr(TTPlatform, "output_tokens_per_step", output_size)
+    _set_platform_contract(monkeypatch, output_size=output_size)
 
     with pytest.raises(ValueError, match=r"prompt_embeds are not supported"):
         TTPlatform.validate_request(
@@ -534,11 +539,7 @@ def test_streaming_input_session_is_rejected_only_for_block_models(
 
 
 def test_explicit_request_uses_tile_aligned_physical_capacity(monkeypatch):
-    monkeypatch.setattr(
-        TTPlatform,
-        "block_model_config",
-        SimpleNamespace(max_model_len=1000),
-    )
+    _set_platform_contract(monkeypatch, max_model_len=1000)
 
     with pytest.raises(
         ValueError,

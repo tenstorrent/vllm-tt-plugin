@@ -13,8 +13,7 @@ _TT_PLATFORM_CONFIG_ATTRS = (
     "_standard_dp_mesh_grids",
     "sample_on_device_mode",
     "always_compat_sampling",
-    "output_tokens_per_step",
-    "block_model_config",
+    "_tt_vllm_config",
 )
 
 

@@ -114,10 +114,18 @@ def test_output_tokens_per_step_defaults_to_ar_and_round_trips():
     config = _vllm_config()
 
     assert tt_config.get_tt_output_tokens_per_step(config) == 1
+    assert not tt_config.is_tt_block_output_model(config)
 
     tt_config.store_tt_output_tokens_per_step(config, 256)
 
     assert tt_config.get_tt_output_tokens_per_step(config) == 256
+    assert tt_config.require_tt_output_tokens_per_step(config) == 256
+    assert tt_config.is_tt_block_output_model(config)
+
+
+def test_required_output_tokens_per_step_rejects_missing_setup_state():
+    with pytest.raises(RuntimeError, match="was not initialized"):
+        tt_config.require_tt_output_tokens_per_step(_vllm_config())
 
 
 @pytest.mark.parametrize("invalid", [True, 0, -1, 1.5, "256"])

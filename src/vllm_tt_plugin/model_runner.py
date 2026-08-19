@@ -42,6 +42,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_block_output_model,
 )
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
@@ -158,7 +159,7 @@ class TTModelRunner:
         self.observability_config = vllm_config.observability_config
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
-        self._is_block_output_model = self._output_tokens_per_step > 1
+        self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._persistent_capture_released = False
 
         if self.model_config.is_encoder_decoder:
