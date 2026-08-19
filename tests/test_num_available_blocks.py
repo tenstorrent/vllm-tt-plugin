@@ -189,6 +189,50 @@ def test_block_output_auto_fit_shrinks_max_model_len_instead_of_raising(cfg):
     assert cfg.model_config.max_model_len == resolved_kv_tokens - 256
 
 
+@pytest.mark.parametrize(
+    ("budget", "fitted"),
+    [
+        # Pool 512 tokens: exactly one canvas is left, which used to pass the
+        # one-canvas check and fit a max_model_len that serves nothing.
+        pytest.param(256, None, id="fits-only-the-canvas"),
+        # Pool 320 tokens: not even the canvas survives the reservation.
+        pytest.param(32, None, id="fits-less-than-the-canvas"),
+        # Pool 576 tokens: 320 left after the canvas, above the 288 minimum.
+        pytest.param(320, 320, id="fits-a-prompt-tile-too"),
+    ],
+)
+def test_block_output_auto_fit_requires_room_for_a_prompt_tile(cfg, budget, fitted):
+    """The fitted length must be servable, not merely one canvas wide.
+
+    ``--max-model-len -1`` bypasses the sizing query's budget check, so this is
+    the only place a pool too small to hold a prompt tile plus a canvas can be
+    caught before the server starts and rejects every request."""
+    from vllm_tt_plugin.worker import (
+        _fit_block_output_max_model_len,
+        get_num_available_blocks_tt,
+    )
+
+    cfg.model_config.max_model_len = 200_000
+    cfg.model_config.original_max_model_len = -1
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _model_budget(budget),
+    ):
+        # An oversized ``-1`` request is not an error here; the fit decides.
+        n = get_num_available_blocks_tt(cfg)
+
+    if fitted is None:
+        with pytest.raises(ValueError, match="must be at least 288"):
+            _fit_block_output_max_model_len(cfg, n)
+        assert cfg.model_config.max_model_len == 200_000
+    else:
+        _fit_block_output_max_model_len(cfg, n)
+        assert cfg.model_config.max_model_len == fitted
+
+
 def test_sliding_window_adds_headroom(cfg):
     """Hybrid models declare a sliding_window; with hybrid KV groups
     enabled the heuristic adds headroom proportional to

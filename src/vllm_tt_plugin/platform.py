@@ -50,6 +50,23 @@ TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 _TT_TOKEN_TILE_SIZE = 32
 
 
+def _min_block_output_max_model_len(output_tokens_per_step: int) -> int:
+    """Smallest ``max_model_len`` that can serve one block-output request.
+
+    ``_resolve_block_output_max_tokens`` rounds the prompt up to a token tile
+    and floors ``max_model_len`` to one, so even a single-token prompt spends a
+    whole tile before the first canvas has to fit. A length that covers only
+    the canvas therefore passes every startup check and then rejects every
+    request.
+    """
+    required = _TT_TOKEN_TILE_SIZE + output_tokens_per_step
+    return (
+        (required + _TT_TOKEN_TILE_SIZE - 1)
+        // _TT_TOKEN_TILE_SIZE
+        * _TT_TOKEN_TILE_SIZE
+    )
+
+
 # TT model versions backed by the single-execute Galaxy generator
 # (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these,
 # --data_parallel_size folds into single-process TT lanes. Maps the selecting
@@ -1368,10 +1385,15 @@ class TTPlatform(Platform):
                     "upstream DiffusionConfig speculative-token accounting."
                 )
                 vllm_config.diffusion_config = None
-            if model_config.max_model_len < output_tokens_per_step:
+            min_max_model_len = _min_block_output_max_model_len(output_tokens_per_step)
+            if model_config.max_model_len < min_max_model_len:
                 raise ValueError(
-                    f"max_model_len={model_config.max_model_len} must be at least "
-                    f"output_tokens_per_step={output_tokens_per_step}"
+                    f"max_model_len={model_config.max_model_len} cannot serve "
+                    "any request: block output is committed in physical "
+                    f"{output_tokens_per_step}-token canvases and the shortest "
+                    f"prompt still occupies one {_TT_TOKEN_TILE_SIZE}-token "
+                    "tile, so max_model_len must be at least "
+                    f"{min_max_model_len}"
                 )
             if vllm_config.scheduler_config.max_num_seqs != 1:
                 raise ValueError(

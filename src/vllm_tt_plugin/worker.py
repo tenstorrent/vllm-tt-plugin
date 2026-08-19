@@ -52,8 +52,10 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
+    _TT_TOKEN_TILE_SIZE,
     TTPlatform,
     _load_standard_dp_visible_groups,
+    _min_block_output_max_model_len,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
@@ -511,9 +513,11 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
 
-    Pure sizing query: validates the budget (raising when a block-output
-    pool cannot hold even one canvas) but never mutates the config; the
-    ``--max-model-len -1`` fit lives in ``_fit_block_output_max_model_len``.
+    Pure sizing query: validates the budget (raising when a block-output pool
+    cannot hold an explicitly configured ``max_model_len`` plus one canvas) but
+    never mutates the config; the ``--max-model-len -1`` fit, and the
+    servability check on the length it writes, live in
+    ``_fit_block_output_max_model_len``.
 
     ``num_devices`` is the runtime-discovered physical device count.
     """
@@ -610,23 +614,21 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
-        if resolved_kv_tokens < required_kv_tokens:
-            fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
-            # ``--max-model-len -1`` is fitted to the pool afterwards by
-            # ``_fit_block_output_max_model_len``, provided at least one
-            # output canvas survives the fit.
-            if (
-                getattr(model_config, "original_max_model_len", None) != -1
-                or fitted_max_model_len < output_tokens_per_step
-            ):
-                raise ValueError(
-                    "Block-output KV budget is too small: resolved "
-                    f"{resolved_kv_tokens} tokens, but max_model_len="
-                    f"{model_config.max_model_len} plus output_tokens_per_step="
-                    f"{output_tokens_per_step} requires at least "
-                    f"{required_kv_tokens}. Fix the model's "
-                    "get_max_tokens_all_users budget."
-                )
+        # ``--max-model-len -1`` asked for whatever the pool allows, so a pool
+        # this length does not fit is not an error yet: the fit that follows
+        # shrinks the length and validates what it writes.
+        if (
+            resolved_kv_tokens < required_kv_tokens
+            and getattr(model_config, "original_max_model_len", None) != -1
+        ):
+            raise ValueError(
+                "Block-output KV budget is too small: resolved "
+                f"{resolved_kv_tokens} tokens, but max_model_len="
+                f"{model_config.max_model_len} plus output_tokens_per_step="
+                f"{output_tokens_per_step} requires at least "
+                f"{required_kv_tokens}. Fix the model's "
+                "get_max_tokens_all_users budget."
+            )
 
     return num_tt_blocks
 
@@ -645,8 +647,9 @@ def _fit_block_output_max_model_len(
     (``EngineCore._initialize_kv_caches``), so upstream's fit sees the
     fitted value as its baseline and, since it only ever shrinks, keeps it.
 
-    ``get_num_available_blocks_tt`` has already rejected pools smaller than
-    one canvas, so the fitted length is always positive here.
+    Also owns the servability check for the fitted length: the sizing query
+    deliberately lets an oversized ``-1`` request through, so this is where a
+    pool too small to hold a prompt tile plus a canvas is rejected.
     """
     model_config = vllm_config.model_config
     output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
@@ -657,6 +660,17 @@ def _fit_block_output_max_model_len(
     fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
     if fitted_max_model_len >= model_config.max_model_len:
         return
+    min_max_model_len = _min_block_output_max_model_len(output_tokens_per_step)
+    if fitted_max_model_len < min_max_model_len:
+        raise ValueError(
+            "Block-output KV budget is too small to auto-fit --max-model-len: "
+            f"the pool holds {resolved_kv_tokens} tokens, leaving "
+            f"max_model_len={fitted_max_model_len} after reserving one "
+            f"{output_tokens_per_step}-token output canvas, but serving a "
+            f"request also needs a {_TT_TOKEN_TILE_SIZE}-token prompt tile, so "
+            f"max_model_len must be at least {min_max_model_len}. Raise the "
+            "model's get_max_tokens_all_users budget."
+        )
     logger.info(
         "Auto-fitting block-output max_model_len from %d to %d so "
         "the KV budget covers one full output canvas.",

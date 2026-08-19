@@ -203,6 +203,7 @@ def _config(
     data_parallel_size=1,
     async_scheduling=False,
     distributed_executor_backend=None,
+    max_model_len=1024,
 ):
     return SimpleNamespace(
         additional_config={"tt": {"sample_on_device_mode": "all"}},
@@ -213,7 +214,7 @@ def _config(
                 model_type="gemma4",
                 canvas_length=256,
             ),
-            max_model_len=1024,
+            max_model_len=max_model_len,
             original_max_model_len=None,
             max_logprobs=20,
             is_moe=False,
@@ -382,6 +383,36 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
 
     with pytest.raises(ValueError, match=message):
         TTPlatform.check_and_update_config(config)
+
+
+@pytest.mark.parametrize("max_model_len", [256, 280, 288, 512])
+def test_startup_admits_exactly_the_lengths_a_request_can_use(
+    monkeypatch, max_model_len
+):
+    """Startup and the per-request check must agree on the shortest usable length.
+
+    Requiring only one canvas let ``max_model_len == output_tokens_per_step``
+    start cleanly and then reject every request: a prompt is rounded up to a
+    32-token tile, so the canvas needs a tile of headroom on top.
+    """
+    config = _config(max_model_len=max_model_len)
+    _patch_model_resolution(monkeypatch)
+
+    try:
+        TTPlatform.check_and_update_config(config)
+        starts = True
+    except ValueError as exc:
+        assert "must be at least 288" in str(exc)
+        starts = False
+
+    try:
+        # The shortest possible prompt still occupies one whole tile.
+        TTPlatform._resolve_block_output_max_tokens(1, None, 256, max_model_len)
+        serves = True
+    except ValueError:
+        serves = False
+
+    assert starts == serves
 
 
 def test_startup_auto_disables_prefix_caching_for_block_models(monkeypatch):
