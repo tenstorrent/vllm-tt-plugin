@@ -26,7 +26,6 @@ Run from the paired tt-metal checkout so the registered model target under
 ```bash
 export PYTHONPATH=/path/to/tt-metal
 export MESH_DEVICE=P150x4
-export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export DG_UPFRONT_COARSE_PREFILL_BUCKETS=1
 export DG_UPFRONT_LAZY_PREFILL_RECAPTURE=1
 export DG_PREFILL_FIXED_CHUNKS=1
@@ -57,8 +56,10 @@ disable DiffusionGemma's model-internal ragged and chunked prompt processing.
 The `DG_TRACE_REGION_SIZE` environment value must match
 `tt.trace_region_size`. The values above are the QB2 (`MESH_DEVICE=P150x4`)
 release configuration validated by tt-shield; variables whose validated value
-matches the tt-metal default are omitted. `VLLM_ENABLE_V1_MULTIPROCESSING=0`
-keeps the engine core in the API-server process. The
+matches the tt-metal default are omitted, as is
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`, which the api_server never reads (its
+AsyncLLM always runs the engine in a background process; the variable only
+affects the offline `LLM` entrypoint). The
 `DG_UPFRONT_COARSE_PREFILL_BUCKETS`, `DG_UPFRONT_LAZY_PREFILL_RECAPTURE`, and
 `DG_PREFILL_FIXED_CHUNKS` gates (all default off) are required to serve
 arbitrary prompt lengths; without them only prompts whose execution length is
