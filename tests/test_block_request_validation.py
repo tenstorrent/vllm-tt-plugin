@@ -420,6 +420,51 @@ def test_second_engine_config_is_rejected_when_a_block_model_is_involved(
         TTPlatform.check_and_update_config(other)
 
 
+def test_failed_same_config_reentry_restores_live_block_contract(monkeypatch):
+    """A failed in-process re-run must not leave the admission handle at None.
+
+    EngineCore / worker init_device re-enter this hook on the same config
+    object, which skips the one-engine guard and used to wipe the handle
+    before a later raise.
+    """
+    _patch_model_resolution(monkeypatch)
+    config = _config()
+    TTPlatform.check_and_update_config(config)
+    assert TTPlatform._tt_vllm_config is config
+
+    config.scheduler_config.max_num_seqs = 2
+    with pytest.raises(ValueError, match="max-num-seqs 1"):
+        TTPlatform.check_and_update_config(config)
+
+    assert TTPlatform._tt_vllm_config is config
+    _validate(SamplingParams(max_tokens=16), prompt_len=32)
+    with pytest.raises(ValueError, match=r"requires 512 physical"):
+        _validate(SamplingParams(max_tokens=257), prompt_len=513)
+
+
+def test_failed_block_start_restores_prior_admission_handle(monkeypatch):
+    _patch_model_resolution(monkeypatch, ARModel)
+    ar_config = _config()
+    TTPlatform.check_and_update_config(ar_config)
+    assert TTPlatform._tt_vllm_config is ar_config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _model_config: (BlockModel, None),
+    )
+    with pytest.raises(ValueError, match="max-num-seqs 1"):
+        TTPlatform.check_and_update_config(_config(max_num_seqs=2))
+
+    assert TTPlatform._tt_vllm_config is ar_config
+
+
+def test_failed_first_config_hook_leaves_admission_handle_unset(monkeypatch):
+    _patch_model_resolution(monkeypatch)
+    with pytest.raises(ValueError, match="max-num-seqs 1"):
+        TTPlatform.check_and_update_config(_config(max_num_seqs=2))
+    assert TTPlatform._tt_vllm_config is None
+
+
 @pytest.mark.parametrize("max_model_len", [256, 280, 288, 512])
 def test_startup_admits_exactly_the_lengths_a_request_can_use(
     monkeypatch, max_model_len

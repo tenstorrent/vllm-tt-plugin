@@ -1172,7 +1172,22 @@ class TTPlatform(Platform):
             )
         cls._standard_dp_visible_device_groups = None
         cls._standard_dp_mesh_grids = {}
+        # Clear the admission handle for this attempt so a half-updated config
+        # is not used for validate_request / get_max_output_tokens. Any raise
+        # after this must restore the snapshot: otherwise a failed in-process
+        # re-entry (EngineCore / worker init_device) drops a live block
+        # engine's canvas contract.
         cls._tt_vllm_config = None
+        try:
+            cls._apply_check_and_update_config(vllm_config, previous_tt_vllm_config)
+        except Exception:
+            cls._tt_vllm_config = previous_tt_vllm_config
+            raise
+
+    @classmethod
+    def _apply_check_and_update_config(
+        cls, vllm_config: "VllmConfig", previous_tt_vllm_config: "VllmConfig | None"
+    ) -> None:
         if _uses_explicit_tt_mpi_launch(vllm_config):
             raise RuntimeError(
                 "Explicit TT MPI/rank-binding/multinode launch is unsupported "
