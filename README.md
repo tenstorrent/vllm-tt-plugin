@@ -47,6 +47,11 @@ Ubuntu 22.04.
 The installation script builds vLLM `0.25.1` from source with
 `VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
 
+To install against vLLM `0.24.0` instead, check out the `compat/vllm-0.24.0`
+tag, the last plugin state that targets it, and follow the same steps. Nothing
+is maintained on top of that tag. Pair it with the tt-metal commit the LLMs
+table lists for it.
+
 ## Environment Setup
 
 Install tt-metal first by following

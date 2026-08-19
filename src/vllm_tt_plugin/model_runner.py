@@ -826,10 +826,10 @@ class TTModelRunner:
           from the absolute decode position, not from slot residency.
 
         Both of ``_preempt_request``'s callers reach here: the scheduler's own
-        running-loop, and the wholesale ``reset_prefix_cache(reset_running_requests
-        =True)`` teardown, whose preemptions surface because the scheduler keeps
-        ``preempted_req_ids`` across the step boundary rather than rebuilding it
-        per call.
+        running-loop, and the wholesale teardown in ``reset_prefix_cache`` when it
+        is asked to reset running requests, whose preemptions surface because the
+        scheduler keeps ``preempted_req_ids`` across the step boundary rather than
+        rebuilding it per call.
 
         ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         """
