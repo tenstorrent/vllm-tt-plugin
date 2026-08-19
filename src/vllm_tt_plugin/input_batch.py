@@ -745,6 +745,7 @@ class TTLaneInputBatch(InputBatch):
         block_sizes: list[int],
         kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
+        disable_logprobs: bool = False,
     ):
         if num_lanes < 1 or per_lane < 1:
             raise ValueError(
@@ -761,6 +762,7 @@ class TTLaneInputBatch(InputBatch):
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             logitsprocs=logitsprocs,
+            disable_logprobs=disable_logprobs,
         )
         # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
         # pre-size so a request can occupy any slot in its lane's chunk, with

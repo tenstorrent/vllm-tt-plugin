@@ -385,6 +385,7 @@ class TTModelRunner:
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
+                disable_logprobs=self._is_block_output_model,
             )
         else:
             self.input_batch = InputBatch(
