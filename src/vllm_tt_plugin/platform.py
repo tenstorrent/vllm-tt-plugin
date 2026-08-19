@@ -1316,15 +1316,6 @@ class TTPlatform(Platform):
         )
 
         if is_block_output_model:
-            distributed_executor_backend = getattr(
-                parallel_config, "distributed_executor_backend", None
-            )
-            if distributed_executor_backend not in (None, "uni"):
-                raise ValueError(
-                    "Block-output models require the uniproc executor; "
-                    f"got distributed_executor_backend="
-                    f"{distributed_executor_backend!r}"
-                )
             required_lifecycle_hooks = (
                 "release_request",
                 "release_persistent_capture",
@@ -1394,6 +1385,18 @@ class TTPlatform(Platform):
                 raise ValueError(
                     "Block-output models do not yet support data parallelism; "
                     "use --data-parallel-size 1"
+                )
+            # After the DP check: upstream auto-selects "mp" whenever
+            # --data-parallel-size > 1, and the DP message is the actionable
+            # one for that launch.
+            distributed_executor_backend = getattr(
+                parallel_config, "distributed_executor_backend", None
+            )
+            if distributed_executor_backend not in (None, "uni"):
+                raise ValueError(
+                    "Block-output models require the uniproc executor; "
+                    f"got distributed_executor_backend="
+                    f"{distributed_executor_backend!r}"
                 )
             if model_config.logits_processors:
                 raise ValueError(

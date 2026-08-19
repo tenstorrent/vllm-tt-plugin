@@ -70,9 +70,10 @@ an empty completion. If the expected aligned prompt lengths change, update
 
 Current support is synchronous, DP=1, one active sequence, on-device sampling
 for all model calls, and no scheduler chunked prefill; vLLM automatic prefix
-caching is disabled by the platform. Async scheduling, host sampling, and
-custom logits processors are rejected at launch; unsupported per-request
-controls are listed below.
+caching is disabled by the platform. Async scheduling, host sampling, custom
+logits processors, and non-uniproc executors are rejected at launch;
+`prompt_embeds` inputs and streaming-input (resumable) sessions are rejected
+per request; other unsupported per-request controls are listed below.
 
 HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 
