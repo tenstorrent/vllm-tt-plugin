@@ -253,9 +253,12 @@ def test_grammar_bitmask_skips_intermediate_prefill_chunks():
         recorded
     )
 
-    grammar_output = coordinator.get_grammar_bitmask(
-        _scheduled_output(["chunk", "decode"])
-    )
+    scheduler_output = _scheduled_output(["chunk", "decode"])
+    # The base scheduler raises the flag for "decode": a structured request that
+    # is past its prefill chunks.
+    scheduler_output.has_structured_output_requests = True
+
+    grammar_output = coordinator.get_grammar_bitmask(scheduler_output)
 
     assert recorded == [["decode"]]
     assert grammar_output.structured_output_request_ids == ["decode"]
