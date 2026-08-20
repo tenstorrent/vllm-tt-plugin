@@ -1034,8 +1034,7 @@ class TTModelRunner:
         def _is_still_prefilling(req_id: str) -> bool:
             row = input_batch.req_id_to_index[req_id]
             return (
-                input_batch.num_computed_tokens_cpu[row]
-                < input_batch.num_prompt_tokens[row]
+                input_batch.num_computed_tokens_cpu[row] < input_batch.num_tokens[row]
             )
 
         # A "prefill" step can contain:
