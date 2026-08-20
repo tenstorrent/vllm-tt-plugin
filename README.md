@@ -24,7 +24,7 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.24)
+|   +-- launcher.py          # tt-run / MPI launch integration
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
@@ -44,8 +44,13 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.24.0` from source with
+The installation script builds vLLM `0.25.1` from source with
 `VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
+
+To install against vLLM `0.24.0` instead, check out the `compat/vllm-0.24.0`
+tag, the last plugin state that targets it, and follow the same steps. Nothing
+is maintained on top of that tag. Pair it with the tt-metal commit the LLMs
+table lists for it.
 
 ## Environment Setup
 
@@ -435,7 +440,8 @@ source edit to the plugin. The built-in map above stays enabled by default; set
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a
 clear error before anything reaches the device:
 
-- Tensor parallel and pipeline parallel execution are not supported.
+- Tensor parallel and pipeline parallel execution are provided by the models
+  internal implementation, not exposed at the vLLM level.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
 - Chunked prefill is disabled for every model type except Gemma 4, and
@@ -445,6 +451,9 @@ clear error before anything reaches the device:
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
+- Multi-host MPI data parallelism is not supported.
+- vLLM's V2 model runner. The plugin implements only the V1 model-runner
+  contract and pins `VLLM_USE_V2_MODEL_RUNNER=0`; setting it to `1` is refused.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 

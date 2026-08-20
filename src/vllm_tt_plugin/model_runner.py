@@ -899,6 +899,12 @@ class TTModelRunner:
           per-slot seed RNG does not need the hold either: the device seed is derived
           from the absolute decode position, not from slot residency.
 
+        Both of ``_preempt_request``'s callers reach here: the scheduler's own
+        running-loop, and the wholesale teardown in ``reset_prefix_cache`` when it
+        is asked to reset running requests, whose preemptions surface because the
+        scheduler keeps ``preempted_req_ids`` across the step boundary rather than
+        rebuilding it per call.
+
         ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         """
         for req_id in scheduler_output.finished_req_ids:
@@ -1102,8 +1108,7 @@ class TTModelRunner:
         def _is_still_prefilling(req_id: str) -> bool:
             row = input_batch.req_id_to_index[req_id]
             return (
-                input_batch.num_computed_tokens_cpu[row]
-                < input_batch.num_prompt_tokens[row]
+                input_batch.num_computed_tokens_cpu[row] < input_batch.num_tokens[row]
             )
 
         # A "prefill" step can contain:
