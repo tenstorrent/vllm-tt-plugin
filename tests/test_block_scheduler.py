@@ -434,6 +434,42 @@ def test_embeds_only_bypassed_prompt_is_replaced_with_placeholders():
     assert scheduler.running == []
 
 
+def test_oversized_embeds_only_prompt_is_replaced_and_truncated():
+    """Embeds replacement and prompt truncation mutate the same four fields
+    in sequence; a refactor breaking only the composition would admit an
+    oversized or internally inconsistent request while the single-step tests
+    stay green."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=64, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="embeds-big-0",
+        prompt_token_ids=None,
+        prompt_embeds=torch.zeros(MAX_MODEL_LEN + 40, 4),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.prompt_token_ids == [0] * SERVABLE_PROMPT
+    assert request.prompt_embeds is None
+    assert request.num_prompt_tokens == SERVABLE_PROMPT
+    assert request.num_tokens == SERVABLE_PROMPT
+    assert request.max_tokens == 32
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"embeds-big-0": SERVABLE_PROMPT}
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+    decode = scheduler.schedule()
+    scheduler.update_from_output(decode, _runner_output(decode, list(range(CANVAS))))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.running == []
+
+
 def test_empty_bypassed_prompt_is_padded_and_served():
     """The frontend rejects empty prompts; admitted bare, the waiting loop
     schedules zero new tokens and upstream's num_new_tokens assert tears
