@@ -245,7 +245,7 @@ python examples/server_example_tt.py
 
 DiffusionGemma uses a 256-token block-serving contract with stricter launch and
 request constraints. See [DiffusionGemma block serving](docs/diffusion-gemma.md)
-for the exact vLLM 0.24 command, request validation, and block metrics.
+for the exact command, request validation, and block metrics.
 
 Send a completion request:
 
