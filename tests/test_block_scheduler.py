@@ -360,6 +360,47 @@ def test_continuation_of_scrubbed_resumable_session_is_dropped():
     assert prefill.num_scheduled_tokens == {"stream-0": 32}
 
 
+def test_multimodal_features_are_dropped_from_bypassed_request():
+    """A text-only block model has a zero encoder budget: an mm feature at
+    offset 0 parks the request in WAITING forever (head-of-line stall), and
+    an interior offset carves a partial prefill chunk that flips the step
+    onto host sampling and kills the engine."""
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="mm-0",
+        prompt_token_ids=[1] * 32,
+        sampling_params=params,
+        pooling_params=None,
+        mm_features=[
+            MultiModalFeatureSpec(
+                data=None,
+                modality="image",
+                identifier="img-0",
+                mm_position=PlaceholderRange(offset=0, length=16),
+            )
+        ],
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+    assert request.has_encoder_inputs
+
+    scheduler.add_request(request)
+
+    assert request.mm_features == []
+    assert not request.has_encoder_inputs
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"mm-0": 32}
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.running == []
+
+
 def test_embeds_only_bypassed_prompt_is_replaced_with_placeholders():
     """The frontend rejects prompt_embeds for every TT model; admitted bare,
     the worker's request-state builder raises NotImplementedError out of

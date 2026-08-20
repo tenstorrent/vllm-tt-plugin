@@ -156,6 +156,18 @@ class TTScheduler(AsyncScheduler):
         """
         from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
 
+        if request.mm_features:
+            # A text-only block model has a zero encoder budget: a feature at
+            # offset 0 forces zero-token schedules forever (head-of-line
+            # stall), and an interior offset carves a partial prefill chunk
+            # that flips the step onto host sampling and kills the engine.
+            # Dropped, the placeholder positions decode as ordinary tokens.
+            logger.warning(
+                "Request %s bypassed frontend validation with multimodal "
+                "features a block-output model cannot encode; dropping them",
+                request.request_id,
+            )
+            request.mm_features = []
         if request.prompt_token_ids is None and request.num_prompt_tokens > 0:
             # The frontend rejects prompt_embeds for every TT model; admitted
             # bare, the worker's request-state builder raises
