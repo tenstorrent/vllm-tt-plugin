@@ -156,6 +156,21 @@ class TTScheduler(AsyncScheduler):
         """
         from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
 
+        if request.num_prompt_tokens == 0:
+            # The frontend rejects empty prompts; admitted bare, the waiting
+            # loop schedules zero new tokens and upstream's num_new_tokens
+            # assert tears down the engine. Pad to one placeholder token so
+            # the request schedules and finishes through the normal path.
+            logger.warning(
+                "Request %s bypassed frontend validation with an empty "
+                "prompt; padding to one placeholder token",
+                request.request_id,
+            )
+            request.prompt_token_ids = [0]
+            request.prompt_embeds = None
+            request._all_token_ids.append(0)
+            request.num_prompt_tokens = 1
+            return
         tile = _TT_TOKEN_TILE_SIZE
         max_model_len = int(self.vllm_config.model_config.max_model_len)
         aligned_max_model_len = max_model_len // tile * tile

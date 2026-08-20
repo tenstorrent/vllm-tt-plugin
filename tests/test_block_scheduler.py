@@ -239,6 +239,10 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         structured_outputs=StructuredOutputsParams(json_object=True),
     )
     params.update_from_generation_config({}, eos_token_id=2)
+    # The tokenized form is what actually flips the worker onto host sampling
+    # (InputBatch reads bad_words_token_ids, not the strings); with
+    # skip_tokenizer_init it stays unset unless seeded here.
+    params._bad_words_token_ids = [[7]]
     request = Request(
         request_id="bypass-0",
         prompt_token_ids=[1] * 32,
@@ -259,6 +263,7 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert params.logit_bias is None
     assert params.allowed_token_ids is None
     assert params.bad_words is None
+    assert params._bad_words_token_ids is None
     # A resumable session would park the stopped request forever and leak the
     # model-owned state slot.
     assert request.resumable is False
@@ -353,6 +358,36 @@ def test_continuation_of_scrubbed_resumable_session_is_dropped():
     assert scheduler.requests["stream-0"] is first
     prefill = scheduler.schedule()
     assert prefill.num_scheduled_tokens == {"stream-0": 32}
+
+
+def test_empty_bypassed_prompt_is_padded_and_served():
+    """The frontend rejects empty prompts; admitted bare, the waiting loop
+    schedules zero new tokens and upstream's num_new_tokens assert tears
+    down the engine."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="empty-0",
+        prompt_token_ids=[],
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.prompt_token_ids == [0]
+    assert request.num_prompt_tokens == 1
+    assert request.num_tokens == 1
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"empty-0": 1}
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.running == []
 
 
 def test_zero_max_tokens_bypassed_request_finishes_after_first_canvas():

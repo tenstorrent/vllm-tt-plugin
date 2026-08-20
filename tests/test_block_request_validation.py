@@ -391,6 +391,34 @@ def test_startup_rejects_unsupported_block_modes(monkeypatch, overrides, message
 
 
 @pytest.mark.parametrize(
+    "tt_config",
+    [{}, {"sample_on_device_mode": "decode_only"}],
+    ids=["unset", "decode-only"],
+)
+def test_startup_requires_device_sampling_for_block_models(monkeypatch, tt_config):
+    """The block contract forces sample_on_device_mode='all'; anything else
+    starts up cleanly and then dies on the first request when host sampling
+    cannot construct a multi-token canvas."""
+    config = _config()
+    config.additional_config = {"tt": tt_config}
+    _patch_model_resolution(monkeypatch)
+
+    with pytest.raises(ValueError, match='sample_on_device_mode="all"'):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_startup_rejects_logits_processors_for_block_models(monkeypatch):
+    """Custom logits processors flip the step onto host sampling; without the
+    gate the launch succeeds and the first request kills the engine."""
+    config = _config()
+    config.model_config.logits_processors = ["my.module.CustomProc"]
+    _patch_model_resolution(monkeypatch)
+
+    with pytest.raises(ValueError, match="logits-processors"):
+        TTPlatform.check_and_update_config(config)
+
+
+@pytest.mark.parametrize(
     ("tt_overrides", "warns"),
     [
         ({}, False),
