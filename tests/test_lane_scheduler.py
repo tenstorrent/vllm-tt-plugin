@@ -46,6 +46,7 @@ class FakeLane:
             SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
         ] + [SimpleNamespace(is_prefill_chunk=True) for _ in range(partial_prefills)]
         self._pending_finished = set(pending_finished)
+        self.requests: dict[str, SimpleNamespace] = {}
         self._mode = TTSchedulingMode.DEFAULT
         self.scheduled_modes: list[TTSchedulingMode] = []
         self.update_calls: list[SchedulerOutput] = []
@@ -222,6 +223,55 @@ def test_preemption_in_a_discarded_prefill_pass_is_carried_to_the_decode_step():
     assert output.preempted_req_ids == {"p"}
     assert "p" not in coordinator._req_to_row
     assert "p" not in get_tt_step_plan(output).req_id_to_row
+
+
+def _structured_request(*, is_prefill_chunk):
+    return SimpleNamespace(
+        use_structured_output=True, is_prefill_chunk=is_prefill_chunk
+    )
+
+
+def _recording_structured_output_manager(recorded):
+    def grammar_bitmask(requests, req_ids, spec_decode_tokens):
+        recorded.append(list(req_ids))
+        return "bitmask"
+
+    return SimpleNamespace(grammar_bitmask=grammar_bitmask)
+
+
+def test_grammar_bitmask_skips_intermediate_prefill_chunks():
+    # An intermediate chunk samples no token, so giving it a bitmask row would
+    # offset every later row against the batch the runner remaps onto.
+    lane = FakeLane()
+    lane.requests = {
+        "chunk": _structured_request(is_prefill_chunk=True),
+        "decode": _structured_request(is_prefill_chunk=False),
+    }
+    coordinator = _make_coordinator([lane])
+    recorded: list[list[str]] = []
+    coordinator.structured_output_manager = _recording_structured_output_manager(
+        recorded
+    )
+
+    grammar_output = coordinator.get_grammar_bitmask(
+        _scheduled_output(["chunk", "decode"])
+    )
+
+    assert recorded == [["decode"]]
+    assert grammar_output.structured_output_request_ids == ["decode"]
+
+
+def test_grammar_bitmask_is_none_when_only_prefill_chunks_are_scheduled():
+    lane = FakeLane()
+    lane.requests = {"chunk": _structured_request(is_prefill_chunk=True)}
+    coordinator = _make_coordinator([lane])
+    recorded: list[list[str]] = []
+    coordinator.structured_output_manager = _recording_structured_output_manager(
+        recorded
+    )
+
+    assert coordinator.get_grammar_bitmask(_scheduled_output(["chunk"])) is None
+    assert recorded == []
 
 
 def test_update_from_output_routes_and_merges_per_lane():

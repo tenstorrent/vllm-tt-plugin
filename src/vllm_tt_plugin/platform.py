@@ -24,6 +24,9 @@ from vllm_tt_plugin.utils.dp_discovery import (
     split_standard_dp_discovery_result,
 )
 
+# These stay behind TYPE_CHECKING deliberately. ``vllm.config`` imports
+# ``HAS_TRITON``, whose module resolves ``current_platform`` at import time, which
+# loads this plugin: a module-level ``vllm.config`` import here is a cycle.
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.inputs import EngineInput
@@ -42,6 +45,10 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
+
+# vLLM reads this on every access until ``enable_envs_cache()``, so writing it
+# from the platform hooks still reaches the engine core and every worker.
+_V2_MODEL_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 # TT model versions backed by the single-execute Galaxy generator
 # (models.demos.llama3_70b_galaxy.tt.generator:Generator). For these,
@@ -439,38 +446,79 @@ def _should_pre_register_tt_test_models_from_cli() -> bool:
 def _install_tt_harmony_truncation_patch() -> None:
     """Use right truncation for TT GPT-OSS tokenizers.
 
-    GPT-OSS harmony prompts have important template/control tokens at the
-    beginning. Left truncation can remove those tokens when prompt truncation is
-    requested, so TT keeps the prefix and truncates from the right for these
-    models.
+    GPT-OSS harmony prompts carry template/control tokens at the beginning, which
+    upstream's ``truncation_side="left"`` default for generate models drops when
+    prompt truncation is requested. TT keeps the prefix and truncates from the
+    right instead.
+
+    ``cached_tokenizer_from_config`` is the hook because it is the call that
+    builds the engine's tokenizer. ``tokenizer_args_from_config`` looks like the
+    natural target but is not: its only caller keeps the renderer mode and
+    discards the tokenizer kwargs. Injecting into the incoming kwargs also keeps
+    the downstream ``lru_cache`` keyed on ``truncation_side`` rather than
+    mutating a cached result.
+
+    ``vllm.renderers.registry`` binds the name at import time, so patch the
+    module too when it is already loaded; if it loads later it picks up the
+    replacement from ``vllm.tokenizers.registry``.
 
     TODO: remove this once fixed in vLLM core.
     """
     import vllm.tokenizers.registry as tokenizer_registry
 
-    if hasattr(tokenizer_registry, "_tt_original_tokenizer_args_from_config"):
+    if hasattr(tokenizer_registry, "_tt_original_cached_tokenizer_from_config"):
         return
 
-    original = tokenizer_registry.tokenizer_args_from_config
-    tokenizer_registry._tt_original_tokenizer_args_from_config = original
+    original = tokenizer_registry.cached_tokenizer_from_config
+    tokenizer_registry._tt_original_cached_tokenizer_from_config = original
 
-    def tokenizer_args_from_config_tt(config, **kwargs):
-        tokenizer_mode, tokenizer_name, args, tokenizer_kwargs = original(
-            config, **kwargs
-        )
+    def cached_tokenizer_from_config_tt(model_config, **kwargs):
+        tokenizer_name = str(getattr(model_config, "tokenizer", "") or "").lower()
         if (
-            "truncation_side" not in tokenizer_kwargs
-            and config.runner_type in ("generate", "draft")
-            and "gpt-oss" in str(tokenizer_name or "").lower()
+            "truncation_side" not in kwargs
+            and model_config.runner_type in ("generate", "draft")
+            and "gpt-oss" in tokenizer_name
         ):
-            tokenizer_kwargs["truncation_side"] = "right"
-        return tokenizer_mode, tokenizer_name, args, tokenizer_kwargs
+            kwargs["truncation_side"] = "right"
+        return original(model_config, **kwargs)
 
-    tokenizer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
+    tokenizer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
     renderer_registry = sys.modules.get("vllm.renderers.registry")
     if renderer_registry is not None:
-        renderer_registry.tokenizer_args_from_config = tokenizer_args_from_config_tt
+        renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
+
+
+def _pin_v1_model_runner() -> None:
+    """Keep the engine on vLLM's V1 model runner.
+
+    ``VllmConfig.use_v2_model_runner`` defaults on for every dense architecture,
+    and the V2 scheduler drops two things the TT runner reads: it folds
+    preemption-resumed requests into ``scheduled_new_reqs`` (so
+    ``CachedRequestData.resumed_req_ids`` is always empty) and stops populating
+    ``all_token_ids``, moving the history to
+    ``NewRequestData.prefill_token_ids``. ``build_cached_request_state`` reads
+    neither, so a resume after preemption would rebuild the request with an empty
+    ``output_token_ids`` while ``num_computed_tokens`` still counts the generated
+    tokens: silent output corruption.
+
+    Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
+    which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
+    set to the empty string. Pin the variable rather than rely on that.
+
+    Refuse an explicit opt-in instead of honoring it: the corruption is silent,
+    so a clear failure is strictly more useful than a wrong answer.
+    """
+    requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
+    if requested is not None and requested != "0":
+        raise ValueError(
+            f"{_V2_MODEL_RUNNER_ENV}={requested!r} selects vLLM's V2 model "
+            "runner. The TT backend implements only the V1 model-runner "
+            "contract: under V2 a request resumed after preemption silently "
+            f"loses every generated token. Unset {_V2_MODEL_RUNNER_ENV} or set "
+            "it to 0."
+        )
+    os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
 
 def _iter_extra_model_bundles():
@@ -808,6 +856,7 @@ class TTPlatform(Platform):
         # this process, so we must ensure TT test models are registered early
         # when explicitly requested via CLI override.
         super().pre_register_and_update(parser)
+        _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
         if _should_pre_register_tt_test_models_from_cli():
             register_tt_test_models()
@@ -839,6 +888,9 @@ class TTPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        # Before any read of ``vllm_config.use_v2_model_runner``, which
+        # ``VllmConfig.__post_init__`` performs immediately after this hook.
+        _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
         cls._standard_dp_visible_device_groups = None
         cls._standard_dp_mesh_grids = {}
@@ -896,11 +948,6 @@ class TTPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
-        parallel_config.engine_core_cls = "vllm.v1.engine.core.EngineCore"
-        parallel_config.engine_core_proc_cls = "vllm.v1.engine.core.EngineCoreProc"
-        parallel_config.engine_core_launcher_cls = (
-            "vllm.v1.engine.utils.CoreEngineLauncher"
-        )
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -1060,6 +1107,17 @@ class TTPlatform(Platform):
                     )
 
         if _uses_explicit_tt_mpi_launch(vllm_config):
+            # ``ParallelConfig`` permits arbitrary attribute writes, so setting a
+            # launcher hook a vLLM build does not define is silently ignored and
+            # the run quietly single-hosts itself. Fail instead.
+            if not hasattr(parallel_config, "engine_core_launcher_cls"):
+                raise NotImplementedError(
+                    "TT MPI multi-host launch (tt.rank_binding, tt.mpi_args, "
+                    "nnodes > 1) needs an engine-core launcher hook "
+                    "(ParallelConfig.engine_core_launcher_cls and "
+                    "vllm.v1.engine.utils.CoreEngineLauncher) that this vLLM "
+                    "build does not provide."
+                )
             parallel_config.engine_core_launcher_cls = (
                 "vllm_tt_plugin.launcher.TTCoreEngineLauncher"
             )

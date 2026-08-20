@@ -25,28 +25,14 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
-
-from vllm_tt_plugin.logger import init_tt_logger
-
-try:
-    # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
-    # the executor reduces into compilation_config. Older vLLM lacks the type;
-    # fall back to a local definition so the return value is still well-formed.
-    from vllm.v1.worker.worker_base import CompilationTimes
-except ImportError:  # pragma: no cover - older vLLM without the timing contract
-    from typing import NamedTuple
-
-    class CompilationTimes(NamedTuple):
-        language_model: float
-        encoder: float
-
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
@@ -75,11 +61,10 @@ register_tt_models(register_test_models=_should_pre_register_tt_test_models_from
 def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
     """Bind ``TT_VISIBLE_DEVICES`` to this rank's device group.
 
-    As of vLLM v0.24, the engine-core launcher writes
-    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a
-    per-rank env var. tt-metal reads only the env var, so the worker
-    materializes it here; otherwise every rank keeps the launcher's value and
-    they share chips.
+    The engine-core launcher writes ``parallel_config.assigned_physical_gpu_ids``
+    rather than exporting a per-rank env var. tt-metal reads only the env var, so
+    the worker materializes it here; otherwise every rank keeps the launcher's
+    value and they share chips.
 
     Standard-DP discovery owns the rank-to-submesh topology. A nonempty
     assignment must agree with the discovered group for the local rank. MPI
@@ -417,11 +402,6 @@ class TTWorker(WorkerBase):
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        # Cache is already initialized in initialize_from_config.
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
         # auto-fit reduces max_model_len to the KV cache capacity.
@@ -434,11 +414,10 @@ class TTWorker(WorkerBase):
         self.model_config.max_model_len = max_model_len
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        # Newer vLLM reduces per-worker timings returned here into
-        # compilation_config.compilation_time; older vLLM ignores the return.
-        # TT does device warmup rather than graph compilation, so report the
-        # warmup wall time as the language-model figure and zero for the
-        # (absent) encoder phase.
+        # The executor reduces per-worker timings returned here into
+        # compilation_config.compilation_time. TT does device warmup rather than
+        # graph compilation, so report the warmup wall time as the language-model
+        # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
             return CompilationTimes(language_model=0.0, encoder=0.0)
