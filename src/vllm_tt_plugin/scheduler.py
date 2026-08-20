@@ -95,7 +95,8 @@ class TTScheduler(AsyncScheduler):
                 "one sampled-token placeholder"
             )
             assert not self.kv_cache_manager.enable_caching, (
-                "Block-output models bypass AsyncScheduler.cache_blocks and "
+                "Block-output models bypass the kv_cache_manager.cache_blocks "
+                "call made by AsyncScheduler._update_request_with_output and "
                 "must disable prefix caching"
             )
 
