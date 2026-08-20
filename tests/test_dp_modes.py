@@ -165,19 +165,31 @@ class TestDPModes:
             "1,0",
         ]
 
-    def test_rank_binding_is_rejected_without_the_launcher_hook(
+    @pytest.mark.parametrize(
+        ("tt_config", "parallel_overrides"),
+        [
+            ({"rank_binding": "/tmp/rank_binding.yaml"}, {}),
+            ({"mpi_args": "--host hostA"}, {}),
+            ({}, {"nnodes": 2}),
+            ({}, {"node_rank": 1}),
+        ],
+    )
+    def test_explicit_tt_launch_is_rejected_without_the_launcher_hook(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
+        tt_config: dict,
+        parallel_overrides: dict,
     ) -> None:
         # Upstream vLLM defines no ``engine_core_launcher_cls``, and writing one
         # anyway is silently ignored, which would quietly single-host a run the
-        # user asked to spread over several nodes.
+        # user asked to spread over several nodes. Every explicit-MPI trigger
+        # (rank_binding, mpi_args, nnodes > 1, node_rank > 0) must fail fast.
         vllm_config.parallel_config.data_parallel_size = 4
-        vllm_config.additional_config = {
-            "tt": {"rank_binding": "/tmp/rank_binding.yaml"}
-        }
+        vllm_config.additional_config = {"tt": tt_config}
+        for key, value in parallel_overrides.items():
+            setattr(vllm_config.parallel_config, key, value)
 
         with pytest.raises(NotImplementedError, match="engine-core launcher hook"):
             self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
