@@ -515,11 +515,15 @@ class TTWorker(WorkerBase):
     # ---- Destructor (used to close devices) ----
 
     def __del__(self):
-        # Delete model runner first in case there are model artifacts
+        # Delete model runner first in case there are model artifacts.
+        # Separate suppress blocks: init_device raises between opening the
+        # mesh and assigning model_runner (sizing validation), and a missing
+        # model_runner must not short-circuit closing the open mesh.
         with suppress(AttributeError):
             # attributes may be already torn down when destructor is called
             del self.model_runner
 
+        with suppress(AttributeError):
             if self.mesh_device:
                 close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
                 del self.mesh_device
