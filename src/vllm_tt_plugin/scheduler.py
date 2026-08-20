@@ -156,6 +156,22 @@ class TTScheduler(AsyncScheduler):
         """
         from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
 
+        if request.prompt_token_ids is None and request.num_prompt_tokens > 0:
+            # The frontend rejects prompt_embeds for every TT model; admitted
+            # bare, the worker's request-state builder raises
+            # NotImplementedError out of execute_model. Replace with
+            # placeholder tokens; an embeds-only Request already carries
+            # [0] * num_prompt_tokens in _all_token_ids, so the replacement
+            # keeps every derived view consistent.
+            logger.warning(
+                "Request %s bypassed frontend validation with a "
+                "prompt_embeds-only prompt the TT backend does not support; "
+                "replacing with %d placeholder tokens",
+                request.request_id,
+                request.num_prompt_tokens,
+            )
+            request.prompt_token_ids = [0] * request.num_prompt_tokens
+            request.prompt_embeds = None
         if request.num_prompt_tokens == 0:
             # The frontend rejects empty prompts; admitted bare, the waiting
             # loop schedules zero new tokens and upstream's num_new_tokens

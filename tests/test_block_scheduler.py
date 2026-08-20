@@ -360,6 +360,39 @@ def test_continuation_of_scrubbed_resumable_session_is_dropped():
     assert prefill.num_scheduled_tokens == {"stream-0": 32}
 
 
+def test_embeds_only_bypassed_prompt_is_replaced_with_placeholders():
+    """The frontend rejects prompt_embeds for every TT model; admitted bare,
+    the worker's request-state builder raises NotImplementedError out of
+    execute_model and kills the engine."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="embeds-0",
+        prompt_token_ids=None,
+        prompt_embeds=torch.zeros(8, 4),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.prompt_token_ids == [0] * 8
+    assert request.prompt_embeds is None
+    assert request.num_prompt_tokens == 8
+    # The max_tokens clamp no longer early-returns on the missing token ids.
+    assert request.max_tokens == 3
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"embeds-0": 8}
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.running == []
+
+
 def test_empty_bypassed_prompt_is_padded_and_served():
     """The frontend rejects empty prompts; admitted bare, the waiting loop
     schedules zero new tokens and upstream's num_new_tokens assert tears
