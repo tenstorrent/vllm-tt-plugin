@@ -569,6 +569,12 @@ class TTLaneCoordinator(SchedulerInterface):
         # requests (request IDs are globally unique). Row order within the
         # bitmask is irrelevant: the runner remaps rows back to batch positions
         # by request ID via reorder_grammar_bitmask_for_tt_batch.
+        #
+        # The merged flag is the union over the lanes, so a false value means no
+        # lane scheduled a constrained request and the per-step union below is
+        # pure waste.
+        if not scheduler_output.has_structured_output_requests:
+            return None
         requests: dict[str, Request] = {}
         for sched in self.lanes:
             requests.update(sched.requests)
