@@ -633,7 +633,7 @@ def _neutralize_model_owned_sampling(params) -> list[str]:
 def _install_block_output_input_processor_patch() -> None:
     """Reject unsupported resumable requests and own block-output defaults.
 
-    vLLM 0.24 validates caller-owned SamplingParams before cloning them, then
+    vLLM 0.25.1 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
     reject resumable streaming-input chunks before EngineCore admits any, and
     neutralize model-owned sampling controls and round the whole-canvas default
@@ -1472,7 +1472,7 @@ class TTPlatform(Platform):
             # over the model-type policy once the output width is known.
             _disable_chunked_prefill(vllm_config, "block-output models")
 
-            # Upstream 0.24 detects diffusion from ``hf_config.canvas_length``.
+            # Upstream 0.25.1 detects diffusion from ``hf_config.canvas_length``.
             # TT block models own their canvas lifecycle, so remove that marker
             # and invalidate the cached property before vLLM selects a model
             # runner or constructs the scheduler. This keeps every downstream
@@ -1705,7 +1705,7 @@ class TTPlatform(Platform):
         vllm_config.scheduler_config.verify_max_model_len(
             vllm_config.model_config.max_model_len
         )
-        # vLLM 0.24 syncs an auto-fitted max_model_len back into this same
+        # vLLM 0.25.1 syncs an auto-fitted max_model_len back into this same
         # frontend config through EngineCoreReadyResponse. Retain one config
         # handle rather than snapshotting either the width or the length.
         # The entry check above protects a live block engine; this one refuses

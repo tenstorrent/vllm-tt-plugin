@@ -29,11 +29,12 @@ _TT_VISIBLE_DEVICES_ENV = "TT_VISIBLE_DEVICES"
 try:
     from vllm.v1.engine.utils import CoreEngineLauncher, EngineLaunchPlan
 except ImportError:
-    # Upstream vLLM 0.24 launches engines directly from launch_core_engines()
-    # and has no public launcher extension classes. Keep the parsing and remote
-    # entrypoint portions of this plugin importable on 0.24; if a later call
-    # tries to use the absent extension point, fail explicitly rather than at
-    # module import (which would also break every DP=1 host test).
+    # Stock upstream vLLM (0.24 and 0.25.1 alike) launches engines directly
+    # from launch_core_engines() and has no public launcher extension classes.
+    # Keep the parsing and remote entrypoint portions of this plugin importable
+    # on such builds; if a later call tries to use the absent extension point,
+    # fail explicitly rather than at module import (which would also break
+    # every DP=1 host test).
     @dataclass
     class EngineLaunchPlan:  # type: ignore[no-redef]
         remote_launched: bool = False
@@ -42,8 +43,8 @@ except ImportError:
     class CoreEngineLauncher:  # type: ignore[no-redef]
         def get_engines_to_handshake(self, *_args, **_kwargs):
             raise RuntimeError(
-                "vLLM 0.24 does not expose the CoreEngineLauncher extension "
-                "point required by explicit tt-run/MPI launch"
+                "this vLLM build does not expose the CoreEngineLauncher "
+                "extension point required by explicit tt-run/MPI launch"
             )
 
 

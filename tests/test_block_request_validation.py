@@ -41,7 +41,7 @@ def _validate(params: SamplingParams, prompt_len: int = 32) -> None:
 def _upstream_process_inputs(
     self, request_id, prompt, params, *args, resumable=False, **kwargs
 ):
-    """The vLLM 0.24 validate -> clone -> resolve-default boundary."""
+    """The vLLM 0.25.1 validate -> clone -> resolve-default boundary."""
     calls = getattr(self, "process_inputs_calls", None)
     if calls is not None:
         calls.append({"resumable": resumable})
@@ -75,7 +75,7 @@ def _patch_upstream_boundary(monkeypatch):
 
 
 def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
-    """Install the vLLM 0.24 validate -> clone -> default boundary."""
+    """Install the vLLM 0.25.1 validate -> clone -> default boundary."""
     input_processor = _patch_upstream_boundary(monkeypatch)
     _install_block_output_input_processor_patch()
 
@@ -109,7 +109,7 @@ def test_auto_fitted_frontend_limit_is_read_live(monkeypatch):
 
     assert platform.get_max_output_tokens(32) == 768
 
-    # Mirrors vLLM 0.24 EngineCoreReadyResponse updating the same frontend
+    # Mirrors vLLM 0.25.1 EngineCoreReadyResponse updating the same frontend
     # ModelConfig object after --max-model-len -1 auto-fit.
     config.model_config.max_model_len = 640
 
