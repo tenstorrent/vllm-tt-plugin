@@ -65,7 +65,12 @@ affects the offline `LLM` entrypoint). The
 arbitrary prompt lengths; without them only prompts whose execution length is
 in `DG_UPFRONT_PREFILL_WARMUP_LENS` are served, and any other prompt returns
 an empty completion. If the expected aligned prompt lengths change, update
-`DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly.
+`DG_UPFRONT_PREFILL_WARMUP_LENS` accordingly. With
+`DG_UPFRONT_COARSE_PREFILL_BUCKETS=1`, `--max-model-len` must be a power of
+two no larger than 262144, as in the release configuration: the adapter
+resolves each prefill to a power-of-two bucket capped at `max_model_len`, so
+under a non-power-of-two limit an admitted prompt aligned past the largest
+bucket has no servable execution shape and the failure is engine-fatal.
 
 ## Request Contract
 
