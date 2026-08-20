@@ -109,7 +109,7 @@ def test_auto_fitted_frontend_limit_is_read_live(monkeypatch):
 
     assert platform.get_max_output_tokens(32) == 768
 
-    # Mirrors vLLM 0.24 CoreEngineReadyResponse updating the same frontend
+    # Mirrors vLLM 0.24 EngineCoreReadyResponse updating the same frontend
     # ModelConfig object after --max-model-len -1 auto-fit.
     config.model_config.max_model_len = 640
 
