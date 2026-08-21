@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import weakref
+from dataclasses import dataclass, field
 
 import cloudpickle
 import yaml
@@ -16,7 +17,7 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_ip
 from vllm.utils.system_utils import kill_process_tree
-from vllm.v1.engine.utils import CoreEngine, CoreEngineLauncher, EngineLaunchPlan
+from vllm.v1.engine.utils import CoreEngine
 from vllm.v1.executor.abstract import UniProcExecutor
 
 from vllm_tt_plugin.config import get_tt_config
@@ -24,6 +25,27 @@ from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
 _TT_VISIBLE_DEVICES_ENV = "TT_VISIBLE_DEVICES"
+
+try:
+    from vllm.v1.engine.utils import CoreEngineLauncher, EngineLaunchPlan
+except ImportError:
+    # Stock upstream vLLM (0.24 and 0.25.1 alike) launches engines directly
+    # from launch_core_engines() and has no public launcher extension classes.
+    # Keep the parsing and remote entrypoint portions of this plugin importable
+    # on such builds; if a later call tries to use the absent extension point,
+    # fail explicitly rather than at module import (which would also break
+    # every DP=1 host test).
+    @dataclass
+    class EngineLaunchPlan:  # type: ignore[no-redef]
+        remote_launched: bool = False
+        non_device_dp_ranks: set[int] = field(default_factory=set)
+
+    class CoreEngineLauncher:  # type: ignore[no-redef]
+        def get_engines_to_handshake(self, *_args, **_kwargs):
+            raise RuntimeError(
+                "this vLLM build does not expose the CoreEngineLauncher "
+                "extension point required by explicit tt-run/MPI launch"
+            )
 
 
 class TTLaunchPlan(EngineLaunchPlan):

@@ -24,7 +24,7 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # tt-run / MPI launch integration
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.25.1)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
@@ -251,9 +251,13 @@ deterministic, but it is not compatible with DP models.
 Start the OpenAI-compatible server:
 
 ```bash
-VLLM_RPC_TIMEOUT=100000 MESH_DEVICE=T3K \
+MESH_DEVICE=T3K \
 python examples/server_example_tt.py
 ```
+
+DiffusionGemma uses a 256-token block-serving contract with stricter launch and
+request constraints. See [DiffusionGemma block serving](docs/diffusion-gemma.md)
+for the exact command, request validation, and block metrics.
 
 Send a completion request:
 
@@ -325,8 +329,8 @@ sizes and validates the KV cache against it, the two must be chosen together:
 | `--max-model-len` | Behavior |
 | --- | --- |
 | numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
-| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Lower `--max-model-len` or raise `max_tokens_all_users`. |
-| `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. |
+| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. |
+| `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. For block-output models the TT worker fits `max_model_len` to the pool minus one output canvas before vLLM's auto-fit runs. |
 | omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
 
 Explicit `-1` auto-fit picks the largest length that fits **one** request, so it
@@ -385,7 +389,6 @@ changes are needed. Wormhole Galaxy example (fabric defaults to `FABRIC_1D_RING`
 ```bash
 MESH_DEVICE=TG \
 TT_LLAMA_TEXT_VER=llama3_70b_galaxy \
-VLLM_RPC_TIMEOUT=900000 \
 python examples/server_example_tt.py \
   --model "meta-llama/Llama-3.3-70B-Instruct" \
   --data_parallel_size 4 \
@@ -415,6 +418,8 @@ implementations. Current families:
 - Gemma 4 text-only models (`TTGemma4ForCausalLM`,
   `TTGemma4ForConditionalGeneration`,
   `TTGemma4UnifiedForConditionalGeneration`)
+- DiffusionGemma block-output models (`TTDiffusionGemmaForBlockDiffusion`,
+  `TTDiffusionGemmaForCausalLM`)
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 
@@ -518,6 +523,18 @@ under `tests/`, for example:
 ```bash
 pytest tests/test_lane_scheduler.py
 ```
+
+These need no Tenstorrent hardware, only an importable `ttnn`. On a host without
+tt-metal, put the CI stub on the path instead — this is what the `unit-tests`
+workflow job runs:
+
+```bash
+PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
+```
+
+The stub answers only the `ttnn` names the plugin touches and raises from
+anything that would reach a device, so a test that starts depending on real
+hardware fails loudly rather than passing against a fake.
 
 ## Hybrid Attention Models
 

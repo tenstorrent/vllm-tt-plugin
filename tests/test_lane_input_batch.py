@@ -91,7 +91,7 @@ def _make_req(req_id, prompt, output, sp_kwargs, seed=None):
     )
 
 
-def _lane_batch(num_lanes, per_lane, with_custom=True):
+def _lane_batch(num_lanes, per_lane, with_custom=True, disable_logprobs=False):
     return TTLaneInputBatch(
         num_lanes=num_lanes,
         per_lane=per_lane,
@@ -101,6 +101,7 @@ def _lane_batch(num_lanes, per_lane, with_custom=True):
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(num_lanes * per_lane, with_custom=with_custom),
+        disable_logprobs=disable_logprobs,
     )
 
 
@@ -443,7 +444,9 @@ def _ref_sampling_metadata(batch, n):
     )
 
 
-def _plain_batch_of_one(req, with_custom=True):
+def _plain_batch_of_one(
+    req, with_custom=True, disable_logprobs=False, output_tokens_per_step=1
+):
     b = InputBatch(
         max_num_reqs=1,
         max_model_len=MAX_MODEL_LEN,
@@ -452,10 +455,49 @@ def _plain_batch_of_one(req, with_custom=True):
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(1, with_custom=with_custom),
+        disable_logprobs=disable_logprobs,
+        output_tokens_per_step=output_tokens_per_step,
     )
     b.add_request(req)
     b.refresh_logitsprocs()
     return b
+
+
+def test_worker_guard_neutralizes_logprobs_for_block_output():
+    req = _make_req("block", [1], [], dict(temperature=0.0, logprobs=0))
+
+    batch = _plain_batch_of_one(req, disable_logprobs=True)
+
+    assert batch.max_num_logprobs is None
+
+
+def test_worker_guard_clamps_max_tokens_for_block_output():
+    leftover = MAX_MODEL_LEN - 1
+    req = _make_req("block", [1], [], dict(temperature=0.0, max_tokens=leftover))
+
+    _plain_batch_of_one(req, output_tokens_per_step=16)
+
+    # prompt=1 tiles to 32; remaining 224 of 16-token canvases.
+    assert req.sampling_params.max_tokens == 224
+
+
+def test_worker_guard_preserves_max_tokens_that_already_fit():
+    req = _make_req("block", [1], [], dict(temperature=0.0, max_tokens=16))
+
+    _plain_batch_of_one(req, output_tokens_per_step=16)
+
+    assert req.sampling_params.max_tokens == 16
+
+
+def test_lane_batch_forwards_the_logprobs_guard():
+    # Unreachable today (block models pin DP=1), but the lane constructor must
+    # not silently drop the guard a future lane-capable block model relies on.
+    batch = _lane_batch(num_lanes=1, per_lane=2, disable_logprobs=True)
+    _add_to_lane(
+        batch, _make_req("block", [1], [], dict(temperature=0.0, logprobs=0)), 0
+    )
+
+    assert batch.max_num_logprobs is None
 
 
 def _feature_specs():

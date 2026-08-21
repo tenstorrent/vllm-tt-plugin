@@ -28,6 +28,7 @@ to ``False``), so the sliding tests pass ``hybrid_enabled=True`` to
 exercise the headroom formula.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -123,6 +124,152 @@ def test_lane_mode_kv_shape_matches_per_lane_standard_dp(cfg):
     # Default tokens (131072) + batch padding (64 * 8 = 512) = 131584 tokens
     # -> ceil/64 = 2056.
     assert n == 2056
+
+
+def test_block_output_budget_includes_one_physical_canvas(cfg):
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.model_config.max_model_len = 1024
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _model_budget(1024),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    assert n * cfg.cache_config.block_size == 1024 + 256
+
+
+def test_block_output_rejects_fallback_budget_below_served_length(cfg):
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.model_config.max_model_len = 200_000
+    cfg.model_config.original_max_model_len = 200_000
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+        pytest.raises(ValueError, match="Block-output KV budget is too small"),
+    ):
+        get_num_available_blocks_tt(cfg)
+
+
+def test_block_output_auto_fit_shrinks_max_model_len_instead_of_raising(cfg):
+    """``--max-model-len -1`` must not die on the pre-auto-fit budget check.
+
+    The sizing query stays pure; the worker fits the length in a separate
+    step (``init_device`` calls ``_fit_block_output_max_model_len`` before
+    the model loads), keeping one full output canvas of headroom in the
+    pool."""
+    from vllm_tt_plugin.worker import (
+        _fit_block_output_max_model_len,
+        get_num_available_blocks_tt,
+    )
+
+    cfg.model_config.max_model_len = 200_000  # HF-derived full context
+    cfg.model_config.original_max_model_len = -1
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+    ):
+        n = get_num_available_blocks_tt(cfg)
+
+    resolved_kv_tokens = n * cfg.cache_config.block_size
+    # Fallback budget 131072 + one 256-token canvas of padding.
+    assert resolved_kv_tokens == 131_072 + 256
+    assert cfg.model_config.max_model_len == 200_000
+
+    _fit_block_output_max_model_len(cfg, n)
+    assert cfg.model_config.max_model_len == resolved_kv_tokens - 256
+
+
+@pytest.mark.parametrize(
+    ("budget", "fitted"),
+    [
+        # Pool 512 tokens: exactly one canvas is left, which used to pass the
+        # one-canvas check and fit a max_model_len that serves nothing.
+        pytest.param(256, None, id="fits-only-the-canvas"),
+        # Pool 320 tokens: not even the canvas survives the reservation.
+        pytest.param(32, None, id="fits-less-than-the-canvas"),
+        # Pool 576 tokens: 320 left after the canvas, above the 288 minimum.
+        pytest.param(320, 320, id="fits-a-prompt-tile-too"),
+    ],
+)
+def test_block_output_auto_fit_requires_room_for_a_prompt_tile(cfg, budget, fitted):
+    """The fitted length must be servable, not merely one canvas wide.
+
+    ``--max-model-len -1`` bypasses the sizing query's budget check, so this is
+    the only place a pool too small to hold a prompt tile plus a canvas can be
+    caught before the server starts and rejects every request."""
+    from vllm_tt_plugin.worker import (
+        _fit_block_output_max_model_len,
+        get_num_available_blocks_tt,
+    )
+
+    cfg.model_config.max_model_len = 200_000
+    cfg.model_config.original_max_model_len = -1
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _model_budget(budget),
+    ):
+        # An oversized ``-1`` request is not an error here; the fit decides.
+        n = get_num_available_blocks_tt(cfg)
+
+    if fitted is None:
+        with pytest.raises(ValueError, match="must be at least 288"):
+            _fit_block_output_max_model_len(cfg, n)
+        assert cfg.model_config.max_model_len == 200_000
+    else:
+        _fit_block_output_max_model_len(cfg, n)
+        assert cfg.model_config.max_model_len == fitted
+
+
+def test_determine_available_memory_reports_the_count_sized_before_load(monkeypatch):
+    """The engine must be told the pool the model was already loaded against.
+
+    ``get_max_tokens_all_users`` derives the budget from ``max_model_len``, so
+    recomputing here -- after ``init_device`` fitted that length down -- would
+    report a different pool than the one the model sized itself to."""
+    from vllm_tt_plugin import worker as worker_mod
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("the block count must not be recomputed")
+
+    monkeypatch.setattr(worker_mod, "get_num_available_blocks_tt", fail_if_called)
+    monkeypatch.setattr(
+        worker_mod,
+        "_available_kv_cache_memory_bytes_for_num_blocks",
+        lambda _cfg, _spec, num_blocks: num_blocks * 1024,
+    )
+
+    w = worker_mod.TTWorker.__new__(worker_mod.TTWorker)
+    w._num_tt_blocks = 11
+    w.vllm_config = SimpleNamespace()
+    w.cache_config = SimpleNamespace(num_gpu_blocks_override=None)
+    w.get_kv_cache_spec = dict
+
+    assert worker_mod.TTWorker.determine_available_memory(w) == 11 * 1024
+    assert w.cache_config.num_gpu_blocks_override == 11
+
+
+def test_determine_available_memory_requires_a_sized_pool():
+    from vllm_tt_plugin import worker as worker_mod
+
+    w = worker_mod.TTWorker.__new__(worker_mod.TTWorker)
+    w._num_tt_blocks = None
+
+    with pytest.raises(RuntimeError, match="has not been sized"):
+        worker_mod.TTWorker.determine_available_memory(w)
 
 
 def test_sliding_window_adds_headroom(cfg):

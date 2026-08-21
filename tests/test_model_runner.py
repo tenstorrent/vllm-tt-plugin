@@ -58,6 +58,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     return SimpleNamespace(
         input_batch=batch,
         requests={"r": request},
+        _output_tokens_per_step=1,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
