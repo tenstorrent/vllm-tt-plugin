@@ -98,6 +98,31 @@ def test_pre_register_installs_models_before_diffusion_architecture_patch(
     assert events == [("register", True), ("patch", None)]
 
 
+def test_general_plugin_entry_point_installs_architecture_patch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Engine-core, worker, and registry subprocesses build ModelConfig without
+    # ever running pre_register_and_update; they get the rewrite through the
+    # vllm.general_plugins entry point, so it must travel with registration.
+    from vllm_tt_plugin import model_registry
+
+    events = []
+    monkeypatch.setattr(
+        model_registry,
+        "register_tt_models",
+        lambda register_test_models=False: events.append("register"),
+    )
+    monkeypatch.setattr(
+        model_registry,
+        "_install_diffusion_gemma_architecture_patch",
+        lambda: events.append("patch"),
+    )
+
+    model_registry.register_tt_models_from_plugin()
+
+    assert events == ["register", "patch"]
+
+
 def test_gemma4_parsers_are_owned_by_upstream_vllm():
     from vllm.reasoning import ReasoningParserManager
     from vllm.reasoning.gemma4_engine_reasoning_parser import (

@@ -313,12 +313,30 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
 
 
 def test_startup_rejects_explicit_diffusion_config(monkeypatch):
+    # A TT-resolved architecture proves the early get_config rewrite ran, so
+    # the upstream hook cannot have auto-created this config: it is explicit.
     config = _config()
+    config.model_config.architecture = "TTFutureBlockModel"
     config.diffusion_config = SimpleNamespace(canvas_length=256)
     _patch_model_resolution(monkeypatch)
 
     with pytest.raises(ValueError, match=r"do not support --diffusion-config"):
         TTPlatform.check_and_update_config(config)
+
+
+def test_startup_clears_hook_created_diffusion_config(monkeypatch):
+    # Without the early rewrite (VllmConfig built outside EngineArgs), the
+    # bare architecture reaches upstream's MODELS_CONFIG_MAP hook, which
+    # auto-creates a DiffusionConfig before the platform hook runs. Startup
+    # must clear it rather than blame an operator flag that was never passed.
+    config = _config()
+    config.model_config.architecture = "FutureBlockModel"
+    config.diffusion_config = SimpleNamespace(canvas_length=256)
+    _patch_model_resolution(monkeypatch)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert config.diffusion_config is None
 
 
 def test_startup_rejects_mismatched_diffusion_canvas(monkeypatch):
