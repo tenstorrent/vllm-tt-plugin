@@ -160,6 +160,53 @@ def test_condense_is_noop():
     assert b.req_id_to_index["b"] == 1
 
 
+def test_greedy_request_collapses_to_device_argmax():
+    """vLLM greedy is temperature≈0 / top_k=0; the device sampler needs k=1, p=0."""
+    b = _lane_batch(num_lanes=1, per_lane=4)
+    sp = SamplingParams(temperature=0.0)
+    assert sp.top_k == 0
+    _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)
+    assert b.sampling.top_k[0].item() == 1
+    assert b.sampling.top_p[0].item() == 0.0
+    # Random rows still expand unrestricted top_k to vocab and leave top_p.
+    _add_to_lane(
+        b,
+        _make_req("b", [1], [], dict(temperature=0.8, top_k=0, top_p=0.95)),
+        0,
+    )
+    assert b.sampling.top_k[1].item() == VOCAB
+    assert b.sampling.top_p[1].item() == pytest.approx(0.95)
+
+
+def test_prefill_penalty_tokens_are_slot_scattered():
+    """Packed prefill history must land on the occupied device slots, not 0..n-1.
+
+    Two lanes × 4 slots: first request in each lane sits at rows 0 and 4.
+    Packed order is [row0, row4]; a pad-at-end would put row4's prompt on
+    row 1 and leave the real slot 4 empty -- the mixed-batch penalty leak.
+    """
+    b = _lane_batch(num_lanes=2, per_lane=4)
+    _add_to_lane(
+        b,
+        _make_req("a", [7, 8, 9], [], dict(temperature=0.0, repetition_penalty=1.0)),
+        lane=0,
+    )
+    _add_to_lane(
+        b,
+        _make_req("b", [1, 2], [3], dict(temperature=0.0, repetition_penalty=2.0)),
+        lane=1,
+    )
+    prompt, output = b.slot_penalty_token_tensors([0, 4], capacity=8)
+    assert prompt.shape == (8, 3)
+    assert prompt[0, :3].tolist() == [7, 8, 9]
+    assert prompt[4, :2].tolist() == [1, 2]
+    assert prompt[1, 0].item() == -1
+    assert output[0, 0].item() == -1
+    assert output[4, 0].item() == 3
+    assert b.sampling.repetition_penalty[0].item() == pytest.approx(1.0)
+    assert b.sampling.repetition_penalty[4].item() == pytest.approx(2.0)
+
+
 # --------------------------------------------------------------------------
 # State update via apply_step_plan (moved here from the lane executor)
 # --------------------------------------------------------------------------
