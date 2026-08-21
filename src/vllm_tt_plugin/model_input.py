@@ -130,3 +130,9 @@ class TTModelInput:
     # sampled token, because more prompt tokens remain after this chunk.
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
+
+    # Request id per forward row. A prefill build can drop rows, so forward row
+    # order is not recoverable from the persistent batch; sample-time consumers
+    # must resolve rows through this. ``None`` for lane builds, whose rows are
+    # the persistent slots.
+    row_req_ids: list[str] | None = None
