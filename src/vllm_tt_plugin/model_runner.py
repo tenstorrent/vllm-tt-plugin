@@ -1033,8 +1033,13 @@ class TTModelRunner:
 
         def _is_still_prefilling(req_id: str) -> bool:
             row = input_batch.req_id_to_index[req_id]
+            # ``num_computed_tokens`` is the scheduler's pre-step snapshot, so a
+            # steady-state decode arrives with exactly one token left to
+            # compute. More than one token left means this step is a prefill
+            # chunk: either prompt tokens or a post-preemption replay.
             return (
-                input_batch.num_computed_tokens_cpu[row] < input_batch.num_tokens[row]
+                input_batch.num_computed_tokens_cpu[row] + 1
+                < input_batch.num_tokens[row]
             )
 
         # A "prefill" step can contain:
