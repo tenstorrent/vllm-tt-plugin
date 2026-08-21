@@ -1,5 +1,7 @@
 <!--
 Thank you for contributing to vllm-tt-plugin.
+Use one title prefix: [bug], [feat], [perf], [ref], [test], [ci], [doc], [deps], ...
+For example: [bug] Reject invalid device IDs for standard TT DP.
 Please complete the relevant sections so reviewers can understand and validate the change.
 -->
 
