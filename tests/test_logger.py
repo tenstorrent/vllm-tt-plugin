@@ -54,5 +54,18 @@ def test_warning_once_deduplicates_unhashable_arguments(caplog):
 def test_warning_once_does_not_format_disabled_message():
     logger = init_tt_logger("vllm_tt_plugin.logger_probe_disabled")
     logger.setLevel(logging.ERROR)
+    cache_size_before = _log_once.cache_info().currsize
 
-    logger.warning_once("bad integer=%d", "not-an-integer")
+    class _RecordingArg:
+        rendered = False
+
+        def __str__(self):
+            type(self).rendered = True
+            return "rendered"
+
+    logger.warning_once("bad value=%s", _RecordingArg())
+
+    # The isEnabledFor guard must return before rendering the dedup key or
+    # touching the once-cache; both would observably happen otherwise.
+    assert _RecordingArg.rendered is False
+    assert _log_once.cache_info().currsize == cache_size_before
