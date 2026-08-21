@@ -1784,6 +1784,14 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
+        # Mixed-batch presence/frequency/repetition penalties are not isolated
+        # on the device sampler with upstream vLLM (standalone plugin):
+        # no-penalty rows pick up a neighbor's penalty. Host sampling already
+        # applies per-row tensors. Same class of bug as
+        # https://github.com/tenstorrent/vllm/issues/286
+        if not input_batch.no_penalties:
+            return False
+
         # Structured outputs are not supported on device yet
         # https://github.com/tenstorrent/vllm/issues/277
         if has_structured_outputs:
