@@ -5,20 +5,55 @@
 # loading, which re-enters this module before it has finished executing.
 import functools
 import logging
+from dataclasses import dataclass, field
 from types import MethodType
 
 _TT_LOGGER_ROOT = "vllm.tt"
 _PACKAGE_PREFIX = "vllm_tt_plugin."
 
 
+@dataclass(frozen=True)
+class _LogOnceCall:
+    cache_key: tuple[str, str]
+    msg: str = field(compare=False, hash=False)
+    args: tuple = field(compare=False, hash=False)
+
+
 @functools.lru_cache
-def _log_once(logger: logging.Logger, level: int, msg: str, args: tuple) -> None:
+def _log_once(logger: logging.Logger, level: int, call: _LogOnceCall) -> None:
     # stacklevel=3 attributes the record to the *_once caller's line.
-    logger.log(level, msg, *args, stacklevel=3)
+    logger.log(level, call.msg, *call.args, stacklevel=3)
 
 
 def _warning_once(self: logging.Logger, msg: str, *args, **_kwargs) -> None:
-    _log_once(self, logging.WARNING, msg, args)
+    if not self.isEnabledFor(logging.WARNING):
+        return
+
+    record = logging.LogRecord(
+        self.name,
+        logging.WARNING,
+        pathname="",
+        lineno=0,
+        msg=msg,
+        args=args,
+        exc_info=None,
+    )
+    try:
+        cache_key = ("rendered", record.getMessage())
+    except Exception:
+        # Normal logging defers interpolation to the handler, where malformed
+        # format arguments are reported without escaping from Logger.warning.
+        # Keep that behavior while still producing a hashable deduplication key.
+        try:
+            raw_call = repr((msg, args))
+        except Exception:
+            raw_call = f"{msg!r} with unrepresentable arguments"
+        cache_key = ("unrenderable", raw_call)
+    _log_once(
+        self,
+        logging.WARNING,
+        _LogOnceCall(cache_key, msg, args),
+    )
 
 
 class _TTFileTag(logging.Filter):
@@ -47,10 +82,9 @@ def init_tt_logger(name: str) -> logging.Logger:
     )
     if not any(isinstance(f, _TTFileTag) for f in logger.filters):
         logger.addFilter(_TTFileTag())
-    # vLLM patches warning_once per instance in init_logger; this stdlib
-    # logger needs its own so warning_once call sites work on every model.
-    # Guarded: another library (e.g. transformers) may have already supplied
-    # it on logging.Logger.
-    if not hasattr(logger, "warning_once"):
-        logger.warning_once = MethodType(_warning_once, logger)
+    # Bind unconditionally: transformers installs an lru_cache warning_once on
+    # logging.Logger keyed on the raw args, which raises TypeError for any
+    # unhashable format argument. The instance binding shadows that class
+    # attribute so TT loggers dedup on the rendered message instead.
+    logger.warning_once = MethodType(_warning_once, logger)
     return logger

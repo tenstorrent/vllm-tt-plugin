@@ -241,7 +241,7 @@ def _config(
             worker_cls="auto",
             distributed_executor_backend=distributed_executor_backend,
         ),
-        diffusion_config=SimpleNamespace(canvas_length=256),
+        diffusion_config=None,
         speculative_config=None,
         lora_config=None,
     )
@@ -310,6 +310,15 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.diffusion_config is None
     assert not hasattr(config.model_config.hf_config, "canvas_length")
     assert config.model_config.is_diffusion is False
+
+
+def test_startup_rejects_explicit_diffusion_config(monkeypatch):
+    config = _config()
+    config.diffusion_config = SimpleNamespace(canvas_length=256)
+    _patch_model_resolution(monkeypatch)
+
+    with pytest.raises(ValueError, match=r"do not support --diffusion-config"):
+        TTPlatform.check_and_update_config(config)
 
 
 def test_startup_rejects_mismatched_diffusion_canvas(monkeypatch):

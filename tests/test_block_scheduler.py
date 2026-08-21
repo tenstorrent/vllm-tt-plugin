@@ -710,7 +710,20 @@ def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
             "stale async output",
             id="stale-async-frame",
         ),
-        pytest.param(None, CANVAS - 1, ValueError, r"15 != 16", id="wrong-width"),
+        pytest.param(
+            None,
+            CANVAS - 1,
+            ValueError,
+            r"15 != 16",
+            id="narrow-output",
+        ),
+        pytest.param(
+            None,
+            CANVAS + 1,
+            ValueError,
+            r"17 != 16",
+            id="wide-output",
+        ),
         pytest.param(
             lambda r: setattr(r, "num_output_placeholders", CANVAS - 1),
             CANVAS,
@@ -746,19 +759,12 @@ def test_k1_delegates_to_upstream_async_scheduler():
 def test_diffusion_checkpoint_books_exactly_one_canvas():
     """After the platform removes the diffusion marker, upstream contributes
     one normal sampled-token placeholder and the plugin reserves only K-1 more."""
-    from vllm.config.diffusion import DiffusionConfig
-
     scheduler = _scheduler(diffusion_checkpoint=True)
 
     assert scheduler.vllm_config.model_config.is_diffusion is False
     assert scheduler.num_sampled_tokens_per_step == 1
     assert scheduler.num_spec_tokens == 0
     assert scheduler.vllm_config.num_speculative_tokens == 0
-    # The platform must still clear a DiffusionConfig created before its hook:
-    # retaining one independently resurrects canvas-as-spec accounting.
-    scheduler.vllm_config.diffusion_config = DiffusionConfig(canvas_length=CANVAS)
-    assert scheduler.vllm_config.num_speculative_tokens == CANVAS
-    scheduler.vllm_config.diffusion_config = None
 
     request = _request(CANVAS * 2)
     scheduler.add_request(request)

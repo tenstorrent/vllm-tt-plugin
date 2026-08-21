@@ -46,12 +46,19 @@ def test_apply_and_build_runner_output_widths(width):
     assert output.sampled_token_ids == [expected]
 
 
-def test_output_width_is_strict():
+@pytest.mark.parametrize(
+    "actual_width",
+    [
+        pytest.param(15, id="narrow-output"),
+        pytest.param(17, id="wide-output"),
+    ],
+)
+def test_output_width_is_strict(actual_width):
     runner, _ = _runner(16)
 
     with pytest.raises(ValueError, match="violates output_tokens_per_step"):
         TTModelRunner._build_runner_output(
-            runner, torch.zeros((1, 15), dtype=torch.int32)
+            runner, torch.zeros((1, actual_width), dtype=torch.int32)
         )
 
 
@@ -295,9 +302,16 @@ def test_get_output_tokens_extracts_full_canvas_per_request():
     assert logprobs == [None]
 
 
-def test_get_output_tokens_rejects_wrong_canvas_width():
+@pytest.mark.parametrize(
+    "actual_width",
+    [
+        pytest.param(3, id="narrow-output"),
+        pytest.param(5, id="wide-output"),
+    ],
+)
+def test_get_output_tokens_rejects_wrong_canvas_width(actual_width):
     with pytest.raises(ValueError, match="violates output_tokens_per_step"):
-        _extract(4, torch.zeros((1, 3), dtype=torch.int32), [1])
+        _extract(4, torch.zeros((1, actual_width), dtype=torch.int32), [1])
 
 
 def test_get_output_tokens_empty_rank_keeps_canvas_width():

@@ -51,6 +51,10 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 _TT_TOKEN_TILE_SIZE = 32
+_DIFFUSION_GEMMA_TT_ARCHITECTURES = {
+    "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
+    "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
+}
 
 
 def _aligned_block_output_remaining(
@@ -485,6 +489,36 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
     """
     if model_arch not in ModelRegistry.get_supported_archs():
         ModelRegistry.register_model(model_arch, model_path)
+
+
+def _install_diffusion_gemma_architecture_patch() -> None:
+    """Resolve DiffusionGemma through its TT architecture before config hooks.
+
+    ``ModelConfig`` resolves its architecture and immediately dispatches through
+    vLLM's ``MODELS_CONFIG_MAP``. The upstream bare architecture has a diffusion
+    hook that configures CUDA attention, speculative canvas accounting, and
+    generation defaults before ``TTPlatform.check_and_update_config`` can run.
+    Rewrite the two checkpoint architecture names as the HF config is loaded so
+    registry inspection selects the TT alias and that upstream hook never runs.
+    """
+    from vllm.config import model as model_config_module
+
+    original_get_config = model_config_module.get_config
+    if getattr(original_get_config, "_tt_diffusion_gemma_architecture_patch", False):
+        return
+
+    def get_config_with_tt_diffusion_gemma(*args, **kwargs):
+        hf_config = original_get_config(*args, **kwargs)
+        architectures = getattr(hf_config, "architectures", None)
+        if architectures:
+            hf_config.architectures = [
+                _DIFFUSION_GEMMA_TT_ARCHITECTURES.get(arch, arch)
+                for arch in architectures
+            ]
+        return hf_config
+
+    get_config_with_tt_diffusion_gemma._tt_diffusion_gemma_architecture_patch = True
+    model_config_module.get_config = get_config_with_tt_diffusion_gemma
 
 
 def _should_pre_register_tt_test_models_from_cli() -> bool:
@@ -1069,19 +1103,16 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
-    # DiffusionGemma emits one complete 256-token canvas per model step. Both
-    # the checkpoint's HF architecture and TT-prefixed aliases must resolve
-    # before ModelConfig falls back to an unrelated Transformers backend.
+    # DiffusionGemma emits one complete 256-token canvas per model step.
+    # Upstream owns the bare DiffusionGemmaForBlockDiffusion registration; do
+    # not pretend an if-missing registration overrides it. The platform's early
+    # HF-config patch maps both supported checkpoint names to these TT aliases
+    # before ModelConfig inspects the registry.
     _diffusion_gemma_target = (
         "models.experimental.diffusion_gemma.tt.generator_vllm:"
         "DiffusionGemmaForCausalLM"
     )
-    for arch in (
-        "DiffusionGemmaForBlockDiffusion",
-        "DiffusionGemmaForCausalLM",
-        "TTDiffusionGemmaForBlockDiffusion",
-        "TTDiffusionGemmaForCausalLM",
-    ):
+    for arch in _DIFFUSION_GEMMA_TT_ARCHITECTURES.values():
         _register_model_if_missing(ModelRegistry, arch, _diffusion_gemma_target)
 
     # DeepseekV3
@@ -1180,8 +1211,10 @@ class TTPlatform(Platform):
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
-        if _should_pre_register_tt_test_models_from_cli():
-            register_tt_test_models()
+        register_tt_models(
+            register_test_models=_should_pre_register_tt_test_models_from_cli()
+        )
+        _install_diffusion_gemma_architecture_patch()
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -1472,11 +1505,12 @@ class TTPlatform(Platform):
             # over the model-type policy once the output width is known.
             _disable_chunked_prefill(vllm_config, "block-output models")
 
-            # Upstream 0.25.1 detects diffusion from ``hf_config.canvas_length``.
-            # TT block models own their canvas lifecycle, so remove that marker
-            # and invalidate the cached property before vLLM selects a model
-            # runner or constructs the scheduler. This keeps every downstream
-            # view of ModelConfig.is_diffusion uniformly false.
+            # Independently of the MODELS_CONFIG_MAP hook prevented during
+            # pre-registration, upstream 0.25.1 detects diffusion directly from
+            # ``hf_config.canvas_length``. TT block models own their canvas
+            # lifecycle, so remove that marker and invalidate the cached property
+            # before vLLM selects a model runner or constructs the scheduler. This
+            # keeps every downstream view of ModelConfig.is_diffusion false.
             hf_config = model_config.hf_config
             declared_canvas_length = hf_config.__dict__.pop("canvas_length", None)
             if (
@@ -1493,16 +1527,12 @@ class TTPlatform(Platform):
                 "Block-output setup failed to clear upstream diffusion detection"
             )
 
-            # ModelConfig may already have caused vLLM to create this config
-            # before the platform hook ran. It represents the same canvas as
-            # output_tokens_per_step, so retaining it double-books the block as
-            # speculative draft tokens.
             if vllm_config.diffusion_config is not None:
-                logger.info(
-                    "Block-output model owns diffusion scheduling; disabling "
-                    "upstream DiffusionConfig speculative-token accounting."
+                raise ValueError(
+                    "Block-output models own canvas scheduling and do not "
+                    "support --diffusion-config; remove the explicit diffusion "
+                    "configuration"
                 )
-                vllm_config.diffusion_config = None
             min_max_model_len = _min_block_output_max_model_len(output_tokens_per_step)
             if model_config.max_model_len < min_max_model_len:
                 raise ValueError(

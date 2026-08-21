@@ -34,3 +34,25 @@ def test_warning_once_deduplicates_identical_calls(caplog):
     records = {id(r): r for r in caplog.records if "dedup probe" in r.getMessage()}
     assert len(records) == 1
     assert next(iter(records.values())).getMessage() == "dedup probe arg"
+
+
+def test_warning_once_deduplicates_unhashable_arguments(caplog):
+    logger = init_tt_logger("vllm_tt_plugin.logger_probe_unhashable")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="vllm.tt.logger_probe_unhashable"):
+            logger.warning_once("config=%s", {"mode": "all"})
+            logger.warning_once("config=%s", {"mode": "all"})
+    finally:
+        logger.removeHandler(caplog.handler)
+
+    records = {id(r): r for r in caplog.records if "config=" in r.getMessage()}
+    assert len(records) == 1
+    assert next(iter(records.values())).getMessage() == "config={'mode': 'all'}"
+
+
+def test_warning_once_does_not_format_disabled_message():
+    logger = init_tt_logger("vllm_tt_plugin.logger_probe_disabled")
+    logger.setLevel(logging.ERROR)
+
+    logger.warning_once("bad integer=%d", "not-an-integer")
