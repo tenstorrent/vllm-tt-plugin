@@ -486,10 +486,25 @@ class TTWorker(WorkerBase):
         return
 
     def shutdown(self) -> None:
-        """Release model-owned captures before the worker process exits."""
+        """Release model-owned captures and close the mesh before exit.
+
+        This is the hook upstream guarantees on every orderly shutdown path:
+        EngineCore's SIGTERM/SIGINT handler ends run_busy_loop and the
+        surrounding ``finally`` reaches ``executor.shutdown()`` even on fatal
+        errors. ``__del__`` alone is not guaranteed at interpreter exit, and a
+        mesh left open wedges the board's ethernet cores for the *next*
+        process ("Timed out while waiting for active ethernet core ... Try
+        resetting the board").
+        """
         runner = getattr(self, "model_runner", None)
         if runner is not None:
             runner.shutdown()
+        mesh_device = getattr(self, "mesh_device", None)
+        if mesh_device is not None:
+            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            # Idempotence: __del__ (and a second shutdown call) must not
+            # close the mesh again.
+            self.mesh_device = None
 
     # ---- Destructor (used to close devices) ----
 

@@ -231,6 +231,30 @@ def test_worker_del_closes_mesh_when_model_runner_was_never_assigned():
     assert not hasattr(worker, "mesh_device")
 
 
+def test_worker_shutdown_closes_mesh_once_across_shutdown_and_del():
+    """SIGTERM reaches worker.shutdown() (EngineCore's finally ->
+    executor.shutdown()), the only hook guaranteed before process exit; an
+    unclosed mesh wedges the board's ethernet cores for the next process.
+    __del__ afterwards must not close the mesh a second time."""
+    from unittest.mock import patch
+
+    closed = []
+    mesh = SimpleNamespace()
+    worker = TTWorker.__new__(TTWorker)
+    worker.mesh_device = mesh
+    worker.vllm_config = SimpleNamespace(additional_config=None)
+
+    with patch(
+        "vllm_tt_plugin.worker.close_mesh_device",
+        side_effect=lambda mesh_device, _cfg: closed.append(mesh_device),
+    ):
+        worker.shutdown()
+        worker.shutdown()
+        worker.__del__()
+
+    assert closed == [mesh]
+
+
 def test_worker_wrapper_shutdown_releases_persistent_capture_once():
     releases = []
     runner = TTModelRunner.__new__(TTModelRunner)
