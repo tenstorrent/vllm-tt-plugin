@@ -72,7 +72,10 @@ def _stub_model_resolution():
 
 
 def _scheduler(
-    output_width: int = CANVAS, *, diffusion_checkpoint: bool = False
+    output_width: int = CANVAS,
+    *,
+    diffusion_checkpoint: bool = False,
+    max_model_len: int = MAX_MODEL_LEN,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -80,11 +83,11 @@ def _scheduler(
         seed=42,
         skip_tokenizer_init=True,
     )
-    model_config.max_model_len = MAX_MODEL_LEN
+    model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
         max_num_seqs=1,
-        max_num_batched_tokens=MAX_MODEL_LEN,
-        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=max_model_len,
+        max_model_len=max_model_len,
         enable_chunked_prefill=False,
         async_scheduling=False,
         is_encoder_decoder=model_config.is_encoder_decoder,
@@ -114,7 +117,7 @@ def _scheduler(
         config.model_config.__dict__.pop("is_diffusion", None)
         assert config.model_config.is_diffusion is False
     store_tt_output_tokens_per_step(config, output_width)
-    num_blocks = MAX_MODEL_LEN // BLOCK_SIZE + 2
+    num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -408,6 +411,63 @@ def test_multimodal_features_are_dropped_from_bypassed_request():
 
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert scheduler.running == []
+
+
+@pytest.mark.parametrize(
+    ("output_width", "max_model_len", "expected_prompt", "expected_max_tokens"),
+    [
+        # keep = (256 - 64) // 32 * 32 = 192; remaining 64 = one 64-canvas.
+        pytest.param(64, 256, 192, 64, id="width-above-tile"),
+        # aligned mml = 250 // 32 * 32 = 224; keep = (224 - 16) // 32 * 32
+        # = 192; remaining 32 = two 16-canvases.
+        pytest.param(CANVAS, 250, 192, 32, id="unaligned-max-model-len"),
+    ],
+)
+def test_truncation_respects_width_and_alignment(
+    output_width, max_model_len, expected_prompt, expected_max_tokens
+):
+    """Regimes where the truncation arithmetic's width term and tile
+    alignment actually matter (the default fixture's 16-token canvas under a
+    tile-aligned limit is insensitive to both, so a regression there admits
+    an unservable prompt whose first canvas is engine-fatal)."""
+    scheduler = _scheduler(output_width, max_model_len=max_model_len)
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=64, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="regime-0",
+        prompt_token_ids=[1] * 300,
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.num_prompt_tokens == expected_prompt
+    assert request.max_tokens == expected_max_tokens
+
+
+def test_plain_prefix_cache_reset_leaves_running_block_requests_alone():
+    """The /reset_prefix_cache endpoint defaults to reset_running_requests=
+    False; with a live block request that plain reset must delegate upstream
+    (harmless False, prefix caching is disabled) instead of raising or
+    preempting."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, _runner_output(prefill, list(range(CANVAS))))
+    assert request.status == RequestStatus.RUNNING
+
+    result = scheduler.reset_prefix_cache(
+        reset_running_requests=False, reset_connector=False
+    )
+
+    assert result is False
+    assert request.status == RequestStatus.RUNNING
+    assert scheduler.running == [request]
 
 
 def test_mixed_token_embeds_bypassed_prompt_drops_the_embeds():
