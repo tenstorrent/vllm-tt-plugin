@@ -971,7 +971,7 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
-    ) -> TTModelInput | None:
+    ) -> TTModelInput:
         """Build a ``TTModelInput`` for one prefill or decode step.
 
         Reads the current persistent ``self.input_batch`` and assembles the
@@ -2259,8 +2259,10 @@ class TTModelRunner:
         captured_req_ids = req_ids
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
+            assert req_state is not None, (
+                "captured request missing from runner state while applying sampled "
+                f"tokens: req_id={req_id!r}"
+            )
             if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
@@ -2277,8 +2279,7 @@ class TTModelRunner:
                     sampled_token_ids_np[req_idx]
                 )
                 self.input_batch.num_tokens[current_row] = end_idx
-
-            req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+                req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
     def apply_and_build_runner_output(
         self,
