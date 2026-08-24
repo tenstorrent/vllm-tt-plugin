@@ -255,6 +255,21 @@ def test_worker_shutdown_closes_mesh_once_across_shutdown_and_del():
     assert closed == [mesh]
 
 
+def test_worker_shutdown_releases_admission_handle(monkeypatch):
+    """Shutdown must free the process-level admission handle immediately so an
+    in-process successor engine is admitted without waiting for GC."""
+    from vllm_tt_plugin.platform import TTPlatform
+
+    config = SimpleNamespace(additional_config=None)
+    worker = TTWorker.__new__(TTWorker)
+    worker.vllm_config = config
+    monkeypatch.setattr(TTPlatform, "_tt_vllm_config", config)
+
+    worker.shutdown()
+
+    assert TTPlatform._tt_vllm_config is None
+
+
 def test_worker_wrapper_shutdown_releases_persistent_capture_once():
     releases = []
     runner = TTModelRunner.__new__(TTModelRunner)

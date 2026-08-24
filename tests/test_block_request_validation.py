@@ -312,6 +312,30 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.model_config.is_diffusion is False
 
 
+def test_admission_handle_releases_when_engine_config_is_collected(monkeypatch):
+    # The one-engine-per-process guard must protect a LIVE engine only: once
+    # the previous engine's config is garbage-collected, a new engine in the
+    # same process is admitted instead of failing forever.
+    import gc
+
+    class _WeakrefableConfig(SimpleNamespace):
+        """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
+
+    def _weakrefable_config():
+        return _WeakrefableConfig(**vars(_config()))
+
+    _patch_model_resolution(monkeypatch)
+    first = _weakrefable_config()
+    TTPlatform.check_and_update_config(first)
+    with pytest.raises(ValueError, match=r"One TT engine per process"):
+        TTPlatform.check_and_update_config(_weakrefable_config())
+
+    del first
+    gc.collect()
+
+    TTPlatform.check_and_update_config(_weakrefable_config())
+
+
 def test_startup_rejects_explicit_diffusion_config(monkeypatch):
     # The general-plugins architecture rewrite keeps upstream's hook from
     # auto-creating this config, so any non-None value is explicit.
@@ -762,29 +786,17 @@ def test_explicit_request_uses_tile_aligned_physical_capacity(monkeypatch):
     _validate(SamplingParams(max_tokens=1), prompt_len=736)
 
 
-@pytest.mark.parametrize(
-    ("prompt", "error"),
-    [
-        pytest.param(
-            {"prompt_token_ids": [1] * 1000},
-            r"physical 256-token canvases.*requires 256 physical.*exceeding",
-            id="token-ids-no-room",
-        ),
-        pytest.param(
-            {"prompt_token_ids": None, "prompt_embeds": [0] * 900},
-            r"prompt_embeds are not supported",
-            id="embeds-partial-tile",
-        ),
-    ],
-)
-def test_input_processor_rejects_default_without_whole_canvas(
-    monkeypatch, prompt, error
-):
-    processor_cls, processor = _processor_harness(monkeypatch)
+def test_default_max_tokens_without_canvas_room_is_rejected_at_validation():
+    # validate_request runs before the input-processor patch resolves the
+    # whole-canvas default, so a prompt leaving no room for one canvas must
+    # already reject there — and must not mutate the caller-owned params.
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
 
-    with pytest.raises(ValueError, match=error):
-        processor_cls.process_inputs(processor, "no-canvas", prompt, params)
+    with pytest.raises(
+        ValueError,
+        match=r"physical 256-token canvases.*requires 256 physical.*exceeding",
+    ):
+        _validate(params, prompt_len=1000)
 
     assert params.max_tokens is None

@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import sys
+import weakref
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
@@ -1173,7 +1174,18 @@ class TTPlatform(Platform):
     _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
     _standard_dp_mesh_grids: ClassVar[dict[str, tuple[int, int]]] = {}
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
-    _tt_vllm_config: ClassVar["VllmConfig | None"] = None
+    # Stored as a weakref in production so a torn-down engine's config stops
+    # tripping the one-engine-per-process guard once nothing else holds it;
+    # tests may seed a direct config object.
+    _tt_vllm_config: ClassVar["weakref.ref[VllmConfig] | VllmConfig | None"] = None
+
+    @classmethod
+    def _resolve_tt_admission_handle(cls) -> "VllmConfig | None":
+        handle = cls._tt_vllm_config
+        if isinstance(handle, weakref.ref):
+            return handle()
+        return handle
+
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
     simple_compile_backend: str = "eager"
@@ -1274,7 +1286,7 @@ class TTPlatform(Platform):
     @classmethod
     def _get_block_output_contract(cls) -> tuple[int, int] | None:
         """Read the live block width and frontend max-model-length limit."""
-        vllm_config = cls._tt_vllm_config
+        vllm_config = cls._resolve_tt_admission_handle()
         if vllm_config is None or not is_tt_block_output_model(vllm_config):
             return None
         return (
@@ -1294,7 +1306,8 @@ class TTPlatform(Platform):
         # contract the first engine validates against. Raise before touching
         # anything. Re-running the hook on the same config (EngineCore re-runs
         # __post_init__ in-process) is fine.
-        previous_tt_vllm_config = cls._tt_vllm_config
+        previous_handle = cls._tt_vllm_config
+        previous_tt_vllm_config = cls._resolve_tt_admission_handle()
         if (
             previous_tt_vllm_config is not None
             and previous_tt_vllm_config is not vllm_config
@@ -1316,7 +1329,7 @@ class TTPlatform(Platform):
         try:
             cls._apply_check_and_update_config(vllm_config, previous_tt_vllm_config)
         except Exception:
-            cls._tt_vllm_config = previous_tt_vllm_config
+            cls._tt_vllm_config = previous_handle
             raise
 
     @classmethod
@@ -1763,7 +1776,13 @@ class TTPlatform(Platform):
                 "involved: TTPlatform keeps process-level admission state "
                 "that a second engine configuration would overwrite"
             )
-        cls._tt_vllm_config = vllm_config
+        # Weakly: when the engine (and its config) is garbage-collected, the
+        # guard stops treating this process as occupied.
+        try:
+            cls._tt_vllm_config = weakref.ref(vllm_config)
+        except TypeError:
+            # Test doubles without weakref support are held directly.
+            cls._tt_vllm_config = vllm_config
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

@@ -505,6 +505,15 @@ class TTWorker(WorkerBase):
             # Idempotence: __del__ (and a second shutdown call) must not
             # close the mesh again.
             self.mesh_device = None
+        # Release the process-level admission handle when it points at this
+        # engine's config, so an in-process successor engine is admitted
+        # without waiting for garbage collection to clear the weakref.
+        vllm_config = getattr(self, "vllm_config", None)
+        if (
+            vllm_config is not None
+            and TTPlatform._resolve_tt_admission_handle() is vllm_config
+        ):
+            TTPlatform._tt_vllm_config = None
 
     # ---- Destructor (used to close devices) ----
 
