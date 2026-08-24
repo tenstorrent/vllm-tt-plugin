@@ -1106,9 +1106,17 @@ class TTModelRunner:
         num_scheduled = scheduler_output.num_scheduled_tokens
 
         def _is_still_prefilling(req_id: str) -> bool:
+            # A steady-state step legitimately has exactly one output width
+            # outstanding (the sampled token for AR, one whole canvas for
+            # block models); only MORE than that means uncomputed history
+            # (chunked-prefill remainder or preemption-resume replay). A
+            # plain ``computed < total`` comparison dispatched every
+            # post-first block step as prompt work, re-encoding the entire
+            # session per canvas: quadratic prefill and decode never ran.
             row = input_batch.req_id_to_index[req_id]
             return (
-                input_batch.num_computed_tokens_cpu[row] < input_batch.num_tokens[row]
+                input_batch.num_computed_tokens_cpu[row] + self._output_tokens_per_step
+                < input_batch.num_tokens[row]
             )
 
         # A "prefill" step can contain:

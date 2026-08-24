@@ -196,6 +196,71 @@ def test_completed_cached_request_builds_decode_input():
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
 
 
+def test_steady_block_step_builds_decode_input():
+    """One whole canvas outstanding is the steady state for a block model.
+    Dispatching it as prompt work re-encodes the entire session per canvas
+    (quadratic prefill) and the decode path never runs."""
+    prompt_len = 8
+    canvas = 16
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=canvas,
+        num_computed_tokens=prompt_len,
+    )
+    runner = _fake_runner(batch, request)
+    runner._output_tokens_per_step = canvas
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"r": canvas}
+    scheduler_output.total_num_scheduled_tokens = canvas
+    scheduler_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["r"],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[prompt_len],
+        num_output_tokens=[canvas],
+    )
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input is not None
+    assert model_input.prompt_lens is None
+
+
+def test_block_resume_replay_past_one_canvas_remains_prefill():
+    """More than one canvas outstanding means uncomputed history (preemption
+    replay): that chunk must stay prompt work."""
+    prompt_len = 8
+    canvas = 8
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=2 * canvas,
+        num_computed_tokens=prompt_len,
+    )
+    runner = _fake_runner(batch, request)
+    runner._output_tokens_per_step = canvas
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"r": canvas}
+    scheduler_output.total_num_scheduled_tokens = canvas
+    scheduler_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["r"],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[prompt_len],
+        num_output_tokens=[2 * canvas],
+    )
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input is not None
+    assert model_input.prompt_lens.tolist() == [prompt_len + canvas]
+
+
 # endregion Decode input construction
 
 # region Output state
