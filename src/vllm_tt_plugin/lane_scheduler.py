@@ -206,7 +206,7 @@ def merge_lane_scheduler_outputs(
             num_invalid_spec_tokens.update(out.num_invalid_spec_tokens)
 
     total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-    return SchedulerOutput(
+    merged = SchedulerOutput(
         scheduled_new_reqs=scheduled_new_reqs,
         scheduled_cached_reqs=cached,
         num_scheduled_tokens=num_scheduled_tokens,
@@ -221,6 +221,10 @@ def merge_lane_scheduler_outputs(
         pending_structured_output_tokens=pending_structured_output_tokens,
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
+    merged.tt_num_running_reqs = sum(int(getattr(out, "tt_num_running_reqs", 0) or 0) for out in lane_outputs)
+    merged.tt_num_waiting_reqs = sum(int(getattr(out, "tt_num_waiting_reqs", 0) or 0) for out in lane_outputs)
+    merged.tt_has_pending_prefill = any(bool(getattr(out, "tt_has_pending_prefill", False)) for out in lane_outputs)
+    return merged
 
 
 class TTLaneCoordinator(SchedulerInterface):

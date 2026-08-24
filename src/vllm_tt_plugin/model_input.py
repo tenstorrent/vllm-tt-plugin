@@ -122,6 +122,11 @@ class TTModelInput:
     # identity. Shape: [total_B].
     slot_remap: torch.Tensor | None = None
 
+    # Decode-only: force TT models to keep their fixed full decode width.
+    # Stateful models may use narrower single-request traces only while the
+    # scheduler is isolated to one live request.
+    force_full_decode_width: bool = False
+
     # Prefill-only: the device state slot each prefilling row writes to. Global for
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None

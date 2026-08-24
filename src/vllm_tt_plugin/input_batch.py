@@ -1211,6 +1211,7 @@ class TTLaneInputBatch(InputBatch):
             output_tokens=output_tokens,
             reset_batch=reset_batch,
             slot_remap=slot_remap,
+            force_full_decode_width=runner._force_full_decode_width_until_idle,
             # Host sampling reads the merged batch directly (see
             # ``extract_output``); the per-rank sidecars are unused here.
             allowed_token_ids_mask_list=[None],
@@ -1310,6 +1311,7 @@ class TTLaneInputBatch(InputBatch):
             output_tokens=output_tokens,
             reset_batch=False,
             slot_remap=None,
+            force_full_decode_width=runner._force_full_decode_width_until_idle,
             allowed_token_ids_mask_list=[None],
             bad_words_token_ids_list=[{}],
             max_num_logprobs=[lane_batch.max_num_logprobs],

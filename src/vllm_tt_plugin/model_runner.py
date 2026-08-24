@@ -193,6 +193,11 @@ class TTModelRunner:
         # change during prefill steps (e.g. new requests added), so we keep a
         # sticky flag and clear it only after a decode input consumes it.
         self._decode_layout_changed_since_last_decode: bool = True
+        # Stateful TT generators may use a narrow single-request decode trace
+        # only while the scheduler is isolated to one request. Once the runner
+        # sees burst-like scheduling, keep subsequent decodes at full wire width
+        # until all live requests drain.
+        self._force_full_decode_width_until_idle: bool = False
 
         # Forward/sampling split: ``execute_model`` runs the device forward,
         # enqueues a deferred sampler here, and returns ``None``; the engine
@@ -735,6 +740,28 @@ class TTModelRunner:
         # sticky across steps and will be consumed by the next decode batch.
         if persistent_batch_layout_changed:
             self._decode_layout_changed_since_last_decode = True
+        tt_num_running = int(getattr(scheduler_output, "tt_num_running_reqs", 0) or 0)
+        tt_num_waiting = int(getattr(scheduler_output, "tt_num_waiting_reqs", 0) or 0)
+        tt_pending_prefill = bool(getattr(scheduler_output, "tt_has_pending_prefill", False))
+        if (
+            not self.requests
+            and self.input_batch.num_reqs == 0
+            and tt_num_running == 0
+            and tt_num_waiting == 0
+        ):
+            self._force_full_decode_width_until_idle = False
+        elif (
+            tt_num_waiting > 0
+            or tt_num_running > 1
+            or tt_pending_prefill
+            or self._force_full_decode_width_until_idle
+            or len(scheduler_output.num_scheduled_tokens) > 1
+            or len(scheduler_output.scheduled_new_reqs) > 1
+            or scheduler_output.scheduled_cached_reqs.num_reqs > 1
+            or self.input_batch.num_reqs > 1
+            or len(self.requests) > 1
+        ):
+            self._force_full_decode_width_until_idle = True
 
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
@@ -1361,6 +1388,7 @@ class TTModelRunner:
             output_tokens=output_tokens,
             reset_batch=reset_batch,
             slot_remap=slot_remap,
+            force_full_decode_width=self._force_full_decode_width_until_idle,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[bad_words_token_ids],
@@ -1917,6 +1945,8 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        if model_input.force_full_decode_width:
+            kwargs["force_full_decode_width"] = True
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

@@ -149,6 +149,10 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
+        num_running, num_waiting = self.get_request_counts()
+        scheduler_output.tt_num_running_reqs = num_running
+        scheduler_output.tt_num_waiting_reqs = num_waiting
+        scheduler_output.tt_has_pending_prefill = self._has_pending_prefill()
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
