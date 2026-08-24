@@ -273,6 +273,14 @@ class ARModel:
     }
 
 
+class _WeakrefableConfig(SimpleNamespace):
+    """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
+
+
+def _weakrefable_config():
+    return _WeakrefableConfig(**vars(_config()))
+
+
 def _patch_model_resolution(monkeypatch, model_class=BlockModel):
     # Simulate a fresh process: the autouse block_contract fixture pre-seeds
     # the class handle, which the hook's one-engine-per-process guard would
@@ -318,12 +326,6 @@ def test_admission_handle_releases_when_engine_config_is_collected(monkeypatch):
     # same process is admitted instead of failing forever.
     import gc
 
-    class _WeakrefableConfig(SimpleNamespace):
-        """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
-
-    def _weakrefable_config():
-        return _WeakrefableConfig(**vars(_config()))
-
     _patch_model_resolution(monkeypatch)
     first = _weakrefable_config()
     TTPlatform.check_and_update_config(first)
@@ -334,6 +336,24 @@ def test_admission_handle_releases_when_engine_config_is_collected(monkeypatch):
     gc.collect()
 
     TTPlatform.check_and_update_config(_weakrefable_config())
+
+
+def test_admission_guard_raise_does_not_pin_the_stale_config(monkeypatch):
+    # The guard's own traceback must not become the reference that keeps a
+    # dead engine's config alive: in a REPL, sys.last_traceback holds the
+    # failed attempt, and a self-pinning raise would fail every retry.
+    _patch_model_resolution(monkeypatch)
+    first = _weakrefable_config()
+    TTPlatform.check_and_update_config(first)
+
+    with pytest.raises(ValueError, match=r"One TT engine per process") as excinfo:
+        TTPlatform.check_and_update_config(_weakrefable_config())
+
+    del first
+    # excinfo still holds the guard's traceback, standing in for
+    # sys.last_traceback; only the engine's own reference was dropped.
+    TTPlatform.check_and_update_config(_weakrefable_config())
+    assert excinfo.value is not None
 
 
 def test_startup_rejects_explicit_diffusion_config(monkeypatch):

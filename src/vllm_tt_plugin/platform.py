@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import gc
 import json
 import multiprocessing
 import os
@@ -1313,6 +1314,22 @@ class TTPlatform(Platform):
             and previous_tt_vllm_config is not vllm_config
             and is_tt_block_output_model(previous_tt_vllm_config)
         ):
+            # A dead engine's config may be alive only through an exception
+            # traceback (a failed startup in a REPL survives via
+            # sys.last_traceback); collect once before concluding that a live
+            # engine occupies the process.
+            previous_tt_vllm_config = None
+            gc.collect()
+            previous_tt_vllm_config = cls._resolve_tt_admission_handle()
+        if (
+            previous_tt_vllm_config is not None
+            and previous_tt_vllm_config is not vllm_config
+            and is_tt_block_output_model(previous_tt_vllm_config)
+        ):
+            # Drop the frame locals before raising: this traceback must not
+            # become the reference that keeps the stale config alive and
+            # makes every retry fail the same way.
+            del previous_tt_vllm_config, previous_handle
             raise ValueError(
                 "One TT engine per process when a block-output model is "
                 "involved: TTPlatform keeps process-level admission state "
@@ -1330,6 +1347,8 @@ class TTPlatform(Platform):
             cls._apply_check_and_update_config(vllm_config, previous_tt_vllm_config)
         except Exception:
             cls._tt_vllm_config = previous_handle
+            # Keep the stale config out of this traceback's frame locals.
+            del previous_handle, previous_tt_vllm_config
             raise
 
     @classmethod
@@ -1771,6 +1790,8 @@ class TTPlatform(Platform):
             and previous_tt_vllm_config is not vllm_config
             and is_block_output_model
         ):
+            # Keep the stale config out of this traceback's frame locals.
+            del previous_tt_vllm_config
             raise ValueError(
                 "One TT engine per process when a block-output model is "
                 "involved: TTPlatform keeps process-level admission state "
