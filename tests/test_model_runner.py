@@ -196,6 +196,95 @@ def test_completed_cached_request_builds_decode_input():
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
 
 
+def test_final_one_token_prompt_chunk_stays_prefill():
+    """A chunked prefill whose remainder is exactly one token is still prompt
+    work: classifying it as decode routes it into the mixed-batch filter,
+    which drops the scheduled token (EngineCore assert / permanent hang)."""
+    prompt_len = 8
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=0,
+        num_computed_tokens=prompt_len - 1,
+    )
+    runner = _fake_runner(batch, request)
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"r": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    scheduler_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["r"],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[prompt_len - 1],
+        num_output_tokens=[0],
+    )
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input is not None
+    assert model_input.prompt_lens.tolist() == [prompt_len]
+    assert model_input.intermediate_prefill_mask.tolist() == [False]
+
+
+def test_mixed_prefill_batch_keeps_scheduled_decode_row():
+    """A cached request with an uncomputed token must never be dropped from a
+    prefill step it was scheduled into: the forward's output rows must match
+    the input batch, and the scheduler never re-schedules a dropped token."""
+    batch = InputBatch(
+        max_num_reqs=MAX_NUM_REQS,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+    )
+    chunking = CachedRequestState(
+        req_id="r1",
+        prompt_token_ids=list(range(8)),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=2,
+        output_token_ids=[],
+    )
+    steady = CachedRequestState(
+        req_id="r2",
+        prompt_token_ids=list(range(8)),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([1],),
+        num_computed_tokens=8,
+        output_token_ids=[100],
+    )
+    batch.add_request(chunking)
+    batch.add_request(steady)
+    runner = _fake_runner(batch, chunking)
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"r1": 2, "r2": 1}
+    scheduler_output.total_num_scheduled_tokens = 3
+    scheduler_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["r1", "r2"],
+        resumed_req_ids=set(),
+        new_token_ids=[[], []],
+        all_token_ids={},
+        new_block_ids=[None, None],
+        num_computed_tokens=[2, 8],
+        num_output_tokens=[0, 1],
+    )
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input is not None
+    # r1's chunk end is 2+2=4 (mid-prompt); r2's single uncomputed token ends
+    # at 8+1=9 -- both rows stay in the prefill batch.
+    assert sorted(model_input.prompt_lens.tolist()) == [4, 9]
+
+
 def test_steady_block_step_builds_decode_input():
     """One whole canvas outstanding is the steady state for a block model.
     Dispatching it as prompt work re-encodes the entire session per canvas

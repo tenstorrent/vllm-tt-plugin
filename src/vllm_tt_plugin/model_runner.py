@@ -1106,16 +1106,23 @@ class TTModelRunner:
         num_scheduled = scheduler_output.num_scheduled_tokens
 
         def _is_still_prefilling(req_id: str) -> bool:
-            # A steady-state step legitimately has exactly one output width
-            # outstanding (the sampled token for AR, one whole canvas for
-            # block models); only MORE than that means uncomputed history
-            # (chunked-prefill remainder or preemption-resume replay). A
-            # plain ``computed < total`` comparison dispatched every
-            # post-first block step as prompt work, re-encoding the entire
-            # session per canvas: quadratic prefill and decode never ran.
+            # Any uncomputed PROMPT token is prefill work, including a final
+            # chunk of exactly one token: only the prompt-aware clause keeps
+            # that chunk in the prefill batch (dispatching it as a decode
+            # computes the same position, but the mixed-batch filter below
+            # would drop it and the request would never finish). Past the
+            # prompt, a steady-state step legitimately has exactly one output
+            # width outstanding (the sampled token for AR, one whole canvas
+            # for block models); only MORE than that means uncomputed history
+            # (preemption-resume replay). A plain ``computed < total``
+            # comparison dispatched every post-first block step as prompt
+            # work, re-encoding the entire session per canvas: quadratic
+            # prefill and decode never ran.
             row = input_batch.req_id_to_index[req_id]
+            num_computed = input_batch.num_computed_tokens_cpu[row]
             return (
-                input_batch.num_computed_tokens_cpu[row] + self._output_tokens_per_step
+                num_computed < input_batch.num_prompt_tokens[row]
+                or num_computed + self._output_tokens_per_step
                 < input_batch.num_tokens[row]
             )
 
@@ -1145,11 +1152,26 @@ class TTModelRunner:
             # from preemption or are chunked-prefill continuations (both still
             # prefill work).
             if cached_reqs.num_reqs > 0:
+                # Filter only rows with NOTHING left to compute: a request
+                # with any uncomputed token (a one-token final prompt chunk, a
+                # replay tail, or a steady decode caught in a DP-async mixed
+                # batch) stays in the prefill batch, where a one-token chunk
+                # computes the same position the decode path would. Dropping a
+                # scheduled row instead desyncs the output row count (the
+                # _coerce_output_block assert kills EngineCore) and the
+                # scheduler never re-schedules the dropped token.
+                def _nothing_left_to_compute(req_id: str) -> bool:
+                    row = input_batch.req_id_to_index[req_id]
+                    return (
+                        input_batch.num_computed_tokens_cpu[row]
+                        >= input_batch.num_tokens[row]
+                    )
+
                 running_req_ids = {
                     req_id
                     for req_id in cached_reqs.req_ids
                     if req_id not in cached_reqs.resumed_req_ids
-                    and not _is_still_prefilling(req_id)
+                    and _nothing_left_to_compute(req_id)
                 }
                 if running_req_ids:
                     # Mixed prefill+decode batch detected. This should not
