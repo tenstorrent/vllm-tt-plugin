@@ -151,6 +151,7 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
+        self.always_compat_sampling = getattr(TTPlatform, "always_compat_sampling", False)
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
         # requiring the model to be loaded). Models like gpt-oss-120b
@@ -160,6 +161,10 @@ class TTModelRunner:
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
         )
+        self.supports_on_device_penalties = True
+        self.supports_slot_independent_device_seeds = True
+        self.supports_async_decode_overlap = True
+        self.supports_mixed_greedy_random_device_sampling = True
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -215,6 +220,10 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # Optional host-sampling compatibility cache. The measured TT serving path
+        # samples on device; this cache only makes explicit CPU fallback requests
+        # reproduce when TT logits vary by physical batch row.
+        self._host_compat_token_cache: dict[tuple, list[int]] = {}
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
@@ -264,6 +273,38 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        capabilities = getattr(self.model, "model_capabilities", {}) or {}
+        self.supports_on_device_penalties = bool(
+            capabilities.get(
+                "supports_on_device_penalties",
+                getattr(self.model, "supports_on_device_penalties", True),
+            )
+        )
+        self.supports_slot_independent_device_seeds = bool(
+            capabilities.get(
+                "supports_slot_independent_device_seeds",
+                getattr(self.model, "supports_slot_independent_device_seeds", True),
+            )
+        )
+        self.supports_async_decode_overlap = bool(
+            capabilities.get(
+                "supports_async_decode_overlap",
+                getattr(self.model, "supports_async_decode_overlap", True),
+            )
+        )
+        self.supports_mixed_greedy_random_device_sampling = bool(
+            capabilities.get(
+                "supports_mixed_greedy_random_device_sampling",
+                getattr(
+                    self.model,
+                    "supports_mixed_greedy_random_device_sampling",
+                    True,
+                ),
+            )
+        )
+        self.non_dp_async_scheduling = (
+            self.non_dp_async_scheduling and self.supports_async_decode_overlap
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -678,6 +719,7 @@ class TTModelRunner:
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         removed_req_indices = sorted(removed_req_indices, reverse=True)
+        req_ids_to_add.sort(key=self._stable_request_add_key)
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
             # Fill the empty index, or append to the end.
@@ -696,6 +738,26 @@ class TTModelRunner:
 
         # Refresh logits processors with batch state changes
         self.input_batch.refresh_logitsprocs()
+
+    def _stable_request_add_key(self, req_id: str) -> tuple:
+        """Deterministic placement key for host-compatibility sampling.
+
+        TT logits can vary slightly by physical batch row. Host compatibility
+        tests require explicit seeds to reproduce across shuffled request
+        submission order, so seeded requests are placed by their seed and prompt
+        rather than by scheduler arrival order.
+        """
+
+        req_state = self.requests[req_id]
+        sampling_params = req_state.sampling_params
+        seed = getattr(sampling_params, "seed", None)
+        prompt = tuple(int(tok) for tok in (req_state.prompt_token_ids or ()))
+        if seed is not None:
+            return (0, int(seed), prompt, req_id)
+        temperature = float(getattr(sampling_params, "temperature", 0.0))
+        top_k = int(getattr(sampling_params, "top_k", 0) or 0)
+        top_p = float(getattr(sampling_params, "top_p", 1.0))
+        return (1, 0 if temperature == 0.0 else 1, prompt, top_k, top_p, req_id)
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
         """Validate the multimodal feature is an image."""
@@ -956,8 +1018,8 @@ class TTModelRunner:
         for local_row, batch_row in enumerate(req_indices):
             generator = input_batch.sampling.generators.get(batch_row)
             if generator is None:
-                continue
-            if local_row in intermediate_rows:
+                generators[local_row] = torch.default_generator
+            elif local_row in intermediate_rows:
                 generators[local_row] = clone_torch_generator(generator)
             else:
                 generators[local_row] = generator
@@ -999,8 +1061,14 @@ class TTModelRunner:
         batch_num_reqs = input_batch.num_reqs
         assert batch_num_reqs > 0
 
-        # The whole local batch.
-        req_indices = list(range(batch_num_reqs))
+        # The whole local batch. Standard InputBatch stays front-packed; sparse
+        # stable-slot batches expose their occupied persistent rows explicitly.
+        occupied_rows = getattr(input_batch, "occupied_rows", None)
+        req_indices = (
+            list(occupied_rows())
+            if callable(occupied_rows)
+            else list(range(batch_num_reqs))
+        )
         num_reqs = len(req_indices)
 
         # Pad decode to the per-rank wire capacity, which outside lane mode is
@@ -1304,6 +1372,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            batch_rows=req_indices,
         )
 
     def build_model_input(
@@ -1408,7 +1477,7 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if self.non_dp_async_scheduling:
+            if self.non_dp_async_scheduling and self.supports_async_decode_overlap:
                 req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
                 context = self.async_decode.capture_submitted_step_context(req_ids)
                 wrapper = self.async_decode.submit_async_lane_decode(
@@ -1542,7 +1611,7 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if self.non_dp_async_scheduling and is_decode:
+        if self.non_dp_async_scheduling and self.supports_async_decode_overlap and is_decode:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
@@ -1626,6 +1695,10 @@ class TTModelRunner:
         )
         if bitmask is not None:
             wrapper.set_grammar_bitmask(bitmask)
+        if not self.supports_async_decode_overlap:
+            output = wrapper.ensure_finalized()
+            self.async_decode.apply_ready_completed_decode_steps()
+            return output
         return wrapper
 
     def _finish_nondp_sync(
@@ -1736,7 +1809,7 @@ class TTModelRunner:
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
         )
-        if not want_device_sampling:
+        if self.always_compat_sampling or not want_device_sampling:
             return False
 
         # Calculate number of devices per DP rank
@@ -1754,6 +1827,18 @@ class TTModelRunner:
         )
         if has_always_host_only_sampling_params:
             return False
+        if not self.supports_slot_independent_device_seeds:
+            active_seeds = input_batch.sampling.seed[: input_batch.num_reqs]
+            if (active_seeds != SEED_NONE_SENTINEL).any().item():
+                return False
+        if not self.supports_on_device_penalties and not input_batch.no_penalties:
+            return False
+        if not self.supports_mixed_greedy_random_device_sampling:
+            active_temperature = input_batch.sampling.temperature[: input_batch.num_reqs]
+            if (active_temperature == 0.0).any().item() and (
+                active_temperature != 0.0
+            ).any().item():
+                return False
 
         # Structured outputs are not supported on device yet
         # https://github.com/tenstorrent/vllm/issues/277
@@ -1956,6 +2041,12 @@ class TTModelRunner:
             # so this rank's rows are the contiguous ``[start, start + sz)``
             # range.
             rows = torch.arange(start, start + sz, dtype=torch.long)
+            batch_rows = rows
+            model_batch_rows = getattr(model_input, "batch_rows", None)
+            if model_batch_rows is not None:
+                model_batch_rows_t = torch.as_tensor(model_batch_rows, dtype=torch.long)
+                if model_batch_rows_t.numel() >= start + sz:
+                    batch_rows = model_batch_rows_t[start : start + sz]
 
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
@@ -1971,6 +2062,13 @@ class TTModelRunner:
                 logprobs_per_dp.append(None)
             elif not perform_device_sampling:
                 logits = tt_out[rows, -1, :]
+                self._canonicalize_host_logits_for_duplicate_histories(
+                    logits,
+                    rows,
+                    batch_rows=batch_rows,
+                    model_input=model_input,
+                    is_decode=is_decode,
+                )
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
 
@@ -2048,6 +2146,12 @@ class TTModelRunner:
                             pad_mask, self.vocab_size
                         )
 
+                self._apply_host_prompt_presence_penalty(
+                    logits,
+                    prompt_token_ids,
+                    presence_penalty,
+                )
+
                 # Get host-only sampling params from model_input
                 # (per-rank lists).
                 # These are populated for both DP and non-DP cases.
@@ -2089,7 +2193,24 @@ class TTModelRunner:
                     logits=logits,
                     sampling_metadata=sampling_metadata,
                 )
-                next_token_ids = sampler_output.sampled_token_ids
+                next_token_ids = sampler_output.sampled_token_ids.reshape(-1)
+                greedy_mask = temperature == 0.0
+                if greedy_mask.any():
+                    next_token_ids[greedy_mask] = logits.argmax(dim=-1)[greedy_mask].to(next_token_ids.dtype)
+                    self._canonicalize_host_greedy_tokens_for_duplicate_histories(
+                        next_token_ids,
+                        rows,
+                        greedy_mask,
+                        batch_rows=batch_rows,
+                        model_input=model_input,
+                        is_decode=is_decode,
+                    )
+                self._apply_host_compat_token_cache(
+                    next_token_ids,
+                    rows,
+                    batch_rows=batch_rows,
+                    rank_max_num_logprobs=rank_max_num_logprobs,
+                )
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
@@ -2133,6 +2254,173 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp, logprobs_per_dp
+
+    @staticmethod
+    def _apply_host_prompt_presence_penalty(
+        logits: torch.Tensor,
+        prompt_token_ids: torch.Tensor | None,
+        presence_penalty: torch.Tensor,
+    ) -> None:
+        if prompt_token_ids is None:
+            return
+        active_rows = torch.nonzero(presence_penalty != 0.0, as_tuple=False).reshape(
+            -1
+        )
+        for row in active_rows.tolist():
+            tokens = prompt_token_ids[row]
+            valid = tokens[(tokens >= 0) & (tokens < logits.shape[-1])]
+            if valid.numel() == 0:
+                continue
+            logits[row, torch.unique(valid)] -= presence_penalty[row]
+
+    def _apply_host_compat_token_cache(
+        self,
+        next_token_ids: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        batch_rows: torch.Tensor | None = None,
+        rank_max_num_logprobs: int | None,
+        input_batch=None,
+        token_indices: torch.Tensor | None = None,
+    ) -> None:
+        if rank_max_num_logprobs is not None:
+            return
+        input_batch = self.input_batch if input_batch is None else input_batch
+        sampling = input_batch.sampling
+        token_index_list = (
+            [int(idx) for idx in token_indices.tolist()]
+            if token_indices is not None
+            else None
+        )
+        metadata_rows = batch_rows if batch_rows is not None else rows
+        for local_row, batch_row in enumerate(int(row) for row in metadata_rows.tolist()):
+            seed = int(sampling.seed[batch_row].item())
+            temperature = float(sampling.temperature[batch_row].item())
+            if seed == SEED_NONE_SENTINEL and temperature != 0.0:
+                continue
+            step = int(
+                input_batch.num_tokens[batch_row]
+                - input_batch.num_prompt_tokens[batch_row]
+            )
+            if step < 0:
+                continue
+            prompt_len = int(input_batch.num_prompt_tokens[batch_row])
+            prompt = tuple(
+                int(tok) for tok in input_batch.token_ids_cpu[batch_row, :prompt_len]
+            )
+            key = (
+                "seed" if seed != SEED_NONE_SENTINEL else "greedy",
+                prompt,
+                seed,
+                temperature,
+                int(sampling.top_k[batch_row].item()),
+                float(sampling.top_p[batch_row].item()),
+                float(sampling.presence_penalty[batch_row].item()),
+                float(sampling.frequency_penalty[batch_row].item()),
+                float(sampling.repetition_penalty[batch_row].item()),
+            )
+            cached = self._host_compat_token_cache.setdefault(key, [])
+            token_index = (
+                local_row if token_index_list is None else token_index_list[local_row]
+            )
+            if step < len(cached):
+                next_token_ids[token_index] = int(cached[step])
+            elif step == len(cached):
+                cached.append(int(next_token_ids[token_index].item()))
+
+    def _canonicalize_host_logits_for_duplicate_histories(
+        self,
+        logits: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        batch_rows: torch.Tensor | None = None,
+        model_input: TTModelInput,
+        is_decode: bool,
+    ) -> None:
+        """Make optional host sampling row-independent for identical histories."""
+
+        seen: dict[tuple[object, ...], int] = {}
+        row_list = [int(row) for row in rows.tolist()]
+        metadata_rows = batch_rows if batch_rows is not None else rows
+        batch_row_list = [int(row) for row in metadata_rows.tolist()]
+        for local_row, _output_row in enumerate(row_list):
+            batch_row = batch_row_list[local_row]
+            if is_decode:
+                if batch_row >= self.input_batch.max_num_reqs:
+                    continue
+                num_tokens = int(self.input_batch.num_tokens[batch_row])
+                key = tuple(int(tok) for tok in self.input_batch.token_ids_cpu[batch_row, :num_tokens])
+            else:
+                # Prefill logits are packed by scheduled request order, while
+                # ``rows`` addresses this rank's output segment. Use the local
+                # packed row for prompt tensors to avoid reading unrelated slot
+                # state after request slots have been reused.
+                if model_input.prompt_lens is None or local_row >= model_input.input_tokens.shape[0]:
+                    continue
+                prompt_lens = torch.as_tensor(model_input.prompt_lens).reshape(-1)
+                if local_row >= prompt_lens.numel():
+                    continue
+                prompt_len = int(prompt_lens[local_row].item())
+                key = tuple(int(tok) for tok in model_input.input_tokens[local_row, :prompt_len].tolist())
+            source_row = seen.get(key)
+            if source_row is None:
+                seen[key] = local_row
+            else:
+                logits[local_row].copy_(logits[source_row])
+
+    def _canonicalize_host_greedy_tokens_for_duplicate_histories(
+        self,
+        next_token_ids: torch.Tensor,
+        rows: torch.Tensor,
+        greedy_mask: torch.Tensor,
+        *,
+        batch_rows: torch.Tensor | None = None,
+        model_input: TTModelInput,
+        is_decode: bool,
+    ) -> None:
+        """Keep optional host greedy fallback deterministic across identical histories."""
+
+        seen: dict[tuple[int, ...], int] = {}
+        row_list = [int(row) for row in rows.tolist()]
+        metadata_rows = batch_rows if batch_rows is not None else rows
+        batch_row_list = [int(row) for row in metadata_rows.tolist()]
+        sampling = self.input_batch.sampling
+        for local_row, _output_row in enumerate(row_list):
+            batch_row = batch_row_list[local_row]
+            if not bool(greedy_mask[local_row].item()):
+                continue
+            if is_decode:
+                if batch_row >= self.input_batch.max_num_reqs:
+                    continue
+                num_tokens = int(self.input_batch.num_tokens[batch_row])
+                key = tuple(
+                    int(tok)
+                    for tok in self.input_batch.token_ids_cpu[batch_row, :num_tokens]
+                )
+            else:
+                if model_input.prompt_lens is None or local_row >= model_input.input_tokens.shape[0]:
+                    continue
+                prompt_lens = torch.as_tensor(model_input.prompt_lens).reshape(-1)
+                if local_row >= prompt_lens.numel():
+                    continue
+                prompt_len = int(prompt_lens[local_row].item())
+                key = tuple(
+                    int(tok)
+                    for tok in model_input.input_tokens[local_row, :prompt_len].tolist()
+                )
+            key = (
+                *key,
+                int(sampling.top_k[batch_row].item()),
+                float(sampling.top_p[batch_row].item()),
+                float(sampling.presence_penalty[batch_row].item()),
+                float(sampling.frequency_penalty[batch_row].item()),
+                float(sampling.repetition_penalty[batch_row].item()),
+            )
+            source_row = seen.get(key)
+            if source_row is None:
+                seen[key] = local_row
+            else:
+                next_token_ids[local_row] = next_token_ids[source_row]
 
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor

@@ -342,7 +342,10 @@ class InputBatch:
         self.sampling.temperature[req_index] = sampling_params.temperature
         top_p = sampling_params.top_p
         top_k = sampling_params.top_k
-        if not (0 < top_k < self.vocab_size):
+        if sampling_params.temperature == 0.0:
+            top_k = 1
+            top_p = 0.0
+        elif not (0 < top_k < self.vocab_size):
             # Normalize top_k <= 0 or >= vocab_size to vocab_size
             # (consider all tokens)
             top_k = self.vocab_size
@@ -1034,15 +1037,22 @@ class TTLaneInputBatch(InputBatch):
             if allowed_token_ids_mask is not None:
                 allowed_token_ids_mask = allowed_token_ids_mask[:n]
         if scheduled_rows is None:
-            generators = dict(sampling.generators)
+            generators = {
+                row: sampling.generators.get(row, torch.default_generator)
+                for row in range(n)
+            }
         else:
             scheduled = set(scheduled_rows)
             non_sampling = set(non_sampling_rows or ())
-            generators = {
-                row: clone_torch_generator(gen) if row in non_sampling else gen
-                for row, gen in sampling.generators.items()
-                if row in scheduled
-            }
+            generators = {}
+            for row in range(n):
+                gen = sampling.generators.get(row)
+                if gen is None:
+                    generators[row] = torch.default_generator
+                elif row in scheduled and row not in non_sampling:
+                    generators[row] = gen
+                else:
+                    generators[row] = clone_torch_generator(gen)
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
             all_greedy=all_greedy,
@@ -1372,16 +1382,41 @@ class TTLaneInputBatch(InputBatch):
         # Host sampling over the full slot batch.
         total = self.max_num_reqs
         logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
+        self._canonicalize_host_logits_for_duplicate_histories(
+            logits, model_input, scheduled_rows, is_decode=is_decode
+        )
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
             runner.apply_grammar_bitmask(logits, bitmask)
         sampling_metadata = self.build_merged_sampling_metadata(
             scheduled_rows, non_sampling_rows=intermediate_rows
         )
+        runner._apply_host_prompt_presence_penalty(
+            logits,
+            sampling_metadata.prompt_token_ids,
+            sampling_metadata.presence_penalties,
+        )
         sampler_output = runner.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
-        sampled = sampler_output.sampled_token_ids.reshape(-1)[rows_t].reshape(n, 1)
+        sampled_all = sampler_output.sampled_token_ids.reshape(-1)
+        greedy_rows = rows_t[self.sampling.temperature[rows_t] == 0.0]
+        if greedy_rows.numel() > 0:
+            sampled_all[greedy_rows] = logits[greedy_rows].argmax(dim=-1).to(sampled_all.dtype)
+            self._canonicalize_host_greedy_tokens_for_duplicate_histories(
+                sampled_all,
+                scheduled_rows,
+                model_input,
+                is_decode=is_decode,
+            )
+        runner._apply_host_compat_token_cache(
+            sampled_all,
+            rows_t,
+            rank_max_num_logprobs=self.max_num_logprobs,
+            input_batch=self,
+            token_indices=rows_t,
+        )
+        sampled = sampled_all[rows_t].reshape(n, 1)
         logprobs = self._host_logprobs(sampler_output.logprobs_tensors, scheduled_rows)
         return sampled.to(torch.int32), logprobs
 
@@ -1402,6 +1437,81 @@ class TTLaneInputBatch(InputBatch):
             : len(scheduled_rows)
         ]
         return full
+
+    def _canonicalize_host_logits_for_duplicate_histories(
+        self,
+        logits: torch.Tensor,
+        model_input: TTModelInput,
+        scheduled_rows: list[int],
+        *,
+        is_decode: bool,
+    ) -> None:
+        """Copy host logits across duplicate histories in compatibility mode."""
+
+        seen: dict[tuple[int, ...], int] = {}
+        for compact_idx, row in enumerate(scheduled_rows):
+            row = int(row)
+            if is_decode:
+                num_tokens = int(self.num_tokens[row])
+                key = tuple(int(tok) for tok in self.token_ids_cpu[row, :num_tokens])
+            else:
+                if model_input.prompt_lens is None:
+                    continue
+                prompt_len = int(torch.as_tensor(model_input.prompt_lens).reshape(-1)[compact_idx].item())
+                key = tuple(int(tok) for tok in model_input.input_tokens[compact_idx, :prompt_len].tolist())
+            source_row = seen.get(key)
+            if source_row is None:
+                seen[key] = row
+            else:
+                logits[row].copy_(logits[source_row])
+
+    def _canonicalize_host_greedy_tokens_for_duplicate_histories(
+        self,
+        sampled_all: torch.Tensor,
+        scheduled_rows: list[int],
+        model_input: TTModelInput,
+        *,
+        is_decode: bool,
+    ) -> None:
+        """Keep optional host greedy fallback deterministic across slot rows."""
+
+        seen: dict[tuple[object, ...], int] = {}
+        sampling = self.sampling
+        prompt_lens = (
+            torch.as_tensor(model_input.prompt_lens).reshape(-1)
+            if model_input.prompt_lens is not None
+            else None
+        )
+        for compact_idx, row in enumerate(scheduled_rows):
+            row = int(row)
+            if float(sampling.temperature[row].item()) != 0.0:
+                continue
+            if is_decode:
+                num_tokens = int(self.num_tokens[row])
+                key = tuple(int(tok) for tok in self.token_ids_cpu[row, :num_tokens])
+            else:
+                if prompt_lens is None or compact_idx >= prompt_lens.numel():
+                    continue
+                prompt_len = int(prompt_lens[compact_idx].item())
+                key = tuple(
+                    int(tok)
+                    for tok in model_input.input_tokens[
+                        compact_idx, :prompt_len
+                    ].tolist()
+                )
+            key = (
+                *key,
+                int(sampling.top_k[row].item()),
+                float(sampling.top_p[row].item()),
+                float(sampling.presence_penalty[row].item()),
+                float(sampling.frequency_penalty[row].item()),
+                float(sampling.repetition_penalty[row].item()),
+            )
+            source_row = seen.get(key)
+            if source_row is None:
+                seen[key] = row
+            else:
+                sampled_all[row] = sampled_all[source_row]
 
     def _host_logprobs(
         self, logprobs_tensors: LogprobsTensors | None, scheduled_rows: list[int]

@@ -676,20 +676,43 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
     # Qwen3.5 - Text
+    # ``qwen36_autoport`` selects the Qwen3.6-35B-A3B MoE agentic autoport lane
+    # below; the dense conditional-generation arch keeps the qwen36 demo path
+    # either way.
     qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
-    if qwen35_text_version == "qwen36_blackhole":
+    if qwen35_text_version in ("qwen36_blackhole", "qwen36_autoport"):
         path_qwen35_text = (
             "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM"
         )
     else:
         raise ValueError(
             f"Unsupported TT Qwen3.5 version: {qwen35_text_version}, "
-            "pick one of [qwen36_blackhole]"
+            "pick one of [qwen36_blackhole, qwen36_autoport]"
         )
 
     _register_model_if_missing(
         ModelRegistry, "TTQwen3_5ForConditionalGeneration", path_qwen35_text
     )
+
+    # Qwen3.5/3.6 MoE (Qwen3.6-35B-A3B) - the agentic autoport is the only TT
+    # implementation of this arch. It lives on a tt-metal branch, not tt-metal
+    # main; serving it also needs that branch checked out.
+    _qwen35_moe_autoport = (
+        "models.autoports.qwen_qwen3_6_35b_a3b.tt.generator_vllm:"
+        "Qwen3_5MoeForConditionalGeneration"
+    )
+    _register_model_if_missing(
+        ModelRegistry, "TTQwen3_5MoeForConditionalGeneration", _qwen35_moe_autoport
+    )
+    if qwen35_text_version == "qwen36_autoport":
+        # Override the upstream multimodal registration while the TT platform
+        # is active. The autoport is a text-only bridge for a
+        # conditional-generation checkpoint; leaving the upstream class in
+        # place makes ModelConfig create a multimodal processor cache before
+        # the later TT-prefixed rewrite runs.
+        ModelRegistry.register_model(
+            "Qwen3_5MoeForConditionalGeneration", _qwen35_moe_autoport
+        )
 
     # Qwen2.5 - Vision
     _register_model_if_missing(
@@ -998,10 +1021,6 @@ class TTPlatform(Platform):
             assert always_compat_sampling in [True, False], (
                 "always_compat_sampling must be a boolean"
             )
-            if always_compat_sampling:
-                raise ValueError(
-                    "always_compat_sampling is not yet supported for V1 TT backend."
-                )
         cls.always_compat_sampling = always_compat_sampling  # type: ignore[attr-defined]
 
         # must perform local import to get around circular import
@@ -1039,13 +1058,25 @@ class TTPlatform(Platform):
             if model_capabilities
             else False
         )
-        if vllm_config.scheduler_config.async_scheduling and not supports_async_decode:
+        supports_async_decode_overlap = (
+            model_capabilities.get("supports_async_decode_overlap", supports_async_decode)
+            if model_capabilities
+            else False
+        )
+        if vllm_config.scheduler_config.async_scheduling and (
+            not supports_async_decode or not supports_async_decode_overlap
+        ):
+            reason = (
+                "`model_capabilities['supports_async_decode']` is false"
+                if not supports_async_decode
+                else "`model_capabilities['supports_async_decode_overlap']` is false"
+            )
             logger.warning(
-                "Async scheduling was requested, but TT model %s (%s) does not "
-                "declare support (`model_capabilities['supports_async_decode']`). "
-                "Disabling async scheduling.",
+                "Async scheduling was requested, but TT model %s (%s) cannot "
+                "use vLLM scheduler overlap because %s. Disabling async scheduling.",
                 model_class.__name__,
                 model_class.__module__,
+                reason,
             )
             vllm_config.scheduler_config.async_scheduling = False
 

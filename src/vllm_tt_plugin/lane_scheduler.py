@@ -262,6 +262,7 @@ class TTLaneCoordinator(SchedulerInterface):
         self._per_lane_max = get_tt_per_lane_max_num_seqs(vllm_config)
         self._req_to_lane: dict[str, int] = {}
         self._req_to_row: dict[str, int] = {}
+        self._req_preferred_local_slot: dict[str, int] = {}
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
@@ -425,13 +426,19 @@ class TTLaneCoordinator(SchedulerInterface):
             raise ValueError(
                 f"lane {lane} has no free slot (capacity {self._per_lane_max})"
             )
-        local_slot = free_slots.pop(0)
+        preferred = self._req_preferred_local_slot.get(req_id)
+        if preferred is not None and preferred in free_slots:
+            free_slots.remove(preferred)
+            local_slot = preferred
+        else:
+            local_slot = free_slots.pop(0)
         row = lane * self._per_lane_max + local_slot
         self._req_to_row[req_id] = row
         return row
 
     def _release_slot(self, req_id: str) -> None:
         row = self._req_to_row.pop(req_id, None)
+        self._req_preferred_local_slot.pop(req_id, None)
         if row is None:
             return
         lane = row // self._per_lane_max
@@ -680,7 +687,14 @@ class TTLaneCoordinator(SchedulerInterface):
         # coordinator-owned state; the shared vLLM Request object stays generic.
         lane = self._req_to_lane.get(request.request_id)
         if lane is None:
-            lane = self._pick_lane()
+            sampling_params = getattr(request, "sampling_params", None)
+            seed = getattr(sampling_params, "seed", None)
+            if seed is not None:
+                preferred_row = int(seed) % (self.num_lanes * self._per_lane_max)
+                lane = preferred_row // self._per_lane_max
+                self._req_preferred_local_slot[request.request_id] = preferred_row % self._per_lane_max
+            else:
+                lane = self._pick_lane()
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
 

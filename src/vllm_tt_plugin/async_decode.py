@@ -276,6 +276,8 @@ class TTAsyncDecodeController:
             return False
         if not model_input.perform_device_sampling:
             return False
+        if not self.runner.supports_async_decode_overlap:
+            return False
         if model_input.reset_batch:
             return False
         if model_input.grammar_bitmask[0] is not None:

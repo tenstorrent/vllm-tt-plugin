@@ -130,3 +130,9 @@ class TTModelInput:
     # sampled token, because more prompt tokens remain after this chunk.
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
+
+    # Host-only: persistent input-batch rows for the packed model-input rows.
+    # Generic non-lane inputs are front-packed by default, but sparse/stable
+    # slot layouts need this mapping when optional host sampling reads persistent
+    # sampling params or token history.
+    batch_rows: list[int] | None = None
