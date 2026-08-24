@@ -2093,6 +2093,10 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
+                assert model_input.grammar_bitmask[dp_rank] is None, (
+                    "grammar bitmask is set but device sampling can't apply it"
+                )
+
                 # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
                 # while decode may return [sz, 1]; downstream logprobs packing
                 # expects a flat vector here.

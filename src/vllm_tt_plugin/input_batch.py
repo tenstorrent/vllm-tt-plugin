@@ -1355,6 +1355,10 @@ class TTLaneInputBatch(InputBatch):
                 "Intermediate prefill rows must use host sampling so their "
                 "device RNG state is not advanced."
             )
+            assert model_input.grammar_bitmask[0] is None, (
+                "grammar bitmask is set but device sampling can't apply it"
+            )
+
             tokens = tt_out.reshape(-1) if isinstance(tt_out, torch.Tensor) else tt_out
             # Decode reads each scheduled slot; prefill returns one token per
             # scheduled request, already in row order.
