@@ -162,9 +162,12 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
 # region Decode input construction
 
 
-def test_completed_cached_request_builds_decode_input():
-    prompt_len = num_computed_tokens = 8
-    output_len = 0
+@pytest.mark.parametrize("output_len", [0, 1, 2, 5])
+def test_completed_cached_request_builds_decode_input(output_len: int):
+    """Classify a cached request that has computed everything but its last token."""
+    prompt_len = 8
+    num_tokens = prompt_len + output_len
+    num_computed_tokens = max(prompt_len, num_tokens - 1)
     batch, request = _batch_with_one_request(
         prompt_len=prompt_len,
         output_len=output_len,
@@ -190,10 +193,11 @@ def test_completed_cached_request_builds_decode_input():
 
     assert model_input is not None
     assert model_input.prompt_lens is None
-    assert model_input.input_positions.tolist() == [prompt_len - 1] + [-1] * (
+    assert model_input.input_positions.tolist() == [num_tokens - 1] + [-1] * (
         MAX_NUM_SEQS - 1
     )
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
+    assert model_input.input_tokens[0, 0] == batch.token_ids_cpu[0, num_tokens - 1]
 
 
 def test_final_one_token_prompt_chunk_stays_prefill():

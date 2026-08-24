@@ -302,6 +302,7 @@ def _extract(
     model_input = SimpleNamespace(
         intermediate_prefill_mask=None,
         max_num_logprobs=[None],
+        grammar_bitmask=[None],
     )
     return TTModelRunner._get_output_tokens(
         runner,

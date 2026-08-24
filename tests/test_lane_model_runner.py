@@ -102,6 +102,7 @@ def test_extract_output_device_decode_returns_scheduled_rows_in_order():
             enable_log_probs=torch.zeros(5, dtype=torch.bool)
         ),
         max_num_logprobs=[None],
+        grammar_bitmask=[None],
     )
 
     sampled, logprobs = batch.extract_output(
@@ -128,6 +129,7 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
         ),
         max_num_logprobs=[None],
         intermediate_prefill_mask=None,
+        grammar_bitmask=[None],
     )
 
     sampled, logprobs = batch.extract_output(

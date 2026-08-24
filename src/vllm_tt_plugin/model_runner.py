@@ -1107,10 +1107,9 @@ class TTModelRunner:
 
         def _is_still_prefilling(req_id: str) -> bool:
             # Any uncomputed PROMPT token is prefill work, including a final
-            # chunk of exactly one token: only the prompt-aware clause keeps
-            # that chunk in the prefill batch (dispatching it as a decode
-            # computes the same position, but the mixed-batch filter below
-            # would drop it and the request would never finish). Past the
+            # chunk of exactly one token: prompt work must dispatch through
+            # the prefill path, which owns chunk bookkeeping (e.g. the
+            # intermediate-prefill mask and vision rope state). Past the
             # prompt, a steady-state step legitimately has exactly one output
             # width outstanding (the sampled token for AR, one whole canvas
             # for block models); only MORE than that means uncomputed history
@@ -1119,6 +1118,7 @@ class TTModelRunner:
             # work, re-encoding the entire session per canvas: quadratic
             # prefill and decode never ran.
             row = input_batch.req_id_to_index[req_id]
+            # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
             num_computed = input_batch.num_computed_tokens_cpu[row]
             return (
                 num_computed < input_batch.num_prompt_tokens[row]
@@ -1146,60 +1146,6 @@ class TTModelRunner:
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
-            # NOTE: In SchedulerOutput, "cached" means "request data already
-            # cached on the worker", not necessarily "decode". During a prefill
-            # step we can legitimately see cached requests if they are resumed
-            # from preemption or are chunked-prefill continuations (both still
-            # prefill work).
-            if cached_reqs.num_reqs > 0:
-                # Filter only rows with NOTHING left to compute: a request
-                # with any uncomputed token (a one-token final prompt chunk, a
-                # replay tail, or a steady decode caught in a DP-async mixed
-                # batch) stays in the prefill batch, where a one-token chunk
-                # computes the same position the decode path would. Dropping a
-                # scheduled row instead desyncs the output row count (the
-                # _coerce_output_block assert kills EngineCore) and the
-                # scheduler never re-schedules the dropped token.
-                def _nothing_left_to_compute(req_id: str) -> bool:
-                    row = input_batch.req_id_to_index[req_id]
-                    return (
-                        input_batch.num_computed_tokens_cpu[row]
-                        >= input_batch.num_tokens[row]
-                    )
-
-                running_req_ids = {
-                    req_id
-                    for req_id in cached_reqs.req_ids
-                    if req_id not in cached_reqs.resumed_req_ids
-                    and _nothing_left_to_compute(req_id)
-                }
-                if running_req_ids:
-                    # Mixed prefill+decode batch detected. This should not
-                    # happen with TTScheduler but can occur under standard DP
-                    # async scheduling edge cases. Filter decode requests out
-                    # of this prefill step; they will be re-scheduled next.
-
-                    logger.warning(
-                        "Prefill batch contained %d running decode request(s); "
-                        "filtering them from this prefill step.",
-                        len(running_req_ids),
-                    )
-
-                    req_indices = [
-                        i
-                        for i in req_indices
-                        if input_batch.req_ids[i] not in running_req_ids
-                    ]
-                    num_reqs = len(req_indices)
-                    if num_reqs == 0:
-                        return None
-
-                    # Rebuild block tables for the filtered indices.
-                    block_tables_per_group = input_batch.block_tables_for_rows(
-                        req_indices, target_width
-                    )
-                    block_tables = block_tables_per_group[0]
-
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[req_indices]
@@ -2247,6 +2193,10 @@ class TTModelRunner:
                 # Capture logprobs for this DP rank
                 logprobs_per_dp.append(sampler_output.logprobs_tensors)
             else:  # sample on device
+                assert model_input.grammar_bitmask[dp_rank] is None, (
+                    "grammar bitmask is set but device sampling can't apply it"
+                )
+
                 next_token_ids = _take(tt_out).reshape(sz, -1)
                 if next_token_ids.shape[1] != self._output_tokens_per_step:
                     raise ValueError(
