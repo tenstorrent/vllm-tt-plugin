@@ -236,6 +236,9 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         logit_bias={2: 1.0},
         allowed_token_ids=[1, 2],
         bad_words=["bad"],
+        presence_penalty=0.5,
+        frequency_penalty=0.5,
+        repetition_penalty=1.1,
         structured_outputs=StructuredOutputsParams(json_object=True),
     )
     params.update_from_generation_config({}, eos_token_id=2)
@@ -264,6 +267,12 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert params.allowed_token_ids is None
     assert params.bad_words is None
     assert params._bad_words_token_ids is None
+    # Penalties do not force host sampling, but leaving them non-neutral
+    # makes every block step build (and discard) session-length penalty
+    # tensors via InputBatch.no_penalties.
+    assert params.presence_penalty == 0.0
+    assert params.frequency_penalty == 0.0
+    assert params.repetition_penalty == 1.0
     # A resumable session would park the stopped request forever and leak the
     # model-owned state slot.
     assert request.resumable is False

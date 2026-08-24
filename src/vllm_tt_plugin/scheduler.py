@@ -106,6 +106,11 @@ class TTScheduler(AsyncScheduler):
     # Host-only sampling controls and their neutral values: any of these
     # forces the step onto host sampling (check_perform_device_sampling),
     # which cannot construct a multi-token canvas and kills the engine.
+    # Penalties do not force host sampling, but a non-neutral value flips
+    # InputBatch.no_penalties and makes every block decode step build (and
+    # discard) penalty token tensors that grow with the committed session
+    # length; the frontend neutralizes them, so mirror that here for
+    # prebuilt requests that bypassed it.
     _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
         ("min_p", 0.0),
         ("min_tokens", 0),
@@ -113,6 +118,9 @@ class TTScheduler(AsyncScheduler):
         ("allowed_token_ids", None),
         ("bad_words", None),
         ("_bad_words_token_ids", None),
+        ("presence_penalty", 0.0),
+        ("frequency_penalty", 0.0),
+        ("repetition_penalty", 1.0),
     )
 
     def add_request(self, request: Request) -> None:
