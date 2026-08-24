@@ -964,6 +964,22 @@ def register_tt_models(register_test_models=False) -> None:
     # first so a distributed bundle can supply a model without touching this file.
     _register_models_from_extra_dir(ModelRegistry)
 
+    # DiffusionGemma aliases register regardless of the builtin-map switch:
+    # they are the counterpart of the always-installed checkpoint-architecture
+    # rewrite, and skipping them would turn a bundles-only launch into an
+    # unactionable "TTDiffusionGemmaForBlockDiffusion is not supported" error
+    # naming an architecture the operator never configured. if-missing keeps
+    # an EXTRA_MODELS_DIR bundle registered above authoritative.
+    _diffusion_gemma_target = (
+        "models.experimental.diffusion_gemma.tt.generator_vllm:"
+        "DiffusionGemmaForCausalLM"
+    )
+    for arch in (
+        "DiffusionGemmaForCausalLM",
+        *_DIFFUSION_GEMMA_TT_ARCHITECTURES.values(),
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _diffusion_gemma_target)
+
     # Built-in map. Kept for compatibility; disable with TT_VLLM_BUILTIN_MODELS=0.
     if not _builtin_models_enabled():
         if register_test_models:
@@ -1105,22 +1121,13 @@ def register_tt_models(register_test_models=False) -> None:
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
 
-    # DiffusionGemma emits one complete 256-token canvas per model step.
-    # Upstream owns the bare DiffusionGemmaForBlockDiffusion registration; do
-    # not pretend an if-missing registration overrides it. The bare
-    # DiffusionGemmaForCausalLM name exists nowhere upstream, so this plugin
-    # remains its only provider. The platform's early HF-config patch maps
-    # both supported checkpoint names to the TT aliases before ModelConfig
-    # inspects the registry.
-    _diffusion_gemma_target = (
-        "models.experimental.diffusion_gemma.tt.generator_vllm:"
-        "DiffusionGemmaForCausalLM"
-    )
-    for arch in (
-        "DiffusionGemmaForCausalLM",
-        *_DIFFUSION_GEMMA_TT_ARCHITECTURES.values(),
-    ):
-        _register_model_if_missing(ModelRegistry, arch, _diffusion_gemma_target)
+    # DiffusionGemma registers above the builtin-map switch: one complete
+    # 256-token canvas per model step. Upstream owns the bare
+    # DiffusionGemmaForBlockDiffusion registration; the plugin registers the
+    # TT aliases plus the bare DiffusionGemmaForCausalLM name (which exists
+    # nowhere upstream), and the early HF-config patch maps both supported
+    # checkpoint names to the TT aliases before ModelConfig inspects the
+    # registry.
 
     # DeepseekV3
     _register_model_if_missing(
@@ -1228,10 +1235,7 @@ class TTPlatform(Platform):
         # Called during CLI/parser setup (APIServer). ModelConfig may
         # validate/inspect architectures before VllmConfig is constructed in
         # this process, so TT models must be registered before that (including
-        # test models when the CLI override requests them). The DiffusionGemma
-        # architecture rewrite is NOT installed here: it travels with model
-        # registration through the vllm.general_plugins entry point, which
-        # every launch path loads before this hook runs.
+        # test models when the CLI override requests them).
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
