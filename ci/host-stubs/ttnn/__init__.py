@@ -37,6 +37,7 @@ class FabricConfig(Enum):
     FABRIC_1D = "fabric_1d"
     FABRIC_1D_RING = "fabric_1d_ring"
     FABRIC_2D = "fabric_2d"
+    FABRIC_2D_TORUS_XY = "fabric_2d_torus_xy"
     CUSTOM = "custom"
 
 
@@ -74,6 +75,7 @@ class ClusterType(Enum):
     P150 = "p150"
     P150_X2 = "p150_x2"
     P150_X4 = "p150_x4"
+    BLACKHOLE_GALAXY = "blackhole_galaxy"
     SIMULATOR_WORMHOLE_B0 = "simulator_wormhole_b0"
     SIMULATOR_BLACKHOLE = "simulator_blackhole"
 

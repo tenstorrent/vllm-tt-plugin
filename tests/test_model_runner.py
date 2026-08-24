@@ -202,8 +202,9 @@ def test_completed_cached_request_builds_decode_input(output_len: int):
 
 def test_final_one_token_prompt_chunk_stays_prefill():
     """A chunked prefill whose remainder is exactly one token is still prompt
-    work: classifying it as decode routes it into the mixed-batch filter,
-    which drops the scheduled token (EngineCore assert / permanent hang)."""
+    work: the prefill path owns chunk bookkeeping (the intermediate-prefill
+    mask and per-request vision rope state), so it must not dispatch as
+    decode even though the computed position would match."""
     prompt_len = 8
     batch, request = _batch_with_one_request(
         prompt_len=prompt_len,
