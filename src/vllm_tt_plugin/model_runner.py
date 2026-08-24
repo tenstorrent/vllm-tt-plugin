@@ -1033,8 +1033,13 @@ class TTModelRunner:
 
         def _is_still_prefilling(req_id: str) -> bool:
             row = input_batch.req_id_to_index[req_id]
+            # ``num_computed_tokens`` is the scheduler's pre-step snapshot, so a
+            # steady-state decode arrives with exactly one token left to
+            # compute. More than one token left means this step is a prefill
+            # chunk: either prompt tokens or a post-preemption replay.
             return (
-                input_batch.num_computed_tokens_cpu[row] < input_batch.num_tokens[row]
+                input_batch.num_computed_tokens_cpu[row] + 1
+                < input_batch.num_tokens[row]
             )
 
         # A "prefill" step can contain:
@@ -1057,45 +1062,6 @@ class TTModelRunner:
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         if is_prompt:
-            # NOTE: In SchedulerOutput, "cached" means "request data already
-            # cached on the worker", not necessarily "decode". During a prefill
-            # step we can legitimately see cached requests if they are resumed
-            # from preemption or are chunked-prefill continuations (both still
-            # prefill work).
-            if cached_reqs.num_reqs > 0:
-                running_req_ids = {
-                    req_id
-                    for req_id in cached_reqs.req_ids
-                    if req_id not in cached_reqs.resumed_req_ids
-                    and not _is_still_prefilling(req_id)
-                }
-                if running_req_ids:
-                    # Mixed prefill+decode batch detected. This should not
-                    # happen with TTScheduler but can occur under standard DP
-                    # async scheduling edge cases. Filter decode requests out
-                    # of this prefill step; they will be re-scheduled next.
-
-                    logger.warning(
-                        "Prefill batch contained %d running decode request(s); "
-                        "filtering them from this prefill step.",
-                        len(running_req_ids),
-                    )
-
-                    req_indices = [
-                        i
-                        for i in req_indices
-                        if input_batch.req_ids[i] not in running_req_ids
-                    ]
-                    num_reqs = len(req_indices)
-                    if num_reqs == 0:
-                        return None
-
-                    # Rebuild block tables for the filtered indices.
-                    block_tables_per_group = input_batch.block_tables_for_rows(
-                        req_indices, target_width
-                    )
-                    block_tables = block_tables_per_group[0]
-
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
             input_positions = input_batch.num_computed_tokens_cpu[req_indices]
