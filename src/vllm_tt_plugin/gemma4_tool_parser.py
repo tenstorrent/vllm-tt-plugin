@@ -43,8 +43,8 @@ class Gemma4ToolParser(ToolParser):
     and normalizes arguments into a JSON string for the OpenAI tool-call schema.
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
+        super().__init__(tokenizer, *args, **kwargs)
 
         # Streaming state.
         self.current_tool_name_sent: bool = False
