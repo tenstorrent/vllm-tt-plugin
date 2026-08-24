@@ -193,6 +193,21 @@ class TTScheduler(AsyncScheduler):
             )
             request.prompt_token_ids = [0] * request.num_prompt_tokens
             request.prompt_embeds = None
+        if request.prompt_embeds is not None:
+            # Mixed-mode prompts (token ids + embeds + prompt_is_token_ids
+            # mask) carry placeholder ids at the embed positions, so the TT
+            # model decodes them as ordinary tokens either way; scrub the
+            # embeds so the prompt_len x hidden_size tensor is not pinned for
+            # the request lifetime, and warn like the embeds-only branch.
+            logger.warning(
+                "Request %s bypassed frontend validation with mixed "
+                "token/embeds prompt content the TT backend does not "
+                "support; dropping the embeds (placeholder ids decode as "
+                "ordinary tokens)",
+                request.request_id,
+            )
+            request.prompt_embeds = None
+            request.prompt_is_token_ids = None
         if request.num_prompt_tokens == 0:
             # The frontend rejects empty prompts; admitted bare, the waiting
             # loop schedules zero new tokens and upstream's num_new_tokens

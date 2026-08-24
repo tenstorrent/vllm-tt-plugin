@@ -410,6 +410,31 @@ def test_multimodal_features_are_dropped_from_bypassed_request():
     assert scheduler.running == []
 
 
+def test_mixed_token_embeds_bypassed_prompt_drops_the_embeds():
+    """A mixed-mode prompt (token ids + embeds + mask) skips the embeds-only
+    replacement branch; the embeds must still be scrubbed so the
+    prompt_len x hidden_size tensor is not pinned for the request lifetime."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=3, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="mixed-0",
+        prompt_token_ids=[1, 0, 3, 0, 5, 6, 7, 8],
+        prompt_embeds=torch.zeros(8, 4),
+        prompt_is_token_ids=[True, False, True, False, True, True, True, True],
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.prompt_embeds is None
+    assert request.prompt_is_token_ids is None
+    assert request.prompt_token_ids == [1, 0, 3, 0, 5, 6, 7, 8]
+
+
 def test_embeds_only_bypassed_prompt_is_replaced_with_placeholders():
     """The frontend rejects prompt_embeds for every TT model; admitted bare,
     the worker's request-state builder raises NotImplementedError out of
