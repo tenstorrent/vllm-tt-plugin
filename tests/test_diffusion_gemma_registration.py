@@ -69,12 +69,12 @@ def test_diffusion_gemma_uses_tt_architecture_before_upstream_config_hooks(
     assert vllm_config.diffusion_config is None
 
 
-def test_pre_register_registers_models_and_leaves_patch_to_general_plugins(
+def test_pre_register_reinstalls_the_architecture_patch(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    # The architecture rewrite travels with the vllm.general_plugins entry
-    # point, which every launch path loads before this hook; installing it
-    # here again would only duplicate that.
+    # Normally the general-plugins entry point installs the rewrite first,
+    # but VLLM_PLUGINS=tt drops that entry point while keeping the platform:
+    # this hook must reinstall (idempotently) so the invariant survives.
     events = []
     monkeypatch.setattr(tt_platform, "_pin_v1_model_runner", lambda: None)
     monkeypatch.setattr(
@@ -98,7 +98,7 @@ def test_pre_register_registers_models_and_leaves_patch_to_general_plugins(
 
     tt_platform.TTPlatform.pre_register_and_update()
 
-    assert events == [("register", True)]
+    assert events == [("register", True), ("patch", None)]
 
 
 def test_general_plugin_entry_point_installs_architecture_patch(

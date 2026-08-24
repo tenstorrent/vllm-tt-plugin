@@ -1238,6 +1238,13 @@ class TTPlatform(Platform):
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
+        # Usually a no-op: the general-plugins entry point installs this in
+        # every process. But VLLM_PLUGINS filters entry points independently
+        # by name, so `VLLM_PLUGINS=tt` keeps the platform while dropping
+        # `tt_model_registry` — without this idempotent reinstall the bare
+        # DiffusionGemma architecture would reach upstream's config hook and
+        # startup would abort blaming a --diffusion-config nobody passed.
+        _install_diffusion_gemma_architecture_patch()
 
     @classmethod
     def import_kernels(cls) -> None:
