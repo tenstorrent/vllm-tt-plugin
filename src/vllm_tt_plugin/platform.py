@@ -1211,15 +1211,17 @@ class TTPlatform(Platform):
     ) -> None:
         # Called during CLI/parser setup (APIServer). ModelConfig may
         # validate/inspect architectures before VllmConfig is constructed in
-        # this process, so we must ensure TT test models are registered early
-        # when explicitly requested via CLI override.
+        # this process, so TT models must be registered before that (including
+        # test models when the CLI override requests them). The DiffusionGemma
+        # architecture rewrite is NOT installed here: it travels with model
+        # registration through the vllm.general_plugins entry point, which
+        # every launch path loads before this hook runs.
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
-        _install_diffusion_gemma_architecture_patch()
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -1532,28 +1534,16 @@ class TTPlatform(Platform):
                 "Block-output setup failed to clear upstream diffusion detection"
             )
 
+            # The general-plugins architecture rewrite keeps upstream's
+            # MODELS_CONFIG_MAP hook from ever auto-creating this config, so a
+            # non-None value is an explicit operator setting on a model that
+            # owns its canvas scheduling.
             if vllm_config.diffusion_config is not None:
-                resolved_arch = str(getattr(model_config, "architecture", "") or "")
-                if resolved_arch.startswith("TT"):
-                    # ModelConfig resolved a TT alias, so the early get_config
-                    # rewrite ran and upstream's MODELS_CONFIG_MAP hook cannot
-                    # have auto-created this config: it is an explicit operator
-                    # setting on a model that owns its canvas scheduling.
-                    raise ValueError(
-                        "Block-output models own canvas scheduling and do not "
-                        "support --diffusion-config; remove the explicit "
-                        "diffusion configuration"
-                    )
-                # Without the rewrite (VllmConfig built outside EngineArgs, so
-                # pre_register_and_update never ran), upstream's DiffusionGemma
-                # hook auto-creates this config before the platform hook runs.
-                # It represents the same canvas as output_tokens_per_step, so
-                # retaining it double-books the block as speculative drafts.
-                logger.warning(
-                    "Block-output model owns diffusion scheduling; disabling "
-                    "upstream DiffusionConfig speculative-token accounting."
+                raise ValueError(
+                    "Block-output models own canvas scheduling and do not "
+                    "support --diffusion-config; remove the explicit "
+                    "diffusion configuration"
                 )
-                vllm_config.diffusion_config = None
             min_max_model_len = _min_block_output_max_model_len(output_tokens_per_step)
             if model_config.max_model_len < min_max_model_len:
                 raise ValueError(
