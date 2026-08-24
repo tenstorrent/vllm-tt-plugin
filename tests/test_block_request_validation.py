@@ -338,6 +338,28 @@ def test_admission_handle_releases_when_engine_config_is_collected(monkeypatch):
     TTPlatform.check_and_update_config(_weakrefable_config())
 
 
+def test_cycle_pinned_dead_ar_config_does_not_block_a_block_engine(monkeypatch):
+    # An AR engine shares the process freely, so its handle survives the entry
+    # guard. When it dies leaving its config reachable only through a
+    # reference cycle, the post-apply guard must collect before refusing to
+    # start a block engine.
+    _patch_model_resolution(monkeypatch, model_class=ARModel)
+    ar_config = _weakrefable_config()
+    ar_config.model_config.hf_config.canvas_length = None
+    ar_config._self_cycle = ar_config
+    TTPlatform.check_and_update_config(ar_config)
+
+    del ar_config
+
+    # Switch only the model resolution: _patch_model_resolution would reset
+    # the admission handle and defeat the scenario.
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _model_config: (BlockModel, None),
+    )
+    TTPlatform.check_and_update_config(_config())
+
+
 def test_admission_guard_raise_does_not_pin_the_stale_config(monkeypatch):
     # The guard's own traceback must not become the reference that keeps a
     # dead engine's config alive: in a REPL, sys.last_traceback holds the

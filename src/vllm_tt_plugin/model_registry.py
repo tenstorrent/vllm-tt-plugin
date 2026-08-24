@@ -17,6 +17,15 @@ __all__ = [
 
 def register_tt_models_from_plugin() -> None:
     """Entry point used by ``vllm.general_plugins``."""
+    # vLLM loads general plugins on EVERY platform; only act when this host
+    # can actually serve TT models (the same probe platform_plugin() uses).
+    # Upstream owns the bare DiffusionGemma architecture, and rewriting it on
+    # a CUDA box (or a TT box whose ttnn install is broken) would redirect
+    # upstream serving into an unimportable tt-metal target.
+    try:
+        import ttnn  # noqa: F401
+    except Exception:
+        return
     register_tt_models(
         register_test_models=_should_pre_register_tt_test_models_from_cli()
     )

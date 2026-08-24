@@ -126,6 +126,34 @@ def test_general_plugin_entry_point_installs_architecture_patch(
     assert events == ["register", "patch"]
 
 
+def test_general_plugin_entry_point_is_inert_without_ttnn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # vLLM loads general plugins on every platform; without ttnn this host
+    # cannot serve TT models, and rewriting the upstream-owned DiffusionGemma
+    # architecture would break upstream serving on a CUDA box.
+    import sys
+
+    from vllm_tt_plugin import model_registry
+
+    events = []
+    monkeypatch.setattr(
+        model_registry,
+        "register_tt_models",
+        lambda register_test_models=False: events.append("register"),
+    )
+    monkeypatch.setattr(
+        model_registry,
+        "_install_diffusion_gemma_architecture_patch",
+        lambda: events.append("patch"),
+    )
+    monkeypatch.setitem(sys.modules, "ttnn", None)
+
+    model_registry.register_tt_models_from_plugin()
+
+    assert events == []
+
+
 def test_gemma4_parsers_are_owned_by_upstream_vllm():
     from vllm.reasoning import ReasoningParserManager
     from vllm.reasoning.gemma4_engine_reasoning_parser import (

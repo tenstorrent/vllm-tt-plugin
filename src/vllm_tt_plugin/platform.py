@@ -1180,12 +1180,15 @@ class TTPlatform(Platform):
     # tests may seed a direct config object.
     _tt_vllm_config: ClassVar["weakref.ref[VllmConfig] | VllmConfig | None"] = None
 
-    @classmethod
-    def _resolve_tt_admission_handle(cls) -> "VllmConfig | None":
-        handle = cls._tt_vllm_config
+    @staticmethod
+    def _deref_admission_handle(handle) -> "VllmConfig | None":
         if isinstance(handle, weakref.ref):
             return handle()
         return handle
+
+    @classmethod
+    def _resolve_tt_admission_handle(cls) -> "VllmConfig | None":
+        return cls._deref_admission_handle(cls._tt_vllm_config)
 
     # Disable torch.compile on TT platform - the triton version in tt-metal
     # is incompatible with torch's inductor backend.
@@ -1344,17 +1347,53 @@ class TTPlatform(Platform):
         # engine's canvas contract.
         cls._tt_vllm_config = None
         try:
-            cls._apply_check_and_update_config(vllm_config, previous_tt_vllm_config)
+            cls._apply_check_and_update_config(vllm_config)
         except Exception:
             cls._tt_vllm_config = previous_handle
             # Keep the stale config out of this traceback's frame locals.
             del previous_handle, previous_tt_vllm_config
             raise
 
+        # This process may already hold another engine's admission handle (an
+        # AR engine shares a process freely, so the entry guard let it
+        # through). A block-output engine must not START alongside it: block
+        # models read the process-level contract from the handle. Applied
+        # after _apply so the successor's blockness is known; the config
+        # mutations above match the pre-existing ordering, where this check
+        # also ran last.
+        previous_tt_vllm_config = cls._deref_admission_handle(previous_handle)
+        if previous_tt_vllm_config is vllm_config:
+            previous_tt_vllm_config = None
+        if previous_tt_vllm_config is not None and is_tt_block_output_model(
+            vllm_config
+        ):
+            # Same remedy as the entry guard: a dead engine's config may be
+            # alive only through cycles or a held traceback.
+            previous_tt_vllm_config = None
+            gc.collect()
+            previous_tt_vllm_config = cls._deref_admission_handle(previous_handle)
+            if previous_tt_vllm_config is vllm_config:
+                previous_tt_vllm_config = None
+            if previous_tt_vllm_config is not None:
+                # The live predecessor keeps owning the process.
+                cls._tt_vllm_config = previous_handle
+                # Keep the stale config out of this traceback's frame locals.
+                del previous_tt_vllm_config, previous_handle
+                raise ValueError(
+                    "One TT engine per process when a block-output model is "
+                    "involved: TTPlatform keeps process-level admission state "
+                    "that a second engine configuration would overwrite"
+                )
+        # Weakly: when the engine (and its config) is garbage-collected, the
+        # guard stops treating this process as occupied.
+        try:
+            cls._tt_vllm_config = weakref.ref(vllm_config)
+        except TypeError:
+            # Test doubles without weakref support are held directly.
+            cls._tt_vllm_config = vllm_config
+
     @classmethod
-    def _apply_check_and_update_config(
-        cls, vllm_config: "VllmConfig", previous_tt_vllm_config: "VllmConfig | None"
-    ) -> None:
+    def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         _apply_chunked_prefill_policy(vllm_config)
 
         assert not vllm_config.speculative_config, (
@@ -1779,31 +1818,13 @@ class TTPlatform(Platform):
             vllm_config.model_config.max_model_len
         )
         # vLLM 0.25.1 syncs an auto-fitted max_model_len back into this same
-        # frontend config through EngineCoreReadyResponse. Retain one config
-        # handle rather than snapshotting either the width or the length.
-        # The entry check above protects a live block engine; this one refuses
+        # frontend config through EngineCoreReadyResponse; the caller retains
+        # one config handle (weakly) rather than snapshotting the width or the
+        # length. Admission guards live in check_and_update_config: the entry
+        # check protects a live block engine, and the post-apply check refuses
         # to START a block engine in a process another engine already
         # configured (AR engines may share a process freely: neither reads the
         # block contract from the handle).
-        if (
-            previous_tt_vllm_config is not None
-            and previous_tt_vllm_config is not vllm_config
-            and is_block_output_model
-        ):
-            # Keep the stale config out of this traceback's frame locals.
-            del previous_tt_vllm_config
-            raise ValueError(
-                "One TT engine per process when a block-output model is "
-                "involved: TTPlatform keeps process-level admission state "
-                "that a second engine configuration would overwrite"
-            )
-        # Weakly: when the engine (and its config) is garbage-collected, the
-        # guard stops treating this process as occupied.
-        try:
-            cls._tt_vllm_config = weakref.ref(vllm_config)
-        except TypeError:
-            # Test doubles without weakref support are held directly.
-            cls._tt_vllm_config = vllm_config
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
