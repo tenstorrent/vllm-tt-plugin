@@ -2259,11 +2259,12 @@ class TTModelRunner:
         captured_req_ids = req_ids
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
-            assert req_state is not None, (
-                "captured request missing from runner state while applying sampled "
-                f"tokens: req_id={req_id!r}"
-            )
-            if request_states is not None and req_state is not request_states[req_idx]:
+            # A deferred decode step can be applied after the engine finished
+            # and dropped its request, so a missing state is ordinary. Same for
+            # readmission under a reused id: the token has no live owner.
+            if req_state is None or (
+                request_states is not None and req_state is not request_states[req_idx]
+            ):
                 continue
 
             current_row = self.input_batch.req_id_to_index.get(req_id)
