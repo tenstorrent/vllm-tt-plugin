@@ -38,6 +38,7 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
 # than user input. Written by store_tt_lane_count, read by
 # get_tt_data_parallel_size.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
+_OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -70,6 +71,55 @@ def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
         additional = {}
         vllm_config.additional_config = additional
     additional[_RESOLVED_LANE_COUNT_KEY] = lanes
+
+
+def get_tt_output_tokens_per_step(vllm_config: "VllmConfig") -> int:
+    """Return the normalized model output width, defaulting to AR behavior.
+
+    ``TTPlatform.check_and_update_config`` resolves the model capability once
+    and stores it on the serializable vLLM config. Scheduler and worker
+    construction therefore do not need to import model-loader code.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_OUTPUT_TOKENS_PER_STEP_KEY, 1))
+
+
+def require_tt_output_tokens_per_step(vllm_config: "VllmConfig") -> int:
+    """Return the resolved output width, failing if setup did not store it."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if (
+        not isinstance(additional, dict)
+        or _OUTPUT_TOKENS_PER_STEP_KEY not in additional
+    ):
+        raise RuntimeError(
+            "TT output_tokens_per_step was not initialized on VllmConfig"
+        )
+    return int(additional[_OUTPUT_TOKENS_PER_STEP_KEY])
+
+
+def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
+    """Whether this config describes a model that commits multi-token blocks."""
+    return get_tt_output_tokens_per_step(vllm_config) > 1
+
+
+def store_tt_output_tokens_per_step(
+    vllm_config: "VllmConfig", output_tokens_per_step: int
+) -> None:
+    """Store the validated per-request output width on the vLLM config."""
+    if (
+        isinstance(output_tokens_per_step, bool)
+        or not isinstance(output_tokens_per_step, int)
+        or output_tokens_per_step < 1
+    ):
+        raise ValueError(
+            "resolved TT output_tokens_per_step must be an integer >= 1, got "
+            f"{output_tokens_per_step!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:

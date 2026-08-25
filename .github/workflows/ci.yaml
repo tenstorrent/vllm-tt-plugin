@@ -5,10 +5,6 @@ on:
   push:
     branches: [dev]
 
-# Only lint runs here. The unit tests import vllm_tt_plugin, which imports the
-# locally built TT vLLM (`empty` target) that is not installable on a stock
-# GitHub runner, so pytest belongs on a TT environment (see tt-metal's
-# vllm-nightly-tests), not in this workflow.
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
@@ -18,3 +14,54 @@ jobs:
         with:
           python-version: "3.10"
       - uses: pre-commit/action@v3.0.1
+
+  unit-tests:
+    # The unit suite needs no Tenstorrent hardware. vLLM's `empty` target builds
+    # in seconds because it compiles no kernels, and `ci/host-stubs` supplies the
+    # `ttnn` module that the platform entry point gates on. Tests that reach a
+    # device patch the stub; the rest never touch it.
+    #
+    # `tests/tt` is excluded: those drive a live vLLM server (see the
+    # `--tt-server-url` option in their conftest) and belong on a TT environment.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both interpreters the supported tt-metal environments ship.
+        python-version: ["3.10", "3.12"]
+    env:
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv
+      # Resolve the PyTorch ecosystem to CPU wheels everywhere, including inside
+      # install-vllm-tt.sh. vLLM's transitive requirements otherwise pull the
+      # CUDA build and its nvidia-* dependencies, several GB that buy nothing on
+      # a CPU runner. tt-metal environments are CPU-torch too.
+      UV_TORCH_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Create the environment
+        run: uv venv --python ${{ matrix.python-version }} "$VIRTUAL_ENV"
+
+      - name: Install torch
+        # Stands in for the tt-metal env, which owns torch in a real install.
+        run: uv pip install torch
+
+      - name: Install vLLM and the plugin
+        # The same script the README hands operators, so this job also fails
+        # when the documented install path rots.
+        run: source docs/install-vllm-tt.sh
+
+      - name: Install pytest
+        # Pinned below 9 to match the tt-metal environments this job stands in
+        # for (they ship 8.x). Known 9.x delta: caplog attaches its own capture
+        # handler to non-propagating loggers, double-capturing records.
+        run: uv pip install "pytest<9"
+
+      - name: Run unit tests
+        run: "$VIRTUAL_ENV/bin/python -m pytest tests/ --ignore=tests/tt"
+        env:
+          PYTHONPATH: ci/host-stubs

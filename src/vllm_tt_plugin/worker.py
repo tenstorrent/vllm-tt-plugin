@@ -30,14 +30,18 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
+    _TT_TOKEN_TILE_SIZE,
     TTPlatform,
     _load_standard_dp_visible_groups,
+    _min_block_output_max_model_len,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
@@ -191,6 +195,7 @@ class TTWorker(WorkerBase):
 
         # Initialized by init_device
         self.mesh_device = None
+        self._num_tt_blocks: int | None = None
 
         # Whether to use ttnn tracing for model execution
         tt_config = get_tt_config(self.vllm_config)
@@ -240,6 +245,21 @@ class TTWorker(WorkerBase):
         self.device_config.device = self.mesh_device
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
+
+        # Size the KV pool and settle --max-model-len here, not in
+        # determine_available_memory: upstream runs the whole executor init
+        # (init_device, then load_model) before it asks for available memory
+        # (EngineCore.__init__ -> _initialize_kv_caches), so a model that sizes
+        # its own KV state at load time would otherwise see the unfitted
+        # length -- for --max-model-len -1 that is the full HF context.
+        # The count is cached rather than recomputed later because
+        # get_max_tokens_all_users derives the budget from max_model_len,
+        # which the fit below may have shrunk.
+        self._num_tt_blocks = get_num_available_blocks_tt(
+            self.vllm_config, self.num_devices
+        )
+        _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
+
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -380,12 +400,17 @@ class TTWorker(WorkerBase):
         in conjunction with the output of get_kv_cache_spec to determine
         the number of kv cache blocks (total memory / page_size / num layers).
 
-        NOTE: TT does not profile device memory yet. Instead, it computes the target
-              TT KV block count, then returns a synthetic byte budget that makes the
-              upstream KV planner reconstruct that same block count in the engine
-              process.
+        NOTE: TT does not profile device memory yet. ``init_device`` computed the
+              target TT KV block count before the model loaded; this returns a
+              synthetic byte budget that makes the upstream KV planner
+              reconstruct that same block count in the engine process.
         """
-        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
+        if self._num_tt_blocks is None:
+            raise RuntimeError(
+                "The TT KV pool has not been sized; determine_available_memory "
+                "ran before init_device"
+            )
+        num_tt_blocks = self._num_tt_blocks
         kv_cache_spec = self.get_kv_cache_spec()
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return _available_kv_cache_memory_bytes_for_num_blocks(
@@ -460,14 +485,48 @@ class TTWorker(WorkerBase):
         # Worker will always be healthy as long as it's running.
         return
 
+    def shutdown(self) -> None:
+        """Release model-owned captures and close the mesh before exit.
+
+        This is the hook upstream guarantees on every orderly shutdown path:
+        EngineCore's SIGTERM/SIGINT handler ends run_busy_loop and the
+        surrounding ``finally`` reaches ``executor.shutdown()`` even on fatal
+        errors. ``__del__`` alone is not guaranteed at interpreter exit, and a
+        mesh left open wedges the board's ethernet cores for the *next*
+        process ("Timed out while waiting for active ethernet core ... Try
+        resetting the board").
+        """
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            runner.shutdown()
+        mesh_device = getattr(self, "mesh_device", None)
+        if mesh_device is not None:
+            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            # Idempotence: __del__ (and a second shutdown call) must not
+            # close the mesh again.
+            self.mesh_device = None
+        # Release the process-level admission handle when it points at this
+        # engine's config, so an in-process successor engine is admitted
+        # without waiting for garbage collection to clear the weakref.
+        vllm_config = getattr(self, "vllm_config", None)
+        if (
+            vllm_config is not None
+            and TTPlatform._resolve_tt_admission_handle() is vllm_config
+        ):
+            TTPlatform._tt_vllm_config = None
+
     # ---- Destructor (used to close devices) ----
 
     def __del__(self):
-        # Delete model runner first in case there are model artifacts
+        # Delete model runner first in case there are model artifacts.
+        # Separate suppress blocks: init_device raises between opening the
+        # mesh and assigning model_runner (sizing validation), and a missing
+        # model_runner must not short-circuit closing the open mesh.
         with suppress(AttributeError):
             # attributes may be already torn down when destructor is called
             del self.model_runner
 
+        with suppress(AttributeError):
             if self.mesh_device:
                 close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
                 del self.mesh_device
@@ -480,6 +539,12 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     """
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
+
+    Pure sizing query: validates the budget (raising when a block-output pool
+    cannot hold an explicitly configured ``max_model_len`` plus one canvas) but
+    never mutates the config; the ``--max-model-len -1`` fit, and the
+    servability check on the length it writes, live in
+    ``_fit_block_output_max_model_len``.
 
     ``num_devices`` is the runtime-discovered physical device count.
     """
@@ -524,9 +589,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # endregion
 
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
-    # allocate an extra block_size per user since vLLM uses a worst-case
-    # heuristic and assumes each touched block will require a new
-    # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
+    # allocate one worst-case output reservation per user. AR models need one
+    # extra cache block; block-output models commit their entire output canvas
+    # atomically and therefore need at least one full canvas of headroom.
     #
     # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
     # padding must use the *per-lane/per-rank* batch -- the number of requests
@@ -536,7 +601,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # Both reduce to the same per-submesh value, keeping the KV shape identical
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
-    max_tokens_all_users += cache_config.block_size * max_batch
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    per_user_output_reservation = max(cache_config.block_size, output_tokens_per_step)
+    max_tokens_all_users += per_user_output_reservation * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers
     # into multiple kv_cache_groups: a full-attention group plus several
@@ -571,8 +638,73 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+    if is_tt_block_output_model(vllm_config):
+        resolved_kv_tokens = num_tt_blocks * cache_config.block_size
+        required_kv_tokens = model_config.max_model_len + output_tokens_per_step
+        # ``--max-model-len -1`` asked for whatever the pool allows, so a pool
+        # this length does not fit is not an error yet: the fit that follows
+        # shrinks the length and validates what it writes.
+        if (
+            resolved_kv_tokens < required_kv_tokens
+            and getattr(model_config, "original_max_model_len", None) != -1
+        ):
+            raise ValueError(
+                "Block-output KV budget is too small: resolved "
+                f"{resolved_kv_tokens} tokens, but max_model_len="
+                f"{model_config.max_model_len} plus output_tokens_per_step="
+                f"{output_tokens_per_step} requires at least "
+                f"{required_kv_tokens}. Fix the model's "
+                "get_max_tokens_all_users budget."
+            )
 
     return num_tt_blocks
+
+
+def _fit_block_output_max_model_len(
+    vllm_config: VllmConfig, num_tt_blocks: int
+) -> None:
+    """Fit ``--max-model-len -1`` to the block-output KV pool.
+
+    Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
+    (vllm/v1/core/kv_cache_utils.py:2092): the TT pool is a fixed budget
+    rather than profiled memory, and the upstream fit would hand the whole
+    pool to ``max_model_len``, while a block-output request also needs one
+    full output canvas of headroom. The engine snapshots ``max_model_len``
+    only after ``determine_available_memory`` returns
+    (``EngineCore._initialize_kv_caches``), so upstream's fit sees the
+    fitted value as its baseline and, since it only ever shrinks, keeps it.
+
+    Also owns the servability check for the fitted length: the sizing query
+    deliberately lets an oversized ``-1`` request through, so this is where a
+    pool too small to hold a prompt tile plus a canvas is rejected.
+    """
+    model_config = vllm_config.model_config
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    auto_fit_requested = getattr(model_config, "original_max_model_len", None) == -1
+    if not auto_fit_requested or not is_tt_block_output_model(vllm_config):
+        return
+    resolved_kv_tokens = num_tt_blocks * vllm_config.cache_config.block_size
+    fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
+    if fitted_max_model_len >= model_config.max_model_len:
+        return
+    min_max_model_len = _min_block_output_max_model_len(output_tokens_per_step)
+    if fitted_max_model_len < min_max_model_len:
+        raise ValueError(
+            "Block-output KV budget is too small to auto-fit --max-model-len: "
+            f"the pool holds {resolved_kv_tokens} tokens, leaving "
+            f"max_model_len={fitted_max_model_len} after reserving one "
+            f"{output_tokens_per_step}-token output canvas, but serving a "
+            f"request also needs a {_TT_TOKEN_TILE_SIZE}-token prompt tile, so "
+            f"max_model_len must be at least {min_max_model_len}. Raise the "
+            "model's get_max_tokens_all_users budget."
+        )
+    logger.info(
+        "Auto-fitting block-output max_model_len from %d to %d so "
+        "the KV budget covers one full output canvas.",
+        model_config.max_model_len,
+        fitted_max_model_len,
+    )
+    model_config.max_model_len = fitted_max_model_len
 
 
 # TT-NN utilities

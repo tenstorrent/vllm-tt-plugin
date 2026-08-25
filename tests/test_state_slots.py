@@ -223,12 +223,18 @@ def test_preemption_releases_its_state_slot():
     r._release_dead_state_slots = lambda so: _release(
         r, finished=so.finished_req_ids, preempted=so.preempted_req_ids
     )
+    released: list[int] = []
+    r.model = SimpleNamespace(release_request=released.append)
+    r._release_model_request = lambda req_id: TTModelRunner._release_model_request(
+        r, req_id
+    )
     r._req_state_slot.update({"P": 0, "KEEP": 1})
     r.requests.update(dict.fromkeys(["P", "KEEP"]))
 
     TTModelRunner._update_states(r, _scheduler_output(preempted={"P"}))
 
     assert r._req_state_slot == {"KEEP": 1}, "only the preempted request releases"
+    assert released == [0], "the model releases the preempted request's slot"
     assert "P" in r.requests, "the request is still live, it just re-prefills"
 
     # Which is the point: the freed slot is available to the incoming prefill.
