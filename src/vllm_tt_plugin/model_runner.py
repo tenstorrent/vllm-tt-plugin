@@ -686,11 +686,10 @@ class TTModelRunner:
             self.requests.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
+        # Upstream input processing gives resubmissions fresh internal IDs, but
+        # keep the update order robust for an internal caller that bypasses it:
+        # a finished and newly scheduled duplicate is treated as two requests,
+        # clearing the old cached state before adding the new one.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             self._release_model_request(req_id)
@@ -2379,15 +2378,14 @@ class TTModelRunner:
         self,
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
-        request_states: tuple[CachedRequestState, ...] | None = None,
         skip_req_ids: set[str] | None = None,
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime
-        # and the ``request_states`` identity check guards slot reuse, so the
-        # live row equals the captured one. ``req_id_to_index`` is therefore the
-        # single source of truth for the target row.
+        # time: lane mode pins each request to a stable slot for its lifetime,
+        # while the scheduler lifecycle skip set rejects stale results before a
+        # live row is resolved. ``req_id_to_index`` is therefore the source of
+        # truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = _coerce_output_block(
@@ -2449,14 +2447,13 @@ class TTModelRunner:
             # raise never leaves a partially applied batch. Block canvases
             # are clipped below instead of raising.
             for req_idx, req_id in enumerate(captured_req_ids):
+                if skip_req_ids is not None and req_id in skip_req_ids:
+                    continue
                 req_state = self.requests.get(req_id)
-                if req_state is None:
-                    continue
-                if (
-                    request_states is not None
-                    and req_state is not request_states[req_idx]
-                ):
-                    continue
+                assert req_state is not None, (
+                    "captured request missing from runner state while applying "
+                    f"sampled tokens: req_id={req_id!r}"
+                )
                 current_row = self.input_batch.req_id_to_index.get(req_id)
                 if current_row is not None:
                     end_idx = (
@@ -2473,14 +2470,10 @@ class TTModelRunner:
             if skip_req_ids is not None and req_id in skip_req_ids:
                 continue
             req_state = self.requests.get(req_id)
-            # A deferred decode step can be applied after the engine finished
-            # and dropped its request, so a missing state is ordinary. Same for
-            # readmission under a reused id: the token has no live owner.
-            if req_state is None or (
-                request_states is not None and req_state is not request_states[req_idx]
-            ):
-                continue
-
+            assert req_state is not None, (
+                "captured request missing from runner state while applying sampled "
+                f"tokens: req_id={req_id!r}"
+            )
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])

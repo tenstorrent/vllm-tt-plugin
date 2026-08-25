@@ -6,6 +6,8 @@ the host tensors are authoritative. A contract-aware tt-metal adapter declares
 `decode_input_update_contract = 1` and receives four independent boolean
 commands on every decode:
 
+## Commands
+
 | Command | Required action |
 | --- | --- |
 | `reload_inputs` | Copy every forward input: token, position, RoPE inputs, and page tables. |
@@ -24,6 +26,15 @@ These are commands, not hints. A version-1 adapter must not replace them with
 model-local sampling-mode checks, tensor comparisons, or prior-call
 heuristics.
 
+### Command defaults
+
+The plugin sends all four commands explicitly on every version-1 decode. If an
+adapter exposes defaults for direct callers, only the host-authoritative
+defaults are safe: `reload_inputs=True` and the other three commands `False`.
+An adapter that accepts arbitrary `**kwargs` must still reject the legacy
+`reset_batch` keyword after declaring version 1, so an older plugin fails
+loudly instead of silently taking an unintended reload path.
+
 `decode_layout_changed` is internal plugin lifecycle state. The runner
 translates it into the four commands for version 1 and into the historical
 `reset_batch` keyword for a legacy device-sampling call. It is not forwarded to
@@ -38,6 +49,29 @@ when sampling runs on the host. Every slot-owning subsystem, including a
 temporarily dormant device sampler, must apply the remap exactly once before it
 reads that state. A full forward-input reload does not implicitly remap model
 or sampling state.
+
+The indices belong to the submission that carries them. For ordinary and
+standard-DP execution they are local to that independent runner's slot space.
+For single-process lane-DP they index the one merged lane batch. There is no
+cross-rank/global standard-DP remap and no rebasing between ranks.
+
+Two superficially reasonable implementations are wrong:
+
+1. **Deliver only during device sampling.** Host sampling can still compact or
+   reassign rows. Withholding the remap leaves model-owned recurrent,
+   convolution, or cached RoPE state attached to the previous request.
+2. **Apply only inside the active device sampler.** Delivering the remap during
+   host sampling is insufficient if dormant seed/RNG/penalty state ignores it.
+   A later return to device sampling then resumes another request's state.
+
+Every slot-addressable subsystem must therefore consume each supplied remap
+exactly once on the accepted decode that carries it. State that is not
+addressable by vLLM slot is exempt because it cannot be moved. The known
+example is unseeded on-device RNG: its
+state lives in per-core hardware PRNG registers with no slot-to-slot gather
+primitive. The adapter must document such state and reset/reinitialize it on a
+commanded sampling-state transition; the exemption never permits silently
+ignoring state that does have a move primitive.
 
 The plugin derives a remap while building the input but advances its state-slot
 ownership map only after `decode_forward` accepts the submission. Advancing it
@@ -135,11 +169,10 @@ invariant and re-establish it through a drain and full reload.
 
 Upstream vLLM replaces each external request id with an internal id carrying a
 random suffix before scheduling, so an ordinary abort and resubmit does not
-reuse a runner id. Rejection is nevertheless keyed on scheduler lifecycle
-events, and the standalone runner retains its cached-request-object snapshot as
-defense for an internal caller that bypasses input processing or an improbable
-id collision. Invalid output rows are emptied before the scheduler consumes
-them, preventing both a host-state append and an extra emitted token.
+reuse a runner id. Rejection is keyed on scheduler lifecycle events rather than
+request-object snapshots: finished, preempted, and resumed ids invalidate the
+outstanding result. Invalid output rows are emptied before the scheduler
+consumes them, preventing both a host-state append and an extra emitted token.
 
 ## Requirements for `decode_input_update_contract = 1`
 
@@ -150,12 +183,17 @@ advertises async decode:
    unsupported combinations loudly instead of adding a heuristic fallback.
 2. **Sampling-state ordering:** apply slot remaps before parameter/state reset;
    reset RNG and penalty state only when requested; advance seed state once per
-   sampled token; initialize it even when the requested seed is `None`.
+   sampled token; initialize and upload it even when both the requested and
+   cached seed are `None`. Explicitly seeded, slot-addressable counters follow
+   the request through a remap. Unseeded per-core PRNG state cannot move and is
+   instead reinitialized on a commanded reset.
 3. **Complete slot remapping:** apply each remap exactly once to all persistent
    state indexed by the vLLM slot, including model recurrent/conv state and a
    dormant device sampler during host sampling.
 4. **Stable-buffer lifetime:** keep persistent forward and sampling buffers
    valid through readback and until an explicit command replaces them.
+
+### Partial adapters
 
 An adapter that structurally requires `reload_inputs=True` can still implement
 version 1 if it leaves `supports_async_decode` false and rejects any unsupported
@@ -209,6 +247,22 @@ This permits the plugin change to merge before tt-metal adapters are migrated.
 `supports_async_decode` remains independent of protocol version: it certifies
 resident decode behavior, while `decode_input_update_contract` selects the call
 interface.
+
+### Marker placement and inheritance
+
+The marker belongs on the vLLM-facing generator implementation that executes
+the commands. Subclasses inherit both the implementation and marker. Moving a
+marker onto a shared base changes the opt-in set, so every existing subclass
+must be audited first. A subclass that overrides `decode_forward` no longer
+inherits the behavior the marker attests to: the override must execute every
+command itself or set `decode_input_update_contract = 0` and remain legacy.
+Merely re-declaring the marker does not make an override conformant.
+
+Versions greater than 1 must remain backward-compatible supersets of version
+1. A later adapter cannot require a new keyword from this plugin because there
+is no reverse handshake. Any added command must be keyword-only with a default
+that reproduces version-1 behavior; a breaking interface needs a distinct
+negotiation key or supported-version range.
 
 Standard multi-process DP needs no TT-specific negotiation. Upstream vLLM runs
 one independent scheduler, plugin runner, model, TT mesh, and async submission

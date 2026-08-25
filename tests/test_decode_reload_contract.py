@@ -6,7 +6,9 @@ import threading
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
+from vllm.v1.core.sched.output import CachedRequestData
 
 from vllm_tt_plugin.async_decode import (
     CompletedDecodeStep,
@@ -14,7 +16,7 @@ from vllm_tt_plugin.async_decode import (
     SubmittedStepContext,
     TTAsyncDecodeController,
 )
-from vllm_tt_plugin.model_input import TTSamplingParams
+from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 
@@ -56,12 +58,13 @@ def _sampling_params(rows=1):
     )
 
 
-def _submission_input(*, device_sampling=True, layout_changed=True):
+def _submission_input(*, device_sampling=True, layout_changed=True, page=0):
+    page_table = torch.tensor([[page]], dtype=torch.int32)
     return SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
         input_positions=torch.zeros((1,), dtype=torch.int32),
-        block_tables=torch.zeros((1, 1), dtype=torch.int32),
-        block_tables_per_group=[torch.zeros((1, 1), dtype=torch.int32)],
+        block_tables=page_table,
+        block_tables_per_group=[page_table],
         block_tables_per_layer=None,
         unpadded_batch_size=1,
         tt_sampling_params=_sampling_params(),
@@ -77,6 +80,20 @@ def _accepted_decode_hooks(runner):
     runner.note_decode_layout_consumed = lambda: None
     runner.note_decode_state_slots_settled = lambda: None
     return runner
+
+
+def _cached_reqs(req_ids, *, context_phase=(), resumed=()):
+    req_ids = list(req_ids)
+    context_phase = set(context_phase)
+    return CachedRequestData(
+        req_ids=req_ids,
+        resumed_req_ids=set(resumed),
+        new_token_ids=[[] for _ in req_ids],
+        all_token_ids={},
+        new_block_ids=[None for _ in req_ids],
+        num_computed_tokens=[1 for _ in req_ids],
+        num_output_tokens=[0 if req_id in context_phase else 1 for req_id in req_ids],
+    )
 
 
 def test_first_and_steady_device_decode_commands():
@@ -96,6 +113,24 @@ def test_first_and_steady_device_decode_commands():
     assert steady.overlap_safe
 
 
+def test_reload_plan_rejects_incoherent_command_combinations():
+    with pytest.raises(AssertionError, match="reset_sampling_state requires"):
+        TTDecodeReloadPlan(
+            reload_inputs=False,
+            reload_page_table=False,
+            reload_sampling_params=True,
+            reset_sampling_state=True,
+        )
+
+    with pytest.raises(AssertionError, match="reload_page_table"):
+        TTDecodeReloadPlan(
+            reload_inputs=True,
+            reload_page_table=True,
+            reload_sampling_params=False,
+            reset_sampling_state=False,
+        )
+
+
 def test_page_table_only_refresh_is_overlap_safe():
     controller = _controller()
     _commit(controller, _decode_input(page=1))
@@ -105,6 +140,40 @@ def test_page_table_only_refresh_is_overlap_safe():
     assert not plan.reload_inputs
     assert plan.reload_page_table
     assert plan.overlap_safe
+
+
+def test_submit_decode_delivers_page_table_only_refresh():
+    calls = []
+
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": True}
+
+        def decode_forward(self, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros((1, 1))
+
+    runner = _accepted_decode_hooks(
+        SimpleNamespace(
+            model=Model(),
+            trace_mode="decode_only",
+            kv_caches=object(),
+            request_specific_rope=False,
+        )
+    )
+    controller = TTAsyncDecodeController(runner)
+
+    controller.submit_decode(
+        _submission_input(layout_changed=True, page=1), read_from_device=True
+    )
+    controller.submit_decode(
+        _submission_input(layout_changed=False, page=2), read_from_device=True
+    )
+
+    assert calls[1]["reload_inputs"] is False
+    assert calls[1]["reload_page_table"] is True
+    assert calls[1]["reload_sampling_params"] is False
+    assert calls[1]["reset_sampling_state"] is False
 
 
 def test_standard_dp_async_requires_contract_v1():
@@ -191,21 +260,52 @@ def test_failed_deferred_readback_is_terminal():
 
 
 def test_state_slot_ownership_commits_only_after_accepted_decode():
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": True}
+        fail = True
+
+        def decode_forward(self, **kwargs):
+            if self.fail:
+                raise RuntimeError("submission failed")
+            return torch.zeros((1, 1))
+
     runner = SimpleNamespace(
+        model=Model(),
+        trace_mode="decode_only",
+        kv_caches=object(),
+        request_specific_rope=False,
         tt_per_lane_max_num_seqs=2,
         _req_state_slot={"a": 1, "b": 0},
         _pending_state_slot_settle=None,
+        _decode_layout_changed_since_last_decode=True,
     )
+    runner.note_decode_layout_consumed = lambda: (
+        TTModelRunner.note_decode_layout_consumed(runner)
+    )
+    runner.note_decode_state_slots_settled = lambda: (
+        TTModelRunner.note_decode_state_slots_settled(runner)
+    )
+    controller = TTAsyncDecodeController(runner)
 
     remap = TTModelRunner._decode_state_slot_remap(runner, ["a", "b"])
+    model_input = _submission_input(layout_changed=True)
+    model_input.slot_remap = remap
 
     assert remap.tolist() == [1, 0]
     assert runner._req_state_slot == {"a": 1, "b": 0}
     assert runner._pending_state_slot_settle == {"a": 0, "b": 1}
 
-    TTModelRunner.note_decode_state_slots_settled(runner)
+    with pytest.raises(RuntimeError, match="submission failed"):
+        controller.submit_decode(model_input, read_from_device=True)
+    assert runner._req_state_slot == {"a": 1, "b": 0}
+    assert runner._decode_layout_changed_since_last_decode
+
+    runner.model.fail = False
+    controller.submit_decode(model_input, read_from_device=True)
     assert runner._req_state_slot == {"a": 0, "b": 1}
     assert runner._pending_state_slot_settle is None
+    assert not runner._decode_layout_changed_since_last_decode
 
 
 def test_host_sampling_and_host_to_device_transition_reload():
@@ -239,6 +339,51 @@ def test_prefill_layout_trace_and_capability_force_input_reload():
     assert _commit(no_residency, _decode_input()).reload_inputs
 
 
+def test_transition_applies_drained_token_before_host_authoritative_reload():
+    request_state = SimpleNamespace(output_token_ids=[])
+    input_batch = SimpleNamespace(
+        req_id_to_index={"request": 0},
+        num_tokens=np.array([3], dtype=np.int32),
+        token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+    )
+    runner = SimpleNamespace(
+        requests={"request": request_state},
+        input_batch=input_batch,
+        model_config=SimpleNamespace(max_model_len=8),
+        model=SimpleNamespace(
+            decode_input_update_contract=1,
+            model_capabilities={"supports_async_decode": True},
+        ),
+        trace_mode="decode_only",
+    )
+    runner._apply_sampled_tokens_to_state = lambda **kwargs: (
+        TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
+    )
+    controller = TTAsyncDecodeController(runner)
+    _commit(controller, _decode_input())
+    completed = CompletedDecodeStep(
+        sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
+        logprobs=None,
+        context=SubmittedStepContext(
+            req_ids=["request"],
+            req_id_to_index={"request": 0},
+            submit_time_ns=1,
+        ),
+        completion_time_ns=2,
+    )
+
+    controller.apply_completed_decode_step(completed)
+    controller.note_prefill_submitted()
+    plan = controller.plan_decode_reload(_decode_input())
+
+    next_position = int(input_batch.num_tokens[0]) - 1
+    assert next_position == 3
+    assert input_batch.token_ids_cpu[0, next_position] == 7
+    assert request_state.output_token_ids == [7]
+    assert plan.reload_inputs
+    assert plan.reset_sampling_state
+
+
 def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
     input_batch = SimpleNamespace(
         req_id_to_index={"request": 0},
@@ -253,11 +398,7 @@ def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
     controller = TTAsyncDecodeController(runner)
     controller._decode_chain_valid = True
     controller._previous_device_sampling = True
-    cached_reqs = SimpleNamespace(
-        req_ids=["request"],
-        resumed_req_ids=set(),
-        is_context_phase=lambda req_id: True,
-    )
+    cached_reqs = _cached_reqs(["request"], context_phase=["request"])
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=cached_reqs,
@@ -269,7 +410,7 @@ def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
     )
     # A decode may schedule several speculative tokens; only the scheduler's
     # phase marker, not a token-count heuristic, classifies it.
-    cached_reqs.is_context_phase = lambda req_id: False
+    scheduler_output.scheduled_cached_reqs = _cached_reqs(["request"])
     runner.requests = {}
     scheduler_output.pending_structured_output_tokens = None
     input_batch.no_penalties = True
@@ -282,6 +423,57 @@ def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
     runner.check_perform_device_sampling = lambda **kwargs: True
     assert controller.steady_decode_scheduler_invariants_met(
         scheduler_output, decode_layout_changed=False
+    )
+
+
+def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
+    req_ids = ["a", "b"]
+    input_batch = SimpleNamespace(
+        req_id_to_index={"a": 0, "b": 1},
+        no_penalties=True,
+        no_allowed_token_ids=True,
+        sampling=SimpleNamespace(
+            bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+        ),
+        max_num_logprobs=None,
+    )
+    runner = SimpleNamespace(
+        model=SimpleNamespace(decode_input_update_contract=1),
+        input_batch=input_batch,
+        requests={req_id: SimpleNamespace(sampling_params=None) for req_id in req_ids},
+        model_config=SimpleNamespace(logits_processors=[]),
+        _decode_layout_changed_since_last_decode=False,
+        check_perform_device_sampling=lambda **kwargs: True,
+    )
+    controller = TTAsyncDecodeController(runner)
+    controller._decode_chain_valid = True
+    controller._previous_device_sampling = True
+
+    def output(ids, *, context=(), resumed=(), scheduled_counts=None):
+        ids = list(ids)
+        return SimpleNamespace(
+            num_scheduled_tokens=scheduled_counts or {req_id: 1 for req_id in ids},
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=_cached_reqs(
+                ids, context_phase=context, resumed=resumed
+            ),
+            pending_structured_output_tokens=False,
+        )
+
+    assert controller.steady_decode_scheduler_invariants_met(output(req_ids))
+    assert not controller.steady_decode_scheduler_invariants_met(output(["a"]))
+    assert not controller.steady_decode_scheduler_invariants_met(
+        output(["a", "b", "c"])
+    )
+    assert not controller.steady_decode_scheduler_invariants_met(
+        output(req_ids, resumed=["b"])
+    )
+    assert not controller.steady_decode_scheduler_invariants_met(
+        output(req_ids, context=["b"])
+    )
+    # A speculative decode may schedule several tokens and remains decode work.
+    assert controller.steady_decode_scheduler_invariants_met(
+        output(req_ids, scheduled_counts={"a": 1, "b": 4})
     )
 
 
@@ -412,7 +604,6 @@ def test_invalidated_async_result_updates_neither_runner_nor_published_output():
         context=SubmittedStepContext(
             req_ids=["request"],
             req_id_to_index={"request": 0},
-            request_states=(request_state,),
             submit_time_ns=1,
         ),
         completion_time_ns=2,
@@ -423,6 +614,20 @@ def test_invalidated_async_result_updates_neither_runner_nor_published_output():
 
     assert request_state.output_token_ids == []
     assert runner_output.sampled_token_ids == [[]]
+
+
+def test_invalidated_result_ids_come_from_current_scheduler_lifecycle():
+    scheduler_output = SimpleNamespace(
+        finished_req_ids={"finished"},
+        preempted_req_ids={"preempted"},
+        scheduled_cached_reqs=_cached_reqs(["resumed"], resumed=["resumed"]),
+    )
+
+    assert TTAsyncDecodeController.invalidated_req_ids(scheduler_output) == {
+        "finished",
+        "preempted",
+        "resumed",
+    }
 
 
 def test_unscheduled_live_request_keeps_accepted_token_in_cached_state():
@@ -437,7 +642,6 @@ def test_unscheduled_live_request_keeps_accepted_token_in_cached_state():
         runner,
         sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
         req_ids=["request"],
-        request_states=(request_state,),
     )
 
     assert request_state.output_token_ids == [7]
