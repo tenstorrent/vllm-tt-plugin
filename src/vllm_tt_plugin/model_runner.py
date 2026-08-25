@@ -1081,6 +1081,28 @@ class TTModelRunner:
         # the whole engine capacity.
         decode_pad_to = self.tt_per_lane_max_num_seqs
 
+        # Models that declare ``tt_supported_decode_batch_sizes`` (e.g. Gemma4)
+        # may pad only to the nearest supported size >= num_reqs, so B=1 is not
+        # forced through a B=max graph.
+        #
+        # A model must declare only the buckets it has actually captured a decode
+        # trace for on this instance: padding to a bucket with no captured trace
+        # leaves the device in an undefined state. There is deliberately no
+        # separate "warmed" list to fall back from -- a bucket that is not warmed
+        # is not supported.
+        decode_buckets = getattr(
+            getattr(self, "model", None), "tt_supported_decode_batch_sizes", None
+        )
+        if decode_buckets:
+            decode_pad_to = next(
+                (
+                    int(b)
+                    for b in sorted(int(x) for x in decode_buckets)
+                    if int(b) >= num_reqs and int(b) <= self.tt_per_lane_max_num_seqs
+                ),
+                self.tt_per_lane_max_num_seqs,
+            )
+
         # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
         # over-wide tables when the total KV-cache limit is tighter than
