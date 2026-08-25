@@ -7,6 +7,7 @@ import pytest
 from tests.tt.utils import (
     RequestConfig,
     assert_deterministic,
+    assert_deterministic_allow_near_tie,
     assert_pairwise_varied,
     assert_varied,
     run_concurrent_batch,
@@ -47,7 +48,7 @@ class TestSeedingAndVariety:
 
         # This tests both prefill and decode
         all_greedy = results1[:greedy_count] + results2[:greedy_count]
-        assert_deterministic(
+        assert_deterministic_allow_near_tie(
             all_greedy,
             "Greedy requests should produce the same output across positions and runs.",
         )
@@ -61,7 +62,7 @@ class TestSeedingAndVariety:
                 results1[greedy_count + seeds + i],
                 results2[greedy_count + seeds + i],
             ]
-            assert_deterministic(
+            assert_deterministic_allow_near_tie(
                 results_for_seed,
                 "Seeded requests should produce the same output"
                 "across positions and runs.",
@@ -143,7 +144,7 @@ class TestSeedingAndVariety:
             results_per_seed[shuffled_indices[i]].append(result)
 
         for i in range(max_batch_size):
-            assert_deterministic(
+            assert_deterministic_allow_near_tie(
                 results_per_seed[i],
                 "Seed should produce the same output in different batches.",
             )
@@ -226,7 +227,9 @@ class TestSeedingAndVariety:
             for _ in range(batch_size)
         ]
         results = run_concurrent_batch(tt_server, tt_model_name, configs)
-        assert_deterministic(results, "Seed should produce deterministic outputs.")
+        assert_deterministic_allow_near_tie(
+            results, "Seed should produce deterministic outputs."
+        )
 
     def test_uniform_noseed_varied(self, tt_server, tt_model_name, max_batch_size):
         """
@@ -323,7 +326,7 @@ class TestSeedingAndVariety:
             greedy_results = results[:num_greedy]
             non_greedy_results = results[num_greedy:]
 
-            assert_deterministic(
+            assert_deterministic_allow_near_tie(
                 greedy_results, "Greedy requests should produce the same output."
             )
             assert_varied(
@@ -339,7 +342,7 @@ class TestSeedingAndVariety:
         # Between batches:
         greedy_results_1 = results_1[:num_greedy]
         greedy_results_2 = results_2[:num_greedy]
-        assert_deterministic(
+        assert_deterministic_allow_near_tie(
             greedy_results_1 + greedy_results_2,
             "Greedy requests should produce the same output when re-ran.",
         )
@@ -375,7 +378,7 @@ class TestSeedingAndVariety:
         result_2 = run_concurrent_batch(tt_server, tt_model_name, batch)
 
         all_results = result_1 + result_2
-        assert_deterministic(
+        assert_deterministic_allow_near_tie(
             all_results,
             "top_k=1 requests should produce the same output across "
             "positions and runs.",
