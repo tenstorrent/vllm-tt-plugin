@@ -6,7 +6,11 @@ from functools import cached_property
 from types import SimpleNamespace
 
 import pytest
-from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.sampling_params import (
+    RepetitionDetectionParams,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 
 from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
@@ -166,6 +170,17 @@ def test_sampling_controls_are_accepted_by_validation():
         ({"allowed_token_ids": [2, 3]}, "allowed_token_ids"),
         ({"min_tokens": 1}, "min_tokens"),
         ({"extra_args": {"custom_sampler": True}}, "extra_args"),
+        ({"logprob_token_ids": [5]}, "logprob_token_ids"),
+        ({"flat_logprobs": True}, "flat_logprobs"),
+        ({"thinking_token_budget": 8}, "thinking_token_budget"),
+        (
+            {
+                "repetition_detection": RepetitionDetectionParams(
+                    max_pattern_size=2, min_count=2
+                )
+            },
+            "repetition_detection",
+        ),
     ],
 )
 def test_contract_changing_controls_are_rejected(kwargs, field):
@@ -358,6 +373,47 @@ def test_cycle_pinned_dead_ar_config_does_not_block_a_block_engine(monkeypatch):
         lambda _model_config: (BlockModel, None),
     )
     TTPlatform.check_and_update_config(_config())
+
+
+def test_live_block_engine_rejects_an_ar_successor(monkeypatch):
+    # The ENTRY guard's unique corridor: a live block engine must refuse any
+    # distinct successor (block contract reads live from the handle), and the
+    # block contract must survive the rejected attempt.
+    _patch_model_resolution(monkeypatch)
+    block_config = _config()
+    TTPlatform.check_and_update_config(block_config)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _model_config: (ARModel, None),
+    )
+    ar_config = _config()
+    ar_config.model_config.hf_config.canvas_length = None
+    with pytest.raises(ValueError, match=r"One TT engine per process"):
+        TTPlatform.check_and_update_config(ar_config)
+
+    assert TTPlatform._resolve_tt_admission_handle() is block_config
+    assert TTPlatform._get_block_output_contract() is not None
+
+
+def test_live_ar_engine_rejects_a_block_successor(monkeypatch):
+    # The POST-APPLY guard's unique corridor: a live AR predecessor passes
+    # the entry guard (not a block model), a valid block config applies
+    # cleanly, and the guard must still refuse to hand the process to the
+    # block engine — the AR handle stays installed.
+    _patch_model_resolution(monkeypatch, model_class=ARModel)
+    ar_config = _config()
+    ar_config.model_config.hf_config.canvas_length = None
+    TTPlatform.check_and_update_config(ar_config)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _model_config: (BlockModel, None),
+    )
+    with pytest.raises(ValueError, match=r"One TT engine per process"):
+        TTPlatform.check_and_update_config(_config())
+
+    assert TTPlatform._resolve_tt_admission_handle() is ar_config
 
 
 def test_admission_guard_raise_does_not_pin_the_stale_config(monkeypatch):
@@ -647,6 +703,10 @@ def test_fit_clamps_leftover_max_tokens_that_resolve_rejects():
         TTPlatform._resolve_block_output_max_tokens(
             prompt_len, leftover, output_size, max_model_len
         )
+
+    # Exact fit at the keep-branch boundary: physical == remaining must keep
+    # the requested value rather than falling through to the clamp.
+    assert _fit_block_output_max_tokens(512, 300, 256, 1024) == 300
 
     assert (
         _fit_block_output_max_tokens(prompt_len, leftover, output_size, max_model_len)
