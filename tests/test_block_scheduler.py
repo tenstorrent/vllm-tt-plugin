@@ -270,9 +270,8 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert params.allowed_token_ids is None
     assert params.bad_words is None
     assert params._bad_words_token_ids is None
-    # Penalties do not force host sampling, but leaving them non-neutral
-    # makes every block step build (and discard) session-length penalty
-    # tensors via InputBatch.no_penalties.
+    # Non-neutral penalties make every block step build session-length
+    # penalty tensors it then discards.
     assert params.presence_penalty == 0.0
     assert params.frequency_penalty == 0.0
     assert params.repetition_penalty == 1.0
@@ -426,10 +425,8 @@ def test_multimodal_features_are_dropped_from_bypassed_request():
 def test_truncation_respects_width_and_alignment(
     output_width, max_model_len, expected_prompt, expected_max_tokens
 ):
-    """Regimes where the truncation arithmetic's width term and tile
-    alignment actually matter (the default fixture's 16-token canvas under a
-    tile-aligned limit is insensitive to both, so a regression there admits
-    an unservable prompt whose first canvas is engine-fatal)."""
+    """Regimes where the width term and tile alignment actually matter; the
+    default fixture (canvas 16, aligned limit) is insensitive to both."""
     scheduler = _scheduler(output_width, max_model_len=max_model_len)
     init_none_hash(sha256)
     params = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -449,10 +446,8 @@ def test_truncation_respects_width_and_alignment(
 
 
 def test_plain_prefix_cache_reset_leaves_running_block_requests_alone():
-    """The /reset_prefix_cache endpoint defaults to reset_running_requests=
-    False; with a live block request that plain reset must delegate upstream
-    (harmless False, prefix caching is disabled) instead of raising or
-    preempting."""
+    """A plain /reset_prefix_cache (reset_running_requests=False) must
+    delegate upstream instead of raising or preempting live block work."""
     scheduler = _scheduler()
     init_none_hash(sha256)
     request = _request(CANVAS * 2)
@@ -471,9 +466,8 @@ def test_plain_prefix_cache_reset_leaves_running_block_requests_alone():
 
 
 def test_mixed_token_embeds_bypassed_prompt_drops_the_embeds():
-    """A mixed-mode prompt (token ids + embeds + mask) skips the embeds-only
-    replacement branch; the embeds must still be scrubbed so the
-    prompt_len x hidden_size tensor is not pinned for the request lifetime."""
+    """Mixed token+embeds prompts skip the embeds-only branch; the embeds
+    must still be scrubbed rather than pinned for the request lifetime."""
     scheduler = _scheduler()
     init_none_hash(sha256)
     params = SamplingParams(max_tokens=3, ignore_eos=True)

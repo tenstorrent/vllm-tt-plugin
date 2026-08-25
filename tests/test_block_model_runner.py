@@ -232,10 +232,8 @@ def test_worker_del_closes_mesh_when_model_runner_was_never_assigned():
 
 
 def test_worker_shutdown_closes_mesh_once_across_shutdown_and_del():
-    """SIGTERM reaches worker.shutdown() (EngineCore's finally ->
-    executor.shutdown()), the only hook guaranteed before process exit; an
-    unclosed mesh wedges the board's ethernet cores for the next process.
-    __del__ afterwards must not close the mesh a second time."""
+    """shutdown() must close the mesh (an unclosed mesh wedges the board for
+    the next process) exactly once, with __del__ as an idempotent backstop."""
     from unittest.mock import patch
 
     closed = []

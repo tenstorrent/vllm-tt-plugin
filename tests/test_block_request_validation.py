@@ -335,103 +335,80 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.model_config.is_diffusion is False
 
 
-def test_admission_handle_releases_when_engine_config_is_collected(monkeypatch):
-    # The one-engine-per-process guard must protect a LIVE engine only: once
-    # the previous engine's config is garbage-collected, a new engine in the
-    # same process is admitted instead of failing forever.
+def _switch_resolution(monkeypatch, model_class):
+    # Unlike _patch_model_resolution, keeps the admission handle intact.
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _model_config: (model_class, None),
+    )
+
+
+def _ar_config():
+    config = _weakrefable_config()
+    config.model_config.hf_config.canvas_length = None
+    return config
+
+
+def test_admission_handle_releases_with_the_dead_engine(monkeypatch):
+    # The guard protects LIVE engines only. Once the previous config is
+    # collected, admission succeeds — and neither the guard's own traceback
+    # (standing in for a REPL's sys.last_traceback) nor gc cycles may keep
+    # the process locked.
     import gc
 
     _patch_model_resolution(monkeypatch)
     first = _weakrefable_config()
     TTPlatform.check_and_update_config(first)
-    with pytest.raises(ValueError, match=r"One TT engine per process"):
+    with pytest.raises(ValueError, match=r"One TT engine per process") as excinfo:
         TTPlatform.check_and_update_config(_weakrefable_config())
 
     del first
     gc.collect()
 
     TTPlatform.check_and_update_config(_weakrefable_config())
+    assert excinfo.value is not None
 
 
 def test_cycle_pinned_dead_ar_config_does_not_block_a_block_engine(monkeypatch):
-    # An AR engine shares the process freely, so its handle survives the entry
-    # guard. When it dies leaving its config reachable only through a
-    # reference cycle, the post-apply guard must collect before refusing to
-    # start a block engine.
+    # A dead AR predecessor reachable only through a reference cycle must be
+    # collected by the post-apply guard, not treated as a live engine.
     _patch_model_resolution(monkeypatch, model_class=ARModel)
-    ar_config = _weakrefable_config()
-    ar_config.model_config.hf_config.canvas_length = None
+    ar_config = _ar_config()
     ar_config._self_cycle = ar_config
     TTPlatform.check_and_update_config(ar_config)
-
     del ar_config
 
-    # Switch only the model resolution: _patch_model_resolution would reset
-    # the admission handle and defeat the scenario.
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.utils.get_model_architecture",
-        lambda _model_config: (BlockModel, None),
-    )
+    _switch_resolution(monkeypatch, BlockModel)
     TTPlatform.check_and_update_config(_config())
 
 
 def test_live_block_engine_rejects_an_ar_successor(monkeypatch):
-    # The ENTRY guard's unique corridor: a live block engine must refuse any
-    # distinct successor (block contract reads live from the handle), and the
-    # block contract must survive the rejected attempt.
+    # Entry guard: a live block engine refuses any distinct successor and its
+    # contract survives the rejected attempt.
     _patch_model_resolution(monkeypatch)
     block_config = _config()
     TTPlatform.check_and_update_config(block_config)
 
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.utils.get_model_architecture",
-        lambda _model_config: (ARModel, None),
-    )
-    ar_config = _config()
-    ar_config.model_config.hf_config.canvas_length = None
+    _switch_resolution(monkeypatch, ARModel)
     with pytest.raises(ValueError, match=r"One TT engine per process"):
-        TTPlatform.check_and_update_config(ar_config)
+        TTPlatform.check_and_update_config(_ar_config())
 
     assert TTPlatform._resolve_tt_admission_handle() is block_config
     assert TTPlatform._get_block_output_contract() is not None
 
 
 def test_live_ar_engine_rejects_a_block_successor(monkeypatch):
-    # The POST-APPLY guard's unique corridor: a live AR predecessor passes
-    # the entry guard (not a block model), a valid block config applies
-    # cleanly, and the guard must still refuse to hand the process to the
-    # block engine — the AR handle stays installed.
+    # Post-apply guard: a live AR predecessor passes the entry guard, so this
+    # is the only defense against a block engine taking over the process.
     _patch_model_resolution(monkeypatch, model_class=ARModel)
-    ar_config = _config()
-    ar_config.model_config.hf_config.canvas_length = None
+    ar_config = _ar_config()
     TTPlatform.check_and_update_config(ar_config)
 
-    monkeypatch.setattr(
-        "vllm.model_executor.model_loader.utils.get_model_architecture",
-        lambda _model_config: (BlockModel, None),
-    )
+    _switch_resolution(monkeypatch, BlockModel)
     with pytest.raises(ValueError, match=r"One TT engine per process"):
         TTPlatform.check_and_update_config(_config())
 
     assert TTPlatform._resolve_tt_admission_handle() is ar_config
-
-
-def test_admission_guard_raise_does_not_pin_the_stale_config(monkeypatch):
-    # The guard's own traceback must not become the reference that keeps a
-    # dead engine's config alive: in a REPL, sys.last_traceback holds the
-    # failed attempt, and a self-pinning raise would fail every retry.
-    _patch_model_resolution(monkeypatch)
-    first = _weakrefable_config()
-    TTPlatform.check_and_update_config(first)
-
-    with pytest.raises(ValueError, match=r"One TT engine per process") as excinfo:
-        TTPlatform.check_and_update_config(_weakrefable_config())
-
-    del first
-    # excinfo still holds the guard's traceback, standing in for
-    # sys.last_traceback; only the engine's own reference was dropped.
-    TTPlatform.check_and_update_config(_weakrefable_config())
-    assert excinfo.value is not None
 
 
 def test_startup_rejects_explicit_diffusion_config(monkeypatch):

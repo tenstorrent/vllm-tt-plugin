@@ -69,84 +69,68 @@ def test_diffusion_gemma_uses_tt_architecture_before_upstream_config_hooks(
     assert vllm_config.diffusion_config is None
 
 
-def test_pre_register_reinstalls_the_architecture_patch(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    # Normally the general-plugins entry point installs the rewrite first,
-    # but VLLM_PLUGINS=tt drops that entry point while keeping the platform:
-    # this hook must reinstall (idempotently) so the invariant survives.
+def _capture_registry_calls(monkeypatch, module, *, test_models_cli=False):
     events = []
-    monkeypatch.setattr(tt_platform, "_pin_v1_model_runner", lambda: None)
     monkeypatch.setattr(
-        tt_platform, "_install_tt_harmony_truncation_patch", lambda: None
+        module,
+        "_should_pre_register_tt_test_models_from_cli",
+        lambda: test_models_cli,
     )
     monkeypatch.setattr(
-        tt_platform, "_should_pre_register_tt_test_models_from_cli", lambda: True
-    )
-    monkeypatch.setattr(
-        tt_platform,
+        module,
         "register_tt_models",
         lambda register_test_models=False: events.append(
             ("register", register_test_models)
         ),
     )
     monkeypatch.setattr(
-        tt_platform,
+        module,
         "_install_diffusion_gemma_architecture_patch",
-        lambda: events.append(("patch", None)),
+        lambda: events.append("patch"),
     )
+    return events
+
+
+def test_pre_register_reinstalls_the_architecture_patch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # VLLM_PLUGINS=tt keeps the platform but drops the general-plugins entry
+    # point, so this hook must reinstall the (idempotent) rewrite.
+    monkeypatch.setattr(tt_platform, "_pin_v1_model_runner", lambda: None)
+    monkeypatch.setattr(
+        tt_platform, "_install_tt_harmony_truncation_patch", lambda: None
+    )
+    events = _capture_registry_calls(monkeypatch, tt_platform, test_models_cli=True)
 
     tt_platform.TTPlatform.pre_register_and_update()
 
-    assert events == [("register", True), ("patch", None)]
+    assert events == [("register", True), "patch"]
 
 
 def test_general_plugin_entry_point_installs_architecture_patch(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    # Engine-core, worker, and registry subprocesses build ModelConfig without
-    # ever running pre_register_and_update; they get the rewrite through the
-    # vllm.general_plugins entry point, so it must travel with registration.
+    # Engine-core/worker/registry subprocesses never run pre_register_and_
+    # update; the rewrite must travel with registration.
     from vllm_tt_plugin import model_registry
 
-    events = []
-    monkeypatch.setattr(
-        model_registry,
-        "register_tt_models",
-        lambda register_test_models=False: events.append("register"),
-    )
-    monkeypatch.setattr(
-        model_registry,
-        "_install_diffusion_gemma_architecture_patch",
-        lambda: events.append("patch"),
-    )
+    events = _capture_registry_calls(monkeypatch, model_registry)
 
     model_registry.register_tt_models_from_plugin()
 
-    assert events == ["register", "patch"]
+    assert events == [("register", False), "patch"]
 
 
 def test_general_plugin_entry_point_is_inert_without_ttnn(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    # vLLM loads general plugins on every platform; without ttnn this host
-    # cannot serve TT models, and rewriting the upstream-owned DiffusionGemma
-    # architecture would break upstream serving on a CUDA box.
+    # Without ttnn, rewriting the upstream-owned architecture would break
+    # upstream DiffusionGemma serving on a non-TT box.
     import sys
 
     from vllm_tt_plugin import model_registry
 
-    events = []
-    monkeypatch.setattr(
-        model_registry,
-        "register_tt_models",
-        lambda register_test_models=False: events.append("register"),
-    )
-    monkeypatch.setattr(
-        model_registry,
-        "_install_diffusion_gemma_architecture_patch",
-        lambda: events.append("patch"),
-    )
+    events = _capture_registry_calls(monkeypatch, model_registry)
     monkeypatch.setitem(sys.modules, "ttnn", None)
 
     model_registry.register_tt_models_from_plugin()
