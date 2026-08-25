@@ -144,6 +144,24 @@ def test_idle_step_propagates_finished_req_ids():
     assert lanes[1].scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
 
 
+def test_step_plan_reports_exact_lane_layout_changes():
+    lane = FakeLane(running=1)
+    coordinator = _make_coordinator([lane], per_lane_max=2)
+
+    first_decode = coordinator.schedule()
+    assert get_tt_step_plan(first_decode).decode_layout_changed
+
+    # The same request keeps the same stable lane row.
+    second_decode = coordinator.schedule()
+    assert not get_tt_step_plan(second_decode).decode_layout_changed
+
+    # A live request omitted from a prefill step still owns its row; unlike a
+    # front-packed batch, unscheduled membership is not a layout transition.
+    empty = SchedulerOutput.make_empty()
+    prefill_plan = coordinator._build_step_plan([empty], empty, is_decode=False)
+    assert not prefill_plan.decode_layout_changed
+
+
 def test_decode_fallback_when_forced_prefill_schedules_nothing():
     # Lane 0 has running decodes (and a finished req to report); lane 1 has a
     # queued request that forces prefill. Prefill schedules nothing, so the

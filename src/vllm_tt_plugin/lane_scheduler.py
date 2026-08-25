@@ -73,6 +73,9 @@ class TTStepPlan:
     req_id_to_row: dict[str, int]
     batch_size_per_dp: tuple[int, ...]
     prefill_empty_slots: tuple[int, ...] | None
+    # Exact scheduler-owned layout transition for this step. Merely leaving a
+    # live request unscheduled does not count: lane rows stay stable.
+    decode_layout_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -456,8 +459,10 @@ class TTLaneCoordinator(SchedulerInterface):
         merged: SchedulerOutput,
         is_decode: bool,
     ) -> TTStepPlan:
+        decode_layout_changed = False
         lane_of_req = self._lane_of_scheduled_reqs(lane_outputs)
         for req_id in merged.finished_req_ids:
+            decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
 
@@ -473,10 +478,12 @@ class TTLaneCoordinator(SchedulerInterface):
         # step, so the row is free on both sides before anything is placed there.
         # ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         for req_id in merged.preempted_req_ids or ():
+            decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
 
         resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
         for req_id in resumed_req_ids:
+            decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
 
         for req_id in merged.num_scheduled_tokens:
@@ -484,6 +491,7 @@ class TTLaneCoordinator(SchedulerInterface):
             if lane is None:
                 raise KeyError(f"no TT lane recorded for scheduled request {req_id!r}")
             self._req_to_lane[req_id] = lane
+            decode_layout_changed |= req_id not in self._req_to_row
             self._assign_slot(req_id, lane)
 
         scheduled_pairs = [
@@ -514,6 +522,7 @@ class TTLaneCoordinator(SchedulerInterface):
             req_id_to_row=dict(self._req_to_row),
             batch_size_per_dp=batch_size_per_dp,
             prefill_empty_slots=prefill_empty_slots,
+            decode_layout_changed=decode_layout_changed,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:

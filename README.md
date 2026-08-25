@@ -372,7 +372,9 @@ The execution model matches TT hardware characteristics:
   mechanism (no gather/scatter; ranks are fully independent).
 
 For a deeper walk-through of the scheduling and execution model, read
-`docs/SCHEDULING.md`.
+[`docs/SCHEDULING.md`](docs/SCHEDULING.md). The model-facing rules that make
+resident async decode safe are documented in
+[`docs/DECODE_RELOAD_CONTRACT.md`](docs/DECODE_RELOAD_CONTRACT.md).
 
 ## Single-Process Galaxy Serving
 

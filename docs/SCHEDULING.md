@@ -359,6 +359,10 @@ overlap. It can be disabled explicitly with `--no-async-scheduling`.
 `--async_engine` in the offline example controls use of vLLM's asynchronous
 client API and is a separate option.
 
+The exact model-side reload commands, host-authority rules, transition table,
+and requirements for declaring `supports_async_decode` are specified in
+[`DECODE_RELOAD_CONTRACT.md`](DECODE_RELOAD_CONTRACT.md).
+
 ## Queueing in Single-Process Lane TT
 
 Single-process lane-DP uses one vLLM engine process and one TT worker.

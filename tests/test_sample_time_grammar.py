@@ -235,7 +235,7 @@ def test_finish_async_decode_sets_bitmask_when_grammar_present():
 
 
 # --------------------------------------------------------------------------
-# _finish_nondp_sync / _finish_lane_sync (grammar applied before sampling)
+# _finish_front_packed_sync / _finish_lane_sync (grammar before sampling)
 # --------------------------------------------------------------------------
 
 
@@ -251,18 +251,18 @@ def _sync_forward(model_input: TTModelInput) -> _SyncForward:
     )
 
 
-def test_finish_nondp_sync_applies_grammar_before_sampling():
+def test_finish_front_packed_sync_applies_grammar_before_sampling():
     order: list[str] = []
 
     def apply_grammar(model_input, grammar_output, *, lane_total):
         order.append("grammar")
         assert lane_total is None
-        return replace(model_input, reset_batch=True)  # mark it was applied
+        return replace(model_input, decode_layout_changed=True)  # mark it was applied
 
     def sample_sync(fwd):
         order.append("sample")
         # Grammar must already be on the input the sampler runs against.
-        assert fwd.model_input.reset_batch is True
+        assert fwd.model_input.decode_layout_changed is True
         return [torch.tensor([[42]], dtype=torch.int32)], []
 
     def build_output(sampled, logprobs, **kwargs):
@@ -276,13 +276,13 @@ def test_finish_nondp_sync_applies_grammar_before_sampling():
     )
     fwd = _sync_forward(_model_input())
 
-    output = TTModelRunner._finish_nondp_sync(runner, _grammar(1), fwd=fwd)
+    output = TTModelRunner._finish_front_packed_sync(runner, _grammar(1), fwd=fwd)
 
     assert order == ["grammar", "sample", "build"]
     assert output.sampled.tolist() == [[42]]
 
 
-def test_finish_nondp_sync_with_no_forward_builds_empty_output():
+def test_finish_front_packed_sync_with_no_forward_builds_empty_output():
     captured: dict = {}
 
     def build_output(sampled, logprobs, **kwargs):
@@ -292,7 +292,7 @@ def test_finish_nondp_sync_with_no_forward_builds_empty_output():
 
     runner = SimpleNamespace(apply_and_build_runner_output=build_output)
 
-    output = TTModelRunner._finish_nondp_sync(runner, None, fwd=None)
+    output = TTModelRunner._finish_front_packed_sync(runner, None, fwd=None)
 
     assert output == "empty"
     assert captured["sampled"].numel() == 0
