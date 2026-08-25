@@ -1104,8 +1104,7 @@ class TTLaneInputBatch(InputBatch):
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            req_id_to_index=self.req_id_to_index,
-            req_indices=list(range(batch_length)),
+            row_req_ids=self.req_ids[:batch_length],
             batch_length=batch_length,
         )
 

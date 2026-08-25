@@ -45,6 +45,7 @@ def _model_input(**overrides) -> TTModelInput:
         allowed_token_ids_mask_list=[None],
         generators_list=[{}],
         max_num_logprobs=[None],
+        row_req_ids=["req-0"],
     )
     base.update(overrides)
     return TTModelInput(**base)
@@ -122,28 +123,53 @@ def test_reorder_grammar_bitmask_lane_path_delegates_to_slot_reorder():
 
 
 def test_reorder_grammar_bitmask_non_dp_path_uses_front_packed_reorder():
-    """Non-DP (``lane_total=None``) reorders against the front-packed batch."""
+    """Non-DP (``lane_total=None``) reorders against the build's own rows."""
     # Two requests, only req-1 structured; batch_length comes from input_tokens.
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(
-            req_id_to_index={"req-0": 0, "req-1": 1}, num_reqs=2
-        )
-    )
+    runner = SimpleNamespace()
     grammar = GrammarOutput(
         structured_output_request_ids=["req-1"],
         grammar_bitmask=np.array([[5, 6]], dtype=np.int32),
     )
-    model_input = _model_input(input_tokens=torch.zeros((2, 1), dtype=torch.int32))
+    model_input = _model_input(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        row_req_ids=["req-0", "req-1"],
+    )
 
     result = TTModelRunner._reorder_grammar_bitmask(
         runner, grammar, model_input, lane_total=None
     )
 
     assert result.shape == (2, VOCAB_WORDS)
-    # req-1 (batch index 1) gets its scheduler bitmask row; req-0 is left
+    # req-1 (forward row 1) gets its scheduler bitmask row; req-0 is left
     # all-ones (-1 in int32 = every token allowed).
     assert result[1].tolist() == [5, 6]
     assert torch.all(result[0] == -1)
+
+
+def test_reorder_grammar_bitmask_non_dp_path_ignores_filtered_rows():
+    """A prefill build drops mixed-in decode rows; the reorder must follow the
+    forward's rows, not the persistent batch's.
+    """
+    # Persistent batch req-0..req-3, forward kept req-0 and req-2. Under a
+    # ``range(num_reqs)`` reorder req-2 lands past the end of a 2-row tensor.
+    runner = SimpleNamespace()
+    grammar = GrammarOutput(
+        structured_output_request_ids=["req-1", "req-2"],
+        grammar_bitmask=np.array([[1, 2], [5, 6]], dtype=np.int32),
+    )
+    model_input = _model_input(
+        input_tokens=torch.zeros((2, 8), dtype=torch.int32),
+        row_req_ids=["req-0", "req-2"],
+    )
+
+    result = TTModelRunner._reorder_grammar_bitmask(
+        runner, grammar, model_input, lane_total=None
+    )
+
+    assert result.shape == (2, VOCAB_WORDS)
+    assert torch.all(result[0] == -1)
+    # req-2's own mask, not req-1's, which the forward never ran.
+    assert result[1].tolist() == [5, 6]
 
 
 # --------------------------------------------------------------------------
