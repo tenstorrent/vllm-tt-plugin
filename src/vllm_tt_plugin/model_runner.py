@@ -1214,6 +1214,8 @@ class TTModelRunner:
                 # defaults. The persistent ``input_batch.sampling`` tail is
                 # never read, so there is nothing to default in place.
 
+        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+
         tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
         if not is_prompt and input_tokens.shape[0] > len(req_indices):
             # Decode inputs are padded to the rank batch size; pad the sampling
@@ -1252,8 +1254,7 @@ class TTModelRunner:
             bitmask = reorder_grammar_bitmask_for_tt_batch(
                 bitmask=bitmask,
                 structured_output_request_ids=structured_output_request_ids,
-                req_id_to_index=input_batch.req_id_to_index,
-                req_indices=req_indices,
+                row_req_ids=row_req_ids,
                 batch_length=batch_length,
             )
 
@@ -1350,7 +1351,6 @@ class TTModelRunner:
         # State follows the request, not the row (``self._req_state_slot``), which
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
-        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
@@ -1369,6 +1369,7 @@ class TTModelRunner:
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
+            row_req_ids=row_req_ids,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -1657,23 +1658,20 @@ class TTModelRunner:
         *,
         lane_total: int | None,
     ) -> torch.Tensor | None:
-        """Reorder a scheduler grammar bitmask into TT batch layout, or ``None``.
-
-        Runs at sample time. ``sample_tokens`` executes before the next
-        schedule, so the live batch/lane layout still matches the forward this
-        bitmask belongs to. ``lane_total`` selects the lane reorder (full slot
-        capacity) over the non-DP front-packed reorder.
-        """
+        """Reorder a scheduler grammar bitmask into TT batch layout, or ``None``."""
         if grammar_output is None or grammar_output.grammar_bitmask is None:
             return None
+
         if lane_total is not None:
             return self.lane_batch.slot_grammar_bitmask(grammar_output, lane_total)
+
+        assert model_input.row_req_ids is not None
+
         bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            req_indices=list(range(self.input_batch.num_reqs)),
+            row_req_ids=model_input.row_req_ids,
             batch_length=model_input.input_tokens.shape[0],
         )
 
@@ -1731,22 +1729,32 @@ class TTModelRunner:
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
 
-        if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
-            num_reqs = self.input_batch.num_reqs
-            prompt_lens = np.asarray(fwd.model_input.prompt_lens)
-            # A row-count mismatch means the forward ran on a filtered subset;
-            # leave it to the output builder below to report.
-            if len(prompt_lens) == num_reqs:
-                intermediate_mask = prompt_lens < self.input_batch.num_tokens[:num_reqs]
-                if intermediate_mask.any():
-                    return self._build_chunked_prefill_output(
-                        req_ids=list(self.input_batch.req_ids[:num_reqs]),
-                        sampled_token_ids=sampled_token_ids,
-                        logprobs=logprobs,
-                        intermediate_mask=intermediate_mask,
-                    )
+        row_req_ids = fwd.model_input.row_req_ids
 
-        return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+        assert row_req_ids is not None
+
+        is_prefill = not fwd.is_decode and fwd.model_input.prompt_lens is not None
+
+        if is_prefill:
+            intermediate_mask = fwd.model_input.intermediate_prefill_mask
+
+            assert intermediate_mask is not None
+
+            if intermediate_mask.any():
+                return self._build_chunked_prefill_output(
+                    req_ids=row_req_ids,
+                    sampled_token_ids=sampled_token_ids,
+                    logprobs=logprobs,
+                    intermediate_mask=intermediate_mask.numpy(),
+                )
+
+        return self.apply_and_build_runner_output(
+            sampled_token_ids,
+            logprobs,
+            # Only a prefill build can filter rows. Decode rows are the front-packed
+            # batch rows, so it keeps the vectorized state write.
+            req_ids=row_req_ids if is_prefill else None,
+        )
 
     def _build_chunked_prefill_output(
         self,
@@ -2406,9 +2414,12 @@ class TTModelRunner:
 
         for req_idx, req_id in enumerate(captured_req_ids):
             req_state = self.requests.get(req_id)
-            if req_state is None:
-                continue
-            if request_states is not None and req_state is not request_states[req_idx]:
+            # A deferred decode step can be applied after the engine finished
+            # and dropped its request, so a missing state is ordinary. Same for
+            # readmission under a reused id: the token has no live owner.
+            if req_state is None or (
+                request_states is not None and req_state is not request_states[req_idx]
+            ):
                 continue
 
             current_row = self.input_batch.req_id_to_index.get(req_id)
