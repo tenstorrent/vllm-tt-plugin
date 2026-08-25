@@ -11,6 +11,7 @@ from tests.tt.utils import (
     assert_pairwise_varied,
     assert_varied,
     run_concurrent_batch,
+    run_concurrent_batch_tokens,
 )
 
 
@@ -226,7 +227,10 @@ class TestSeedingAndVariety:
             )
             for _ in range(batch_size)
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        # Token ids, not text: a single flipped token makes every later token
+        # unrelated, so a text comparison cannot tell a one-token near-tie from a
+        # wholly corrupt batch. The assertion reports the divergence index.
+        results = run_concurrent_batch_tokens(tt_server, tt_model_name, configs)
         assert_deterministic_allow_near_tie(
             results, "Seed should produce deterministic outputs."
         )

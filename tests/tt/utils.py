@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 import asyncio
+import re
 import warnings
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -161,6 +162,47 @@ def run_concurrent_batch(
     return asyncio.run(_run())
 
 
+def extract_token_ids(response):
+    """Token ids for one legacy-completion response.
+
+    Requires the request to have been sent with ``return_tokens_as_token_ids=True``
+    and ``logprobs`` set: vLLM then reports each token as the string "token_id:NNN"
+    in ``choices[0].logprobs.tokens``. Falls back to the raw token strings if the
+    server did not use the token-id form, so a determinism assertion still has
+    something exact to compare.
+    """
+    logprobs = getattr(response.choices[0], "logprobs", None)
+    tokens = getattr(logprobs, "tokens", None) if logprobs is not None else None
+    if not tokens:
+        return response.choices[0].text
+    return [
+        int(t.split(":", 1)[1])
+        if isinstance(t, str) and t.startswith("token_id:")
+        else t
+        for t in tokens
+    ]
+
+
+def run_concurrent_batch_tokens(tt_server, tt_model_name, configs):
+    """Like run_concurrent_batch, but returns per-request TOKEN ID sequences.
+
+    Determinism assertions compare token-by-token, so they can report *where* two
+    outputs part company rather than only that they differ. Text comparison cannot:
+    one flipped token makes every later token unrelated.
+
+    The configs are sent with return_tokens_as_token_ids and logprobs=0 so the
+    server reports the sampled token ids; sampling parameters are untouched.
+    """
+    token_configs = [
+        replace(cfg, return_tokens_as_token_ids=True, logprobs=cfg.logprobs or 0)
+        for cfg in configs
+    ]
+    responses = run_concurrent_batch(
+        tt_server, tt_model_name, token_configs, return_full_response=True
+    )
+    return [extract_token_ids(r) for r in responses]
+
+
 def assert_varied(results, min_varied, explanation):
     unique_results = set(results)
     assert len(unique_results) >= min_varied, (
@@ -200,52 +242,116 @@ def assert_deterministic(results, explanation):
 # the arithmetic. So when two candidate tokens sit closer together than that margin,
 # which one wins depends on where in the batch the request landed.
 #
-# The practical signature is ONE request out of a batch disagreeing with the rest.
-# A real determinism bug does not look like that -- it corrupts many slots, or the
-# same slot every time. We therefore warn on a single outlier and fail on more.
+# Comparing whole outputs for equality cannot express that. One flipped token at
+# position 2 makes the remaining 18 tokens unrelated, so `len(set(results))` reports
+# a single near-tie and a totally corrupt batch identically. What discriminates them
+# is WHERE the outputs part company and HOW MANY slots part company together:
+#
+#   one slot, deep mid-stream, identical prefix -> near-tie, or seed handling
+#   several slots, first tokens, same index      -> shared upstream cause
+#
+# So we diverge-index instead of set-count: find the first differing unit against
+# the majority, report the histogram, and gate on the number of deviating SLOTS.
 NEAR_TIE_NOTE = (
     "This is the signature of a near-tie: two candidate tokens closer together than "
     "TT's decode error margin, so batch position decides the winner. It is a known "
     "precision property, not a sampling bug. If this warning becomes frequent, or "
-    "the count rises above one, treat it as a real regression."
+    "more than one slot deviates, treat it as a real regression."
 )
+
+# Word-ish units used when a result is plain text. Real token ids are exact and are
+# used instead whenever the caller passes them (see run_concurrent_batch_tokens);
+# this split only has to be stable and monotonic to make a divergence index useful.
+_UNIT_RE = re.compile(r"\s*\S+|\s+")
+
+
+def _key(result):
+    """Hashable identity for a result (token-id sequences are lists)."""
+    return result if isinstance(result, str) else tuple(result)
+
+
+def _as_units(result):
+    """Decompose one result into comparable units.
+
+    Sequences (token id lists from ``return_tokens_as_token_ids``) are used verbatim.
+    Strings are split into word-ish units, which approximates token position closely
+    enough to tell "diverged immediately" from "diverged deep mid-stream".
+    """
+    if isinstance(result, str):
+        return _UNIT_RE.findall(result)
+    return list(result)
+
+
+def first_divergence(a, b):
+    """Index of the first unit where ``a`` and ``b`` differ, or None if one is a
+    prefix of the other and they are otherwise equal."""
+    ua, ub = _as_units(a), _as_units(b)
+    for i, (x, y) in enumerate(zip(ua, ub)):
+        if x != y:
+            return i
+    if len(ua) != len(ub):
+        return min(len(ua), len(ub))
+    return None
+
+
+def _describe_divergences(results, majority):
+    """(outlier_slots, histogram, shared_prefix_units) for results vs majority."""
+    outlier_slots = [i for i, r in enumerate(results) if r != majority]
+    histogram = Counter()
+    shared = None
+    for i in outlier_slots:
+        idx = first_divergence(majority, results[i])
+        histogram[idx] += 1
+        shared = idx if shared is None else min(shared, idx)
+    return outlier_slots, histogram, shared
 
 
 def assert_deterministic_allow_near_tie(
-    results, explanation, max_warn_outliers: int = 1
+    results, explanation, max_outlier_slots: int = 1
 ):
-    """Like assert_deterministic, but tolerate a single odd-one-out with a warning.
+    """Like assert_deterministic, but tolerate a single deviating slot with a warning.
 
-    Fails when more than ``max_warn_outliers`` results disagree with the majority,
+    Fails when more than ``max_outlier_slots`` results disagree with the majority,
     which is what an actual determinism bug looks like. Use for assertions over a
     *batch*, where near-tie flips are possible; keep plain assert_deterministic for
     repeated single requests, which share one batch position and must not vary.
+
+    ``results`` may be output texts or token-id sequences. Token ids give exact
+    divergence indices; text falls back to word-ish units.
     """
-    if len(set(results)) == 1:
+    if len(set(map(_key, results))) == 1:
         return
 
-    counts = Counter(results)
-    majority, majority_n = counts.most_common(1)[0]
-    outliers = [r for r in results if r != majority]
+    counts = Counter(map(_key, results))
+    majority_key, majority_n = counts.most_common(1)[0]
+    majority = next(r for r in results if _key(r) == majority_key)
+    outlier_slots, histogram, earliest = _describe_divergences(
+        [r for r in results], majority
+    )
+    where = ", ".join(
+        f"index {idx} x{n}"
+        for idx, n in sorted(histogram.items(), key=lambda kv: (kv[0] is None, kv[0]))
+    )
+    alternatives = sorted({_key(results[i]) for i in outlier_slots})
 
-    if len(outliers) <= max_warn_outliers:
-        warnings.warn(
-            f"{explanation}\n"
-            f"{len(outliers)}/{len(results)} result(s) differed from the majority.\n"
-            f"{NEAR_TIE_NOTE}\n"
-            f"majority ({majority_n}x): {majority!r}\n"
-            f"outlier(s): {outliers!r}",
-            stacklevel=2,
-        )
+    detail = (
+        f"{len(outlier_slots)}/{len(results)} slot(s) diverged from the majority "
+        f"({majority_n}x).\n"
+        f"Divergence position: {where} (earliest: {earliest}).\n"
+        f"Slots: {outlier_slots}\n"
+        f"Majority: {majority!r}\n"
+        f"Distinct alternatives ({len(alternatives)}): {alternatives!r}"
+    )
+
+    if len(outlier_slots) <= max_outlier_slots:
+        warnings.warn(f"{explanation}\n{detail}\n{NEAR_TIE_NOTE}", stacklevel=2)
         return
 
     raise AssertionError(
         f"{explanation}\n"
         f"Expected reproducible outputs across the batch.\n"
-        f"Got {len(counts)} unique results out of {len(results)}; "
-        f"{len(outliers)} differed from the majority "
-        f"(more than the {max_warn_outliers} tolerated as a near-tie).\n"
-        f"Results: {results}"
+        f"{detail}\n"
+        f"(more than the {max_outlier_slots} slot tolerated as a near-tie)"
     )
 
 
