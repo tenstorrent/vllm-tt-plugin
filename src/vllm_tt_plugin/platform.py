@@ -1340,10 +1340,12 @@ class TTPlatform(Platform):
             and previous_tt_vllm_config is not vllm_config
             and is_tt_block_output_model(previous_tt_vllm_config)
         ):
-            # Drop the frame locals before raising: this traceback must not
+            # Unbind the frame locals before raising: this traceback must not
             # become the reference that keeps the stale config alive and
-            # makes every retry fail the same way.
-            del previous_tt_vllm_config, previous_handle
+            # makes every retry fail the same way. (Rebound to None rather
+            # than `del` so the names stay defined for later code paths.)
+            previous_tt_vllm_config = None
+            previous_handle = None
             raise ValueError(
                 "One TT engine per process when a block-output model is "
                 "involved: TTPlatform keeps process-level admission state "
@@ -1362,7 +1364,8 @@ class TTPlatform(Platform):
         except Exception:
             cls._tt_vllm_config = previous_handle
             # Keep the stale config out of this traceback's frame locals.
-            del previous_handle, previous_tt_vllm_config
+            previous_handle = None
+            previous_tt_vllm_config = None
             raise
 
         # This process may already hold another engine's admission handle (an
@@ -1389,7 +1392,8 @@ class TTPlatform(Platform):
                 # The live predecessor keeps owning the process.
                 cls._tt_vllm_config = previous_handle
                 # Keep the stale config out of this traceback's frame locals.
-                del previous_tt_vllm_config, previous_handle
+                previous_tt_vllm_config = None
+                previous_handle = None
                 raise ValueError(
                     "One TT engine per process when a block-output model is "
                     "involved: TTPlatform keeps process-level admission state "
