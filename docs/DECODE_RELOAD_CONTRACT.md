@@ -84,9 +84,13 @@ resumed request's state in its scheduler-owned destination slot. Lane-DP keeps
 live decode rows stable, so merely omitting a live request from a prefill step
 does not constitute a layout change.
 
-A remap cannot express slot reuse. A newly admitted request has no predecessor
-state to gather, so reuse is reported by `decode_layout_changed`; the resulting
-sampling-state reset and model-side authoritative rebuild initialize that slot.
+A remap describes only continuing ownership: new slot `i` takes existing state
+from old slot `j`. It has no "new request / no predecessor" sentinel. When a
+newly admitted request takes a slot formerly owned by another request, prefill
+and `empty_slots` initialize its model state. `decode_layout_changed` records
+the transition so the next device-sampling decode rebuilds sampling state from
+authoritative parameters. Continuing requests that move during the same
+transition are still represented by `slot_remap`.
 
 ## Modes
 
