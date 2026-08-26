@@ -34,7 +34,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm_tt_plugin.config import store_tt_output_tokens_per_step
 from vllm_tt_plugin.scheduler import TTScheduler
 
-BLOCK_SIZE = 32
+BLOCK_SIZE = 128
 CANVAS = 16
 MAX_MODEL_LEN = 256
 LOCAL_MODEL_CONFIG = Path(__file__).parent / "model_configs" / "qwen2"
