@@ -12,6 +12,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
+    BLOCK_UNVALIDATED_SAMPLING_NEUTRAL,
     get_tt_output_tokens_per_step,
     is_tt_block_output_model,
 )
@@ -102,26 +103,6 @@ class TTScheduler(AsyncScheduler):
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
-
-    # Host-only sampling controls and their neutral values: any of these
-    # forces the step onto host sampling (check_perform_device_sampling),
-    # which cannot construct a multi-token canvas and kills the engine.
-    # Penalties do not force host sampling, but a non-neutral value flips
-    # InputBatch.no_penalties and makes every block decode step build (and
-    # discard) penalty token tensors that grow with the committed session
-    # length; the frontend neutralizes them, so mirror that here for
-    # prebuilt requests that bypassed it.
-    _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
-        ("min_p", 0.0),
-        ("min_tokens", 0),
-        ("logit_bias", None),
-        ("allowed_token_ids", None),
-        ("bad_words", None),
-        ("_bad_words_token_ids", None),
-        ("presence_penalty", 0.0),
-        ("frequency_penalty", 0.0),
-        ("repetition_penalty", 1.0),
-    )
 
     def add_request(self, request: Request) -> None:
         if self._is_block_output_model:
@@ -281,15 +262,20 @@ class TTScheduler(AsyncScheduler):
 
     def _neutralize_block_output_host_sampling(self, request: Request) -> None:
         """Strip controls a block-output model cannot honor from a bypassed
-        request: host-sampling forcers, structured outputs, and resumable
-        streaming-input sessions.
+        request: structured outputs, resumable streaming-input sessions, and
+        the three sampling groups in
+        ``config.BLOCK_UNVALIDATED_SAMPLING_NEUTRAL`` -- host-sampling forcers,
+        penalties, and unsupported response controls. The consequence differs
+        per group; each config table says which.
 
-        Frontend validation rejects these; a prebuilt EngineCoreRequest skips
-        it, and any of them flips the step to host sampling mid-flight (which
-        cannot construct a multi-token canvas) or parks the request forever.
-        Raising here is no safer: an add_request exception also tears down
-        EngineCore, so neutralize instead, the way the sampling controls are
-        neutralized at the frontend.
+        A prebuilt EngineCoreRequest skips the frontend, which rejects the
+        response-contract controls outright and neutralizes the model-owned
+        sampling controls on the clone. Raising here is no safer than repairing:
+        an add_request exception also tears down EngineCore, so neutralize.
+
+        The field list lives in ``config.BLOCK_UNVALIDATED_SAMPLING_NEUTRAL``
+        so it can be pinned against the live predicate,
+        ``TTModelRunner.check_perform_device_sampling``.
         """
         params = request.sampling_params
         if params is None:
@@ -311,7 +297,7 @@ class TTScheduler(AsyncScheduler):
             # model-owned state slot. The frontend rejects it for block models.
             request.resumable = False
             stripped.append("resumable")
-        for field, neutral in self._BLOCK_HOST_ONLY_SAMPLING_NEUTRAL:
+        for field, neutral in BLOCK_UNVALIDATED_SAMPLING_NEUTRAL:
             if getattr(params, field, neutral) not in (neutral, [], {}):
                 setattr(params, field, neutral)
                 stripped.append(field.lstrip("_"))

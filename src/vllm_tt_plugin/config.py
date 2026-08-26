@@ -102,6 +102,56 @@ def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
     return get_tt_output_tokens_per_step(vllm_config) > 1
 
 
+# ``SamplingParams`` fields that can force a step onto host sampling, and the
+# value that does not. Host sampling yields one token where a canvas is needed,
+# so ``_get_output_tokens`` raises and takes EngineCore with it.
+#
+# Mirrored from ``check_perform_device_sampling``; add a request-driven branch
+# there and you must add its field here. Pinned behaviorally, not by a second
+# list -- see ``tests/test_lane_input_batch.py``.
+BLOCK_HOST_SAMPLING_FORCERS: tuple[tuple[str, Any], ...] = (
+    ("min_p", 0.0),
+    ("min_tokens", 0),
+    ("logit_bias", None),
+    ("allowed_token_ids", None),
+    ("bad_words", None),
+    ("_bad_words_token_ids", None),
+    # Forces host sampling on any device count outside {8, 32} -- P150x4
+    # included -- and ``logprobs=0`` (OpenAI ``logprobs: true``) is enough. The
+    # worker-side ``disable_logprobs`` sentinel already blocks it; this entry is
+    # the second layer, so the table mirrors the predicate rather than depending
+    # on that sentinel.
+    ("logprobs", None),
+)
+
+# Response-shape controls a block-output model cannot honor. Kept out of
+# ``BLOCK_HOST_SAMPLING_FORCERS`` so that table stays an exact mirror of the
+# predicate.
+BLOCK_UNSUPPORTED_RESPONSE_CONTROLS: tuple[tuple[str, Any], ...] = (
+    ("prompt_logprobs", None),
+)
+
+# Penalties neither force host sampling nor change generation -- the model owns
+# its sampler and drops what it is handed. The cost is host waste: a non-neutral
+# value flips ``InputBatch.no_penalties``, and every block decode step then
+# rebuilds the prompt and output token-history tensors in
+# ``_prepare_model_inputs``, the output one growing with the session. The
+# frontend neutralizes them; mirror it here.
+BLOCK_PENALTY_NEUTRAL: tuple[tuple[str, Any], ...] = (
+    ("presence_penalty", 0.0),
+    ("frequency_penalty", 0.0),
+    ("repetition_penalty", 1.0),
+)
+
+# What TTScheduler applies to a request that reached the engine without frontend
+# validation.
+BLOCK_UNVALIDATED_SAMPLING_NEUTRAL: tuple[tuple[str, Any], ...] = (
+    BLOCK_HOST_SAMPLING_FORCERS
+    + BLOCK_PENALTY_NEUTRAL
+    + BLOCK_UNSUPPORTED_RESPONSE_CONTROLS
+)
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:
