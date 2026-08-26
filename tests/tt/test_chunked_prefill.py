@@ -20,12 +20,11 @@ the model. A block-size-aligned-but-not-q_chunk-aligned offset scored 10/20 here
 against 20/20 with chunked prefill off.
 """
 
-import asyncio
 import random
 
 import pytest
 
-from tests.tt.utils import RequestConfig, send_batch_concurrent
+from tests.tt.utils import RequestConfig, run_concurrent_batch
 
 # The passphrase sits this far into the filler, so a prompt split into several
 # chunks plants it past a boundary and recalling it needs K/V written at a
@@ -87,14 +86,6 @@ def _recalled(output: str | None, passphrase: str) -> bool:
     return passphrase.lower() in (output or "").lower()
 
 
-def _run(tt_server, tt_model_name, configs):
-    return asyncio.run(
-        send_batch_concurrent(
-            tt_server.get_async_client(), tt_model_name, configs, use_chat=False
-        )
-    )
-
-
 @pytest.fixture(scope="module")
 def budget(chunked_prefill_budget):
     """The served ``max_num_batched_tokens``.
@@ -129,7 +120,7 @@ def test_a_solo_split_prefill_recalls_its_needle(tt_server, tt_model_name, budge
     passphrase = "cobalt-heron-42"
     prompt = _needle_prompt(budget, passphrase, seed=0xC401, nonce="Solo.\n")
 
-    (output,) = _run(
+    (output,) = run_concurrent_batch(
         tt_server,
         tt_model_name,
         [RequestConfig(prompt=prompt, max_tokens=24, temperature=0)],
@@ -168,7 +159,7 @@ def test_prefills_sharing_a_step_each_recall_their_own_needle(
             for i, passphrase in enumerate(passphrases)
         ]
 
-        outputs = _run(tt_server, tt_model_name, configs)
+        outputs = run_concurrent_batch(tt_server, tt_model_name, configs)
         total += len(outputs)
         for i, (passphrase, output) in enumerate(zip(passphrases, outputs)):
             if not _recalled(output, passphrase):
