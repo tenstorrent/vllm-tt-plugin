@@ -292,6 +292,80 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
 
 
+def test_stripped_controls_produce_one_combined_warning(caplog):
+    """The split into two strip methods must not turn one log record per request
+    into two: the orchestrator collects both name lists and logs once. Splitting
+    them did exactly that once, so pin the record count."""
+    import logging
+
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(
+        max_tokens=CANVAS,
+        ignore_eos=True,
+        min_p=0.2,
+        logprobs=0,
+        structured_outputs=StructuredOutputsParams(json_object=True),
+    )
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="bypass-log",
+        prompt_token_ids=[1] * 32,
+        sampling_params=params,
+        pooling_params=None,
+        resumable=True,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    # vLLM configures its logger tree with propagate=False, so records never
+    # reach the root logger where caplog listens; attach its handler directly
+    # (same pattern as tests/test_logger.py).
+    from vllm_tt_plugin.scheduler import logger as scheduler_logger
+
+    scheduler_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=scheduler_logger.name):
+            scheduler.add_request(request)
+    finally:
+        scheduler_logger.removeHandler(caplog.handler)
+
+    stripped_records = [r for r in caplog.records if "stripped" in r.getMessage()]
+    assert len(stripped_records) == 1, [r.getMessage() for r in stripped_records]
+    message = stripped_records[0].getMessage()
+    # One record naming controls from both strip methods.
+    for name in ("structured_outputs", "resumable", "min_p", "logprobs"):
+        assert name in message
+
+
+def test_clamp_refuses_a_prompt_the_truncation_step_should_have_shrunk():
+    """The clamp's precondition comes from two sites outside it: the prompt
+    truncation the orchestrator runs immediately before, and the startup floor
+    in platform.py. Swapping the two repair calls looks free and would
+    otherwise hand the request a zero-token budget; the assert makes that
+    loud."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=CANVAS, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    # Aligns up to exactly max_model_len, leaving no room for a canvas -- the
+    # state _truncate_overlong_prompt exists to prevent.
+    request = Request(
+        request_id="untruncated-0",
+        prompt_token_ids=[1] * (MAX_MODEL_LEN - 6),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    with pytest.raises(AssertionError, match="must stay positive"):
+        scheduler._clamp_max_tokens_to_whole_canvases(request)
+
+    # And the supported order leaves it servable.
+    scheduler._repair_unvalidated_block_request(request)
+    assert request.max_tokens > 0
+    assert request.max_tokens % CANVAS == 0
+
+
 # Largest tile-aligned prompt that still fits one whole canvas: the
 # truncation target for unservable bypassed prompts (mml=256, K=16 -> 224).
 SERVABLE_PROMPT = (MAX_MODEL_LEN // 32 * 32 - CANVAS) // 32 * 32

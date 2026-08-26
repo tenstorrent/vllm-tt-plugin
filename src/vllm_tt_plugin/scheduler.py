@@ -104,106 +104,191 @@ class TTScheduler(AsyncScheduler):
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
 
+    # ------------------------------------------------------------------
+    # Request repair for unvalidated requests
+    # ------------------------------------------------------------------
+    #
+    # Requests normally enter through vLLM's input processor:
+    # ``TTPlatform.validate_request`` 4xxes unsupported prompt shapes and
+    # response-contract controls, and ``_neutralize_model_owned_sampling``
+    # resets the model-owned sampling controls on the clone.
+    #
+    # This layer defends the one entry point that skips all of that: a caller
+    # that builds an ``EngineCoreRequest`` itself and hands it to
+    # ``EngineCore.add_request``. Nothing on the supported surface reaches it,
+    # so it is a safety net rather than a live path. It repairs and answers
+    # HTTP 200 -- raising from ``add_request`` tears down EngineCore and every
+    # other in-flight request with it -- which means a client here can get a
+    # successful answer computed from a materially different prompt.
+    #
+    # It is not a mirror of the frontend: a bypassed request can still carry a
+    # control the frontend would have rejected and get a reply that ignores it.
+    # For what it does repair, read ``_repair_unvalidated_block_request``; its
+    # body is the list, in order, and ``docs/diffusion-gemma.md`` tabulates the
+    # substitutions with their log levels.
+
     def add_request(self, request: Request) -> None:
         if self._is_block_output_model:
-            existing = self.requests.get(request.request_id)
-            if existing is not None and existing.streaming_queue is None:
-                # A continuation (next input chunk or the closing sentinel) of
-                # a session whose resumable flag the neutralization below
-                # scrubbed. The base scheduler asserts on the missing
-                # streaming_queue, which would tear down EngineCore. The
-                # session cannot accept more input, so drop the message; the
-                # live request finishes and notifies its client on its own.
-                logger.warning(
-                    "Dropping streaming-input continuation for request %s: "
-                    "block-output models do not support resumable sessions",
-                    request.request_id,
-                )
+            if self._drop_continuation_of_scrubbed_session(request):
                 return
-            self._truncate_unservable_block_prompt(request)
-            self._align_block_output_max_tokens(request)
-            self._neutralize_block_output_host_sampling(request)
+            self._repair_unvalidated_block_request(request)
         super().add_request(request)
 
-    def _truncate_unservable_block_prompt(self, request: Request) -> None:
-        """Contain a bypassed prompt that leaves no room for a whole canvas.
+    def _repair_unvalidated_block_request(self, request: Request) -> None:
+        """Make a request that skipped frontend validation servable.
 
-        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
-        skips it, and neither upstream EngineCore.add_request nor the base
-        scheduler re-checks prompt length. Admitted untouched, the prompt
-        either can never be scheduled (chunked prefill is disabled and the
-        prompt exceeds the token budget: parked in WAITING forever,
-        head-of-line blocking every later request), overflows the worker's
-        max_model_len-wide token buffer, or — even when it fits
-        max_model_len — trips the adapter's own canvas-capacity validation,
-        which raises out of execute_model in eager (no-upfront-capture) mode
-        where there is no graceful stop-canvas rejection. Truncate to the
-        largest tile-aligned prompt that still fits one whole canvas below
-        the tile-floored max_model_len, so every admitted request is
-        genuinely servable and finishes through the normal notifying path.
-        Prefix caching is disabled for block models (__init__ asserts it), so
-        the request's stale block hashes stay inert.
+        The order is load-bearing: prompt content first, so the length checks
+        see the token count the worker will build; then truncation, which
+        establishes the invariant the clamp depends on (at least one whole
+        canvas fits); then the clamp; then the controls, which do not interact
+        with length. Swapping the middle two lets the clamp compute a zero-token
+        budget, so it asserts its own precondition rather than trusting this
+        order.
+        """
+        self._drop_unencodable_mm_features(request)
+        self._replace_prompt_embeds_with_placeholders(request)
+        self._drop_mixed_mode_prompt_embeds(request)
+        if not self._pad_empty_prompt(request):
+            # A padded prompt is one token: inside every budget, nothing to
+            # truncate. (Skipping is behavior-preserving, not required.)
+            self._truncate_overlong_prompt(request)
+        self._clamp_max_tokens_to_whole_canvases(request)
+        # One combined record, as before the split.
+        stripped = self._strip_unsupported_block_controls(request)
+        stripped += self._neutralize_unsupported_sampling_controls(request)
+        if stripped:
+            logger.warning(
+                "Request %s bypassed frontend validation; stripped "
+                "controls unsupported by block-output models: %s",
+                request.request_id,
+                ", ".join(stripped),
+            )
+
+    def _drop_continuation_of_scrubbed_session(self, request: Request) -> bool:
+        """Drop a continuation of a session whose resumable flag was scrubbed.
+
+        Returns True when the message was dropped and must not be admitted.
+
+        ``_strip_unsupported_block_controls`` clears ``resumable``, so the
+        session has no ``streaming_queue`` to append to. The base scheduler
+        asserts on the missing queue, which would tear down EngineCore. The
+        session cannot accept more input, so drop the message; the live
+        request finishes and notifies its client on its own.
+        """
+        existing = self.requests.get(request.request_id)
+        if existing is None or existing.streaming_queue is not None:
+            return False
+        logger.warning(
+            "Dropping streaming-input continuation for request %s: "
+            "block-output models do not support resumable sessions",
+            request.request_id,
+        )
+        return True
+
+    def _drop_unencodable_mm_features(self, request: Request) -> None:
+        """Drop multimodal features a text-only block model cannot encode.
+
+        A text-only block model has a zero encoder budget: a feature at offset
+        0 forces zero-token schedules forever (head-of-line stall), and an
+        interior offset carves a partial prefill chunk that flips the step onto
+        host sampling and kills the engine. Dropped, the placeholder positions
+        decode as ordinary tokens.
+        """
+        if not request.mm_features:
+            return
+        logger.warning(
+            "Request %s bypassed frontend validation with multimodal "
+            "features a block-output model cannot encode; dropping them",
+            request.request_id,
+        )
+        request.mm_features = []
+
+    def _replace_prompt_embeds_with_placeholders(self, request: Request) -> None:
+        """Turn an embeds-only prompt into placeholder tokens.
+
+        The frontend rejects ``prompt_embeds`` for every TT model; admitted
+        bare, the worker's request-state builder raises ``NotImplementedError``
+        out of ``execute_model``. An embeds-only ``Request`` already carries
+        ``[0] * num_prompt_tokens`` in ``_all_token_ids``, so the replacement
+        keeps every derived view consistent.
+        """
+        if request.prompt_token_ids is not None or request.num_prompt_tokens <= 0:
+            return
+        logger.warning(
+            "Request %s bypassed frontend validation with a "
+            "prompt_embeds-only prompt the TT backend does not support; "
+            "replacing with %d placeholder tokens",
+            request.request_id,
+            request.num_prompt_tokens,
+        )
+        request.prompt_token_ids = [0] * request.num_prompt_tokens
+        request.prompt_embeds = None
+
+    def _drop_mixed_mode_prompt_embeds(self, request: Request) -> None:
+        """Scrub the embeds half of a mixed token/embeds prompt.
+
+        Mixed-mode prompts (token ids + embeds + ``prompt_is_token_ids`` mask)
+        carry placeholder ids at the embed positions, so the TT model decodes
+        them as ordinary tokens either way; scrubbing keeps the
+        ``prompt_len x hidden_size`` tensor from being pinned for the request
+        lifetime.
+        """
+        if request.prompt_embeds is None:
+            return
+        logger.warning(
+            "Request %s bypassed frontend validation with mixed "
+            "token/embeds prompt content the TT backend does not "
+            "support; dropping the embeds (placeholder ids decode as "
+            "ordinary tokens)",
+            request.request_id,
+        )
+        request.prompt_embeds = None
+        request.prompt_is_token_ids = None
+
+    def _pad_empty_prompt(self, request: Request) -> bool:
+        """Pad an empty prompt to one placeholder token; True if it padded.
+
+        The frontend rejects empty prompts; admitted bare, the waiting loop
+        schedules zero new tokens and upstream's ``num_new_tokens`` assert
+        tears down the engine.
+        """
+        if request.num_prompt_tokens != 0:
+            return False
+        logger.warning(
+            "Request %s bypassed frontend validation with an empty "
+            "prompt; padding to one placeholder token",
+            request.request_id,
+        )
+        request.prompt_token_ids = [0]
+        request.prompt_embeds = None
+        request._all_token_ids.append(0)
+        request.num_prompt_tokens = 1
+        return True
+
+    def _truncate_overlong_prompt(self, request: Request) -> None:
+        """Truncate a prompt that leaves no room for a whole canvas.
+
+        Neither upstream ``EngineCore.add_request`` nor the base scheduler
+        re-checks prompt length. Admitted untouched, such a prompt either can
+        never be scheduled (chunked prefill is disabled and the prompt exceeds
+        the token budget: parked in WAITING forever, head-of-line blocking
+        every later request), overflows the worker's ``max_model_len``-wide
+        token buffer, or -- even when it fits ``max_model_len`` -- trips the
+        adapter's own canvas-capacity validation, which raises out of
+        ``execute_model`` in eager (no-upfront-capture) mode where there is no
+        graceful stop-canvas rejection.
+
+        Truncates to the largest tile-aligned prompt that still fits one whole
+        canvas below the tile-floored ``max_model_len``, so every admitted
+        request is genuinely servable and finishes through the normal
+        notifying path. This is what establishes the invariant
+        ``_clamp_max_tokens_to_whole_canvases`` consumes.
+
+        Prefix caching is disabled for block models (``__init__`` asserts it),
+        so the request's stale block hashes stay inert.
         """
         from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
 
-        if request.mm_features:
-            # A text-only block model has a zero encoder budget: a feature at
-            # offset 0 forces zero-token schedules forever (head-of-line
-            # stall), and an interior offset carves a partial prefill chunk
-            # that flips the step onto host sampling and kills the engine.
-            # Dropped, the placeholder positions decode as ordinary tokens.
-            logger.warning(
-                "Request %s bypassed frontend validation with multimodal "
-                "features a block-output model cannot encode; dropping them",
-                request.request_id,
-            )
-            request.mm_features = []
-        if request.prompt_token_ids is None and request.num_prompt_tokens > 0:
-            # The frontend rejects prompt_embeds for every TT model; admitted
-            # bare, the worker's request-state builder raises
-            # NotImplementedError out of execute_model. Replace with
-            # placeholder tokens; an embeds-only Request already carries
-            # [0] * num_prompt_tokens in _all_token_ids, so the replacement
-            # keeps every derived view consistent.
-            logger.warning(
-                "Request %s bypassed frontend validation with a "
-                "prompt_embeds-only prompt the TT backend does not support; "
-                "replacing with %d placeholder tokens",
-                request.request_id,
-                request.num_prompt_tokens,
-            )
-            request.prompt_token_ids = [0] * request.num_prompt_tokens
-            request.prompt_embeds = None
-        if request.prompt_embeds is not None:
-            # Mixed-mode prompts (token ids + embeds + prompt_is_token_ids
-            # mask) carry placeholder ids at the embed positions, so the TT
-            # model decodes them as ordinary tokens either way; scrub the
-            # embeds so the prompt_len x hidden_size tensor is not pinned for
-            # the request lifetime, and warn like the embeds-only branch.
-            logger.warning(
-                "Request %s bypassed frontend validation with mixed "
-                "token/embeds prompt content the TT backend does not "
-                "support; dropping the embeds (placeholder ids decode as "
-                "ordinary tokens)",
-                request.request_id,
-            )
-            request.prompt_embeds = None
-            request.prompt_is_token_ids = None
-        if request.num_prompt_tokens == 0:
-            # The frontend rejects empty prompts; admitted bare, the waiting
-            # loop schedules zero new tokens and upstream's num_new_tokens
-            # assert tears down the engine. Pad to one placeholder token so
-            # the request schedules and finishes through the normal path.
-            logger.warning(
-                "Request %s bypassed frontend validation with an empty "
-                "prompt; padding to one placeholder token",
-                request.request_id,
-            )
-            request.prompt_token_ids = [0]
-            request.prompt_embeds = None
-            request._all_token_ids.append(0)
-            request.num_prompt_tokens = 1
-            return
         tile = _TT_TOKEN_TILE_SIZE
         max_model_len = int(self.vllm_config.model_config.max_model_len)
         aligned_max_model_len = max_model_len // tile * tile
@@ -227,13 +312,13 @@ class TTScheduler(AsyncScheduler):
         del request._all_token_ids[keep:]
         request.num_prompt_tokens = keep
 
-    def _align_block_output_max_tokens(self, request: Request) -> None:
-        """Clamp max_tokens so a bypassed EngineCoreRequest cannot overshoot.
+    def _clamp_max_tokens_to_whole_canvases(self, request: Request) -> None:
+        """Clamp max_tokens so a bypassed request cannot overshoot the context.
 
         Frontend validation rejects an oversized limit. Prebuilt requests skip
-        that path; the last canvas would then be applied past max_model_len and
-        kill the engine. Shrink the logical cap to the largest whole-canvas
-        budget that still fits. Lane mode reaches this through each lane.
+        that path; the last canvas would then be applied past
+        ``max_model_len`` and kill the engine. Shrink the logical cap to the
+        largest whole-canvas budget that still fits.
         """
         from vllm_tt_plugin.platform import _fit_block_output_max_tokens
 
@@ -248,8 +333,16 @@ class TTScheduler(AsyncScheduler):
         )
         if fitted == request.max_tokens:
             return
-        # The prompt truncation above guarantees at least one whole canvas
-        # fits, so a clamp always leaves a positive, servable budget.
+        # Precondition, asserted rather than trusted. Two sites supply it,
+        # neither of them this method: ``_truncate_overlong_prompt`` just above
+        # in the orchestrator, and the startup floor in
+        # ``platform._min_block_output_max_model_len``.
+        assert fitted > 0, (
+            f"clamped block-output budget must stay positive, got {fitted} "
+            f"for a {len(prompt_ids)}-token prompt with canvas "
+            f"{self._output_tokens_per_step} and max_model_len "
+            f"{self.vllm_config.model_config.max_model_len}"
+        )
         logger.debug(
             "Clamping block-output max_tokens from %s to %s for request %s "
             "so physical canvases fit max_model_len",
@@ -260,26 +353,15 @@ class TTScheduler(AsyncScheduler):
         request.max_tokens = fitted
         request.sampling_params.max_tokens = fitted
 
-    def _neutralize_block_output_host_sampling(self, request: Request) -> None:
-        """Strip controls a block-output model cannot honor from a bypassed
-        request: structured outputs, resumable streaming-input sessions, and
-        the three sampling groups in
-        ``config.BLOCK_UNVALIDATED_SAMPLING_NEUTRAL`` -- host-sampling forcers,
-        penalties, and unsupported response controls. The consequence differs
-        per group; each config table says which.
+    def _strip_unsupported_block_controls(self, request: Request) -> list[str]:
+        """Strip structured outputs and the resumable flag; name what was hit.
 
-        A prebuilt EngineCoreRequest skips the frontend, which rejects the
-        response-contract controls outright and neutralizes the model-owned
-        sampling controls on the clone. Raising here is no safer than repairing:
-        an add_request exception also tears down EngineCore, so neutralize.
-
-        The field list lives in ``config.BLOCK_UNVALIDATED_SAMPLING_NEUTRAL``
-        so it can be pinned against the live predicate,
-        ``TTModelRunner.check_perform_device_sampling``.
+        Structured outputs force host sampling, which cannot construct a
+        multi-token canvas. A resumable session parks the stopped request to
+        wait for more input instead of finishing it, permanently leaking the
+        model-owned state slot; a later continuation of the scrubbed session
+        is dropped by ``_drop_continuation_of_scrubbed_session``.
         """
-        params = request.sampling_params
-        if params is None:
-            return
         stripped = []
         if request.structured_output_request is not None:
             request.structured_output_request = None
@@ -289,25 +371,39 @@ class TTScheduler(AsyncScheduler):
             # out of skipped_waiting, so restore schedulability.
             if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
                 request.status = RequestStatus.WAITING
-        if params.structured_outputs is not None:
-            params.structured_outputs = None
+        if request.sampling_params is not None:
+            request.sampling_params.structured_outputs = None
         if request.resumable:
-            # A resumable session parks the stopped request to wait for more
-            # input instead of finishing it, permanently leaking the
-            # model-owned state slot. The frontend rejects it for block models.
             request.resumable = False
             stripped.append("resumable")
+        return stripped
+
+    def _neutralize_unsupported_sampling_controls(self, request: Request) -> list[str]:
+        """Reset sampling and response controls to neutral; name what was reset.
+
+        Three groups, from ``config.BLOCK_UNVALIDATED_SAMPLING_NEUTRAL``, and
+        only the first is about host sampling:
+
+        - host-sampling forcers, which matter most: host sampling produces one
+          token where the canvas contract needs a whole canvas, so a
+          block-output model that lands there raises mid-step and takes
+          EngineCore with it;
+        - penalties, which cost a session-length tensor rebuild per step;
+        - unsupported response controls (``prompt_logprobs``).
+
+        The field list is deliberately not local: keeping it in ``config`` is
+        what lets the forcer group be pinned against the live predicate,
+        ``TTModelRunner.check_perform_device_sampling``.
+        """
+        params = request.sampling_params
+        if params is None:
+            return []
+        stripped = []
         for field, neutral in BLOCK_UNVALIDATED_SAMPLING_NEUTRAL:
             if getattr(params, field, neutral) not in (neutral, [], {}):
                 setattr(params, field, neutral)
                 stripped.append(field.lstrip("_"))
-        if stripped:
-            logger.warning(
-                "Request %s bypassed frontend validation; stripped "
-                "controls unsupported by block-output models: %s",
-                request.request_id,
-                ", ".join(stripped),
-            )
+        return stripped
 
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.

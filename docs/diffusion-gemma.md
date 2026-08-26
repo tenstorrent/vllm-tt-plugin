@@ -109,6 +109,44 @@ OpenAI endpoints any output limit — omitted or explicit — is capped to the
 largest whole-canvas capacity that fits; the formula rejects an oversized
 `max_tokens` only for offline `SamplingParams` callers.
 
+### Unvalidated engine-API requests
+
+Everything above describes the validated path: the OpenAI server and `LLM` both
+build their requests through vLLM's input processor, which calls
+`current_platform.validate_request` itself, so unsupported inputs come back as a
+4xx before the engine sees them. (The plugin separately patches `process_inputs`
+for a different job: rejecting resumable streaming-input requests and owning
+block-output defaults on the per-request `SamplingParams` clone.)
+
+One entry point skips that: a caller that builds an `EngineCoreRequest` itself
+and hands it to `EngineCore.add_request`. `VLLM_USE_RUST_FRONTEND=1` would be a
+second -- it runs HTTP outside Python and never reaches TT request validation
+-- which is why the platform refuses it at startup rather than relying on the
+repairs below. No supported surface produces such a request, so this is a
+safety net for out-of-tree engine-API callers rather than a live path.
+
+`TTScheduler.add_request` does **not** reject those requests. Raising from
+`add_request` tears down EngineCore and takes every other in-flight request
+with it, so it repairs them instead, logs what it substituted, and the client
+receives **HTTP 200** -- possibly an answer computed from a materially different
+prompt than it sent. Everything below warns except the `max_tokens` clamp, which
+logs at debug level and so is silent at the default level:
+
+| Unsupported input | Substitution | Warning |
+|---|---|---|
+| Multimodal features | Dropped; placeholder positions decode as ordinary tokens | `...multimodal features a block-output model cannot encode; dropping them` |
+| `prompt_embeds`-only prompt | Replaced with `num_prompt_tokens` placeholder tokens | `...replacing with N placeholder tokens` |
+| Mixed token/`prompt_embeds` prompt | Embeds dropped, placeholder ids kept | `...dropping the embeds` |
+| Empty prompt | Padded to one placeholder token | `...padding to one placeholder token` |
+| Prompt with no room for a whole canvas | Truncated to the largest tile-aligned prompt that fits one canvas | `...truncating to N tokens so the request can finish length-capped` |
+| `max_tokens` past the context | Clamped to the largest whole-canvas budget | debug-level `Clamping block-output max_tokens from ... to ...` |
+| Structured outputs, `resumable` | Stripped | `...stripped controls unsupported by block-output models: ...` |
+| Host-sampling controls, penalties, `prompt_logprobs` | Reset to neutral values | same combined warning as above |
+| Continuation of a scrubbed resumable session | Message dropped; the live request still finishes and notifies | `Dropping streaming-input continuation for request ...` |
+
+The repair order is load-bearing and documented in
+`TTScheduler._repair_unvalidated_block_request`.
+
 ## Metrics
 
 vLLM request metrics count logical output tokens after EOS, stop-token, and

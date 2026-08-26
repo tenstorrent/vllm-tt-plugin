@@ -888,7 +888,7 @@ def test_repaired_bypassed_request_satisfies_the_device_sampling_predicate():
     assert _predicate(disable_logprobs=True) is False
     assert _predicate(disable_logprobs=False) is False
 
-    TTScheduler._neutralize_block_output_host_sampling(SimpleNamespace(), request)
+    TTScheduler._neutralize_unsupported_sampling_controls(SimpleNamespace(), request)
 
     assert _predicate(disable_logprobs=True) is True
     assert _predicate(disable_logprobs=False) is True
