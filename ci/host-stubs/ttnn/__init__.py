@@ -20,11 +20,6 @@ Put this directory's parent on ``PYTHONPATH`` to use it:
 
 from enum import Enum
 
-# Hardware-fixed tile dimension used by tt-metal operator shapes. The host CI
-# only needs this constant for import-time provenance checks; device entry
-# points below continue to require real hardware.
-TILE_SIZE = 32
-
 
 def _no_device(name):
     def raise_no_device(*args, **kwargs):

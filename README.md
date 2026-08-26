@@ -532,9 +532,9 @@ workflow job runs:
 PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
 ```
 
-The stub answers only the `ttnn` names the plugin touches and raises from
-anything that would reach a device, so a test that starts depending on real
-hardware fails loudly rather than passing against a fake.
+The stub answers only the device-independent `ttnn` names the plugin touches and
+raises from anything that would reach a device, so a test that starts depending
+on real hardware fails loudly rather than passing against a fake.
 
 ## Hybrid Attention Models
 
