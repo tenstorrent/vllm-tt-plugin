@@ -35,7 +35,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
 # ``HAS_TRITON``, whose module resolves ``current_platform`` at import time, which
 # loads this plugin: a module-level ``vllm.config`` import here is a cycle.
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import SchedulerConfig, VllmConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -132,9 +132,72 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
-# HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
-# prefill, i.e. the ones token-chunked prefill has been validated against.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+
+def _resolve_chunked_prefill_alignment(
+    model_capabilities: dict | None, model_class: type
+) -> int:
+    """Token alignment every resume offset of this model must land on.
+
+    A model that declares ``supports_chunked_prefill`` must also declare the
+    alignment. It is a property of that model's chunked-SDPA program config, not
+    of the plugin, and too small a value makes the op read the wrong prefix
+    rather than fail, so there is deliberately no default.
+    """
+    alignment = (model_capabilities or {}).get("chunked_prefill_token_alignment")
+    if not isinstance(alignment, int) or isinstance(alignment, bool) or alignment <= 0:
+        raise ValueError(
+            f"TT model {model_class.__name__} ({model_class.__module__}) declares "
+            "`model_capabilities['supports_chunked_prefill']` but does not declare a "
+            "positive integer `model_capabilities['chunked_prefill_token_alignment']` "
+            f"(got {alignment!r}). Both keys are required together."
+        )
+    return alignment
+
+
+def _align_chunked_prefill_token_budget(
+    scheduler_config: "SchedulerConfig", alignment: int
+) -> None:
+    """Round the token budget so fewer resume offsets need correcting.
+
+    Best effort; nothing depends on it for correctness. The threshold caps tokens
+    per *request*, but the budget is shared across the step, so a request
+    admitted into what is left of one still gets a ragged count and resumes from
+    a ragged offset from then on. The tt-metal generator floors those; this only
+    reduces how often it has to.
+
+    Requests shorter than the threshold stay unsplit, which keeps them on the
+    generator's batched-prefill path.
+    """
+    budget = scheduler_config.max_num_batched_tokens
+    if budget < alignment:
+        raise ValueError(
+            f"max_num_batched_tokens ({budget}) is smaller than this model's "
+            f"chunked-prefill token alignment ({alignment}), so no chunk boundary "
+            "could be aligned. Raise max_num_batched_tokens or pass "
+            "--no-enable-chunked-prefill."
+        )
+
+    threshold = scheduler_config.long_prefill_token_threshold
+    if threshold <= 0:
+        # Unset: one request may consume a whole step.
+        threshold = budget
+    threshold = max(alignment, (min(threshold, budget) // alignment) * alignment)
+    budget = (budget // threshold) * threshold
+
+    # Logged even when nothing was rounded: it is the only signal from outside
+    # the process that chunked prefill is active and at what budget, and CI gates
+    # its device tests on it.
+    logger.info(
+        "Chunked prefill enabled, token budget aligned to multiples of %d: "
+        "max_num_batched_tokens %d -> %d, long_prefill_token_threshold %d -> %d.",
+        alignment,
+        scheduler_config.max_num_batched_tokens,
+        budget,
+        scheduler_config.long_prefill_token_threshold,
+        threshold,
+    )
+    scheduler_config.max_num_batched_tokens = budget
+    scheduler_config.long_prefill_token_threshold = threshold
 
 
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
@@ -169,20 +232,37 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     scheduler_config.long_prefill_token_threshold = 0
 
 
-def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
-    """Restrict token-chunked prefill to the model types that support it."""
+def _apply_chunked_prefill_policy(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Restrict token-chunked prefill to the models that declare support for it."""
     scheduler_config = vllm_config.scheduler_config
-    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    model_desc = f"TT model {model_class.__name__} ({model_class.__module__})"
 
-    if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
-        # A chunk boundary inside a multimodal item would split its embeddings
-        # from their positions. Only meaningful while prefill can be split, and
-        # vLLM rejects the flag outright when one item exceeds the token budget,
-        # so it stays off for every model type below.
-        scheduler_config.disable_chunked_mm_input = True
+    supports_chunked_prefill = (
+        model_capabilities.get("supports_chunked_prefill", False)
+        if model_capabilities
+        else False
+    )
+    if not supports_chunked_prefill:
+        _disable_chunked_prefill(vllm_config, model_desc)
         return
 
-    _disable_chunked_prefill(vllm_config, f"`model_type={model_type}`")
+    # Validated even when the feature is off for this run: a declaration missing
+    # its alignment is a model bug, not a serving choice.
+    alignment = _resolve_chunked_prefill_alignment(model_capabilities, model_class)
+    if not scheduler_config.enable_chunked_prefill:
+        _disable_chunked_prefill(vllm_config, model_desc)
+        return
+
+    # A chunk boundary inside a multimodal item would split its embeddings from
+    # their positions. Only meaningful while prefill can be split, and vLLM
+    # rejects the flag outright when one item exceeds the token budget, so it
+    # stays off for every model that does not reach here.
+    scheduler_config.disable_chunked_mm_input = True
+    _align_chunked_prefill_token_budget(scheduler_config, alignment)
 
 
 def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
@@ -1436,8 +1516,6 @@ class TTPlatform(Platform):
 
     @classmethod
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        _apply_chunked_prefill_policy(vllm_config)
-
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
@@ -1560,6 +1638,10 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # Rewrites scheduler_config; nothing between here and the closing
+        # ``verify_max_model_len`` reads the fields it touches.
+        _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         is_block_output_model = is_tt_block_output_model(vllm_config)
