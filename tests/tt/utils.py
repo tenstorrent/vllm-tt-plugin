@@ -307,14 +307,26 @@ def _describe_divergences(results, majority):
 
 
 def assert_deterministic_allow_near_tie(
-    results, explanation, max_outlier_slots: int = 1
+    results,
+    explanation,
+    max_outlier_slots: int = 1,
+    min_common_prefix: int = 1,
 ):
     """Like assert_deterministic, but tolerate a single deviating slot with a warning.
 
-    Fails when more than ``max_outlier_slots`` results disagree with the majority,
-    which is what an actual determinism bug looks like. Use for assertions over a
-    *batch*, where near-tie flips are possible; keep plain assert_deterministic for
-    repeated single requests, which share one batch position and must not vary.
+    A near-tie is defined RELATIVE TO A MAJORITY, so three conditions must all hold
+    before a deviation is excused:
+
+    1. A strict majority exists (``majority_n > len(outliers)``). With two results
+       that disagree there is no majority and therefore no outlier -- neither is more
+       authoritative than the other, so the disagreement is reported, not excused.
+       Without this the failure branch is unreachable at n == 2, which silently
+       disabled every 2-element assertion.
+    2. Each deviation shares at least ``min_common_prefix`` leading units with the
+       majority. A near-tie parts company at ONE point after a shared prefix; an
+       output that differs from its first token is a different phenomenon and is
+       never excused, however few slots show it.
+    3. At most ``max_outlier_slots`` slots deviate.
 
     ``results`` may be output texts or token-id sequences. Token ids give exact
     divergence indices; text falls back to word-ish units.
@@ -325,9 +337,7 @@ def assert_deterministic_allow_near_tie(
     counts = Counter(map(_key, results))
     majority_key, majority_n = counts.most_common(1)[0]
     majority = next(r for r in results if _key(r) == majority_key)
-    outlier_slots, histogram, earliest = _describe_divergences(
-        [r for r in results], majority
-    )
+    outlier_slots, histogram, earliest = _describe_divergences(results, majority)
     where = ", ".join(
         f"index {idx} x{n}"
         for idx, n in sorted(histogram.items(), key=lambda kv: (kv[0] is None, kv[0]))
@@ -343,7 +353,24 @@ def assert_deterministic_allow_near_tie(
         f"Distinct alternatives ({len(alternatives)}): {alternatives!r}"
     )
 
-    if len(outlier_slots) <= max_outlier_slots:
+    reasons = []
+    if majority_n <= len(outlier_slots):
+        reasons.append(
+            f"no strict majority ({majority_n} vs {len(outlier_slots)} deviating): "
+            f"nothing here is authoritative enough for the others to be near-ties"
+        )
+    if earliest is not None and earliest < min_common_prefix:
+        reasons.append(
+            f"diverges at index {earliest}, before the {min_common_prefix}-unit "
+            f"shared prefix a near-tie requires"
+        )
+    if len(outlier_slots) > max_outlier_slots:
+        reasons.append(
+            f"{len(outlier_slots)} slots deviate, more than the "
+            f"{max_outlier_slots} tolerated"
+        )
+
+    if not reasons:
         warnings.warn(f"{explanation}\n{detail}\n{NEAR_TIE_NOTE}", stacklevel=2)
         return
 
@@ -351,7 +378,7 @@ def assert_deterministic_allow_near_tie(
         f"{explanation}\n"
         f"Expected reproducible outputs across the batch.\n"
         f"{detail}\n"
-        f"(more than the {max_outlier_slots} slot tolerated as a near-tie)"
+        "Not excusable as a near-tie because: " + "; ".join(reasons)
     )
 
 
@@ -373,8 +400,21 @@ def assert_deterministic_allow_near_tie(
 def count_prompts_changed_by(
     tt_server, tt_model_name, prompts, max_tokens=24, **penalty_kwargs
 ):
-    """Return (n_changed, detail_lines) for greedy output with vs without a penalty."""
+    """Return (n_changed, n_slot_noise, detail_lines) for greedy output ± a penalty.
+
+    Each prompt is run as a TWO-REQUEST batch, so the baseline and the penalised
+    request occupy different slots. Slot position alone can flip a near-tie on TT
+    (that is the whole premise of the near-tie tolerance above), so a raw "changed"
+    count cannot distinguish "the penalty did something" from "the two slots
+    disagreed anyway".
+
+    So every prompt is also run as a CONTROL: the same two-request batch, same
+    width, same slots, both requests UNPENALISED. Any disagreement there is slot
+    noise by construction, and ``n_slot_noise`` is the floor that ``n_changed``
+    has to clear before it means anything.
+    """
     changed = 0
+    slot_noise = 0
     detail = []
     for prompt in prompts:
         base, pen = run_concurrent_batch(
@@ -390,9 +430,23 @@ def count_prompts_changed_by(
                 ),
             ],
         )
+        control_a, control_b = run_concurrent_batch(
+            tt_server,
+            tt_model_name,
+            [
+                RequestConfig(prompt=prompt, max_tokens=max_tokens, temperature=0),
+                RequestConfig(prompt=prompt, max_tokens=max_tokens, temperature=0),
+            ],
+        )
+        noisy = control_a != control_b
+        if noisy:
+            slot_noise += 1
         if base != pen:
             changed += 1
-            detail.append(f"  CHANGED {prompt!r}")
+            detail.append(
+                f"  CHANGED {prompt!r}"
+                + ("   [control also disagreed]" if noisy else "")
+            )
         else:
             detail.append(f"  same    {prompt!r}\n    -> {base!r}")
-    return changed, detail
+    return changed, slot_noise, detail
