@@ -495,10 +495,31 @@ class TTWorker(WorkerBase):
         mesh left open wedges the board's ethernet cores for the *next*
         process ("Timed out while waiting for active ethernet core ... Try
         resetting the board").
+
+        Order matters: the model owns tensors, traces and captures allocated
+        *on* the mesh, so it must go before the mesh closes.
+        ``TTModelRunner.shutdown`` does that explicitly, because a plain ``del``
+        cannot establish the order -- the runner sits in reference cycles and is
+        reclaimed whenever the cyclic collector runs. ``__del__`` stays a
+        best-effort backstop and deliberately does not call it; see the note
+        there. What is not covered is in that method's scope paragraph.
         """
-        runner = getattr(self, "model_runner", None)
-        if runner is not None:
-            runner.shutdown()
+        if getattr(self, "model_runner", None) is not None:
+            try:
+                self.model_runner.shutdown()
+            except Exception:
+                # The close below must not be skipped: a mesh left open wedges
+                # the board for the next process.
+                logger.exception(
+                    "Model runner shutdown failed; closing the mesh anyway"
+                )
+            del self.model_runner
+        # init_device sets these alongside mesh_device, so clearing only
+        # mesh_device would leave two live references to a closed device.
+        self.device = None
+        device_config = getattr(self, "device_config", None)
+        if device_config is not None:
+            device_config.device = None
         mesh_device = getattr(self, "mesh_device", None)
         if mesh_device is not None:
             close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
@@ -519,6 +540,10 @@ class TTWorker(WorkerBase):
 
     def __del__(self):
         # Delete model runner first in case there are model artifacts.
+        # Deliberately does NOT call ``TTModelRunner.shutdown``: from a
+        # destructor that risks raising something this ``suppress`` misses,
+        # which would skip the mesh close below.
+        #
         # Separate suppress blocks: init_device raises between opening the
         # mesh and assigning model_runner (sizing validation), and a missing
         # model_runner must not short-circuit closing the open mesh.

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+import weakref
+from collections import deque
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +14,18 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
+
+
+def _finish_step(runner, held, grammar=None):
+    """Stand-in for the runner-bound finishers queued in ``_pending_samples``."""
+    return held
+
+
+class _Weakrefable:
+    """Attribute bag that supports weak references, unlike SimpleNamespace."""
+
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
 
 
 def _runner(width: int, *, num_tokens: int = 0, max_model_len: int = 32):
@@ -247,10 +262,139 @@ def test_worker_shutdown_closes_mesh_once_across_shutdown_and_del():
         side_effect=lambda mesh_device, _cfg: closed.append(mesh_device),
     ):
         worker.shutdown()
+        # Pin *when*: the first shutdown() closes the mesh itself. Deferring the
+        # close to __del__ would satisfy the counts below, but __del__ is not
+        # guaranteed to run at interpreter exit -- the mesh could stay open and
+        # wedge the board for the next process.
+        assert closed == [mesh]
+        assert worker.mesh_device is None
         worker.shutdown()
         worker.__del__()
 
     assert closed == [mesh]
+
+
+def test_worker_shutdown_releases_the_model_before_closing_the_mesh():
+    """The model owns tensors, traces and captures allocated on the mesh, so
+    they must be released before close_mesh_device -- and dropping references
+    cannot achieve that, since the runner and its async-decode controller
+    reference each other. So observe actual release with weakrefs.
+
+    Every liveness fact is sampled inside the patched close, not asserted after
+    it: "was it released" stays true once true, but "is it still alive" does
+    not, because the runner and its queued step form an isolated cycle any
+    gen-0 pass would collect. Cyclic collection is disabled across the call for
+    the same reason.
+    """
+    import gc
+    from unittest.mock import patch
+
+    at_close: dict = {}
+    order: list[str] = []
+    mesh = SimpleNamespace()
+    worker = TTWorker.__new__(TTWorker)
+    worker.mesh_device = mesh
+    worker.device = mesh
+    worker.device_config = SimpleNamespace(device=mesh)
+    worker.vllm_config = SimpleNamespace(additional_config=None)
+
+    def _attach_runner():
+        """Build the runner in a scope that leaves no strong reference."""
+        runner = TTModelRunner.__new__(TTModelRunner)
+        model = _Weakrefable(
+            release_persistent_capture=lambda: order.append("capture-released")
+        )
+        runner.model = model
+        runner.kv_caches = [SimpleNamespace()]
+        runner._shutdown_complete = False
+        # An async step that ran but was never sampled, with the ``_controller``
+        # back-edge an engine-held output really has.
+        controller = _Weakrefable(runner=runner)
+        in_flight = _Weakrefable(_controller=controller)
+        runner._pending_samples = deque([partial(_finish_step, runner, in_flight)])
+        runner.async_decode = controller
+        worker.model_runner = runner
+        return (
+            weakref.ref(model),
+            weakref.ref(runner),
+            weakref.ref(in_flight),
+            controller,
+        )
+
+    model_ref, runner_ref, in_flight_ref, controller = _attach_runner()
+
+    gc.disable()
+    try:
+        with patch(
+            "vllm_tt_plugin.worker.close_mesh_device",
+            side_effect=lambda _mesh, _cfg: (
+                order.append("mesh-closed"),
+                at_close.update(
+                    model_alive=model_ref() is not None,
+                    in_flight_alive=in_flight_ref() is not None,
+                    runner_alive=runner_ref() is not None,
+                    controller_cut=in_flight_ref()._controller.runner is None,
+                ),
+            ),
+        ):
+            worker.shutdown()
+    finally:
+        gc.enable()
+
+    assert order == ["capture-released", "mesh-closed"]
+    # The safety property: the model is gone before the close, not after.
+    assert at_close["model_alive"] is False
+    assert model_ref() is None
+    # The deliberate leak: an in-flight async read is not freed here.
+    assert at_close["in_flight_alive"] is True
+    assert at_close["runner_alive"] is True
+    # The cut: an engine-held output must not reach a runner whose model is gone.
+    assert controller.runner is None
+    assert at_close["controller_cut"] is True
+    assert not hasattr(worker, "model_runner")
+    assert worker.mesh_device is None
+    assert worker.device is None
+    assert worker.device_config.device is None
+
+
+def test_worker_shutdown_closes_the_mesh_even_if_the_runner_raises():
+    """A failing runner release must not stop the mesh from being closed."""
+    from unittest.mock import patch
+
+    closed = []
+    worker = TTWorker.__new__(TTWorker)
+    worker.mesh_device = SimpleNamespace()
+    worker.device = worker.mesh_device
+    worker.device_config = SimpleNamespace(device=worker.mesh_device)
+    worker.vllm_config = SimpleNamespace(additional_config=None)
+    worker.model_runner = SimpleNamespace(
+        shutdown=lambda: (_ for _ in ()).throw(RuntimeError("device fault"))
+    )
+
+    with patch(
+        "vllm_tt_plugin.worker.close_mesh_device",
+        side_effect=lambda mesh_device, _cfg: closed.append(mesh_device),
+    ):
+        worker.shutdown()
+
+    assert len(closed) == 1
+    assert worker.mesh_device is None
+
+
+def test_runner_shutdown_is_idempotent():
+    """Second call must not re-release the capture."""
+    releases = []
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.model = SimpleNamespace(
+        release_persistent_capture=lambda: releases.append("released")
+    )
+
+    runner.shutdown()
+    runner.shutdown()
+
+    assert releases == ["released"]
+    assert runner.model is None
+    assert runner.kv_caches == []
 
 
 def test_worker_shutdown_releases_admission_handle(monkeypatch):
@@ -271,7 +415,6 @@ def test_worker_shutdown_releases_admission_handle(monkeypatch):
 def test_worker_wrapper_shutdown_releases_persistent_capture_once():
     releases = []
     runner = TTModelRunner.__new__(TTModelRunner)
-    runner._persistent_capture_released = False
     runner.model = SimpleNamespace(
         release_persistent_capture=lambda: releases.append("released")
     )
