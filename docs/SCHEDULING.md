@@ -20,9 +20,10 @@ The current TT path is more specialized than upstream vLLM:
 
 - A TT step is treated as either all-prefill or all-decode.
 - TT does not support mixed prefill+decode batches.
-- Token-chunked prefill is supported, but only for model types whose tt-metal
-  generator can resume a prefill (never for block-output models); a chunk
-  continuation is prefill work and only ever runs in a prefill step.
+- Token-chunked prefill is supported, but only for models whose tt-metal class
+  declares that its generator can resume a prefill (never for block-output
+  models); a chunk continuation is prefill work and only ever runs in a prefill
+  step.
 - CPU-device work overlap is a decode optimization.
 - Standard multi-process DP runs independent per-rank engines.
 - Single-process lane-DP coordinates lanes within one process and executes one
@@ -158,8 +159,9 @@ The reason for this policy is simple: TT wants a homogeneous batch type per
 step.
 
 At configuration time the platform turns requested chunked prefill off for
-every model type whose tt-metal generator cannot resume a prefill — and for
-every block-output model, which cannot resume a split prompt — and zeroes
+every model that does not declare
+`model_capabilities['supports_chunked_prefill']` — and for every block-output
+model, which cannot resume a split prompt — and zeroes
 `long_prefill_token_threshold` (the base scheduler applies that cap before it
 consults `enable_chunked_prefill`, so leaving it set would still split a
 prefill). When chunked prefill is off and `max_num_batched_tokens` is smaller
@@ -169,7 +171,7 @@ prompt can be admitted instead of leaving an unschedulable request in
 
 ### Chunked prefill
 
-For a model type that supports it, the base scheduler may give a long prompt
+For a model that declares support, the base scheduler may give a long prompt
 only part of the token budget. The request then moves to `running` with
 `is_prefill_chunk` set, and later prefill steps schedule the next chunk until
 the prompt is fully computed.
@@ -461,8 +463,8 @@ The current TT path is more constrained:
 
 - it treats prefill and decode as separate batch modes
 - it avoids mixed prefill+decode batches
-- it allows chunked prefill only for model types validated for it, and always
-  on the prefill side of the split
+- it allows chunked prefill only for models that declare support for it, and
+  always on the prefill side of the split
 
 ### 2. Async queueing model
 
