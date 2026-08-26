@@ -76,10 +76,20 @@ bucket has no servable execution shape and the failure is engine-fatal.
 
 Current support is synchronous, DP=1, one active sequence, on-device sampling
 for all model calls, and no scheduler chunked prefill; vLLM automatic prefix
-caching is disabled by the platform. Async scheduling, host sampling, custom
-logits processors, and non-uniproc executors are rejected at launch;
-`prompt_embeds` inputs and streaming-input (resumable) sessions are rejected
-per request; other unsupported per-request controls are listed below.
+caching is disabled by the platform.
+
+Rejected at launch: async scheduling, host sampling, custom logits processors,
+non-uniproc executors, an explicit `--diffusion-config` (the platform derives
+the canvas contract from the model's own capability declaration, so an operator
+copying a launch line from upstream DiffusionGemma documentation must drop that
+flag), and `VLLM_USE_RUST_FRONTEND=1` (that frontend runs HTTP outside Python
+and never calls TT request validation, so nothing would reject the requests
+listed below before they reach the engine).
+
+Rejected per request: streaming-input (resumable) sessions, for block-output
+models only. `prompt_embeds` inputs are rejected too, but that one is
+platform-wide -- every TT model refuses them, not just this one. Other
+unsupported per-request controls are listed below.
 
 HTTP sampling controls are accepted for OpenAI-client compatibility but ignored:
 
