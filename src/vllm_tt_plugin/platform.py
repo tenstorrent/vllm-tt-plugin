@@ -10,6 +10,7 @@ import weakref
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
+import ttnn
 from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
@@ -52,7 +53,12 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
-_TT_TOKEN_TILE_SIZE = 32
+# tt-metal's fixed Tensix tile height. The DiffusionGemma vLLM adapter performs
+# the same tile alignment with ttnn.TILE_SIZE in
+# models/experimental/diffusion_gemma/tt/generator_vllm.py
+# (_aligned_prefill_len and _round_down_to_tile), so admission and the adapter
+# must agree on this hardware-fixed value.
+_TT_TOKEN_TILE_SIZE = ttnn.TILE_SIZE
 _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
     "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
     "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
