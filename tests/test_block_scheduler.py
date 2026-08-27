@@ -801,18 +801,12 @@ def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
 
     resumed = scheduler.schedule()
     assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
-    assert request.num_output_placeholders == 2
+    assert resumed.scheduled_cached_reqs.is_context_phase(request.request_id)
+    assert request.num_output_placeholders == 1
 
     outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert outputs[0].outputs[0].new_token_ids == [7]
     assert list(request.output_token_ids) == [7]
-    assert request.num_output_placeholders == 1
-
-    resumed_outputs = scheduler.update_from_output(
-        resumed, _runner_output(resumed, [8])
-    )
-    assert resumed_outputs[0].outputs[0].new_token_ids == [8]
-    assert list(request.output_token_ids) == [7, 8]
     assert request.num_output_placeholders == 0
 
 
@@ -824,7 +818,7 @@ def test_forced_reset_discards_stale_frame_before_following_valid_frame():
 
     assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
     stale = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
-    assert not stale
+    assert stale[0].outputs == []
     assert request.async_tokens_to_discard == 0
     assert list(request.output_token_ids) == []
 

@@ -282,6 +282,44 @@ def test_finish_front_packed_sync_applies_grammar_before_sampling():
     assert output.sampled.tolist() == [[42]]
 
 
+def test_v0_sync_decode_defers_state_under_upstream_async_scheduler():
+    order: list[str] = []
+
+    def apply_grammar(model_input, grammar_output, *, lane_total):
+        order.append("grammar")
+        return model_input
+
+    def sample_sync(fwd):
+        order.append("sample")
+        return [torch.tensor([[42]], dtype=torch.int32)], []
+
+    def defer_output(sampled, logprobs, **kwargs):
+        order.append("defer")
+        assert kwargs["req_ids"] == ["req-0"]
+        return SimpleNamespace(sampled=sampled)
+
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        # Contract-v0 standard DP disables device async decode, but the engine
+        # still uses AsyncScheduler placeholder accounting.
+        async_decode_scheduling=False,
+        input_batch=SimpleNamespace(req_ids=["req-0"], num_reqs=1),
+        _apply_grammar_to_input=apply_grammar,
+        _sample_sync_forward=sample_sync,
+        defer_state_apply_and_build_runner_output=defer_output,
+        apply_and_build_runner_output=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("async scheduler output must defer runner state")
+        ),
+    )
+
+    output = TTModelRunner._finish_front_packed_sync(
+        runner, _grammar(1), fwd=_sync_forward(_model_input())
+    )
+
+    assert order == ["grammar", "sample", "defer"]
+    assert output.sampled.tolist() == [[42]]
+
+
 def test_finish_front_packed_sync_with_no_forward_builds_empty_output():
     captured: dict = {}
 

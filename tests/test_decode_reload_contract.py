@@ -697,6 +697,58 @@ def test_forced_reset_skips_only_newest_counted_runner_state_frames():
     ]
 
 
+def test_async_scheduled_final_prefill_uses_forced_reset_lifecycle():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    runner.async_decode = controller
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+
+    TTModelRunner._enqueue_deferred_state_apply(
+        runner,
+        torch.tensor([[7]], dtype=torch.int32),
+        ["request"],
+        runner_output,
+    )
+
+    # Sampling completed and its output is publishable, but the runner waits
+    # for the next SchedulerOutput before committing host state.
+    assert request_state.output_token_ids == []
+    assert runner_output.sampled_token_ids == [[7]]
+
+    controller.apply_ready_completed_decode_steps(
+        forced_reset_discard_counts={"request": 1}
+    )
+
+    # The stale prefill frame stays published so AsyncScheduler consumes its
+    # discard counter, while runner state remains at the committed prefix.
+    assert request_state.output_token_ids == []
+    assert runner_output.sampled_token_ids == [[7]]
+
+
+def test_async_scheduled_final_prefill_applies_on_ordinary_next_step():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    runner.async_decode = controller
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+    TTModelRunner._enqueue_deferred_state_apply(
+        runner,
+        torch.tensor([[7]], dtype=torch.int32),
+        ["request"],
+        runner_output,
+    )
+
+    controller.apply_ready_completed_decode_steps()
+
+    assert request_state.output_token_ids == [7]
+    assert runner_output.sampled_token_ids == [[7]]
+
+
 def test_forced_reset_discard_count_requires_all_stale_frames():
     request_state = SimpleNamespace(output_token_ids=[])
     runner = _async_apply_runner(request_state)

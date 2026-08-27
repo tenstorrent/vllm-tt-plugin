@@ -68,7 +68,12 @@ class SubmittedStepContext:
 
 @dataclass
 class CompletedDecodeStep:
-    """Decode output that has completed readback but is not yet applied."""
+    """Sampled output that has completed but is not yet applied to host state.
+
+    Most instances are async decode readbacks. Async-scheduled final prefills
+    also use this lifecycle so a prefix reset can discard their published frame
+    before it reaches runner state.
+    """
 
     sampled_token_ids: torch.Tensor
     logprobs: LogprobsLists | None

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, fields, replace
 from functools import partial
@@ -35,6 +36,7 @@ from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
+    SubmittedStepContext,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.config import (
@@ -328,6 +330,18 @@ class TTModelRunner:
         self.async_decode_scheduling = bool(
             self.scheduler_config.async_scheduling
             and (self.parallel_config.data_parallel_size == 1 or contract_version >= 1)
+        )
+
+    def _uses_async_scheduler(self) -> bool:
+        """Whether upstream publishes outputs through placeholder accounting.
+
+        This is intentionally broader than ``async_decode_scheduling``: a
+        contract-v0 standard-DP runner executes synchronously but still sits
+        behind ``AsyncScheduler`` and therefore needs lifecycle-deferred host
+        state for its sampled outputs.
+        """
+        return bool(
+            getattr(getattr(self, "scheduler_config", None), "async_scheduling", False)
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -1652,8 +1666,13 @@ class TTModelRunner:
                     sampled_token_ids=sampled,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask,
+                    defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
+        if TTModelRunner._uses_async_scheduler(self):
+            return self.defer_state_apply_and_build_runner_output(
+                sampled, logprobs, req_ids=req_ids
+            )
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
@@ -1813,8 +1832,19 @@ class TTModelRunner:
                     sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask.numpy(),
+                    defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
+        if TTModelRunner._uses_async_scheduler(self):
+            return self.defer_state_apply_and_build_runner_output(
+                sampled_token_ids,
+                logprobs,
+                req_ids=(
+                    row_req_ids
+                    if is_prefill
+                    else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+                ),
+            )
         return self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
@@ -1830,6 +1860,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None,
         intermediate_mask: np.ndarray,
         req_id_to_index: dict[str, int] | None = None,
+        defer_state_apply: bool = False,
     ) -> ModelRunnerOutput:
         """Build a prefill output that emits no token for intermediate chunks.
 
@@ -1842,11 +1873,14 @@ class TTModelRunner:
             "request; block-output models must disable chunked prefill"
         )
         final_idx_np = np.where(~intermediate_mask)[0]
+        final_tokens = None
+        final_req_ids: list[str] = []
         if final_idx_np.shape[0] > 0:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
             final_tokens = sampled_token_ids[final_idx_tensor]
             final_req_ids = [req_ids[int(i)] for i in final_idx_np]
-            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+            if not defer_state_apply:
+                self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
 
         num_reqs = len(req_ids)
         sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
@@ -1857,7 +1891,7 @@ class TTModelRunner:
             for i in range(num_reqs)
         ]
 
-        return ModelRunnerOutput(
+        runner_output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=(
                 dict(req_id_to_index)
@@ -1869,6 +1903,11 @@ class TTModelRunner:
             prompt_logprobs_dict=dict.fromkeys(req_ids, None),
             pooler_output=[],
         )
+        if defer_state_apply and final_tokens is not None:
+            self._enqueue_deferred_state_apply(
+                final_tokens, final_req_ids, runner_output
+            )
+        return runner_output
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -2531,6 +2570,52 @@ class TTModelRunner:
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
+
+    def _enqueue_deferred_state_apply(
+        self,
+        sampled_token_ids: torch.Tensor,
+        req_ids: list[str],
+        runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Queue sampled host state until scheduler lifecycle is known.
+
+        Final prefills and contract-v0 decode are sampled synchronously, but
+        under AsyncScheduler their published output is still protected by a
+        placeholder. Queue them beside completed async decodes so a forced
+        prefix reset can leave the published row intact for discard accounting
+        without first appending its stale token to runner state.
+        """
+        now = time.perf_counter_ns()
+        self.async_decode.enqueue_completed_decode_step(
+            CompletedDecodeStep(
+                sampled_token_ids=sampled_token_ids,
+                logprobs=None,
+                context=SubmittedStepContext(
+                    req_ids=list(req_ids),
+                    req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+                    submit_time_ns=now,
+                ),
+                completion_time_ns=now,
+                runner_output=runner_output,
+            )
+        )
+
+    def defer_state_apply_and_build_runner_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None = None,
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        assert req_ids is not None, "deferred synchronous output needs request IDs"
+        runner_output = self._build_runner_output(
+            sampled_token_ids=sampled_token_ids,
+            logprobs=logprobs,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+        )
+        self._enqueue_deferred_state_apply(sampled_token_ids, req_ids, runner_output)
+        return runner_output
 
     def warmup_model(self) -> None:
         # Two-phase warmup: compile first, then capture traces.

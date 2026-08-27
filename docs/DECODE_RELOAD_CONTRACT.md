@@ -139,7 +139,10 @@ prefill replays it. Finished-request rows are suppressed. A wholesale
 marks the exact number of outstanding frames stale, the runner omits only those
 frames from cached host state, and their published rows remain intact so
 vLLM's `async_tokens_to_discard` consumes the stale frames rather than the next
-valid output.
+valid output. Under upstream async scheduling, every synchronously sampled
+output—including final prefill and contract-v0 synchronous decode—joins the
+same deferred host-state queue as async decode readbacks; otherwise a reset
+could count a synchronously applied frame that the runner had no way to reject.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
