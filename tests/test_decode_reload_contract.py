@@ -347,6 +347,7 @@ def test_transition_applies_drained_token_before_host_authoritative_reload():
         token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
     )
     runner = SimpleNamespace(
+        _output_tokens_per_step=1,
         requests={"request": request_state},
         input_batch=input_batch,
         model_config=SimpleNamespace(max_model_len=8),
@@ -585,6 +586,7 @@ def test_invalidated_async_result_updates_neither_runner_nor_published_output():
         req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
     )
     runner = SimpleNamespace(
+        _output_tokens_per_step=1,
         scheduler_config=SimpleNamespace(async_scheduling=True),
         requests={},
         input_batch=SimpleNamespace(
@@ -633,6 +635,7 @@ def test_invalidated_result_ids_come_from_current_scheduler_lifecycle():
 def test_unscheduled_live_request_keeps_accepted_token_in_cached_state():
     request_state = SimpleNamespace(output_token_ids=[])
     runner = SimpleNamespace(
+        _output_tokens_per_step=1,
         requests={"request": request_state},
         input_batch=SimpleNamespace(req_id_to_index={}),
         model_config=SimpleNamespace(max_model_len=8),
