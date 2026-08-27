@@ -26,6 +26,7 @@ logger = init_tt_logger(__name__)
 # request IDs, identify exactly how many newest in-flight frames a wholesale
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
+_TT_UNRESERVED_RESUMED_PREFILL_REQ_IDS_ATTR = "_tt_unreserved_resumed_prefill_req_ids"
 
 
 def set_tt_forced_reset_discard_counts(
@@ -39,6 +40,29 @@ def get_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, int]:
     return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
+
+
+def set_tt_unreserved_resumed_prefill_req_ids(
+    scheduler_output: SchedulerOutput, req_ids: set[str]
+) -> None:
+    if req_ids:
+        setattr(
+            scheduler_output,
+            _TT_UNRESERVED_RESUMED_PREFILL_REQ_IDS_ATTR,
+            frozenset(req_ids),
+        )
+
+
+def get_tt_unreserved_resumed_prefill_req_ids(
+    scheduler_output: SchedulerOutput,
+) -> frozenset[str]:
+    return frozenset(
+        getattr(
+            scheduler_output,
+            _TT_UNRESERVED_RESUMED_PREFILL_REQ_IDS_ATTR,
+            (),
+        )
+    )
 
 
 class TTSchedulingMode(Enum):
@@ -365,6 +389,19 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
+        # Capture this before upstream mutates PREEMPTED requests during
+        # scheduling. When a resume starts with an older output placeholder
+        # outstanding, vLLM does not reserve another placeholder for the
+        # replay's final-prefill sample; that duplicate row must be suppressed.
+        # Keep this signal step-local: UniProc's two-batch queue consumes the
+        # older frame before another prefill chunk can schedule, so a later
+        # final chunk owns a new placeholder and must emit its token.
+        self._resume_with_outstanding_output_req_ids = {
+            request.request_id
+            for request in getattr(self, "requests", {}).values()
+            if request.status == RequestStatus.PREEMPTED
+            and request.num_output_placeholders > 0
+        }
         has_pending_prefill = self._has_pending_prefill()
         # A partial prefill occupies ``running`` but cannot produce a decode
         # token, so it must not make the decode fallback below look viable.
@@ -415,6 +452,12 @@ class TTScheduler(AsyncScheduler):
         if pending_reset_discards:
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        set_tt_unreserved_resumed_prefill_req_ids(
+            scheduler_output,
+            set(resumed_req_ids)
+            & getattr(self, "_resume_with_outstanding_output_req_ids", set()),
+        )
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:

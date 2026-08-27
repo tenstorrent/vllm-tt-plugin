@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.scheduler import set_tt_unreserved_resumed_prefill_req_ids
 
 # region Constants
 VOCAB_SIZE = 64
@@ -125,7 +126,6 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens=[num_computed_tokens],
         num_output_tokens=[0],
     )
-
     model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
 
     assert model_input is not None
@@ -173,6 +173,32 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
         num_computed_tokens + num_scheduled_tokens
     ]
     assert model_input.intermediate_prefill_mask.tolist() == [True]
+
+
+def test_resumed_context_phase_marks_its_unreserved_output_for_suppression():
+    batch, request = _batch_with_one_request(
+        prompt_len=4,
+        output_len=0,
+        num_computed_tokens=0,
+    )
+    runner = _fake_runner(batch, request)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"r": 4}
+    scheduler_output.total_num_scheduled_tokens = 4
+    scheduler_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["r"],
+        resumed_req_ids={"r"},
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[0],
+        num_output_tokens=[0],
+    )
+    set_tt_unreserved_resumed_prefill_req_ids(scheduler_output, {"r"})
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input.suppressed_prefill_output_req_ids == frozenset({"r"})
 
 
 # endregion Prefill classification

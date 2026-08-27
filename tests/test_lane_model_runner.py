@@ -279,7 +279,9 @@ def test_get_output_tokens_skips_all_intermediate_prefill_rows():
 def test_finish_lane_sync_suppresses_intermediate_prefill_output():
     # The chunk ends at position 3 but the request has 8 tokens, so the step
     # contributes KV state only.
-    model_input = SimpleNamespace(prompt_lens=[3])
+    model_input = SimpleNamespace(
+        prompt_lens=[3], suppressed_prefill_output_req_ids=frozenset()
+    )
 
     def extract_output(
         runner, tt_out, tt_log_probs, model_input, scheduled_rows, *, is_decode
@@ -321,6 +323,51 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
     )
 
     assert output.req_ids == ["request"]
+    assert output.sampled_token_ids == [[]]
+
+
+def test_finish_lane_sync_suppresses_resumed_prefill_duplicate():
+    model_input = SimpleNamespace(
+        prompt_lens=[8],
+        suppressed_prefill_output_req_ids=frozenset({"request"}),
+    )
+
+    def extract_output(
+        runner, tt_out, tt_log_probs, model_input, scheduled_rows, *, is_decode
+    ):
+        assert is_decode is False
+        return torch.tensor([[42]], dtype=torch.int32), None
+
+    runner = SimpleNamespace(
+        _apply_grammar_to_input=lambda model_input,
+        grammar_output,
+        *,
+        lane_total: model_input,
+        lane_batch=SimpleNamespace(
+            extract_output=extract_output,
+            req_ids={0: "request"},
+            num_tokens=[8],
+        ),
+        apply_and_build_runner_output=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("duplicate resumed-prefill output must not be applied")
+        ),
+        _output_tokens_per_step=1,
+    )
+    runner._build_chunked_prefill_output = lambda **kwargs: (
+        TTModelRunner._build_chunked_prefill_output(runner, **kwargs)
+    )
+
+    output = TTModelRunner._finish_lane_sync(
+        runner,
+        None,
+        tt_out=object(),
+        tt_log_probs=None,
+        model_input=model_input,
+        scheduled_rows=[0],
+        is_decode=False,
+        lane_total=1,
+    )
+
     assert output.sampled_token_ids == [[]]
 
 

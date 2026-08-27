@@ -65,7 +65,10 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    get_tt_unreserved_resumed_prefill_req_ids,
+)
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -1277,6 +1280,9 @@ class TTModelRunner:
                 # never read, so there is nothing to default in place.
 
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        suppressed_prefill_output_req_ids = get_tt_unreserved_resumed_prefill_req_ids(
+            scheduler_output
+        )
 
         tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
         if not is_prompt and input_tokens.shape[0] > len(req_indices):
@@ -1432,6 +1438,7 @@ class TTModelRunner:
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
+            suppressed_prefill_output_req_ids=suppressed_prefill_output_req_ids,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -1660,12 +1667,16 @@ class TTModelRunner:
                 dtype=np.int64,
             )
             intermediate_mask = prompt_lens < num_tokens
-            if intermediate_mask.any():
+            suppressed = getattr(
+                model_input, "suppressed_prefill_output_req_ids", frozenset()
+            )
+            if intermediate_mask.any() or suppressed:
                 return self._build_chunked_prefill_output(
                     req_ids=req_ids,
                     sampled_token_ids=sampled,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask,
+                    suppressed_req_ids=suppressed,
                     defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
@@ -1826,12 +1837,16 @@ class TTModelRunner:
 
             assert intermediate_mask is not None
 
-            if intermediate_mask.any():
+            suppressed = getattr(
+                fwd.model_input, "suppressed_prefill_output_req_ids", frozenset()
+            )
+            if intermediate_mask.any() or suppressed:
                 return self._build_chunked_prefill_output(
                     req_ids=row_req_ids,
                     sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask.numpy(),
+                    suppressed_req_ids=suppressed,
                     defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
@@ -1861,18 +1876,29 @@ class TTModelRunner:
         intermediate_mask: np.ndarray,
         req_id_to_index: dict[str, int] | None = None,
         defer_state_apply: bool = False,
+        suppressed_req_ids: set[str] | frozenset[str] | None = None,
     ) -> ModelRunnerOutput:
-        """Build a prefill output that emits no token for intermediate chunks.
+        """Build a prefill output with lifecycle-owned rows suppressed.
 
         A request mid-prompt gets ``[]`` so the engine advances its computed
-        tokens without appending output; only rows whose chunk ended the prompt
-        emit a token and are applied to runner state.
+        tokens without appending output. A resumed context-phase request also
+        gets ``[]`` when its older in-flight frame is still outstanding: replay
+        predicts the same logical token and did not reserve another placeholder.
+        Only the remaining final rows emit a token and reach runner state.
         """
         assert self._output_tokens_per_step == 1, (
             "Chunked-prefill output suppression assumes one sampled token per "
             "request; block-output models must disable chunked prefill"
         )
-        final_idx_np = np.where(~intermediate_mask)[0]
+        suppressed = set(suppressed_req_ids or ())
+        emit_mask = np.asarray(
+            [
+                not bool(intermediate_mask[i]) and req_id not in suppressed
+                for i, req_id in enumerate(req_ids)
+            ],
+            dtype=bool,
+        )
+        final_idx_np = np.where(emit_mask)[0]
         final_tokens = None
         final_req_ids: list[str] = []
         if final_idx_np.shape[0] > 0:
@@ -1887,7 +1913,7 @@ class TTModelRunner:
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
         sampled_token_id_lists = [
-            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            [int(sampled_token_ids_np[i])] if emit_mask[i] else []
             for i in range(num_reqs)
         ]
 

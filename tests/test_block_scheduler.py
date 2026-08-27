@@ -36,6 +36,7 @@ from vllm_tt_plugin.config import store_tt_output_tokens_per_step
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
     get_tt_forced_reset_discard_counts,
+    get_tt_unreserved_resumed_prefill_req_ids,
 )
 
 BLOCK_SIZE = 128
@@ -807,6 +808,31 @@ def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
 
     resumed = scheduler.schedule()
     assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
+    assert get_tt_unreserved_resumed_prefill_req_ids(resumed) == frozenset()
+
+
+def test_resume_before_inflight_output_suppresses_duplicate_prefill_frame():
+    scheduler, request, submitted = _scheduled(output_width=1, async_scheduling=True)
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, time.monotonic())
+
+    resumed = scheduler.schedule()
+    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
+    assert get_tt_unreserved_resumed_prefill_req_ids(resumed) == frozenset(
+        {request.request_id}
+    )
+    # Resumed replay did not reserve a second output: its final-prefill sample
+    # predicts the same logical token as the still-valid older frame.
+    assert request.num_output_placeholders == 1
+
+    older = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
+    assert older[0].outputs[0].new_token_ids == [7]
+    assert request.num_output_placeholders == 0
+
+    duplicate = scheduler.update_from_output(resumed, _runner_output(resumed, []))
+    assert duplicate[0].outputs == []
+    assert list(request.output_token_ids) == [7]
+    assert request.num_output_placeholders == 0
 
 
 def test_forced_reset_discards_stale_frame_before_following_valid_frame():
