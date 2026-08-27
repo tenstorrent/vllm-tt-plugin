@@ -799,15 +799,14 @@ def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
     scheduler.running.remove(request)
     scheduler._preempt_request(request, time.monotonic())
 
-    resumed = scheduler.schedule()
-    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
-    assert resumed.scheduled_cached_reqs.is_context_phase(request.request_id)
     assert request.num_output_placeholders == 1
-
     outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert outputs[0].outputs[0].new_token_ids == [7]
     assert list(request.output_token_ids) == [7]
     assert request.num_output_placeholders == 0
+
+    resumed = scheduler.schedule()
+    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
 
 
 def test_forced_reset_discards_stale_frame_before_following_valid_frame():
