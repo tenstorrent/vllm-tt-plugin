@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 from vllm.sampling_params import SamplingType
+from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
@@ -241,12 +242,14 @@ class InputBatch:
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
-            max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             pin_memory=False,
             device="cpu",
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
+            # Per-group max blocks per request; TT runs without context
+            # parallelism (cp_world_size == 1).
+            max_num_blocks=[cdiv(max_model_len, bs) for bs in block_sizes],
         )
 
         self.req_output_token_ids: list[list[int] | None] = []

@@ -24,7 +24,7 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.25.1)
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.26.0)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
@@ -44,7 +44,7 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.25.1` from source with
+The installation script builds vLLM `0.26.0` from source with
 `VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
 
 To install against vLLM `0.24.0` instead, check out the `compat/vllm-0.24.0`
