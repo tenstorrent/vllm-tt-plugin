@@ -139,10 +139,6 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
-# HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
-# prefill, i.e. the ones token-chunked prefill has been validated against.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
-
 
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
@@ -176,20 +172,41 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     scheduler_config.long_prefill_token_threshold = 0
 
 
-def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
-    """Restrict token-chunked prefill to the model types that support it."""
+def _apply_chunked_prefill_policy(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Restrict token-chunked prefill to the models that declare support for it."""
     scheduler_config = vllm_config.scheduler_config
-    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    model_desc = f"TT model {model_class.__name__} ({model_class.__module__})"
 
-    if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
-        # A chunk boundary inside a multimodal item would split its embeddings
-        # from their positions. Only meaningful while prefill can be split, and
-        # vLLM rejects the flag outright when one item exceeds the token budget,
-        # so it stays off for every model type below.
-        scheduler_config.disable_chunked_mm_input = True
+    supports_chunked_prefill = (
+        model_capabilities.get("supports_chunked_prefill", False)
+        if model_capabilities
+        else False
+    )
+    if not supports_chunked_prefill or not scheduler_config.enable_chunked_prefill:
+        _disable_chunked_prefill(vllm_config, model_desc)
         return
 
-    _disable_chunked_prefill(vllm_config, f"`model_type={model_type}`")
+    # A chunk boundary inside a multimodal item would split its embeddings from
+    # their positions. Only meaningful while prefill can be split, and vLLM
+    # rejects the flag outright when one item exceeds the token budget, so it
+    # stays off for every model that does not reach here.
+    scheduler_config.disable_chunked_mm_input = True
+
+    # The only signal from outside the process that chunked prefill is active and
+    # at what budget: the scheduler config is absent from /metrics and an
+    # intermediate chunk emits no token, so it raises no iteration stats either.
+    # CI gates its device tests on this line, so it is logged unconditionally.
+    logger.info(
+        "Chunked prefill enabled for %s: max_num_batched_tokens=%d, "
+        "long_prefill_token_threshold=%d.",
+        model_desc,
+        scheduler_config.max_num_batched_tokens,
+        scheduler_config.long_prefill_token_threshold,
+    )
 
 
 def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
@@ -1443,8 +1460,6 @@ class TTPlatform(Platform):
 
     @classmethod
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        _apply_chunked_prefill_policy(vllm_config)
-
         assert not vllm_config.speculative_config, (
             "Speculative decoding is not yet supported for TT backend"
         )
@@ -1567,6 +1582,10 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # Rewrites scheduler_config; nothing between here and the closing
+        # ``verify_max_model_len`` reads the fields it touches.
+        _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         is_block_output_model = is_tt_block_output_model(vllm_config)
