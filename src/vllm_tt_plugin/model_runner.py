@@ -63,6 +63,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -1451,10 +1452,10 @@ class TTModelRunner:
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """
-        # Update scheduler-owned state before accepting any older async result:
-        # requests finished, preempted, or resumed by this schedule must reject
-        # the speculative token, while continuing requests need it before host
-        # tensors are built.
+        # Update scheduler-owned state before accepting any older async result.
+        # Finished rows reject it. Ordinary preemption/resume keeps a completed
+        # token valid for replay; only a wholesale prefix-cache reset marks its
+        # outstanding frames stale through an explicit scheduler discard count.
         self._update_states(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
@@ -1464,7 +1465,12 @@ class TTModelRunner:
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
         self.async_decode.apply_ready_completed_decode_steps(
-            skip_req_ids=self.async_decode.invalidated_req_ids(scheduler_output)
+            suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
+                scheduler_output
+            ),
+            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ),
         )
         if not scheduler_output.total_num_scheduled_tokens:
             return None
@@ -1511,7 +1517,9 @@ class TTModelRunner:
                 decode_layout_changed=plan.decode_layout_changed,
             )
         )
-        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+        if self.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate, scheduler_output
+        ):
             self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
 
         layout_changed = lane_batch.apply_step_plan(
@@ -1528,7 +1536,12 @@ class TTModelRunner:
                     apply_completed=False
                 )
         self.async_decode.apply_ready_completed_decode_steps(
-            skip_req_ids=self.async_decode.invalidated_req_ids(scheduler_output)
+            suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
+                scheduler_output
+            ),
+            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ),
         )
 
         if not scheduler_output.total_num_scheduled_tokens:
@@ -1666,11 +1679,13 @@ class TTModelRunner:
         # Decide whether the next build can remain one step host-stale before
         # mutating the persistent batch. On a transition, finalize pending work
         # now but defer applying it until ``build_model_input`` has processed
-        # lifecycle events and can reject finished/preempted/resumed rows.
+        # lifecycle events and the forced-reset discard boundary.
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
-        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+        if self.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate, scheduler_output
+        ):
             self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
 
         # Grammar is applied at sample time, so the forward builds without it.

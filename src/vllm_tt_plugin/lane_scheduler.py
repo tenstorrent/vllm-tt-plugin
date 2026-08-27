@@ -48,7 +48,12 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTScheduler,
+    TTSchedulingMode,
+    get_tt_forced_reset_discard_counts,
+    set_tt_forced_reset_discard_counts,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -148,6 +153,7 @@ def merge_lane_scheduler_outputs(
     has_structured_output_requests = False
     pending_structured_output_tokens = False
     num_invalid_spec_tokens: dict[str, int] | None = None
+    forced_reset_discard_counts: dict[str, int] = {}
 
     for out in lane_outputs:
         scheduled_new_reqs.extend(out.scheduled_new_reqs)
@@ -207,9 +213,13 @@ def merge_lane_scheduler_outputs(
             if num_invalid_spec_tokens is None:
                 num_invalid_spec_tokens = {}
             num_invalid_spec_tokens.update(out.num_invalid_spec_tokens)
+        for req_id, count in get_tt_forced_reset_discard_counts(out).items():
+            forced_reset_discard_counts[req_id] = (
+                forced_reset_discard_counts.get(req_id, 0) + count
+            )
 
     total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-    return SchedulerOutput(
+    merged = SchedulerOutput(
         scheduled_new_reqs=scheduled_new_reqs,
         scheduled_cached_reqs=cached,
         num_scheduled_tokens=num_scheduled_tokens,
@@ -224,6 +234,8 @@ def merge_lane_scheduler_outputs(
         pending_structured_output_tokens=pending_structured_output_tokens,
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
+    set_tt_forced_reset_discard_counts(merged, forced_reset_discard_counts)
+    return merged
 
 
 class TTLaneCoordinator(SchedulerInterface):
@@ -554,6 +566,7 @@ class TTLaneCoordinator(SchedulerInterface):
             carried_finished = merged.finished_req_ids
             carried_free_encoder = merged.free_encoder_mm_hashes
             carried_preempted = merged.preempted_req_ids
+            carried_reset_discards = get_tt_forced_reset_discard_counts(merged)
             forced_mode = TTSchedulingMode.DECODE_ONLY
             lane_outputs = self._schedule_all_lanes(forced_mode)
             merged = merge_lane_scheduler_outputs(lane_outputs)
@@ -565,6 +578,13 @@ class TTLaneCoordinator(SchedulerInterface):
                 merged.preempted_req_ids = (
                     merged.preempted_req_ids or set()
                 ) | carried_preempted
+            if carried_reset_discards:
+                current_reset_discards = get_tt_forced_reset_discard_counts(merged)
+                for req_id, count in carried_reset_discards.items():
+                    current_reset_discards[req_id] = (
+                        current_reset_discards.get(req_id, 0) + count
+                    )
+                set_tt_forced_reset_discard_counts(merged, current_reset_discards)
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
         plan = self._build_step_plan(lane_outputs, merged, is_decode)

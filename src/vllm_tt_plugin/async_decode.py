@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -14,6 +15,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 if TYPE_CHECKING:
@@ -300,12 +302,15 @@ class TTAsyncDecodeController:
         )
 
     @staticmethod
-    def invalidated_req_ids(scheduler_output: SchedulerOutput) -> set[str]:
-        """Requests an older in-flight decode result must not update."""
-        invalidated = set(scheduler_output.finished_req_ids)
-        invalidated.update(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
-        invalidated.update(scheduler_output.preempted_req_ids or ())
-        return invalidated
+    def suppressed_output_req_ids(scheduler_output: SchedulerOutput) -> set[str]:
+        """Requests whose older output must not reach scheduler accounting.
+
+        Ordinary preemption and resume deliberately do not appear here: their
+        in-flight token is valid and AsyncScheduler must consume its output
+        placeholder. Forced-reset frames also stay published so
+        ``async_tokens_to_discard`` consumes the stale frame itself.
+        """
+        return set(scheduler_output.finished_req_ids)
 
     def capture_submitted_step_context(
         self, req_ids: list[str] | None = None
@@ -485,10 +490,62 @@ class TTAsyncDecodeController:
         return completed
 
     def apply_ready_completed_decode_steps(
-        self, *, skip_req_ids: set[str] | None = None
+        self,
+        *,
+        suppress_output_req_ids: set[str] | None = None,
+        forced_reset_discard_counts: dict[str, int] | None = None,
     ) -> None:
-        for completed in self.drain_completed_decode_steps():
-            self.apply_completed_decode_step(completed, skip_req_ids=skip_req_ids)
+        completed_steps = self.drain_completed_decode_steps()
+        suppressed = set(suppress_output_req_ids or ())
+        discard_counts = forced_reset_discard_counts or {}
+
+        # An output can already have reached AsyncScheduler while its runner
+        # state apply is still queued. Such accepted frames precede the stale
+        # frames counted at reset time, so skip only the newest N matching rows.
+        remaining_rows: Counter[str] = Counter()
+        for completed in completed_steps:
+            if completed.runner_output is None:
+                continue
+            for req_id in completed.context.req_ids:
+                req_idx = completed.runner_output.req_id_to_index.get(req_id)
+                if (
+                    req_idx is not None
+                    and completed.runner_output.sampled_token_ids[req_idx]
+                ):
+                    remaining_rows[req_id] += 1
+
+        missing = {
+            req_id: count - remaining_rows[req_id]
+            for req_id, count in discard_counts.items()
+            if remaining_rows[req_id] < count
+        }
+        if missing:
+            raise RuntimeError(
+                "Forced-reset async discard boundary is missing completed "
+                f"frames: {missing}"
+            )
+
+        for completed in completed_steps:
+            published_req_ids: set[str] = set()
+            if completed.runner_output is not None:
+                for req_id in completed.context.req_ids:
+                    req_idx = completed.runner_output.req_id_to_index.get(req_id)
+                    if (
+                        req_idx is not None
+                        and completed.runner_output.sampled_token_ids[req_idx]
+                    ):
+                        published_req_ids.add(req_id)
+            forced_reset_rows = {
+                req_id
+                for req_id in published_req_ids
+                if 0 < remaining_rows[req_id] <= discard_counts.get(req_id, 0)
+            }
+            self.apply_completed_decode_step(
+                completed,
+                suppress_output_req_ids=suppressed,
+                skip_state_req_ids=suppressed | forced_reset_rows,
+            )
+            remaining_rows.subtract(published_req_ids)
         self.prune_finished_async_events()
 
     def wait_for_all_pending_async_steps(self, *, apply_completed: bool = True) -> None:
@@ -507,10 +564,17 @@ class TTAsyncDecodeController:
     def must_drain_pending_async_steps(
         self,
         steady_decode_candidate: bool,
+        scheduler_output: SchedulerOutput | None = None,
     ) -> bool:
         with self.runner._steady_decode_lock:
             if not self.runner._pending_async_steps:
                 return False
+            # A wholesale reset marks the already-submitted frames stale. They
+            # must all be present before suffix discard counts are applied.
+            if scheduler_output is not None and get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ):
+                return True
             if not steady_decode_candidate:
                 return True
             return any(
@@ -578,25 +642,29 @@ class TTAsyncDecodeController:
         self,
         completed: CompletedDecodeStep,
         *,
-        skip_req_ids: set[str] | None = None,
+        suppress_output_req_ids: set[str] | None = None,
+        skip_state_req_ids: set[str] | None = None,
     ) -> None:
-        invalid_req_ids = set(skip_req_ids or ())
+        suppressed = set(suppress_output_req_ids or ())
+        skipped_state = set(skip_state_req_ids or ())
         # The batch-queue loop schedules the current step before consuming the
-        # previous future. Scrub invalid rows before scheduler.update_from_output
-        # observes that cached output, not only before runner host-state apply.
+        # previous future. Scrub finished rows before
+        # scheduler.update_from_output observes that cached output. Forced-reset
+        # rows intentionally remain intact: AsyncScheduler must see them to
+        # decrement ``async_tokens_to_discard``.
         if completed.runner_output is not None:
             assert self.runner.scheduler_config.async_scheduling, (
                 "mutating a published runner output is only ordered correctly "
                 "under the batch-queue step loop"
             )
-            for req_id in invalid_req_ids:
+            for req_id in suppressed:
                 req_idx = completed.runner_output.req_id_to_index.get(req_id)
                 if req_idx is not None:
                     completed.runner_output.sampled_token_ids[req_idx] = []
         self.runner._apply_sampled_tokens_to_state(
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
-            skip_req_ids=invalid_req_ids,
+            skip_req_ids=skipped_state,
         )
 
     def submit_async_decode(

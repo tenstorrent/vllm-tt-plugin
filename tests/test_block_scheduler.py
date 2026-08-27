@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +33,10 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import store_tt_output_tokens_per_step
-from vllm_tt_plugin.scheduler import TTScheduler
+from vllm_tt_plugin.scheduler import (
+    TTScheduler,
+    get_tt_forced_reset_discard_counts,
+)
 
 BLOCK_SIZE = 128
 CANVAS = 16
@@ -76,6 +80,7 @@ def _scheduler(
     *,
     diffusion_checkpoint: bool = False,
     max_model_len: int = MAX_MODEL_LEN,
+    async_scheduling: bool = False,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -106,7 +111,7 @@ def _scheduler(
             parallel_config=ParallelConfig(),
             device_config=DeviceConfig(device="cpu"),
         )
-    config.scheduler_config.async_scheduling = False
+    config.scheduler_config.async_scheduling = async_scheduling
     if diffusion_checkpoint:
         # Reproduce the platform hook's post-update state, including
         # invalidation of ModelConfig.is_diffusion's cached True value.
@@ -164,8 +169,9 @@ def _scheduled(
     *,
     output_width: int = CANVAS,
     ignore_eos: bool = True,
+    async_scheduling: bool = False,
 ) -> tuple[TTScheduler, Request, SchedulerOutput]:
-    scheduler = _scheduler(output_width)
+    scheduler = _scheduler(output_width, async_scheduling=async_scheduling)
     request = _request(max_tokens, ignore_eos=ignore_eos)
     scheduler.add_request(request)
     return scheduler, request, scheduler.schedule()
@@ -785,6 +791,46 @@ def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
     assert scheduler.running == []
     assert request.status == RequestStatus.PREEMPTED
     assert request.async_tokens_to_discard == 1
+    assert request.num_output_placeholders == 0
+
+
+def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
+    scheduler, request, submitted = _scheduled(output_width=1, async_scheduling=True)
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, time.monotonic())
+
+    resumed = scheduler.schedule()
+    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
+    assert request.num_output_placeholders == 2
+
+    outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
+    assert outputs[0].outputs[0].new_token_ids == [7]
+    assert list(request.output_token_ids) == [7]
+    assert request.num_output_placeholders == 1
+
+    resumed_outputs = scheduler.update_from_output(
+        resumed, _runner_output(resumed, [8])
+    )
+    assert resumed_outputs[0].outputs[0].new_token_ids == [8]
+    assert list(request.output_token_ids) == [7, 8]
+    assert request.num_output_placeholders == 0
+
+
+def test_forced_reset_discards_stale_frame_before_following_valid_frame():
+    scheduler, request, submitted = _scheduled(output_width=1, async_scheduling=True)
+
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    resumed = scheduler.schedule()
+
+    assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
+    stale = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
+    assert not stale
+    assert request.async_tokens_to_discard == 0
+    assert list(request.output_token_ids) == []
+
+    valid = scheduler.update_from_output(resumed, _runner_output(resumed, [8]))
+    assert valid[0].outputs[0].new_token_ids == [8]
+    assert list(request.output_token_ids) == [8]
     assert request.num_output_placeholders == 0
 
 

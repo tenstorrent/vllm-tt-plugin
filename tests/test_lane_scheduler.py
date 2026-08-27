@@ -19,7 +19,11 @@ from vllm_tt_plugin.lane_scheduler import (
     get_tt_step_plan,
     merge_lane_scheduler_outputs,
 )
-from vllm_tt_plugin.scheduler import TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTSchedulingMode,
+    get_tt_forced_reset_discard_counts,
+    set_tt_forced_reset_discard_counts,
+)
 
 
 class FakeLane:
@@ -182,6 +186,25 @@ def test_decode_fallback_when_forced_prefill_schedules_nothing():
         TTSchedulingMode.PREFILL_ONLY,
         TTSchedulingMode.DECODE_ONLY,
     ]
+
+
+def test_decode_fallback_carries_forced_reset_discard_counts():
+    lane0 = FakeLane(running=1)
+    lane1 = FakeLane(waiting=1)
+    coordinator = _make_coordinator([lane0, lane1])
+    lane_schedule = lane0.schedule
+
+    def _schedule():
+        output = lane_schedule()
+        if lane0.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY:
+            set_tt_forced_reset_discard_counts(output, {"stale": 2})
+        return output
+
+    lane0.schedule = _schedule
+
+    output = coordinator.schedule()
+
+    assert get_tt_forced_reset_discard_counts(output) == {"stale": 2}
 
 
 def test_no_fallback_when_no_running_requests():
@@ -347,6 +370,7 @@ def test_merge_combines_nonempty_lane_outputs():
     lane0.free_encoder_mm_hashes = ["h0"]
     lane0.preempted_req_ids = {"pre-0"}
     lane0.num_invalid_spec_tokens = {"a": 3}
+    set_tt_forced_reset_discard_counts(lane0, {"a": 1})
 
     lane1 = SchedulerOutput.make_empty()
     lane1.scheduled_new_reqs = ["new-b", "new-c"]
@@ -365,6 +389,7 @@ def test_merge_combines_nonempty_lane_outputs():
     lane1.finished_req_ids = {"fin-1"}
     lane1.free_encoder_mm_hashes = ["h1"]
     # lane1 reports no preemption and no invalid spec tokens.
+    set_tt_forced_reset_discard_counts(lane1, {"b": 2})
 
     merged = merge_lane_scheduler_outputs([lane0, lane1])
 
@@ -390,6 +415,7 @@ def test_merge_combines_nonempty_lane_outputs():
     # Optional fields reported by exactly one lane survive the merge.
     assert merged.preempted_req_ids == {"pre-0"}
     assert merged.num_invalid_spec_tokens == {"a": 3}
+    assert get_tt_forced_reset_discard_counts(merged) == {"a": 1, "b": 2}
 
 
 def test_merge_preserves_none_for_absent_optional_fields():

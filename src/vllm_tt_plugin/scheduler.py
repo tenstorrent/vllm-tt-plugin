@@ -20,6 +20,27 @@ from vllm_tt_plugin.logger import init_tt_logger
 logger = init_tt_logger(__name__)
 
 
+# ``SchedulerOutput`` has no backend metadata field. Like lane step state, this
+# TT-only signal is attached to the mutable output object and therefore follows
+# it through the executor serialization boundary. Counts, rather than a set of
+# request IDs, identify exactly how many newest in-flight frames a wholesale
+# prefix-cache reset made stale.
+_TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
+
+
+def set_tt_forced_reset_discard_counts(
+    scheduler_output: SchedulerOutput, counts: dict[str, int]
+) -> None:
+    if counts:
+        setattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts))
+
+
+def get_tt_forced_reset_discard_counts(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, int]:
+    return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
+
+
 class TTSchedulingMode(Enum):
     DEFAULT = "default"
     DECODE_ONLY = "decode_only"
@@ -87,6 +108,7 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        self._pending_forced_reset_discard_counts: dict[str, int] = {}
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         if self._is_block_output_model:
@@ -387,6 +409,12 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
+        pending_reset_discards = getattr(
+            self, "_pending_forced_reset_discard_counts", {}
+        )
+        if pending_reset_discards:
+            set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
+            self._pending_forced_reset_discard_counts = {}
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
@@ -469,7 +497,33 @@ class TTScheduler(AsyncScheduler):
                 logger.error("%s", message)
                 return False
             raise RuntimeError(message)
-        return super().reset_prefix_cache(reset_running_requests, reset_connector)
+        # AsyncScheduler turns every outstanding placeholder into one discard
+        # when it preempts all running requests. Preserve that scheduler-owned
+        # boundary for the runner: the stale frames must still be published so
+        # AsyncScheduler consumes its counters, but must not be appended to the
+        # runner's cached request state before resumed-prefill inputs are built.
+        reset_candidates = (
+            [
+                (request, request.num_output_placeholders)
+                for request in self.running
+                if request.num_output_placeholders > 0
+            ]
+            if reset_running_requests
+            else []
+        )
+        try:
+            return super().reset_prefix_cache(reset_running_requests, reset_connector)
+        finally:
+            for request, placeholder_count in reset_candidates:
+                if (
+                    request.status == RequestStatus.PREEMPTED
+                    and request.async_tokens_to_discard > 0
+                ):
+                    count = min(placeholder_count, request.async_tokens_to_discard)
+                    pending = self._pending_forced_reset_discard_counts
+                    pending[request.request_id] = (
+                        pending.get(request.request_id, 0) + count
+                    )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Reserve the complete physical output emitted by each block step.

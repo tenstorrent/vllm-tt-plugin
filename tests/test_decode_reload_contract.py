@@ -3,6 +3,7 @@
 """Host-only coverage for the explicit TT decode reload contract."""
 
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -580,28 +581,9 @@ def test_contract_v0_keeps_legacy_call_shape_and_warns_once(monkeypatch):
     assert len(warnings) == 1
 
 
-def test_invalidated_async_result_updates_neither_runner_nor_published_output():
-    request_state = SimpleNamespace(output_token_ids=[])
-    runner_output = SimpleNamespace(
-        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
-    )
-    runner = SimpleNamespace(
-        _output_tokens_per_step=1,
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        requests={},
-        input_batch=SimpleNamespace(
-            req_id_to_index={},
-            num_tokens=np.zeros(1, dtype=np.int32),
-            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
-        ),
-        model_config=SimpleNamespace(max_model_len=8),
-    )
-    runner._apply_sampled_tokens_to_state = lambda **kwargs: (
-        TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
-    )
-    controller = TTAsyncDecodeController(runner)
-    completed = CompletedDecodeStep(
-        sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
+def _completed_step(token: int, runner_output=None) -> CompletedDecodeStep:
+    return CompletedDecodeStep(
+        sampled_token_ids=torch.tensor([[token]], dtype=torch.int32),
         logprobs=None,
         context=SubmittedStepContext(
             req_ids=["request"],
@@ -612,24 +594,124 @@ def test_invalidated_async_result_updates_neither_runner_nor_published_output():
         runner_output=runner_output,
     )
 
-    controller.apply_completed_decode_step(completed, skip_req_ids={"request"})
+
+def _async_apply_runner(request_state):
+    runner = SimpleNamespace(
+        _output_tokens_per_step=1,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        requests={"request": request_state},
+        input_batch=SimpleNamespace(
+            req_id_to_index={},
+            num_tokens=np.zeros(1, dtype=np.int32),
+            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+        ),
+        model_config=SimpleNamespace(max_model_len=8),
+        _steady_decode_lock=threading.Lock(),
+        _completed_decode_steps=deque(),
+        _pending_async_steps=deque(),
+        _pending_async_overlap_ok=deque(),
+    )
+    runner._apply_sampled_tokens_to_state = lambda **kwargs: (
+        TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
+    )
+    return runner
+
+
+def test_finished_async_result_updates_neither_runner_nor_published_output():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    completed = _completed_step(7, runner_output)
+
+    controller.apply_completed_decode_step(
+        completed,
+        suppress_output_req_ids={"request"},
+        skip_state_req_ids={"request"},
+    )
 
     assert request_state.output_token_ids == []
     assert runner_output.sampled_token_ids == [[]]
 
 
-def test_invalidated_result_ids_come_from_current_scheduler_lifecycle():
+@pytest.mark.parametrize("lifecycle", ["preempted", "resumed"])
+def test_ordinary_preemption_or_resume_keeps_inflight_token(lifecycle):
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids={"request"} if lifecycle == "preempted" else set(),
+        scheduled_cached_reqs=_cached_reqs(
+            ["request"], resumed=["request"] if lifecycle == "resumed" else []
+        ),
+    )
+
+    controller.apply_completed_decode_step(
+        _completed_step(7, runner_output),
+        suppress_output_req_ids=controller.suppressed_output_req_ids(scheduler_output),
+    )
+
+    assert request_state.output_token_ids == [7]
+    assert runner_output.sampled_token_ids == [[7]]
+
+
+def test_only_finished_result_ids_are_suppressed_from_scheduler_output():
     scheduler_output = SimpleNamespace(
         finished_req_ids={"finished"},
         preempted_req_ids={"preempted"},
         scheduled_cached_reqs=_cached_reqs(["resumed"], resumed=["resumed"]),
     )
 
-    assert TTAsyncDecodeController.invalidated_req_ids(scheduler_output) == {
-        "finished",
-        "preempted",
-        "resumed",
+    assert TTAsyncDecodeController.suppressed_output_req_ids(scheduler_output) == {
+        "finished"
     }
+
+
+def test_forced_reset_skips_only_newest_counted_runner_state_frames():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    outputs = [
+        SimpleNamespace(req_id_to_index={"request": 0}, sampled_token_ids=[[token]])
+        for token in (5, 6, 7)
+    ]
+    runner._completed_decode_steps.extend(
+        _completed_step(token, output) for token, output in zip((5, 6, 7), outputs)
+    )
+
+    controller.apply_ready_completed_decode_steps(
+        forced_reset_discard_counts={"request": 2}
+    )
+
+    assert request_state.output_token_ids == [5]
+    assert [output.sampled_token_ids for output in outputs] == [
+        [[5]],
+        [[6]],
+        [[7]],
+    ]
+
+
+def test_forced_reset_discard_count_requires_all_stale_frames():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    runner._completed_decode_steps.append(
+        _completed_step(
+            7,
+            SimpleNamespace(req_id_to_index={"request": 0}, sampled_token_ids=[[7]]),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="missing completed frames"):
+        controller.apply_ready_completed_decode_steps(
+            forced_reset_discard_counts={"request": 2}
+        )
 
 
 def test_unscheduled_live_request_keeps_accepted_token_in_cached_state():

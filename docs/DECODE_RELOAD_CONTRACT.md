@@ -130,9 +130,16 @@ transition are still represented by `slot_remap`.
 | Adapter without `supports_async_decode` | reload every step | no | on transition | on transition |
 
 Any transition requiring full inputs or sampling-state mutation drains pending
-decode work first. The plugin applies the completed token and advances the host
-position before building authoritative inputs. It rejects an older result for
-a request the current scheduler output finished, preempted, or resumed.
+decode work first. The plugin applies completed tokens and advances host
+positions before building authoritative inputs. An ordinary preemption does
+not invalidate an already-submitted decode: that forward completed against the
+old KV before the blocks were freed, so its token is appended and the resumed
+prefill replays it. Finished-request rows are suppressed. A wholesale
+`reset_prefix_cache(reset_running_requests=True)` is different: the scheduler
+marks the exact number of outstanding frames stale, the runner omits only those
+frames from cached host state, and their published rows remain intact so
+vLLM's `async_tokens_to_discard` consumes the stale frames rather than the next
+valid output.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
@@ -156,8 +163,9 @@ sampled token `t_k` and the resident position is the position at which `t_k`
 must be consumed by step `k+1`.
 
 The base case is a full reload. Before issuing it, the runner finalizes the
-older step, rejects rows invalidated by current scheduler lifecycle events,
-and applies accepted tokens to host request state. It then copies the
+older step, suppresses finished rows, excludes explicitly marked forced-reset
+frames from runner state, and applies every accepted token—including an
+ordinary preemption's in-flight token—to host request state. It then copies the
 authoritative token, position, layout, and requested sampling state.
 
 For the induction step, a steady device decode issues no full or
@@ -173,10 +181,11 @@ invariant and re-establish it through a drain and full reload.
 
 Upstream vLLM replaces each external request id with an internal id carrying a
 random suffix before scheduling, so an ordinary abort and resubmit does not
-reuse a runner id. Rejection is keyed on scheduler lifecycle events rather than
-request-object snapshots: finished, preempted, and resumed ids invalidate the
-outstanding result. Invalid output rows are emptied before the scheduler
-consumes them, preventing both a host-state append and an extra emitted token.
+reuse a runner id. Finished IDs suppress both runner-state append and published
+output. Ordinary preempted/resumed IDs suppress neither. Forced-reset discard
+counts are scheduler-owned sidecar metadata on `SchedulerOutput`; they suppress
+only runner-state append for the newest counted frames, while leaving their
+published rows nonempty for vLLM's discard accounting.
 
 ## Requirements for `decode_input_update_contract = 1`
 
