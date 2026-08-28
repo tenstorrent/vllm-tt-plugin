@@ -8,10 +8,13 @@ on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
 length, forced-mode scheduling, and ``update_from_output``).
 """
 
+import collections
 from types import SimpleNamespace
 
+import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.request import RequestStatus
 
 from vllm_tt_plugin.lane_scheduler import (
     TTLaneCoordinator,
@@ -39,6 +42,7 @@ class FakeLane:
         skipped_waiting=0,
         partial_prefills=0,
         pending_finished=(),
+        owns=(),
     ):
         self.waiting = [object()] * waiting
         self.skipped_waiting = [object()] * skipped_waiting
@@ -51,6 +55,8 @@ class FakeLane:
         self.scheduled_modes: list[TTSchedulingMode] = []
         self.update_calls: list[SchedulerOutput] = []
         self._eco: dict[int, EngineCoreOutputs] = {}
+        self._owned = {r.request_id: r for r in owns}
+        self.finish_calls: list[tuple] = []
 
     def set_forced_mode(self, mode):
         self._mode = mode
@@ -70,6 +76,16 @@ class FakeLane:
     def update_from_output(self, scheduler_output, model_runner_output):
         self.update_calls.append(scheduler_output)
         return self._eco
+
+    def finish_requests(self, request_ids, finished_status):
+        self.finish_calls.append((request_ids, finished_status))
+        if request_ids is None:
+            ids = list(self._owned)
+        elif isinstance(request_ids, str):
+            ids = [request_ids]
+        else:
+            ids = list(request_ids)
+        return [self._owned.pop(rid) for rid in ids if rid in self._owned]
 
 
 def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
@@ -519,3 +535,44 @@ def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():
     # model sizing is left untouched (copied, not aliased/mutated).
     assert global_config.scheduler_config.max_num_seqs == 32
     assert per_lane_config.scheduler_config is not global_config.scheduler_config
+
+
+def _req(rid, client_index=0):
+    return SimpleNamespace(request_id=rid, client_index=client_index)
+
+
+@pytest.mark.parametrize(
+    "request_ids, expected_ids",
+    [
+        (None, ["a0", "a1", "b0"]),  # None -> every held request
+        (["a1", "b0", "gone"], ["a1", "b0"]),  # spans lanes; unheld id no-ops
+        ("a0", ["a0"]),  # single str id
+    ],
+)
+def test_finish_requests_returns_only_owned_no_duplicates(request_ids, expected_ids):
+    # Each lane returns only the requests it holds (a request lives in exactly one
+    # lane), so the coordinator's concatenation is the aborted set with no
+    # duplicates.
+    a0, a1, b0 = _req("a0", 0), _req("a1", 1), _req("b0", 0)
+    owned = {"a0": a0, "a1": a1, "b0": b0}
+    coordinator = _make_coordinator([FakeLane(owns=[a0, a1]), FakeLane(owns=[b0])])
+
+    aborted = coordinator.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    assert aborted == [owned[i] for i in expected_ids]  # exact objects, in lane order
+    assert len({id(r) for r in aborted}) == len(aborted)  # no request returned twice
+
+
+def test_finish_requests_result_is_routable_per_client():
+    # The returned Requests must carry client_index so engine-core's
+    # _send_abort_outputs can notify each client. True end-to-end notification is
+    # covered device-side in tests/tt.
+    lanes = [FakeLane(owns=[_req("a", 0), _req("b", 1)]), FakeLane(owns=[_req("c", 0)])]
+    coordinator = _make_coordinator(lanes)
+
+    aborted = coordinator.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+
+    by_client = collections.defaultdict(set)
+    for r in aborted:
+        by_client[r.client_index].add(r.request_id)
+    assert by_client == {0: {"a", "c"}, 1: {"b"}}
