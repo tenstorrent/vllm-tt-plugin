@@ -513,11 +513,11 @@ class TTAsyncDecodeController:
         For example, suppose request R has finalized rows A then B in this
         queue. A reached ``AsyncScheduler`` before a prefix reset but still
         awaits runner-state apply; B was outstanding at reset, so the scheduler
-        reports ``discard_count[R] = 1``. A is accepted into runner state. B,
-        the newest one matching row, remains published so ``AsyncScheduler``
-        consumes ``async_tokens_to_discard``, but is not appended to runner
-        state. Blank B instead and vLLM would not consume the counter, causing
-        the next valid row to be discarded.
+        reports ``forced_reset_discard_counts[R] = 1``. A is accepted into
+        runner state. B, the newest one matching row, remains published so
+        ``AsyncScheduler`` consumes ``async_tokens_to_discard``, but is not
+        appended to runner state. Blank B instead and vLLM would not consume
+        the counter, causing the next valid row to be discarded.
 
         Finished rows are suppressed from both destinations. Ordinary
         preemption is neither suppressed nor discarded.
