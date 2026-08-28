@@ -500,40 +500,33 @@ class TTAsyncDecodeController:
         suppress_output_req_ids: set[str] | None = None,
         forced_reset_discard_counts: dict[str, int] | None = None,
     ) -> None:
-        """Apply finalized outputs after the next scheduler lifecycle is known.
+        """Apply completed outputs after the scheduler updates request state.
 
-        Finalization and host-state application deliberately straddle batch
-        mutation. A pending step is finalized while its submission layout is
-        still intact because lane output extraction reads that layout. Its
-        token is applied only after the next ``SchedulerOutput`` has updated
-        request lifecycle and layout, exposing finished requests and the exact
-        forced-prefix-reset discard boundary. This method must run before any
-        host-authoritative reload input is built.
+        Finish each pending step before the batch layout changes. Lane output
+        extraction uses the layout from that step. Apply its token after the
+        next ``SchedulerOutput`` updates the request state and batch layout.
+        We then know which requests are finished and which outputs vLLM must
+        discard. Apply these tokens before you build reload inputs from host
+        state.
 
-        A forced prefix-cache reset is
-        ``reset_prefix_cache(reset_running_requests=True)``. Unlike an
-        ordinary cache clear, it preempts every live request so all KV blocks
-        can be freed. It is a control-plane operation used for an explicit
-        live-request reset or pause/sleep with cache clearing, not ordinary
-        scheduler preemption. As part of that wholesale teardown, vLLM resumes
-        from committed token history and declares outstanding submissions
-        stale by counting their placeholders in ``async_tokens_to_discard``.
+        A forced prefix-cache reset calls
+        ``reset_prefix_cache(reset_running_requests=True)``. It preempts live
+        requests and frees their KV blocks. vLLM resumes the requests from
+        saved token history. It records the number of in-flight outputs in
+        ``async_tokens_to_discard``. Do not add those outputs to runner state.
 
-        For example, suppose request R has finalized rows A then B in this
-        queue. A reached ``AsyncScheduler`` before a prefix reset but still
-        awaits runner-state apply; B was outstanding at reset, so the scheduler
-        reports ``forced_reset_discard_counts[R] = 1``. A is accepted into
-        runner state. B, the newest one matching row, remains published so
-        ``AsyncScheduler`` consumes ``async_tokens_to_discard``, but is not
-        appended to runner state. Blank B instead and vLLM would not consume
-        the counter, causing the next valid row to be discarded.
+        For example, request R has completed rows A and B. vLLM accepted A
+        before the reset, but the runner has not applied it. B was in flight at
+        the reset, so ``forced_reset_discard_counts[R]`` is 1. Apply A to runner
+        state. Keep B in the published output so vLLM consumes the discard
+        count, but do not apply B to runner state. If B is blank, vLLM discards
+        the next valid row instead.
 
-        Separately, a late row for a request already reported finished is
-        suppressed from both scheduler output and runner state. This can be a
-        speculative row submitted before an earlier row ended the request, or
-        a row that raced with an abort; the row that actually finished the
-        request was already accepted and is not discarded. Ordinary
-        preemption is neither case and its in-flight token is retained.
+        A request can also have a late row after it ends. The row can be in
+        flight when an earlier row ends the request or when an abort occurs.
+        Remove the late row from the published output. Do not add it to runner
+        state. Keep the row that ended the request. Also keep an in-flight
+        token after an ordinary preemption.
         """
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
