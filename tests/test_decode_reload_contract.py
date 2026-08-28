@@ -743,7 +743,7 @@ def test_forced_reset_discard_count_requires_all_stale_frames():
         )
     )
 
-    with pytest.raises(RuntimeError, match="missing completed frames"):
+    with pytest.raises(RuntimeError, match="Not enough completed outputs"):
         controller.apply_ready_completed_decode_steps(
             forced_reset_discard_counts={"request": 2}
         )

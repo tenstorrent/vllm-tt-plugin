@@ -502,40 +502,48 @@ class TTAsyncDecodeController:
     ) -> None:
         """Apply completed outputs after the scheduler updates request state.
 
-        Finish each pending step before the batch layout changes. Lane output
-        extraction uses the layout from that step. Apply its token after the
-        next ``SchedulerOutput`` updates the request state and batch layout.
-        We then know which requests are finished and which outputs vLLM must
-        discard. Apply these tokens before you build reload inputs from host
-        state.
+        Complete each pending step before the batch layout changes. Lane output
+        extraction needs the layout used for that step. Apply the token only
+        after the next ``SchedulerOutput`` updates request state. This update
+        tells us which tokens are valid. Apply valid tokens before you build
+        reload inputs from host state.
 
         A forced prefix-cache reset calls
         ``reset_prefix_cache(reset_running_requests=True)``. It preempts live
         requests and frees their KV blocks. vLLM resumes the requests from
         saved token history. It records the number of in-flight outputs in
-        ``async_tokens_to_discard``. Do not add those outputs to runner state.
+        ``async_tokens_to_discard``.
 
-        For example, request R has completed rows A and B. vLLM accepted A
-        before the reset, but the runner has not applied it. B was in flight at
-        the reset, so ``forced_reset_discard_counts[R]`` is 1. Apply A to runner
-        state. Keep B in the published output so vLLM consumes the discard
-        count, but do not apply B to runner state. If B is blank, vLLM discards
-        the next valid row instead.
+        "Publish" means that the output stays visible to vLLM. "Apply" means
+        that the runner adds the token to its request state. Use these rules:
 
-        A request can also have a late row after it ends. The row can be in
-        flight when an earlier row ends the request or when an abort occurs.
-        Remove the late row from the published output. Do not add it to runner
-        state. Keep the row that ended the request. Also keep an in-flight
-        token after an ordinary preemption.
+        * Normal output for a live request: publish and apply.
+        * Ordinary preemption or resume: publish and apply.
+        * Forced-reset output: publish, but do not apply. vLLM discards it.
+        * Request already finished or aborted: remove any late output and do
+          not apply it.
+
+        For example, request R has two completed decode results: result A and
+        result B. vLLM accepted result A before the reset, but the runner has
+        not applied its token. Result B was in flight at the reset, so
+        ``forced_reset_discard_counts[R]`` is 1. Apply the token from result A.
+        Publish result B, but do not apply its token. This lets vLLM discard
+        result B and reduce its discard count. If result B is not published,
+        vLLM discards the next valid result instead.
+
+        A late result can occur when an earlier result ends the request. It can
+        also occur when a result is in flight during an abort. The result that
+        ended the request was already accepted. Only the late result is
+        removed.
         """
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
         discard_counts = forced_reset_discard_counts or {}
 
-        # An output can already have reached AsyncScheduler while its runner
-        # state apply is still queued. Such accepted frames precede the stale
-        # frames counted at reset time, so skip only the newest N matching rows.
-        remaining_rows: Counter[str] = Counter()
+        # Results are ordered from oldest to newest. vLLM accepted the older
+        # results before the reset. The discard count applies to the newest
+        # results that were in flight during the reset.
+        remaining_results: Counter[str] = Counter()
         for completed in completed_steps:
             if completed.runner_output is None:
                 continue
@@ -545,17 +553,17 @@ class TTAsyncDecodeController:
                     req_idx is not None
                     and completed.runner_output.sampled_token_ids[req_idx]
                 ):
-                    remaining_rows[req_id] += 1
+                    remaining_results[req_id] += 1
 
         missing = {
-            req_id: count - remaining_rows[req_id]
+            req_id: count - remaining_results[req_id]
             for req_id, count in discard_counts.items()
-            if remaining_rows[req_id] < count
+            if remaining_results[req_id] < count
         }
         if missing:
             raise RuntimeError(
-                "Forced-reset async discard boundary is missing completed "
-                f"frames: {missing}"
+                "Not enough completed outputs for the forced-reset discard "
+                f"counts: {missing}"
             )
 
         for completed in completed_steps:
@@ -568,17 +576,17 @@ class TTAsyncDecodeController:
                         and completed.runner_output.sampled_token_ids[req_idx]
                     ):
                         published_req_ids.add(req_id)
-            forced_reset_rows = {
+            forced_reset_req_ids = {
                 req_id
                 for req_id in published_req_ids
-                if 0 < remaining_rows[req_id] <= discard_counts.get(req_id, 0)
+                if 0 < remaining_results[req_id] <= discard_counts.get(req_id, 0)
             }
             self.apply_completed_decode_step(
                 completed,
                 suppress_output_req_ids=suppressed,
-                skip_state_req_ids=suppressed | forced_reset_rows,
+                skip_state_req_ids=suppressed | forced_reset_req_ids,
             )
-            remaining_rows.subtract(published_req_ids)
+            remaining_results.subtract(published_req_ids)
         self.prune_finished_async_events()
 
     def wait_for_all_pending_async_steps(self) -> None:
@@ -680,11 +688,11 @@ class TTAsyncDecodeController:
         suppressed = set(suppress_output_req_ids or ())
         skipped_state = set(skip_state_req_ids or ())
         # The batch-queue loop schedules the current step before consuming the
-        # previous future. Scrub late rows for request IDs already reported
+        # previous future. Scrub late results for request IDs already reported
         # finished before scheduler.update_from_output observes that cached
-        # output. The row that actually finished the request was already
-        # accepted; these are speculative-after-finish or abort-racing rows.
-        # Forced-reset rows intentionally remain intact: AsyncScheduler must
+        # output. The result that finished the request was already accepted.
+        # These results arrived after finish or raced with an abort.
+        # Forced-reset results stay intact because AsyncScheduler must
         # see them to decrement ``async_tokens_to_discard``.
         if completed.runner_output is not None:
             assert self.runner.scheduler_config.async_scheduling, (
