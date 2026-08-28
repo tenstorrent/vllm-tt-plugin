@@ -28,7 +28,6 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.scheduler import get_tt_unreserved_resumed_prefill_req_ids
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -1344,9 +1343,6 @@ class TTLaneInputBatch(InputBatch):
                 else None
             ),
             intermediate_prefill_mask=intermediate_prefill_mask,
-            suppressed_prefill_output_req_ids=(
-                get_tt_unreserved_resumed_prefill_req_ids(scheduler_output)
-            ),
         )
 
     def extract_output(

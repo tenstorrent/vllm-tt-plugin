@@ -134,12 +134,11 @@ decode work first. The plugin applies completed tokens and advances host
 positions before building authoritative inputs. An ordinary preemption does
 not invalidate an already-submitted decode: that forward completed against the
 old KV before the blocks were freed, so its token is appended. If that frame
-arrives before rescheduling, resumed prefill replays it and legitimately emits
-the following token. If rescheduling happens first, resumed prefill replays
-only the committed sequence and recomputes the same logical token; vLLM does
-not reserve a second placeholder for that duplicate, so the scheduler marks
-that exact resumed step and the plugin suppresses its context-phase row while
-retaining the older valid frame.
+has not arrived yet, the scheduler leaves the preempted request waiting while
+its output placeholder remains outstanding. Once the frame is accounted for,
+resumed prefill replays the accepted token and legitimately emits the following
+token with a fresh placeholder. This also prevents a discarded replay sample
+from advancing the request's seeded host or device RNG state.
 Finished-request rows are suppressed. A wholesale
 `reset_prefix_cache(reset_running_requests=True)` is different: the scheduler
 marks the exact number of outstanding frames stale, the runner omits only those
@@ -192,10 +191,9 @@ Upstream vLLM replaces each external request id with an internal id carrying a
 random suffix before scheduling, so an ordinary abort and resubmit does not
 reuse a runner id. Finished IDs suppress both runner-state append and published
 output. Ordinary preemption never suppresses the older submitted frame. A
-resumed request suppresses only its own context-phase result when the scheduler
-observed an older placeholder before rescheduling, meaning that replay still
-shares the older frame's reservation. The signal is carried on that submitted
-prefill, not inferred later from the request's status.
+preempted request cannot resume while it still owns an output placeholder, so
+resumed prefill always includes the accepted frame in its replay history and
+owns a new reservation for its sampled result.
 Forced-reset discard counts are scheduler-owned sidecar metadata on
 `SchedulerOutput`; they suppress only runner-state append for the newest
 counted frames, while leaving their published rows nonempty for vLLM's discard

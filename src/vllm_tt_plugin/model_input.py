@@ -175,10 +175,3 @@ class TTModelInput:
     # must resolve rows through this. ``None`` for lane builds, whose rows are
     # the persistent slots.
     row_req_ids: list[str] | None = None
-
-    # Prefill-only rows whose sampled output is a duplicate of an older valid
-    # in-flight frame. This occurs when ordinary async preemption is resumed
-    # before that older frame reaches the scheduler: replay rebuilds KV from the
-    # committed sequence, but its final prefill predicts the same logical token
-    # and owns no additional output placeholder.
-    suppressed_prefill_output_req_ids: frozenset[str] = frozenset()

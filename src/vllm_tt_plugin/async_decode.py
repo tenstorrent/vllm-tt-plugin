@@ -553,7 +553,7 @@ class TTAsyncDecodeController:
             remaining_rows.subtract(published_req_ids)
         self.prune_finished_async_events()
 
-    def wait_for_all_pending_async_steps(self, *, apply_completed: bool = True) -> None:
+    def wait_for_all_pending_async_steps(self, *, apply_completed: bool) -> None:
         # Drive each pending readback to completion here rather than blocking on
         # its event: the engine has not popped these futures yet (and on 0.22
         # will not until after this returns), so nothing else will set the

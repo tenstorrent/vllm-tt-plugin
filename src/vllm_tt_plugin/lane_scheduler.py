@@ -52,9 +52,7 @@ from vllm_tt_plugin.scheduler import (
     TTScheduler,
     TTSchedulingMode,
     get_tt_forced_reset_discard_counts,
-    get_tt_unreserved_resumed_prefill_req_ids,
     set_tt_forced_reset_discard_counts,
-    set_tt_unreserved_resumed_prefill_req_ids,
 )
 
 if TYPE_CHECKING:
@@ -156,7 +154,6 @@ def merge_lane_scheduler_outputs(
     pending_structured_output_tokens = False
     num_invalid_spec_tokens: dict[str, int] | None = None
     forced_reset_discard_counts: dict[str, int] = {}
-    unreserved_resumed_prefill_req_ids: set[str] = set()
 
     for out in lane_outputs:
         scheduled_new_reqs.extend(out.scheduled_new_reqs)
@@ -220,9 +217,6 @@ def merge_lane_scheduler_outputs(
             forced_reset_discard_counts[req_id] = (
                 forced_reset_discard_counts.get(req_id, 0) + count
             )
-        unreserved_resumed_prefill_req_ids.update(
-            get_tt_unreserved_resumed_prefill_req_ids(out)
-        )
 
     total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
     merged = SchedulerOutput(
@@ -241,9 +235,6 @@ def merge_lane_scheduler_outputs(
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
     set_tt_forced_reset_discard_counts(merged, forced_reset_discard_counts)
-    set_tt_unreserved_resumed_prefill_req_ids(
-        merged, unreserved_resumed_prefill_req_ids
-    )
     return merged
 
 

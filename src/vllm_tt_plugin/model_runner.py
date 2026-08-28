@@ -65,10 +65,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import (
-    get_tt_forced_reset_discard_counts,
-    get_tt_unreserved_resumed_prefill_req_ids,
-)
+from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -231,8 +228,9 @@ class TTModelRunner:
         self._pending_samples: deque[Any] = deque()
 
         # The platform has already disabled upstream async scheduling when the
-        # registered model lacks async-decode capability. After loading, the
-        # v0 standard-DP rollout guard below may narrow this further.
+        # registered model lacks async-decode capability. After loading, v0
+        # restores the pre-contract runner predicate exactly; v1 keeps this
+        # platform-gated value.
         self.async_decode_scheduling = self.scheduler_config.async_scheduling
         self._steady_decode_lock = threading.Lock()
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
@@ -319,28 +317,34 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
-        self._disable_async_decode_for_v0_standard_dp()
+        self._preserve_v0_async_decode_selection()
 
-    def _disable_async_decode_for_v0_standard_dp(self) -> None:
-        """Preserve the pre-contract synchronous standard-DP runner path.
+    def _preserve_v0_async_decode_selection(self) -> None:
+        """Restore the pre-contract runner-local async predicate for v0.
 
-        The platform capability gate owns the broader async decision. This
-        post-load guard only handles rollout compatibility: v0 standard-DP
-        adapters remain synchronous, while v1 adapters may overlap locally on
-        each independent rank.
+        Before the reload contract the runner enabled its deferred decode path
+        exactly when upstream async scheduling was enabled and its local
+        ``data_parallel_size`` was one. Dense standard-DP engine processes are
+        normalized by upstream to that rank-local value, so they were async too;
+        preserving v0 means retaining that behavior rather than reconstructing
+        the deployment's original DP size here. Contract-v1 adapters keep the
+        broader platform-gated value initialized before model load.
         """
         model = getattr(self, "model", None)
         contract_version = int(getattr(model, "decode_input_update_contract", 0))
-        if self.parallel_config.data_parallel_size > 1 and contract_version < 1:
-            self.async_decode_scheduling = False
+        if contract_version < 1:
+            self.async_decode_scheduling = bool(
+                self.scheduler_config.async_scheduling
+                and self.parallel_config.data_parallel_size == 1
+            )
 
     def _uses_async_scheduler(self) -> bool:
         """Whether upstream publishes outputs through placeholder accounting.
 
-        This is intentionally broader than ``async_decode_scheduling``: a
-        contract-v0 standard-DP runner executes synchronously but still sits
-        behind ``AsyncScheduler`` and therefore needs lifecycle-deferred host
-        state for its sampled outputs.
+        This is intentionally broader than ``async_decode_scheduling``: the
+        legacy v0 runner predicate can narrow deferred device readback while
+        the engine still uses ``AsyncScheduler`` placeholder accounting, whose
+        sampled outputs require lifecycle-deferred host state.
         """
         return bool(
             getattr(getattr(self, "scheduler_config", None), "async_scheduling", False)
@@ -1279,9 +1283,6 @@ class TTModelRunner:
                 # never read, so there is nothing to default in place.
 
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
-        suppressed_prefill_output_req_ids = get_tt_unreserved_resumed_prefill_req_ids(
-            scheduler_output
-        )
 
         tt_sampling_params = slice_tt_sampling_params(sample_params, req_indices)
         if not is_prompt and input_tokens.shape[0] > len(req_indices):
@@ -1437,7 +1438,6 @@ class TTModelRunner:
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
-            suppressed_prefill_output_req_ids=suppressed_prefill_output_req_ids,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -1666,16 +1666,12 @@ class TTModelRunner:
                 dtype=np.int64,
             )
             intermediate_mask = prompt_lens < num_tokens
-            suppressed = getattr(
-                model_input, "suppressed_prefill_output_req_ids", frozenset()
-            )
-            if intermediate_mask.any() or suppressed:
+            if intermediate_mask.any():
                 return self._build_chunked_prefill_output(
                     req_ids=req_ids,
                     sampled_token_ids=sampled,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask,
-                    suppressed_req_ids=suppressed,
                     defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
@@ -1835,17 +1831,12 @@ class TTModelRunner:
             intermediate_mask = fwd.model_input.intermediate_prefill_mask
 
             assert intermediate_mask is not None
-
-            suppressed = getattr(
-                fwd.model_input, "suppressed_prefill_output_req_ids", frozenset()
-            )
-            if intermediate_mask.any() or suppressed:
+            if intermediate_mask.any():
                 return self._build_chunked_prefill_output(
                     req_ids=row_req_ids,
                     sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask.numpy(),
-                    suppressed_req_ids=suppressed,
                     defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
@@ -1875,26 +1866,19 @@ class TTModelRunner:
         intermediate_mask: np.ndarray,
         req_id_to_index: dict[str, int] | None = None,
         defer_state_apply: bool = False,
-        suppressed_req_ids: set[str] | frozenset[str] | None = None,
     ) -> ModelRunnerOutput:
-        """Build a prefill output with lifecycle-owned rows suppressed.
+        """Build a prefill output with intermediate rows suppressed.
 
         A request mid-prompt gets ``[]`` so the engine advances its computed
-        tokens without appending output. A resumed context-phase request also
-        gets ``[]`` when its older in-flight frame is still outstanding: replay
-        predicts the same logical token and did not reserve another placeholder.
-        Only the remaining final rows emit a token and reach runner state.
+        tokens without appending output. Only final rows emit a token and reach
+        runner state.
         """
         assert self._output_tokens_per_step == 1, (
             "Chunked-prefill output suppression assumes one sampled token per "
             "request; block-output models must disable chunked prefill"
         )
-        suppressed = set(suppressed_req_ids or ())
         emit_mask = np.asarray(
-            [
-                not bool(intermediate_mask[i]) and req_id not in suppressed
-                for i, req_id in enumerate(req_ids)
-            ],
+            [not bool(intermediate_mask[i]) for i in range(len(req_ids))],
             dtype=bool,
         )
         final_idx_np = np.where(emit_mask)[0]

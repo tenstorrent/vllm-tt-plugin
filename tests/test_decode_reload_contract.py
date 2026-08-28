@@ -177,47 +177,51 @@ def test_submit_decode_delivers_page_table_only_refresh():
     assert calls[1]["reset_sampling_state"] is False
 
 
-def test_v0_standard_dp_disables_runner_async_decode():
+def test_v0_preserves_legacy_dp_greater_than_one_disable():
     runner = SimpleNamespace(
         model=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         parallel_config=SimpleNamespace(data_parallel_size=4),
         async_decode_scheduling=True,
     )
 
-    TTModelRunner._disable_async_decode_for_v0_standard_dp(runner)
+    TTModelRunner._preserve_v0_async_decode_selection(runner)
     assert not runner.async_decode_scheduling
 
 
-def test_v1_standard_dp_keeps_runner_async_decode():
+def test_v1_keeps_platform_async_for_dp_greater_than_one():
     runner = SimpleNamespace(
         model=SimpleNamespace(decode_input_update_contract=1),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         parallel_config=SimpleNamespace(data_parallel_size=4),
         async_decode_scheduling=True,
     )
 
-    TTModelRunner._disable_async_decode_for_v0_standard_dp(runner)
+    TTModelRunner._preserve_v0_async_decode_selection(runner)
     assert runner.async_decode_scheduling
 
 
-def test_v0_single_process_keeps_runner_async_decode():
+def test_v0_keeps_legacy_rank_local_async_decode():
     runner = SimpleNamespace(
         model=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
         parallel_config=SimpleNamespace(data_parallel_size=1),
         async_decode_scheduling=True,
     )
 
-    TTModelRunner._disable_async_decode_for_v0_standard_dp(runner)
+    TTModelRunner._preserve_v0_async_decode_selection(runner)
     assert runner.async_decode_scheduling
 
 
-def test_disabled_upstream_async_stays_disabled_for_v1_standard_dp():
+def test_disabled_upstream_async_stays_disabled_for_v1():
     runner = SimpleNamespace(
         model=SimpleNamespace(decode_input_update_contract=1),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         parallel_config=SimpleNamespace(data_parallel_size=4),
         async_decode_scheduling=False,
     )
 
-    TTModelRunner._disable_async_decode_for_v0_standard_dp(runner)
+    TTModelRunner._preserve_v0_async_decode_selection(runner)
     assert not runner.async_decode_scheduling
 
 
