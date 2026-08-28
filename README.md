@@ -45,12 +45,12 @@ vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
 The installation script builds vLLM `0.26.0` from source with
-`VLLM_TARGET_DEVICE=empty`. Other vLLM versions are not tested.
+`VLLM_TARGET_DEVICE=empty`.
 
-To install against vLLM `0.24.0` instead, check out the `compat/vllm-0.24.0`
-tag, the last plugin state that targets it, and follow the same steps. Nothing
-is maintained on top of that tag. Pair it with the tt-metal commit the LLMs
-table lists for it.
+To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),
+check out the `compat/vllm-X.Y.Z` tag (e.g., `compat/vllm-0.25.1`), the last plugin state
+that targets it, and follow the same steps. Nothing is maintained on top of that tag for now.
+Pair it with the tt-metal commit the LLMs table lists for it.
 
 ## Environment Setup
 
