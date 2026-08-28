@@ -1450,9 +1450,11 @@ class TTModelRunner:
         TTModelInput from it's own scheduler output.
         """
         # Update scheduler-owned state before accepting any older async result.
-        # Finished rows reject it. Ordinary preemption/resume keeps a completed
-        # token valid for replay; only a wholesale prefix-cache reset marks its
-        # outstanding frames stale through an explicit scheduler discard count.
+        # Late rows for request IDs already reported finished are rejected; the
+        # row that actually finished the request was accepted earlier. Ordinary
+        # preemption/resume keeps a completed token valid for replay; only a
+        # wholesale prefix-cache reset marks its outstanding frames stale
+        # through an explicit scheduler discard count.
         self._update_states(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1

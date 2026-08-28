@@ -308,7 +308,7 @@ class TTAsyncDecodeController:
 
     @staticmethod
     def suppressed_output_req_ids(scheduler_output: SchedulerOutput) -> set[str]:
-        """Requests whose older output must not reach scheduler accounting.
+        """Requests whose late output must not reach scheduler accounting.
 
         Ordinary preemption and resume deliberately do not appear here: their
         in-flight token is valid and AsyncScheduler must consume its output
@@ -510,10 +510,14 @@ class TTAsyncDecodeController:
         forced-prefix-reset discard boundary. This method must run before any
         host-authoritative reload input is built.
 
-        A forced-reset stale frame is a submission still outstanding when
-        ``reset_prefix_cache(reset_running_requests=True)`` invalidates the
-        running request's KV and replay state. vLLM counts those outstanding
-        placeholders in ``async_tokens_to_discard``.
+        A forced prefix-cache reset is
+        ``reset_prefix_cache(reset_running_requests=True)``. Unlike an
+        ordinary cache clear, it preempts every live request so all KV blocks
+        can be freed. It is a control-plane operation used for an explicit
+        live-request reset or pause/sleep with cache clearing, not ordinary
+        scheduler preemption. As part of that wholesale teardown, vLLM resumes
+        from committed token history and declares outstanding submissions
+        stale by counting their placeholders in ``async_tokens_to_discard``.
 
         For example, suppose request R has finalized rows A then B in this
         queue. A reached ``AsyncScheduler`` before a prefix reset but still
@@ -524,8 +528,12 @@ class TTAsyncDecodeController:
         appended to runner state. Blank B instead and vLLM would not consume
         the counter, causing the next valid row to be discarded.
 
-        Finished rows are suppressed from both destinations. Ordinary
-        preemption is neither suppressed nor discarded.
+        Separately, a late row for a request already reported finished is
+        suppressed from both scheduler output and runner state. This can be a
+        speculative row submitted before an earlier row ended the request, or
+        a row that raced with an abort; the row that actually finished the
+        request was already accepted and is not discarded. Ordinary
+        preemption is neither case and its in-flight token is retained.
         """
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
@@ -679,10 +687,12 @@ class TTAsyncDecodeController:
         suppressed = set(suppress_output_req_ids or ())
         skipped_state = set(skip_state_req_ids or ())
         # The batch-queue loop schedules the current step before consuming the
-        # previous future. Scrub finished rows before
-        # scheduler.update_from_output observes that cached output. Forced-reset
-        # rows intentionally remain intact: AsyncScheduler must see them to
-        # decrement ``async_tokens_to_discard``.
+        # previous future. Scrub late rows for request IDs already reported
+        # finished before scheduler.update_from_output observes that cached
+        # output. The row that actually finished the request was already
+        # accepted; these are speculative-after-finish or abort-racing rows.
+        # Forced-reset rows intentionally remain intact: AsyncScheduler must
+        # see them to decrement ``async_tokens_to_discard``.
         if completed.runner_output is not None:
             assert self.runner.scheduler_config.async_scheduling, (
                 "mutating a published runner output is only ordered correctly "

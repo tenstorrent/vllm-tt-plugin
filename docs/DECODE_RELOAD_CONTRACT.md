@@ -144,15 +144,24 @@ remains outstanding. Once the frame is accounted for, resumed prefill replays
 the accepted token and legitimately emits the following token with a fresh
 placeholder. This also prevents a discarded replay sample from advancing the
 request's seeded host or device RNG state.
-Finished-request rows are suppressed. A wholesale
-`reset_prefix_cache(reset_running_requests=True)` is different: the scheduler
-marks the exact number of outstanding frames stale, the runner omits only those
+Late rows for a request ID already reported finished are suppressed. Such a row
+can have been submitted before an earlier row ended the request, or can have
+raced with an abort; the row that actually finished the request was already
+accepted and is not discarded. A forced prefix-cache reset is different.
+Ordinary `reset_prefix_cache()` only succeeds when running requests no longer
+hold KV blocks. `reset_prefix_cache(reset_running_requests=True)` instead
+preempts live requests so all KV blocks can be freed. This wholesale path is a
+control-plane operation used by an explicit live-request reset or by
+pause/sleep with cache clearing; normal request completion, scheduler
+preemption, and cache eviction do not enter it. As part of the teardown, the
+scheduler resumes each request from committed token history and marks the
+exact number of its outstanding frames stale. The runner omits only those
 frames from cached host state, and their published rows remain intact so
 vLLM's `async_tokens_to_discard` consumes the stale frames rather than the next
-valid output. Under upstream async scheduling, every synchronously sampled
-final-prefill output joins the same deferred host-state queue as async decode
-readbacks; otherwise a reset could count a synchronously applied frame that the
-runner had no way to reject.
+valid output. Under upstream async scheduling, every
+synchronously sampled final-prefill output joins the same deferred host-state
+queue as async decode readbacks; otherwise a reset could count a synchronously
+applied frame that the runner had no way to reject.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
@@ -176,10 +185,11 @@ sampled token `t_k` and the resident position is the position at which `t_k`
 must be consumed by step `k+1`.
 
 The base case is a full reload. Before issuing it, the runner finalizes the
-older step, suppresses finished rows, excludes explicitly marked forced-reset
-frames from runner state, and applies every accepted token—including an
-ordinary preemption's in-flight token—to host request state. It then copies the
-authoritative token, position, layout, and requested sampling state.
+older step, suppresses late rows for request IDs already reported finished,
+excludes explicitly marked forced-reset frames from runner state, and applies
+every accepted token—including an ordinary preemption's in-flight token—to
+host request state. It then copies the authoritative token, position, layout,
+and requested sampling state.
 
 For the induction step, a steady device decode issues no full or
 sampling-state reload. The trace consumes resident `t_k`, writes exactly one KV
