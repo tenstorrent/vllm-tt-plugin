@@ -130,39 +130,42 @@ transition are still represented by `slot_remap`.
 | Adapter without `supports_async_decode` | reload every step | no | on transition | on transition |
 
 Any transition requiring full inputs or sampling-state mutation drains pending
-decode work first. The plugin applies completed tokens and advances host
-positions before building authoritative inputs. Finalization and host-state
-application deliberately straddle the scheduler update: the older step is
-finalized while its submission layout is still intact because lane output
-extraction reads that layout, then its token is applied after the next
-`SchedulerOutput` identifies finished requests and the exact forced-reset
-discard boundary. An ordinary preemption does not invalidate an
-already-submitted decode: that forward completed against the old KV before the
-blocks were freed, so its token is appended. If that frame has not arrived yet,
-the scheduler leaves the preempted request waiting while its output placeholder
-remains outstanding. Once the frame is accounted for, resumed prefill replays
-the accepted token and legitimately emits the following token with a fresh
-placeholder. This also prevents a discarded replay sample from advancing the
-request's seeded host or device RNG state.
-Late results for a request ID already reported finished are suppressed. Such a
-result can have been submitted before an earlier result ended the request, or
-can have raced with an abort; the result that actually finished the request was
-already accepted and is not discarded. A forced prefix-cache reset is
-different.
-Ordinary `reset_prefix_cache()` only succeeds when running requests no longer
-hold KV blocks. `reset_prefix_cache(reset_running_requests=True)` instead
-preempts live requests so all KV blocks can be freed. This wholesale path is a
-control-plane operation used by an explicit live-request reset or by
-pause/sleep with cache clearing; normal request completion, scheduler
-preemption, and cache eviction do not enter it. As part of the teardown, the
-scheduler resumes each request from committed token history and marks the
-exact number of its outstanding frames stale. The runner omits only those
-frames from cached host state, and their published results remain intact so
-vLLM's `async_tokens_to_discard` consumes the stale frames rather than the next
-valid output. Under upstream async scheduling, every
-synchronously sampled final-prefill output joins the same deferred host-state
-queue as async decode readbacks; otherwise a reset could count a synchronously
-applied frame that the runner had no way to reject.
+decode work first. Complete a pending step before the batch layout changes.
+Lane output extraction needs the layout used to submit that step. Apply its
+token only after the next `SchedulerOutput` updates request state. Apply all
+valid tokens before building reload inputs from host state.
+
+"Publish" means that a decode result stays visible to vLLM. "Apply" means that
+the runner adds its token to local request state. The plugin uses these rules:
+
+- Normal result for a live request: publish and apply.
+- Ordinary preemption or resume: publish and apply.
+- Forced-reset result: publish, but do not apply. vLLM discards it.
+- Request already finished or aborted: remove any late result and do not apply
+  it. The result that ended the request was already accepted.
+
+An ordinary preemption does not invalidate an in-flight decode. Its forward
+completed before the KV blocks were reused, so its token is valid. If its
+result is still in flight, the scheduler does not resume the request. After
+vLLM accepts the result, resumed prefill includes the token and gets a new
+output placeholder. This prevents two physical results from using one
+placeholder. It also prevents an extra sample from advancing seeded RNG state.
+
+A forced prefix-cache reset calls
+`reset_prefix_cache(reset_running_requests=True)`. It preempts live requests so
+all KV blocks can be freed. vLLM resumes each request from committed token
+history and records the number of in-flight results in its upstream
+`Request.async_tokens_to_discard` field. The plugin keeps those results visible
+to vLLM, but does not add their tokens to local request state. If the plugin
+removes one of these results, vLLM cannot reduce the discard count and discards
+the next valid result instead. This control path is used by an explicit
+live-request reset or by pause/sleep with cache clearing. Normal completion,
+ordinary scheduler preemption, and cache eviction do not use it. An ordinary
+`reset_prefix_cache()` only succeeds when no running request holds KV blocks.
+
+Under upstream async scheduling, a synchronously sampled final-prefill result
+uses the same deferred state-apply queue as an async decode result. This lets a
+forced reset reject its token before the runner adds it to local state.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
@@ -187,7 +190,7 @@ must be consumed by step `k+1`.
 
 The base case is a full reload. Before issuing it, the runner finalizes the
 older step, suppresses late results for request IDs already reported finished,
-excludes explicitly marked forced-reset frames from runner state, and applies
+excludes explicitly marked forced-reset results from runner state, and applies
 every accepted token—including an ordinary preemption's in-flight token—to
 host request state. It then copies the authoritative token, position, layout,
 and requested sampling state.
@@ -203,17 +206,22 @@ Host sampling always returns to the base case. Prefill and request-layout,
 sampling-mode, preemption, and resume transitions also break the steady
 invariant and re-establish it through a drain and full reload.
 
-Upstream vLLM replaces each external request id with an internal id carrying a
-random suffix before scheduling, so an ordinary abort and resubmit does not
-reuse a runner id. Finished IDs suppress both runner-state append and published
-output. Ordinary preemption never suppresses the older submitted frame. A
-preempted request cannot resume while it still owns an output placeholder, so
-resumed prefill always includes the accepted frame in its replay history and
-owns a new reservation for its sampled result.
+By default, upstream vLLM adds a random suffix to each external request ID
+before scheduling. An abort and resubmit therefore gets a new runner ID. The
+upstream `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION` setting disables this safety;
+when it is set, the caller must keep active and resubmitted IDs unique.
+
+When `SchedulerOutput` reports that a request is finished, the plugin removes
+any later result that vLLM has not consumed and does not add its token to runner
+state. The result that finished the request was already accepted. Ordinary
+preemption does not suppress its in-flight result. A preempted request cannot
+resume while it owns an output placeholder. Resumed prefill therefore includes
+the accepted token and owns a new placeholder for its next result.
+
 Forced-reset discard counts are scheduler-owned sidecar metadata on
-`SchedulerOutput`; they suppress only runner-state append for the newest
-counted frames, while leaving their published rows nonempty for vLLM's discard
-accounting.
+`SchedulerOutput`. They prevent runner-state updates for only the newest
+counted results. The results stay visible to vLLM so it can reduce its upstream
+discard count.
 
 ## Requirements for `decode_input_update_contract = 1`
 
