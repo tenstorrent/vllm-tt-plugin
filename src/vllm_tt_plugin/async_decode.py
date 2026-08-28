@@ -510,6 +510,11 @@ class TTAsyncDecodeController:
         forced-prefix-reset discard boundary. This method must run before any
         host-authoritative reload input is built.
 
+        A forced-reset stale frame is a submission still outstanding when
+        ``reset_prefix_cache(reset_running_requests=True)`` invalidates the
+        running request's KV and replay state. vLLM counts those outstanding
+        placeholders in ``async_tokens_to_discard``.
+
         For example, suppose request R has finalized rows A then B in this
         queue. A reached ``AsyncScheduler`` before a prefix reset but still
         awaits runner-state apply; B was outstanding at reset, so the scheduler
