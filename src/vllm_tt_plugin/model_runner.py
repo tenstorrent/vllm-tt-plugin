@@ -230,10 +230,10 @@ class TTModelRunner:
         # correct even with one forward in flight.
         self._pending_samples: deque[Any] = deque()
 
-        # Standard-DP version 0 was synchronous before the explicit contract;
-        # keep it so until the loaded adapter can prove it understands which
-        # host inputs are authoritative. ``load_model`` refreshes this for v1.
-        self._configure_async_decode_scheduling()
+        # The platform has already disabled upstream async scheduling when the
+        # registered model lacks async-decode capability. After loading, the
+        # v0 standard-DP rollout guard below may narrow this further.
+        self.async_decode_scheduling = self.scheduler_config.async_scheduling
         self._steady_decode_lock = threading.Lock()
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
@@ -319,21 +319,20 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
-        self._configure_async_decode_scheduling()
+        self._disable_async_decode_for_v0_standard_dp()
 
-    def _configure_async_decode_scheduling(self) -> None:
-        """Select this runner's async path without changing engine config.
+    def _disable_async_decode_for_v0_standard_dp(self) -> None:
+        """Preserve the pre-contract synchronous standard-DP runner path.
 
-        Each standard-DP rank owns an independent submission stream, so v1 can
-        overlap locally with no gather or vote. A version-0 standard-DP adapter
-        keeps the pre-contract synchronous runner path.
+        The platform capability gate owns the broader async decision. This
+        post-load guard only handles rollout compatibility: v0 standard-DP
+        adapters remain synchronous, while v1 adapters may overlap locally on
+        each independent rank.
         """
         model = getattr(self, "model", None)
         contract_version = int(getattr(model, "decode_input_update_contract", 0))
-        self.async_decode_scheduling = bool(
-            self.scheduler_config.async_scheduling
-            and (self.parallel_config.data_parallel_size == 1 or contract_version >= 1)
-        )
+        if self.parallel_config.data_parallel_size > 1 and contract_version < 1:
+            self.async_decode_scheduling = False
 
     def _uses_async_scheduler(self) -> bool:
         """Whether upstream publishes outputs through placeholder accounting.
