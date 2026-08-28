@@ -131,23 +131,28 @@ transition are still represented by `slot_remap`.
 
 Any transition requiring full inputs or sampling-state mutation drains pending
 decode work first. The plugin applies completed tokens and advances host
-positions before building authoritative inputs. An ordinary preemption does
-not invalidate an already-submitted decode: that forward completed against the
-old KV before the blocks were freed, so its token is appended. If that frame
-has not arrived yet, the scheduler leaves the preempted request waiting while
-its output placeholder remains outstanding. Once the frame is accounted for,
-resumed prefill replays the accepted token and legitimately emits the following
-token with a fresh placeholder. This also prevents a discarded replay sample
-from advancing the request's seeded host or device RNG state.
+positions before building authoritative inputs. Finalization and host-state
+application deliberately straddle the scheduler update: the older step is
+finalized while its submission layout is still intact because lane output
+extraction reads that layout, then its token is applied after the next
+`SchedulerOutput` identifies finished requests and the exact forced-reset
+discard boundary. An ordinary preemption does not invalidate an
+already-submitted decode: that forward completed against the old KV before the
+blocks were freed, so its token is appended. If that frame has not arrived yet,
+the scheduler leaves the preempted request waiting while its output placeholder
+remains outstanding. Once the frame is accounted for, resumed prefill replays
+the accepted token and legitimately emits the following token with a fresh
+placeholder. This also prevents a discarded replay sample from advancing the
+request's seeded host or device RNG state.
 Finished-request rows are suppressed. A wholesale
 `reset_prefix_cache(reset_running_requests=True)` is different: the scheduler
 marks the exact number of outstanding frames stale, the runner omits only those
 frames from cached host state, and their published rows remain intact so
 vLLM's `async_tokens_to_discard` consumes the stale frames rather than the next
 valid output. Under upstream async scheduling, every synchronously sampled
-output—including final prefill and contract-v0 synchronous decode—joins the
-same deferred host-state queue as async decode readbacks; otherwise a reset
-could count a synchronously applied frame that the runner had no way to reject.
+final-prefill output joins the same deferred host-state queue as async decode
+readbacks; otherwise a reset could count a synchronously applied frame that the
+runner had no way to reject.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
@@ -258,8 +263,11 @@ adapter's previous overlap behavior, and emits a one-time warning. Existing
 standalone-plugin `slot_remap` delivery in both sampling modes is unchanged.
 The exact v0 drain points are also preserved: new v1 residency, sampling-mode,
 and context-phase checks do not make a legacy adapter drain more often.
-Standard-DP v0 runners remain on their prior synchronous path; independent
-per-rank overlap is enabled only after the loaded adapter negotiates version 1.
+Contract version does not select async scheduling. The platform gates it on
+`supports_async_decode`; both standard-DP ranks and lane-DP runners have a local
+`data_parallel_size` of one and retain their existing eligibility. TT rejects
+the remaining upstream case that would expose `data_parallel_size > 1` to a
+runner: standard-DP MoE.
 
 | Plugin | tt-metal adapter | Result |
 | --- | --- | --- |

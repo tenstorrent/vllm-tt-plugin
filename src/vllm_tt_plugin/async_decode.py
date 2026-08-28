@@ -500,6 +500,28 @@ class TTAsyncDecodeController:
         suppress_output_req_ids: set[str] | None = None,
         forced_reset_discard_counts: dict[str, int] | None = None,
     ) -> None:
+        """Apply finalized outputs after the next scheduler lifecycle is known.
+
+        Finalization and host-state application deliberately straddle batch
+        mutation. A pending step is finalized while its submission layout is
+        still intact because lane output extraction reads that layout. Its
+        token is applied only after the next ``SchedulerOutput`` has updated
+        request lifecycle and layout, exposing finished requests and the exact
+        forced-prefix-reset discard boundary. This method must run before any
+        host-authoritative reload input is built.
+
+        For example, suppose request R has finalized rows A then B in this
+        queue. A reached ``AsyncScheduler`` before a prefix reset but still
+        awaits runner-state apply; B was outstanding at reset, so the scheduler
+        reports ``discard_count[R] = 1``. A is accepted into runner state. B,
+        the newest one matching row, remains published so ``AsyncScheduler``
+        consumes ``async_tokens_to_discard``, but is not appended to runner
+        state. Blank B instead and vLLM would not consume the counter, causing
+        the next valid row to be discarded.
+
+        Finished rows are suppressed from both destinations. Ordinary
+        preemption is neither suppressed nor discarded.
+        """
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
         discard_counts = forced_reset_discard_counts or {}
@@ -553,7 +575,8 @@ class TTAsyncDecodeController:
             remaining_rows.subtract(published_req_ids)
         self.prune_finished_async_events()
 
-    def wait_for_all_pending_async_steps(self, *, apply_completed: bool) -> None:
+    def wait_for_all_pending_async_steps(self) -> None:
+        """Finalize pending readbacks without applying them to runner state."""
         # Drive each pending readback to completion here rather than blocking on
         # its event: the engine has not popped these futures yet (and on 0.22
         # will not until after this returns), so nothing else will set the
@@ -563,8 +586,6 @@ class TTAsyncDecodeController:
             steps = list(self.runner._pending_async_steps)
         for step in steps:
             step.ensure_finalized()
-        if apply_completed:
-            self.apply_ready_completed_decode_steps()
 
     def must_drain_pending_async_steps(
         self,

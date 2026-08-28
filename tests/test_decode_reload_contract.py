@@ -177,54 +177,6 @@ def test_submit_decode_delivers_page_table_only_refresh():
     assert calls[1]["reset_sampling_state"] is False
 
 
-def test_v0_preserves_legacy_dp_greater_than_one_disable():
-    runner = SimpleNamespace(
-        model=SimpleNamespace(),
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        parallel_config=SimpleNamespace(data_parallel_size=4),
-        async_decode_scheduling=True,
-    )
-
-    TTModelRunner._preserve_v0_async_decode_selection(runner)
-    assert not runner.async_decode_scheduling
-
-
-def test_v1_keeps_platform_async_for_dp_greater_than_one():
-    runner = SimpleNamespace(
-        model=SimpleNamespace(decode_input_update_contract=1),
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        parallel_config=SimpleNamespace(data_parallel_size=4),
-        async_decode_scheduling=True,
-    )
-
-    TTModelRunner._preserve_v0_async_decode_selection(runner)
-    assert runner.async_decode_scheduling
-
-
-def test_v0_keeps_legacy_rank_local_async_decode():
-    runner = SimpleNamespace(
-        model=SimpleNamespace(),
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        async_decode_scheduling=True,
-    )
-
-    TTModelRunner._preserve_v0_async_decode_selection(runner)
-    assert runner.async_decode_scheduling
-
-
-def test_disabled_upstream_async_stays_disabled_for_v1():
-    runner = SimpleNamespace(
-        model=SimpleNamespace(decode_input_update_contract=1),
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        parallel_config=SimpleNamespace(data_parallel_size=4),
-        async_decode_scheduling=False,
-    )
-
-    TTModelRunner._preserve_v0_async_decode_selection(runner)
-    assert not runner.async_decode_scheduling
-
-
 def test_v0_preserves_host_to_device_overlap_predicate():
     common_runner = dict(
         async_decode_scheduling=True,

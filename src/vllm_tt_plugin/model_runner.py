@@ -228,9 +228,8 @@ class TTModelRunner:
         self._pending_samples: deque[Any] = deque()
 
         # The platform has already disabled upstream async scheduling when the
-        # registered model lacks async-decode capability. After loading, v0
-        # restores the pre-contract runner predicate exactly; v1 keeps this
-        # platform-gated value.
+        # registered model lacks async-decode capability. Contract negotiation
+        # selects reload semantics, not async eligibility.
         self.async_decode_scheduling = self.scheduler_config.async_scheduling
         self._steady_decode_lock = threading.Lock()
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
@@ -317,34 +316,12 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
-        self._preserve_v0_async_decode_selection()
-
-    def _preserve_v0_async_decode_selection(self) -> None:
-        """Restore the pre-contract runner-local async predicate for v0.
-
-        Before the reload contract the runner enabled its deferred decode path
-        exactly when upstream async scheduling was enabled and its local
-        ``data_parallel_size`` was one. Dense standard-DP engine processes are
-        normalized by upstream to that rank-local value, so they were async too;
-        preserving v0 means retaining that behavior rather than reconstructing
-        the deployment's original DP size here. Contract-v1 adapters keep the
-        broader platform-gated value initialized before model load.
-        """
-        model = getattr(self, "model", None)
-        contract_version = int(getattr(model, "decode_input_update_contract", 0))
-        if contract_version < 1:
-            self.async_decode_scheduling = bool(
-                self.scheduler_config.async_scheduling
-                and self.parallel_config.data_parallel_size == 1
-            )
 
     def _uses_async_scheduler(self) -> bool:
         """Whether upstream publishes outputs through placeholder accounting.
 
-        This is intentionally broader than ``async_decode_scheduling``: the
-        legacy v0 runner predicate can narrow deferred device readback while
-        the engine still uses ``AsyncScheduler`` placeholder accounting, whose
-        sampled outputs require lifecycle-deferred host state.
+        Synchronously produced outputs such as final prefills still require
+        lifecycle-deferred host state when the engine uses ``AsyncScheduler``.
         """
         return bool(
             getattr(getattr(self, "scheduler_config", None), "async_scheduling", False)
@@ -1483,7 +1460,7 @@ class TTModelRunner:
         ):
             # Preserve the legacy path's drain point: version-0 adapters still
             # own reload policy and receive reset_batch after batch mutation.
-            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
+            self.async_decode.wait_for_all_pending_async_steps()
         self.async_decode.apply_ready_completed_decode_steps(
             suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
                 scheduler_output
@@ -1540,7 +1517,7 @@ class TTModelRunner:
         if self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
-            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
+            self.async_decode.wait_for_all_pending_async_steps()
 
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
@@ -1552,9 +1529,7 @@ class TTModelRunner:
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
             if self.async_decode.decode_input_update_contract_version() < 1:
-                self.async_decode.wait_for_all_pending_async_steps(
-                    apply_completed=False
-                )
+                self.async_decode.wait_for_all_pending_async_steps()
         self.async_decode.apply_ready_completed_decode_steps(
             suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
                 scheduler_output
@@ -1711,7 +1686,7 @@ class TTModelRunner:
         if self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
-            self.async_decode.wait_for_all_pending_async_steps(apply_completed=False)
+            self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = self.build_model_input(scheduler_output, None)
@@ -2588,11 +2563,11 @@ class TTModelRunner:
     ) -> None:
         """Queue sampled host state until scheduler lifecycle is known.
 
-        Final prefills and contract-v0 decode are sampled synchronously, but
-        under AsyncScheduler their published output is still protected by a
-        placeholder. Queue them beside completed async decodes so a forced
-        prefix reset can leave the published row intact for discard accounting
-        without first appending its stale token to runner state.
+        Final prefills are sampled synchronously, but under AsyncScheduler their
+        published output is still protected by a placeholder. Queue them beside
+        completed async decodes so a forced prefix reset can leave the published
+        row intact for discard accounting without first appending its stale
+        token to runner state.
         """
         now = time.perf_counter_ns()
         self.async_decode.enqueue_completed_decode_step(
