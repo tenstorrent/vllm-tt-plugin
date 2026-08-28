@@ -12,6 +12,12 @@ on:
     - cron: "0 6 * * 1"   # Mondays, 06:00 UTC
   workflow_dispatch: {}
 
+# Serialize runs so an overlapping schedule + manual dispatch can't both pass the
+# dedup check and double-create. cancel-in-progress: false queues rather than kills.
+concurrency:
+  group: vllm-release-watch
+  cancel-in-progress: false
+
 permissions:
   contents: read
   issues: write
@@ -28,8 +34,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Source of truth for what the plugin currently targets.
-          pinned=$(grep -oE 'vllm==[0-9]+\.[0-9]+\.[0-9]+' docs/install-vllm-tt.sh | head -1 | cut -d '=' -f3)
+          # Source of truth for what the plugin currently targets. Capture the full
+          # version token (not just X.Y.Z) so a .postN / rcN suffix is preserved.
+          pinned=$(sed -nE 's/.*vllm==([^[:space:]]+).*/\1/p' docs/install-vllm-tt.sh | head -1)
           # Latest stable upstream release (prereleases are excluded by the API).
           latest=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name | sed 's/^v//')
           if [ -z "$pinned" ] || [ -z "$latest" ]; then
@@ -59,10 +66,14 @@ jobs:
         run: |
           set -euo pipefail
           title="vLLM v${LATEST} compatibility assessment"
-          # Dedup: skip when an open issue already names this version.
-          count=$(gh issue list --state open --search "vLLM v${LATEST} in:title" --json number --jq 'length')
-          if [ "${count:-0}" -gt 0 ]; then
-            echo "issue already open for v${LATEST}; nothing to do."
+          # Dedup — mainly to stop the weekly schedule re-filing the same issue
+          # until the pin is bumped. Use the list endpoint (not --search, which is
+          # eventually consistent and can lag), scoped by our label; --state all so
+          # a version's issue is never re-created even after it is closed.
+          exists=$(gh issue list --state all --label type:compatibility --limit 200 \
+            --json title --jq "map(select(.title == \"$title\")) | length")
+          if [ "${exists:-0}" -gt 0 ]; then
+            echo "issue already exists for v${LATEST}; nothing to do."
             exit 0
           fi
           # Auto-fill the one section CI can compute without analysis: the

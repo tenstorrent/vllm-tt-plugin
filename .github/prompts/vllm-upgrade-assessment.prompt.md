@@ -35,8 +35,8 @@ otherwise the phases below stand alone.
   `python -c "import importlib.util as u; print(u.find_spec('vllm_tt_plugin').origin)"`.
   Confirm it is the tree you intend to assess.
 - Derive BASELINE from the repo, not the environment: the pin in `docs/install-vllm-tt.sh`
-  — `grep -oE 'vllm==[0-9]+\.[0-9]+\.[0-9]+' docs/install-vllm-tt.sh`. That is the version
-  the checkout targets.
+  — `sed -nE 's/.*vllm==([^[:space:]]+).*/\1/p' docs/install-vllm-tt.sh` (capture the full
+  version token, including any `.postN`/`rcN` suffix). That is the version the checkout targets.
 - Gate on installed == pin: `python -c "import vllm; print(vllm.__version__)"` (ignore any
   `+empty`/local suffix). On a **mismatch** the environment has drifted and the installed
   tree is the wrong baseline — never diff against it, and never auto-rebuild the venv (that
