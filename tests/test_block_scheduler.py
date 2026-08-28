@@ -772,7 +772,7 @@ def test_deferred_keep_reset_returns_false_without_preempting_block_request():
     )
     assert scheduler.running == [request]
     assert request.status == RequestStatus.RUNNING
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
 
 
 def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
@@ -784,7 +784,7 @@ def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
     )
     assert scheduler.running == []
     assert request.status == RequestStatus.PREEMPTED
-    assert request.async_tokens_to_discard == 1
+    assert request.drop_stale_output is True
     assert request.num_output_placeholders == 0
 
 
@@ -792,7 +792,7 @@ def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
     ("mutate", "width", "exc", "match"),
     [
         pytest.param(
-            lambda r: setattr(r, "async_tokens_to_discard", 1),
+            lambda r: setattr(r, "num_stale_output_tokens", r.num_in_flight_tokens),
             CANVAS,
             RuntimeError,
             "stale async output",

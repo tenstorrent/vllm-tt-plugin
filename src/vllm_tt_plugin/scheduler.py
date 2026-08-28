@@ -66,8 +66,9 @@ class TTScheduler(AsyncScheduler):
       strict queue, and every async op is forced to complete before the next
       prefill, so no later write can reach the KV they were computed against.
       The base class appends them on arrival and the resumed prefill replays
-      them. ``Request.async_tokens_to_discard`` serves the wholesale
-      ``reset_prefix_cache`` teardown only; wiring ordinary preemption into it
+      them. Only the wholesale ``reset_prefix_cache`` teardown discards them
+      (upstream marks the request with ``drop_stale_output`` /
+      ``num_stale_output_tokens``); wiring ordinary preemption into that path
       drops valid tokens and silently truncates the response.
 
     Supports ``set_forced_mode`` for lane coordination:
@@ -490,12 +491,14 @@ class TTScheduler(AsyncScheduler):
                 request.num_output_placeholders += extra_placeholders
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int]
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
-            return super()._update_request_with_output(request, new_token_ids)
-        if request.async_tokens_to_discard:
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
+        if is_stale:
             raise RuntimeError(
                 "A stale async output reached synchronous block serving; "
                 "block-output async scheduling and running prefix resets are "
