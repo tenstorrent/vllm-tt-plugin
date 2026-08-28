@@ -24,7 +24,8 @@ break it — assess the actual source, never infer from release notes (those are
 index, not truth). Investigate read-only first; edit only once the plan is clear.
 
 - **TARGET** — the vLLM tag to move to (e.g. `v0.28.0`); default = latest upstream release.
-- **BASELINE** — the vLLM version the plugin currently targets (the installed one).
+- **BASELINE** — the vLLM version the checkout targets: the pin in
+  `docs/install-vllm-tt.sh`, not merely whatever happens to be installed.
 
 If tt-buddy skills are available, use `tt:learn`/`tt:note` and subagents as accelerants;
 otherwise the phases below stand alone.
@@ -33,14 +34,27 @@ otherwise the phases below stand alone.
 - Activate the tt-metal venv, then resolve the installed checkout (the only authority):
   `python -c "import importlib.util as u; print(u.find_spec('vllm_tt_plugin').origin)"`.
   Confirm it is the tree you intend to assess.
-- Record BASELINE: `python -c "import vllm; print(vllm.__version__)"` and the installed
-  source dir (`.../site-packages/vllm/`). Confirm `import ttnn` works.
+- Derive BASELINE from the repo, not the environment: the pin in `docs/install-vllm-tt.sh`
+  — `grep -oE 'vllm==[0-9]+\.[0-9]+\.[0-9]+' docs/install-vllm-tt.sh`. That is the version
+  the checkout targets.
+- Gate on installed == pin: `python -c "import vllm; print(vllm.__version__)"` (ignore any
+  `+empty`/local suffix). On a **mismatch** the environment has drifted and the installed
+  tree is the wrong baseline — never diff against it, and never auto-rebuild the venv (that
+  mutates the environment and belongs to Phase 5 / explicit consent). Instead:
+  - Report all three versions: installed, pin, TARGET.
+  - **Interactive:** ask the user which is the intended baseline — the repo pin (the usual
+    answer) or the installed version — and proceed only on their answer.
+  - **Unattended** (no one to answer, e.g. an agent picking up the tracking issue):
+    **hard-stop.** Do no assessment; post a blocking note stating the drift (installed vs
+    pin vs TARGET) and that a human must reconcile it (rebuild the pin, or confirm intent)
+    before the assessment can run.
+- Confirm `import ttnn` works; note the installed source dir (`.../site-packages/vllm/`).
 
 ## Phase 1 — Map the coupling surface (the breakage surface)
 Re-derive from the plugin source every time — it evolves. Use the greps below and the
 **Known surface** snapshot as a starting checklist; durable, hard-to-re-derive nuances live
 in **Gotchas** at the end.
-- Imports: `grep -rhnE "^\s*(from|import)\s+vllm" src/`
+- Imports: `grep -rnE "^\s*(from|import)\s+vllm" src/`
 - vLLM subclasses: `grep -rnE "^class [A-Za-z_]+\(" src/` (note which extend vLLM bases).
 - Constructed vLLM dataclasses: grep for `ModelRunnerOutput(`, `SchedulerOutput(`,
   `SamplingMetadata(`, `CachedRequestState(`, `LogprobsTensors(`, `EngineCoreOutputs(`,
@@ -72,7 +86,10 @@ helpers) from source and treat that as authoritative. If a coupling was added or
 the greps catch it and this list will not — update the snapshot when they diverge.
 
 ## Phase 2 — Diff the coupled files (BASELINE vs TARGET)
-- BASELINE side = installed source (exact, local): read `.../site-packages/vllm/<path>`.
+- BASELINE side = the pinned baseline source (per the Phase 0 gate). When installed == pin,
+  read the exact local tree `.../site-packages/vllm/<path>` — fastest and byte-exact.
+  Otherwise read the pinned tag `refs/tags/v<pin>` the same way as TARGET below; never diff
+  against a drifted installed version.
 - TARGET side = upstream at the tag: fetch `vllm/<path>` at `refs/tags/<TARGET>` via your
   GitHub file tool, or `https://raw.githubusercontent.com/vllm-project/vllm/<TARGET>/<path>`.
   No shell `curl`/`gh`/`git` clone needed.
@@ -103,8 +120,8 @@ handling have churned across bumps — check them every time.
 - Low / conditional watch items (behavioral deltas, new optional fields, new default methods).
 
 ## Phase 5 — Validate (only when applying)
-- Static: `uvx ruff@<pyproject pin> check` and `ruff format --check` on changed files;
-  pre-commit runs the same hooks on commit.
+- Static: `uvx ruff@<pyproject pin> check` and `uvx ruff@<pyproject pin> format --check`
+  on changed files (the commit/CI pre-commit job runs these plus the other hooks).
 - Build TARGET: bump `docs/install-vllm-tt.sh`, then (tt-metal venv active)
   `source docs/install-vllm-tt.sh` — rebuilds vLLM's `empty` target and reinstalls the
   plugin. Re-verify the import origin and `vllm.__version__`.
