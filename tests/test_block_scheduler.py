@@ -657,7 +657,7 @@ def test_engine_level_reset_aborts_running_block_requests():
     )
     assert scheduler.running == []
     assert request.status == RequestStatus.FINISHED_ABORTED
-    assert sent == [[("req-0", 0)]]
+    assert sent == [[request]]
 
 
 def test_engine_reset_patch_requires_resolved_output_width():
