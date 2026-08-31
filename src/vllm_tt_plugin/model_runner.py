@@ -1115,7 +1115,9 @@ class TTModelRunner:
             target_width,
             null_stale_tail=bool(
                 getattr(
-                    getattr(self, "model", None), "tt_null_stale_block_table_tail", False
+                    getattr(self, "model", None),
+                    "tt_null_stale_block_table_tail",
+                    False,
                 )
             ),
         )

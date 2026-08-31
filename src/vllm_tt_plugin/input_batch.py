@@ -1220,7 +1220,9 @@ class TTLaneInputBatch(InputBatch):
             width=runner.max_num_blocks_per_req,
             null_stale_tail=bool(
                 getattr(
-                    getattr(runner, "model", None), "tt_null_stale_block_table_tail", False
+                    getattr(runner, "model", None),
+                    "tt_null_stale_block_table_tail",
+                    False,
                 )
             ),
         )
@@ -1318,7 +1320,9 @@ class TTLaneInputBatch(InputBatch):
             width=runner.max_num_blocks_per_req,
             null_stale_tail=bool(
                 getattr(
-                    getattr(runner, "model", None), "tt_null_stale_block_table_tail", False
+                    getattr(runner, "model", None),
+                    "tt_null_stale_block_table_tail",
+                    False,
                 )
             ),
         )
