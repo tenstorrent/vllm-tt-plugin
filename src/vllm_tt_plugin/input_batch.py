@@ -687,6 +687,19 @@ class InputBatch:
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
             bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            # Zero every column past the row's valid block count. vLLM's
+            # move_row/condense copies only num_blocks entries, so a reused row
+            # keeps the previous occupant's block ids in its tail. Upstream GPU
+            # consumers mask by num_blocks_per_row; the TT path materializes the
+            # full width into device page tables (gemma4 chunked-prefill
+            # continuation slices to full-prompt width), so a stale tail routes
+            # KV writes into another live request's blocks (cross-user KV
+            # clobber, corrupt from decode step 2). Block 0 is the reserved
+            # null block, the same convention as decode row padding (#92).
+            for i, r in enumerate(rows):
+                nb = int(bt.num_blocks_per_row[int(r)])
+                if nb < bt_cpu.shape[1]:
+                    bt_cpu[i, nb:] = 0
             if bt_cpu.shape[1] < width:
                 pad = torch.zeros(
                     bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
