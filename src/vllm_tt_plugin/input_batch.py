@@ -1116,15 +1116,23 @@ class TTLaneInputBatch(InputBatch):
     # ------------------------------------------------------------------
 
     def slot_block_tables(
-        self, rows: list[int], zero_gaps: bool, total: int, width: int
+        self,
+        rows: list[int],
+        zero_gaps: bool,
+        total: int,
+        width: int,
+        null_stale_tail: bool = False,
     ) -> list[torch.Tensor]:
         """Per-group block tables for ``rows`` (one row per slot), each padded
         to ``width`` (``max_num_blocks_per_req``). When ``zero_gaps`` is set,
         rows of ``range(total)`` not in ``rows`` are zeroed (empty decode slots
-        carry no blocks)."""
+        carry no blocks). ``null_stale_tail`` forwards to
+        ``block_tables_for_rows`` (lane mode builds both prefill and decode
+        tables through here, so the opt-in must ride along or lane-mode
+        deployments never execute the fix)."""
         occupied = set(rows)
         sel = list(range(total)) if zero_gaps else rows
-        out = self.block_tables_for_rows(sel, width)
+        out = self.block_tables_for_rows(sel, width, null_stale_tail=null_stale_tail)
         if zero_gaps and len(occupied) < total:
             gap = torch.ones(total, dtype=torch.bool)
             gap[list(occupied)] = False
@@ -1206,7 +1214,15 @@ class TTLaneInputBatch(InputBatch):
         input_tokens = torch.from_numpy(tokens_np)
 
         block_tables_per_group = lane_batch.slot_block_tables(
-            occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
+            occupied,
+            zero_gaps=True,
+            total=total,
+            width=runner.max_num_blocks_per_req,
+            null_stale_tail=bool(
+                getattr(
+                    getattr(runner, "model", None), "tt_null_stale_block_table_tail", False
+                )
+            ),
         )
         rows_all = list(range(total))
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
@@ -1296,7 +1312,15 @@ class TTLaneInputBatch(InputBatch):
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
 
         block_tables_per_group = lane_batch.slot_block_tables(
-            rows, zero_gaps=False, total=0, width=runner.max_num_blocks_per_req
+            rows,
+            zero_gaps=False,
+            total=0,
+            width=runner.max_num_blocks_per_req,
+            null_stale_tail=bool(
+                getattr(
+                    getattr(runner, "model", None), "tt_null_stale_block_table_tail", False
+                )
+            ),
         )
         tt_sampling_params = lane_batch.slot_sampling_params(rows)
         batch_size_per_dp = list(plan.batch_size_per_dp)
