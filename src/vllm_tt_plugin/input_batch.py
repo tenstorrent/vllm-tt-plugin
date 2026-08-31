@@ -678,7 +678,7 @@ class InputBatch:
         return output_token_ids_tensor
 
     def block_tables_for_rows(
-        self, rows: torch.Tensor | list[int], width: int
+        self, rows: torch.Tensor | list[int], width: int, null_stale_tail: bool = False
     ) -> list[torch.Tensor]:
         """Per-group block tables sliced to ``rows`` and right-padded on the
         block dimension to ``width``.
@@ -686,10 +686,25 @@ class InputBatch:
         Constant ``width`` (``max_num_blocks_per_req``) is required for ttnn
         tracing: runtime block tables must match the traced width even when
         their underlying group is narrower.
+
+        ``null_stale_tail`` additionally zeroes every column past each row's
+        valid block count. vLLM's move_row/condense copies only ``num_blocks``
+        entries, so a reused row keeps the previous occupant's block ids in
+        its tail; upstream GPU consumers mask by ``num_blocks_per_row``, but a
+        model that materializes the full width into device page tables (e.g.
+        gemma4's chunked-prefill continuation) would route KV writes into
+        another live request's blocks. Opt-in via the model attribute
+        ``tt_null_stale_block_table_tail`` so models that never consume past
+        the valid count keep today's behavior byte-for-byte.
         """
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
             bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            if null_stale_tail:
+                for i, r in enumerate(rows):
+                    nb = int(bt.num_blocks_per_row[int(r)])
+                    if nb < bt_cpu.shape[1]:
+                        bt_cpu[i, nb:] = 0
             if bt_cpu.shape[1] < width:
                 pad = torch.zeros(
                     bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype

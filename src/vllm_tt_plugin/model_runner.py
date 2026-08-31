@@ -1111,7 +1111,13 @@ class TTModelRunner:
         # block-table widths differ after upstream page-size unification.
         target_width = self.max_num_blocks_per_req
         block_tables_per_group = input_batch.block_tables_for_rows(
-            req_indices, target_width
+            req_indices,
+            target_width,
+            null_stale_tail=bool(
+                getattr(
+                    getattr(self, "model", None), "tt_null_stale_block_table_tail", False
+                )
+            ),
         )
 
         # Group-0 view kept on TTModelInput.block_tables for back-compat with
