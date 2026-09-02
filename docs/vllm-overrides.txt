@@ -17,5 +17,17 @@
 opencv-python-headless==4.11.0.86
 numpy>=1.24.4,<2
 
-# cf. https://github.com/vllm-project/vllm/pull/49797 (vllm v0.28.0 has this)
+# vLLM 0.26.0 reads Gemma 4's head_dim off the global HF config
+# (transformers_utils/model_arch_config_convertor.py get_head_size, and
+# model_executor/models/gemma4.py). transformers 5.15.0 made head_dim a per-layer
+# attribute on heterogeneous configs and raises AmbiguousGlobalPerLayerAttributeError
+# on that read, so google/gemma-4-* fails during ModelConfig construction, before any
+# TT code runs. vLLM 0.28.0 carries the fix (vllm-project/vllm#49797).
+#
+# Retarget this ceiling when the pinned vLLM moves; do not just delete it. common.txt
+# declares no upper bound, so an uncapped install resolves the newest transformers
+# release, which is validated against neither the pinned vLLM nor the tt-metal env
+# (tt_metal/python_env/requirements-dev.txt pins transformers 5.12.1). The floor
+# restates vLLM's own: --override replaces a requirement instead of intersecting it.
+transformers>=5.5.3,<5.15.0
 transformers>=5.5.3,<5.15.0
