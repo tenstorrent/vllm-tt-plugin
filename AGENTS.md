@@ -155,11 +155,27 @@ explicitly, installs it, and then installs vLLM itself with `--no-deps` and
 **When bumping the pinned vLLM version, all of the following must change
 together:**
 
-- `docs/install-vllm-tt.sh`, the `common.txt` URL (line with `v0.x`)
-- `docs/install-vllm-tt.sh`, the `vllm==0.x` install line
-- `README.md`, the stated version
+- `docs/install-vllm-tt.sh`, the `common.txt` URL (the `v0.x` tag)
+- `docs/install-vllm-tt.sh`, the `vllm==0.x` install line. Do **not** touch
+  `torchvision==0.x` a few lines above it: that pin tracks tt-metal's
+  `requirements-dev.txt`, not vLLM, and the two currently carry the same
+  version string by coincidence. A find-and-replace on the version breaks the
+  torch pair.
+- `README.md`, twice: the stated version, and the `launcher.py` line in the
+  package layout. The `compat/vllm-X.Y.Z` guidance below them is generic and
+  stays as it is.
+- `docs/diffusion-gemma.md`, twice: the pinned-build line and the `gemma4`
+  reasoning and tool parsers line.
 - `docs/vllm-overrides.txt`, re-checked against the new `common.txt` (upstream
   may have relaxed the opencv floor)
+
+The pin is spread across a sourced shell script that installs with `--no-deps`,
+so what resolved and what the docs claim can diverge silently. After
+installing, confirm the version rather than trusting the pin:
+
+```bash
+python -c "import vllm; print(vllm.__version__)"
+```
 
 ## 4. Linting, formatting and pre-commit
 
@@ -403,6 +419,10 @@ in this plugin is in bounds; see section 1.
 
 This file is the agent source of truth. It wins over `CONTRIBUTING.md` where
 they disagree (including `git rebase -i` / force-push guidance there).
+
+`CLAUDE.md` exists only because Claude Code reads that name and not
+`AGENTS.md`. It is a one-line `@AGENTS.md` import. Put instructions here, never
+there, or the two toolchains drift.
 
 - Keep it lean. Put operator docs in `docs/` and `README.md`; do not duplicate
   them here.
