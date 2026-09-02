@@ -267,6 +267,8 @@ class TTLaneCoordinator(SchedulerInterface):
         ]
         # No KV connector on TT; surfaced for engine-core attribute access.
         self.connector: KVConnectorBase_V1 | None = None
+        # No encoder-cache connector on TT; required by vLLM EngineCore.
+        self.ec_connector = None
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
