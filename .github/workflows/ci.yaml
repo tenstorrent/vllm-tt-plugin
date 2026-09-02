@@ -48,7 +48,10 @@ jobs:
 
       - name: Install torch
         # Stands in for the tt-metal env, which owns torch in a real install.
-        run: uv pip install torch
+        # Pinned to the version that env pins (tt-metal
+        # tt_metal/python_env/requirements-dev.txt), so the torchvision pin in
+        # install-vllm-tt.sh resolves against the torch it is paired with.
+        run: uv pip install torch==2.11.0
 
       - name: Install vLLM and the plugin
         # The same script the README hands operators, so this job also fails
