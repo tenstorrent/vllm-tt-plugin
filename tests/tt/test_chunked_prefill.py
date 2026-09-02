@@ -26,9 +26,11 @@ import pytest
 
 from tests.tt.utils import RequestConfig, run_concurrent_batch
 
-# The passphrase sits this far into the filler, so a prompt split into several
-# chunks plants it past a boundary and recalling it needs K/V written at a
-# nonzero chunk_start_idx to be correct.
+# The passphrase sits this far into the filler. A prompt of about one budget
+# plants it in the first chunk, so the resumed tail must attend back to the
+# prefix that chunk wrote. A prompt several times the budget plants it past a
+# chunk boundary, so recalling it also needs K/V written at a nonzero
+# chunk_start_idx.
 NEEDLE_POSITION = 0.75
 
 # Four prompts of roughly one budget each overflow every step, so each step
@@ -128,6 +130,29 @@ def test_a_solo_split_prefill_recalls_its_needle(tt_server, tt_model_name, budge
 
     assert _recalled(output, passphrase), (
         f"a solo split prefill lost the passphrase planted {NEEDLE_POSITION:.0%} "
+        f"into its prompt: want {passphrase!r}, got {output!r}"
+    )
+
+
+def test_a_long_split_prefill_recalls_its_needle(tt_server, tt_model_name, budget):
+    """Prompt long enough that a resumed span pins q_chunk_size=256.
+
+    tt_transformers uses q_chunk_size 64 when the padded remaining span is
+    below 2048 and 256 at or above it. The budget-sized solo prompt only
+    resumes a short tail, so it never hits the 256 alignment. Three budgets
+    of filler leave a remaining span that pads to 2048 or more.
+    """
+    passphrase = "cobalt-heron-256"
+    prompt = _needle_prompt(3 * budget, passphrase, seed=0xC402, nonce="Long.\n")
+
+    (output,) = run_concurrent_batch(
+        tt_server,
+        tt_model_name,
+        [RequestConfig(prompt=prompt, max_tokens=24, temperature=0)],
+    )
+
+    assert _recalled(output, passphrase), (
+        f"a long split prefill lost the passphrase planted {NEEDLE_POSITION:.0%} "
         f"into its prompt: want {passphrase!r}, got {output!r}"
     )
 

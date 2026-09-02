@@ -140,6 +140,48 @@ _GALAXY_GENERATOR_VERSIONS = {
 }
 
 
+# vLLM fills an unset ``max_num_batched_tokens`` from this pair when the
+# platform reports no device memory: 2048 for ``vllm serve``, 8192 for ``LLM()``.
+_VLLM_UNSET_MAX_NUM_BATCHED_TOKENS = frozenset({2048, 8192})
+
+
+def _cli_set_max_num_batched_tokens() -> bool:
+    """True when this process was launched with an explicit token budget."""
+    for arg in sys.argv:
+        name, _, _ = arg.partition("=")
+        if name in ("--max-num-batched-tokens", "--max_num_batched_tokens"):
+            return True
+    return False
+
+
+def _raise_vllm_default_token_budget(vllm_config: "VllmConfig") -> None:
+    """Keep a full prompt in one step when the operator did not set a budget.
+
+    Before chunked prefill was capability-gated, Llama/Qwen/Mistral always had
+    it forced off, which made this plugin raise ``max_num_batched_tokens`` to
+    ``max_model_len``. Leaving vLLM's 2048/8192 fallback in place would drop
+    the per-step prefill size by 16x on a 32k model with no flag change. An
+    explicit ``--max-num-batched-tokens`` is left alone.
+    """
+    scheduler_config = vllm_config.scheduler_config
+    max_model_len = vllm_config.model_config.max_model_len
+    budget = scheduler_config.max_num_batched_tokens
+    if budget >= max_model_len:
+        return
+    if budget not in _VLLM_UNSET_MAX_NUM_BATCHED_TOKENS:
+        return
+    if _cli_set_max_num_batched_tokens():
+        return
+    logger.info(
+        "max_num_batched_tokens=%d is vLLM's unset default; raising it to "
+        "max_model_len=%d so a full prompt still fits in one step. Pass "
+        "--max-num-batched-tokens to set the budget.",
+        budget,
+        max_model_len,
+    )
+    scheduler_config.max_num_batched_tokens = max_model_len
+
+
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
     scheduler_config = vllm_config.scheduler_config
@@ -186,8 +228,18 @@ def _apply_chunked_prefill_policy(
         if model_capabilities
         else False
     )
-    if not supports_chunked_prefill or not scheduler_config.enable_chunked_prefill:
-        _disable_chunked_prefill(vllm_config, model_desc)
+    output_tokens_per_step = (
+        model_capabilities.get("output_tokens_per_step", 1) if model_capabilities else 1
+    )
+    if (
+        not supports_chunked_prefill
+        or not scheduler_config.enable_chunked_prefill
+        or output_tokens_per_step > 1
+    ):
+        reason = model_desc
+        if supports_chunked_prefill and output_tokens_per_step > 1:
+            reason = f"{model_desc} (block-output)"
+        _disable_chunked_prefill(vllm_config, reason)
         return
 
     # A chunk boundary inside a multimodal item would split its embeddings from
@@ -195,6 +247,8 @@ def _apply_chunked_prefill_policy(
     # rejects the flag outright when one item exceeds the token budget, so it
     # stays off for every model that does not reach here.
     scheduler_config.disable_chunked_mm_input = True
+
+    _raise_vllm_default_token_budget(vllm_config)
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
@@ -1648,9 +1702,9 @@ class TTPlatform(Platform):
                     + ", ".join(missing_hooks)
                 )
 
-            # Gemma4 autoregressive models support token-chunked prefill, but
-            # block-output models cannot resume a split prompt. Capability wins
-            # over the model-type policy once the output width is known.
+            # Block-output models cannot resume a split prompt. The policy
+            # already disables this from output_tokens_per_step; keep the
+            # same guard after the width is stored on the config.
             _disable_chunked_prefill(vllm_config, "block-output models")
 
             # Independently of the MODELS_CONFIG_MAP hook prevented during

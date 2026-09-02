@@ -160,14 +160,17 @@ step.
 
 At configuration time the platform turns requested chunked prefill off for
 every model that does not declare
-`model_capabilities['supports_chunked_prefill']` — and for every block-output
-model, which cannot resume a split prompt — and zeroes
+`model_capabilities['supports_chunked_prefill']`, and for every block-output
+model, which cannot resume a split prompt, and zeroes
 `long_prefill_token_threshold` (the base scheduler applies that cap before it
 consults `enable_chunked_prefill`, so leaving it set would still split a
 prefill). When chunked prefill is off and `max_num_batched_tokens` is smaller
 than `max_model_len`, it raises that token budget to `max_model_len` so a full
 prompt can be admitted instead of leaving an unschedulable request in
-`waiting`.
+`waiting`. When chunked prefill stays on and the operator did not pass
+`--max-num-batched-tokens`, the same full-prompt budget is kept: vLLM's unset
+defaults of 2048 (`vllm serve`) and 8192 (`LLM()`) would otherwise become the
+per-step size. An explicit `--max-num-batched-tokens` is left alone.
 
 ### Chunked prefill
 
