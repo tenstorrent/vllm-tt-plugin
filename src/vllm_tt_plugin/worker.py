@@ -630,11 +630,22 @@ def get_fabric_config(tt_config, num_devices):
     # Override fabric_config if specified in TT plugin config.
     if tt_config is not None and "fabric_config" in tt_config:
         fabric_config_str = tt_config["fabric_config"]
+        # The FABRIC_2D_TORUS_* variants are 2D routing with deadlock avoidance
+        # along the wrapped axes. They are required, not merely preferred, on a
+        # mesh whose graph descriptor declares a torus: a 2D collective on a
+        # non-degenerate mesh asserts fabric_is_2d unless it is given an
+        # explicit cluster_axis (all_gather_device_operation.cpp:44), so a
+        # torus topology driven with FABRIC_1D_RING cannot run one at all.
+        # Omitting them here meant a model spec had no way to name the fabric
+        # matching its own descriptor.
         fabric_config_map = {
             "DISABLED": ttnn.FabricConfig.DISABLED,
             "FABRIC_1D": ttnn.FabricConfig.FABRIC_1D,
             "FABRIC_1D_RING": ttnn.FabricConfig.FABRIC_1D_RING,
             "FABRIC_2D": ttnn.FabricConfig.FABRIC_2D,
+            "FABRIC_2D_TORUS_X": ttnn.FabricConfig.FABRIC_2D_TORUS_X,
+            "FABRIC_2D_TORUS_Y": ttnn.FabricConfig.FABRIC_2D_TORUS_Y,
+            "FABRIC_2D_TORUS_XY": ttnn.FabricConfig.FABRIC_2D_TORUS_XY,
             "CUSTOM": ttnn.FabricConfig.CUSTOM,
         }
         fabric_config = fabric_config_map.get(fabric_config_str)
