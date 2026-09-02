@@ -18,8 +18,11 @@ license = "Apache-2.0"
 dependencies = ["tblib>=3.1.0"]
 
 [project.optional-dependencies]
-# The plugin runs only inside a tt-metal python_env, which already owns torch,
-# transformers, numpy, and torchvision; restating them here only risks conflicts.
+# The plugin runs only inside a tt-metal env, which already owns torch,
+# transformers, and numpy; restating them here only risks conflicts. torchvision
+# is not among them: the ttnn wheel declares neither torch nor torchvision, so
+# only environments built from tt-metal's requirements-dev.txt happen to carry
+# it, and docs/install-vllm-tt.sh installs it explicitly.
 # qwen-vl-utils is used solely by the offline Qwen-VL example
 # (examples/offline_inference_tt.py), not by the serving path, and the tt-metal
 # env does not provide it.

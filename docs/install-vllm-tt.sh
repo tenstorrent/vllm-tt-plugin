@@ -20,6 +20,16 @@ curl -fsSL \
 uv pip install --override docs/vllm-overrides.txt \
     -r "$VLLM_COMMON_REQUIREMENTS"   # see that file for why. Must read when bumping vllm version!
 rm -f "$VLLM_COMMON_REQUIREMENTS"
+# torchvision is absent from common.txt (requirements/cuda.txt carries it for
+# the CUDA target), yet several vLLM model and processor modules import it
+# unconditionally. Registry inspection imports the module for the resolved
+# architecture, so without torchvision a serve command dies before any TT code
+# runs; transformers' Gemma4 processor reaches it for google/gemma-4-*.
+# --no-deps and the CPU index leave torch alone: this is the torchvision half
+# of the torch pair the tt-metal env fixes, and the default PyPI wheel is the
+# CUDA build.
+uv pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
+    torchvision==0.26.0   # keep in sync with tt-metal requirements-dev.txt
 # --no-binary vllm: the published wheel is the CUDA build, kernels included, so
 # vLLM has to come from source. vLLM ends up declaring no torch dependency, which
 # is intended; torch belongs to the tt-metal env this plugin runs inside.
