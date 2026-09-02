@@ -25,7 +25,10 @@ SLOTS = 8
 def _runner(slots=SLOTS):
     """Fake runner: the state-slot map, the live-request set and the slot capacity."""
     return SimpleNamespace(
-        tt_per_lane_max_num_seqs=slots, _req_state_slot={}, requests={}
+        tt_per_lane_max_num_seqs=slots,
+        _req_state_slot={},
+        _pending_state_slot_settle=None,
+        requests={},
     )
 
 
@@ -37,6 +40,7 @@ def _prefill(runner, row_req_ids):
 
 def _decode(runner, row_req_ids):
     remap = TTModelRunner._decode_state_slot_remap(runner, list(row_req_ids))
+    TTModelRunner.note_decode_state_slots_settled(runner)
     return None if remap is None else remap.tolist()
 
 
@@ -113,12 +117,11 @@ def test_state_follows_the_request_across_row_moves():
     )
 
 
-def test_building_the_decode_remap_advances_the_ownership_map():
-    """Not a pure query: it records the post-gather layout.
+def test_accepting_the_decode_remap_advances_the_ownership_map():
+    """An accepted decode records the post-gather layout.
 
-    So the remap it returns has to reach the device. A caller that built it and then
-    dropped it would leave the map claiming a move that never happened, and every
-    later step would read the wrong slot behind an identity remap.
+    Building only proposes the move; the helper also models successful submission.
+    A raised decode must leave the ownership map at its pre-gather layout.
     """
     r = _runner()
     r._req_state_slot.update({"A": 3, "B": 1})

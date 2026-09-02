@@ -85,13 +85,11 @@ def _captured_runner(width: int, num_tokens: tuple[int, int]):
 def test_captured_ar_capacity_overrun_leaves_batch_unmutated():
     """The deferred-apply path validates every live row before mutating any:
     an oversized AR step on a later row must not leave earlier rows applied."""
-    runner, states, (outputs_a, outputs_b) = _captured_runner(1, (0, 32))
+    runner, _, (outputs_a, outputs_b) = _captured_runner(1, (0, 32))
     tokens = torch.arange(2, dtype=torch.int32).reshape(2, 1)
 
     with pytest.raises(ValueError, match="exceed the max model length"):
-        TTModelRunner._apply_sampled_tokens_to_state(
-            runner, tokens, req_ids=["a", "b"], request_states=states
-        )
+        TTModelRunner._apply_sampled_tokens_to_state(runner, tokens, req_ids=["a", "b"])
 
     # Row 0 fit, but must not have been applied before row 1's rejection.
     assert runner.input_batch.num_tokens.tolist() == [0, 32]
@@ -103,12 +101,10 @@ def test_captured_block_overrun_clips_only_the_overflowing_row():
     """A block canvas past max_model_len must not kill the engine: the
     deferred-apply path keeps only the slice that fits for that row and
     applies the others in full."""
-    runner, states, (outputs_a, outputs_b) = _captured_runner(16, (0, 17))
+    runner, _, (outputs_a, outputs_b) = _captured_runner(16, (0, 17))
     blocks = torch.arange(32, dtype=torch.int32).reshape(2, 16)
 
-    TTModelRunner._apply_sampled_tokens_to_state(
-        runner, blocks, req_ids=["a", "b"], request_states=states
-    )
+    TTModelRunner._apply_sampled_tokens_to_state(runner, blocks, req_ids=["a", "b"])
 
     assert runner.input_batch.num_tokens.tolist() == [16, 32]
     assert runner.input_batch.token_ids_cpu[0, :16].tolist() == list(range(16))

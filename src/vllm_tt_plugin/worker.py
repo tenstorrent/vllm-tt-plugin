@@ -457,7 +457,7 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Run the device forward for a non-DP or lane-DP step.
+        """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None``: the forward leaves a pending sampler that the engine
         finalizes via ``sample_tokens``. The runner dispatches plain

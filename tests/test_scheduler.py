@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.request import RequestStatus
 
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
@@ -20,7 +21,12 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = create_request_queue(scheduler.policy)
     for _ in range(waiting):
-        scheduler.waiting.add_request(object())
+        scheduler.waiting.add_request(
+            SimpleNamespace(
+                status=RequestStatus.WAITING,
+                num_output_placeholders=0,
+            )
+        )
     scheduler.skipped_waiting = create_request_queue(scheduler.policy)
     for _ in range(skipped_waiting):
         scheduler.skipped_waiting.add_request(object())

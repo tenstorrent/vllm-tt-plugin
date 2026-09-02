@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, fields, replace
 from functools import partial
@@ -35,6 +36,7 @@ from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
+    SubmittedStepContext,
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.config import (
@@ -63,6 +65,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -101,7 +104,7 @@ def _parse_layer_index(layer_name: str) -> int:
 
 @dataclass(frozen=True)
 class _SyncForward:
-    """Materialized non-DP forward result awaiting host/device sampling.
+    """Materialized front-packed forward result awaiting sampling.
 
     Carries everything ``_get_output_tokens`` needs so the sampling tail can
     run in a later ``sample_tokens`` call rather than inside ``execute_model``.
@@ -224,12 +227,10 @@ class TTModelRunner:
         # correct even with one forward in flight.
         self._pending_samples: deque[Any] = deque()
 
-        # Non-DP async scheduling: overlap CPU scheduling with device execution.
-        # Only supported for DP=1 (DP>1 uses a different execution path).
-        self.non_dp_async_scheduling = (
-            self.scheduler_config.async_scheduling
-            and self.parallel_config.data_parallel_size == 1
-        )
+        # The platform has already disabled upstream async scheduling when the
+        # registered model lacks async-decode capability. Contract negotiation
+        # selects reload semantics, not async eligibility.
+        self.async_decode_scheduling = self.scheduler_config.async_scheduling
         self._steady_decode_lock = threading.Lock()
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
@@ -243,6 +244,7 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        self._pending_state_slot_settle: dict[str, int] | None = None
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
@@ -296,8 +298,8 @@ class TTModelRunner:
         ``tt_data_parallel_size`` in-process DP replicas. In this mode the
         persistent batch is a ``TTLaneInputBatch`` that owns the lane layout
         (stable per-lane device slots, merged sampling) and the runner only
-        orchestrates; standard multi-process DP and non-DP keep the plain
-        ``InputBatch``, one per engine.
+        orchestrates; single-process execution and standard multi-process DP
+        ranks keep the plain ``InputBatch``, one per engine.
 
         Derived (rather than cached in ``__init__``) so it depends only on
         already-set runner state -- this mirrors ``uses_tt_lane_coordinator``:
@@ -313,6 +315,16 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+
+    def _uses_async_scheduler(self) -> bool:
+        """Whether upstream publishes outputs through placeholder accounting.
+
+        Synchronously produced outputs such as final prefills still require
+        lifecycle-deferred host state when the engine uses ``AsyncScheduler``.
+        """
+        return bool(
+            getattr(getattr(self, "scheduler_config", None), "async_scheduling", False)
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -672,11 +684,10 @@ class TTModelRunner:
             self.requests.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
+        # Upstream input processing gives resubmissions fresh internal IDs, but
+        # keep the update order robust for an internal caller that bypasses it:
+        # a finished and newly scheduled duplicate is treated as two requests,
+        # clearing the old cached state before adding the new one.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             self._release_model_request(req_id)
@@ -958,8 +969,8 @@ class TTModelRunner:
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
-        means identity, so skip it. Commits the move to ``self._req_state_slot`` for
-        every request the permutation touches, off-batch holders included."""
+        means identity, so skip it. The resulting ownership map remains pending
+        until ``decode_forward`` accepts the submission."""
         n_slots = self.tt_per_lane_max_num_seqs
         # More decode rows than slots means the batch cannot be described at all, so
         # truncating would just drop a request's state silently.
@@ -999,10 +1010,21 @@ class TTModelRunner:
         for row, slot in enumerate(remap):
             for req_id in by_slot.get(slot, ()):
                 moved[req_id] = row
-        self._req_state_slot = moved
+        self._pending_state_slot_settle = moved
         if all(remap[i] == i for i in range(n_slots)):
+            self._pending_state_slot_settle = None
             return None
         return torch.tensor(remap, dtype=torch.int32)
+
+    def note_decode_state_slots_settled(self) -> None:
+        """Commit a remap only after the model accepted the decode."""
+        if self._pending_state_slot_settle is not None:
+            self._req_state_slot = self._pending_state_slot_settle
+            self._pending_state_slot_settle = None
+
+    def note_decode_layout_consumed(self) -> None:
+        """Retire the sticky layout transition after an accepted decode."""
+        self._decode_layout_changed_since_last_decode = False
 
     @staticmethod
     def _build_host_generators(
@@ -1050,8 +1072,9 @@ class TTModelRunner:
 
         Reads the current persistent ``self.input_batch`` and assembles the
         padded, fixed-shape tensors a TT model needs (constant shapes are
-        required for ttnn tracing). This is the input builder for the non-DP and
-        standard multi-process DP paths; each operates on its whole local
+        required for ttnn tracing). This is the front-packed input builder for
+        single-process execution and standard multi-process DP; each rank
+        operates on its whole local
         ``input_batch``. Single-process lane mode does not use this builder --
         it builds its merged device input directly from ``TTLaneInputBatch``.
 
@@ -1192,7 +1215,7 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
-            reset_batch = False
+            decode_layout_changed = False
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1200,10 +1223,10 @@ class TTModelRunner:
                 req_indices, positions_np
             ].view(-1, 1)
             prompt_lens = None
-            # For on-device decode sampling, tell the backend if the padded
-            # decode batch layout changed since the previous step.
-            reset_batch = self._decode_layout_changed_since_last_decode
-            self._decode_layout_changed_since_last_decode = False
+            # Record whether the padded decode layout changed since the previous
+            # decode. The controller translates this lifecycle fact into either
+            # explicit contract commands or the legacy ``reset_batch`` keyword.
+            decode_layout_changed = self._decode_layout_changed_since_last_decode
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -1398,7 +1421,7 @@ class TTModelRunner:
             grammar_bitmask=[bitmask],  # wrap to match DP case
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
@@ -1426,23 +1449,29 @@ class TTModelRunner:
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """
-        # Update cached state
+        # Update scheduler-owned state before accepting any older async result.
+        # Reject late results for request IDs already reported finished. The
+        # result that finished the request was accepted earlier. Ordinary
+        # preemption or resume keeps a completed token valid for replay. Only a
+        # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
+        if (
+            self.async_decode.decode_input_update_contract_version() < 1
+            and self._decode_layout_changed_since_last_decode
+        ):
+            # Preserve the legacy path's drain point: version-0 adapters still
+            # own reload policy and receive reset_batch after batch mutation.
+            self.async_decode.wait_for_all_pending_async_steps()
+        self.async_decode.apply_ready_completed_decode_steps(
+            suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
+                scheduler_output
+            ),
+            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ),
+        )
         if not scheduler_output.total_num_scheduled_tokens:
             return None
-
-        # ``_update_states`` may have just discovered a layout change that the
-        # scheduler-output prediction could not see: it predicts the resets caused by
-        # new or resumed requests, but removals, unscheduled requests and batch
-        # condensation only surface here, after the drain decision was already made.
-        # ``_decode_layout_changed_since_last_decode = True`` implies
-        # ``reset_batch=True``: ``_prepare_model_inputs`` below reloads inputs from host
-        # state, which a pending async decode step has not been applied to yet. This
-        # step is therefore not steady-decode eligible, so drain pending decodes to
-        # ensure updated host inputs. No-op when the flag was already set before the
-        # step (the caller's drain decision covered it) or when nothing is pending.
-        if self._decode_layout_changed_since_last_decode:
-            self.async_decode.wait_for_all_pending_async_steps()
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
@@ -1480,25 +1509,36 @@ class TTModelRunner:
             )
 
         lane_batch = self.lane_batch
-        self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_lane_decode_from_scheduler(
-                scheduler_output
+                scheduler_output,
+                decode_layout_changed=plan.decode_layout_changed,
             )
         )
-        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+        if self.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate, scheduler_output
+        ):
             self.async_decode.wait_for_all_pending_async_steps()
 
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
         )
+        assert layout_changed == plan.decode_layout_changed, (
+            "lane scheduler and runner disagreed about decode layout change: "
+            f"plan={plan.decode_layout_changed}, applied={layout_changed}"
+        )
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
-            # ``_decode_layout_changed_since_last_decode = True`` implies
-            # ``reset_batch=True``: the model will reload inputs. This step is not
-            # steady-decode eligible, so drain pending decodes to ensure updated
-            # host inputs.
-            self.async_decode.wait_for_all_pending_async_steps()
+            if self.async_decode.decode_input_update_contract_version() < 1:
+                self.async_decode.wait_for_all_pending_async_steps()
+        self.async_decode.apply_ready_completed_decode_steps(
+            suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
+                scheduler_output
+            ),
+            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ),
+        )
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1515,7 +1555,7 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if self.non_dp_async_scheduling:
+            if self.async_decode_scheduling:
                 req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
                 context = self.async_decode.capture_submitted_step_context(req_ids)
                 wrapper = self.async_decode.submit_async_lane_decode(
@@ -1608,8 +1648,13 @@ class TTModelRunner:
                     sampled_token_ids=sampled,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask,
+                    defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
+        if TTModelRunner._uses_async_scheduler(self):
+            return self.defer_state_apply_and_build_runner_output(
+                sampled, logprobs, req_ids=req_ids
+            )
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
@@ -1617,7 +1662,7 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
-        """Run the device forward for one non-DP or lane-DP step.
+        """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None`` after enqueuing a pending sampler; the engine computes
         the grammar bitmask while the forward runs and then calls
@@ -1632,15 +1677,16 @@ class TTModelRunner:
         if get_tt_step_plan(scheduler_output) is not None:
             return self._execute_lane_step(scheduler_output)
 
-        # Apply any decode steps that have already completed on the async
-        # thread. In steady decode mode we intentionally allow one step of
-        # lag between host application and device submission, but we never let
-        # completed work pile up unbounded.
-        self.async_decode.apply_ready_completed_decode_steps()
+        # Decide whether the next build can remain one step host-stale before
+        # mutating the persistent batch. On a transition, finalize pending work
+        # now but defer applying it until ``build_model_input`` has processed
+        # lifecycle events and the forced-reset discard boundary.
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
-        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+        if self.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate, scheduler_output
+        ):
             self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
@@ -1649,11 +1695,11 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if self.non_dp_async_scheduling and is_decode:
+        if self.async_decode_scheduling and is_decode:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
-            wrapper = self.async_decode.submit_async_non_dp_decode(
+            wrapper = self.async_decode.submit_async_decode(
                 model_input,
                 steady_decode_fast_path=steady_decode_fast_path,
             )
@@ -1670,7 +1716,7 @@ class TTModelRunner:
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
         fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_nondp_sync, fwd=fwd))
+        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
         return None
 
     def _reorder_grammar_bitmask(
@@ -1732,10 +1778,10 @@ class TTModelRunner:
             wrapper.set_grammar_bitmask(bitmask)
         return wrapper
 
-    def _finish_nondp_sync(
+    def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
     ) -> ModelRunnerOutput:
-        """Sample and build the runner output for a deferred non-DP forward."""
+        """Sample and build output for a deferred front-packed forward."""
         if fwd is None:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
@@ -1761,15 +1807,25 @@ class TTModelRunner:
             intermediate_mask = fwd.model_input.intermediate_prefill_mask
 
             assert intermediate_mask is not None
-
             if intermediate_mask.any():
                 return self._build_chunked_prefill_output(
                     req_ids=row_req_ids,
                     sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask.numpy(),
+                    defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
+        if TTModelRunner._uses_async_scheduler(self):
+            return self.defer_state_apply_and_build_runner_output(
+                sampled_token_ids,
+                logprobs,
+                req_ids=(
+                    row_req_ids
+                    if is_prefill
+                    else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+                ),
+            )
         return self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
@@ -1785,34 +1841,42 @@ class TTModelRunner:
         logprobs: LogprobsLists | None,
         intermediate_mask: np.ndarray,
         req_id_to_index: dict[str, int] | None = None,
+        defer_state_apply: bool = False,
     ) -> ModelRunnerOutput:
-        """Build a prefill output that emits no token for intermediate chunks.
+        """Build a prefill output with intermediate rows suppressed.
 
         A request mid-prompt gets ``[]`` so the engine advances its computed
-        tokens without appending output; only rows whose chunk ended the prompt
-        emit a token and are applied to runner state.
+        tokens without appending output. Only final rows emit a token and reach
+        runner state.
         """
         assert self._output_tokens_per_step == 1, (
             "Chunked-prefill output suppression assumes one sampled token per "
             "request; block-output models must disable chunked prefill"
         )
-        final_idx_np = np.where(~intermediate_mask)[0]
+        emit_mask = np.asarray(
+            [not bool(intermediate_mask[i]) for i in range(len(req_ids))],
+            dtype=bool,
+        )
+        final_idx_np = np.where(emit_mask)[0]
+        final_tokens = None
+        final_req_ids: list[str] = []
         if final_idx_np.shape[0] > 0:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
             final_tokens = sampled_token_ids[final_idx_tensor]
             final_req_ids = [req_ids[int(i)] for i in final_idx_np]
-            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+            if not defer_state_apply:
+                self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
 
         num_reqs = len(req_ids)
         sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
         sampled_token_id_lists = [
-            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            [int(sampled_token_ids_np[i])] if emit_mask[i] else []
             for i in range(num_reqs)
         ]
 
-        return ModelRunnerOutput(
+        runner_output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=(
                 dict(req_id_to_index)
@@ -1824,6 +1888,11 @@ class TTModelRunner:
             prompt_logprobs_dict=dict.fromkeys(req_ids, None),
             pooler_output=[],
         )
+        if defer_state_apply and final_tokens is not None:
+            self._enqueue_deferred_state_apply(
+                final_tokens, final_req_ids, runner_output
+            )
+        return runner_output
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -1956,8 +2025,11 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
+            self.async_decode.note_prefill_submitted()
             return tt_out
-        return self.model.prefill_forward(**kwargs)
+        tt_out = self.model.prefill_forward(**kwargs)
+        self.async_decode.note_prefill_submitted()
+        return tt_out
 
     def _forward_with_model_input(
         self,
@@ -2345,14 +2417,14 @@ class TTModelRunner:
         self,
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
-        request_states: tuple[CachedRequestState, ...] | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime
-        # and the ``request_states`` identity check guards slot reuse, so the
-        # live row equals the captured one. ``req_id_to_index`` is therefore the
-        # single source of truth for the target row.
+        # time: lane mode pins each request to a stable slot for its lifetime,
+        # while the scheduler lifecycle skip set rejects stale results before a
+        # live row is resolved. ``req_id_to_index`` is therefore the source of
+        # truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         sampled_token_ids = _coerce_output_block(
@@ -2414,14 +2486,13 @@ class TTModelRunner:
             # raise never leaves a partially applied batch. Block canvases
             # are clipped below instead of raising.
             for req_idx, req_id in enumerate(captured_req_ids):
+                if skip_req_ids is not None and req_id in skip_req_ids:
+                    continue
                 req_state = self.requests.get(req_id)
-                if req_state is None:
-                    continue
-                if (
-                    request_states is not None
-                    and req_state is not request_states[req_idx]
-                ):
-                    continue
+                assert req_state is not None, (
+                    "captured request missing from runner state while applying "
+                    f"sampled tokens: req_id={req_id!r}"
+                )
                 current_row = self.input_batch.req_id_to_index.get(req_id)
                 if current_row is not None:
                     end_idx = (
@@ -2435,15 +2506,13 @@ class TTModelRunner:
                         )
 
         for req_idx, req_id in enumerate(captured_req_ids):
-            req_state = self.requests.get(req_id)
-            # A deferred decode step can be applied after the engine finished
-            # and dropped its request, so a missing state is ordinary. Same for
-            # readmission under a reused id: the token has no live owner.
-            if req_state is None or (
-                request_states is not None and req_state is not request_states[req_idx]
-            ):
+            if skip_req_ids is not None and req_id in skip_req_ids:
                 continue
-
+            req_state = self.requests.get(req_id)
+            assert req_state is not None, (
+                "captured request missing from runner state while applying sampled "
+                f"tokens: req_id={req_id!r}"
+            )
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
@@ -2486,6 +2555,52 @@ class TTModelRunner:
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
         )
+
+    def _enqueue_deferred_state_apply(
+        self,
+        sampled_token_ids: torch.Tensor,
+        req_ids: list[str],
+        runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Queue sampled host state until scheduler lifecycle is known.
+
+        Final prefills are sampled synchronously, but under AsyncScheduler their
+        published output is still protected by a placeholder. Queue them beside
+        completed async decodes so a forced prefix reset can leave the published
+        row intact for discard accounting without first appending its stale
+        token to runner state.
+        """
+        now = time.perf_counter_ns()
+        self.async_decode.enqueue_completed_decode_step(
+            CompletedDecodeStep(
+                sampled_token_ids=sampled_token_ids,
+                logprobs=None,
+                context=SubmittedStepContext(
+                    req_ids=list(req_ids),
+                    req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+                    submit_time_ns=now,
+                ),
+                completion_time_ns=now,
+                runner_output=runner_output,
+            )
+        )
+
+    def defer_state_apply_and_build_runner_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None = None,
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        assert req_ids is not None, "deferred synchronous output needs request IDs"
+        runner_output = self._build_runner_output(
+            sampled_token_ids=sampled_token_ids,
+            logprobs=logprobs,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+        )
+        self._enqueue_deferred_state_apply(sampled_token_ids, req_ids, runner_output)
+        return runner_output
 
     def warmup_model(self) -> None:
         # Two-phase warmup: compile first, then capture traces.

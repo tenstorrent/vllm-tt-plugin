@@ -125,7 +125,6 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens=[num_computed_tokens],
         num_output_tokens=[0],
     )
-
     model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
 
     assert model_input is not None

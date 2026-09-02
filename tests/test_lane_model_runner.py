@@ -342,6 +342,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         trace_mode="none",
         request_specific_rope=False,
         model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
     )
     model_input = SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
@@ -393,6 +394,8 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         trace_mode="none",
         request_specific_rope=False,
         model=FakeModel(),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: None,
     )
     remap = torch.tensor([1, 0], dtype=torch.int32)
     model_input = SimpleNamespace(
@@ -405,7 +408,7 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         perform_device_sampling=perform_device_sampling,
         prompt_tokens=None,
         output_tokens=None,
-        reset_batch=False,
+        decode_layout_changed=False,
         slot_remap=remap,
     )
 
@@ -444,7 +447,6 @@ def test_async_lane_decode_uses_batch_extraction():
     context = SubmittedStepContext(
         req_ids=["req-4"],
         req_id_to_index={"req-4": 0},
-        request_states=(),
         submit_time_ns=123,
     )
     model_input = object()

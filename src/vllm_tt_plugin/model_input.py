@@ -20,6 +20,44 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
 @dataclass(frozen=True)
+class TTDecodeReloadPlan:
+    """Explicit host-to-device updates for one decode submission.
+
+    The TT runner owns these decisions because it knows whether host
+    token/position tensors are authoritative or intentionally one step behind
+    an overlapped device-sampling decode. Contract-aware generators execute
+    these flags as commands; they must not infer additional reloads from tensor
+    equality, sampling mode, or their own previous-call state.
+    """
+
+    reload_inputs: bool
+    reload_page_table: bool
+    reload_sampling_params: bool
+    reset_sampling_state: bool
+
+    def __post_init__(self) -> None:
+        # Sampling-state reset may align seeded counters from the host position,
+        # which is authoritative only on a full forward-input reload.
+        assert not (self.reset_sampling_state and not self.reload_inputs), (
+            "reset_sampling_state requires reload_inputs"
+        )
+        # A full input reload already includes page tables. The two booleans
+        # encode "everything", "page table only", or "nothing".
+        assert not (self.reload_page_table and self.reload_inputs), (
+            "reload_page_table is only valid without reload_inputs"
+        )
+
+    @property
+    def overlap_safe(self) -> bool:
+        """Whether a device-resident decode may be submitted host-stale."""
+        return not (
+            self.reload_inputs
+            or self.reload_sampling_params
+            or self.reset_sampling_state
+        )
+
+
+@dataclass(frozen=True)
 class TTSamplingParams:
     """Sampling parameters for TT model execution.
 
@@ -90,13 +128,13 @@ class TTModelInput:
     # In lane mode this is true only if every lane can sample on device.
     perform_device_sampling: bool
 
-    # always lists: single-element for non-DP, multi-element for DP
+    # Lists preserve the sampling-helper interface; each independent runner and
+    # each merged lane step supplies one element.
     # If not used, [None]
     grammar_bitmask: list[torch.Tensor | None]
 
-    # Host-only sampling params - lists for DP (one per rank), single-element
-    # for non-DP. These are used for host sampling when device sampling is not
-    # supported.
+    # Host-only sampling params. Each independent rank supplies one list entry;
+    # lane mode supplies one merged entry. Used when device sampling is absent.
     logitsprocs_list: list[LogitsProcessors | None]
     # bad_words_token_ids: list of dicts mapping req_index -> token_ids
     bad_words_token_ids_list: list[dict[int, list[list[int]]]]
@@ -113,9 +151,10 @@ class TTModelInput:
     prompt_tokens: torch.Tensor | None = None
     output_tokens: torch.Tensor | None = None
 
-    # Decode-only: indicates the padded decode-batch layout changed since the
-    # previous step (used by on-device sampling).
-    reset_batch: bool = False
+    # Decode-only runner lifecycle signal. Contract-v1 adapters receive the
+    # explicit reload commands derived from this; legacy adapters receive it
+    # translated to their historical ``reset_batch`` keyword.
+    decode_layout_changed: bool = False
 
     # Decode-only: device state slot remap - row i reads slot remap[i]. From
     # ``_req_state_slot`` (lane mode: the condense-move remap). ``None`` means
