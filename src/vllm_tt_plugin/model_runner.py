@@ -406,6 +406,28 @@ class TTModelRunner:
                     f"{group.layer_names}, got {type(group.kv_cache_spec).__name__}"
                 )
 
+    def _tensor_parallel_width(self) -> int:
+        """Number of devices the model shards KV heads across.
+
+        TT models in the tt_transformers family shard along the mesh's
+        *column* axis and replicate down the rows -- see
+        ``ShardTensor2dMesh(..., dims=(None, tensor_dim))`` and
+        ``tp=mesh_device.shape[1]`` in the model implementations. So the
+        tensor-parallel width is the column count, not the device count;
+        the two coincide only on a single-row mesh.
+
+        The column count alone is not enough, because a data-parallel run
+        reshapes the parent mesh before splitting it: a 32-device mesh is
+        reshaped to (4, 8) and then carved into ``1 x (32 // dp)`` submeshes,
+        so the parent reports 8 columns while each submesh has fewer. The
+        per-submesh device count bounds it.
+        """
+        devices_per_submesh = self.num_devices // self.tt_data_parallel_size
+        shape = getattr(self.mesh_device, "shape", None)
+        if shape is None:
+            return devices_per_submesh
+        return min(int(tuple(shape)[-1]), devices_per_submesh)
+
     def _kv_cache_shape(
         self, spec: AttentionSpec, num_blocks: int
     ) -> tuple[int, int, int, int]:
@@ -415,9 +437,16 @@ class TTModelRunner:
         TP factor is folded in here because it is handled on the model
         side for TT (caches are replicated per submesh and each device
         carries ``num_kv_heads // tp`` heads internally).
+
+        ``tp`` is the mesh's tensor-parallel width, which is not the device
+        count on a mesh with more than one row -- dividing by the device
+        count there under-allocates every buffer by ``devices / tp``. The
+        clamp to at least one head mirrors the models' own GQA fallback for
+        when a layer has fewer KV heads than there are TP devices to spread
+        them over (``num_local_kv_heads = 1 if kv_replicated else ...``).
         """
-        num_devices = self.num_devices // self.tt_data_parallel_size
-        num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)
+        tp = self._tensor_parallel_width()
+        num_kv_heads = max(1, spec.num_kv_heads // tp)
         return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)
 
     def _allocate_kv_caches(self, kv_cache_config: KVCacheConfig) -> Any:
