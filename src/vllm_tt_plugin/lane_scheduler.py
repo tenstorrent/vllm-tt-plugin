@@ -686,13 +686,15 @@ class TTLaneCoordinator(SchedulerInterface):
 
     def finish_requests(
         self,
-        request_ids: str | Iterable[str],
+        request_ids: str | Iterable[str] | None,
         finished_status: RequestStatus,
-    ) -> None:
+    ) -> list[Request]:
         # Broadcast to every lane; a lane no-ops for IDs it does not hold, so no
         # request->lane map is needed.
+        aborted: list[Request] = []
         for sched in self.lanes:
-            sched.finish_requests(request_ids, finished_status)
+            aborted.extend(sched.finish_requests(request_ids, finished_status))
+        return aborted
 
     # ------------------------------------------------------------------
     # SchedulerInterface: queries / lifecycle
