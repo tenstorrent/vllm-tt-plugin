@@ -16,3 +16,6 @@
 # (https://github.com/tenstorrent/tt-metal/issues/30193).
 opencv-python-headless==4.11.0.86
 numpy>=1.24.4,<2
+
+# cf. https://github.com/vllm-project/vllm/pull/49797 (vllm v0.28.0 has this)
+transformers>=5.5.3,<5.15.0
