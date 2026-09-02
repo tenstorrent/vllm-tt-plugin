@@ -142,11 +142,18 @@ _GALAXY_GENERATOR_VERSIONS = {
 
 # vLLM fills an unset ``max_num_batched_tokens`` from this pair when the
 # platform reports no device memory: 2048 for ``vllm serve``, 8192 for ``LLM()``.
+# Keep in step with the no-device branch of ``EngineArgs.get_batch_defaults``
+# when the pinned vLLM version is bumped (AGENTS.md section 3).
 _VLLM_UNSET_MAX_NUM_BATCHED_TOKENS = frozenset({2048, 8192})
 
 
 def _cli_set_max_num_batched_tokens() -> bool:
-    """True when this process was launched with an explicit token budget."""
+    """True when argv carries ``--max-num-batched-tokens``.
+
+    Explicit budgets equal to 2048/8192 set programmatically
+    (``LLM(max_num_batched_tokens=2048)``) or via a vLLM ``--config`` file
+    never appear here and are treated as unset.
+    """
     for arg in sys.argv:
         name, _, _ = arg.partition("=")
         if name in ("--max-num-batched-tokens", "--max_num_batched_tokens"):
