@@ -140,55 +140,6 @@ _GALAXY_GENERATOR_VERSIONS = {
 }
 
 
-# vLLM fills an unset ``max_num_batched_tokens`` from this pair when the
-# platform reports no device memory: 2048 for ``vllm serve``, 8192 for ``LLM()``.
-# Keep in step with the no-device branch of ``EngineArgs.get_batch_defaults``
-# when the pinned vLLM version is bumped (AGENTS.md section 3).
-_VLLM_UNSET_MAX_NUM_BATCHED_TOKENS = frozenset({2048, 8192})
-
-
-def _cli_set_max_num_batched_tokens() -> bool:
-    """True when argv carries ``--max-num-batched-tokens``.
-
-    Explicit budgets equal to 2048/8192 set programmatically
-    (``LLM(max_num_batched_tokens=2048)``) or via a vLLM ``--config`` file
-    never appear here and are treated as unset.
-    """
-    for arg in sys.argv:
-        name, _, _ = arg.partition("=")
-        if name in ("--max-num-batched-tokens", "--max_num_batched_tokens"):
-            return True
-    return False
-
-
-def _raise_vllm_default_token_budget(vllm_config: "VllmConfig") -> None:
-    """Keep a full prompt in one step when the operator did not set a budget.
-
-    Before chunked prefill was capability-gated, Llama/Qwen/Mistral always had
-    it forced off, which made this plugin raise ``max_num_batched_tokens`` to
-    ``max_model_len``. Leaving vLLM's 2048/8192 fallback in place would drop
-    the per-step prefill size by 16x on a 32k model with no flag change. An
-    explicit ``--max-num-batched-tokens`` is left alone.
-    """
-    scheduler_config = vllm_config.scheduler_config
-    max_model_len = vllm_config.model_config.max_model_len
-    budget = scheduler_config.max_num_batched_tokens
-    if budget >= max_model_len:
-        return
-    if budget not in _VLLM_UNSET_MAX_NUM_BATCHED_TOKENS:
-        return
-    if _cli_set_max_num_batched_tokens():
-        return
-    logger.info(
-        "max_num_batched_tokens=%d is vLLM's unset default; raising it to "
-        "max_model_len=%d so a full prompt still fits in one step. Pass "
-        "--max-num-batched-tokens to set the budget.",
-        budget,
-        max_model_len,
-    )
-    scheduler_config.max_num_batched_tokens = max_model_len
-
-
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
     scheduler_config = vllm_config.scheduler_config
@@ -254,8 +205,6 @@ def _apply_chunked_prefill_policy(
     # rejects the flag outright when one item exceeds the token budget, so it
     # stays off for every model that does not reach here.
     scheduler_config.disable_chunked_mm_input = True
-
-    _raise_vllm_default_token_budget(vllm_config)
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an

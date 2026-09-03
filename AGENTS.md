@@ -168,12 +168,6 @@ together:**
   reasoning and tool parsers line.
 - `docs/vllm-overrides.txt`, re-checked against the new `common.txt` (upstream
   may have relaxed the opencv floor)
-- `src/vllm_tt_plugin/platform.py`, `_VLLM_UNSET_MAX_NUM_BATCHED_TOKENS`.
-  Must match the no-device-memory branch of vLLM
-  `EngineArgs.get_batch_defaults` (`OPENAI_API_SERVER` and `LLM_CLASS`).
-  TT reports no device memory, so we never take the H100 16384/8192 branch.
-  A silent retune of those defaults would raise (or fail to raise) an
-  operator-set 2048/8192 that this plugin can no longer tell from unset.
 
 The pin is spread across a sourced shell script that installs with `--no-deps`,
 so what resolved and what the docs claim can diverge silently. After

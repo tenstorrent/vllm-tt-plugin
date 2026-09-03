@@ -468,14 +468,14 @@ clear error before anything reaches the device:
 - LoRA is not currently supported.
 - Chunked prefill is gated on the model's declared capability, not on a
   `model_type` allowlist. vLLM enables it by default; pass
-  `--no-enable-chunked-prefill` to opt out. When it is disabled,
-  `max_num_batched_tokens` is bumped to `max_model_len`. When it is enabled
-  and the operator did not pass `--max-num-batched-tokens`, the same
-  full-prompt budget is kept: vLLM's unset defaults (2048 for `vllm serve`,
-  8192 for `LLM()`) would otherwise silently drop the per-step size. Pass
-  `--max-num-batched-tokens` to set the split size. Resume offsets need an
-  alignment that depends on the model's program config and on the length of
-  each remaining span, and the tt-metal generator corrects them itself.
+  `--no-enable-chunked-prefill` to opt out. When it stays on,
+  `max_num_batched_tokens` is left as vLLM set it (2048 for `vllm serve` /
+  `server_example_tt.py`, 8192 for `LLM()`, or an explicit
+  `--max-num-batched-tokens`). When it is disabled, a budget smaller than
+  `max_model_len` is raised to `max_model_len` so a full prompt still fits in
+  one step. Resume offsets need an alignment that depends on the model's
+  program config and on the length of each remaining span, and the tt-metal
+  generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
