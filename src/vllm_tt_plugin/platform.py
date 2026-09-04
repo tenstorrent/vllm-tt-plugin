@@ -1147,35 +1147,22 @@ def register_tt_models(register_test_models=False) -> None:
 
     # Gemma4 — text-only TT bridge.
     #
-    # Gemma4 isn't in vLLM's upstream registry, so without an entry here
-    # the upstream architecture resolver falls back to
-    # ``TransformersMultiModalForCausalLM`` (because ``hf_config !=
-    # hf_text_config`` for Gemma4's nested config — see
-    # ``ModelConfig._get_transformers_backend_cls``) and crashes on the
-    # ``_processor_factory`` assertion in the multimodal registry. The
-    # plugin's later ``TT``-prefix logic runs after that resolution, so
-    # it can't help.
+    # Only the ``TT``-prefixed aliases. Do not add the bare HF names: vLLM
+    # 0.25.1 registers all three itself and ``_register_model_if_missing``
+    # never overrides an existing entry, so those calls are no-ops.
     #
-    # We register the plain HF arch names directly so upstream resolution
-    # finds our class. Since ``Gemma4ForCausalLM`` (the TT class) does not
-    # use ``SupportsMultiModal``, vLLM's ``_model_info.supports_multimodal``
-    # is False, ``multimodal_config`` is not populated, and the request
-    # path stays text-only — which matches what the TT model implements.
-    # The ``TT``-prefixed aliases satisfy the plugin's later validation
-    # in ``check_and_update_config`` so no override is needed.
-    #
-    # The 12B checkpoint is the "unified" multimodal variant: its config
-    # declares ``architectures: ['Gemma4UnifiedForConditionalGeneration']``
-    # with ``model_type: gemma4_unified`` and nested text/vision/audio
-    # configs. Without the unified arch registered, the same nested-config
-    # fallback resolves it to ``TransformersMultiModalForCausalLM``. We map
-    # the unified arch (and its ``TT`` alias) to the same text-only TT class
-    # so text-only inference runs on the unified checkpoint.
+    # The prefix rewrite in ``check_and_update_config`` decides which class the
+    # loader instantiates, and nothing more. ``ModelConfig.__post_init__`` has
+    # already inspected the *bare* architecture by then, and for
+    # ``Gemma4ForConditionalGeneration`` and
+    # ``Gemma4UnifiedForConditionalGeneration`` that resolves to upstream's
+    # multimodal class -- so ``multimodal_config``, ``runner_type`` and
+    # ``convert_type`` are upstream's, and upstream's ``Gemma4Config`` hook has
+    # run against the TT config. Do not read the prefix as isolating Gemma4
+    # from upstream's Gemma4 handling; closing that would mean generalizing
+    # ``_install_diffusion_gemma_architecture_patch`` beyond one family.
     _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
     for arch in (
-        "Gemma4ForCausalLM",
-        "Gemma4ForConditionalGeneration",
-        "Gemma4UnifiedForConditionalGeneration",
         "TTGemma4ForCausalLM",
         "TTGemma4ForConditionalGeneration",
         "TTGemma4UnifiedForConditionalGeneration",
