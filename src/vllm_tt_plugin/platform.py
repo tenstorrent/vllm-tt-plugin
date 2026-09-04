@@ -2028,32 +2028,3 @@ class TTPlatform(Platform):
                 "This block-output model owns its Gumbel sampling and does not "
                 "support these request parameters: " + "; ".join(unsupported)
             )
-
-    @staticmethod
-    def compat_sampling_required(sampling_params, num_devices) -> bool:
-        # Device logprobs only supported on multi-device setups and only
-        # the sampled token's logprob is returned (not top-k alternatives).
-        # Single device: any logprobs require host sampling.
-        # Multi-device: logprobs > 1 requires host sampling because device
-        # can only return the sampled token's logprob.
-        # https://github.com/tenstorrent/tt-metal/issues/34077
-        if (
-            sampling_params.logprobs is not None
-            and sampling_params.logprobs > 0
-            and (num_devices == 1 or sampling_params.logprobs > 1)
-        ):
-            return True
-
-        # all of the following sampling params require compat sampling
-        return (
-            sampling_params.min_p != 0.0
-            or (
-                sampling_params.bad_words is not None
-                and len(sampling_params.bad_words) > 0
-            )
-            or sampling_params.prompt_logprobs is not None
-            or sampling_params.structured_outputs is not None
-            or sampling_params.logit_bias is not None
-            or sampling_params.allowed_token_ids is not None
-            or sampling_params.min_tokens != 0
-        )
