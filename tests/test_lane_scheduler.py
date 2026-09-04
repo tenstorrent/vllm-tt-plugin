@@ -100,6 +100,7 @@ def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
     coordinator.log_stats = log_stats
     coordinator.structured_output_manager = None
     coordinator.connector = None
+    coordinator.ec_connector = None
     coordinator._req_to_lane = {}
     coordinator._req_to_row = {}
     coordinator._free_slots_by_lane = [
