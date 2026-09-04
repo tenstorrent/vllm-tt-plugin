@@ -360,9 +360,11 @@ selects the TT-owned runtime classes through vLLM's extension points:
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
-- Token-chunked prefill is available for Gemma 4: a long prompt is split across
+- Token-chunked prefill is available to any model whose tt-metal class declares
+  `model_capabilities['supports_chunked_prefill']`: a long prompt is split across
   prefill steps and only the chunk that completes the prompt emits a token.
-  Every other model type keeps prefill unsplit.
+  Today that is the `tt_transformers` Llama, Qwen and Mistral text bridges plus
+  Gemma 4. Every other model keeps prefill unsplit.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -464,8 +466,16 @@ clear error before anything reaches the device:
   internal implementation, not exposed at the vLLM level.
 - Speculative decoding is not currently supported.
 - LoRA is not currently supported.
-- Chunked prefill is disabled for every model type except Gemma 4, and
-  `max_num_batched_tokens` is bumped to `max_model_len` when it is disabled.
+- Chunked prefill is gated on the model's declared capability, not on a
+  `model_type` allowlist. vLLM enables it by default; pass
+  `--no-enable-chunked-prefill` to opt out. When it stays on,
+  `max_num_batched_tokens` is left as vLLM set it (2048 for `vllm serve` /
+  `server_example_tt.py`, 8192 for `LLM()`, or an explicit
+  `--max-num-batched-tokens`). When it is disabled, a budget smaller than
+  `max_model_len` is raised to `max_model_len` so a full prompt still fits in
+  one step. Resume offsets need an alignment that depends on the model's
+  program config and on the length of each remaining span, and the tt-metal
+  generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
