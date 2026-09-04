@@ -78,6 +78,7 @@ import numpy as np
 
 logger = init_tt_logger(__name__)
 
+
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
 # bare "layers.5" forms used in TT spec hooks. The first capture group is
@@ -163,7 +164,7 @@ class TTModelRunner:
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
-        self._persistent_capture_released = False
+        self._shutdown_complete = False
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -262,16 +263,35 @@ class TTModelRunner:
         )
 
     def shutdown(self) -> None:
-        """Deterministically release optional model-lifetime captures.
+        """Release what this runner holds on the mesh, while it is still open.
 
-        Called from ``TTWorker.shutdown`` while the mesh is still open. This
-        is intentionally not wired to ``__del__``: the runner sits in
-        reference cycles, so a destructor can fire during interpreter
-        teardown after the devices closed, where a device-side release is
-        worse than leaking the capture to process exit.
+        Called from ``TTWorker.shutdown`` because releasing a device-resident
+        object after its device closed is unsafe. Idempotent.
+
+        Explicit rather than a consequence of dropped references: the runner and
+        ``TTAsyncDecodeController`` reference each other, so refcounting never
+        reclaims either and a destructor runs whenever the cyclic collector gets
+        to it -- for interpreter teardown, after the devices closed.
+
+        Scope is the model and its caches. An in-flight async decode submission
+        is deliberately not released: its read destination and ttnn read events
+        may still be the target of a device read, and no wait for that can be
+        bounded against the close. Those leak to process exit, which is the safe
+        direction.
         """
-        if getattr(self, "_persistent_capture_released", False):
+        if getattr(self, "_shutdown_complete", False):
             return
+        self._shutdown_complete = True
+
+        # Neither ``_pending_samples`` nor ``_pending_async_steps`` is cleared: a
+        # step that ran but was not sampled sits in both, and between
+        # ``execute_model`` and ``sample_tokens`` this runner is its only holder
+        # -- the window a mid-step raise lands in -- so clearing them would free
+        # a buffer ttnn is writing into, moments before the close. The cost is
+        # that this runner is not reclaimed promptly, which is not a safety
+        # property; releasing the model below is.
+
+        # While the model is still alive, and before the mesh closes.
         release = getattr(
             getattr(self, "model", None), "release_persistent_capture", None
         )
@@ -280,7 +300,18 @@ class TTModelRunner:
                 release()
             except Exception:
                 logger.exception("Failed to release persistent model capture")
-        self._persistent_capture_released = True
+
+        self.model = None
+        self.kv_caches = []
+
+        async_decode = getattr(self, "async_decode", None)
+        if async_decode is not None:
+            # An engine-held async output keeps ``_controller``, so cut the
+            # controller's edge back to this runner: otherwise it walks into a
+            # runner whose model is gone and fails as a missing
+            # ``process_decode_output_host``.
+            async_decode.runner = None
+            self.async_decode = None
 
     @property
     def lane_batch(self) -> TTLaneInputBatch:
