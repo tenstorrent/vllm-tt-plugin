@@ -288,6 +288,20 @@ class ARModel:
     }
 
 
+class GreedyOnlyARModel:
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_non_greedy_sampling_on_device": False,
+    }
+
+
+class InvalidSamplingCapabilityARModel:
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_non_greedy_sampling_on_device": "no",
+    }
+
+
 class _WeakrefableConfig(SimpleNamespace):
     """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
 
@@ -347,6 +361,38 @@ def _ar_config():
     config = _weakrefable_config()
     config.model_config.hf_config.canvas_length = None
     return config
+
+
+def test_greedy_only_device_sampling_rejects_non_greedy_at_request_boundary(
+    monkeypatch,
+):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, GreedyOnlyARModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    with pytest.raises(ValueError, match="greedy device sampling only"):
+        _validate(SamplingParams(max_tokens=16, temperature=1.0, top_p=0.9))
+    _validate(SamplingParams(max_tokens=16, temperature=0.0))
+
+
+def test_existing_device_sampling_capability_keeps_non_greedy_behavior(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, ARModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    _validate(SamplingParams(max_tokens=16, temperature=1.0, top_p=0.9))
+
+
+def test_non_greedy_device_sampling_capability_must_be_boolean(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, InvalidSamplingCapabilityARModel)
+
+    with pytest.raises(
+        ValueError, match="supports_non_greedy_sampling_on_device.*bool"
+    ):
+        TTPlatform.check_and_update_config(config)
 
 
 def test_admission_handle_releases_with_the_dead_engine(monkeypatch):

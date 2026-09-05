@@ -1243,6 +1243,7 @@ class TTPlatform(Platform):
     _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
     _standard_dp_mesh_grids: ClassVar[dict[str, tuple[int, int]]] = {}
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
+    non_greedy_decoding_on_device: ClassVar[bool] = True
     # Stored as a weakref in production so a torn-down engine's config stops
     # tripping the one-engine-per-process guard once nothing else holds it;
     # tests may seed a direct config object.
@@ -1787,6 +1788,21 @@ class TTPlatform(Platform):
             if model_capabilities
             else False
         )
+        # Existing device-sampling models predate this narrower capability and
+        # support non-greedy requests, so absence preserves that contract. A
+        # greedy-only implementation must declare the restriction explicitly.
+        supports_non_greedy_sampling_on_device = (
+            model_capabilities.get("supports_non_greedy_sampling_on_device", True)
+            if model_capabilities
+            else True
+        )
+        if not isinstance(supports_non_greedy_sampling_on_device, bool):
+            raise ValueError(
+                "model_capabilities['supports_non_greedy_sampling_on_device'] "
+                "must be a bool, got "
+                f"{supports_non_greedy_sampling_on_device!r}"
+            )
+        cls.non_greedy_decoding_on_device = supports_non_greedy_sampling_on_device
         if sample_on_device_mode is not None and not supports_sample_on_device:
             raise ValueError(
                 f"sample_on_device_mode={sample_on_device_mode!r} was requested, "
@@ -1968,7 +1984,7 @@ class TTPlatform(Platform):
         params: "SamplingParams | PoolingParams",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
-        from vllm.sampling_params import SamplingParams
+        from vllm.sampling_params import SamplingParams, SamplingType
 
         dev = cls.device_name
 
@@ -1977,6 +1993,18 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        if (
+            isinstance(params, SamplingParams)
+            and cls.sample_on_device_mode in ("all", "decode_only")
+            and not cls.non_greedy_decoding_on_device
+            and params.sampling_type is not SamplingType.GREEDY
+        ):
+            raise ValueError(
+                "This TT model supports greedy device sampling only; got "
+                f"temperature={params.temperature}, top_p={params.top_p}, "
+                f"top_k={params.top_k}"
+            )
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
