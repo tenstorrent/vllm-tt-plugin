@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import sys
 import weakref
+from dataclasses import replace
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
@@ -14,6 +15,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    SUPPORTED_MM_MODALITIES,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
@@ -924,6 +926,79 @@ def _install_block_output_pause_guard_patch() -> None:
         cls.pause_scheduler = _wrap(original)
 
 
+def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
+    """Advertise to vLLM only the modalities this backend can transport.
+
+    Admission upstream is an allowlist keyed on what the *model* declares:
+    ``allowed_mm_limits`` iterates ``supported_mm_limits``, and
+    ``validate_num_items`` falls back to ``0`` for anything absent from it. A
+    model that never mentions video is therefore already refused, with "At most
+    0 video(s) may be provided in one prompt."
+
+    Nothing reconciles that declaration with what this plugin can carry, and the
+    two legitimately differ: a tt-metal model may implement a modality --
+    Qwen3.6 serves video through its own demo path -- while
+    ``TTModelRunner._gather_multi_modal_inputs`` has no kwarg to hand it over
+    in. vLLM then admits the request and the runner raises
+    ``NotImplementedError`` mid-step, taking EngineCore and the whole server
+    down instead of rejecting one request.
+
+    Wrap the model's ``ProcessingInfo`` so the limits reaching vLLM are the
+    intersection with ``SUPPORTED_MM_MODALITIES``. Dropping the key, rather than
+    pinning it to zero, keeps upstream's own rule ("absent means unsupported")
+    as the single source of truth and leaves a deployment free to lower a limit
+    we do support without having to enumerate the ones we do not.
+
+    See https://github.com/tenstorrent/vllm-tt-plugin/issues/112.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None or not getattr(model_config, "is_multimodal_model", False):
+        return
+
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    try:
+        model_cls = MULTIMODAL_REGISTRY._get_model_cls(model_config)
+    except Exception:
+        # Architecture resolution is validated just above this call; a model
+        # without a processor factory is not multimodal in the sense meant here.
+        return
+
+    factories = getattr(model_cls, "_processor_factory", None)
+    info_cls = getattr(factories, "info", None)
+    if info_cls is None or getattr(info_cls, "_tt_restricts_modalities", False):
+        return
+
+    class _TTModalityRestrictedInfo(info_cls):
+        # The registry keeps one factory per model class, so the wrap has to be
+        # idempotent: check_and_update_config re-runs on the same class when the
+        # engine rebuilds its config in-process.
+        _tt_restricts_modalities = True
+
+        def get_supported_mm_limits(self):
+            limits = super().get_supported_mm_limits()
+            served = {
+                modality: limit
+                for modality, limit in limits.items()
+                if modality in SUPPORTED_MM_MODALITIES
+            }
+            dropped = sorted(set(limits) - set(served))
+            if dropped:
+                logger.warning_once(
+                    "Model declares multimodal input this backend cannot serve: "
+                    "%s. Requests carrying it are rejected; serving %s. See "
+                    "https://github.com/tenstorrent/vllm-tt-plugin/issues/112",
+                    ", ".join(dropped),
+                    ", ".join(sorted(served)) or "no multimodal input",
+                )
+            return served
+
+    _TTModalityRestrictedInfo.__name__ = info_cls.__name__
+    _TTModalityRestrictedInfo.__qualname__ = info_cls.__qualname__
+    _TTModalityRestrictedInfo.__doc__ = info_cls.__doc__
+    model_cls._processor_factory = replace(factories, info=_TTModalityRestrictedInfo)
+
+
 def _iter_extra_model_bundles():
     """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
 
@@ -1548,6 +1623,10 @@ class TTPlatform(Platform):
                 f"model: '{vllm_config.model_config.model}'. "
                 f"Available TT architectures: {tt_archs}"
             )
+
+        # After the arch resolution above, so the model class the registry
+        # hands back is the TT one whose limits we mean to restrict.
+        _restrict_advertised_mm_modalities(vllm_config)
 
         # Setting attributes on the class level is kind of hacky, but
         # it's the only way to make validate_request depend on vllm_config
