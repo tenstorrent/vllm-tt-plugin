@@ -2,14 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """The transportable-modality set and the runner guard that reads it.
 
-``_gather_multi_modal_inputs`` builds one fixed pair of kwargs
-(``pixel_values`` / ``image_grid_thw``), so image is the only modality whose
-payload can reach a model. ``SUPPORTED_MM_MODALITIES`` names that fact and
-``_validate_mm_feature`` enforces it.
-
-These pin the two together: widening the set without teaching the gather step
-to collect the new kwargs would admit a payload the model never receives.
-See https://github.com/tenstorrent/vllm-tt-plugin/issues/112.
+Pins the two together: widening the set without teaching
+``_gather_multi_modal_inputs`` to collect the new kwargs would admit a payload
+the model never receives. See issue #112.
 """
 
 from types import SimpleNamespace

@@ -10,23 +10,11 @@ if TYPE_CHECKING:
 
 logger = init_tt_logger(__name__)
 
-# Modalities the TT runner can actually hand to a model.
-#
-# ``TTModelRunner._gather_multi_modal_inputs`` builds exactly the
-# ``pixel_values`` / ``image_grid_thw`` pair, so image is the only modality
-# whose payload reaches the model; nothing carries ``pixel_values_videos``,
-# audio features, or any other per-modality kwarg. The restriction dates back
-# to the first multimodal support in the vLLM fork (tenstorrent/vllm#217) and
-# came over verbatim when the backend was extracted into this package.
-#
-# Adding a modality means teaching the gather step to collect its kwargs, not
-# just widening this set.
-#
-# It lives here rather than next to the gather step because the platform reads
-# it while deciding what to advertise to vLLM, and ``model_runner`` imports
-# ``platform``.
-#
-# See https://github.com/tenstorrent/vllm-tt-plugin/issues/112.
+# Modalities the runner can hand to a model. Widening this set alone is not
+# enough: ``TTModelRunner._gather_multi_modal_inputs`` builds only the
+# ``pixel_values`` / ``image_grid_thw`` pair, so any other payload has no
+# kwarg to travel in. Lives here because the platform reads it too, and
+# ``model_runner`` imports ``platform``. See issue #112.
 SUPPORTED_MM_MODALITIES = frozenset({"image"})
 
 

@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """Restricting the modality limits the plugin advertises to vLLM.
 
-Upstream admission is an allowlist keyed on the model's declaration: a modality
-absent from ``get_supported_mm_limits`` is refused with a 4xx. A tt-metal model
-may legitimately declare one the runner cannot transport, so the platform
-intersects the declaration with ``SUPPORTED_MM_MODALITIES`` before vLLM reads
-it. See https://github.com/tenstorrent/vllm-tt-plugin/issues/112.
+Upstream refuses a modality absent from ``get_supported_mm_limits`` with a 4xx,
+so the platform intersects the model's declaration with
+``SUPPORTED_MM_MODALITIES`` before vLLM reads it. See issue #112.
 """
 
 from dataclasses import dataclass
@@ -14,9 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-# Importing vLLM first lets its platform-plugin resolution finish; pulling the
-# plugin in cold re-enters that half-initialized machinery. tests/conftest.py
-# defers its own platform import for the same reason.
+# Let vLLM finish its own import before the plugin module pulls it in again.
 import vllm  # noqa: F401
 
 from vllm_tt_plugin.platform import _restrict_advertised_mm_modalities

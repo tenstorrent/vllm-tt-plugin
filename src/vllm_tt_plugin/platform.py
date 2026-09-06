@@ -929,27 +929,16 @@ def _install_block_output_pause_guard_patch() -> None:
 def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
     """Advertise to vLLM only the modalities this backend can transport.
 
-    Admission upstream is an allowlist keyed on what the *model* declares:
-    ``allowed_mm_limits`` iterates ``supported_mm_limits``, and
-    ``validate_num_items`` falls back to ``0`` for anything absent from it. A
-    model that never mentions video is therefore already refused, with "At most
-    0 video(s) may be provided in one prompt."
+    Upstream admission is an allowlist keyed on ``supported_mm_limits``:
+    ``validate_num_items`` refuses anything absent from it with a 4xx. A model
+    may declare a modality the runner cannot carry -- Qwen3.6 implements video
+    but ``_gather_multi_modal_inputs`` has no kwarg for it -- and vLLM would
+    then admit a request that dies mid-step, taking EngineCore with it.
 
-    Nothing reconciles that declaration with what this plugin can carry, and the
-    two legitimately differ: a tt-metal model may implement a modality --
-    Qwen3.6 serves video through its own demo path -- while
-    ``TTModelRunner._gather_multi_modal_inputs`` has no kwarg to hand it over
-    in. vLLM then admits the request and the runner raises
-    ``NotImplementedError`` mid-step, taking EngineCore and the whole server
-    down instead of rejecting one request.
-
-    Wrap the model's ``ProcessingInfo`` so the limits reaching vLLM are the
-    intersection with ``SUPPORTED_MM_MODALITIES``. Dropping the key, rather than
-    pinning it to zero, keeps upstream's own rule ("absent means unsupported")
-    as the single source of truth and leaves a deployment free to lower a limit
-    we do support without having to enumerate the ones we do not.
-
-    See https://github.com/tenstorrent/vllm-tt-plugin/issues/112.
+    Wrap the model's ``ProcessingInfo`` so vLLM sees the intersection with
+    ``SUPPORTED_MM_MODALITIES``. Dropping the key rather than pinning it to
+    zero keeps upstream's "absent means unsupported" as the only rule. See
+    issue #112.
     """
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
@@ -960,8 +949,7 @@ def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
     try:
         model_cls = MULTIMODAL_REGISTRY._get_model_cls(model_config)
     except Exception:
-        # Architecture resolution is validated just above this call; a model
-        # without a processor factory is not multimodal in the sense meant here.
+        # The arch check above this call owns resolution failures.
         return
 
     factories = getattr(model_cls, "_processor_factory", None)
@@ -970,9 +958,8 @@ def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
         return
 
     class _TTModalityRestrictedInfo(info_cls):
-        # The registry keeps one factory per model class, so the wrap has to be
-        # idempotent: check_and_update_config re-runs on the same class when the
-        # engine rebuilds its config in-process.
+        # One factory per model class, and the hook re-runs when the engine
+        # rebuilds its config in-process, so the wrap must be idempotent.
         _tt_restricts_modalities = True
 
         def get_supported_mm_limits(self):
@@ -1624,8 +1611,7 @@ class TTPlatform(Platform):
                 f"Available TT architectures: {tt_archs}"
             )
 
-        # After the arch resolution above, so the model class the registry
-        # hands back is the TT one whose limits we mean to restrict.
+        # After the arch resolution above, so the registry hands back the TT class.
         _restrict_advertised_mm_modalities(vllm_config)
 
         # Setting attributes on the class level is kind of hacky, but
