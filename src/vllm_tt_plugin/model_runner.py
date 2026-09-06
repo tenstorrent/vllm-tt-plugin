@@ -40,6 +40,7 @@ from vllm_tt_plugin.async_decode import (
     TTAsyncDecodeController,
 )
 from vllm_tt_plugin.config import (
+    SUPPORTED_MM_MODALITIES,
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
@@ -783,8 +784,8 @@ class TTModelRunner:
         self.input_batch.refresh_logitsprocs()
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
-        """Validate the multimodal feature is an image."""
-        if mm_feature.modality != "image":
+        """Validate the multimodal feature is one this runner can transport."""
+        if mm_feature.modality not in SUPPORTED_MM_MODALITIES:
             raise NotImplementedError("Only images are supported for now")
 
     def _gather_multi_modal_inputs(
