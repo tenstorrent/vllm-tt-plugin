@@ -101,6 +101,51 @@ def test_wrapping_is_idempotent(registry):
     assert _advertised(registry.model_cls) == {"image": 1}
 
 
+def test_a_shared_info_class_is_left_intact(registry):
+    # tt-metal registers upstream classes directly (Mistral3ProcessingInfo,
+    # Gemma3ProcessingInfo), and TT_Qwen3VLProcessingInfo backs two models.
+    # Restricting one model must not reach the class or its other users.
+    shared = _model_cls({"image": 1, "video": 1})._processor_factory.info
+
+    class Owner:
+        _processor_factory = _Factories(info=shared)
+
+    class Other:
+        _processor_factory = _Factories(info=shared)
+
+    registry.model_cls = Owner
+    _restrict_advertised_mm_modalities(_config())
+
+    assert _advertised(Owner) == {"image": 1}
+    assert _advertised(Other) == {"image": 1, "video": 1}
+    assert shared().get_supported_mm_limits() == {"image": 1, "video": 1}
+
+
+def test_wrap_keeps_the_identity_processor_builders_report(registry):
+    # _build_llava_or_pixtral_hf_processor and friends dispatch on
+    # isinstance(info, ...) and raise NotImplementedError(type(info)).
+    base = _model_cls({"image": 1, "video": 1})._processor_factory.info
+    registry.model_cls = _model_cls({"image": 1, "video": 1})
+    registry.model_cls._processor_factory = _Factories(info=base)
+
+    _restrict_advertised_mm_modalities(_config())
+
+    wrapped = registry.model_cls._processor_factory.info
+    assert isinstance(wrapped(), base)
+    for attr in ("__name__", "__qualname__", "__module__", "__doc__"):
+        assert getattr(wrapped, attr) == getattr(base, attr)
+
+
+def test_wrap_does_not_stack_mro_levels(registry):
+    registry.model_cls = _model_cls({"image": 1, "video": 1})
+    depth = len(registry.model_cls._processor_factory.info.__mro__)
+
+    for _ in range(5):
+        _restrict_advertised_mm_modalities(_config())
+
+    assert len(registry.model_cls._processor_factory.info.__mro__) == depth + 1
+
+
 def test_other_factory_fields_survive_the_wrap(registry):
     registry.model_cls = _model_cls({"image": 1, "video": 1})
 

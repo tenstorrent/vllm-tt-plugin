@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import contextlib
+import functools
 import gc
 import json
 import multiprocessing
@@ -958,8 +960,9 @@ def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
         return
 
     class _TTModalityRestrictedInfo(info_cls):
-        # One factory per model class, and the hook re-runs when the engine
-        # rebuilds its config in-process, so the wrap must be idempotent.
+        # The hook re-runs on the same class when the engine rebuilds its
+        # config in-process. The filter is idempotent, but re-wrapping is not:
+        # each pass adds an MRO level the super() chain then walks.
         _tt_restricts_modalities = True
 
         def get_supported_mm_limits(self):
@@ -980,9 +983,13 @@ def _restrict_advertised_mm_modalities(vllm_config: "VllmConfig") -> None:
                 )
             return served
 
-    _TTModalityRestrictedInfo.__name__ = info_cls.__name__
-    _TTModalityRestrictedInfo.__qualname__ = info_cls.__qualname__
-    _TTModalityRestrictedInfo.__doc__ = info_cls.__doc__
+    # ``_build_llava_or_pixtral_hf_processor`` and friends raise
+    # ``NotImplementedError(type(info))``, so keep the identity readable. Copy
+    # what ``functools.wraps`` would rather than a hand-picked list, which
+    # already missed ``__module__``; everything else comes from the base.
+    for attr in functools.WRAPPER_ASSIGNMENTS:
+        with contextlib.suppress(AttributeError):
+            setattr(_TTModalityRestrictedInfo, attr, getattr(info_cls, attr))
     model_cls._processor_factory = replace(factories, info=_TTModalityRestrictedInfo)
 
 
