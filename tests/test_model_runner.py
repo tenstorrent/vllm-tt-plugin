@@ -29,6 +29,7 @@ def _batch_with_one_request(
     prompt_len: int,
     output_len: int,
     num_computed_tokens: int,
+    sampling_params: SamplingParams | None = None,
 ) -> tuple[InputBatch, CachedRequestState]:
     """Creates a batch with a single request, for testing purposes."""
     batch = InputBatch(
@@ -43,7 +44,7 @@ def _batch_with_one_request(
         req_id="r",
         prompt_token_ids=list(range(prompt_len)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=sampling_params or SamplingParams(temperature=0.0),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -314,3 +315,55 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+# region Device sampling eligibility
+
+
+@pytest.mark.parametrize(
+    "temperature, supports_non_greedy, expect_device_sampling",
+    [
+        (0.0, True, True),
+        (0.0, False, True),
+        (1.0, True, True),
+        (1.0, False, False),
+    ],
+    ids=[
+        "greedy-full",
+        "greedy-restricted",
+        "non-greedy-full",
+        "non-greedy-restricted",
+    ],
+)
+def test_check_perform_device_sampling_routes_non_greedy_to_host_when_restricted(
+    temperature: float,
+    supports_non_greedy: bool,
+    expect_device_sampling: bool,
+):
+    """A device sampler that only implements argmax must not receive a
+    non-greedy step. check_perform_device_sampling routes that step to host
+    sampling instead, the same way it already does for bad_words, min_p, and
+    every other always-host-only sampling control."""
+    batch, _ = _batch_with_one_request(
+        prompt_len=4,
+        output_len=0,
+        num_computed_tokens=4,
+        sampling_params=SamplingParams(temperature=temperature),
+    )
+    runner = SimpleNamespace(
+        input_batch=batch,
+        sample_on_device_mode="all",
+        num_devices=1,
+        tt_data_parallel_size=1,
+        model_config=SimpleNamespace(logits_processors=None),
+        supports_topk_logprobs=False,
+        supports_non_greedy_sampling_on_device=supports_non_greedy,
+    )
+
+    result = TTModelRunner.check_perform_device_sampling(
+        runner, is_decode=True, has_structured_outputs=False
+    )
+
+    assert result is expect_device_sampling
+
+
+# endregion Device sampling eligibility

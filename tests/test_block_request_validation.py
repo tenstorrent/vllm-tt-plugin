@@ -288,12 +288,32 @@ class ARModel:
     }
 
 
+class GreedyOnlyARModel:
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_non_greedy_sampling_on_device": False,
+    }
+
+
+class InvalidSamplingCapabilityARModel:
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_non_greedy_sampling_on_device": "no",
+    }
+
+
 class _WeakrefableConfig(SimpleNamespace):
     """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
 
 
 def _weakrefable_config():
     return _WeakrefableConfig(**vars(_config()))
+
+
+def _ar_config():
+    config = _weakrefable_config()
+    config.model_config.hf_config.canvas_length = None
+    return config
 
 
 def _patch_model_resolution(monkeypatch, model_class=BlockModel):
@@ -316,6 +336,40 @@ def _patch_model_resolution(monkeypatch, model_class=BlockModel):
         "vllm.model_executor.model_loader.utils.get_model_architecture",
         lambda _model_config: (model_class, None),
     )
+
+
+def test_startup_defaults_non_greedy_sampling_capability_to_supported(monkeypatch):
+    """A model that predates supports_non_greedy_sampling_on_device keeps
+    the established contract: its device sampler is assumed to support the
+    full sampling pipeline, unrestricted."""
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, ARModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert TTPlatform.supports_non_greedy_sampling_on_device is True
+
+
+def test_startup_resolves_greedy_only_sampling_capability(monkeypatch):
+    """A model that declares supports_non_greedy_sampling_on_device=False
+    gets that restriction recorded on TTPlatform, for
+    check_perform_device_sampling to read per step."""
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, GreedyOnlyARModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert TTPlatform.supports_non_greedy_sampling_on_device is False
+
+
+def test_startup_rejects_non_boolean_non_greedy_sampling_capability(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, InvalidSamplingCapabilityARModel)
+
+    with pytest.raises(
+        ValueError, match="supports_non_greedy_sampling_on_device.*bool"
+    ):
+        TTPlatform.check_and_update_config(config)
 
 
 def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
@@ -721,6 +775,27 @@ def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
     with pytest.raises(
         ValueError,
         match=r"supports_prefix_caching.*capability declaration",
+    ):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_startup_rejects_block_model_declaring_greedy_only_sampling(monkeypatch):
+    """A block-output request's cloned SamplingParams is always neutralized
+    to a non-greedy temperature, so declaring this capability False would
+    force every step to host sampling, which cannot build a canvas."""
+
+    class BlockModelClaimingGreedyOnly(BlockModel):
+        model_capabilities = {
+            **BlockModel.model_capabilities,
+            "supports_non_greedy_sampling_on_device": False,
+        }
+
+    config = _config()
+    _patch_model_resolution(monkeypatch, BlockModelClaimingGreedyOnly)
+
+    with pytest.raises(
+        ValueError,
+        match=r"supports_non_greedy_sampling_on_device.*capability declaration",
     ):
         TTPlatform.check_and_update_config(config)
 

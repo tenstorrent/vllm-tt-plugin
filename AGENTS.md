@@ -247,6 +247,7 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `supports_prefix_caching` | `False` | Whether the vLLM prefix cache may be used |
 | `output_tokens_per_step` | `1` | Committed output width per step. `1` is token-at-a-time; `>1` is block-output width |
 | `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
+| `supports_non_greedy_sampling_on_device` | `True` | Whether an enrolled device sampler can execute temperature/top_p/top_k, not only greedy. `check_perform_device_sampling` routes a non-greedy step to host sampling when `False` |
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
 
 Absent keys default via `.get`. That is the live contract. Do not add
@@ -335,7 +336,8 @@ lifetime of the value:
   `check_and_update_config` configures every later test. Current names in
   `tests/conftest.py` `_TT_PLATFORM_CONFIG_ATTRS`:
   `_standard_dp_visible_device_groups`, `_standard_dp_mesh_grids`,
-  `sample_on_device_mode`, `always_compat_sampling`, `_tt_vllm_config`.
+  `sample_on_device_mode`, `supports_non_greedy_sampling_on_device`,
+  `always_compat_sampling`, `_tt_vllm_config`.
   `always_compat_sampling` is assigned at runtime inside
   `_apply_check_and_update_config`, not declared as a `ClassVar` on the class
   body.
