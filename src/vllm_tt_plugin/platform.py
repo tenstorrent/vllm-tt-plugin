@@ -1243,7 +1243,7 @@ class TTPlatform(Platform):
     _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
     _standard_dp_mesh_grids: ClassVar[dict[str, tuple[int, int]]] = {}
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
-    supports_non_greedy_sampling_on_device: ClassVar[bool] = True
+    supports_random_sampling_on_device: ClassVar[bool] = True
     # Stored as a weakref in production so a torn-down engine's config stops
     # tripping the one-engine-per-process guard once nothing else holds it;
     # tests may seed a direct config object.
@@ -1798,21 +1798,21 @@ class TTPlatform(Platform):
 
         # Independently narrows an enrolled device sampler to greedy-only,
         # for a device kernel that only implements argmax. Absence defaults
-        # to True so existing device-sampling models keep supporting
-        # non-greedy requests; check_perform_device_sampling reads the
-        # resolved value to fall back to host sampling otherwise.
-        supports_non_greedy_sampling_on_device = (
-            model_capabilities.get("supports_non_greedy_sampling_on_device", True)
+        # to True so existing device-sampling models keep supporting random
+        # requests (temperature != 0); check_perform_device_sampling reads
+        # the resolved value to fall back to host sampling otherwise.
+        supports_random_sampling_on_device = (
+            model_capabilities.get("supports_random_sampling_on_device", True)
             if model_capabilities
             else True
         )
-        if not isinstance(supports_non_greedy_sampling_on_device, bool):
+        if not isinstance(supports_random_sampling_on_device, bool):
             raise ValueError(
-                "model_capabilities['supports_non_greedy_sampling_on_device'] "
+                "model_capabilities['supports_random_sampling_on_device'] "
                 "must be a bool, got "
-                f"{supports_non_greedy_sampling_on_device!r}"
+                f"{supports_random_sampling_on_device!r}"
             )
-        if is_block_output_model and not supports_non_greedy_sampling_on_device:
+        if is_block_output_model and not supports_random_sampling_on_device:
             # _neutralize_model_owned_sampling fixes the cloned per-request
             # temperature to 1.0, never 0.0, so input_batch.all_greedy is
             # always False here. Combined with this capability set to
@@ -1821,14 +1821,12 @@ class TTPlatform(Platform):
             raise ValueError(
                 "Block-output models commit output from a model-owned "
                 "sampler and cannot declare "
-                "supports_non_greedy_sampling_on_device=False: it would "
+                "supports_random_sampling_on_device=False: it would "
                 "force every step to host sampling, which cannot build a "
                 "block-output canvas. Remove the capability declaration for "
                 f"model {model_class.__name__} ({model_class.__module__})."
             )
-        cls.supports_non_greedy_sampling_on_device = (
-            supports_non_greedy_sampling_on_device
-        )
+        cls.supports_random_sampling_on_device = supports_random_sampling_on_device
         if is_block_output_model and sample_on_device_mode != "all":
             raise ValueError(
                 "Block-output models emit complete multi-token outputs from "

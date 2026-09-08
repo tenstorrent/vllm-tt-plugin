@@ -182,11 +182,11 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
-        # Whether the device sampler can execute a non-greedy request;
-        # check_perform_device_sampling falls back to host sampling when it
-        # can't.
-        self.supports_non_greedy_sampling_on_device = getattr(
-            TTPlatform, "supports_non_greedy_sampling_on_device", True
+        # Whether the device sampler supports random sampling (temperature
+        # != 0), not only greedy; check_perform_device_sampling falls back
+        # to host sampling when it can't.
+        self.supports_random_sampling_on_device = getattr(
+            TTPlatform, "supports_random_sampling_on_device", True
         )
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
@@ -1948,12 +1948,10 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # An argmax-only device sampler can't execute a non-greedy request;
-        # one non-greedy row sends the whole step's batch to host sampling.
-        if (
-            not self.supports_non_greedy_sampling_on_device
-            and not input_batch.all_greedy
-        ):
+        # An argmax-only device sampler can't execute a random request; one
+        # such row (input_batch.all_greedy False) sends the whole step's
+        # batch to host sampling.
+        if not self.supports_random_sampling_on_device and not input_batch.all_greedy:
             return False
 
         # Structured outputs are not supported on device yet
