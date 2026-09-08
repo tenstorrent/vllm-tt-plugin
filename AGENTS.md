@@ -247,7 +247,7 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `supports_prefix_caching` | `False` | Whether the vLLM prefix cache may be used |
 | `output_tokens_per_step` | `1` | Committed output width per step. `1` is token-at-a-time; `>1` is block-output width |
 | `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
-| `supports_non_greedy_sampling_on_device` | `True` | Whether an enrolled device sampler can execute temperature/top_p/top_k, not only greedy. `check_perform_device_sampling` routes a non-greedy step to host sampling when `False` |
+| `supports_random_sampling_on_device` | `True` | Whether an enrolled device sampler can execute random sampling (temperature/top_p/top_k), not only greedy. `check_perform_device_sampling` routes a random-sampling step to host sampling when `False` |
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
 | `tt_adaptive_block_output` | `False` | Block-output models only: commit the block only on solo decode steps and decode batched steps as plain 1-token baseline. Requires `output_tokens_per_step > 1` (raises otherwise) and relaxes five gates: `max_num_seqs 1`, data-parallelism, the distributed-executor backend allow-list (adds `mp`), the async-scheduling refusal, and the block-output sampling mode (accepts `decode_only` as well as `all`) |
 | `tt_adaptive_block_max_prompt_tokens` | `0` (no limit) | Adaptive block models only: prompts longer than this are served as plain baseline (width-1 steps) for their whole lifetime; the scheduler reserves accordingly. Raises when negative, and when non-zero without `tt_adaptive_block_output` |
@@ -338,7 +338,7 @@ lifetime of the value:
   `check_and_update_config` configures every later test. Current names in
   `tests/conftest.py` `_TT_PLATFORM_CONFIG_ATTRS`:
   `_standard_dp_visible_device_groups`, `_standard_dp_mesh_grids`,
-  `sample_on_device_mode`, `supports_non_greedy_sampling_on_device`,
+  `sample_on_device_mode`, `supports_random_sampling_on_device`,
   `always_compat_sampling`, `_tt_vllm_config`.
   `always_compat_sampling` is assigned at runtime inside
   `_apply_check_and_update_config`, not declared as a `ClassVar` on the class

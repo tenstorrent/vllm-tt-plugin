@@ -280,7 +280,7 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-Requests that cannot use TT on-device sampling automatically fall back to vLLM’s host-side sampling path. This fallback is selected per batch and requires no user configuration. One case: a model whose on-device sampler only implements greedy decoding (`model_capabilities['supports_non_greedy_sampling_on_device'] = False`) falls back to host sampling for the whole batch on any step that contains a non-greedy request.
+Requests that cannot use TT on-device sampling automatically fall back to vLLM’s host-side sampling path. This fallback is selected per batch and requires no user configuration. One case: a model whose on-device sampler only implements greedy decoding (`model_capabilities['supports_random_sampling_on_device'] = False`) falls back to host sampling for the whole batch on any step that contains a random-sampling request (temperature > 0).
 
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
