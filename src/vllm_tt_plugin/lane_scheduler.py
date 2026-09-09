@@ -49,6 +49,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
+    TTDecodeInterleavePolicy,
     TTScheduler,
     TTSchedulingMode,
     get_tt_forced_reset_discard_counts,
@@ -282,6 +283,10 @@ class TTLaneCoordinator(SchedulerInterface):
         ]
         # No KV connector on TT; surfaced for engine-core attribute access.
         self.connector: KVConnectorBase_V1 | None = None
+        # One policy for the whole step, not one per lane. Every lane executes
+        # the single negotiated mode, so per-lane instances would each see only
+        # their own lane's work and disagree about when to interleave.
+        self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -388,6 +393,16 @@ class TTLaneCoordinator(SchedulerInterface):
             has_partial_prefill or (has_waiting and ((not has_running) or has_capacity))
         )
 
+    def _has_running_decode(self) -> bool:
+        """Whether any lane holds a request a decode step can advance.
+
+        A partial-prefill continuation occupies ``running`` but samples no
+        token, so it does not qualify.
+        """
+        return any(
+            any(not r.is_prefill_chunk for r in sched.running) for sched in self.lanes
+        )
+
     def _negotiate_forced_mode(self) -> TTSchedulingMode:
         """Pick the single mode (prefill- or decode-only) all lanes will run.
 
@@ -395,8 +410,18 @@ class TTLaneCoordinator(SchedulerInterface):
         decode, so the lanes must agree. If *any* lane wants to prefill, the
         whole step is prefill-only; otherwise it is decode-only. Lanes without
         work for the chosen mode simply contribute an empty batch.
+
+        The decode-interleave policy overrides a prefill intent once a run of
+        prefill steps reaches its bound, so the decision stays a single
+        coordinator-level choice: taking it per lane would let lanes disagree
+        about the shared mode.
         """
         intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
+        if intent == 1 and self._decode_interleave.wants_decode_step(
+            has_pending_prefill=True,
+            has_running_decode=self._has_running_decode(),
+        ):
+            return TTSchedulingMode.DECODE_ONLY
         return TTSchedulingMode.from_prefill_intent(intent)
 
     def _schedule_all_lanes(
@@ -587,6 +612,7 @@ class TTLaneCoordinator(SchedulerInterface):
                 set_tt_forced_reset_discard_counts(merged, current_reset_discards)
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
+        self._decode_interleave.record_step(is_decode=is_decode)
         plan = self._build_step_plan(lane_outputs, merged, is_decode)
         _set_tt_step_state(merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan))
         return merged
