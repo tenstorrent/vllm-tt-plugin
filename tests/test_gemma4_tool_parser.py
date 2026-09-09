@@ -134,3 +134,35 @@ def test_streaming_assembles_name_and_args(parser: Gemma4ToolParser):
 
     assert name == "get_weather"
     assert json.loads(args_acc) == {"location": "Paris", "units": "c"}
+
+
+# ---------------------------------------------------------------------------
+# Construction signature.
+#
+# vLLM builds the parser positionally, `tool_parser_cls(tokenizer, tools)`
+# (vllm/parser/abstract_parser.py:121), once per request that carries tools.
+# The fixture above uses a keyword and one argument, so it cannot catch a
+# signature that has drifted from that call — and the drift is silent until a
+# request arrives: the server starts, /health reports ready, and every chat
+# completion returns HTTP 400 "takes 2 positional arguments but 3 were given".
+# Under aiperf that is an error row rather than a crash, so a sweep completes,
+# writes reports and exits 0 with no latency metrics at all.
+
+
+def test_constructs_the_way_vllm_constructs_it():
+    """Two positional arguments, as the request path passes them."""
+    parser = Gemma4ToolParser(None, None)
+    assert parser.model_tokenizer is None
+
+
+def test_constructs_with_a_tool_list():
+    """A tools list is accepted and reaches the base class."""
+
+    class _Fn:
+        name = "get_weather"
+
+    parser = Gemma4ToolParser(None, [_Fn()])
+    # The base class filters to the OpenAI tool types it knows; the contract
+    # asserted here is that passing a list is accepted at all, which is what
+    # the request path does on every tool-bearing request.
+    assert hasattr(parser, "tools")

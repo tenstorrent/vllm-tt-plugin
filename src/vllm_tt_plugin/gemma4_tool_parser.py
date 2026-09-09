@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
+from vllm.tool_parsers.utils import Tool
 
 from vllm_tt_plugin.logger import init_tt_logger
 
@@ -43,8 +44,22 @@ class Gemma4ToolParser(ToolParser):
     and normalizes arguments into a JSON string for the OpenAI tool-call schema.
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
-        super().__init__(tokenizer)
+    def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
+        # `tools` is not optional in practice: the request's tool list is
+        # passed positionally at construction
+        # (vllm/parser/abstract_parser.py:121, `tool_parser_cls(tokenizer,
+        # tools)`), so a parser that accepts only a tokenizer raises TypeError
+        # there. The base class stores and filters the list, so it is forwarded
+        # rather than reimplemented here.
+        #
+        # The failure is invisible until a request arrives with tools: the
+        # server starts, /health reports ready, and every chat completion then
+        # returns HTTP 400 "Gemma4ToolParser.__init__() takes 2 positional
+        # arguments but 3 were given". Under aiperf that is an error row rather
+        # than a crash, so a benchmark sweep completes, writes reports and
+        # exits 0 with error_request_count equal to the request count and no
+        # latency metrics at all.
+        super().__init__(tokenizer, tools)
 
         # Streaming state.
         self.current_tool_name_sent: bool = False
