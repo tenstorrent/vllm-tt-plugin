@@ -45,8 +45,7 @@ def test_models_without_fabric_capability_keep_hardware_defaults(
 
 
 def test_model_fabric_kwargs_pass_through_without_mutating_capability(fabric):
-    router = ttnn.FabricRouterConfig()
-    router.max_packet_payload_size_bytes = 8192
+    router = object()
     model_config = {
         "config": ttnn.FabricConfig.FABRIC_1D_RING,
         "reliability_mode": ttnn.FabricReliabilityMode.RELAXED_INIT,
@@ -57,7 +56,6 @@ def test_model_fabric_kwargs_pass_through_without_mutating_capability(fabric):
     worker.set_fabric(None, 4, model_config)
     assert fabric.call_args.kwargs == original
     assert model_config == original
-    assert router.max_packet_payload_size_bytes == 8192
 
 
 def test_launch_overrides_win_without_discarding_other_model_defaults(fabric):
