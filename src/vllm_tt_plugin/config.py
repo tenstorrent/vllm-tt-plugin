@@ -179,3 +179,64 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
         vllm_config.parallel_config.data_parallel_size == 1
         and get_tt_data_parallel_size(vllm_config) > 1
     )
+
+
+# Decode-interleave policy. TT executes a step as all-prefill or all-decode, so
+# a run of prefill steps stalls every running decode for its whole duration.
+# These bound that run. Read by the scheduler and by the lane coordinator.
+_DECODE_INTERLEAVE_ENABLED_KEY = "decode_interleave_enabled"
+_DECODE_INTERLEAVE_PREFILL_STEPS_KEY = "decode_interleave_prefill_steps"
+_DECODE_INTERLEAVE_DECODE_STEPS_KEY = "decode_interleave_decode_steps"
+
+_DECODE_INTERLEAVE_ENABLED_DEFAULT = True
+_DECODE_INTERLEAVE_PREFILL_STEPS_DEFAULT = 1
+_DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT = 1
+
+
+def _read_tt_bool(tt_config: dict[str, Any], key: str, default: bool) -> bool:
+    value = tt_config.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"additional_config['tt']['{key}'] must be a boolean, got {value!r}"
+        )
+    return value
+
+
+def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> int:
+    value = tt_config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"additional_config['tt']['{key}'] must be an integer >= 1, got {value!r}"
+        )
+    return value
+
+
+def get_tt_decode_interleave_config(
+    vllm_config: "VllmConfig",
+) -> tuple[bool, int, int]:
+    """Return ``(enabled, prefill_steps, decode_steps)`` for decode interleave.
+
+    ``prefill_steps`` is the number of consecutive prefill steps allowed before
+    a decode-only step is inserted; ``decode_steps`` is how many decode-only
+    steps that insertion runs before prefill is required again. Both are step
+    counts rather than token counts because the interleave granularity on TT is
+    a whole step: the device cannot mix prefill and decode rows in one batch.
+    """
+    tt_config = get_tt_config(vllm_config)
+    return (
+        _read_tt_bool(
+            tt_config,
+            _DECODE_INTERLEAVE_ENABLED_KEY,
+            _DECODE_INTERLEAVE_ENABLED_DEFAULT,
+        ),
+        _read_tt_positive_int(
+            tt_config,
+            _DECODE_INTERLEAVE_PREFILL_STEPS_KEY,
+            _DECODE_INTERLEAVE_PREFILL_STEPS_DEFAULT,
+        ),
+        _read_tt_positive_int(
+            tt_config,
+            _DECODE_INTERLEAVE_DECODE_STEPS_KEY,
+            _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT,
+        ),
+    )

@@ -16,6 +16,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
@@ -170,6 +171,31 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     # ``enable_chunked_prefill``, so leaving it nonzero still splits prefills
     # for a model that cannot resume one.
     scheduler_config.long_prefill_token_threshold = 0
+
+
+def _report_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
+    """Validate the decode-interleave settings and record the resolved policy.
+
+    Called for its raising side effect as much as for the log line: an invalid
+    ``decode_interleave_*`` value must stop the server at config time rather
+    than at the first scheduler step in a worker subprocess. The scheduler
+    config is absent from ``/metrics`` and an interleaved decode step is
+    indistinguishable from an ordinary one in the iteration stats, so this line
+    is the only external signal of the active policy.
+    """
+    enabled, prefill_steps, decode_steps = get_tt_decode_interleave_config(vllm_config)
+    if not enabled:
+        logger.info(
+            "Decode interleave disabled: a run of prefill steps stalls every "
+            "running decode for its whole duration."
+        )
+        return
+    logger.info(
+        "Decode interleave enabled: at most %d consecutive prefill step(s) "
+        "before %d decode-only step(s).",
+        prefill_steps,
+        decode_steps,
+    )
 
 
 def _apply_chunked_prefill_policy(
@@ -1596,6 +1622,7 @@ class TTPlatform(Platform):
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
+        _report_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         is_block_output_model = is_tt_block_output_model(vllm_config)
