@@ -308,13 +308,35 @@ Common options:
 | `trace_region_size` | Trace region size for TT runtime tracing. |
 | `worker_l1_size` | Worker L1 size override. |
 | `l1_small_size` | Small L1 size override. |
-| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Defaults: Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
+| `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Overrides model defaults; otherwise defaults to Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
-| `fabric_max_packet_payload_size_bytes` | Positive router payload size in bytes. Omit for TT-Metal's default; Llama 3.1-8B QB2 uses 8192. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
+
+### Model Fabric Configuration
+
+A model class may declare `model_capabilities["fabric_config"]` as a dictionary
+of keyword arguments to `ttnn.set_fabric_config`, using TTNN enums and config
+objects directly. For example:
+
+```python
+model_capabilities = {
+    "fabric_config": {
+        "config": ttnn.FabricConfig.FABRIC_1D_RING,
+        "num_planes": 2,
+    },
+}
+```
+
+The worker applies hardware defaults, then the model's dictionary, then explicit
+`fabric_config` and `fabric_reliability_mode` launch overrides. It forwards the
+result with `ttnn.set_fabric_config(**fabric_kwargs)` before opening the mesh.
+Any TTNN fabric argument is supported, including `router_config`; TTNN validates
+the arguments. The plugin does not mutate the model's dictionary or store its
+TTNN objects in the serialized vLLM configuration. Single-device meshes do not
+initialize fabric. Models without this capability keep the hardware defaults.
 
 ### `max_model_len` And KV Cache Capacity
 

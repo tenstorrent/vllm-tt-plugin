@@ -234,9 +234,11 @@ class TestDPModes:
 
         assert assigned_devices == [mesh_device]
 
+    @pytest.mark.parametrize("declares_fabric", [False, True])
     def test_init_device_tracks_mesh_as_worker_device(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        declares_fabric: bool,
     ) -> None:
         mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
         model_runner = SimpleNamespace()
@@ -255,16 +257,29 @@ class TestDPModes:
         # WorkerBase aliases the field; keep the test's view identical.
         worker_instance.parallel_config = parallel_config
         worker_instance.device_config = SimpleNamespace(device=None)
+        worker_instance.model_config = SimpleNamespace()
         worker_instance.trace_mode = "all"
         worker_instance.enable_model_warmup = True
 
         monkeypatch.setattr(TTPlatform, "check_and_update_config", lambda _cfg: None)
         monkeypatch.setattr(worker, "get_tt_config", lambda _cfg: {})
-        monkeypatch.setattr(
-            worker,
-            "open_mesh_device",
-            lambda _tt_config, _trace_mode, _local_dp_rank: mesh_device,
+        fabric_config = (
+            {"config": worker.ttnn.FabricConfig.FABRIC_1D_RING}
+            if declares_fabric
+            else None
         )
+        model_class = SimpleNamespace()
+        if declares_fabric:
+            model_class.model_capabilities = {"fabric_config": fabric_config}
+        monkeypatch.setattr(
+            worker, "get_model_architecture", lambda _cfg: (model_class, "model")
+        )
+
+        def open_mesh(_tt_config, _trace_mode, _local_dp_rank, *, model_fabric_config):
+            assert model_fabric_config is fabric_config
+            return mesh_device
+
+        monkeypatch.setattr(worker, "open_mesh_device", open_mesh)
 
         # The KV pool is sized and --max-model-len settled during init_device so
         # the model sees the fitted length when load_model runs next.
