@@ -313,7 +313,7 @@ Common options:
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
 | `decode_interleave_enabled` | Insert decode-only steps into a run of consecutive prefill steps, so a running request's inter-token latency does not scale with another request's prompt length. Default: `true`. |
-| `decode_interleave_prefill_steps` | Consecutive prefill steps allowed before one insertion. Raise it to favor time to first token, lower it to favor inter-token latency. Default: `1`. |
+| `decode_interleave_prefill_steps` | Consecutive prefill steps allowed before one insertion. Raise it to favor time to first token, lower it to favor inter-token latency. Default: `2`. |
 | `decode_interleave_decode_steps` | Decode-only steps each insertion runs before a prefill step is required again. Default: `1`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |

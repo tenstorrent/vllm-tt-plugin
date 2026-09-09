@@ -58,10 +58,9 @@ def _run_phases(policy, steps, *, has_pending_prefill=True, has_running_decode=T
 
 
 def test_policy_is_enabled_by_default():
-    enabled, prefill_steps, decode_steps = get_tt_decode_interleave_config(_config())
-    assert enabled is True
-    assert prefill_steps >= 1
-    assert decode_steps >= 1
+    # Pinned so a change to the shipped cadence is deliberate. The value comes
+    # from a T3K sweep recorded in docs/SCHEDULING.md.
+    assert get_tt_decode_interleave_config(_config()) == (True, 2, 1)
 
 
 def test_config_keys_override_the_defaults():
@@ -115,6 +114,10 @@ def test_cadence_matches_the_configured_bounds(prefill_steps, decode_steps, expe
         decode_interleave_decode_steps=decode_steps,
     )
     assert _run_phases(policy, len(expected)) == expected
+
+
+def test_default_cadence_leaves_two_prefill_steps_per_decode_step():
+    assert _run_phases(_policy(), 9) == "PPDPPDPPD"
 
 
 def test_first_step_of_a_prefill_run_is_never_stolen():
