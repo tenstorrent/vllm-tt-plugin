@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 from enum import Enum
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
@@ -12,10 +12,14 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
+    get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_tt_logger(__name__)
 
@@ -53,6 +57,87 @@ class TTSchedulingMode(Enum):
         if prefill_intent == 1:
             return cls.PREFILL_ONLY
         raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
+
+
+class TTDecodeInterleavePolicy:
+    """Bounds how many consecutive prefill steps may stall running decodes.
+
+    A TT step carries either prefill rows or decode rows, never both, so a
+    prompt that the base scheduler splits into N chunks occupies N consecutive
+    prefill steps and every running decode waits for all of them. The inter-token
+    latency a decode request observes therefore grows with the *other* requests'
+    prompt lengths. Splitting a long prompt does not fix that on its own: the
+    chunks are simply consecutive.
+
+    This policy inserts decode-only steps into such a run. It holds two
+    counters and answers one question per step, from state the scheduler
+    already has:
+
+    - ``prefill_steps``: how many consecutive prefill steps run before a
+      decode-only step is inserted.
+    - ``decode_steps``: how many decode-only steps that insertion runs before a
+      prefill step is required again.
+
+    Both bounds are step counts, not token counts, because the interleave
+    granularity is a whole step. They give a two-sided guarantee: a running
+    decode advances at least once every ``prefill_steps + decode_steps`` steps,
+    and pending prefill work gets a step at least once every
+    ``prefill_steps + decode_steps`` steps, so neither side starves and the
+    policy cannot oscillate faster than that period.
+
+    The policy only ever chooses a decode-only step in place of a prefill step.
+    It never chooses prefill, so it cannot delay a decode that would have run
+    anyway. The zero-progress fallback that turns a prefill step scheduling no
+    tokens into a decode step is a separate decision; the policy only records
+    the phase that fallback settled on.
+    """
+
+    def __init__(self, vllm_config: "VllmConfig") -> None:
+        (
+            self._enabled,
+            self._prefill_steps,
+            self._decode_steps,
+        ) = get_tt_decode_interleave_config(vllm_config)
+        self._prefill_run = 0
+        self._decode_run = 0
+
+    def wants_decode_step(
+        self, *, has_pending_prefill: bool, has_running_decode: bool
+    ) -> bool:
+        """Whether to spend this step on decode although prefill work is pending.
+
+        ``has_running_decode`` must exclude partial-prefill continuations: a
+        decode step cannot advance one, so interleaving on its account would
+        trade a productive prefill step for an empty one.
+        """
+        if not self._enabled or not has_pending_prefill or not has_running_decode:
+            return False
+        return (
+            self._prefill_run >= self._prefill_steps
+            and self._decode_run < self._decode_steps
+        )
+
+    def record_step(self, *, is_decode: bool) -> None:
+        """Advance the counters with the phase the step actually ran.
+
+        Called for every step, including one that scheduled no tokens. A
+        decode-only step that schedules nothing (upstream's running loop skips a
+        request whose async placeholders have already reached ``max_tokens``)
+        still consumes its decode allowance; leaving the counters untouched
+        there would re-pick decode on every following step and livelock the
+        engine on empty steps.
+        """
+        if is_decode:
+            self._decode_run += 1
+            if self._decode_run >= self._decode_steps:
+                # Allowance spent: require a fresh run of prefill steps before
+                # the next insertion, which is what stops the policy from
+                # holding the device in decode while a prompt waits.
+                self._decode_run = 0
+                self._prefill_run = 0
+        else:
+            self._prefill_run += 1
+            self._decode_run = 0
 
 
 class TTScheduler(AsyncScheduler):
@@ -113,6 +198,10 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        # Read only in DEFAULT mode. A lane coordinator sets a forced mode
+        # before every one of its lanes' schedule() calls and owns the one
+        # policy instance for the whole step, so this one stays dormant there.
+        self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
@@ -436,16 +525,29 @@ class TTScheduler(AsyncScheduler):
         # Prefer prefill whenever prefill work is pending, so new requests are
         # admitted and partial prefills advance.
         if has_pending_prefill:
+            if self._decode_interleave.wants_decode_step(
+                has_pending_prefill=True, has_running_decode=has_running_decode
+            ):
+                # A run of prefill steps has reached its bound. Spend this step
+                # on the running decodes so their inter-token latency does not
+                # scale with the pending prompt's length; the pending prefill
+                # resumes on the next step.
+                self._decode_interleave.record_step(is_decode=True)
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result)
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
             # and free capacity for a later prefill admission.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running_decode:
+                self._decode_interleave.record_step(is_decode=True)
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
+            self._decode_interleave.record_step(is_decode=False)
             return self._finalize_scheduler_output(prefill_result)
 
         # No pending prefill work in default mode: run decode-only naturally.
+        self._decode_interleave.record_step(is_decode=True)
         result = super().schedule()
         return self._finalize_scheduler_output(result)
 

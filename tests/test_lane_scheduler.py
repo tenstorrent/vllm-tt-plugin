@@ -23,6 +23,7 @@ from vllm_tt_plugin.lane_scheduler import (
     merge_lane_scheduler_outputs,
 )
 from vllm_tt_plugin.scheduler import (
+    TTDecodeInterleavePolicy,
     TTSchedulingMode,
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
@@ -92,9 +93,19 @@ class FakeLane:
         return [self._owned.pop(rid) for rid in ids if rid in self._owned]
 
 
-def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
+def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False, **interleave_keys):
     coordinator = TTLaneCoordinator.__new__(TTLaneCoordinator)
     coordinator.lanes = lanes
+    # The coordinator owns a single decode-interleave policy for the whole
+    # step. Disabled unless a test passes bounds, so the mode negotiation
+    # under test is the plain prefill-wins rule.
+    coordinator._decode_interleave = TTDecodeInterleavePolicy(
+        SimpleNamespace(
+            additional_config={
+                "tt": interleave_keys or {"decode_interleave_enabled": False}
+            }
+        )
+    )
     coordinator.num_lanes = len(lanes)
     coordinator._per_lane_max = per_lane_max
     coordinator.log_stats = log_stats
@@ -146,6 +157,66 @@ def test_negotiate_prefill_for_running_continuation_at_lane_capacity():
     coordinator = _make_coordinator([FakeLane(partial_prefills=1)], per_lane_max=1)
 
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_decode_interleave_overrides_a_prefill_intent_once_the_bound_is_hit():
+    # One lane holds a multi-chunk prefill it cannot finish in one step; the
+    # other lane is decoding. Without the interleave every step is prefill and
+    # the decoding lane stalls for the whole prompt.
+    lanes = [FakeLane(partial_prefills=1), FakeLane(running=2)]
+    coordinator = _make_coordinator(
+        lanes,
+        decode_interleave_prefill_steps=2,
+        decode_interleave_decode_steps=1,
+    )
+
+    # schedule() advances the counters in production; negotiation alone does
+    # not, so drive them the way the step loop does.
+    modes = []
+    for _ in range(9):
+        mode = coordinator._negotiate_forced_mode()
+        coordinator._decode_interleave.record_step(
+            is_decode=mode == TTSchedulingMode.DECODE_ONLY
+        )
+        modes.append(mode)
+
+    P, D = TTSchedulingMode.PREFILL_ONLY, TTSchedulingMode.DECODE_ONLY
+    assert modes == [P, P, D, P, P, D, P, P, D]
+
+
+def test_decode_interleave_needs_a_lane_with_a_genuine_running_decode():
+    # Every running request across both lanes is a partial-prefill
+    # continuation. A decode step samples nothing for those, so the interleave
+    # would only produce empty steps.
+    lanes = [FakeLane(partial_prefills=1), FakeLane(partial_prefills=1)]
+    coordinator = _make_coordinator(lanes, decode_interleave_prefill_steps=1)
+
+    for _ in range(4):
+        mode = coordinator._negotiate_forced_mode()
+        coordinator._decode_interleave.record_step(
+            is_decode=mode == TTSchedulingMode.DECODE_ONLY
+        )
+        assert mode == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_schedule_records_the_step_phase_for_the_interleave_policy():
+    # The counters must follow the mode the step actually ran, which schedule()
+    # settles only after the zero-token prefill fallback has had its say.
+    # FakeLane always schedules zero prefill tokens, so this step falls back to
+    # decode and must be recorded as a decode step.
+    lanes = [FakeLane(waiting=1, running=1)]
+    coordinator = _make_coordinator(lanes, decode_interleave_prefill_steps=1)
+
+    coordinator.schedule()
+
+    assert lanes[0].scheduled_modes == [
+        TTSchedulingMode.PREFILL_ONLY,
+        TTSchedulingMode.DECODE_ONLY,
+    ]
+    # The fallback decode consumed the allowance, so the next step prefills.
+    assert not coordinator._decode_interleave.wants_decode_step(
+        has_pending_prefill=True, has_running_decode=True
+    )
 
 
 def test_idle_step_propagates_finished_req_ids():
