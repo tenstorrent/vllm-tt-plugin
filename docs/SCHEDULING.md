@@ -210,7 +210,7 @@ has to choose to alternate.
 counters and answers one question per step, from state the scheduler already
 has:
 
-- `decode_interleave_prefill_steps` (default 1): consecutive prefill steps
+- `decode_interleave_prefill_steps` (default 2): consecutive prefill steps
   allowed before a decode-only step is inserted.
 - `decode_interleave_decode_steps` (default 1): decode-only steps that
   insertion runs before a prefill step is required again.
@@ -251,6 +251,25 @@ The policy therefore trades some decode-overlap efficiency and some time to
 first token for a bounded inter-token latency. `decode_interleave_prefill_steps`
 is the knob: raise it to favor time to first token, lower it to favor
 inter-token latency.
+
+Measured on a T3K (4x n300) with `meta-llama/Llama-3.1-8B-Instruct` at
+`max_num_batched_tokens=2048`, four 16384-token prompts arriving against four
+streaming decodes, median of three reps:
+
+| `decode_interleave_prefill_steps` | worst decode gap | median TTFT | output throughput |
+| --- | --- | --- | --- |
+| policy off | 11152 ms | 4338 ms | 138.1 tok/s |
+| 4 | 1603 ms | 4228 ms | 137.3 tok/s |
+| 2 (default) | 899 ms | 4381 ms | 136.4 tok/s |
+| 1 | 523 ms | 4660 ms | 131.5 tok/s |
+
+The same run with chunked prefill switched off entirely gives a 1853 ms worst
+decode gap, so at this token budget a run of prefill chunks makes the worst
+case six times worse than not splitting the prompt at all, and the default
+setting brings it two times below the unsplit figure. The benefit is
+proportional to how long the run of consecutive prefill steps actually is: at
+`max_num_batched_tokens=8192` the same arrival pattern never queues more than
+two chunks, and the policy then changes the worst gap by about one percent.
 
 In single-process lane-DP the policy lives in `TTLaneCoordinator`, not in the
 per-lane schedulers. Every lane executes the one negotiated mode, so a per-lane
