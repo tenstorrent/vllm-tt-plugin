@@ -1932,8 +1932,7 @@ class TTModelRunner:
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
-        capabilities = getattr(self.model, "model_capabilities", None) or {}
-        if not input_batch.no_penalties and not capabilities.get(
+        if not input_batch.no_penalties and not self.model.model_capabilities.get(
             "supports_device_penalties", True
         ):
             return False
