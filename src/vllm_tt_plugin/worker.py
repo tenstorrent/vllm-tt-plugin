@@ -785,7 +785,18 @@ def set_fabric(tt_config, num_devices):
             fabric_config,
             reliability_mode,
         )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+        router_config = ttnn.FabricRouterConfig()
+        payload_size = (tt_config or {}).get("fabric_max_packet_payload_size_bytes")
+        if payload_size is not None:
+            if type(payload_size) is not int or payload_size <= 0:
+                raise ValueError(
+                    "fabric_max_packet_payload_size_bytes must be a positive integer, "
+                    f"got {payload_size!r}"
+                )
+            router_config.max_packet_payload_size_bytes = payload_size
+        ttnn.set_fabric_config(
+            fabric_config, reliability_mode, router_config=router_config
+        )
 
 
 # From tt-metal/conftest.py:

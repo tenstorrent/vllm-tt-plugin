@@ -46,6 +46,11 @@ class FabricReliabilityMode(Enum):
     RELAXED_INIT = "relaxed_init"
 
 
+class FabricRouterConfig:
+    def __init__(self):
+        self.max_packet_payload_size_bytes = None
+
+
 class DispatchCoreAxis(Enum):
     ROW = "row"
     COL = "col"

@@ -310,6 +310,7 @@ Common options:
 | `l1_small_size` | Small L1 size override. |
 | `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Defaults: Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
+| `fabric_max_packet_payload_size_bytes` | Positive router payload size in bytes. Omit for TT-Metal's default; Llama 3.1-8B QB2 uses 8192. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
