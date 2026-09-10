@@ -248,6 +248,8 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `output_tokens_per_step` | `1` | Committed output width per step. `1` is token-at-a-time; `>1` is block-output width |
 | `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
+| `tt_adaptive_block_output` | `False` | Block-output models only: commit the block only on solo decode steps and decode batched steps as plain 1-token baseline. Relaxes the `max_num_seqs 1` and DP gates |
+| `tt_adaptive_block_max_prompt_tokens` | `0` (no limit) | Adaptive block models only: prompts longer than this are served as plain baseline (width-1 steps) for their whole lifetime; the scheduler reserves accordingly |
 
 Absent keys default via `.get`. That is the live contract. Do not add
 fail-on-missing for a new key unless the matching tt-metal generators will

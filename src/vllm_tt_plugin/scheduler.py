@@ -12,7 +12,9 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
+    get_tt_adaptive_block_max_prompt_tokens,
     get_tt_output_tokens_per_step,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -116,6 +118,15 @@ class TTScheduler(AsyncScheduler):
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
+        # Adaptive: emit the block only on a solo decode step; batch >1 decodes
+        # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
+        self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
+        # Prompt-length frontier for the block path (0 = none): a longer prompt
+        # is served as plain baseline by the model for its whole lifetime, so
+        # its steps reserve width-1 even when solo.
+        self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
+            self.vllm_config
+        )
         if self._is_block_output_model:
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "
@@ -581,10 +592,48 @@ class TTScheduler(AsyncScheduler):
         extra_placeholders = (
             self._output_tokens_per_step - self.num_sampled_tokens_per_step
         )
+        # Adaptive: the model emits its block ONLY on a SOLO DECODE step; every
+        # other step (batched decodes, and the prefill that host-samples the
+        # anchor) commits exactly one plain token and reserves one placeholder.
+        # This MUST match the model's own gate, which runs the spec block in
+        # decode_forward when batch == 1 and a plain token otherwise:
+        #   - solo == batch 1 (exactly one request scheduled this step);
+        #   - decode == the prompt is fully computed (a prefill step still has
+        #     num_computed_tokens < num_prompt_tokens, so it takes prefill_forward
+        #     and emits the single anchor). num_computed reflects prior committed
+        #     steps here, so it is 0<prompt on the prefill and >=prompt on the
+        #     first decode -- robust where an output-token count can still read 0.
+        # ``_tt_block_step`` records the decision so the reconciliation in
+        # _update_request_with_output takes the same path (block serving is
+        # synchronous, so the stamp and its commit never interleave).
+        solo = len(scheduler_output.num_scheduled_tokens) == 1
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
-            if not request.is_prefill_chunk:
+            if request.is_prefill_chunk:
+                continue
+            if self._is_adaptive_block:
+                # num_computed_tokens is already advanced by THIS step's
+                # scheduled tokens here, so subtract them back out: a step is a
+                # decode iff the prompt was fully computed BEFORE it. This is a
+                # pure scheduling-side quantity -- output-commit timing (which
+                # differs between sync tests and the pipelined engine loop)
+                # cannot skew it. A resumed replay scheduling prompt+output
+                # tokens lands back below the prompt boundary and correctly
+                # stays a non-block step.
+                scheduled = scheduler_output.num_scheduled_tokens[req_id]
+                is_decode = (
+                    request.num_computed_tokens - scheduled >= request.num_prompt_tokens
+                )
+                spec_eligible = (
+                    self._adaptive_block_max_prompt == 0
+                    or request.num_prompt_tokens <= self._adaptive_block_max_prompt
+                )
+                block_step = solo and is_decode and spec_eligible
+            else:
+                block_step = True
+            if block_step:
                 request.num_output_placeholders += extra_placeholders
+            request._tt_block_step = block_step
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
@@ -592,6 +641,20 @@ class TTScheduler(AsyncScheduler):
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
             return super()._update_request_with_output(request, new_token_ids)
+        # Adaptive: a request that decoded batched this step committed a single
+        # baseline token (no block was reserved for it) -> plain reconciliation.
+        # The flag is stamped by _ensure_block_output_placeholders in the SAME
+        # step this output belongs to (block-output serving is synchronous, so
+        # commits never interleave with the next step's scheduling decision).
+        if self._is_adaptive_block:
+            block_step = getattr(request, "_tt_block_step", None)
+            if block_step is None:
+                raise RuntimeError(
+                    "adaptive block-output request committed output without a "
+                    f"scheduling decision: req_id={request.request_id!r}"
+                )
+            if not block_step:
+                return super()._update_request_with_output(request, new_token_ids)
         if request.async_tokens_to_discard:
             raise RuntimeError(
                 "A stale async output reached synchronous block serving; "
