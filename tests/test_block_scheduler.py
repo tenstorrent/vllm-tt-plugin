@@ -38,6 +38,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
+    get_tt_block_step_decisions,
     get_tt_forced_reset_discard_counts,
 )
 
@@ -963,7 +964,7 @@ def test_diffusion_checkpoint_books_exactly_one_canvas():
 def _adaptive_anchor(scheduler, request, token=5):
     """Drive the prefill step: adaptive prefills commit ONE anchor token."""
     submitted = scheduler.schedule()
-    assert request._tt_block_step is False
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is False
     assert request.num_output_placeholders == 1
     outputs = scheduler.update_from_output(
         submitted, _runner_output(submitted, [token])
@@ -983,7 +984,7 @@ def test_adaptive_prefill_commits_single_anchor_then_solo_decode_blocks():
     _adaptive_anchor(scheduler, request)
 
     submitted = scheduler.schedule()
-    assert request._tt_block_step is True
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is True
     assert request.num_output_placeholders == CANVAS
 
     block = list(range(10, 10 + CANVAS))
@@ -1016,7 +1017,7 @@ def test_adaptive_batched_decode_commits_single_tokens():
     # Batched DECODE step: still plain one-token baseline for both.
     submitted = scheduler.schedule()
     for req in (req_a, req_b):
-        assert req._tt_block_step is False
+        assert get_tt_block_step_decisions(submitted)[req.request_id] is False
         assert req.num_output_placeholders == 1
     decode_output = ModelRunnerOutput(
         req_ids=["req-a", "req-b"],
@@ -1055,7 +1056,7 @@ def test_adaptive_returns_to_block_width_when_solo_again():
 
     resumed = scheduler.schedule()
     assert len(resumed.num_scheduled_tokens) == 1
-    assert req_a._tt_block_step is True
+    assert get_tt_block_step_decisions(resumed)[req_a.request_id] is True
     assert req_a.num_output_placeholders == CANVAS
 
 
@@ -1066,6 +1067,53 @@ def test_adaptive_commit_without_scheduling_decision_raises():
     request = _request(CANVAS * 2)
     with pytest.raises(RuntimeError, match="without a scheduling decision"):
         scheduler._update_request_with_output(request, list(range(CANVAS)))
+
+
+def test_adaptive_block_decision_survives_async_schedule_lag():
+    """The async batch queue runs schedule() for the NEXT step (mutating
+    Request state) before update_from_output commits the PREVIOUS step. The
+    per-step decision must ride its own SchedulerOutput, not a Request slot the
+    next schedule overwrites -- the exact interleave that crashed the engine
+    with "1 != 64" when the prefill anchor's width-1 commit hit the decode
+    step's block stamp."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 3)
+    scheduler.add_request(request)
+
+    # Step P: schedule the prefill (anchor, width-1, non-block).
+    prefill = scheduler.schedule()
+    assert get_tt_block_step_decisions(prefill)[request.request_id] is False
+
+    # Emulate the batch queue: the anchor's output is NOT committed yet. Run
+    # schedule() for the FIRST DECODE step first, overwriting live Request
+    # state (num_computed_tokens, num_output_placeholders) the way async does.
+    scheduler.update_from_output(prefill, _runner_output(prefill, [5]))
+    decode = scheduler.schedule()
+    assert get_tt_block_step_decisions(decode)[request.request_id] is True
+    # A stale single-slot would now read True for BOTH steps; the SchedulerOutput
+    # maps stay independent.
+    assert get_tt_block_step_decisions(prefill)[request.request_id] is False
+
+    # Commit the decode block: reads the decode SchedulerOutput's decision and
+    # accepts the full-width block, not the anchor's width.
+    block = list(range(10, 10 + CANVAS))
+    outputs = scheduler.update_from_output(decode, _runner_output(decode, block))
+    assert outputs[0].outputs[0].new_token_ids == block
+    assert request.num_output_placeholders == 0
+
+
+def test_adaptive_block_width_mismatch_raises():
+    """If the scheduler reserves a block but the model returns a different
+    width (gate disagreement), fail loudly rather than leak placeholders."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+    submitted = scheduler.schedule()
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is True
+    with pytest.raises(ValueError, match="block gates disagree"):
+        # Solo decode reserved a block; a width-1 output contradicts it.
+        scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
 
 
 def test_adaptive_over_frontier_prompt_never_blocks():
@@ -1084,7 +1132,7 @@ def test_adaptive_over_frontier_prompt_never_blocks():
     _adaptive_anchor(scheduler, request)
 
     submitted = scheduler.schedule()  # solo decode -- but over the frontier
-    assert request._tt_block_step is False
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is False
     assert request.num_output_placeholders == 1
     outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [9]))
     assert outputs[0].outputs[0].new_token_ids == [9]
@@ -1101,6 +1149,6 @@ def test_adaptive_under_frontier_prompt_still_blocks():
     scheduler.add_request(request)
     _adaptive_anchor(scheduler, request)
 
-    scheduler.schedule()
-    assert request._tt_block_step is True
+    submitted = scheduler.schedule()
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is True
     assert request.num_output_placeholders == CANVAS
