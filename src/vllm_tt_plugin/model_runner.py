@@ -44,6 +44,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.input_batch import (
@@ -163,6 +164,7 @@ class TTModelRunner:
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
+        self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
         self._persistent_capture_released = False
 
         if self.model_config.is_encoder_decoder:
@@ -2152,7 +2154,14 @@ class TTModelRunner:
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
 
-            if not perform_device_sampling and self._is_block_output_model:
+            # An adaptive block model's PREFILL emits one plain host-sampled
+            # anchor token (its blocks come only from solo decode steps); any
+            # other host-sampled block step cannot construct the canvas.
+            if (
+                not perform_device_sampling
+                and self._is_block_output_model
+                and not (self._is_adaptive_block_output and not is_decode)
+            ):
                 raise ValueError(
                     "Block-output step fell back to host sampling; "
                     "host sampling cannot construct a multi-token canvas"
@@ -2300,11 +2309,15 @@ class TTModelRunner:
                 )
 
                 next_token_ids = _take(tt_out).reshape(sz, -1)
-                if next_token_ids.shape[1] != self._output_tokens_per_step:
+                allowed_widths = (
+                    (1, self._output_tokens_per_step)
+                    if self._is_adaptive_block_output
+                    else (self._output_tokens_per_step,)
+                )
+                if next_token_ids.shape[1] not in allowed_widths:
                     raise ValueError(
                         "Model output width violates output_tokens_per_step: "
-                        f"{next_token_ids.shape[1]} != "
-                        f"{self._output_tokens_per_step}"
+                        f"{next_token_ids.shape[1]} not in {allowed_widths}"
                     )
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
@@ -2390,7 +2403,7 @@ class TTModelRunner:
             else {req_id: idx for idx, req_id in enumerate(output_req_ids)}
         )
         sampled_token_ids = _coerce_output_block(
-            sampled_token_ids, num_reqs, self._output_tokens_per_step
+            sampled_token_ids, num_reqs, self._tt_committed_width(sampled_token_ids)
         )
 
         sampled_token_ids_np = sampled_token_ids.numpy()
@@ -2427,10 +2440,10 @@ class TTModelRunner:
         # truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
+        num_out_tokens = self._tt_committed_width(sampled_token_ids)
         sampled_token_ids = _coerce_output_block(
-            sampled_token_ids, num_reqs, self._output_tokens_per_step
+            sampled_token_ids, num_reqs, num_out_tokens
         )
-        num_out_tokens = self._output_tokens_per_step
 
         sampled_token_ids_np = sampled_token_ids.numpy()
         if sampled_token_ids_np.dtype != np.int32:
@@ -2532,6 +2545,23 @@ class TTModelRunner:
                 block = sampled_token_ids_np[req_idx]
 
             req_state.output_token_ids.extend(int(token_id) for token_id in block)
+
+    def _tt_committed_width(self, sampled_token_ids: torch.Tensor) -> int:
+        """Resolve one step's committed output width.
+
+        Fixed at ``output_tokens_per_step``, except an ADAPTIVE block model's
+        non-block steps (batched decodes and prefill anchors) emit exactly one
+        valid token per request -- the scheduler reserved exactly one
+        placeholder for those steps, so the emitted row length IS the step's
+        contract. Any other width still fails _coerce_output_block.
+        """
+        if (
+            self._is_adaptive_block_output
+            and sampled_token_ids.dim() == 2
+            and sampled_token_ids.shape[1] == 1
+        ):
+            return 1
+        return self._output_tokens_per_step
 
     def apply_and_build_runner_output(
         self,

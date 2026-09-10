@@ -17,8 +17,11 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    store_tt_adaptive_block_max_prompt_tokens,
+    store_tt_adaptive_block_output,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
     uses_tt_lane_coordinator,
@@ -554,6 +557,40 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
         ModelRegistry.register_model(model_arch, model_path)
 
 
+def _tt_model_class_overrides() -> dict[str, str]:
+    """Parse ``TT_MODEL_CLASS_OVERRIDES`` into an {architecture: target} map.
+
+    Format: comma-separated ``Arch=module.path:Class`` entries, e.g.::
+
+        TT_MODEL_CLASS_OVERRIDES = \
+            "Gemma4ForCausalLM=models.demos.gemma4.tt:Gemma4MTPForCausalLM"
+
+    Generic serving-class selection for ANY architecture: the override is
+    registered before the built-in targets, and ``_register_model_if_missing``
+    keeps the first registration authoritative for the rest of the process.
+    Model-specific selection envs are deliberately not added per model type --
+    behaviour keyed on model identity is against this repo's gating contract.
+    """
+    raw = os.getenv("TT_MODEL_CLASS_OVERRIDES", "").strip()
+    if not raw:
+        return {}
+    overrides: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        arch, sep, target = entry.partition("=")
+        arch = arch.strip()
+        target = target.strip()
+        if not sep or not arch or ":" not in target:
+            raise ValueError(
+                f"TT_MODEL_CLASS_OVERRIDES entry {entry!r} is not of the form "
+                "'Architecture=module.path:ClassName'"
+            )
+        overrides[arch] = target
+    return overrides
+
+
 def _install_diffusion_gemma_architecture_patch() -> None:
     """Resolve DiffusionGemma through its TT architecture before config hooks.
 
@@ -1021,8 +1058,15 @@ def _builtin_models_enabled() -> bool:
 def register_tt_models(register_test_models=False) -> None:
     from vllm.model_executor.models.registry import ModelRegistry
 
+    # Operator overrides register FIRST: an explicit per-launch
+    # TT_MODEL_CLASS_OVERRIDES entry is the most specific intent and wins over
+    # bundles and built-ins via the if-missing precedence below.
+    for _arch, _target in _tt_model_class_overrides().items():
+        _register_model_if_missing(ModelRegistry, _arch, _target)
+
     # Dynamic hook: register any bundles dropped under EXTRA_MODELS_DIR. Runs
-    # first so a distributed bundle can supply a model without touching this file.
+    # before the built-ins so a distributed bundle can supply a model without
+    # touching this file.
     _register_models_from_extra_dir(ModelRegistry)
 
     # DiffusionGemma aliases register regardless of the builtin-map switch:
@@ -1598,6 +1642,37 @@ class TTPlatform(Platform):
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
+        # Adaptive block-output: the model emits its block ONLY when it decodes
+        # alone (batch==1) and falls back to plain batched baseline otherwise,
+        # so the max_num_seqs=1 and data-parallel gates below are relaxed for
+        # it -- the scheduler reserves the block placeholder only on solo
+        # decode steps.
+        adaptive_block_output = bool(
+            (model_capabilities or {}).get("tt_adaptive_block_output", False)
+        )
+        if adaptive_block_output and output_tokens_per_step <= 1:
+            raise ValueError(
+                "tt_adaptive_block_output requires output_tokens_per_step > 1"
+            )
+        store_tt_adaptive_block_output(vllm_config, adaptive_block_output)
+        # Optional prompt-length frontier for the adaptive block path: prompts
+        # above it are served as plain baseline by the model, so the scheduler
+        # must reserve width-1 for them (see TTScheduler). 0 = no limit.
+        adaptive_block_max_prompt = int(
+            (model_capabilities or {}).get("tt_adaptive_block_max_prompt_tokens", 0)
+        )
+        if adaptive_block_max_prompt < 0:
+            raise ValueError(
+                "tt_adaptive_block_max_prompt_tokens must be >= 0; got "
+                f"{adaptive_block_max_prompt}"
+            )
+        if adaptive_block_max_prompt and not adaptive_block_output:
+            raise ValueError(
+                "tt_adaptive_block_max_prompt_tokens requires tt_adaptive_block_output"
+            )
+        store_tt_adaptive_block_max_prompt_tokens(
+            vllm_config, adaptive_block_max_prompt
+        )
         is_block_output_model = is_tt_block_output_model(vllm_config)
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
@@ -1705,18 +1780,29 @@ class TTPlatform(Platform):
                     "tile, so max_model_len must be at least "
                     f"{min_max_model_len}"
                 )
-            if vllm_config.scheduler_config.max_num_seqs != 1:
+            adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
+            if (
+                not adaptive_block_output
+                and vllm_config.scheduler_config.max_num_seqs != 1
+            ):
                 raise ValueError(
                     "Block-output models currently own one model-side request "
-                    "state and require --max-num-seqs 1"
+                    "state and require --max-num-seqs 1 (or declare "
+                    "tt_adaptive_block_output to batch >1 as plain baseline)"
                 )
-            if (
+            if not adaptive_block_output and (
                 parallel_config.data_parallel_size != 1
                 or get_tt_data_parallel_size(vllm_config) != 1
             ):
+                # Adaptive block-output IS data-parallel-safe: each DP engine owns
+                # its own scheduler + model state and runs the solo-decode block
+                # gate independently, so N engines each serve solo requests at
+                # block width and batched requests as plain baseline. A plain
+                # (non-adaptive) block-output model owns one shared state -> DP 1.
                 raise ValueError(
                     "Block-output models do not yet support data parallelism; "
-                    "use --data-parallel-size 1"
+                    "use --data-parallel-size 1 (or declare "
+                    "tt_adaptive_block_output for per-engine adaptive DP)"
                 )
             # After the DP check: upstream auto-selects "mp" whenever
             # --data-parallel-size > 1, and the DP message is the actionable
@@ -1724,7 +1810,13 @@ class TTPlatform(Platform):
             distributed_executor_backend = getattr(
                 parallel_config, "distributed_executor_backend", None
             )
-            if distributed_executor_backend not in (None, "uni"):
+            allowed_backends = (None, "uni")
+            if adaptive_block_output:
+                # Adaptive DP runs one engine process per DP rank (the mp
+                # executor upstream auto-selects for data_parallel_size > 1),
+                # each with its own single-rank scheduler and model state.
+                allowed_backends = (None, "uni", "mp")
+            if distributed_executor_backend not in allowed_backends:
                 raise ValueError(
                     "Block-output models require the uniproc executor; "
                     f"got distributed_executor_backend="
@@ -1794,12 +1886,22 @@ class TTPlatform(Platform):
                 f"({model_class.__module__}) does not support on-device sampling. "
                 "Unset sample_on_device_mode or use a model that supports it."
             )
-        if is_block_output_model and sample_on_device_mode != "all":
-            raise ValueError(
-                "Block-output models emit complete multi-token outputs from "
-                "their model-owned sampler and require "
-                f'sample_on_device_mode="all"; got {sample_on_device_mode!r}'
+        if is_block_output_model:
+            # An adaptive block model's prefill and batched-decode steps are
+            # plain one-token steps, so its prefill anchor may be host-sampled:
+            # decode_only is valid for it. Blocks themselves always come from
+            # the model-owned sampler on solo decode steps.
+            allowed_sampling = (
+                ("all", "decode_only")
+                if is_tt_adaptive_block_output_model(vllm_config)
+                else ("all",)
             )
+            if sample_on_device_mode not in allowed_sampling:
+                raise ValueError(
+                    "Block-output models emit complete multi-token outputs from "
+                    "their model-owned sampler and require sample_on_device_mode "
+                    f"in {allowed_sampling}; got {sample_on_device_mode!r}"
+                )
 
         # Model-gated async scheduling. Async overlap requires generators that
         # support split decode submission via `decode_forward(...,
