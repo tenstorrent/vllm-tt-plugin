@@ -1837,10 +1837,24 @@ class TTPlatform(Platform):
                     "Block-output models do not support --logits-processors "
                     "because output is sampled inside the model"
                 )
-            if vllm_config.scheduler_config.async_scheduling:
+            if (
+                vllm_config.scheduler_config.async_scheduling
+                and not adaptive_block_output
+            ):
+                # A PLAIN block-output model reserves its whole canvas on every
+                # step and cannot survive the async schedule/commit lag (the
+                # next step's schedule overwrites the Request state before the
+                # prior output commits). An ADAPTIVE block-output model may
+                # serve async: TTScheduler carries each step's block decision on
+                # its SchedulerOutput (which the engine pairs with that step's
+                # output), so a solo block commit and a batched width-1 commit
+                # each reconcile against their own step regardless of the lag.
+                # The batched baseline fallback wants the async decode overlap;
+                # the solo block step has no read to overlap and stays correct.
                 raise ValueError(
                     "Block-output models currently support synchronous serving "
-                    "only; launch with --no-async-scheduling"
+                    "only; launch with --no-async-scheduling (adaptive "
+                    "block-output models may serve async)"
                 )
             # Worker knobs the launch gates cannot hard-require: eager serving
             # without upfront capture is legitimate. But a capture-based model
