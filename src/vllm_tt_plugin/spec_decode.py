@@ -3,16 +3,22 @@
 """Contract types for speculative decoding between the runner and a TT model.
 
 The contract these types encode is specified in
-https://github.com/tenstorrent/vllm-tt-plugin/issues/110. Nothing here reads a
-`model_capabilities` key or admits a configuration; this module is the wire
-surface only, so a model class and the runner can agree on shapes and modes
-before either side implements a step of the loop.
+https://github.com/tenstorrent/vllm-tt-plugin/issues/110. This module holds the
+wire surface and the validation of the values that cross it, so a model class
+and the runner can agree on shapes and modes before either side implements a
+step of the loop. It reads no ``model_capabilities`` key and admits no
+configuration: ``normalize_declared_values`` validates a declaration a caller
+has already read, and lives here next to the constant sets it validates.
 
-Two properties of the contract are enforced here rather than left to each
-caller, because both were ambiguous enough in earlier revisions to produce
-off-by-one and shape errors: the inclusive range a valid ``accepted_counts``
-entry lies in, and the pairing between a ``spec_mode`` and the fields a verify
-return must carry for it.
+Per the contract, one step is verify then propose: the runner calls
+``decode_forward`` over the ``[B, 1+K]`` candidate block, walks acceptance, and
+calls ``propose_draft_tokens`` with that same step's hidden state.
+
+Two properties are enforced by these types rather than left to each caller,
+because leaving either to a caller invites an off-by-one or a shape error that
+only surfaces inside an accept walk: the inclusive range a valid
+``accepted_counts`` entry lies in, and the pairing between a ``spec_mode`` and
+the fields a verify return must carry for it.
 """
 
 from collections.abc import Sequence
@@ -22,10 +28,25 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import torch
 
-# Accept modes, named by what the verify call returns rather than by which side
-# performs acceptance. Naming the performer cannot describe a device argmax
-# followed by a host walk, which is what both existing tt-metal
+# Accept modes. The first two are named for what the verify call returns, which
+# is what the runner branches on; naming the performer instead cannot describe a
+# device argmax followed by a host walk, which is what both existing tt-metal
 # implementations do.
+#
+#   "logits"       returns logits [B, 1+K, V]. The host walks acceptance, so
+#                  this is the only mode that can serve a request needing host
+#                  arbitration: structured output, host logits processors,
+#                  min_p, logit_bias, bad_words, allowed_token_ids, min_tokens
+#                  or logprobs. It pays a [B, 1+K, V] readback.
+#   "argmax_ids"   returns the verify argmax ids [B, 1+K]. The host walks
+#                  acceptance greedily, comparing ids, so no logits cross. This
+#                  mode is greedy only.
+#   "fused_sample" returns accepted ids and counts. The device accepts and
+#                  samples: rejection sampling, the residual correction and the
+#                  bonus token all happen there, which is the fusion the name
+#                  describes. It is the only mode that may be followed by a
+#                  verify with accepted_counts=None, because it is the only one
+#                  that leaves an authoritative count on the device.
 ACCEPT_MODE_LOGITS = "logits"
 ACCEPT_MODE_ARGMAX_IDS = "argmax_ids"
 ACCEPT_MODE_FUSED_SAMPLE = "fused_sample"
@@ -64,8 +85,15 @@ HIDDEN_HANDOFF_ON_DEVICE = "on_device"
 HIDDEN_HANDOFF_ROUNDTRIP = "roundtrip"
 HIDDEN_HANDOFFS = frozenset({HIDDEN_HANDOFF_ON_DEVICE, HIDDEN_HANDOFF_ROUNDTRIP})
 
-# Which verify-return fields each mode must carry.
-_MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+# The contract's name for the target hidden state a device drafter consumes.
+# Deliberately unconstrained: the runner holds it and hands it back without
+# interpreting its dtype, layout or tensor-parallel fracturing. Named so the
+# term is greppable on both sides of the boundary.
+HiddenHandle = Any
+
+# Which verify-return fields each mode must carry. Contract information, so a
+# caller can check a return it did not build.
+MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     ACCEPT_MODE_LOGITS: ("logits",),
     ACCEPT_MODE_ARGMAX_IDS: ("argmax_ids",),
     ACCEPT_MODE_FUSED_SAMPLE: ("accepted_token_ids", "accepted_counts"),
@@ -86,11 +114,26 @@ class SpecPlan:
     """
 
     effective_k: int
+    # Decode rows one speculating request occupies while verifying its
+    # [B, 1+K] block. Unrelated to a lane-DP lane: this counts rows of the
+    # model's decode batch, not TT lanes in an engine. The runner checks it
+    # against its own row budget and never asks how the rows are arranged.
     lanes_per_request: int
+    # Fixed device bytes per speculating request, independent of sequence
+    # length: candidate state slots, a conv stash, retained hidden rows.
     extra_bytes_per_seq: int
+    # Device bytes per KV token beyond the target KV, which is what a drafter
+    # with its own paged KV pair costs, since that cache grows with the
+    # sequence. A model reporting only the fixed part under-reserves by the
+    # whole drafter cache.
     extra_bytes_per_token: int
     accept_modes: tuple[str, ...]
     drafter_state: str
+    # Whether the model also serves a narrow [B, 1] decode alongside the wide
+    # [B, 1+K] one. Speculative decode calls are uniformly 1+K wide even on a
+    # step where no request carries drafts, so that a model needs one verify
+    # shape rather than two; a model that sets this offers a second, narrower
+    # shape and the runner prefers it on those steps.
     supports_narrow_decode: bool = False
 
     def __post_init__(self) -> None:
@@ -109,18 +152,12 @@ class SpecPlan:
             if value < 0:
                 raise ValueError(f"SpecPlan.{name} must not be negative, got {value}")
 
-        modes = tuple(self.accept_modes)
+        modes = normalize_declared_values(
+            self.accept_modes, ACCEPT_MODES, "SpecPlan.accept_modes"
+        )
         object.__setattr__(self, "accept_modes", modes)
         if not modes:
             raise ValueError("SpecPlan.accept_modes must name at least one mode")
-        unknown = [mode for mode in modes if mode not in ACCEPT_MODES]
-        if unknown:
-            raise ValueError(
-                f"SpecPlan.accept_modes has unknown modes {unknown}; "
-                f"known modes are {sorted(ACCEPT_MODES)}"
-            )
-        if len(set(modes)) != len(modes):
-            raise ValueError(f"SpecPlan.accept_modes repeats a mode: {list(modes)}")
         if self.drafter_state not in DRAFTER_STATES:
             raise ValueError(
                 f"SpecPlan.drafter_state {self.drafter_state!r} is not one of "
@@ -182,10 +219,13 @@ class SpecReject:
 class DraftOutput:
     """What a device drafter returns for one step.
 
-    ``draft_token_ids`` is ``[B, K]`` and padded: row ``i`` carries its real
-    draft count in the runner's own per-row bookkeeping, not in this tensor.
-    ``draft_scores`` is ``[B, K, q]`` for a drafter that produces them, and
-    ``None`` otherwise; a runner that does not need scores must not require it.
+    ``draft_token_ids`` is ``[B, K]`` and padded. How many of row ``i``'s
+    drafts are real is the runner's own bookkeeping, carried into the verify
+    call as ``num_valid_drafts``, not encoded in this tensor.
+    ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
+    drafted position, for a drafter that produces them and ``None`` otherwise.
+    An accept rule that needs the drafter distribution reads them; a runner
+    that does not must not require them.
     """
 
     draft_token_ids: "torch.Tensor"
@@ -202,17 +242,22 @@ class VerifyOutput:
     """
 
     spec_mode: str
+    # [B, 1+K] verify argmax ids, for spec_mode "argmax_ids".
     argmax_ids: "torch.Tensor | None" = None
+    # [B, 1+K, V] over the whole vocabulary, for spec_mode "logits".
     logits: "torch.Tensor | None" = None
+    # [B, 1+K] committed prefix plus correction or bonus, for "fused_sample".
     accepted_token_ids: "torch.Tensor | None" = None
+    # [B] committed token count per row, for "fused_sample". Same domain as the
+    # accepted_counts a verify takes as input: see SpecPlan.
     accepted_counts: "torch.Tensor | None" = None
-    # Opaque to the runner, which holds it and passes it back to the drafter
-    # without interpreting its dtype, layout or tensor-parallel fracturing.
-    # Empty when the model retains the hidden state on device.
-    hidden: Any = None
+    # The target hidden state a device drafter consumes, held by the runner and
+    # handed back to propose_draft_tokens uninterpreted. None when the model
+    # retains it on device.
+    hidden: HiddenHandle = None
 
     def __post_init__(self) -> None:
-        required = _MODE_REQUIRED_FIELDS.get(self.spec_mode)
+        required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
         if required is None:
             raise ValueError(
                 f"VerifyOutput.spec_mode {self.spec_mode!r} is not one of "
@@ -265,6 +310,8 @@ __all__ = [
     "SPEC_REQUIREMENT_HIDDEN_FEED",
     "SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE",
     "DraftOutput",
+    "MODE_REQUIRED_FIELDS",
+    "HiddenHandle",
     "SpecPlan",
     "SpecReject",
     "VerifyOutput",
