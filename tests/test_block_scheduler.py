@@ -32,7 +32,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_tt_plugin.config import store_tt_output_tokens_per_step
+from vllm_tt_plugin.config import (
+    store_tt_adaptive_block_output,
+    store_tt_output_tokens_per_step,
+)
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
     get_tt_forced_reset_discard_counts,
@@ -81,6 +84,8 @@ def _scheduler(
     diffusion_checkpoint: bool = False,
     max_model_len: int = MAX_MODEL_LEN,
     async_scheduling: bool = False,
+    adaptive: bool = False,
+    max_num_seqs: int = 1,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -90,7 +95,7 @@ def _scheduler(
     )
     model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_model_len,
         max_model_len=max_model_len,
         enable_chunked_prefill=False,
@@ -122,6 +127,8 @@ def _scheduler(
         config.model_config.__dict__.pop("is_diffusion", None)
         assert config.model_config.is_diffusion is False
     store_tt_output_tokens_per_step(config, output_width)
+    if adaptive:
+        store_tt_adaptive_block_output(config, True)
     num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
@@ -148,7 +155,9 @@ def _scheduler(
     )
 
 
-def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
+def _request(
+    max_tokens: int, *, ignore_eos: bool = True, request_id: str = "req-0"
+) -> Request:
     init_none_hash(sha256)
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -156,7 +165,7 @@ def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
     )
     sampling_params.update_from_generation_config({}, eos_token_id=2)
     return Request(
-        request_id="req-0",
+        request_id=request_id,
         prompt_token_ids=[1] * 32,
         sampling_params=sampling_params,
         pooling_params=None,
@@ -946,3 +955,152 @@ def test_diffusion_checkpoint_books_exactly_one_canvas():
     assert request.num_output_placeholders == 0
     assert cache_calls == []
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+
+# ── Adaptive block-output (tt_adaptive_block_output) ─────────────────────────
+
+
+def _adaptive_anchor(scheduler, request, token=5):
+    """Drive the prefill step: adaptive prefills commit ONE anchor token."""
+    submitted = scheduler.schedule()
+    assert request._tt_block_step is False
+    assert request.num_output_placeholders == 1
+    outputs = scheduler.update_from_output(
+        submitted, _runner_output(submitted, [token])
+    )
+    assert outputs[0].outputs[0].new_token_ids == [token]
+    assert request.num_output_placeholders == 0
+    return outputs
+
+
+def test_adaptive_prefill_commits_single_anchor_then_solo_decode_blocks():
+    """Prefill is a plain one-token step; the following solo decode reserves
+    and commits the full block. On the old code the prefill itself reserved
+    the block and a 1-token anchor commit was rejected."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    submitted = scheduler.schedule()
+    assert request._tt_block_step is True
+    assert request.num_output_placeholders == CANVAS
+
+    block = list(range(10, 10 + CANVAS))
+    outputs = scheduler.update_from_output(submitted, _runner_output(submitted, block))
+    assert outputs[0].outputs[0].new_token_ids == block
+    assert request.num_output_placeholders == 0
+
+
+def test_adaptive_batched_decode_commits_single_tokens():
+    """Two decodes in one step each get ONE placeholder and commit one
+    baseline token."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    req_b = _request(CANVAS * 2, request_id="req-b")
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    # Batched prefill step: both commit their anchors.
+    submitted = scheduler.schedule()
+    assert len(submitted.num_scheduled_tokens) == 2
+    anchor_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[5], [6]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(submitted, anchor_output)
+
+    # Batched DECODE step: still plain one-token baseline for both.
+    submitted = scheduler.schedule()
+    for req in (req_a, req_b):
+        assert req._tt_block_step is False
+        assert req.num_output_placeholders == 1
+    decode_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[7], [9]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(submitted, decode_output)
+    committed = {o.request_id: o.new_token_ids for o in outputs[0].outputs}
+    assert committed == {"req-a": [7], "req-b": [9]}
+    assert req_a.num_output_placeholders == 0
+    assert req_b.num_output_placeholders == 0
+
+
+def test_adaptive_returns_to_block_width_when_solo_again():
+    """After a peer finishes, the survivor's next solo decode reserves the
+    block again."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 4, request_id="req-a")
+    req_b = _request(1, request_id="req-b", ignore_eos=False)
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    submitted = scheduler.schedule()  # batched prefill anchors
+    anchor_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[5], [2]],  # req-b hits max_tokens=1 and finishes
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(submitted, anchor_output)
+    assert req_b.is_finished()
+
+    resumed = scheduler.schedule()
+    assert len(resumed.num_scheduled_tokens) == 1
+    assert req_a._tt_block_step is True
+    assert req_a.num_output_placeholders == CANVAS
+
+
+def test_adaptive_commit_without_scheduling_decision_raises():
+    """A committing request the placeholder pass never stamped is a broken
+    invariant, not a silent block-path default."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 2)
+    with pytest.raises(RuntimeError, match="without a scheduling decision"):
+        scheduler._update_request_with_output(request, list(range(CANVAS)))
+
+
+def test_adaptive_over_frontier_prompt_never_blocks():
+    """A prompt over tt_adaptive_block_max_prompt_tokens is served as plain
+    baseline for its whole lifetime: width-1 reservation even on solo decode.
+    On the old code the solo decode reserved the full block and the model's
+    width-1 baseline output killed the engine."""
+    from vllm_tt_plugin.config import store_tt_adaptive_block_max_prompt_tokens
+
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    # frontier below this request's 32-token prompt
+    store_tt_adaptive_block_max_prompt_tokens(scheduler.vllm_config, 16)
+    scheduler._adaptive_block_max_prompt = 16
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    submitted = scheduler.schedule()  # solo decode -- but over the frontier
+    assert request._tt_block_step is False
+    assert request.num_output_placeholders == 1
+    outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [9]))
+    assert outputs[0].outputs[0].new_token_ids == [9]
+    assert request.num_output_placeholders == 0
+
+
+def test_adaptive_under_frontier_prompt_still_blocks():
+    from vllm_tt_plugin.config import store_tt_adaptive_block_max_prompt_tokens
+
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    store_tt_adaptive_block_max_prompt_tokens(scheduler.vllm_config, 64)
+    scheduler._adaptive_block_max_prompt = 64
+    request = _request(CANVAS * 2)  # 32-token prompt <= 64
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    scheduler.schedule()
+    assert request._tt_block_step is True
+    assert request.num_output_placeholders == CANVAS
