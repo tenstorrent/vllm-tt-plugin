@@ -163,7 +163,7 @@ login()
 
 For the target model, follow any setup instructions in the corresponding
 tt-metal demo. For Llama 3.1, Llama 3.2, and Qwen 2.5 models, follow the
-[tt-transformers demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
+[tt-transformers demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/ttt_compat)
 for weights and environment variables.
 
 ## Running The Offline Inference Example
@@ -569,7 +569,7 @@ a 6x reduction in KV cache memory.
 
 To enable hybrid KV cache support for a TT model:
 
-1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`
+1. Inherit from `models.ttt_compat.tt.generator_vllm.HybridAttentionForCausalLM`
    instead of `Generator`. The base class provides a default
    `get_kv_cache_spec` classmethod that builds per-layer specs from
    `hf_config.text_config.layer_types`.
