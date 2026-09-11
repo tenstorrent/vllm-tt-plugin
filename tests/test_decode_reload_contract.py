@@ -21,6 +21,18 @@ from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
 
 
+def _bind_committed_width(runner: SimpleNamespace) -> SimpleNamespace:
+    """Attach the block-output width helpers ``_apply_sampled_tokens_to_state``
+    resolves the committed width through (``_tt_committed_width`` reads
+    ``_is_adaptive_block_output`` and ``_output_tokens_per_step``). These decode
+    fakes are non-adaptive, so the committed width is ``_output_tokens_per_step``."""
+    runner._is_adaptive_block_output = False
+    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
+        runner, toks
+    )
+    return runner
+
+
 def _controller(*, trace_mode="decode_only", supports_async=True):
     runner = SimpleNamespace(
         model=SimpleNamespace(
@@ -330,16 +342,18 @@ def test_transition_applies_drained_token_before_host_authoritative_reload():
         num_tokens=np.array([3], dtype=np.int32),
         token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
     )
-    runner = SimpleNamespace(
-        _output_tokens_per_step=1,
-        requests={"request": request_state},
-        input_batch=input_batch,
-        model_config=SimpleNamespace(max_model_len=8),
-        model=SimpleNamespace(
-            decode_input_update_contract=1,
-            model_capabilities={"supports_async_decode": True},
-        ),
-        trace_mode="decode_only",
+    runner = _bind_committed_width(
+        SimpleNamespace(
+            _output_tokens_per_step=1,
+            requests={"request": request_state},
+            input_batch=input_batch,
+            model_config=SimpleNamespace(max_model_len=8),
+            model=SimpleNamespace(
+                decode_input_update_contract=1,
+                model_capabilities={"supports_async_decode": True},
+            ),
+            trace_mode="decode_only",
+        )
     )
     runner._apply_sampled_tokens_to_state = lambda **kwargs: (
         TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
@@ -579,20 +593,22 @@ def _completed_step(token: int, runner_output=None) -> CompletedDecodeStep:
 
 
 def _async_apply_runner(request_state):
-    runner = SimpleNamespace(
-        _output_tokens_per_step=1,
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        requests={"request": request_state},
-        input_batch=SimpleNamespace(
-            req_id_to_index={},
-            num_tokens=np.zeros(1, dtype=np.int32),
-            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
-        ),
-        model_config=SimpleNamespace(max_model_len=8),
-        _steady_decode_lock=threading.Lock(),
-        _completed_decode_steps=deque(),
-        _pending_async_steps=deque(),
-        _pending_async_overlap_ok=deque(),
+    runner = _bind_committed_width(
+        SimpleNamespace(
+            _output_tokens_per_step=1,
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+            requests={"request": request_state},
+            input_batch=SimpleNamespace(
+                req_id_to_index={},
+                num_tokens=np.zeros(1, dtype=np.int32),
+                token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+            ),
+            model_config=SimpleNamespace(max_model_len=8),
+            _steady_decode_lock=threading.Lock(),
+            _completed_decode_steps=deque(),
+            _pending_async_steps=deque(),
+            _pending_async_overlap_ok=deque(),
+        )
     )
     runner._apply_sampled_tokens_to_state = lambda **kwargs: (
         TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
@@ -751,11 +767,13 @@ def test_forced_reset_discard_count_requires_all_stale_frames():
 
 def test_unscheduled_live_request_keeps_accepted_token_in_cached_state():
     request_state = SimpleNamespace(output_token_ids=[])
-    runner = SimpleNamespace(
-        _output_tokens_per_step=1,
-        requests={"request": request_state},
-        input_batch=SimpleNamespace(req_id_to_index={}),
-        model_config=SimpleNamespace(max_model_len=8),
+    runner = _bind_committed_width(
+        SimpleNamespace(
+            _output_tokens_per_step=1,
+            requests={"request": request_state},
+            input_batch=SimpleNamespace(req_id_to_index={}),
+            model_config=SimpleNamespace(max_model_len=8),
+        )
     )
 
     TTModelRunner._apply_sampled_tokens_to_state(
