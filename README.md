@@ -416,7 +416,18 @@ At startup the backend logs that it is running single-process lane-DP.
 ## Supported Model Families
 
 The plugin registers TT-prefixed model architectures backed by tt-metal model
-implementations. Current families:
+implementations. A checkpoint declares its own (bare) architecture name;
+`check_and_update_config` prepends `TT` before the registry lookup, which is
+why the names below are the registered ones rather than the ones in a
+`config.json`. The rewrite selects the class the model loader instantiates; it
+does not undo what `ModelConfig` already derived from the bare name upstream
+(architecture metadata, multimodal config, runner and convert types).
+
+DiffusionGemma is the exception in both directions: the plugin registers the
+bare `DiffusionGemmaForCausalLM`, and deliberately does *not* register the bare
+`DiffusionGemmaForBlockDiffusion`, because vLLM 0.25.1 owns that name and the
+plugin rewrites the architecture before registry lookup instead. Current
+families:
 
 - Llama 3.1 / 3.2 / 3.3 text models (`TTLlamaForCausalLM`)
 - Llama 3.2 vision models (`TTMllamaForConditionalGeneration`)
@@ -429,7 +440,10 @@ implementations. Current families:
   `TTGemma4ForConditionalGeneration`,
   `TTGemma4UnifiedForConditionalGeneration`)
 - DiffusionGemma block-output models (`TTDiffusionGemmaForBlockDiffusion`,
-  `TTDiffusionGemmaForCausalLM`)
+  `TTDiffusionGemmaForCausalLM`). A checkpoint's `config.json` declares the
+  bare `DiffusionGemmaForBlockDiffusion` or `DiffusionGemmaForCausalLM`; the
+  names here are what the rewrite above turns those into, so match your
+  checkpoint against the bare names.
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
 
@@ -479,6 +493,9 @@ clear error before anything reaches the device:
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
+- `prompt_embeds` inputs are rejected at request validation time, for
+  every TT model. (Block-output models additionally reject
+  streaming-input sessions; see the DiffusionGemma document.)
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
 - Multi-host MPI data parallelism is not supported.

@@ -326,9 +326,17 @@ class TTWorker(WorkerBase):
         # to the architectures list. As a result the cached property still
         # holds the upstream (e.g. CUDA) name, and resolving it would find
         # upstream's vLLM model class — which doesn't have our
-        # ``get_kv_cache_spec`` hook. Prefer the prefixed entry from the
-        # ``architectures`` list (which the platform modifies in-place) and
-        # fall back to prepending ``"TT"`` when neither is available.
+        # ``get_kv_cache_spec`` hook.
+        #
+        # ``ModelConfig.architectures`` is a pydantic snapshot taken in
+        # ``__post_init__``, so it does not see ``check_and_update_config``
+        # rewriting ``hf_config.architectures`` in place afterwards. The
+        # ``next(...)`` therefore only matches a checkpoint that was already
+        # TT-prefixed when ``ModelConfig`` was built (DiffusionGemma via the
+        # ``get_config`` patch; the ``vllm_test_utils`` dummies and TT-named
+        # ``EXTRA_MODELS_DIR`` bundles natively). For a bare HF name the
+        # ``"TT" + architecture`` fallback is what resolves the class, so do not
+        # drop it as redundant.
         arch = next(
             (a for a in self.model_config.architectures if a.startswith("TT")),
             None,
