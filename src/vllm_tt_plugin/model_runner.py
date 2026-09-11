@@ -1917,6 +1917,13 @@ class TTModelRunner:
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
+    # Request-driven branches below decide host vs device sampling. A
+    # block-output model that lands on host sampling gets one token where the
+    # canvas contract needs ``_output_tokens_per_step``, so ``_get_output_tokens``
+    # raises. Two layers keep it away: the ``InputBatch`` is built with
+    # ``disable_logprobs`` for block models, and ``TTScheduler`` neutralizes
+    # ``config.BLOCK_HOST_SAMPLING_FORCERS`` on unvalidated requests -- extend
+    # that table when adding a request-driven branch here.
     def check_perform_device_sampling(
         self, is_decode: bool, has_structured_outputs: bool
     ) -> bool:
@@ -1958,6 +1965,8 @@ class TTModelRunner:
         # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
         if max_lp is not None:
+            # A *requested* count is enough, including the 0 that OpenAI's
+            # ``logprobs: true`` produces.
             if num_devices not in (8, 32):
                 return False
             if max_lp > 0 and not self.supports_topk_logprobs:

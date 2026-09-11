@@ -232,9 +232,9 @@ def test_add_request_clamps_max_tokens_that_would_overshoot_max_model_len():
 
 
 def test_add_request_strips_host_sampling_controls_from_bypassed_request():
-    """A prebuilt EngineCoreRequest skips frontend validation; any of these
-    controls flips the step onto host sampling, which cannot construct a
-    multi-token canvas and would kill the engine."""
+    """A prebuilt EngineCoreRequest skips frontend validation. The consequence
+    differs by group -- see the three tables in ``config`` -- so this pins only
+    that every field is reset, not that each one is fatal."""
     scheduler = _scheduler()
     init_none_hash(sha256)
     params = SamplingParams(
@@ -248,6 +248,10 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         presence_penalty=0.5,
         frequency_penalty=0.5,
         repetition_penalty=1.1,
+        # OpenAI ``logprobs: true`` arrives as logprobs=0, which is enough to
+        # force host sampling on every device count outside {8, 32}.
+        logprobs=0,
+        prompt_logprobs=1,
         structured_outputs=StructuredOutputsParams(json_object=True),
     )
     params.update_from_generation_config({}, eos_token_id=2)
@@ -276,8 +280,11 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert params.allowed_token_ids is None
     assert params.bad_words is None
     assert params._bad_words_token_ids is None
-    # Non-neutral penalties make every block step build session-length
-    # penalty tensors it then discards.
+    assert params.logprobs is None
+    assert params.prompt_logprobs is None
+    # Non-neutral penalties do not change block output -- the model discards
+    # them -- but they flip no_penalties and make every step rebuild
+    # session-length token tensors. See config.BLOCK_PENALTY_NEUTRAL.
     assert params.presence_penalty == 0.0
     assert params.frequency_penalty == 0.0
     assert params.repetition_penalty == 1.0
