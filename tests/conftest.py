@@ -12,6 +12,7 @@ _TT_PLATFORM_CONFIG_ATTRS = (
     "_standard_dp_visible_device_groups",
     "_standard_dp_mesh_grids",
     "sample_on_device_mode",
+    "supports_random_sampling_on_device",
     "always_compat_sampling",
     "_tt_vllm_config",
 )

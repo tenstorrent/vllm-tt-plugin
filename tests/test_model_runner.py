@@ -29,6 +29,7 @@ def _batch_with_one_request(
     prompt_len: int,
     output_len: int,
     num_computed_tokens: int,
+    sampling_params: SamplingParams | None = None,
 ) -> tuple[InputBatch, CachedRequestState]:
     """Creates a batch with a single request, for testing purposes."""
     batch = InputBatch(
@@ -43,7 +44,7 @@ def _batch_with_one_request(
         req_id="r",
         prompt_token_ids=list(range(prompt_len)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=sampling_params or SamplingParams(temperature=0.0),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -314,3 +315,117 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+# region Device sampling eligibility
+
+
+def _runner_for_device_sampling(
+    batch: InputBatch, supports_random: bool
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        input_batch=batch,
+        sample_on_device_mode="all",
+        num_devices=1,
+        tt_data_parallel_size=1,
+        model_config=SimpleNamespace(logits_processors=None),
+        supports_topk_logprobs=False,
+        supports_random_sampling_on_device=supports_random,
+    )
+
+
+def _batch_with_requests(*sampling_params: SamplingParams) -> InputBatch:
+    """Creates a batch with one request per given SamplingParams."""
+    batch = InputBatch(
+        max_num_reqs=MAX_NUM_REQS,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+    )
+    for i, params in enumerate(sampling_params):
+        batch.add_request(
+            CachedRequestState(
+                req_id=f"r{i}",
+                prompt_token_ids=list(range(4)),
+                mm_features=None,
+                sampling_params=params,
+                generator=None,
+                block_ids=([0],),
+                num_computed_tokens=4,
+                output_token_ids=[],
+            )
+        )
+    return batch
+
+
+@pytest.mark.parametrize(
+    "temperature, supports_random, expect_device_sampling",
+    [
+        (0.0, True, True),
+        (0.0, False, True),
+        (1.0, True, True),
+        (1.0, False, False),
+    ],
+    ids=[
+        "greedy-full",
+        "greedy-restricted",
+        "random-full",
+        "random-restricted",
+    ],
+)
+def test_check_perform_device_sampling_routes_random_to_host_when_restricted(
+    temperature: float,
+    supports_random: bool,
+    expect_device_sampling: bool,
+):
+    """A device sampler that only implements argmax must not receive a
+    random step. check_perform_device_sampling routes that step to host
+    sampling instead, the same way it already does for bad_words, min_p, and
+    every other always-host-only sampling control."""
+    batch, _ = _batch_with_one_request(
+        prompt_len=4,
+        output_len=0,
+        num_computed_tokens=4,
+        sampling_params=SamplingParams(temperature=temperature),
+    )
+
+    result = TTModelRunner.check_perform_device_sampling(
+        _runner_for_device_sampling(batch, supports_random),
+        is_decode=True,
+        has_structured_outputs=False,
+    )
+
+    assert result is expect_device_sampling
+
+
+def test_check_perform_device_sampling_routes_mixed_batch_to_host_when_restricted():
+    """One random row in an otherwise-greedy batch sends the whole step's
+    batch to host sampling for a greedy-only device sampler; an all-greedy
+    batch of the same size still uses the device."""
+    mixed_batch = _batch_with_requests(
+        SamplingParams(temperature=0.0), SamplingParams(temperature=1.0)
+    )
+    all_greedy_batch = _batch_with_requests(
+        SamplingParams(temperature=0.0), SamplingParams(temperature=0.0)
+    )
+
+    assert (
+        TTModelRunner.check_perform_device_sampling(
+            _runner_for_device_sampling(mixed_batch, supports_random=False),
+            is_decode=True,
+            has_structured_outputs=False,
+        )
+        is False
+    )
+    assert (
+        TTModelRunner.check_perform_device_sampling(
+            _runner_for_device_sampling(all_greedy_batch, supports_random=False),
+            is_decode=True,
+            has_structured_outputs=False,
+        )
+        is True
+    )
+
+
+# endregion Device sampling eligibility
