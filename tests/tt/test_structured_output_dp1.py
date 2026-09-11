@@ -30,6 +30,7 @@ async def _send_choice_request(async_client, model: str, request_id: int) -> str
         ],
         max_completion_tokens=8,
         temperature=0,
+        presence_penalty=0.5,
         extra_body={"structured_outputs": {"choice": CHOICES}},
     )
     content = response.choices[0].message.content
@@ -101,11 +102,12 @@ async def _send_plain_request(async_client, model: str, request_id: int) -> str:
     return content
 
 
-def test_dp1_full_capacity_mixes_structured_and_plain_requests(
+def _run_mixed_request_wave(
     tt_server,
-    tt_model_name,
-    max_batch_size,
-):
+    tt_model_name: str,
+    max_batch_size: int,
+    wave: int,
+) -> None:
     async def _run() -> None:
         async_client = tt_server.get_async_client()
         request_count = min(max_batch_size, 32)
@@ -115,17 +117,33 @@ def test_dp1_full_capacity_mixes_structured_and_plain_requests(
             _send_json_request,
             _send_plain_request,
         ]
-
+        request_ids = range(wave * request_count, (wave + 1) * request_count)
         tasks = [
-            senders[request_id % len(senders)](
+            senders[(request_id + wave) % len(senders)](
                 async_client,
                 tt_model_name,
                 request_id,
             )
-            for request_id in range(request_count)
+            for request_id in request_ids
         ]
 
         results = await asyncio.gather(*tasks)
         assert len(results) == request_count
 
     asyncio.run(_run())
+
+
+def test_dp1_full_capacity_mixes_structured_and_plain_requests_first_wave(
+    tt_server,
+    tt_model_name,
+    max_batch_size,
+):
+    _run_mixed_request_wave(tt_server, tt_model_name, max_batch_size, wave=0)
+
+
+def test_dp1_full_capacity_reuses_slots_for_second_mixed_wave(
+    tt_server,
+    tt_model_name,
+    max_batch_size,
+):
+    _run_mixed_request_wave(tt_server, tt_model_name, max_batch_size, wave=1)

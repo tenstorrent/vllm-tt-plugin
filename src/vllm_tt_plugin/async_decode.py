@@ -36,6 +36,8 @@ class TTDecodeSubmission:
     batch_size_per_dp: list[int]
     sampling_params: Any
     perform_device_sampling: bool
+    device_sampling_params: Any | None = None
+    deferred_device_sampling: bool = False
     reload_plan: TTDecodeReloadPlan | None = None
 
 
@@ -206,6 +208,7 @@ class TTAsyncDecodeController:
         self._previous_device_sampling: bool | None = None
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
         self._legacy_contract_warning_emitted = False
+        self.device_grammar_sample_count = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -446,7 +449,7 @@ class TTAsyncDecodeController:
             return False
         if model_input.decode_layout_changed:
             return False
-        if model_input.grammar_bitmask[0] is not None:
+        if getattr(model_input, "defer_device_sampling", False):
             return False
         if (
             model_input.prompt_tokens is not None
@@ -773,7 +776,24 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        deferred_device_sampling = bool(
+            getattr(model_input, "defer_device_sampling", False)
+        )
         contract_version = self.decode_input_update_contract_version()
+        if deferred_device_sampling and (
+            not perform_device_sampling or model_input.prompt_lens is not None
+        ):
+            raise ValueError(
+                "defer_device_sampling requires a device-sampled decode step; "
+                f"perform_device_sampling={perform_device_sampling}, "
+                f"is_decode={model_input.prompt_lens is None}"
+            )
+        if deferred_device_sampling and (read_from_device or async_read):
+            raise ValueError(
+                "deferred device sampling must retain device logits and cannot "
+                f"read them during submission; read_from_device={read_from_device}, "
+                f"async_read={async_read}"
+            )
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
@@ -781,6 +801,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
                 perform_device_sampling=perform_device_sampling,
+                deferred_device_sampling=deferred_device_sampling,
                 reload_plan=None,
             )
 
@@ -797,6 +818,7 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        device_sampling_params = None
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -810,7 +832,11 @@ class TTAsyncDecodeController:
                 None if s == SEED_NONE_SENTINEL else s
                 for s in sampling_param_dict["seed"]
             ]
-            kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+            device_sampling_params = type(sampling_params)(**sampling_param_dict)
+            if deferred_device_sampling:
+                kwargs["defer_device_sampling"] = True
+            else:
+                kwargs["sampling_params"] = device_sampling_params
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
@@ -901,8 +927,76 @@ class TTAsyncDecodeController:
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
+            device_sampling_params=device_sampling_params,
+            deferred_device_sampling=deferred_device_sampling,
             reload_plan=reload_plan,
         )
+
+    def complete_deferred_device_sampling(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+    ) -> TTFinalizedDecode:
+        """Apply sample-time grammar on device, then finalize sampled tokens."""
+
+        def fail_deferred() -> None:
+            self._decode_chain_valid = False
+            self._submitted_page_tables = None
+            self.runner._poison_device_grammar()
+
+        if not submission.deferred_device_sampling:
+            raise ValueError(
+                "decode submission is not awaiting deferred device sampling"
+            )
+        if submission.tt_out is None or submission.device_sampling_params is None:
+            raise RuntimeError(
+                "deferred device sampling is missing device logits or "
+                "sampling parameters"
+            )
+        if len(model_input.grammar_bitmask) != 1:
+            raise ValueError(
+                "deferred device grammar expects one merged mask payload, got "
+                f"{len(model_input.grammar_bitmask)}"
+            )
+        grammar_bitmask = model_input.grammar_bitmask[0]
+        if grammar_bitmask is None:
+            fail_deferred()
+            raise RuntimeError(
+                "structured decode reached deferred device sampling without "
+                "a sample-time grammar bitmask"
+            )
+
+        sample_decode = getattr(self.runner.model, "sample_decode_on_device", None)
+        if not callable(sample_decode):
+            fail_deferred()
+            raise AttributeError(
+                "TT model declares device grammar support but does not implement "
+                "sample_decode_on_device()"
+            )
+        try:
+            sampled = sample_decode(
+                submission.tt_out,
+                sampling_params=submission.device_sampling_params,
+                grammar_bitmask=grammar_bitmask,
+            )
+            completed_submission = replace(
+                submission,
+                tt_out=sampled,
+                read_events=None,
+                deferred_device_sampling=False,
+            )
+            finalized = self.finalize_decode(completed_submission)
+            if finalized is None:
+                raise RuntimeError("deferred device sampling produced no output")
+        except Exception:
+            fail_deferred()
+            raise
+        self.device_grammar_sample_count += 1
+        logger.info(
+            "TT device grammar sampling active count=%d",
+            self.device_grammar_sample_count,
+        )
+        return finalized
 
     def finalize_decode(
         self,
@@ -911,6 +1005,10 @@ class TTAsyncDecodeController:
         runner = self.runner
         if submission.tt_out is None:
             return None
+        if submission.deferred_device_sampling:
+            raise RuntimeError(
+                "cannot finalize decode logits before deferred device sampling"
+            )
 
         if submission.read_events is not None:
             for read_event in submission.read_events:

@@ -5,7 +5,7 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -29,6 +29,7 @@ def _batch_with_one_request(
     prompt_len: int,
     output_len: int,
     num_computed_tokens: int,
+    sampling_params: SamplingParams | None = None,
 ) -> tuple[InputBatch, CachedRequestState]:
     """Creates a batch with a single request, for testing purposes."""
     batch = InputBatch(
@@ -43,7 +44,11 @@ def _batch_with_one_request(
         req_id="r",
         prompt_token_ids=list(range(prompt_len)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=(
+            sampling_params
+            if sampling_params is not None
+            else SamplingParams(temperature=0.0)
+        ),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -215,6 +220,33 @@ def test_completed_cached_request_builds_decode_input(output_len: int):
     )
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
     assert model_input.input_tokens[0, 0] == batch.token_ids_cpu[0, num_tokens - 1]
+
+
+def test_structured_decode_build_captures_expected_grammar_request_ids():
+    prompt_len = 8
+    output_len = 1
+    num_computed_tokens = prompt_len
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=output_len,
+        num_computed_tokens=num_computed_tokens,
+        sampling_params=SamplingParams(
+            temperature=0.0,
+            structured_outputs=StructuredOutputsParams(json_object=True),
+        ),
+    )
+    runner = _fake_runner(batch, request)
+    runner.check_perform_device_sampling = lambda **_: True
+
+    model_input = _prepare(
+        runner,
+        ("r", 1, num_computed_tokens, output_len),
+    )
+
+    assert model_input.prompt_lens is None
+    assert model_input.grammar_bitmask == [None]
+    assert model_input.structured_output_req_ids == frozenset({"r"})
+    assert model_input.defer_device_sampling is True
 
 
 def test_final_one_token_prompt_chunk_stays_prefill():

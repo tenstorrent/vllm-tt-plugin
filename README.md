@@ -280,7 +280,11 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-Requests that cannot use TT on-device sampling automatically fall back to vLLM’s host-side sampling path. This fallback is selected per batch and requires no user configuration.
+Before a forward is submitted, TT selects one sampling path for the whole
+submitted batch. If any request or batch feature cannot use on-device
+sampling, the batch uses vLLM's host-side path. A failure after deferred device
+sampling has begun is terminal rather than retried on host, because the device
+decode and sampler state may already have advanced.
 
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
@@ -314,6 +318,28 @@ Common options:
 | `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
+
+Structured-output sampling is capability-gated independently from ordinary
+device sampling:
+
+| Step | Sampling path |
+| --- | --- |
+| Structured prefill | Host sampling |
+| Eligible structured decode | TT device sampling after the sample-time grammar mask arrives |
+| Structured decode with logprobs, another host-only sampling option, or no effective device-grammar support | Host sampling |
+
+Eligibility requires an operator-selected `sample_on_device_mode`, the static
+`supports_device_grammar` capability, a compatible runtime sampler (not
+row-sharded), model warmup when tracing, and no logprobs (including
+`logprobs=0`) or other host-only sampling option. It also requires
+`--no-async-scheduling`; with upstream batch-queue overlap enabled, structured
+requests retain host sampling. Block-output models reject structured outputs
+rather than falling back.
+
+Fallback is selected before forward submission. Once an eligible decode is
+submitted with deferred device sampling, its sample-time grammar mask must be
+present and valid. A missing mask or a device-sampling failure is terminal for
+that runner and requires recovery/restart; it is not retried on host.
 
 ### `max_model_len` And KV Cache Capacity
 

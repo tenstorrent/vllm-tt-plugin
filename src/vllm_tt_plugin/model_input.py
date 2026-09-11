@@ -175,3 +175,16 @@ class TTModelInput:
     # must resolve rows through this. ``None`` for lane builds, whose rows are
     # the persistent slots.
     row_req_ids: list[str] | None = None
+
+    # Decode-only: retain device logits until sample_tokens supplies the grammar,
+    # then invoke the model's device sampler. Structured prefills stay on host.
+    defer_device_sampling: bool = False
+
+    # Requests in this forward that must receive a sample-time grammar row.
+    # Captured with the forward so a partial GrammarOutput cannot silently leave
+    # a structured row all-allowed after the persistent batch changes.
+    structured_output_req_ids: frozenset[str] = frozenset()
+
+    # Immutable row identity used for sample-time grammar remapping. Includes
+    # padding/gap rows as None and is never reconstructed from a mutable batch.
+    grammar_row_req_ids: tuple[str | None, ...] = ()

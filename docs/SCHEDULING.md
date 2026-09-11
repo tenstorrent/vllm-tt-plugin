@@ -352,6 +352,24 @@ Overlap is disabled and pending async work is drained when correctness would oth
 - logprobs, including an explicit `logprobs=0`, or other features that force a
   more synchronous path
 
+When device sampling is operator-enabled, a model declares
+`supports_device_grammar`, its loaded sampler reports compatible runtime
+support, and the submitted batch has no logprobs or other host-only option, a
+structured decode keeps logits on device until `sample_tokens()` supplies and
+remaps the packed grammar mask. Sampling-path eligibility is batch-wide: one
+ineligible request moves the whole submitted TT batch to host sampling. The
+runner drains pending async work before that forward and completes device
+sampling synchronously after the mask arrives. This initial path also requires
+`async_scheduling=False`, because upstream's batch queue can otherwise submit
+another forward before the current grammar arrives. Structured prefill and
+ineligible structured decode retain host sampling. Block-output models reject
+structured outputs.
+
+That choice is made before forward submission. A deferred decode that later
+receives no mask, an incomplete request-to-mask mapping, or a device-sampling
+failure invalidates the runner; it cannot safely retry the already-submitted
+step on host.
+
 So the TT async path is best understood as a fast path for steady decode, not as a universal async execution model.
 
 The effective `async_scheduling` setting controls this engine and device

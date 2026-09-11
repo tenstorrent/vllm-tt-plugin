@@ -247,6 +247,7 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `supports_prefix_caching` | `False` | Whether the vLLM prefix cache may be used |
 | `output_tokens_per_step` | `1` | Committed output width per step. `1` is token-at-a-time; `>1` is block-output width |
 | `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
+| `supports_device_grammar` | `False` | Whether decode sampling can accept vLLM's packed grammar bitmask after forward. Requires `supports_sample_on_device`; structured prefill remains host-sampled |
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
 
 Absent keys default via `.get`. That is the live contract. Do not add

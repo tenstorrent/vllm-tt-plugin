@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -29,8 +30,10 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.structured_output import (
+    capture_structured_decode_request_ids,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
+    scheduled_structured_output_request_ids,
 )
 
 if TYPE_CHECKING:
@@ -1124,7 +1127,10 @@ class TTLaneInputBatch(InputBatch):
         )
 
     def slot_grammar_bitmask(
-        self, grammar_output: "GrammarOutput | None", batch_length: int
+        self,
+        grammar_output: "GrammarOutput | None",
+        batch_length: int,
+        expected_structured_output_request_ids: Collection[str] | None = None,
     ) -> torch.Tensor | None:
         """Reorder the scheduler grammar bitmask into a full slot-batch tensor.
 
@@ -1140,6 +1146,9 @@ class TTLaneInputBatch(InputBatch):
             structured_output_request_ids=grammar_output.structured_output_request_ids,
             row_req_ids=self.req_ids[:batch_length],
             batch_length=batch_length,
+            expected_structured_output_request_ids=(
+                expected_structured_output_request_ids
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1200,9 +1209,20 @@ class TTLaneInputBatch(InputBatch):
         has_structured = has_structured_outputs(
             runner.requests, scheduler_output, bitmask
         )
+        scheduled_structured_req_ids = scheduled_structured_output_request_ids(
+            runner.requests,
+            scheduler_output,
+        )
+        has_scheduled_structured = bool(scheduled_structured_req_ids)
+        structured_output_req_ids = capture_structured_decode_request_ids(
+            scheduled_structured_req_ids,
+            lane_batch.req_ids[:total],
+        )
         perform_device_sampling = runner.check_perform_device_sampling(
             is_decode=True, has_structured_outputs=has_structured
         )
+        if has_structured and not has_scheduled_structured:
+            perform_device_sampling = False
 
         # The prompt/output token tensors feed device-side penalties only. Host
         # sampling rebuilds them itself in ``build_merged_sampling_metadata``, so
@@ -1241,6 +1261,11 @@ class TTLaneInputBatch(InputBatch):
             logitsprocs_list=[None],
             generators_list=[{}],
             prefill_empty_slots=None,
+            defer_device_sampling=(
+                perform_device_sampling and has_scheduled_structured
+            ),
+            structured_output_req_ids=structured_output_req_ids,
+            grammar_row_req_ids=tuple(lane_batch.req_ids[:total]),
         )
 
     def _build_prefill_input(
@@ -1288,6 +1313,17 @@ class TTLaneInputBatch(InputBatch):
         bitmask = lane_batch.slot_grammar_bitmask(
             grammar_output, lane_batch.max_num_reqs
         )
+        scheduled_structured_req_ids = scheduled_structured_output_request_ids(
+            runner.requests,
+            scheduler_output,
+        )
+        structured_output_req_ids = frozenset(
+            lane_batch.req_ids[row]
+            for local_row, row in enumerate(rows)
+            if lane_batch.req_ids[row] in scheduled_structured_req_ids
+            and not bool(intermediate_prefill_mask[local_row])
+        )
+        prefill_rows = set(rows)
         has_structured = has_structured_outputs(
             runner.requests, scheduler_output, bitmask
         )
@@ -1343,6 +1379,12 @@ class TTLaneInputBatch(InputBatch):
                 else None
             ),
             intermediate_prefill_mask=intermediate_prefill_mask,
+            defer_device_sampling=False,
+            structured_output_req_ids=structured_output_req_ids,
+            grammar_row_req_ids=tuple(
+                lane_batch.req_ids[row] if row in prefill_rows else None
+                for row in range(lane_batch.max_num_reqs)
+            ),
         )
 
     def extract_output(

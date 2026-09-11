@@ -21,6 +21,7 @@ from vllm_tt_plugin.config import (
     require_tt_output_tokens_per_step,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_supports_device_grammar,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
@@ -1570,6 +1571,39 @@ class TTPlatform(Platform):
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         is_block_output_model = is_tt_block_output_model(vllm_config)
+        supports_device_grammar = (
+            model_capabilities.get("supports_device_grammar", False)
+            if model_capabilities
+            else False
+        )
+        if not isinstance(supports_device_grammar, bool):
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "must declare model_capabilities['supports_device_grammar'] "
+                f"as a boolean, got {supports_device_grammar!r}"
+            )
+        supports_sample_on_device = (
+            model_capabilities.get("supports_sample_on_device", False)
+            if model_capabilities
+            else False
+        )
+        if supports_device_grammar and not supports_sample_on_device:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['supports_device_grammar']=True "
+                "without model_capabilities['supports_sample_on_device']=True"
+            )
+        if is_block_output_model and supports_device_grammar:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['supports_device_grammar']=True, "
+                "but block-output models own a multi-token sampler and do not "
+                "support vLLM grammar masks"
+            )
+        store_tt_supports_device_grammar(
+            vllm_config,
+            supports_device_grammar,
+        )
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
                 "DiffusionGemma must declare output_tokens_per_step > 1 "
@@ -1753,11 +1787,6 @@ class TTPlatform(Platform):
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
         # `supports_sample_on_device` in their `model_capabilities` dict.
-        supports_sample_on_device = (
-            model_capabilities.get("supports_sample_on_device", False)
-            if model_capabilities
-            else False
-        )
         if sample_on_device_mode is not None and not supports_sample_on_device:
             raise ValueError(
                 f"sample_on_device_mode={sample_on_device_mode!r} was requested, "

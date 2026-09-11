@@ -39,6 +39,7 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
 # get_tt_data_parallel_size.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
+_SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -120,6 +121,43 @@ def store_tt_output_tokens_per_step(
         additional = {}
         vllm_config.additional_config = additional
     additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
+
+
+def get_tt_supports_device_grammar(vllm_config: "VllmConfig") -> bool:
+    """Return the resolved model-side device grammar capability."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_DEVICE_GRAMMAR_KEY, False))
+
+
+def is_tt_device_grammar_preload_eligible(
+    vllm_config: "VllmConfig",
+    *,
+    trace_mode: str,
+    enable_model_warmup: bool,
+) -> bool:
+    """Whether config-time state permits loading device grammar support.
+
+    Grammar-on sampling traces must be compiled before traced execution starts.
+    The loaded runner separately checks sampler/API and mesh-layout support.
+    """
+    return get_tt_supports_device_grammar(vllm_config) and (
+        trace_mode == "none" or enable_model_warmup
+    )
+
+
+def store_tt_supports_device_grammar(
+    vllm_config: "VllmConfig", supported: bool
+) -> None:
+    """Store device grammar support on the serializable vLLM config."""
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"resolved TT supports_device_grammar must be a boolean, got {supported!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_DEVICE_GRAMMAR_KEY] = supported
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:

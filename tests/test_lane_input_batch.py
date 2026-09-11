@@ -18,10 +18,12 @@ No device / ttnn execution required.
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils import torch_utils
+from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.sample import sampler as sampler_module
 from vllm.v1.sample.logits_processor import AdapterLogitsProcessor, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -31,6 +33,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
+from vllm_tt_plugin.model_runner import TTModelRunner
 
 VOCAB = 64
 BLOCK = 16
@@ -319,6 +322,148 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
     assert model_input.intermediate_prefill_mask.tolist() == [True]
     # An intermediate chunk must not advance device RNG state.
     assert model_input.perform_device_sampling is False
+
+
+def test_lane_structured_decode_captures_expected_grammar_request_ids():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    batch = _lane_batch(num_lanes=1, per_lane=2, with_custom=False)
+    request = _make_req(
+        "request",
+        [1, 2],
+        [3],
+        {
+            "temperature": 0.0,
+            "structured_outputs": StructuredOutputsParams(json_object=True),
+        },
+    )
+    row = _add_to_lane(batch, request, lane=0)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"request": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    plan = _plan({"request": row}, is_decode=True, capacity=2)
+    runner = SimpleNamespace(
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _block_tables_per_layer=lambda _: None,
+        check_perform_device_sampling=lambda **_: True,
+        _decode_layout_changed_since_last_decode=False,
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        requests={"request": request},
+    )
+
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+
+    assert model_input.grammar_bitmask == [None]
+    assert model_input.structured_output_req_ids == frozenset({"request"})
+    assert model_input.defer_device_sampling is True
+
+
+def test_slot_grammar_bitmask_default_preserves_non_strict_mapping():
+    batch = _lane_batch(num_lanes=1, per_lane=2, with_custom=False)
+    request = _make_req(
+        "request",
+        [1, 2],
+        [3],
+        {"temperature": 0.0},
+    )
+    _add_to_lane(batch, request, lane=0)
+    grammar = GrammarOutput(
+        structured_output_request_ids=["request"],
+        grammar_bitmask=np.array([[10, 11]], dtype=np.int32),
+    )
+
+    reordered = batch.slot_grammar_bitmask(grammar, batch_length=2)
+
+    assert reordered.tolist() == [[10, 11], [-1, -1]]
+
+
+def test_sparse_two_lane_grammar_uses_submitted_row_snapshot():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    batch = _lane_batch(num_lanes=2, per_lane=2, with_custom=False)
+    structured_a = _make_req(
+        "structured-a",
+        [1, 2],
+        [3],
+        {
+            "temperature": 0.0,
+            "structured_outputs": StructuredOutputsParams(json_object=True),
+        },
+    )
+    plain = _make_req("plain", [4, 5], [6], {"temperature": 0.0})
+    structured_b = _make_req(
+        "structured-b",
+        [7, 8],
+        [9],
+        {
+            "temperature": 0.0,
+            "structured_outputs": StructuredOutputsParams(json_object=True),
+        },
+    )
+    batch.add_request_to_row(structured_a, 1)
+    batch.add_request_to_row(plain, 2)
+    batch.add_request_to_row(structured_b, 3)
+    requests = {
+        request.req_id: request for request in (structured_a, plain, structured_b)
+    }
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {
+        "structured-a": 1,
+        "plain": 1,
+        "structured-b": 1,
+    }
+    scheduler_output.total_num_scheduled_tokens = 3
+    plan = _plan(
+        {"structured-a": 1, "plain": 2, "structured-b": 3},
+        is_decode=True,
+        capacity=4,
+        num_lanes=2,
+    )
+    runner = SimpleNamespace(
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _block_tables_per_layer=lambda _: None,
+        check_perform_device_sampling=lambda **_: True,
+        _decode_layout_changed_since_last_decode=False,
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        requests=requests,
+    )
+
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+    grammar = GrammarOutput(
+        structured_output_request_ids=["structured-b", "structured-a"],
+        grammar_bitmask=np.array([[30, 31], [10, 11]], dtype=np.int32),
+    )
+    reordered = TTModelRunner._reorder_grammar_bitmask(
+        SimpleNamespace(),
+        grammar,
+        model_input,
+        lane_total=4,
+    )
+
+    assert model_input.grammar_row_req_ids == (
+        None,
+        "structured-a",
+        "plain",
+        "structured-b",
+    )
+    assert reordered.tolist() == [
+        [-1, -1],
+        [10, 11],
+        [-1, -1],
+        [30, 31],
+    ]
+
+    missing = GrammarOutput(
+        structured_output_request_ids=["structured-a"],
+        grammar_bitmask=np.array([[10, 11]], dtype=np.int32),
+    )
+    with pytest.raises(RuntimeError, match="structured-b"):
+        TTModelRunner._reorder_grammar_bitmask(
+            SimpleNamespace(),
+            missing,
+            model_input,
+            lane_total=4,
+        )
 
 
 def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():

@@ -38,13 +38,16 @@ from vllm_tt_plugin.async_decode import (
     DeferredDecodeOutput,
     SubmittedStepContext,
     TTAsyncDecodeController,
+    TTDecodeSubmission,
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_supports_device_grammar,
     is_tt_block_output_model,
+    is_tt_device_grammar_preload_eligible,
 )
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
@@ -67,8 +70,10 @@ from vllm_tt_plugin.model_input import (
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import (
+    capture_structured_decode_request_ids,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
+    scheduled_structured_output_request_ids,
 )
 
 if TYPE_CHECKING:
@@ -117,6 +122,7 @@ class _SyncForward:
     batch_size_per_dp: list[int]
     perform_device_sampling: bool
     is_decode: bool
+    decode_submission: TTDecodeSubmission | None = None
 
 
 def _coerce_output_block(
@@ -164,6 +170,7 @@ class TTModelRunner:
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._persistent_capture_released = False
+        self._device_grammar_poisoned = False
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -177,11 +184,39 @@ class TTModelRunner:
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
+        self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
+            vllm_config,
+            trace_mode=self.trace_mode,
+            enable_model_warmup=self.enable_model_warmup,
+        )
+        if (
+            not self.supports_device_grammar
+            and get_tt_supports_device_grammar(vllm_config)
+            and self.trace_mode != "none"
+            and not self.enable_model_warmup
+        ):
+            logger.warning(
+                "TT device grammar sampling requires model warmup before "
+                "traced execution; retaining host grammar sampling because "
+                "enable_model_warmup is false"
+            )
+            self.supports_device_grammar = False
         # Runtime-discovered physical device count, supplied by the worker.
         self.num_devices = num_devices
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
+        if self.supports_device_grammar and (
+            self.sample_on_device_mode is None or self.scheduler_config.async_scheduling
+        ):
+            logger.info(
+                "TT device grammar runtime activation is disabled "
+                "(sample_on_device_mode=%s, async_scheduling=%s); retaining "
+                "host grammar sampling",
+                self.sample_on_device_mode,
+                self.scheduler_config.async_scheduling,
+            )
+            self.supports_device_grammar = False
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
         # requiring the model to be loaded). Models like gpt-oss-120b
@@ -316,6 +351,37 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        if self.supports_device_grammar:
+            activate = getattr(self.model, "enable_device_grammar", None)
+            if callable(activate):
+                activate()
+            runtime_support = bool(getattr(self.model, "device_grammar_enabled", False))
+            has_sample_api = callable(
+                getattr(self.model, "sample_decode_on_device", None)
+            )
+            if not runtime_support or not has_sample_api:
+                logger.warning(
+                    "TT model declares device grammar support but this runtime "
+                    "layout has no compatible sampler; retaining host grammar "
+                    "sampling (runtime_support=%s, sample_api=%s)",
+                    runtime_support,
+                    has_sample_api,
+                )
+                self.supports_device_grammar = False
+
+    def _poison_device_grammar(self) -> None:
+        """Reject all later runner work after a deferred decode becomes unsafe."""
+        self._device_grammar_poisoned = True
+        poison_model = getattr(self.model, "poison_deferred_device_sampling", None)
+        if callable(poison_model):
+            poison_model()
+
+    def _raise_if_device_grammar_poisoned(self) -> None:
+        if getattr(self, "_device_grammar_poisoned", False):
+            raise RuntimeError(
+                "TT device grammar sampling previously failed after decode "
+                "submission; reconstruct the model runner before continuing"
+            )
 
     def _uses_async_scheduler(self) -> bool:
         """Whether upstream publishes outputs through placeholder accounting.
@@ -1281,6 +1347,26 @@ class TTModelRunner:
         has_structured = has_structured_outputs(
             self.requests, scheduler_output, bitmask
         )
+        scheduled_structured_req_ids = scheduled_structured_output_request_ids(
+            self.requests,
+            scheduler_output,
+        )
+        has_scheduled_structured = bool(scheduled_structured_req_ids)
+        if is_prompt:
+            structured_output_req_ids = frozenset(
+                req_id
+                for row, req_id in enumerate(row_req_ids)
+                if req_id in scheduled_structured_req_ids
+                and (
+                    intermediate_prefill_mask is None
+                    or not bool(intermediate_prefill_mask[row])
+                )
+            )
+        else:
+            structured_output_req_ids = capture_structured_decode_request_ids(
+                scheduled_structured_req_ids,
+                row_req_ids,
+            )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
@@ -1301,17 +1387,23 @@ class TTModelRunner:
                 structured_output_request_ids=structured_output_request_ids,
                 row_req_ids=row_req_ids,
                 batch_length=batch_length,
+                expected_structured_output_request_ids=structured_output_req_ids,
             )
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
         )
+        if has_structured and not has_scheduled_structured:
+            perform_device_sampling = False
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
             perform_device_sampling = False
+        defer_device_sampling = (
+            perform_device_sampling and has_scheduled_structured and not is_prompt
+        )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only).
@@ -1434,6 +1526,10 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            defer_device_sampling=defer_device_sampling,
+            structured_output_req_ids=structured_output_req_ids,
+            grammar_row_req_ids=tuple(row_req_ids)
+            + (None,) * (input_tokens.shape[0] - len(row_req_ids)),
         )
 
     def build_model_input(
@@ -1555,8 +1651,17 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if self.async_decode_scheduling:
-                req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+            if model_input.defer_device_sampling:
+                self.async_decode.wait_for_all_pending_async_steps()
+            if self.async_decode_scheduling and not model_input.defer_device_sampling:
+                req_ids = [
+                    model_input.grammar_row_req_ids[row] for row in scheduled_rows
+                ]
+                if any(req_id is None for req_id in req_ids):
+                    raise RuntimeError(
+                        "submitted lane row identity is missing scheduled request IDs: "
+                        f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+                    )
                 context = self.async_decode.capture_submitted_step_context(req_ids)
                 wrapper = self.async_decode.submit_async_lane_decode(
                     model_input, context, scheduled_rows
@@ -1571,14 +1676,21 @@ class TTModelRunner:
                 )
                 return None
             submission = self.async_decode.submit_decode(
-                model_input, read_from_device=True, async_read=False
+                model_input,
+                read_from_device=not model_input.defer_device_sampling,
+                async_read=False,
             )
-            finalized = self.async_decode.finalize_decode(submission)
-            assert finalized is not None
-            tt_out = finalized.tt_out
-            tt_log_probs = finalized.tt_log_probs
+            if model_input.defer_device_sampling:
+                tt_out = submission.tt_out
+                tt_log_probs = None
+            else:
+                finalized = self.async_decode.finalize_decode(submission)
+                assert finalized is not None
+                tt_out = finalized.tt_out
+                tt_log_probs = finalized.tt_log_probs
             is_decode = True
         else:
+            submission = None
             # Prefill reorders against the per-lane request capacity.
             lane_total = lane_batch.max_num_reqs
             tt_out = self.submit_prefill(model_input, model_input.unpadded_batch_size)
@@ -1608,6 +1720,7 @@ class TTModelRunner:
                 scheduled_rows=scheduled_rows,
                 is_decode=is_decode,
                 lane_total=lane_total,
+                decode_submission=submission,
             )
         )
         return None
@@ -1622,17 +1735,83 @@ class TTModelRunner:
         scheduled_rows: list[int],
         is_decode: bool,
         lane_total: int,
+        decode_submission: TTDecodeSubmission | None = None,
+    ) -> ModelRunnerOutput:
+        deferred = bool(getattr(model_input, "defer_device_sampling", False))
+        try:
+            return TTModelRunner._finish_lane_sync_impl(
+                self,
+                grammar_output,
+                tt_out=tt_out,
+                tt_log_probs=tt_log_probs,
+                model_input=model_input,
+                scheduled_rows=scheduled_rows,
+                is_decode=is_decode,
+                lane_total=lane_total,
+                decode_submission=decode_submission,
+            )
+        except Exception:
+            if deferred:
+                self._poison_device_grammar()
+            raise
+
+    def _finish_lane_sync_impl(
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        tt_out: Any,
+        tt_log_probs: Any,
+        model_input: TTModelInput,
+        scheduled_rows: list[int],
+        is_decode: bool,
+        lane_total: int,
+        decode_submission: TTDecodeSubmission | None = None,
     ) -> ModelRunnerOutput:
         """Sample and build the runner output for a deferred lane forward."""
         model_input = self._apply_grammar_to_input(
             model_input, grammar_output, lane_total=lane_total
         )
+        if getattr(model_input, "defer_device_sampling", False):
+            if decode_submission is None:
+                raise RuntimeError(
+                    "deferred lane decode is missing its device submission"
+                )
+            finalized = self.async_decode.complete_deferred_device_sampling(
+                decode_submission,
+                model_input,
+            )
+            tt_out = finalized.tt_out
+            tt_log_probs = finalized.tt_log_probs
+            model_input = replace(
+                model_input,
+                grammar_bitmask=[None],
+                defer_device_sampling=False,
+            )
         sampled, logprobs = self.lane_batch.extract_output(
             self, tt_out, tt_log_probs, model_input, scheduled_rows, is_decode=is_decode
         )
         # ``scheduled_rows`` are persistent slots; their req_ids in row order are
         # the canonical merged output order.
-        req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        submitted_row_ids = getattr(model_input, "grammar_row_req_ids", ())
+        snapshot_covers_rows = bool(submitted_row_ids) and (
+            not scheduled_rows or max(scheduled_rows) < len(submitted_row_ids)
+        )
+        if isinstance(model_input, TTModelInput) and not snapshot_covers_rows:
+            raise RuntimeError(
+                "submitted lane row identity does not cover scheduled rows: "
+                f"scheduled_rows={scheduled_rows}, "
+                f"row_identity_size={len(submitted_row_ids)}"
+            )
+        req_ids = (
+            [submitted_row_ids[row] for row in scheduled_rows]
+            if snapshot_covers_rows
+            else [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        )
+        if any(req_id is None for req_id in req_ids):
+            raise RuntimeError(
+                "submitted lane row identity is missing scheduled request IDs: "
+                f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+            )
 
         if not is_decode and model_input.prompt_lens is not None:
             lane_batch = self.lane_batch
@@ -1670,6 +1849,8 @@ class TTModelRunner:
         nothing was scheduled (no sampler is enqueued). Standard multi-process
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
+        TTModelRunner._raise_if_device_grammar_poisoned(self)
+
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
         # the scheduler output. When present, the step runs over the merged lane
         # batch (``TTLaneInputBatch`` owns all the lane-specific input/output
@@ -1695,7 +1876,13 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if self.async_decode_scheduling and is_decode:
+        if model_input.defer_device_sampling:
+            self.async_decode.wait_for_all_pending_async_steps()
+        if (
+            self.async_decode_scheduling
+            and is_decode
+            and not model_input.defer_device_sampling
+        ):
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
@@ -1725,22 +1912,31 @@ class TTModelRunner:
         model_input: TTModelInput,
         *,
         lane_total: int | None,
+        require_complete: bool = True,
     ) -> torch.Tensor | None:
         """Reorder a scheduler grammar bitmask into TT batch layout, or ``None``."""
         if grammar_output is None or grammar_output.grammar_bitmask is None:
+            if require_complete and model_input.structured_output_req_ids:
+                raise RuntimeError(
+                    "sample-time grammar output is absent for TT batch request IDs: "
+                    f"{sorted(model_input.structured_output_req_ids)}"
+                )
             return None
 
-        if lane_total is not None:
-            return self.lane_batch.slot_grammar_bitmask(grammar_output, lane_total)
-
-        assert model_input.row_req_ids is not None
-
         bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
+        row_req_ids = model_input.grammar_row_req_ids
+        if not row_req_ids:
+            raise RuntimeError(
+                "sample-time grammar remapping is missing the submitted TT row identity"
+            )
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            row_req_ids=model_input.row_req_ids,
-            batch_length=model_input.input_tokens.shape[0],
+            row_req_ids=row_req_ids,
+            batch_length=len(row_req_ids),
+            expected_structured_output_request_ids=(
+                model_input.structured_output_req_ids if require_complete else None
+            ),
         )
 
     def _apply_grammar_to_input(
@@ -1769,16 +1965,37 @@ class TTModelRunner:
         """Attach the sample-time grammar bitmask to a deferred async decode.
 
         The reorder happens here on the engine thread (layout still matches the
-        forward); the wrapper applies the bitmask when its read completes.
+        forward); the wrapper applies the bitmask when its read completes. A
+        row finished by the preceding queued result may be absent from the new
+        grammar output; it stays unrestricted here and late-output suppression
+        discards its sampled token.
         """
         bitmask = self._reorder_grammar_bitmask(
-            grammar_output, model_input, lane_total=lane_total
+            grammar_output,
+            model_input,
+            lane_total=lane_total,
+            require_complete=False,
         )
         if bitmask is not None:
             wrapper.set_grammar_bitmask(bitmask)
         return wrapper
 
     def _finish_front_packed_sync(
+        self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
+    ) -> ModelRunnerOutput:
+        deferred = bool(fwd is not None and fwd.model_input.defer_device_sampling)
+        try:
+            return TTModelRunner._finish_front_packed_sync_impl(
+                self,
+                grammar_output,
+                fwd=fwd,
+            )
+        except Exception:
+            if deferred:
+                self._poison_device_grammar()
+            raise
+
+    def _finish_front_packed_sync_impl(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
     ) -> ModelRunnerOutput:
         """Sample and build output for a deferred front-packed forward."""
@@ -1912,6 +2129,7 @@ class TTModelRunner:
         ``EngineCore``'s ``if model_output is None`` path), so the true cause
         surfaces instead of being masked by the empty-popleft error.
         """
+        TTModelRunner._raise_if_device_grammar_poisoned(self)
         if not self._pending_samples:
             return None
         finish = self._pending_samples.popleft()
@@ -1942,9 +2160,17 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # Structured outputs are not supported on device yet
-        # https://github.com/tenstorrent/vllm/issues/277
-        if has_structured_outputs:
+        # The initial model contract covers decode only. Prefill keeps the
+        # established host path so its first token remains grammar-safe.
+        # Upstream async scheduling can queue another forward before the
+        # current sample-time grammar arrives; the traced TT logits buffer is
+        # single-owner, so structured decode stays on host until that overlap
+        # has a dedicated multi-buffer contract.
+        if has_structured_outputs and (
+            not is_decode
+            or not self.supports_device_grammar
+            or self.scheduler_config.async_scheduling
+        ):
             return False
 
         # Logprobs on device require multi-device setups (num_devices in {8,32}).
@@ -1957,6 +2183,11 @@ class TTModelRunner:
         # return the sampled token's logprob, so max_lp > 0 falls back to
         # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
+        if has_structured_outputs and max_lp is not None:
+            # Grammar-aware device logprob parity is not part of the initial
+            # contract. Keep vLLM's host path rather than publish incomplete
+            # or force-argmax placeholder metadata.
+            return False
         if max_lp is not None:
             if num_devices not in (8, 32):
                 return False
@@ -2052,6 +2283,7 @@ class TTModelRunner:
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
         tt_log_probs = None
+        decode_submission = None
 
         # Execute model
         if not is_decode:
@@ -2068,17 +2300,20 @@ class TTModelRunner:
             elif isinstance(tt_out, tuple):
                 tt_out, _ = tt_out
         else:
-            submission = self.async_decode.submit_decode(
+            decode_submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
-            finalized = self.async_decode.finalize_decode(submission)
-            assert finalized is not None
-            # ``finalize_decode`` already unpacked ``(tt_out, tt_log_probs)``.
-            tt_out = finalized.tt_out
-            tt_log_probs = finalized.tt_log_probs
-            batch_size_per_dp = submission.batch_size_per_dp
-            sampling_params = submission.sampling_params
-            perform_device_sampling = submission.perform_device_sampling
+            if model_input.defer_device_sampling:
+                tt_out = decode_submission.tt_out
+            else:
+                finalized = self.async_decode.finalize_decode(decode_submission)
+                assert finalized is not None
+                # ``finalize_decode`` already unpacked ``(tt_out, tt_log_probs)``.
+                tt_out = finalized.tt_out
+                tt_log_probs = finalized.tt_log_probs
+            batch_size_per_dp = decode_submission.batch_size_per_dp
+            sampling_params = decode_submission.sampling_params
+            perform_device_sampling = decode_submission.perform_device_sampling
 
         return _SyncForward(
             tt_out=tt_out,
@@ -2088,12 +2323,30 @@ class TTModelRunner:
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
+            decode_submission=decode_submission,
         )
 
     def _sample_sync_forward(
         self, fwd: _SyncForward
     ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
         """Sample a forward produced by ``_forward_with_model_input``."""
+        if getattr(fwd.model_input, "defer_device_sampling", False):
+            if fwd.decode_submission is None:
+                raise RuntimeError("deferred decode is missing its device submission")
+            finalized = self.async_decode.complete_deferred_device_sampling(
+                fwd.decode_submission,
+                fwd.model_input,
+            )
+            fwd = replace(
+                fwd,
+                tt_out=finalized.tt_out,
+                tt_log_probs=finalized.tt_log_probs,
+                model_input=replace(
+                    fwd.model_input,
+                    grammar_bitmask=[None],
+                    defer_device_sampling=False,
+                ),
+            )
         return self._get_output_tokens(
             tt_out=fwd.tt_out,
             tt_log_probs=fwd.tt_log_probs,
@@ -2636,6 +2889,8 @@ class TTModelRunner:
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )
+        if self.supports_device_grammar:
+            decode_kwargs["can_sample_device_grammar"] = True
 
         # Phase 1: compile all code paths (no trace capture)
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
@@ -2645,8 +2900,52 @@ class TTModelRunner:
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled)
+        decode_trace_prepared = False
+        if trace_prefill_mode and trace_decode_mode and self.supports_device_grammar:
+            prepare_decode = getattr(
+                self.model,
+                "prepare_device_grammar_decode_trace_warmup",
+                None,
+            )
+            if callable(prepare_decode):
+                decode_trace_prepared = bool(
+                    prepare_decode(
+                        kv_cache=self.kv_caches,
+                        max_batch_size=self.tt_max_batch_size,
+                        num_blocks=self.max_num_blocks_per_req,
+                    )
+                )
+            if not decode_trace_prepared:
+                logger.warning(
+                    "TT device grammar decode buffers could not be prepared "
+                    "before prefill trace capture; retaining host grammar "
+                    "sampling for trace_mode='all'"
+                )
+                self.supports_device_grammar = False
+                decode_kwargs.pop("can_sample_device_grammar", None)
+
+        # Phase 2 captures the compiled variants. For trace_mode="all", the
+        # grammar hook has also prepared both decode input families before
+        # prefill capture.
         if trace_prefill_mode:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+        if decode_trace_prepared:
+            capture_decode = getattr(
+                self.model,
+                "capture_prepared_device_grammar_decode_trace",
+                None,
+            )
+            if not callable(capture_decode):
+                raise RuntimeError(
+                    "TT model prepared a device grammar decode trace but does "
+                    "not expose its capture method"
+                )
+            capture_decode()
         if trace_decode_mode:
-            self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+            traced_decode_kwargs = dict(decode_kwargs)
+            if decode_trace_prepared:
+                traced_decode_kwargs["sampling_trace_variants_prepared"] = True
+            self.model.warmup_model_decode(
+                enable_trace=True,
+                **traced_decode_kwargs,
+            )
