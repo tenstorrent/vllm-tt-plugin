@@ -8,7 +8,11 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import RequestStatus
 
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTDecodeInterleavePolicy,
+    TTScheduler,
+    TTSchedulingMode,
+)
 
 
 def _running(is_prefill_chunk=False):
@@ -33,6 +37,11 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
     scheduler._forced_mode = mode
+    # Production defaults; the decode-interleave cadence itself is covered in
+    # tests/test_decode_interleave.py.
+    scheduler._decode_interleave = TTDecodeInterleavePolicy(
+        SimpleNamespace(additional_config={})
+    )
     return scheduler
 
 
