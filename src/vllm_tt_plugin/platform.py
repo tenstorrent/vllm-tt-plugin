@@ -1049,7 +1049,7 @@ def register_tt_models(register_test_models=False) -> None:
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
-        path_llama_text = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
+        path_llama_text = "models.ttt_compat.tt.generator_vllm:LlamaForCausalLM"
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:LlamaForCausalLM"
@@ -1071,17 +1071,17 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(
         ModelRegistry,
         "TTMllamaForConditionalGeneration",
-        "models.tt_transformers.tt.generator_vllm:MllamaForConditionalGeneration",
+        "models.ttt_compat.tt.generator_vllm:MllamaForConditionalGeneration",
     )
 
     # Qwen2.5 - Text
-    path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
+    path_qwen_text = "models.ttt_compat.tt.generator_vllm:QwenForCausalLM"
     _register_model_if_missing(ModelRegistry, "TTQwen2ForCausalLM", path_qwen_text)
 
     # Qwen3 - Text
     qwen3_text_version = os.getenv("TT_QWEN3_TEXT_VER", "tt_transformers")
     if qwen3_text_version == "tt_transformers":
-        path_qwen3_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
+        path_qwen3_text = "models.ttt_compat.tt.generator_vllm:QwenForCausalLM"
     elif qwen3_text_version == "qwen3_32b_galaxy":
         path_qwen3_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:QwenForCausalLM"
@@ -1128,21 +1128,21 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(
         ModelRegistry,
         "TTMistralForCausalLM",
-        "models.tt_transformers.tt.generator_vllm:MistralForCausalLM",
+        "models.ttt_compat.tt.generator_vllm:MistralForCausalLM",
     )
 
     # Mistral 3 - Multimodal (Vision + Text)
     _register_model_if_missing(
         ModelRegistry,
         "TTMistral3ForConditionalGeneration",
-        "models.tt_transformers.tt.generator_vllm:Mistral3ForConditionalGeneration",
+        "models.ttt_compat.tt.generator_vllm:Mistral3ForConditionalGeneration",
     )
 
     # Gemma3
     _register_model_if_missing(
         ModelRegistry,
         "TTGemma3ForConditionalGeneration",
-        "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
+        "models.ttt_compat.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
 
     # Gemma4 — text-only TT bridge.
@@ -1201,7 +1201,7 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(
         ModelRegistry,
         "TTGptOssForCausalLM",
-        "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
+        "models.ttt_compat.tt.generator_vllm:GptOssForCausalLM",
     )
 
     # Optionally register test models if explicitly enabled
