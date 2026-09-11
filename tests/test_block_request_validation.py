@@ -513,7 +513,7 @@ def test_startup_requires_device_sampling_for_block_models(monkeypatch, tt_confi
     config.additional_config = {"tt": tt_config}
     _patch_model_resolution(monkeypatch)
 
-    with pytest.raises(ValueError, match='sample_on_device_mode="all"'):
+    with pytest.raises(ValueError, match=r"sample_on_device_mode in \('all',\)"):
         TTPlatform.check_and_update_config(config)
 
 
