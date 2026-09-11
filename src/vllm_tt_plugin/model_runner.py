@@ -2645,8 +2645,14 @@ class TTModelRunner:
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled)
-        if trace_prefill_mode:
-            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+        # Phase 2: capture traces (all ops already compiled). Capture decode
+        # before prefill: the decode trace's persistent input buffers (token,
+        # position, page table) are staged with copy_host_to_device while no
+        # trace is live, so they cannot be placed inside a prefill trace's
+        # scratch. Capturing prefill first leaves those buffers allocated while
+        # a prefill trace is live, and every later prefill replay then rewrites
+        # them (observed as a zeroed decode token buffer on decode).
         if trace_decode_mode:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+        if trace_prefill_mode:
+            self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
