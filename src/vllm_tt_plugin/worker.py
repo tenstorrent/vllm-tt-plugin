@@ -238,8 +238,13 @@ class TTWorker(WorkerBase):
             os.environ.get(TTPlatform.device_control_env_var),
             os.environ.get("MESH_DEVICE"),
         )
+        model_class, _ = get_model_architecture(self.model_config)
+        model_capabilities = getattr(model_class, "model_capabilities", None) or {}
         self.mesh_device = open_mesh_device(
-            get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+            get_tt_config(self.vllm_config),
+            self.trace_mode,
+            local_dp_rank,
+            model_fabric_config=model_capabilities.get("fabric_config"),
         )
         self.device = self.mesh_device
         self.device_config.device = self.mesh_device
@@ -772,20 +777,24 @@ def get_reliability_mode(tt_config):
     return reliability_mode
 
 
-# From tt-metal/conftest.py:
-# Set fabric config to passed in value
-# Do nothing if not set
-# Must be called before creating the mesh device
-def set_fabric(tt_config, num_devices):
-    fabric_config = get_fabric_config(tt_config, num_devices)
-    if fabric_config:
-        reliability_mode = get_reliability_mode(tt_config)
-        logger.info(
-            "Setting fabric config: %s, reliability mode: %s",
-            fabric_config,
-            reliability_mode,
-        )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+def set_fabric(tt_config, num_devices, model_fabric_config=None):
+    """Apply hardware defaults, model defaults, then explicit launch overrides."""
+    if num_devices == 1:
+        return
+
+    fabric_kwargs = {
+        "config": get_fabric_config(None, num_devices),
+        "reliability_mode": get_reliability_mode(None),
+    }
+    if model_fabric_config is not None:
+        fabric_kwargs = {**fabric_kwargs, **model_fabric_config}
+    if tt_config and "fabric_config" in tt_config:
+        fabric_kwargs["config"] = get_fabric_config(tt_config, num_devices)
+    if tt_config and "fabric_reliability_mode" in tt_config:
+        fabric_kwargs["reliability_mode"] = get_reliability_mode(tt_config)
+
+    logger.info("Setting fabric config: %s", fabric_kwargs)
+    ttnn.set_fabric_config(**fabric_kwargs)
 
 
 # From tt-metal/conftest.py:
@@ -844,7 +853,9 @@ def get_mesh_grid(*args: Any, **kwargs: Any):
     return mesh_grid
 
 
-def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
+def open_mesh_device(
+    tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
+):
     mesh_grid = get_mesh_grid()
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
@@ -852,7 +863,7 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
     # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested)
+    set_fabric(tt_config, num_devices_requested, model_fabric_config)
 
     mesh_device = ttnn.open_mesh_device(
         ttnn.MeshShape(*mesh_grid),

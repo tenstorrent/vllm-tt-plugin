@@ -1058,10 +1058,15 @@ def register_tt_models(register_test_models=False) -> None:
         path_llama_text = (
             "models.demos.t3000.llama2_70b.tt.generator_vllm:TtLlamaForCausalLM"
         )
+    elif llama_text_version == "llama31_8b_qb2":
+        path_llama_text = (
+            "models.demos.llama31_8b_qb2.tt.generator_vllm:LlamaForCausalLM"
+        )
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]"
+            "pick one of [tt_transformers, llama3_70b_galaxy, "
+            "llama2_70b, llama31_8b_qb2]"
         )
 
     # Llama3.1/3.2 - Text
