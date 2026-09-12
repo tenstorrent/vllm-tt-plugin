@@ -12,7 +12,9 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
+    get_tt_adaptive_block_max_prompt_tokens,
     get_tt_output_tokens_per_step,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -39,6 +41,31 @@ def get_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, int]:
     return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
+
+
+# Per-step block-output reconciliation decisions, keyed by request id. Attached
+# to the ``SchedulerOutput`` -- the ONLY object that re-associates a step's
+# output with the scheduling decision that produced it: under async scheduling
+# ``schedule()`` for step K+1 (which mutates per-``Request`` state) runs BEFORE
+# ``update_from_output`` commits step K, so a single overwritten ``Request``
+# slot would hand step K's commit the K+1 decision. The engine core holds each
+# in-flight step's ``SchedulerOutput`` in its batch queue and passes it back to
+# ``update_from_output``, so a map carried here always matches the output being
+# committed (in sync mode the pairing is trivially the same step). Mirrors the
+# forced-reset-count pattern above.
+_TT_BLOCK_STEP_DECISIONS_ATTR = "_tt_block_step_decisions"
+
+
+def set_tt_block_step_decisions(
+    scheduler_output: SchedulerOutput, decisions: dict[str, bool]
+) -> None:
+    setattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions))
+
+
+def get_tt_block_step_decisions(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, bool]:
+    return dict(getattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, {}))
 
 
 class TTSchedulingMode(Enum):
@@ -114,8 +141,25 @@ class TTScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
+        # Block-step decisions for the step currently being committed, read off
+        # its SchedulerOutput in update_from_output so _update_request_with_output
+        # sees the decision that produced THIS output (not a later schedule).
+        self._committing_block_step_decisions: dict[str, bool] = {}
+        # Request id that owns the adaptive model's SINGLE speculative
+        # session, mirrored from scheduling-side facts (see
+        # _mirror_spec_session). Only its owner can emit a block.
+        self._spec_session_owner: str | None = None
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
+        # Adaptive: emit the block only on a solo decode step; batch >1 decodes
+        # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
+        self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
+        # Prompt-length frontier for the block path (0 = none): a longer prompt
+        # is served as plain baseline by the model for its whole lifetime, so
+        # its steps reserve width-1 even when solo.
+        self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
+            self.vllm_config
+        )
         if self._is_block_output_model:
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "
@@ -581,10 +625,123 @@ class TTScheduler(AsyncScheduler):
         extra_placeholders = (
             self._output_tokens_per_step - self.num_sampled_tokens_per_step
         )
+        # Adaptive: the model emits its block ONLY on a SOLO DECODE step; every
+        # other step (batched decodes, and the prefill that host-samples the
+        # anchor) commits exactly one plain token and reserves one placeholder.
+        # This MUST match the model's own gate, which runs the spec block in
+        # decode_forward when batch == 1 and a plain token otherwise:
+        #   - solo == batch 1 (exactly one request scheduled this step);
+        #   - decode == the prompt is fully computed (a prefill step still has
+        #     num_computed_tokens < num_prompt_tokens, so it takes prefill_forward
+        #     and emits the single anchor). num_computed reflects prior committed
+        #     steps here, so it is 0<prompt on the prefill and >=prompt on the
+        #     first decode -- robust where an output-token count can still read 0.
+        # The decision is attached to THIS step's SchedulerOutput (not a Request
+        # slot): under async the next step's schedule() overwrites Request state
+        # before this step's output commits, but the engine core hands the
+        # matching SchedulerOutput back to update_from_output, so the map always
+        # pairs with the output being committed.
+        solo = len(scheduler_output.num_scheduled_tokens) == 1
+        if self._is_adaptive_block:
+            self._mirror_spec_session(scheduler_output, solo)
+        decisions: dict[str, bool] = {}
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
-            if not request.is_prefill_chunk:
+            if request.is_prefill_chunk:
+                continue
+            if self._is_adaptive_block:
+                # num_computed_tokens is already advanced by THIS step's
+                # scheduled tokens here, so subtract them back out: a step is a
+                # decode iff the prompt was fully computed BEFORE it. This is a
+                # pure scheduling-side quantity -- output-commit timing (which
+                # differs between sync tests and the pipelined engine loop)
+                # cannot skew it. A resumed replay scheduling prompt+output
+                # tokens lands back below the prompt boundary and correctly
+                # stays a non-block step.
+                scheduled = scheduler_output.num_scheduled_tokens[req_id]
+                is_decode = (
+                    request.num_computed_tokens - scheduled >= request.num_prompt_tokens
+                )
+                # Owning the model's single spec session is part of the
+                # gate: the model serves a solo decode as plain baseline
+                # whenever it has no session for THAT request, so reserving
+                # a block for a non-owner would reserve a width the model
+                # cannot emit (see _mirror_spec_session).
+                block_step = (
+                    solo
+                    and is_decode
+                    and self._spec_eligible(request)
+                    and self._spec_session_owner == req_id
+                )
+            else:
+                block_step = True
+            if block_step:
                 request.num_output_placeholders += extra_placeholders
+            decisions[req_id] = block_step
+        set_tt_block_step_decisions(scheduler_output, decisions)
+
+    def _spec_eligible(self, request: Request) -> bool:
+        """Prompt short enough for the model to arm a spec session for it."""
+        return (
+            self._adaptive_block_max_prompt == 0
+            or request.num_prompt_tokens <= self._adaptive_block_max_prompt
+        )
+
+    def _mirror_spec_session(self, scheduler_output, solo: bool) -> None:
+        """Track which request owns the adaptive model's SINGLE spec session.
+
+        The model keeps one global session: drafter taps are captured during a
+        request's own prefill, and only the request that owns them can emit a
+        multi-token block. Every transition of that session is driven by the
+        shape of a step, so the scheduler can mirror it exactly without asking
+        the model -- and that is what keeps the width this scheduler RESERVES
+        equal to the width the model EMITS:
+
+        * a PREFILL step re-seats the session. The model captures taps only for
+          a solo, spec-eligible prefill and drops the session on any other
+          prefill (batched, or a prompt over the capture frontier).
+        * a BATCHED decode step destroys it. The model releases the decoder and
+          serves plain baseline from then on, and it never re-arms, because
+          taps only ever come from a prefill. This is the case that made a
+          benchmark sweep fail: as concurrency drains back to one request, that
+          request is solo and eligible but no longer owns a session.
+        * a SOLO decode leaves ownership alone -- the owner bootstraps its
+          pending taps and keeps the session for the rest of its life.
+
+        A TT step is never mixed prefill+decode (docs/SCHEDULING.md), so the
+        first scheduled request classifies the whole step.
+        """
+        owner = self._spec_session_owner
+        # A finished or aborted owner no longer holds the session: the model
+        # clears it in release_request, and the id is gone from self.requests.
+        if owner is not None and owner not in self.requests:
+            owner = None
+        scheduled_tokens = scheduler_output.num_scheduled_tokens
+        first_id = next(iter(scheduled_tokens), None)
+        if first_id is not None:
+            request = self.requests[first_id]
+            step_is_decode = (
+                request.num_computed_tokens - scheduled_tokens[first_id]
+                >= request.num_prompt_tokens
+            )
+            if not step_is_decode:
+                owner = first_id if (solo and self._spec_eligible(request)) else None
+            elif not solo:
+                owner = None
+        self._spec_session_owner = owner
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        """Bind this step's block-step decisions before the base loop commits
+        its outputs, so ``_update_request_with_output`` reads the decision that
+        produced THIS output rather than a later schedule's overwrite."""
+        if self._is_block_output_model:
+            self._committing_block_step_decisions = get_tt_block_step_decisions(
+                scheduler_output
+            )
+        try:
+            return super().update_from_output(scheduler_output, model_runner_output)
+        finally:
+            self._committing_block_step_decisions = {}
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]
@@ -592,16 +749,39 @@ class TTScheduler(AsyncScheduler):
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
             return super()._update_request_with_output(request, new_token_ids)
+        # Adaptive: a request that decoded batched (or over-frontier) this step
+        # committed a single baseline token (no block was reserved) -> plain
+        # reconciliation. The decision is read from THIS step's SchedulerOutput
+        # (set in _update_after_schedule), which the engine core pairs with this
+        # output even when async scheduling has already run a later schedule().
+        if self._is_adaptive_block:
+            block_step = self._committing_block_step_decisions.get(request.request_id)
+            if block_step is None:
+                raise RuntimeError(
+                    "adaptive block-output request committed output without a "
+                    f"scheduling decision: req_id={request.request_id!r}"
+                )
+            if not block_step:
+                return super()._update_request_with_output(request, new_token_ids)
         if request.async_tokens_to_discard:
+            # A block step reserved K placeholders; the AsyncScheduler discard
+            # path drains only one per stale frame, so it cannot balance a
+            # dropped block. Block requests are never reset-preempted
+            # (reset_prefix_cache raises while one runs) and solo spec steps are
+            # not KV-preempted, so this must not happen -- fail loudly rather
+            # than silently leak placeholders.
             raise RuntimeError(
-                "A stale async output reached synchronous block serving; "
-                "block-output async scheduling and running prefix resets are "
-                "unsupported"
+                "A stale async output reached block serving for a block step; "
+                "block-output frames cannot be discarded (reset/preempt of a "
+                "running block request is unsupported)"
             )
         if len(new_token_ids) != self._output_tokens_per_step:
             raise ValueError(
                 "Model output width violates output_tokens_per_step: "
-                f"{len(new_token_ids)} != {self._output_tokens_per_step}"
+                f"{len(new_token_ids)} != {self._output_tokens_per_step} "
+                f"(req_id={request.request_id!r}); the scheduler reserved a "
+                "block but the model returned a different width -- the "
+                "scheduler and model block gates disagree"
             )
 
         # Scheduler appends token-by-token and trims at EOS, stop tokens,

@@ -9,23 +9,40 @@ import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
-from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.model_runner import TTModelRunner, _coerce_output_block
 from vllm_tt_plugin.worker import TTWorker
+
+
+def _bind_committed_width(runner: SimpleNamespace) -> SimpleNamespace:
+    """Attach the block-output width helpers the output-commit methods call.
+
+    ``_apply_sampled_tokens_to_state`` / ``_build_runner_output`` /
+    ``_get_output_tokens`` resolve the step's committed width through
+    ``_tt_committed_width`` (reads ``_is_adaptive_block_output`` and
+    ``_output_tokens_per_step``). These fakes are non-adaptive block-output.
+    """
+    runner._is_adaptive_block_output = False
+    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
+        runner, toks
+    )
+    return runner
 
 
 def _runner(width: int, *, num_tokens: int = 0, max_model_len: int = 32):
     output_tokens: list[int] = []
     return (
-        SimpleNamespace(
-            _output_tokens_per_step=width,
-            input_batch=SimpleNamespace(
-                num_reqs=1,
-                req_ids=["req-0"],
-                num_tokens=np.array([num_tokens], dtype=np.int32),
-                token_ids_cpu=np.zeros((1, max_model_len), dtype=np.int32),
-                req_output_token_ids=[output_tokens],
-            ),
-            model_config=SimpleNamespace(max_model_len=max_model_len),
+        _bind_committed_width(
+            SimpleNamespace(
+                _output_tokens_per_step=width,
+                input_batch=SimpleNamespace(
+                    num_reqs=1,
+                    req_ids=["req-0"],
+                    num_tokens=np.array([num_tokens], dtype=np.int32),
+                    token_ids_cpu=np.zeros((1, max_model_len), dtype=np.int32),
+                    req_output_token_ids=[output_tokens],
+                ),
+                model_config=SimpleNamespace(max_model_len=max_model_len),
+            )
         ),
         output_tokens,
     )
@@ -69,15 +86,17 @@ def _captured_runner(width: int, num_tokens: tuple[int, int]):
         SimpleNamespace(output_token_ids=outputs_a),
         SimpleNamespace(output_token_ids=outputs_b),
     )
-    runner = SimpleNamespace(
-        _output_tokens_per_step=width,
-        requests={"a": state_a, "b": state_b},
-        input_batch=SimpleNamespace(
-            req_id_to_index={"a": 0, "b": 1},
-            num_tokens=np.array(num_tokens, dtype=np.int32),
-            token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
-        ),
-        model_config=SimpleNamespace(max_model_len=32),
+    runner = _bind_committed_width(
+        SimpleNamespace(
+            _output_tokens_per_step=width,
+            requests={"a": state_a, "b": state_b},
+            input_batch=SimpleNamespace(
+                req_id_to_index={"a": 0, "b": 1},
+                num_tokens=np.array(num_tokens, dtype=np.int32),
+                token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
+            ),
+            model_config=SimpleNamespace(max_model_len=32),
+        )
     )
     return runner, (state_a, state_b), (outputs_a, outputs_b)
 
@@ -300,10 +319,12 @@ def _extract(
     is_decode=False,
     enable_log_probs=False,
 ):
-    runner = SimpleNamespace(
-        _output_tokens_per_step=width,
-        _is_block_output_model=width > 1,
-        tt_per_lane_max_num_seqs=1,
+    runner = _bind_committed_width(
+        SimpleNamespace(
+            _output_tokens_per_step=width,
+            _is_block_output_model=width > 1,
+            tt_per_lane_max_num_seqs=1,
+        )
     )
     sampling_params = SimpleNamespace(
         enable_log_probs=torch.tensor([enable_log_probs]),
@@ -371,3 +392,36 @@ def test_get_output_tokens_rejects_host_sampling_for_block_models():
 def test_get_output_tokens_rejects_device_logprobs_for_block_models():
     with pytest.raises(ValueError, match="one output token per step"):
         _extract(4, torch.zeros((1, 4), dtype=torch.int32), [1], enable_log_probs=True)
+
+
+# ── Adaptive committed width (sentinel-free step contract) ───────────────────
+
+
+class _WidthRunnerStub:
+    """Minimal stand-in exposing exactly what _tt_committed_width reads."""
+
+    def __init__(self, adaptive: bool, width: int):
+        self._is_adaptive_block_output = adaptive
+        self._output_tokens_per_step = width
+
+
+def _committed_width(adaptive: bool, width: int, tensor):
+    stub = _WidthRunnerStub(adaptive, width)
+    return TTModelRunner._tt_committed_width(stub, tensor)
+
+
+def test_adaptive_width_one_rows_commit_one_token():
+    assert _committed_width(True, 16, torch.zeros((3, 1), dtype=torch.int32)) == 1
+
+
+def test_adaptive_full_blocks_commit_the_declared_width():
+    assert _committed_width(True, 16, torch.zeros((1, 16), dtype=torch.int32)) == 16
+
+
+def test_non_adaptive_models_never_narrow_the_width():
+    """A fixed-canvas model emitting width-1 must FAIL the width contract, not
+    silently commit one token (the coercion still enforces the fixed width)."""
+    tensor = torch.zeros((3, 1), dtype=torch.int32)
+    assert _committed_width(False, 16, tensor) == 16
+    with pytest.raises(ValueError, match="output_tokens_per_step"):
+        _coerce_output_block(tensor, 3, 16)

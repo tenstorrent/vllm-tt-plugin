@@ -55,10 +55,11 @@ def _batch_with_one_request(
 
 def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamespace:
     """Creates a fake runner with the given batch and request, for testing purposes."""
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         input_batch=batch,
         requests={"r": request},
         _output_tokens_per_step=1,
+        _is_adaptive_block_output=False,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -71,6 +72,12 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+    # The output-commit methods resolve the step's committed width through
+    # _tt_committed_width (reads _is_adaptive_block_output + _output_tokens_per_step).
+    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
+        runner, toks
+    )
+    return runner
 
 
 def _prepare(runner, *rows):

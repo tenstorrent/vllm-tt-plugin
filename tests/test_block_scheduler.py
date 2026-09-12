@@ -32,9 +32,13 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_tt_plugin.config import store_tt_output_tokens_per_step
+from vllm_tt_plugin.config import (
+    store_tt_adaptive_block_output,
+    store_tt_output_tokens_per_step,
+)
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
+    get_tt_block_step_decisions,
     get_tt_forced_reset_discard_counts,
 )
 
@@ -81,6 +85,8 @@ def _scheduler(
     diffusion_checkpoint: bool = False,
     max_model_len: int = MAX_MODEL_LEN,
     async_scheduling: bool = False,
+    adaptive: bool = False,
+    max_num_seqs: int = 1,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -90,7 +96,7 @@ def _scheduler(
     )
     model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_model_len,
         max_model_len=max_model_len,
         enable_chunked_prefill=False,
@@ -122,6 +128,8 @@ def _scheduler(
         config.model_config.__dict__.pop("is_diffusion", None)
         assert config.model_config.is_diffusion is False
     store_tt_output_tokens_per_step(config, output_width)
+    if adaptive:
+        store_tt_adaptive_block_output(config, True)
     num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
@@ -148,7 +156,9 @@ def _scheduler(
     )
 
 
-def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
+def _request(
+    max_tokens: int, *, ignore_eos: bool = True, request_id: str = "req-0"
+) -> Request:
     init_none_hash(sha256)
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -156,7 +166,7 @@ def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
     )
     sampling_params.update_from_generation_config({}, eos_token_id=2)
     return Request(
-        request_id="req-0",
+        request_id=request_id,
         prompt_token_ids=[1] * 32,
         sampling_params=sampling_params,
         pooling_params=None,
@@ -946,3 +956,293 @@ def test_diffusion_checkpoint_books_exactly_one_canvas():
     assert request.num_output_placeholders == 0
     assert cache_calls == []
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+
+# ── Adaptive block-output (tt_adaptive_block_output) ─────────────────────────
+
+
+def _adaptive_anchor(scheduler, request, token=5):
+    """Drive the prefill step: adaptive prefills commit ONE anchor token."""
+    submitted = scheduler.schedule()
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is False
+    assert request.num_output_placeholders == 1
+    outputs = scheduler.update_from_output(
+        submitted, _runner_output(submitted, [token])
+    )
+    assert outputs[0].outputs[0].new_token_ids == [token]
+    assert request.num_output_placeholders == 0
+    return outputs
+
+
+def test_adaptive_prefill_commits_single_anchor_then_solo_decode_blocks():
+    """Prefill is a plain one-token step; the following solo decode reserves
+    and commits the full block. On the old code the prefill itself reserved
+    the block and a 1-token anchor commit was rejected."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    submitted = scheduler.schedule()
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is True
+    assert request.num_output_placeholders == CANVAS
+
+    block = list(range(10, 10 + CANVAS))
+    outputs = scheduler.update_from_output(submitted, _runner_output(submitted, block))
+    assert outputs[0].outputs[0].new_token_ids == block
+    assert request.num_output_placeholders == 0
+
+
+def test_adaptive_batched_decode_commits_single_tokens():
+    """Two decodes in one step each get ONE placeholder and commit one
+    baseline token."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    req_b = _request(CANVAS * 2, request_id="req-b")
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    # Batched prefill step: both commit their anchors.
+    submitted = scheduler.schedule()
+    assert len(submitted.num_scheduled_tokens) == 2
+    anchor_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[5], [6]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(submitted, anchor_output)
+
+    # Batched DECODE step: still plain one-token baseline for both.
+    submitted = scheduler.schedule()
+    for req in (req_a, req_b):
+        assert get_tt_block_step_decisions(submitted)[req.request_id] is False
+        assert req.num_output_placeholders == 1
+    decode_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[7], [9]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(submitted, decode_output)
+    committed = {o.request_id: o.new_token_ids for o in outputs[0].outputs}
+    assert committed == {"req-a": [7], "req-b": [9]}
+    assert req_a.num_output_placeholders == 0
+    assert req_b.num_output_placeholders == 0
+
+
+def test_adaptive_batch_prefilled_request_never_blocks():
+    """A request whose PREFILL ran batched never gets a block -- not even once
+    it is the only request left.
+
+    The model captures drafter taps only during a SOLO prefill and never
+    re-arms afterwards (taps come only from a prefill), so a batch-prefilled
+    request holds no speculative session for its whole life and serves every
+    solo decode as plain width-1 baseline. Reserving the block here is what
+    broke the benchmark sweep as concurrency drained back to one request: the
+    scheduler reserved CANVAS and the model emitted 1.
+
+    This replaces an earlier test that asserted the survivor DID block again,
+    which described a capability the model does not have.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 4, request_id="req-a")
+    req_b = _request(1, request_id="req-b", ignore_eos=False)
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    submitted = scheduler.schedule()  # batched prefill -> taps for neither
+    assert len(submitted.num_scheduled_tokens) == 2
+    assert scheduler._spec_session_owner is None
+    anchor_output = ModelRunnerOutput(
+        req_ids=["req-a", "req-b"],
+        req_id_to_index={"req-a": 0, "req-b": 1},
+        sampled_token_ids=[[5], [2]],  # req-b hits max_tokens=1 and finishes
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(submitted, anchor_output)
+    assert req_b.is_finished()
+
+    resumed = scheduler.schedule()
+    assert len(resumed.num_scheduled_tokens) == 1
+    assert get_tt_block_step_decisions(resumed)[req_a.request_id] is False
+    assert req_a.num_output_placeholders == 1
+    # ... and the width-1 commit the model actually emits reconciles cleanly.
+    outputs = scheduler.update_from_output(resumed, _runner_output(resumed, [7]))
+    assert outputs[0].outputs[0].new_token_ids == [7]
+    assert req_a.num_output_placeholders == 0
+
+
+def test_adaptive_batched_decode_drops_the_session_permanently():
+    """The sweep-tail case, with both requests prefilled SOLO so each owned
+    the session in turn.
+
+    A batched decode makes the model release its session, and it never
+    re-arms. So when the peer finishes, the survivor is solo AND spec-eligible
+    but owns nothing -- it must stay at width 1.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 4, request_id="req-a")
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a)  # solo prefill -> req-a owns the session
+    assert scheduler._spec_session_owner == "req-a"
+
+    # req-b prefills solo: the model's SINGLE session is re-seated to req-b.
+    req_b = _request(2, request_id="req-b", ignore_eos=False)
+    scheduler.add_request(req_b)
+    prefill_b = scheduler.schedule()
+    assert len(prefill_b.num_scheduled_tokens) == 1, "TT steps are never mixed"
+    assert get_tt_block_step_decisions(prefill_b)["req-b"] is False
+    scheduler.update_from_output(prefill_b, _runner_output(prefill_b, [5]))
+    assert scheduler._spec_session_owner == "req-b"
+
+    # Both decode together: the model releases the session for good.
+    batched = scheduler.schedule()
+    assert len(batched.num_scheduled_tokens) == 2
+    assert scheduler._spec_session_owner is None
+    decisions = get_tt_block_step_decisions(batched)
+    assert decisions["req-a"] is False and decisions["req-b"] is False
+    scheduler.update_from_output(
+        batched,
+        ModelRunnerOutput(
+            req_ids=["req-a", "req-b"],
+            req_id_to_index={"req-a": 0, "req-b": 1},
+            sampled_token_ids=[[6], [2]],  # req-b stops on EOS
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert req_b.is_finished()
+
+    # req-a is alone again -- and still session-less.
+    resumed = scheduler.schedule()
+    assert len(resumed.num_scheduled_tokens) == 1
+    assert get_tt_block_step_decisions(resumed)["req-a"] is False
+    assert req_a.num_output_placeholders == 1
+
+
+def test_adaptive_aborted_owner_does_not_hand_its_session_to_a_peer():
+    """req-b's prefill re-seats the model's single session. If req-b is
+    aborted before it ever decodes, req-a's next solo decode must NOT inherit
+    req-b's taps: speculating from another prompt's residuals (and another
+    prompt's length) yields wrong TOKENS, not merely a wrong width. The model
+    refuses it independently via _spec_pending_is_mine; the scheduler must
+    agree so the widths still match.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 4, request_id="req-a")
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a)
+    assert scheduler._spec_session_owner == "req-a"
+
+    req_b = _request(CANVAS * 4, request_id="req-b")
+    scheduler.add_request(req_b)
+    prefill_b = scheduler.schedule()
+    scheduler.update_from_output(prefill_b, _runner_output(prefill_b, [5]))
+    assert scheduler._spec_session_owner == "req-b"
+
+    scheduler.finish_requests("req-b", RequestStatus.FINISHED_ABORTED)
+
+    resumed = scheduler.schedule()
+    assert len(resumed.num_scheduled_tokens) == 1
+    assert get_tt_block_step_decisions(resumed)["req-a"] is False
+    assert req_a.num_output_placeholders == 1
+
+
+def test_adaptive_commit_without_scheduling_decision_raises():
+    """A committing request the placeholder pass never stamped is a broken
+    invariant, not a silent block-path default."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 2)
+    with pytest.raises(RuntimeError, match="without a scheduling decision"):
+        scheduler._update_request_with_output(request, list(range(CANVAS)))
+
+
+def test_adaptive_block_decision_survives_async_schedule_lag():
+    """The async batch queue runs schedule() for the NEXT step (mutating
+    Request state) before update_from_output commits the PREVIOUS step. The
+    per-step decision must ride its own SchedulerOutput, not a Request slot the
+    next schedule overwrites -- the exact interleave that crashed the engine
+    with "1 != 64" when the prefill anchor's width-1 commit hit the decode
+    step's block stamp."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 3)
+    scheduler.add_request(request)
+
+    # Step P: schedule the prefill (anchor, width-1, non-block).
+    prefill = scheduler.schedule()
+    assert get_tt_block_step_decisions(prefill)[request.request_id] is False
+
+    # Emulate the batch queue: the anchor's output is NOT committed yet. Run
+    # schedule() for the FIRST DECODE step first, overwriting live Request
+    # state (num_computed_tokens, num_output_placeholders) the way async does.
+    scheduler.update_from_output(prefill, _runner_output(prefill, [5]))
+    decode = scheduler.schedule()
+    assert get_tt_block_step_decisions(decode)[request.request_id] is True
+    # A stale single-slot would now read True for BOTH steps; the SchedulerOutput
+    # maps stay independent.
+    assert get_tt_block_step_decisions(prefill)[request.request_id] is False
+
+    # Commit the decode block: reads the decode SchedulerOutput's decision and
+    # accepts the full-width block, not the anchor's width.
+    block = list(range(10, 10 + CANVAS))
+    outputs = scheduler.update_from_output(decode, _runner_output(decode, block))
+    assert outputs[0].outputs[0].new_token_ids == block
+    assert request.num_output_placeholders == 0
+
+
+def test_adaptive_block_width_mismatch_raises():
+    """If the scheduler reserves a block but the model returns a different
+    width (gate disagreement), fail loudly rather than leak placeholders."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+    submitted = scheduler.schedule()
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is True
+    with pytest.raises(ValueError, match="block gates disagree"):
+        # Solo decode reserved a block; a width-1 output contradicts it.
+        scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
+
+
+def test_adaptive_over_frontier_prompt_never_blocks():
+    """A prompt over tt_adaptive_block_max_prompt_tokens is served as plain
+    baseline for its whole lifetime: width-1 reservation even on solo decode.
+    On the old code the solo decode reserved the full block and the model's
+    width-1 baseline output killed the engine."""
+    from vllm_tt_plugin.config import store_tt_adaptive_block_max_prompt_tokens
+
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    # frontier below this request's 32-token prompt
+    store_tt_adaptive_block_max_prompt_tokens(scheduler.vllm_config, 16)
+    scheduler._adaptive_block_max_prompt = 16
+    request = _request(CANVAS * 2)
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    submitted = scheduler.schedule()  # solo decode -- but over the frontier
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is False
+    assert request.num_output_placeholders == 1
+    outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [9]))
+    assert outputs[0].outputs[0].new_token_ids == [9]
+    assert request.num_output_placeholders == 0
+
+
+def test_adaptive_under_frontier_prompt_still_blocks():
+    from vllm_tt_plugin.config import store_tt_adaptive_block_max_prompt_tokens
+
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    store_tt_adaptive_block_max_prompt_tokens(scheduler.vllm_config, 64)
+    scheduler._adaptive_block_max_prompt = 64
+    request = _request(CANVAS * 2)  # 32-token prompt <= 64
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+
+    submitted = scheduler.schedule()
+    assert get_tt_block_step_decisions(submitted)[request.request_id] is True
+    assert request.num_output_placeholders == CANVAS
