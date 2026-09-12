@@ -1034,15 +1034,28 @@ def test_adaptive_batched_decode_commits_single_tokens():
     assert req_b.num_output_placeholders == 0
 
 
-def test_adaptive_returns_to_block_width_when_solo_again():
-    """After a peer finishes, the survivor's next solo decode reserves the
-    block again."""
+def test_adaptive_batch_prefilled_request_never_blocks():
+    """A request whose PREFILL ran batched never gets a block -- not even once
+    it is the only request left.
+
+    The model captures drafter taps only during a SOLO prefill and never
+    re-arms afterwards (taps come only from a prefill), so a batch-prefilled
+    request holds no speculative session for its whole life and serves every
+    solo decode as plain width-1 baseline. Reserving the block here is what
+    broke the benchmark sweep as concurrency drained back to one request: the
+    scheduler reserved CANVAS and the model emitted 1.
+
+    This replaces an earlier test that asserted the survivor DID block again,
+    which described a capability the model does not have.
+    """
     scheduler = _scheduler(adaptive=True, max_num_seqs=2)
     req_a = _request(CANVAS * 4, request_id="req-a")
     req_b = _request(1, request_id="req-b", ignore_eos=False)
     scheduler.add_request(req_a)
     scheduler.add_request(req_b)
-    submitted = scheduler.schedule()  # batched prefill anchors
+    submitted = scheduler.schedule()  # batched prefill -> taps for neither
+    assert len(submitted.num_scheduled_tokens) == 2
+    assert scheduler._spec_session_owner is None
     anchor_output = ModelRunnerOutput(
         req_ids=["req-a", "req-b"],
         req_id_to_index={"req-a": 0, "req-b": 1},
@@ -1056,8 +1069,89 @@ def test_adaptive_returns_to_block_width_when_solo_again():
 
     resumed = scheduler.schedule()
     assert len(resumed.num_scheduled_tokens) == 1
-    assert get_tt_block_step_decisions(resumed)[req_a.request_id] is True
-    assert req_a.num_output_placeholders == CANVAS
+    assert get_tt_block_step_decisions(resumed)[req_a.request_id] is False
+    assert req_a.num_output_placeholders == 1
+    # ... and the width-1 commit the model actually emits reconciles cleanly.
+    outputs = scheduler.update_from_output(resumed, _runner_output(resumed, [7]))
+    assert outputs[0].outputs[0].new_token_ids == [7]
+    assert req_a.num_output_placeholders == 0
+
+
+def test_adaptive_batched_decode_drops_the_session_permanently():
+    """The sweep-tail case, with both requests prefilled SOLO so each owned
+    the session in turn.
+
+    A batched decode makes the model release its session, and it never
+    re-arms. So when the peer finishes, the survivor is solo AND spec-eligible
+    but owns nothing -- it must stay at width 1.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 4, request_id="req-a")
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a)  # solo prefill -> req-a owns the session
+    assert scheduler._spec_session_owner == "req-a"
+
+    # req-b prefills solo: the model's SINGLE session is re-seated to req-b.
+    req_b = _request(2, request_id="req-b", ignore_eos=False)
+    scheduler.add_request(req_b)
+    prefill_b = scheduler.schedule()
+    assert len(prefill_b.num_scheduled_tokens) == 1, "TT steps are never mixed"
+    assert get_tt_block_step_decisions(prefill_b)["req-b"] is False
+    scheduler.update_from_output(prefill_b, _runner_output(prefill_b, [5]))
+    assert scheduler._spec_session_owner == "req-b"
+
+    # Both decode together: the model releases the session for good.
+    batched = scheduler.schedule()
+    assert len(batched.num_scheduled_tokens) == 2
+    assert scheduler._spec_session_owner is None
+    decisions = get_tt_block_step_decisions(batched)
+    assert decisions["req-a"] is False and decisions["req-b"] is False
+    scheduler.update_from_output(
+        batched,
+        ModelRunnerOutput(
+            req_ids=["req-a", "req-b"],
+            req_id_to_index={"req-a": 0, "req-b": 1},
+            sampled_token_ids=[[6], [2]],  # req-b stops on EOS
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert req_b.is_finished()
+
+    # req-a is alone again -- and still session-less.
+    resumed = scheduler.schedule()
+    assert len(resumed.num_scheduled_tokens) == 1
+    assert get_tt_block_step_decisions(resumed)["req-a"] is False
+    assert req_a.num_output_placeholders == 1
+
+
+def test_adaptive_aborted_owner_does_not_hand_its_session_to_a_peer():
+    """req-b's prefill re-seats the model's single session. If req-b is
+    aborted before it ever decodes, req-a's next solo decode must NOT inherit
+    req-b's taps: speculating from another prompt's residuals (and another
+    prompt's length) yields wrong TOKENS, not merely a wrong width. The model
+    refuses it independently via _spec_pending_is_mine; the scheduler must
+    agree so the widths still match.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 4, request_id="req-a")
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a)
+    assert scheduler._spec_session_owner == "req-a"
+
+    req_b = _request(CANVAS * 4, request_id="req-b")
+    scheduler.add_request(req_b)
+    prefill_b = scheduler.schedule()
+    scheduler.update_from_output(prefill_b, _runner_output(prefill_b, [5]))
+    assert scheduler._spec_session_owner == "req-b"
+
+    scheduler.finish_requests("req-b", RequestStatus.FINISHED_ABORTED)
+
+    resumed = scheduler.schedule()
+    assert len(resumed.num_scheduled_tokens) == 1
+    assert get_tt_block_step_decisions(resumed)["req-a"] is False
+    assert req_a.num_output_placeholders == 1
 
 
 def test_adaptive_commit_without_scheduling_decision_raises():

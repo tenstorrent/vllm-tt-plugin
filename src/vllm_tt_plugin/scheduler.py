@@ -145,6 +145,10 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # Request id that owns the adaptive model's SINGLE speculative
+        # session, mirrored from scheduling-side facts (see
+        # _mirror_spec_session). Only its owner can emit a block.
+        self._spec_session_owner: str | None = None
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
@@ -638,6 +642,8 @@ class TTScheduler(AsyncScheduler):
         # matching SchedulerOutput back to update_from_output, so the map always
         # pairs with the output being committed.
         solo = len(scheduler_output.num_scheduled_tokens) == 1
+        if self._is_adaptive_block:
+            self._mirror_spec_session(scheduler_output, solo)
         decisions: dict[str, bool] = {}
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
@@ -656,17 +662,73 @@ class TTScheduler(AsyncScheduler):
                 is_decode = (
                     request.num_computed_tokens - scheduled >= request.num_prompt_tokens
                 )
-                spec_eligible = (
-                    self._adaptive_block_max_prompt == 0
-                    or request.num_prompt_tokens <= self._adaptive_block_max_prompt
+                # Owning the model's single spec session is part of the
+                # gate: the model serves a solo decode as plain baseline
+                # whenever it has no session for THAT request, so reserving
+                # a block for a non-owner would reserve a width the model
+                # cannot emit (see _mirror_spec_session).
+                block_step = (
+                    solo
+                    and is_decode
+                    and self._spec_eligible(request)
+                    and self._spec_session_owner == req_id
                 )
-                block_step = solo and is_decode and spec_eligible
             else:
                 block_step = True
             if block_step:
                 request.num_output_placeholders += extra_placeholders
             decisions[req_id] = block_step
         set_tt_block_step_decisions(scheduler_output, decisions)
+
+    def _spec_eligible(self, request: Request) -> bool:
+        """Prompt short enough for the model to arm a spec session for it."""
+        return (
+            self._adaptive_block_max_prompt == 0
+            or request.num_prompt_tokens <= self._adaptive_block_max_prompt
+        )
+
+    def _mirror_spec_session(self, scheduler_output, solo: bool) -> None:
+        """Track which request owns the adaptive model's SINGLE spec session.
+
+        The model keeps one global session: drafter taps are captured during a
+        request's own prefill, and only the request that owns them can emit a
+        multi-token block. Every transition of that session is driven by the
+        shape of a step, so the scheduler can mirror it exactly without asking
+        the model -- and that is what keeps the width this scheduler RESERVES
+        equal to the width the model EMITS:
+
+        * a PREFILL step re-seats the session. The model captures taps only for
+          a solo, spec-eligible prefill and drops the session on any other
+          prefill (batched, or a prompt over the capture frontier).
+        * a BATCHED decode step destroys it. The model releases the decoder and
+          serves plain baseline from then on, and it never re-arms, because
+          taps only ever come from a prefill. This is the case that made a
+          benchmark sweep fail: as concurrency drains back to one request, that
+          request is solo and eligible but no longer owns a session.
+        * a SOLO decode leaves ownership alone -- the owner bootstraps its
+          pending taps and keeps the session for the rest of its life.
+
+        A TT step is never mixed prefill+decode (docs/SCHEDULING.md), so the
+        first scheduled request classifies the whole step.
+        """
+        owner = self._spec_session_owner
+        # A finished or aborted owner no longer holds the session: the model
+        # clears it in release_request, and the id is gone from self.requests.
+        if owner is not None and owner not in self.requests:
+            owner = None
+        scheduled_tokens = scheduler_output.num_scheduled_tokens
+        first_id = next(iter(scheduled_tokens), None)
+        if first_id is not None:
+            request = self.requests[first_id]
+            step_is_decode = (
+                request.num_computed_tokens - scheduled_tokens[first_id]
+                >= request.num_prompt_tokens
+            )
+            if not step_is_decode:
+                owner = first_id if (solo and self._spec_eligible(request)) else None
+            elif not solo:
+                owner = None
+        self._spec_session_owner = owner
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """Bind this step's block-step decisions before the base loop commits
