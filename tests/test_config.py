@@ -132,3 +132,17 @@ def test_required_output_tokens_per_step_rejects_missing_setup_state():
 def test_output_tokens_per_step_rejects_invalid_values(invalid):
     with pytest.raises(ValueError, match="integer >= 1"):
         tt_config.store_tt_output_tokens_per_step(_vllm_config(), invalid)
+
+
+def test_persistent_request_state_slots_default_safe_and_round_trip():
+    config = _vllm_config()
+
+    assert tt_config.requires_tt_persistent_request_state_slots(config) is True
+    tt_config.store_tt_persistent_request_state_slots(config, False)
+    assert tt_config.requires_tt_persistent_request_state_slots(config) is False
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false", []])
+def test_persistent_request_state_slots_rejects_non_boolean(invalid):
+    with pytest.raises(ValueError, match="must be boolean"):
+        tt_config.store_tt_persistent_request_state_slots(_vllm_config(), invalid)

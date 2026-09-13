@@ -39,6 +39,7 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
 # get_tt_data_parallel_size.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
+_PERSISTENT_REQUEST_STATE_SLOTS_KEY = "_tt_persistent_request_state_slots"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -120,6 +121,39 @@ def store_tt_output_tokens_per_step(
         additional = {}
         vllm_config.additional_config = additional
     additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
+
+
+def store_tt_persistent_request_state_slots(
+    vllm_config: "VllmConfig", required: bool
+) -> None:
+    """Persist whether requests own device state outside scheduler KV blocks.
+
+    Models that do not declare the capability retain the conservative historical
+    behavior: every live request owns a stable device state slot.  An explicit
+    ``False`` lets stateless paged models use the scheduler page table as their
+    complete request identity instead of imposing a second, smaller admission
+    limit in the model runner.
+    """
+    if not isinstance(required, bool):
+        raise ValueError(
+            "persistent request-state slot capability must be boolean, got "
+            f"{required!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PERSISTENT_REQUEST_STATE_SLOTS_KEY] = required
+
+
+def requires_tt_persistent_request_state_slots(vllm_config: "VllmConfig") -> bool:
+    """Return the normalized request-state capability.
+
+    Missing setup state is treated as persistent, preserving correctness for
+    every existing model that predates the capability declaration.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_PERSISTENT_REQUEST_STATE_SLOTS_KEY, True))
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:
