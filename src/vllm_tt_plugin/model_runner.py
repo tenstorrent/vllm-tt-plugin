@@ -45,6 +45,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
     is_tt_block_output_model,
+    requires_tt_persistent_request_state_slots,
 )
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
@@ -239,6 +240,9 @@ class TTModelRunner:
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
+        self.requires_persistent_request_state_slots = (
+            requires_tt_persistent_request_state_slots(vllm_config)
+        )
 
         # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
@@ -1022,6 +1026,37 @@ class TTModelRunner:
             self._req_state_slot = self._pending_state_slot_settle
             self._pending_state_slot_settle = None
 
+    def _state_slot_inputs(
+        self, row_req_ids: list[str], *, is_prompt: bool
+    ) -> tuple[list[int] | None, torch.Tensor | None]:
+        """Build model state-slot inputs for one scheduler submission.
+
+        Stateful models retain the historical request-owned slot map. Stateless
+        paged models instead use the page table as durable request identity, so a
+        slot number is meaningful only within the current prefill submission.
+        """
+        # Legacy runners and lightweight test doubles may predate platform
+        # capability normalization. Missing setup state must preserve the
+        # conservative historical contract rather than silently becoming
+        # stateless.
+        if not getattr(self, "requires_persistent_request_state_slots", True):
+            return (list(range(len(row_req_ids))) if is_prompt else None), None
+        if is_prompt:
+            allocate = getattr(self, "_alloc_prefill_state_slots", None)
+            slots = (
+                allocate(row_req_ids)
+                if callable(allocate)
+                else TTModelRunner._alloc_prefill_state_slots(self, row_req_ids)
+            )
+            return slots, None
+        remap = getattr(self, "_decode_state_slot_remap", None)
+        slot_remap = (
+            remap(row_req_ids)
+            if callable(remap)
+            else TTModelRunner._decode_state_slot_remap(self, row_req_ids)
+        )
+        return None, slot_remap
+
     def note_decode_layout_consumed(self) -> None:
         """Retire the sticky layout transition after an accepted decode."""
         self._decode_layout_changed_since_last_decode = False
@@ -1396,15 +1431,12 @@ class TTModelRunner:
         # State follows the request, not the row (``self._req_state_slot``), which
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
-        prefill_empty_slots = None
-        slot_remap = None
-        if is_prompt:
-            prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
-        else:
-            # Advances the ownership map to the post-gather layout, so the returned
-            # remap has to reach the device: dropping it would leave the map claiming
-            # a move that never happened.
-            slot_remap = self._decode_state_slot_remap(row_req_ids)
+        # A persistent-state decode advances ownership to the post-gather layout,
+        # so its remap must reach the device. Stateless paged models have no such
+        # ownership map: page-table rows are the durable request identity.
+        prefill_empty_slots, slot_remap = TTModelRunner._state_slot_inputs(
+            self, row_req_ids, is_prompt=is_prompt
+        )
 
         return TTModelInput(
             input_tokens=input_tokens,
