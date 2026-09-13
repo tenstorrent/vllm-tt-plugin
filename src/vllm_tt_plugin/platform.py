@@ -26,6 +26,7 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_persistent_request_state_slots,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
@@ -1430,6 +1431,7 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
         output_tokens_per_step = (
             model_capabilities.get("output_tokens_per_step", 1)
             if model_capabilities
@@ -1680,6 +1682,19 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        persistent_state_slots = (
+            model_capabilities.get("requires_persistent_request_state_slots", True)
+            if model_capabilities
+            else True
+        )
+        if not isinstance(persistent_state_slots, bool):
+            raise ValueError(
+                "model_capabilities['requires_persistent_request_state_slots'] "
+                f"must be boolean for {model_class.__module__}."
+                f"{model_class.__name__}; got {persistent_state_slots!r}"
+            )
+        store_tt_persistent_request_state_slots(vllm_config, persistent_state_slots)
 
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.

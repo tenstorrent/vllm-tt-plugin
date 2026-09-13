@@ -292,6 +292,74 @@ def test_slot_exhaustion_fails_instead_of_guessing():
         _prefill(_runner(slots=2), ["A", "B", "C"])
 
 
+def test_stateless_model_does_not_retain_slots_across_scheduler_steps():
+    """Queued work may exceed max_num_seqs even though each scheduled step cannot.
+
+    A stateless paged model therefore uses row-local prefill slots and its page
+    tables, not the persistent map required by recurrent models.
+    """
+    r = _runner(slots=2)
+    r.requires_persistent_request_state_slots = False
+    r._req_state_slot.update({"A": 0, "B": 1})
+    r.requests.update(dict.fromkeys(["A", "B", "C", "D"]))
+
+    prefill_slots, remap = TTModelRunner._state_slot_inputs(
+        r, ["C", "D"], is_prompt=True
+    )
+    assert prefill_slots == [0, 1]
+    assert remap is None
+    assert r._req_state_slot == {"A": 0, "B": 1}, "stateless path must not mutate"
+
+    prefill_slots, remap = TTModelRunner._state_slot_inputs(
+        r, ["C", "D"], is_prompt=False
+    )
+    assert prefill_slots is None and remap is None
+
+
+def test_stateless_model_accepts_new_prefill_wave_after_full_prior_wave():
+    """A completed B32 wave cannot consume the next wave's row-local slots."""
+    r = _runner(slots=32)
+    r.requires_persistent_request_state_slots = False
+    prior = [f"old-{i}" for i in range(32)]
+    incoming = [f"new-{i}" for i in range(31)]
+    r._req_state_slot.update({req_id: i for i, req_id in enumerate(prior)})
+    r.requests.update(dict.fromkeys([*prior, *incoming]))
+
+    prefill_slots, remap = TTModelRunner._state_slot_inputs(r, incoming, is_prompt=True)
+
+    assert prefill_slots == list(range(31))
+    assert remap is None
+    assert r._req_state_slot == dict(zip(prior, range(32), strict=True))
+
+
+def test_persistent_model_keeps_request_owned_slot_mapping():
+    r = _runner(slots=2)
+    r.requires_persistent_request_state_slots = True
+
+    prefill_slots, remap = TTModelRunner._state_slot_inputs(
+        r, ["A", "B"], is_prompt=True
+    )
+    assert prefill_slots == [0, 1] and remap is None
+    r.requests.update(dict.fromkeys(["A", "B"]))
+
+    prefill_slots, remap = TTModelRunner._state_slot_inputs(
+        r, ["B", "A"], is_prompt=False
+    )
+    assert prefill_slots is None
+    assert remap.tolist()[:2] == [1, 0]
+
+
+def test_missing_capability_keeps_persistent_state_slots():
+    """Legacy runners without normalized setup state remain conservative."""
+    r = _runner(slots=2)
+
+    prefill_slots, remap = TTModelRunner._state_slot_inputs(
+        r, ["A", "B"], is_prompt=True
+    )
+    assert prefill_slots == [0, 1] and remap is None
+    assert r._req_state_slot == {"A": 0, "B": 1}
+
+
 def test_more_decode_rows_than_slots_raises():
     """Truncating to the slot width would silently drop C's state instead of saying
     the batch cannot be described."""
