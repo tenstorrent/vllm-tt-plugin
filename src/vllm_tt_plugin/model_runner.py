@@ -1974,7 +1974,7 @@ class TTModelRunner:
         if has_structured_outputs:
             return unsupported("structured outputs")
 
-        # Logprobs on device require multi-device setups (num_devices in {8,32}).
+        # Logprobs on device require a multi-device vocabulary shard.
         # On single device, all logprobs require host sampling.
         # https://github.com/tenstorrent/tt-metal/issues/34077
         #
@@ -1985,7 +1985,7 @@ class TTModelRunner:
         # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
         if max_lp is not None:
-            if num_devices not in (8, 32):
+            if num_devices < 2:
                 return unsupported("logprobs on this mesh width")
             sampled_logprobs = sampling_capabilities.get("sampled_logprobs")
             if device_sampling_required and sampled_logprobs is not True:

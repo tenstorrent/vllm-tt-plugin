@@ -24,16 +24,17 @@ SAMPLED_TOKEN_ID = 42
 
 
 def _sampling_capability_runner(*, required, max_num_logprobs=None,
-                                host_only=False):
+                                host_only=False, num_devices=4,
+                                sampled_logprobs=False):
     return SimpleNamespace(
         sample_on_device_mode="all",
-        num_devices=4,
+        num_devices=num_devices,
         tt_data_parallel_size=1,
         supports_topk_logprobs=False,
         model=SimpleNamespace(model_capabilities={
             "device_sampling": {
                 "required": required,
-                "sampled_logprobs": False,
+                "sampled_logprobs": sampled_logprobs,
                 "topk_logprobs": False,
             }}),
         model_config=SimpleNamespace(logits_processors=[]),
@@ -55,6 +56,22 @@ def test_required_device_sampler_rejects_instead_of_falling_back_to_host():
 
 def test_required_device_sampler_refuses_unadvertised_logprobs():
     runner = _sampling_capability_runner(required=True, max_num_logprobs=0)
+    with pytest.raises(ValueError, match="sampled-token logprobs"):
+        TTModelRunner.check_perform_device_sampling(
+            runner, is_decode=True, has_structured_outputs=False)
+
+
+def test_required_device_sampler_accepts_mesh4_sampled_logprobs():
+    runner = _sampling_capability_runner(
+        required=True, max_num_logprobs=0, sampled_logprobs=True)
+    assert TTModelRunner.check_perform_device_sampling(
+        runner, is_decode=True, has_structured_outputs=False)
+
+
+def test_required_device_sampler_rejects_single_device_logprobs():
+    runner = _sampling_capability_runner(
+        required=True, max_num_logprobs=0, num_devices=1,
+        sampled_logprobs=True)
     with pytest.raises(ValueError, match="logprobs on this mesh width"):
         TTModelRunner.check_perform_device_sampling(
             runner, is_decode=True, has_structured_outputs=False)
