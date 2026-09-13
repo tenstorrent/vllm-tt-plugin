@@ -22,6 +22,49 @@ DP_SIZE = 1
 SAMPLED_TOKEN_ID = 42
 # endregion Constants
 
+
+def _sampling_capability_runner(*, required, max_num_logprobs=None,
+                                host_only=False):
+    return SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        supports_topk_logprobs=False,
+        model=SimpleNamespace(model_capabilities={
+            "device_sampling": {
+                "required": required,
+                "sampled_logprobs": False,
+                "topk_logprobs": False,
+            }}),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_allowed_token_ids=not host_only,
+            sampling=SimpleNamespace(
+                bad_words_token_ids=False,
+                has_active_logitsprocs=lambda: False),
+            max_num_logprobs=max_num_logprobs),
+    )
+
+
+def test_required_device_sampler_rejects_instead_of_falling_back_to_host():
+    runner = _sampling_capability_runner(required=True, host_only=True)
+    with pytest.raises(ValueError, match="forbids host sampling fallback"):
+        TTModelRunner.check_perform_device_sampling(
+            runner, is_decode=True, has_structured_outputs=False)
+
+
+def test_required_device_sampler_refuses_unadvertised_logprobs():
+    runner = _sampling_capability_runner(required=True, max_num_logprobs=0)
+    with pytest.raises(ValueError, match="logprobs on this mesh width"):
+        TTModelRunner.check_perform_device_sampling(
+            runner, is_decode=True, has_structured_outputs=False)
+
+
+def test_legacy_sampler_retains_existing_host_fallback_contract():
+    runner = _sampling_capability_runner(required=False, host_only=True)
+    assert not TTModelRunner.check_perform_device_sampling(
+        runner, is_decode=True, has_structured_outputs=False)
+
 # region Test helpers
 
 
