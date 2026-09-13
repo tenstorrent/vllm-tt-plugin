@@ -127,6 +127,10 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _block_tables_per_layer=lambda _: None,
         _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
         _decode_state_slot_remap=lambda row_req_ids: None,
+        _state_slot_inputs=lambda row_req_ids, *, is_prompt: (
+            list(range(len(row_req_ids))) if is_prompt else None,
+            None,
+        ),
         _sampling_params_for_padded_decode=lambda params, req_indices, n: params,
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
