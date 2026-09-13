@@ -1343,6 +1343,9 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+        cls.device_sampling_capabilities = (
+            dict(model_capabilities.get("device_sampling") or {})
+            if model_capabilities else {})
 
         output_tokens_per_step = (
             model_capabilities.get("output_tokens_per_step", 1)
@@ -1994,6 +1997,31 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        sampling = getattr(cls, "device_sampling_capabilities", {}) or {}
+        if isinstance(params, SamplingParams) and sampling.get("required") is True:
+            unsupported = []
+            if params.min_p != 0.0:
+                unsupported.append("min_p")
+            if params.bad_words:
+                unsupported.append("bad_words")
+            if params.structured_outputs is not None:
+                unsupported.append("structured_outputs")
+            if params.logit_bias is not None:
+                unsupported.append("logit_bias")
+            if params.allowed_token_ids is not None:
+                unsupported.append("allowed_token_ids")
+            if params.min_tokens != 0:
+                unsupported.append("min_tokens")
+            if params.logprobs is not None:
+                if sampling.get("sampled_logprobs") is not True:
+                    unsupported.append("logprobs on this device mesh")
+                elif params.logprobs > 0 and sampling.get("topk_logprobs") is not True:
+                    unsupported.append("top-k logprobs")
+            if unsupported:
+                raise ValueError(
+                    "This implementation requires on-device sampling and does "
+                    "not support host fallback for: " + "; ".join(unsupported))
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:

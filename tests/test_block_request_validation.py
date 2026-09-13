@@ -43,6 +43,27 @@ def _validate(params: SamplingParams, prompt_len: int = 32) -> None:
     TTPlatform.validate_request(prompt, params)
 
 
+def test_required_device_sampler_rejects_logprobs_at_request_boundary(monkeypatch):
+    monkeypatch.setattr(TTPlatform, "_get_block_output_contract",
+                        classmethod(lambda cls: None))
+    monkeypatch.setattr(TTPlatform, "device_sampling_capabilities", {
+        "required": True, "sampled_logprobs": False, "topk_logprobs": False},
+        raising=False)
+    with pytest.raises(ValueError, match="requires on-device sampling"):
+        _validate(SamplingParams(temperature=0.7, logprobs=1))
+
+
+def test_required_device_sampler_accepts_device_penalties(monkeypatch):
+    monkeypatch.setattr(TTPlatform, "_get_block_output_contract",
+                        classmethod(lambda cls: None))
+    monkeypatch.setattr(TTPlatform, "device_sampling_capabilities", {
+        "required": True, "sampled_logprobs": False, "topk_logprobs": False},
+        raising=False)
+    _validate(SamplingParams(
+        temperature=0.7, presence_penalty=0.5,
+        frequency_penalty=0.25, repetition_penalty=1.1))
+
+
 def _upstream_process_inputs(
     self, request_id, prompt, params, *args, resumable=False, **kwargs
 ):
