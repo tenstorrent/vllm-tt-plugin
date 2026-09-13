@@ -1942,6 +1942,17 @@ class TTModelRunner:
         if not want_device_sampling:
             return False
 
+        model_capabilities = getattr(self.model, "model_capabilities", {}) or {}
+        sampling_capabilities = model_capabilities.get("device_sampling") or {}
+        device_sampling_required = sampling_capabilities.get("required") is True
+
+        def unsupported(reason: str) -> bool:
+            if device_sampling_required:
+                raise ValueError(
+                    "request requires unsupported on-device sampling control: "
+                    f"{reason}; this model forbids host sampling fallback")
+            return False
+
         # Calculate number of devices per DP rank
         num_devices = self.num_devices // self.tt_data_parallel_size
 
@@ -1956,12 +1967,12 @@ class TTModelRunner:
             or bool(self.model_config.logits_processors)  # custom logitsprocs
         )
         if has_always_host_only_sampling_params:
-            return False
+            return unsupported("logits processors or token hard constraints")
 
         # Structured outputs are not supported on device yet
         # https://github.com/tenstorrent/vllm/issues/277
         if has_structured_outputs:
-            return False
+            return unsupported("structured outputs")
 
         # Logprobs on device require multi-device setups (num_devices in {8,32}).
         # On single device, all logprobs require host sampling.
@@ -1975,9 +1986,15 @@ class TTModelRunner:
         max_lp = input_batch.max_num_logprobs
         if max_lp is not None:
             if num_devices not in (8, 32):
-                return False
-            if max_lp > 0 and not self.supports_topk_logprobs:
-                return False
+                return unsupported("logprobs on this mesh width")
+            sampled_logprobs = sampling_capabilities.get("sampled_logprobs")
+            if device_sampling_required and sampled_logprobs is not True:
+                return unsupported("sampled-token logprobs")
+            supports_topk = (
+                sampling_capabilities.get("topk_logprobs") is True
+                if device_sampling_required else self.supports_topk_logprobs)
+            if max_lp > 0 and not supports_topk:
+                return unsupported("top-k logprobs")
 
         return True
 
