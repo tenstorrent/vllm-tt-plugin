@@ -30,6 +30,7 @@ import torch
 
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_INTERNAL,
     HIDDEN_HANDOFF_ON_DEVICE,
@@ -167,6 +168,14 @@ class FakeSpecModel:
             raise ValueError(
                 f"FakeSpecModel serves {list(self.accept_modes)}, "
                 f"asked for {spec_mode!r}"
+            )
+        if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            # Reachable only through a configured variant that declares the
+            # mode. Refused by name rather than falling through to the logits
+            # return, which VerifyOutput would reject for this mode.
+            raise NotImplementedError(
+                "FakeSpecModel does not implement on-device rejection "
+                "sampling; no model does"
             )
         rows, block_width = self._check_block("verify", tokens, positions)
         num_drafts = block_width - 1
