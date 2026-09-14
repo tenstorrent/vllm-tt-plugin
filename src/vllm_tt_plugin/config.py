@@ -8,6 +8,8 @@ from vllm_tt_plugin.logger import init_tt_logger
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    from vllm_tt_plugin.spec_decode import SpecPlan
+
 logger = init_tt_logger(__name__)
 
 
@@ -32,13 +34,17 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config)
 
 
-# Internal key recording the resolved TT lane count. Stored at the top level of
-# additional_config -- deliberately outside the user "tt" namespace -- so it
-# never collides with user config and reads as platform-derived state rather
-# than user input. Written by store_tt_lane_count, read by
-# get_tt_data_parallel_size.
+# Internal keys recording resolved platform state. Stored at the top level of
+# additional_config -- deliberately outside the user "tt" namespace -- so they
+# never collide with user config and read as platform-derived state rather than
+# user input. Every value here stays JSON-encodable, because
+# VllmConfig.compute_hash calls json.dumps over the whole dictionary.
+# Written by store_tt_lane_count, store_tt_output_tokens_per_step and
+# store_tt_spec_plan; read by get_tt_data_parallel_size,
+# get_tt_output_tokens_per_step and get_tt_spec_plan.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
+_SPEC_PLAN_KEY = "_tt_spec_plan"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -102,34 +108,6 @@ def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
     return get_tt_output_tokens_per_step(vllm_config) > 1
 
 
-_SPEC_PLAN_KEY = "_tt_spec_plan"
-
-
-def get_tt_spec_plan(vllm_config: "VllmConfig"):
-    """Return the admitted speculative plan, or ``None`` when speculation is off.
-
-    ``TTPlatform.check_and_update_config`` admits the configuration once and
-    stores the model's own ``SpecPlan`` here, so the scheduler, worker and
-    runner read one resolved object instead of re-reading capabilities or
-    calling back into model-loader code.
-
-    Deliberately NOT stored as ``output_tokens_per_step``: that key selects the
-    block-output rail through ``is_tt_block_output_model``, which neutralizes
-    sampling controls and disables logprobs. Speculation honours both.
-    """
-    additional = getattr(vllm_config, "additional_config", None) or {}
-    return additional.get(_SPEC_PLAN_KEY)
-
-
-def store_tt_spec_plan(vllm_config: "VllmConfig", plan) -> None:
-    """Store the admitted speculative plan on the vLLM config."""
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
-        additional = {}
-        vllm_config.additional_config = additional
-    additional[_SPEC_PLAN_KEY] = plan
-
-
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:
@@ -148,6 +126,61 @@ def store_tt_output_tokens_per_step(
         additional = {}
         vllm_config.additional_config = additional
     additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
+
+
+def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
+    """Return the admitted speculative plan, or ``None``.
+
+    ``None`` covers two cases that a caller needing to tell them apart should
+    resolve with ``require_tt_spec_plan``: no speculation was requested, and
+    admission has not run in this process.
+
+    Nothing reads this yet. It is the handoff slot the scheduler, worker and
+    runner read once the speculative execution path lands. Admission runs once
+    per process, not once per launch: ``TTWorker.init_device`` re-runs
+    ``TTPlatform.check_and_update_config``, so each process rebuilds its own
+    plan from the same declarations.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    stored = additional.get(_SPEC_PLAN_KEY)
+    if stored is None:
+        return None
+    from vllm_tt_plugin.spec_decode import SpecPlan
+
+    # Rebuilt rather than returned, so SpecPlan.__post_init__ validates on the
+    # way out and additional_config stays JSON-encodable for vLLM's config
+    # hashing.
+    return SpecPlan(**stored)
+
+
+def require_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
+    """Return the admitted plan, failing if admission did not run."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict) or _SPEC_PLAN_KEY not in additional:
+        raise RuntimeError("TT speculative admission did not run on VllmConfig")
+    return get_tt_spec_plan(vllm_config)
+
+
+def store_tt_spec_plan(vllm_config: "VllmConfig", plan: "SpecPlan | None") -> None:
+    """Store the admitted speculative plan, or ``None`` for no speculation.
+
+    Stored as a plain dictionary because every other key in
+    ``additional_config`` is JSON-encodable and ``VllmConfig.compute_hash``
+    calls ``json.dumps`` over the whole dictionary.
+    """
+    from dataclasses import asdict
+
+    from vllm_tt_plugin.spec_decode import SpecPlan
+
+    if plan is not None and not isinstance(plan, SpecPlan):
+        raise ValueError(
+            f"TT speculative plan must be a SpecPlan or None, got {plan!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SPEC_PLAN_KEY] = None if plan is None else asdict(plan)
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:

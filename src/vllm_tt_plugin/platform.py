@@ -16,6 +16,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
@@ -26,7 +27,10 @@ from vllm_tt_plugin.config import (
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.spec_decode import admit_speculative_config
+from vllm_tt_plugin.spec_admission import (
+    refuse_unimplemented_execution,
+    resolve_speculative_plan,
+)
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -1596,18 +1600,6 @@ class TTPlatform(Platform):
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
-        # Admitted before the width is stored, so the block-output rail is
-        # detected by what the model declared rather than by anything
-        # speculation sets.
-        store_tt_spec_plan(
-            vllm_config,
-            admit_speculative_config(
-                vllm_config,
-                model_class,
-                model_capabilities,
-                declared_output_tokens_per_step=output_tokens_per_step,
-            ),
-        )
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         is_block_output_model = is_tt_block_output_model(vllm_config)
         if is_diffusion_gemma and not is_block_output_model:
@@ -1624,6 +1616,17 @@ class TTPlatform(Platform):
             if model_capabilities
             else False
         )
+        if is_block_output_model and vllm_config.speculative_config:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['output_tokens_per_step'] > 1, "
+                "which selects the block-output rail, and a speculative "
+                "config was also requested. Both define the committed output "
+                "width per step, and the block-output rail neutralizes the "
+                "HTTP sampling controls and disables the logprobs that "
+                "speculation honours. The model capability cannot be changed "
+                "from the command line, so drop the speculative flags"
+            )
         if is_block_output_model and supports_prefix_caching:
             raise ValueError(
                 f"Model {model_class.__module__}.{model_class.__name__} "
@@ -1838,6 +1841,40 @@ class TTPlatform(Platform):
         # Must run before the validation/routing below so the lane path is
         # selected. model_class carries the single-execute decision for GPT-OSS.
         _convert_dp_to_lanes(vllm_config, model_class)
+
+        # After the lane fold: _convert_dp_to_lanes rewrites
+        # scheduler_config.max_num_seqs and stores the lane count, and a plan is
+        # dimensioned against the concurrency it was resolved for. Admitting
+        # earlier would resolve a plan for the per-lane batch and then have the
+        # engine-core re-run resolve it for the global one.
+        spec_plan = resolve_speculative_plan(
+            vllm_config,
+            model_class,
+            model_capabilities,
+            get_tt_max_batch_size(vllm_config),
+        )
+        if spec_plan is not None:
+            requested_k = vllm_config.speculative_config.num_speculative_tokens
+            if spec_plan.effective_k != requested_k:
+                # Published back, because vLLM's own scheduler budgets its
+                # lookahead slots off num_speculative_tokens. Leaving the
+                # request there would have the scheduler reserve for a draft
+                # length the model will not verify.
+                logger.info(
+                    "TT speculative decoding: %s reduced the draft length from "
+                    "%d to %d",
+                    model_class.__name__,
+                    requested_k,
+                    spec_plan.effective_k,
+                )
+                vllm_config.speculative_config.num_speculative_tokens = (
+                    spec_plan.effective_k
+                )
+        store_tt_spec_plan(vllm_config, spec_plan)
+        if spec_plan is not None:
+            # Delete this call, and nothing else here, when TTWorker publishes
+            # draft token ids and TTModelRunner drives the loop.
+            refuse_unimplemented_execution(model_class)
 
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (

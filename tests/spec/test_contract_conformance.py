@@ -601,3 +601,15 @@ def test_propose_records_the_hidden_handoff_and_returns_no_scores():
         num_drafts, tokens, positions, _per_row(rows, 1), hidden=sentinel
     )
     assert model.propose_calls[1]["hidden_was_none"] is False
+
+
+def test_a_bare_string_declaration_is_refused_as_a_string():
+    # A model author writing "device_propose" instead of ["device_propose"]
+    # would otherwise get fourteen unknown single characters.
+    with pytest.raises(ValueError) as excinfo:
+        normalize_declared_values(
+            "device_propose", SPEC_REQUIREMENTS, "spec_requirements"
+        )
+    message = str(excinfo.value)
+    assert "wrap it in a list" in message
+    assert "device_propose" in message
