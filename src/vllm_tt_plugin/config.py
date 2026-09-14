@@ -102,6 +102,34 @@ def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
     return get_tt_output_tokens_per_step(vllm_config) > 1
 
 
+_SPEC_PLAN_KEY = "_tt_spec_plan"
+
+
+def get_tt_spec_plan(vllm_config: "VllmConfig"):
+    """Return the admitted speculative plan, or ``None`` when speculation is off.
+
+    ``TTPlatform.check_and_update_config`` admits the configuration once and
+    stores the model's own ``SpecPlan`` here, so the scheduler, worker and
+    runner read one resolved object instead of re-reading capabilities or
+    calling back into model-loader code.
+
+    Deliberately NOT stored as ``output_tokens_per_step``: that key selects the
+    block-output rail through ``is_tt_block_output_model``, which neutralizes
+    sampling controls and disables logprobs. Speculation honours both.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return additional.get(_SPEC_PLAN_KEY)
+
+
+def store_tt_spec_plan(vllm_config: "VllmConfig", plan) -> None:
+    """Store the admitted speculative plan on the vLLM config."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SPEC_PLAN_KEY] = plan
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:
