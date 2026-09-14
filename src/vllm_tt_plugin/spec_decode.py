@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
+    from vllm.config import VllmConfig
 
 # Accept modes. The first two are named for what the verify call returns, which
 # is what the runner branches on; naming the performer instead cannot describe a
@@ -381,5 +382,177 @@ __all__ = [
     "SpecPlan",
     "SpecReject",
     "VerifyOutput",
+    "admit_speculative_config",
+    "method_requirements",
     "normalize_declared_values",
 ]
+
+
+# vLLM speculative methods that draft entirely on the host and ask nothing of
+# the model. A method absent from every table below is refused by name at
+# config time rather than assumed serviceable.
+_HOST_DRAFTER_METHODS = frozenset({"ngram", "suffix"})
+
+# Methods whose drafter runs on device and reads the target's hidden state,
+# beyond the EAGLE and MTP family that vLLM groups under EagleModelTypes.
+_HIDDEN_FEED_METHODS = frozenset({"medusa", "mlp_speculator"})
+
+
+def method_requirements(method: str) -> tuple[str, ...]:
+    """What a vLLM speculative method requires of the model.
+
+    The plugin owns this mapping, so a new upstream method name is a plugin
+    change rather than a model release, and a model declares what it can serve
+    without ever enumerating method names.
+    """
+    # Deferred: this module is imported while vLLM resolves its platform
+    # plugin, so importing vLLM's config package at module scope inverts that
+    # bootstrap.
+    from typing import get_args
+
+    from vllm.config.speculative import EagleModelTypes, SpeculativeMethod
+
+    if method in _HOST_DRAFTER_METHODS:
+        return ()
+    if method in get_args(EagleModelTypes) or method in _HIDDEN_FEED_METHODS:
+        return (SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED)
+    if method == "draft_model":
+        return (
+            SPEC_REQUIREMENT_DEVICE_PROPOSE,
+            SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE,
+        )
+    known = sorted(get_args(SpeculativeMethod))
+    raise ValueError(
+        f"speculative method {method!r} is not supported by the TT backend. "
+        f"Supported: host drafters {sorted(_HOST_DRAFTER_METHODS)}, the EAGLE "
+        f"and MTP family, {sorted(_HIDDEN_FEED_METHODS)}, and 'draft_model'. "
+        f"vLLM knows {known}"
+    )
+
+
+def admit_speculative_config(
+    vllm_config: "VllmConfig",
+    model_class: type,
+    model_capabilities: dict | None,
+    *,
+    declared_output_tokens_per_step: int,
+) -> SpecPlan | None:
+    """Resolve a speculative configuration at config time, or refuse it.
+
+    Returns the model's plan when speculation is admitted, and ``None`` when
+    the configuration asks for no speculation. Every refusal raises with the
+    offending values; speculation is never disabled silently, because a server
+    that quietly serves without it reports speedups it did not achieve.
+
+    ``declared_output_tokens_per_step`` is the width the MODEL declared, read
+    before anything stores a speculative width, so the block-output rail can be
+    detected by what the model asked for rather than by what speculation would
+    later set.
+    """
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if not speculative_config:
+        return None
+
+    capabilities = model_capabilities or {}
+    if not capabilities.get("supports_spec_decode", False):
+        raise ValueError(
+            f"{model_class.__name__} does not declare "
+            "model_capabilities['supports_spec_decode'], so it cannot serve a "
+            "speculative_config"
+        )
+
+    # Both own output_tokens_per_step, and the block-output rail's machinery
+    # (placeholder accounting, neutralized sampling controls, disabled
+    # logprobs) is wrong for speculation, which honours sampling through its
+    # logits mode instead.
+    if declared_output_tokens_per_step > 1:
+        raise ValueError(
+            f"{model_class.__name__} declares output_tokens_per_step="
+            f"{declared_output_tokens_per_step}, which selects the block-output "
+            "rail, and a speculative_config was also requested. The two own the "
+            "same output width and cannot be combined; pick one"
+        )
+
+    method = getattr(speculative_config, "method", None)
+    if not method:
+        raise ValueError(
+            "speculative_config carries no method; the TT backend resolves a "
+            "model's requirements from the method name"
+        )
+    required = method_requirements(str(method))
+    declared = normalize_declared_values(
+        capabilities.get("spec_requirements"),
+        SPEC_REQUIREMENTS,
+        f"{model_class.__name__} model_capabilities['spec_requirements']",
+    )
+    missing = [name for name in required if name not in declared]
+    if missing:
+        raise ValueError(
+            f"speculative method {method!r} requires {list(required)}, but "
+            f"{model_class.__name__} declares spec_requirements "
+            f"{list(declared)}; missing {missing}"
+        )
+
+    handoff = normalize_declared_values(
+        capabilities.get("spec_hidden_handoff"),
+        HIDDEN_HANDOFFS,
+        f"{model_class.__name__} model_capabilities['spec_hidden_handoff']",
+    )
+    if SPEC_REQUIREMENT_HIDDEN_FEED in required and not handoff:
+        raise ValueError(
+            f"speculative method {method!r} feeds the target hidden state to "
+            f"its drafter, but {model_class.__name__} declares no "
+            f"spec_hidden_handoff; expected one of {sorted(HIDDEN_HANDOFFS)}"
+        )
+
+    spec_plan = getattr(model_class, "spec_plan", None)
+    if spec_plan is None:
+        raise ValueError(
+            f"{model_class.__name__} declares supports_spec_decode but has no "
+            "spec_plan classmethod, so its feasible (max_num_seqs, K) points "
+            "cannot be resolved"
+        )
+
+    max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    requested_k = int(speculative_config.num_speculative_tokens)
+    outcome = spec_plan(vllm_config, max_num_seqs, requested_k)
+
+    if isinstance(outcome, SpecReject):
+        supported = (
+            f"; supported draft lengths at max_num_seqs={max_num_seqs}: "
+            f"{list(outcome.supported_k)}"
+            if outcome.supported_k
+            else f"; no draft length is supported at max_num_seqs={max_num_seqs}"
+        )
+        raise ValueError(
+            f"{model_class.__name__} refused speculation at "
+            f"max_num_seqs={max_num_seqs}, num_speculative_tokens="
+            f"{requested_k}: {outcome.reason}{supported}"
+        )
+    if not isinstance(outcome, SpecPlan):
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan must return SpecPlan or "
+            f"SpecReject, got {type(outcome).__name__}"
+        )
+    if outcome.effective_k > requested_k:
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan returned effective_k="
+            f"{outcome.effective_k}, above the requested "
+            f"num_speculative_tokens={requested_k}"
+        )
+
+    # Refused until a model implements them, so the first server to reach
+    # either path is not the first test of it.
+    if ACCEPT_MODE_FUSED_SAMPLE in outcome.accept_modes:
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan declares accept mode "
+            f"{ACCEPT_MODE_FUSED_SAMPLE!r}, which no model implements and the "
+            "runner cannot yet drive"
+        )
+    if outcome.drafter_state == DRAFTER_STATE_PAGED:
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan declares drafter_state "
+            f"{DRAFTER_STATE_PAGED!r}, which needs a scheduler-owned drafter "
+            "cache the runner does not yet allocate"
+        )
+    return outcome

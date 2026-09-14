@@ -26,10 +26,12 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_spec_plan,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.spec_decode import admit_speculative_config
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -1558,9 +1560,6 @@ class TTPlatform(Platform):
 
     @classmethod
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -1686,6 +1685,18 @@ class TTPlatform(Platform):
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
+        # Admitted before the width is stored, so the block-output rail is
+        # detected by what the model declared rather than by anything
+        # speculation sets.
+        store_tt_spec_plan(
+            vllm_config,
+            admit_speculative_config(
+                vllm_config,
+                model_class,
+                model_capabilities,
+                declared_output_tokens_per_step=output_tokens_per_step,
+            ),
+        )
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         # Adaptive block-output: the model emits its block ONLY when it decodes
         # alone (batch==1) and falls back to plain batched baseline otherwise,
