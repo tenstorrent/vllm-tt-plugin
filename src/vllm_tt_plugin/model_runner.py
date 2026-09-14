@@ -44,6 +44,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_spec_plan,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.input_batch import (
@@ -66,6 +67,7 @@ from vllm_tt_plugin.model_input import (
 )
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -164,6 +166,20 @@ class TTModelRunner:
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._persistent_capture_released = False
+
+        # Resolved and validated by the platform's config-time admission;
+        # ``None`` means the launch asked for no speculation. The draft length
+        # is the plan's, not ``speculative_config.num_speculative_tokens``, for
+        # a model that reduced it -- though the platform publishes the
+        # reduction back, so the two agree.
+        spec_plan = get_tt_spec_plan(vllm_config)
+        self._num_speculative_tokens = spec_plan.effective_k if spec_plan else 0
+        # A model that also serves a narrow [B, 1] decode lets a step on which
+        # no request carries drafts keep the plain decode shape instead of
+        # padding every row's draft columns away.
+        self._spec_supports_narrow_decode = bool(
+            spec_plan and spec_plan.supports_narrow_decode
+        )
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -398,6 +414,9 @@ class TTModelRunner:
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
+                # No num_speculative_tokens: the platform refuses a speculating
+                # lane launch, because lane mode builds its device input from
+                # TTLaneInputBatch, which has no candidate-block builder.
                 output_tokens_per_step=self._output_tokens_per_step,
             )
         else:
@@ -411,6 +430,7 @@ class TTModelRunner:
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
+                num_speculative_tokens=self._num_speculative_tokens,
             )
 
         # The block tables in the persistent input batch have
@@ -1063,6 +1083,48 @@ class TTModelRunner:
         input_batch.advance_generators(rows_to_advance)
         return generators
 
+    @staticmethod
+    def _spec_candidate_block(
+        input_batch: InputBatch,
+        req_indices: list[int],
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Widen a ``[B, 1]`` decode into the uniform ``[B, 1+K]`` block.
+
+        Column 0 is the row's last committed token at its own position, which
+        is the token a plain decode would have sent; columns 1..K are that
+        row's pending drafts at the K positions that follow. A row with fewer
+        than K valid drafts pads its tail columns, and a token there is
+        ``PLACEHOLDER_TOKEN_ID`` while a position there is -1, which is the
+        same no-position marker the unused rows of a padded decode carry. A
+        padded column must therefore never be mistaken for a real candidate,
+        which is what ``num_valid_drafts`` tells the model.
+
+        K comes from ``input_batch.draft_token_ids``, so the block width has
+        one source of truth: whatever width the persistent batch allocated for
+        this launch.
+        """
+        num_drafts = input_batch.draft_token_ids.shape[1]
+        drafts = torch.from_numpy(input_batch.draft_token_ids[req_indices])
+        num_valid = torch.from_numpy(input_batch.num_valid_drafts[req_indices])
+        columns = torch.arange(num_drafts, dtype=torch.int32)
+        # True where a column lies past that row's valid draft count.
+        padded_draft = columns.unsqueeze(0) >= num_valid.unsqueeze(1)
+        # Column 0 is committed, so it is never padded.
+        padded = torch.cat(
+            [torch.zeros(len(req_indices), 1, dtype=torch.bool), padded_draft], dim=1
+        )
+
+        tokens = torch.cat([input_tokens, drafts], dim=1)
+        tokens = torch.where(
+            padded, torch.full_like(tokens, PLACEHOLDER_TOKEN_ID), tokens
+        )
+        offsets = torch.arange(1 + num_drafts, dtype=input_positions.dtype)
+        positions = input_positions.unsqueeze(1) + offsets.unsqueeze(0)
+        positions = torch.where(padded, torch.full_like(positions, -1), positions)
+        return tokens, positions
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1190,6 +1252,8 @@ class TTModelRunner:
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        num_valid_drafts: torch.Tensor | None = None
+        accepted_counts: torch.Tensor | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -1216,6 +1280,15 @@ class TTModelRunner:
                 req_indices, :max_prefill_tokens
             ]
             decode_layout_changed = False
+            if input_batch.num_speculative_tokens:
+                # A prefilling row's pending drafts are stale: a request
+                # resumed from preemption replays its own history, and a
+                # chunked continuation has not reached its drafted positions.
+                # 1 is the committed count after a prefill, so the first
+                # speculative step after one needs no special case.
+                input_batch.accepted_counts[req_indices] = 1
+                input_batch.num_valid_drafts[req_indices] = 0
+                input_batch.draft_token_ids[req_indices] = PLACEHOLDER_TOKEN_ID
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1228,17 +1301,59 @@ class TTModelRunner:
             # explicit contract commands or the legacy ``reset_batch`` keyword.
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
+            if input_batch.num_speculative_tokens:
+                num_valid_drafts = torch.from_numpy(
+                    input_batch.num_valid_drafts[req_indices]
+                )
+                accepted_counts = torch.from_numpy(
+                    input_batch.accepted_counts[req_indices]
+                )
+                # Uniformly 1+K wide, so a model needs one verify shape rather
+                # than two, unless it declared a narrow decode as well and no
+                # row carries a draft this step.
+                if not self._spec_supports_narrow_decode or bool(
+                    num_valid_drafts.any()
+                ):
+                    input_tokens, input_positions = self._spec_candidate_block(
+                        input_batch, req_indices, input_tokens, input_positions
+                    )
+
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
             if input_tokens.shape[0] < decode_pad_to:
                 batch_pad = decode_pad_to - input_tokens.shape[0]
+                # Width comes from the built block: 1 for a plain decode, 1+K
+                # for a speculative one.
                 input_tokens = torch.cat(
-                    [input_tokens, torch.zeros(batch_pad, 1, dtype=torch.int32)]
+                    [
+                        input_tokens,
+                        torch.zeros(
+                            batch_pad, input_tokens.shape[1], dtype=torch.int32
+                        ),
+                    ]
                 )
                 # Pad positions with -1 to indicate no position
                 input_positions = torch.cat(
-                    [input_positions, torch.ones(batch_pad, dtype=torch.int32) * -1]
+                    [
+                        input_positions,
+                        torch.full(
+                            (batch_pad, *input_positions.shape[1:]),
+                            -1,
+                            dtype=input_positions.dtype,
+                        ),
+                    ]
                 )
+                if num_valid_drafts is not None:
+                    # A padding row carries no draft and stands on its own
+                    # input token, which is the count 1: ``accepted_counts`` is
+                    # a count in [1, 1+K] and is never 0, on a padding row as
+                    # much as on a real one.
+                    num_valid_drafts = torch.cat(
+                        [num_valid_drafts, torch.zeros(batch_pad, dtype=torch.int32)]
+                    )
+                    accepted_counts = torch.cat(
+                        [accepted_counts, torch.ones(batch_pad, dtype=torch.int32)]
+                    )
                 # Pad each per-group block table to the same wire capacity so
                 # the device sees a fixed shape regardless of how many users
                 # are active. Keep ``block_tables`` aliased to the (now padded)
@@ -1434,6 +1549,11 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            # Already in post-remap row order: ``req_indices`` reads the
+            # persistent batch after ``condense`` moved every surviving
+            # request's speculative state down with it.
+            num_valid_drafts=num_valid_drafts,
+            accepted_counts=accepted_counts,
         )
 
     def build_model_input(
