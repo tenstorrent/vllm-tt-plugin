@@ -162,3 +162,17 @@ def test_an_unreduced_draft_length_is_left_alone(monkeypatch, vllm_config):
     with pytest.raises(ValueError):
         _run_hook(monkeypatch, _speculative(vllm_config, requested_k=7), model)
     assert vllm_config.speculative_config.num_speculative_tokens == 7
+
+
+def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
+    # Lane mode builds its device input from TTLaneInputBatch, which has no
+    # candidate-block builder, so the refusal is what stops a lane launch from
+    # accepting the flags and sending plain single-token decodes.
+    vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
+    vllm_config.parallel_config.data_parallel_size = 1
+    model = make_fake_spec_model(max_supported_num_seqs=1024)
+    with pytest.raises(ValueError) as excinfo:
+        _run_hook(monkeypatch, _speculative(vllm_config), model)
+    message = str(excinfo.value)
+    assert "lane mode" in message
+    assert "TTLaneInputBatch" in message
