@@ -268,7 +268,7 @@ Two more contracts are methods, not dict keys: hybrid KV opt-in is
 `release_persistent_capture`.
 
 The model classes and their capability declarations live in **tt-metal**, under
-`models.tt_transformers.tt.generator_vllm` and the per-demo generators such as
+`models.ttt_compat.tt.generator_vllm` and the per-demo generators such as
 `models.demos.llama3_70b_galaxy.tt.generator_vllm`.
 
 Consequence: a plugin change that consumes a new capability needs a matching
