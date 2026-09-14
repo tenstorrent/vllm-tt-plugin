@@ -2607,12 +2607,12 @@ class TTModelRunner:
         return runner_output
 
     def warmup_model(self) -> None:
-        # Two-phase warmup: compile first, then capture traces.
+        # Two-phase warmup: eager preparation, then trace-enabled warmup.
         #
-        # Phase 1 compiles all op variants (prefill + decode) into the
-        # program cache WITHOUT capturing any traces.  Phase 2 then
-        # captures traces with every op already compiled, so no new
-        # kernel-cache allocations occur that could corrupt trace memory.
+        # Phase 1 warms the eager prefill/decode paths without capturing
+        # traces. Generators own preparation of the programs and persistent
+        # buffers their traces need. Keep prefill first in Phase 2 because
+        # some custom adapters defer its preparation to that call.
         #
         # Assumptions / limitations:
         #   1. Traced and non-traced code paths must use the same ops.
@@ -2641,7 +2641,9 @@ class TTModelRunner:
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )
 
-        # Phase 1: compile all code paths (no trace capture)
+        # Phase 1: eager warmup (no trace capture). tt-metal #55343 also
+        # stages generic decode trace inputs here, using the profiled
+        # num_blocks above, so Phase 2 can reuse their device allocations.
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
         self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
 
@@ -2649,14 +2651,13 @@ class TTModelRunner:
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled). Capture decode
-        # before prefill: the decode trace's persistent input buffers (token,
-        # position, page table) are staged with copy_host_to_device while no
-        # trace is live, so they cannot be placed inside a prefill trace's
-        # scratch. Capturing prefill first leaves those buffers allocated while
-        # a prefill trace is live, and every later prefill replay then rewrites
-        # them (observed as a zeroed decode token buffer on decode).
-        if trace_decode_mode:
-            self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+        # Phase 2: capture prefill before decode. Custom adapters such as
+        # Qwen can defer persistent prefill allocations / compilation until
+        # this trace-enabled warmup; they must not run behind decode traces.
+        # Generic decode inputs are already staged by tt-metal #55343, so
+        # restoring this order does not require allocating them after prefill
+        # capture. Older tt-metal revisions lack that protection (see #122).
         if trace_prefill_mode:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+        if trace_decode_mode:
+            self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)

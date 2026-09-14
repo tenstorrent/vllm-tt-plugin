@@ -41,6 +41,12 @@ If testing a specific model, check the
 [TT-Metal LLMs table](https://github.com/tenstorrent/tt-metal?tab=readme-ov-file#llms)
 for the appropriate tt-metal and vLLM commits.
 
+The current warmup ordering requires tt-metal's trace-input preparation fixes
+from [PR #55343](https://github.com/tenstorrent/tt-metal/pull/55343), merged as
+`743890db568bd3ff9626166a2ae201c28aa35072`, or a descendant containing those fixes.
+Older revisions can allocate persistent decode inputs after prefill trace
+capture, allowing subsequent prefill replay to corrupt decode tokens.
+
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
