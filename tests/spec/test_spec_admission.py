@@ -19,6 +19,11 @@ import vllm  # noqa: F401
 
 from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import get_tt_spec_plan, store_tt_spec_plan
+from vllm_tt_plugin.spec_admission import (
+    method_requirements,
+    refuse_unimplemented_execution,
+    resolve_speculative_plan,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_FUSED_SAMPLE,
@@ -28,12 +33,13 @@ from vllm_tt_plugin.spec_decode import (
     SPEC_REQUIREMENT_HIDDEN_FEED,
     SpecPlan,
     SpecReject,
-    admit_speculative_config,
-    method_requirements,
 )
 
-# An MTP method name vLLM already carries for the model this plan targets.
-MTP_METHOD = "qwen3_5_mtp"
+_SENTINEL = object()
+
+# The only MTP name admission can receive: SpeculativeConfig.__post_init__
+# rewrites every other MTPModelTypes member to "mtp" during construction.
+MTP_METHOD = "mtp"
 
 
 def _config(*, method=MTP_METHOD, requested_k=7, max_num_seqs=1, speculative=True):
@@ -48,12 +54,12 @@ def _config(*, method=MTP_METHOD, requested_k=7, max_num_seqs=1, speculative=Tru
     )
 
 
-def _admit(config, model_class=FakeSpecModel, declared_width=1):
-    return admit_speculative_config(
+def _admit(config, model_class=FakeSpecModel, capabilities=_SENTINEL):
+    return resolve_speculative_plan(
         config,
         model_class,
-        model_class.model_capabilities,
-        declared_output_tokens_per_step=declared_width,
+        model_class.model_capabilities if capabilities is _SENTINEL else capabilities,
+        int(config.scheduler_config.max_num_seqs),
     )
 
 
@@ -65,7 +71,20 @@ def test_host_drafters_ask_nothing_of_the_model():
     assert method_requirements("suffix") == ()
 
 
-@pytest.mark.parametrize("method", [MTP_METHOD, "eagle", "eagle3", "dflash", "medusa"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        MTP_METHOD,
+        "eagle",
+        "eagle3",
+        "dflash",
+        "medusa",
+        "mlp_speculator",
+        # Table-only: SpeculativeConfig rewrites this to "mtp" before
+        # admission ever sees it, so it can never arrive in production.
+        "qwen3_5_mtp",
+    ],
+)
 def test_device_drafters_need_propose_and_a_hidden_feed(method):
     assert method_requirements(method) == (
         SPEC_REQUIREMENT_DEVICE_PROPOSE,
@@ -111,13 +130,17 @@ def test_a_refusal_names_the_supported_draft_lengths():
         _admit(_config(requested_k=2))
     message = str(excinfo.value)
     assert "[3, 7, 11]" in message
-    assert "2" in message
+    # The wrapper's own contribution, not the reason string the model wrote.
+    assert "num_speculative_tokens=2" in message
+    assert "--spec-tokens" in message
 
 
 def test_a_refusal_names_the_concurrency_it_cannot_serve():
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(max_num_seqs=8))
-    assert "8" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "max_num_seqs=8" in message
+    assert "--max-num-seqs" in message
 
 
 def test_speculation_is_never_disabled_silently():
@@ -187,31 +210,37 @@ def test_a_model_declaring_support_without_a_plan_is_refused():
     assert "spec_plan" in str(excinfo.value)
 
 
-# --- the two rails cannot be combined -------------------------------------
+# --- model_capabilities that is absent entirely ---------------------------
 
 
-def test_a_block_output_model_cannot_also_speculate():
-    # Both own output_tokens_per_step, and the rail's machinery neutralizes
-    # sampling controls and disables logprobs, which speculation honours.
+def test_an_absent_capability_dictionary_is_refused_not_crashed():
+    # TTPlatform resolves it with getattr(model_class, "model_capabilities",
+    # None), so None is a live value.
     with pytest.raises(ValueError) as excinfo:
-        _admit(_config(), declared_width=64)
-    assert "64" in str(excinfo.value)
-
-
-def test_a_single_token_model_is_not_treated_as_a_block_model():
-    assert _admit(_config(), declared_width=1).effective_k == 7
+        _admit(_config(), capabilities=None)
+    assert "supports_spec_decode" in str(excinfo.value)
 
 
 # --- surfaces refused until something implements them ---------------------
 
 
-def test_a_fused_sample_mode_is_refused():
+def test_offering_fused_sample_alongside_a_runnable_mode_is_still_admitted():
+    # Declaring a real capability must not make a model less admissible, or a
+    # model author's only remedy is to hide what the device can do.
     variant = make_fake_spec_model(
         accept_modes=(ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_FUSED_SAMPLE)
     )
+    plan = _admit(_config(), model_class=variant)
+    assert ACCEPT_MODE_FUSED_SAMPLE in plan.accept_modes
+
+
+def test_a_plan_offering_only_unrunnable_modes_is_refused():
+    variant = make_fake_spec_model(accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,))
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(), model_class=variant)
-    assert ACCEPT_MODE_FUSED_SAMPLE in str(excinfo.value)
+    message = str(excinfo.value)
+    assert ACCEPT_MODE_FUSED_SAMPLE in message
+    assert ACCEPT_MODE_ARGMAX_IDS in message
 
 
 def test_a_paged_drafter_cache_is_refused():
@@ -264,7 +293,11 @@ def test_a_reject_with_no_supported_lengths_still_explains_itself():
 
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(), model_class=_NeverModel)
-    assert "no spare rows" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "no spare rows" in message
+    # The empty-supported_k branch, which tells an operator that no draft
+    # length works at this concurrency rather than printing a bare list.
+    assert "no draft length is supported" in message
 
 
 # --- the resolved plan is what downstream reads ---------------------------
@@ -274,10 +307,104 @@ def test_the_admitted_plan_round_trips_through_the_config():
     config = _config()
     plan = _admit(config)
     store_tt_spec_plan(config, plan)
-    assert get_tt_spec_plan(config) is plan
+    # Equal, not identical: the plan is stored as a dictionary so
+    # additional_config stays JSON-encodable, and rebuilt on the way out.
+    assert get_tt_spec_plan(config) == plan
 
 
 def test_an_unspeculative_config_stores_no_plan():
     config = _config(speculative=False)
     store_tt_spec_plan(config, _admit(config))
     assert get_tt_spec_plan(config) is None
+
+
+# --- the plugin's own method table cannot drift from vLLM's -----------------
+
+
+def test_every_mapped_method_name_is_one_vllm_knows():
+    # The coupling runs one way: vLLM's literals feed the table, but the
+    # plugin's own entries are plain strings. An upstream rename would
+    # otherwise leave the plugin mapping a dead name while refusing the live
+    # one, with every test green.
+    from typing import get_args
+
+    from vllm.config.speculative import SpeculativeMethod
+
+    from vllm_tt_plugin.spec_admission import _build_method_requirements
+
+    assert set(_build_method_requirements()) <= set(get_args(SpeculativeMethod))
+
+
+def test_the_refusal_quotes_method_names_the_backend_does_serve():
+    with pytest.raises(ValueError) as excinfo:
+        method_requirements("ngram_gpu")
+    message = str(excinfo.value)
+    assert "ngram_gpu" in message
+    assert "eagle" in message
+    assert "--spec-method" in message
+
+
+# --- a spec_plan attribute that is not callable ---------------------------
+
+
+def test_a_non_callable_spec_plan_is_refused_naming_what_was_found():
+    # The natural mistake is a class attribute of that name, which an
+    # `is None` test would pass straight through to a bare TypeError.
+    class _NotAMethodModel(FakeSpecModel):
+        spec_plan = 5
+
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(), model_class=_NotAMethodModel)
+    message = str(excinfo.value)
+    assert "spec_plan" in message
+    assert "5" in message
+
+
+# --- nothing can execute an admitted plan yet ------------------------------
+
+
+def test_resolution_accepts_what_execution_cannot_run():
+    # Resolution validates the declarations; the separate refusal keeps a
+    # server from starting with no execution path behind it. Deleting that one
+    # call is the whole change when the runner lands.
+    config = _config()
+    assert (
+        resolve_speculative_plan(
+            config, FakeSpecModel, FakeSpecModel.model_capabilities, 1
+        ).effective_k
+        == 7
+    )
+    with pytest.raises(ValueError) as excinfo:
+        refuse_unimplemented_execution(FakeSpecModel)
+    message = str(excinfo.value)
+    assert "take_draft_token_ids" in message
+    assert "verify-then-propose" in message
+
+
+# --- the paged-drafter gate cannot be walked around ------------------------
+
+
+def test_a_paged_cache_method_is_refused_even_when_the_plan_says_internal():
+    # The gate must fire on the method's requirement, not only on the returned
+    # plan, or a model whose two declarations contradict each other is admitted
+    # through the gap between them.
+    variant = make_fake_spec_model(
+        model_capabilities={
+            "supports_spec_decode": True,
+            "spec_requirements": [
+                SPEC_REQUIREMENT_DEVICE_PROPOSE,
+                "paged_drafter_cache",
+            ],
+        },
+    )
+    assert variant.spec_plan(None, 1, 7).drafter_state == "internal"
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(method="draft_model"), model_class=variant)
+    assert "scheduler-owned drafter cache" in str(excinfo.value)
+
+
+def test_a_plan_returning_a_paged_drafter_state_is_also_refused():
+    variant = make_fake_spec_model(drafter_state=DRAFTER_STATE_PAGED)
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(), model_class=variant)
+    assert DRAFTER_STATE_PAGED in str(excinfo.value)
