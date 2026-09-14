@@ -6,9 +6,11 @@ The contract these types encode is specified in
 https://github.com/tenstorrent/vllm-tt-plugin/issues/110. This module holds the
 wire surface and the validation of the values that cross it, so a model class
 and the runner can agree on shapes and modes before either side implements a
-step of the loop. It reads no ``model_capabilities`` key and admits no
-configuration: ``normalize_declared_values`` validates a declaration a caller
-has already read, and lives here next to the constant sets it validates.
+step of the loop. It reads no ``model_capabilities`` key, admits no
+configuration and imports nothing from vLLM at run time:
+``normalize_declared_values`` validates a declaration a caller has already
+read, and lives here next to the constant sets it validates. The plugin's own
+admission policy lives in ``spec_admission``, which imports from here.
 
 Per the contract, one step is verify then propose: the runner calls
 ``decode_forward`` over the ``[B, 1+K]`` candidate block, walks acceptance, and
@@ -343,6 +345,11 @@ def normalize_declared_values(
     """
     if values is None:
         return ()
+    if isinstance(values, str):
+        raise ValueError(
+            f"{label} must be a list of values, not the single string "
+            f"{values!r}; wrap it in a list"
+        )
     declared = tuple(values)
     unknown = [value for value in declared if value not in known]
     if unknown:

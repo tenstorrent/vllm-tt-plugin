@@ -239,7 +239,8 @@ instance exists. Downstream code reads rewritten scheduler and cache fields,
 `store_tt_*` / `get_tt_*` on `VllmConfig`, or `TTPlatform` class attributes.
 It does not re-read the dict.
 
-Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
+Keys currently consumed by `src/vllm_tt_plugin/platform.py` and
+`src/vllm_tt_plugin/spec_admission.py`:
 
 | Key | Default if absent | Effect |
 |---|---|---|
@@ -248,6 +249,9 @@ Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
 | `output_tokens_per_step` | `1` | Committed output width per step. `1` is token-at-a-time; `>1` is block-output width |
 | `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
 | `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
+| `supports_spec_decode` | `False` | Master gate for speculative decoding. The three keys below and the `spec_plan` method are read only when a `speculative_config` is present |
+| `spec_requirements` | `[]` | What the model's drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. The plugin maps a vLLM speculative method onto these; a model never names a method |
+| `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when the method needs `hidden_feed` |
 
 Absent keys default via `.get`. That is the live contract. Do not add
 fail-on-missing for a new key unless the matching tt-metal generators will
@@ -263,9 +267,10 @@ not remove them in an unrelated pull request:
 - GPT-OSS top-K logprobs: `hf_config.model_type == "gpt_oss"`
 - hybrid KV: `get_kv_cache_spec` on the model class, not `model_capabilities`
 
-Two more contracts are methods, not dict keys: hybrid KV opt-in is
+Three more contracts are methods, not dict keys: hybrid KV opt-in is
 `get_kv_cache_spec`; block-output lifecycle is `release_request` and
-`release_persistent_capture`.
+`release_persistent_capture`; speculative feasibility is `spec_plan`, a
+classmethod specified in `docs/SPEC_DECODE_CONTRACT.md`.
 
 The model classes and their capability declarations live in **tt-metal**, under
 `models.tt_transformers.tt.generator_vllm` and the per-demo generators such as
