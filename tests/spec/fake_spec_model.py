@@ -153,7 +153,7 @@ class FakeSpecModel:
         num_valid_drafts,
         accepted_counts,
         spec_mode: str,
-        page_table=None,
+        page_tables_per_layer=None,
         slot_mapping=None,
         sampling_params=None,
     ) -> VerifyOutput:
@@ -162,7 +162,7 @@ class FakeSpecModel:
         ``spec_mode`` has no default, so a caller that forgets it fails rather
         than silently receiving greedy ids.
         """
-        del page_table, slot_mapping, sampling_params
+        del page_tables_per_layer, slot_mapping, sampling_params
         if spec_mode not in self.accept_modes:
             raise ValueError(
                 f"FakeSpecModel serves {list(self.accept_modes)}, "

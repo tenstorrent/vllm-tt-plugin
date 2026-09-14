@@ -54,13 +54,47 @@ ACCEPT_MODES = frozenset(
     {ACCEPT_MODE_LOGITS, ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_FUSED_SAMPLE}
 )
 
-# Where a drafter's own state lives. "internal" means the model allocates it
-# and reports its size through the two byte fields of SpecPlan. "paged" means
-# the drafter needs a scheduler-owned growing cache, declared through the model
-# class's get_kv_cache_spec hook.
+# Where a drafter's own state lives. The first two describe a cost the runner
+# must budget through the two byte fields of SpecPlan: "internal" means the
+# model allocates the state itself, "paged" means the drafter needs a
+# scheduler-owned growing cache declared through the model class's
+# get_kv_cache_spec hook. The third describes a constraint instead of a cost,
+# which is why a byte field alone cannot carry it: a drafter that cross-attends
+# into the TARGET's caches reserves nothing but requires things to stay true of
+# how those caches are organised, carried in
+# SpecPlan.drafter_target_cache_requires.
 DRAFTER_STATE_INTERNAL = "internal"
 DRAFTER_STATE_PAGED = "paged"
-DRAFTER_STATES = frozenset({DRAFTER_STATE_INTERNAL, DRAFTER_STATE_PAGED})
+DRAFTER_STATE_SHARED_WITH_TARGET = "shared_with_target"
+DRAFTER_STATES = frozenset(
+    {
+        DRAFTER_STATE_INTERNAL,
+        DRAFTER_STATE_PAGED,
+        DRAFTER_STATE_SHARED_WITH_TARGET,
+    }
+)
+
+# What a "shared_with_target" drafter requires of the target's caches. These are
+# requirements rather than costs because violating either produces reads from
+# the wrong cache positions, not an allocation failure.
+#
+#   "named_layer_caches"   the drafter reads specific target layers, normally
+#                          the last of each attention kind, so those caches
+#                          must stay allocated and addressable for the life of
+#                          the request.
+#   "absolute_positions"   the drafter addresses target cache slots by absolute
+#                          position, so a target whose sliding layers are a
+#                          bounded ring must apply the same wrap modulo in the
+#                          drafter's attention, and the drafter's own window
+#                          must match the target's.
+DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES = "named_layer_caches"
+DRAFTER_TARGET_CACHE_ABSOLUTE_POSITIONS = "absolute_positions"
+DRAFTER_TARGET_CACHE_REQUIREMENTS = frozenset(
+    {
+        DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES,
+        DRAFTER_TARGET_CACHE_ABSOLUTE_POSITIONS,
+    }
+)
 
 # What a drafting method needs from the model. The runner maps a vLLM
 # SpeculativeConfig method name onto these; a model never enumerates method
@@ -90,6 +124,13 @@ HIDDEN_HANDOFFS = frozenset({HIDDEN_HANDOFF_ON_DEVICE, HIDDEN_HANDOFF_ROUNDTRIP}
 # interpreting its dtype, layout or tensor-parallel fracturing. Named so the
 # term is greppable on both sides of the boundary.
 HiddenHandle = Any
+
+# Tail marker for a fixed-width block of token ids that committed fewer tokens
+# than the width. The runner truncates at the first occurrence. A real token id
+# must never be used, including the end-of-sequence id: it is indistinguishable
+# from a committed token, so it silently turns a short commit into a stop.
+# Matches upstream's PLACEHOLDER_TOKEN_ID.
+PLACEHOLDER_TOKEN_ID = -1
 
 # Which verify-return fields each mode must carry. Contract information, so a
 # caller can check a return it did not build.
@@ -129,6 +170,10 @@ class SpecPlan:
     extra_bytes_per_token: int
     accept_modes: tuple[str, ...]
     drafter_state: str
+    # Only meaningful for drafter_state "shared_with_target", where both byte
+    # fields are zero and what crosses instead is what must stay true of the
+    # target's caches. Empty for the two states that carry a cost.
+    drafter_target_cache_requires: tuple[str, ...] = ()
     # Whether the model also serves a narrow [B, 1] decode alongside the wide
     # [B, 1+K] one. Speculative decode calls are uniformly 1+K wide even on a
     # step where no request carries drafts, so that a model needs one verify
@@ -162,6 +207,20 @@ class SpecPlan:
             raise ValueError(
                 f"SpecPlan.drafter_state {self.drafter_state!r} is not one of "
                 f"{sorted(DRAFTER_STATES)}"
+            )
+
+        requires = normalize_declared_values(
+            self.drafter_target_cache_requires,
+            DRAFTER_TARGET_CACHE_REQUIREMENTS,
+            "SpecPlan.drafter_target_cache_requires",
+        )
+        object.__setattr__(self, "drafter_target_cache_requires", requires)
+        if requires and self.drafter_state != DRAFTER_STATE_SHARED_WITH_TARGET:
+            raise ValueError(
+                "SpecPlan.drafter_target_cache_requires applies only to "
+                f"drafter_state {DRAFTER_STATE_SHARED_WITH_TARGET!r}, but "
+                f"drafter_state is {self.drafter_state!r} with requirements "
+                f"{list(requires)}"
             )
 
     @property
@@ -247,6 +306,8 @@ class VerifyOutput:
     # [B, 1+K, V] over the whole vocabulary, for spec_mode "logits".
     logits: "torch.Tensor | None" = None
     # [B, 1+K] committed prefix plus correction or bonus, for "fused_sample".
+    # Rows that committed fewer than 1+K tokens pad the tail with
+    # PLACEHOLDER_TOKEN_ID; the runner truncates at the first one.
     accepted_token_ids: "torch.Tensor | None" = None
     # [B] committed token count per row, for "fused_sample". Same domain as the
     # accepted_counts a verify takes as input: see SpecPlan.
@@ -299,8 +360,12 @@ __all__ = [
     "ACCEPT_MODE_FUSED_SAMPLE",
     "ACCEPT_MODE_LOGITS",
     "DRAFTER_STATES",
+    "DRAFTER_STATE_SHARED_WITH_TARGET",
     "DRAFTER_STATE_INTERNAL",
     "DRAFTER_STATE_PAGED",
+    "DRAFTER_TARGET_CACHE_ABSOLUTE_POSITIONS",
+    "DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES",
+    "DRAFTER_TARGET_CACHE_REQUIREMENTS",
     "HIDDEN_HANDOFFS",
     "HIDDEN_HANDOFF_ON_DEVICE",
     "HIDDEN_HANDOFF_ROUNDTRIP",
@@ -311,6 +376,7 @@ __all__ = [
     "SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE",
     "DraftOutput",
     "MODE_REQUIRED_FIELDS",
+    "PLACEHOLDER_TOKEN_ID",
     "HiddenHandle",
     "SpecPlan",
     "SpecReject",

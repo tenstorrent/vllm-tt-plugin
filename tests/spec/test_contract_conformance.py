@@ -25,8 +25,14 @@ from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_LOGITS,
     ACCEPT_MODES,
     DRAFTER_STATE_INTERNAL,
+    DRAFTER_STATE_PAGED,
+    DRAFTER_STATE_SHARED_WITH_TARGET,
+    DRAFTER_TARGET_CACHE_ABSOLUTE_POSITIONS,
+    DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES,
+    DRAFTER_TARGET_CACHE_REQUIREMENTS,
     HIDDEN_HANDOFFS,
     MODE_REQUIRED_FIELDS,
+    PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENTS,
     SpecPlan,
     SpecReject,
@@ -122,6 +128,67 @@ def test_spec_plan_accepts_fused_sample_because_admission_owns_that_policy():
     # a config-time decision, not a property of the value object.
     plan = _plan(accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,))
     assert plan.accept_modes == (ACCEPT_MODE_FUSED_SAMPLE,)
+
+
+# --- drafter state: two cost kinds and one constraint kind ----------------
+
+
+@pytest.mark.parametrize(
+    "state",
+    [DRAFTER_STATE_INTERNAL, DRAFTER_STATE_PAGED, DRAFTER_STATE_SHARED_WITH_TARGET],
+)
+def test_every_drafter_state_is_accepted(state):
+    assert _plan(drafter_state=state).drafter_state == state
+
+
+def test_a_shared_drafter_declares_what_it_needs_of_the_target():
+    plan = _plan(
+        drafter_state=DRAFTER_STATE_SHARED_WITH_TARGET,
+        drafter_target_cache_requires=[
+            DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES,
+            DRAFTER_TARGET_CACHE_ABSOLUTE_POSITIONS,
+        ],
+    )
+    assert set(plan.drafter_target_cache_requires) == DRAFTER_TARGET_CACHE_REQUIREMENTS
+
+
+def test_a_cost_bearing_drafter_state_carries_no_target_requirements():
+    # The two states that reserve bytes describe a cost, not a constraint, so a
+    # requirement on either is a contradiction rather than extra information.
+    assert (
+        _plan(drafter_state=DRAFTER_STATE_INTERNAL).drafter_target_cache_requires == ()
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _plan(
+            drafter_state=DRAFTER_STATE_PAGED,
+            drafter_target_cache_requires=[DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES],
+        )
+    assert DRAFTER_STATE_SHARED_WITH_TARGET in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "requires",
+    [
+        ["nonsense"],
+        [DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES] * 2,
+    ],
+)
+def test_target_cache_requirements_are_validated(requires):
+    with pytest.raises(ValueError):
+        _plan(
+            drafter_state=DRAFTER_STATE_SHARED_WITH_TARGET,
+            drafter_target_cache_requires=requires,
+        )
+
+
+# --- the block padding marker ---------------------------------------------
+
+
+def test_placeholder_token_id_is_negative_and_not_a_token():
+    # A real token id as a pad is indistinguishable from a committed token, so
+    # the marker has to be outside the vocabulary for every model.
+    assert PLACEHOLDER_TOKEN_ID == -1
+    assert PLACEHOLDER_TOKEN_ID < 0
 
 
 # --- SpecReject carries a usable refusal ----------------------------------
