@@ -239,10 +239,13 @@ class SpecPlan:
 
     @property
     def block_width(self) -> int:
-        """Row width of every speculative decode call, ``1 + effective_k``.
+        """Row width of a **wide** speculative decode call, ``1 + effective_k``.
 
-        Uniform once speculation is on, including on a step where no request
-        carries drafts, so a model needs one verify shape and not two.
+        Every speculative step is this wide, including a step where no request
+        carries drafts, so a model needs one verify shape and not two. The one
+        exception is a model that sets ``supports_narrow_decode``: it also
+        receives the plain decode's own shapes on a draftless step, and this
+        property does not describe that call.
         """
         return 1 + self.effective_k
 
@@ -412,6 +415,11 @@ def accept_greedy_drafts(
         )
 
     ids = argmax_ids.to(torch.int32)
+    if num_drafts == 0:
+        # A narrow step: the model was handed one column because no row carried
+        # a draft, so every row commits that column and nothing else. Handled
+        # before the walk because an argmax over a zero-width reduction raises.
+        return ids, torch.ones(rows, dtype=torch.int32)
     matched = ids[:, :num_drafts] == draft_token_ids.to(torch.int32)
     # A column past a row's own count holds padding, not a candidate, so it can
     # neither be accepted nor reject the row.

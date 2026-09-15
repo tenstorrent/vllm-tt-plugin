@@ -11,17 +11,29 @@ https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
 
 ## Status
 
-The plugin admits a configuration, builds the candidate block described in
-section 4, and then refuses the launch, because no execution path exists yet:
-`TTWorker` implements no `take_draft_token_ids` and `TTModelRunner` drives no
-verify-then-propose loop, so nothing proposes drafts or walks acceptance.
-Implementing this contract on a model is therefore useful now for validating
-declarations and input shapes, and does not yet produce a speculating server.
+A model implementing this contract serves speculative decoding, within one
+boundary. What runs:
 
-Speculation and TT lane mode cannot be combined. Lane mode builds its device
-input from `TTLaneInputBatch`, which has no candidate-block builder, so the
-platform refuses that pair rather than serving plain decodes under speculative
-flags.
+- the **n-gram** method, and no other. The runner proposes for `ngram` only, so
+  every other method vLLM knows is refused at configuration time rather than
+  admitted to draft nothing.
+- the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
+  is refused, because the runner requests `argmax_ids` on every step.
+- **greedy requests**, and no others. A request carrying a temperature,
+  logprobs, structured output, a token filter or a penalty is refused per
+  request: the accept walk compares token ids and never sees logits, so it
+  cannot arbitrate any of those, and answering greedily anyway would change
+  what was asked for without saying so.
+- the **synchronous** decode tail. A launch combining speculation with
+  asynchronous scheduling is refused, because the accept walk lives in the
+  synchronous path.
+- **front-packed** execution. Lane mode is refused: it builds its device input
+  from `TTLaneInputBatch`, which has no candidate-block builder.
+
+Every one of those is a refusal that raises with the offending values, never a
+silent fallback. A device drafter, the sampled accept walk, structured output
+over drafts, and `fused_sample` each need their own execution path before the
+matching refusal can go.
 
 ## 1. Capability declarations
 
@@ -123,13 +135,30 @@ drafts and resets its count to 1, because a request resumed from preemption
 replays its own history and its drafts no longer sit at the positions they were
 drafted for.
 
-A model that declares `supports_narrow_decode` receives the plain decode's own
-shapes on a step where no row carries a draft, which are `[B, 1]` tokens and
-`[B]` positions, so the narrow step is the ordinary decode call and not a third
-shape to implement. It receives the two `[B]` side tensors on that step too,
-because the count is how it picks the candidate state slot its previous step
-committed from, whatever this step's width. A model that does not declare it
-receives `[B, 1+K]` on every decode step.
+### The two call shapes
+
+A model that does not declare `supports_narrow_decode` only ever sees the wide
+call. One that does sees the narrow one on a step where no row carries a draft.
+
+| | wide call | narrow call |
+| --- | --- | --- |
+| `tokens` | `[B, 1+K]` int32 | `[B, 1]` int32 |
+| `start_pos` | `[B, 1+K]` int32 | `[B]` int32, 1-D |
+| `draft_token_ids` | `[B, K]` int32 | `[B, K]` int32, every entry padding |
+| `num_valid_drafts` | `[B]` int32 | `[B]` int32, every entry 0 |
+| `accepted_counts` | `[B]` int32 | `[B]` int32 |
+| `spec_mode` | present | present |
+| return | `VerifyOutput`, `argmax_ids` `[B, 1+K]` | `VerifyOutput`, `argmax_ids` `[B, 1]` |
+
+The narrow call is the ordinary decode call: its `tokens` and `start_pos` are
+exactly the shapes a non-speculating decode sends, so a model that declares it
+implements no third shape. Both `[B]` side tensors still come with it, because
+`accepted_counts` is how a model picks the candidate state slot its previous
+step committed from whatever this step's width is.
+
+Its return carries one column, which is that step's committed token, and the
+runner reads it with an accepted count of 1. `SpecPlan.block_width` describes
+the wide call only.
 
 ## 4a. The verify call
 
