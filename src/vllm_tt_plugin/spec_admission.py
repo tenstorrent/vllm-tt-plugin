@@ -98,24 +98,6 @@ def method_requirements(method: str) -> tuple[str, ...]:
     )
 
 
-def refuse_unimplemented_execution(model_class: type) -> None:
-    """Refuse a resolved plan, because nothing can execute it yet.
-
-    Called after resolution, the writeback and the store, so a model author
-    sees their own declaration error rather than this blanket refusal, and so
-    whoever implements the execution path deletes exactly one call.
-    """
-    raise ValueError(
-        f"{model_class.__name__} is admissible for speculative decoding, but "
-        "the TT backend cannot execute it yet: TTWorker implements no "
-        "take_draft_token_ids, which vLLM's EngineCore calls on every step of "
-        "a speculative run, and TTModelRunner drives no verify-then-propose "
-        "loop. Refused rather than started, because a server that accepts the "
-        "flags and serves no speculation reports a speedup it did not achieve. "
-        "Drop the speculative flags to serve this model"
-    )
-
-
 def resolve_speculative_plan(
     vllm_config: "VllmConfig",
     model_class: type,
@@ -247,6 +229,5 @@ def resolve_speculative_plan(
 
 __all__ = [
     "method_requirements",
-    "refuse_unimplemented_execution",
     "resolve_speculative_plan",
 ]

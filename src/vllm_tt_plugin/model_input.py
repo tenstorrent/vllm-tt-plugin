@@ -165,6 +165,14 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
+    # drafts the block's columns 1..K carry, kept alongside the block because
+    # the accept walk needs them again after the verify returns. ``spec_mode``
+    # names the accept mode the verify was asked for, and its presence is what
+    # marks a step speculative. Both ``None`` otherwise.
+    draft_token_ids: torch.Tensor | None = None
+    spec_mode: str | None = None
+
     # Decode-only, speculation only. ``num_valid_drafts[i]`` is how many of row
     # i's ``input_tokens[i, 1:]`` columns are real drafts, in [0, K]; the
     # columns past it carry a padding marker and must not be verified.
