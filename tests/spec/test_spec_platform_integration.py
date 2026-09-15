@@ -17,7 +17,7 @@ import pytest
 # on a half-built module, so let vLLM finish importing itself first.
 import vllm  # noqa: F401
 
-from tests.spec.fake_spec_model import make_fake_spec_model
+from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_spec_plan,
@@ -156,6 +156,28 @@ def test_an_unreduced_draft_length_is_left_alone(monkeypatch, vllm_config):
     model = make_fake_spec_model(max_supported_num_seqs=4)
     _run_hook(monkeypatch, _speculative(vllm_config, requested_k=7), model)
     assert vllm_config.speculative_config.num_speculative_tokens == 7
+
+
+def test_async_scheduling_cannot_speculate(monkeypatch, vllm_config):
+    # The loop lives in the synchronous decode tail: _finish_async_decode has
+    # no accept walk, so an asynchronous speculative step would hand the
+    # verify's candidate block to the ordinary sampler and commit ids as
+    # though they had been sampled.
+    # A model that does not declare async-decode support has async scheduling
+    # cleared for it earlier, so the pair only arises for one that does.
+    vllm_config.scheduler_config.async_scheduling = True
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4,
+        model_capabilities={
+            **FakeSpecModel.model_capabilities,
+            "supports_async_decode": True,
+        },
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _run_hook(monkeypatch, _speculative(vllm_config), model)
+    message = str(excinfo.value)
+    assert "asynchronous scheduling" in message
+    assert "--no-async-scheduling" in message
 
 
 def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
