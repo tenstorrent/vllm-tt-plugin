@@ -131,7 +131,29 @@ because the count is how it picks the candidate state slot its previous step
 committed from, whatever this step's width. A model that does not declare it
 receives `[B, 1+K]` on every decode step.
 
-## 5. What the plugin does with a refusal
+## 5. What a verify returns, column by column
+
+The input block's column `j` carries the token at candidate position `j`:
+column 0 the row's last committed token, columns 1..K its drafts. A verify's
+return is indexed by **drafted position**, not by input column:
+
+| Return column | What it is |
+| --- | --- |
+| `j` for `j < K` | The model's choice at candidate position `j`, which is the token draft `j` has to match |
+| `K` | The bonus, the choice that follows a fully accepted row |
+
+So for `argmax_ids` the committed block is the return truncated at the accepted
+count, with no column spent echoing an input the runner already holds, and for
+`logits` column `j` is the distribution the accept test for draft `j` reads.
+A row with `num_valid_drafts` of `n` finds its bonus at column `n`.
+
+This is upstream's layout: its greedy kernel compares `target_argmax[pos]`
+against `draft_token_ids[pos]` and writes the committed token at `pos`, so a
+kernel or a test ported from upstream needs no index adjustment. It is spelled
+out because it is invisible from the shape: `[B, 1+K]` in and `[B, 1+K]` out
+admits an off-by-one that only shows up as wrong output text.
+
+## 6. What the plugin does with a refusal
 
 Every refusal raises `ValueError` at configuration time, naming the offending
 values and the command-line flag that changes them. Speculation is never
