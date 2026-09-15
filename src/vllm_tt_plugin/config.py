@@ -102,7 +102,11 @@ def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
     return get_tt_output_tokens_per_step(vllm_config) > 1
 
 
-_ADAPTIVE_BLOCK_OUTPUT_KEY = "tt_adaptive_block_output"
+# Platform-derived, like _RESOLVED_LANE_COUNT_KEY above: written from the
+# MODEL's declared capability, never read from operator input. The leading
+# underscore keeps an operator-passed --additional-config entry of the same
+# name from reading as configuration this code honours.
+_ADAPTIVE_BLOCK_OUTPUT_KEY = "_tt_adaptive_block_output"
 
 
 def is_tt_adaptive_block_output_model(vllm_config: "VllmConfig") -> bool:
@@ -117,14 +121,22 @@ def is_tt_adaptive_block_output_model(vllm_config: "VllmConfig") -> bool:
     speedup, at higher concurrency the server is a plain batched baseline
     (never worse). ``TTScheduler._update_after_schedule`` owns the reservation
     predicate and reserves the K-token placeholder block only when the step is
-    solo, is a decode, is within ``tt_adaptive_block_max_prompt_tokens``, and
-    the request owns the model's speculative session.
+    solo, is a decode, and the request owns the model's speculative session --
+    which is where ``tt_adaptive_block_max_prompt_tokens`` was already applied,
+    at the prefill that armed that session.
     """
     additional = getattr(vllm_config, "additional_config", None) or {}
     return bool(additional.get(_ADAPTIVE_BLOCK_OUTPUT_KEY, False))
 
 
 def store_tt_adaptive_block_output(vllm_config: "VllmConfig", flag: bool) -> None:
+    """Record the model's adaptive block-output capability on the config.
+
+    Internal platform-to-runtime handoff, not user-facing: the value comes from
+    the model's ``tt_adaptive_block_output`` capability, which
+    ``TTPlatform.check_and_update_config`` has already validated against
+    ``output_tokens_per_step > 1``.
+    """
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, dict):
         additional = {}
@@ -132,7 +144,8 @@ def store_tt_adaptive_block_output(vllm_config: "VllmConfig", flag: bool) -> Non
     additional[_ADAPTIVE_BLOCK_OUTPUT_KEY] = bool(flag)
 
 
-_ADAPTIVE_BLOCK_MAX_PROMPT_KEY = "tt_adaptive_block_max_prompt_tokens"
+# Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY.
+_ADAPTIVE_BLOCK_MAX_PROMPT_KEY = "_tt_adaptive_block_max_prompt_tokens"
 
 
 def get_tt_adaptive_block_max_prompt_tokens(vllm_config: "VllmConfig") -> int:
@@ -150,6 +163,20 @@ def get_tt_adaptive_block_max_prompt_tokens(vllm_config: "VllmConfig") -> int:
 def store_tt_adaptive_block_max_prompt_tokens(
     vllm_config: "VllmConfig", limit: int
 ) -> None:
+    """Record the adaptive block path's prompt-length frontier on the config.
+
+    Internal platform-to-runtime handoff, not user-facing: the value comes from
+    the model's ``tt_adaptive_block_max_prompt_tokens`` capability. Validated
+    here, next to its sibling ``store_tt_output_tokens_per_step``, rather than
+    in the platform -- the pairing rule that a non-zero frontier requires the
+    adaptive capability stays in the platform, because only the platform sees
+    both capabilities.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError(
+            "resolved TT adaptive_block_max_prompt_tokens must be an integer "
+            f">= 0, got {limit!r}"
+        )
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, dict):
         additional = {}

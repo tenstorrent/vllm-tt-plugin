@@ -480,6 +480,45 @@ This lets a distribution tool (e.g. `tt-kernel`) deliver a ready-to-serve model 
 source edit to the plugin. The built-in map above stays enabled by default; set
 `TT_VLLM_BUILTIN_MODELS=0` to rely solely on `EXTRA_MODELS_DIR`.
 
+### Selecting a serving class (`TT_MODEL_CLASS_OVERRIDES`)
+
+A checkpoint whose architecture already has a serving class can be pointed at a
+DIFFERENT one for a single launch, without editing the plugin or building a
+bundle. This is how one Gemma 4 checkpoint serves as a plain baseline, as an
+MTP speculative model, or as a dFlash speculative model.
+
+```bash
+export TT_MODEL_CLASS_OVERRIDES="TTGemma4ForCausalLM=models.demos.gemma4.tt.generator_vllm:Gemma4DFlashForCausalLM"
+```
+
+Comma-separate several entries. Each is `Architecture=module.path:ClassName`.
+
+Four things an operator needs to know:
+
+1. **Use the `TT`-prefixed architecture name.** `TTPlatform.check_and_update_config`
+   rewrites every checkpoint architecture in place with a `TT` prefix before the
+   registry is consulted, so `TTGemma4ForCausalLM` is the name that resolves. A
+   bare name is accepted and normalised, but the prefixed form is what takes
+   effect.
+2. **Name the architecture the checkpoint actually resolves to.** Several aliases
+   can share one serving class -- Gemma 4 has six -- and overriding one alias
+   leaves the rest on the default class. Check the `architectures` field of the
+   checkpoint's `config.json`.
+3. **Precedence.** Overrides register first and unconditionally, so they outrank
+   both `EXTRA_MODELS_DIR` bundles and the built-in map for the whole process.
+   Every applied override is logged at INFO as
+   `Applied TT_MODEL_CLASS_OVERRIDES: <arch> -> <target>`; if that line is
+   missing from the server log, the variable was not set in the environment the
+   engine actually started in.
+4. **The target must be importable in the worker process**, i.e. on `PYTHONPATH`
+   alongside tt-metal's `models/` tree.
+
+The registration environment variables, in the order they are consulted:
+`TT_MODEL_CLASS_OVERRIDES`, `EXTRA_MODELS_DIR`, then the built-in map
+(`TT_VLLM_BUILTIN_MODELS=0` disables it). `TT_LLAMA_TEXT_VER`,
+`TT_QWEN3_TEXT_VER` and `TT_QWEN35_TEXT_VER` select a version WITHIN a built-in
+family and are unrelated to the above.
+
 ## Operational Constraints
 
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a

@@ -74,3 +74,55 @@ def test_register_tt_models_applies_overrides_first(
         registered["Gemma4ForConditionalGeneration"]
         == "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
     )
+
+
+def test_override_applies_to_an_architecture_upstream_already_ships(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The registry holds every architecture upstream vLLM ships (362 in vLLM
+    0.26.0), so registering an override only when the name is MISSING silently
+    discarded most overrides -- no log, no warning, no error, and the default
+    class served. Registration is unconditional; upstream permits it."""
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    registered: dict[str, str] = {
+        "TTGemma4ForCausalLM": "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
+    }
+    monkeypatch.setattr(
+        ModelRegistry, "get_supported_archs", staticmethod(lambda: list(registered))
+    )
+    monkeypatch.setattr(
+        ModelRegistry,
+        "register_model",
+        staticmethod(lambda arch, target: registered.__setitem__(arch, target)),
+    )
+    target = "models.demos.gemma4.tt.generator_vllm:Gemma4DFlashForCausalLM"
+    monkeypatch.setenv("TT_MODEL_CLASS_OVERRIDES", f"TTGemma4ForCausalLM={target}")
+
+    tt_platform.register_tt_models()
+
+    assert registered["TTGemma4ForCausalLM"] == target
+
+
+def test_override_registers_the_tt_prefixed_name(monkeypatch: pytest.MonkeyPatch):
+    """check_and_update_config rewrites checkpoint architectures with a TT
+    prefix before the registry is consulted, so a bare-name override would
+    never be looked up. Both forms are registered."""
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    registered: dict[str, str] = {}
+    monkeypatch.setattr(
+        ModelRegistry, "get_supported_archs", staticmethod(lambda: list(registered))
+    )
+    monkeypatch.setattr(
+        ModelRegistry,
+        "register_model",
+        staticmethod(lambda arch, target: registered.__setitem__(arch, target)),
+    )
+    target = "pkg.mod:MyClass"
+    monkeypatch.setenv("TT_MODEL_CLASS_OVERRIDES", f"Gemma4ForCausalLM={target}")
+
+    tt_platform.register_tt_models()
+
+    assert registered["TTGemma4ForCausalLM"] == target
+    assert registered["Gemma4ForCausalLM"] == target

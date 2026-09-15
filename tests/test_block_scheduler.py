@@ -1246,3 +1246,76 @@ def test_adaptive_under_frontier_prompt_still_blocks():
     submitted = scheduler.schedule()
     assert get_tt_block_step_decisions(submitted)[request.request_id] is True
     assert request.num_output_placeholders == CANVAS
+
+
+def test_adaptive_solo_decode_by_a_non_owner_drops_the_session():
+    """A solo decode step whose single request does not own the session must
+    clear ownership. Async scheduling reaches this: upstream skips a request
+    that has hit max_tokens (guarded on num_output_placeholders), so the OWNER
+    can drop out of a step while its session is still armed, leaving a peer
+    alone. On the old code ownership survived ("a SOLO decode leaves ownership
+    alone"), the model kept an armed session it would have served the peer
+    from, and the peer committed the owner's speculated block against a single
+    reserved placeholder.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a)
+    assert scheduler._spec_session_owner == "req-a"
+
+    # req-b is running and decoding; req-a is still alive but not in this step.
+    req_b = _request(CANVAS * 2, request_id="req-b")
+    scheduler.requests[req_b.request_id] = req_b
+    req_b.num_computed_tokens = req_b.num_prompt_tokens + 1
+
+    scheduler._mirror_spec_session(
+        SimpleNamespace(num_scheduled_tokens={"req-b": 1}), solo=True
+    )
+    assert scheduler._spec_session_owner is None
+
+
+def test_adaptive_solo_decode_by_the_owner_keeps_the_session():
+    """The companion of the above: the owner's own solo decode step is the
+    steady state and must not disturb ownership."""
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a)
+    assert scheduler._spec_session_owner == "req-a"
+
+    req_a.num_computed_tokens = req_a.num_prompt_tokens + 1
+    scheduler._mirror_spec_session(
+        SimpleNamespace(num_scheduled_tokens={"req-a": 1}), solo=True
+    )
+    assert scheduler._spec_session_owner == "req-a"
+
+
+def test_adaptive_frontier_is_measured_on_the_replayed_length():
+    """A resumed prefill replays the prompt AND the generated tokens, and the
+    model measures its capture frontier on that replayed length (the runner's
+    prompt_lens is input_positions + chunk_lens). The scheduler must measure
+    the same quantity: on the old code it compared num_prompt_tokens, which
+    never grows, so a preempted-and-resumed request crossed the frontier on
+    the model side only -- the model served plain baseline while the scheduler
+    reserved a block, and the width check killed the engine core.
+    """
+    from vllm_tt_plugin.config import store_tt_adaptive_block_max_prompt_tokens
+
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    store_tt_adaptive_block_max_prompt_tokens(scheduler.vllm_config, 64)
+    scheduler._adaptive_block_max_prompt = 64
+    request = _request(CANVAS * 2)  # 32-token prompt, under the frontier
+    scheduler.add_request(request)
+    _adaptive_anchor(scheduler, request)
+    assert scheduler._spec_session_owner == request.request_id
+
+    # Resumed from preemption: the replay spans prompt + 68 generated tokens,
+    # so the model sees prompt_lens=100 and drops the session at 100 > 64.
+    replayed = 100
+    request.num_computed_tokens = replayed
+    scheduler._mirror_spec_session(
+        SimpleNamespace(num_scheduled_tokens={request.request_id: replayed}),
+        solo=True,
+    )
+    assert scheduler._spec_session_owner is None
