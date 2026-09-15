@@ -1839,6 +1839,19 @@ class TTPlatform(Platform):
         # selected. model_class carries the single-execute decision for GPT-OSS.
         _convert_dp_to_lanes(vllm_config, model_class)
 
+        if (
+            vllm_config.speculative_config
+            and vllm_config.scheduler_config.async_scheduling
+        ):
+            raise ValueError(
+                "TT asynchronous scheduling and speculative decoding cannot be "
+                "combined. The verify-then-propose loop runs in the "
+                "synchronous decode tail, so an asynchronous step would return "
+                "the verify's candidate block through the ordinary sampler and "
+                "never walk acceptance. Launch with --no-async-scheduling, or "
+                "drop the speculative flags"
+            )
+
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(
                 "TT lane mode and speculative decoding cannot be combined. "
