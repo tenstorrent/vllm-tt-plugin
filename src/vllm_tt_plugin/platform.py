@@ -1230,6 +1230,16 @@ def register_tt_test_models():
         "models.vllm_test_utils.no_op_test.test_model:DummyNoOpModel",
     )
 
+    # The same, implementing the speculative-decoding contract: the only way to
+    # exercise the plugin's speculative path against a real engine, scheduler
+    # and worker, and the instrument for measuring what a speculative step
+    # costs on the host with no device work under it.
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTDummySpecDecodeModel",
+        "models.vllm_test_utils.spec_test.test_model:DummySpecDecodeModel",
+    )
+
     # Fake model for testing multi-host inference on dual Galaxy
     _register_model_if_missing(
         ModelRegistry,
