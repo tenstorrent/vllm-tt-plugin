@@ -150,20 +150,27 @@ class FakeSpecModel:
     def decode_forward(
         self,
         tokens,
-        positions,
+        start_pos,
         num_valid_drafts,
         accepted_counts,
         spec_mode: str,
-        page_tables_per_layer=None,
-        slot_mapping=None,
-        sampling_params=None,
+        **kwargs,
     ) -> VerifyOutput:
         """The verify primitive: one forward over the [B, 1+K] candidate block.
 
+        The signature is the plugin's ordinary decode call, ``tokens`` and
+        ``start_pos``, plus the three speculative arguments. That is what makes
+        the contract an extension of the existing call rather than a second one
+        every model would have to grow: a speculative block travels in the same
+        two tensors, only wider.
+
         ``spec_mode`` has no default, so a caller that forgets it fails rather
-        than silently receiving greedy ids.
+        than silently receiving greedy ids. Everything else the runner passes a
+        decode, the page tables, the kv cache and the reload commands, this
+        stand-in has no use for.
         """
-        del page_tables_per_layer, slot_mapping, sampling_params
+        del kwargs
+        positions = start_pos
         if spec_mode not in self.accept_modes:
             raise ValueError(
                 f"FakeSpecModel serves {list(self.accept_modes)}, "
@@ -307,11 +314,17 @@ class FakeSpecModel:
         verified[:, :num_drafts] = torch.where(
             diverge, (drafted + 1) % self.vocab_size, drafted
         )
-        # The bonus continues this stand-in's own drafting arithmetic one step
-        # past the last draft, so a test can predict it from the input token.
-        verified[:, num_drafts] = (
-            tokens[:, 0].to(torch.int64) + num_drafts + 1
-        ) % self.vocab_size
+        # The bonus sits at each row's own valid draft count, which is where the
+        # contract says a row finds it, and not at a column fixed for the batch:
+        # a row carrying no drafts has its bonus at column 0.
+        #
+        # Its value continues this stand-in's own drafting arithmetic one step
+        # past that row's last draft. Its drafter proposes ``last + 1 + j``, so
+        # accepting n of them leaves ``last + n + 1`` next, which makes a
+        # speculated run and an unspeculated one walk the same token sequence.
+        valid = num_valid_drafts.to(torch.int64)
+        bonus = (tokens[:, 0].to(torch.int64) + valid + 1) % self.vocab_size
+        verified.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
         return verified.to(torch.int32)
 
 

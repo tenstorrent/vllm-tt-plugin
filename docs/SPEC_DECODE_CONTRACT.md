@@ -131,6 +131,29 @@ because the count is how it picks the candidate state slot its previous step
 committed from, whatever this step's width. A model that does not declare it
 receives `[B, 1+K]` on every decode step.
 
+## 4a. The verify call
+
+Verify is not a new entry point. It is the model's existing `decode_forward`,
+whose `tokens` and `start_pos` arrive `1+K` wide, plus three added keyword
+arguments:
+
+```python
+def decode_forward(
+    self,
+    tokens,            # [B, 1+K]
+    start_pos,         # [B, 1+K]
+    *,
+    num_valid_drafts,  # [B] int32
+    accepted_counts,   # [B] int32
+    spec_mode: str,    # the accept mode the runner wants
+    **kwargs,          # page_table, kv_cache, sampling_params, reload commands
+) -> VerifyOutput
+```
+
+Everything a decode already receives it still receives, under the name it
+already has. A model implementing this grows three keyword arguments and a
+wider block; it does not grow a second call.
+
 ## 5. What a verify returns, column by column
 
 The input block's column `j` carries the token at candidate position `j`:
