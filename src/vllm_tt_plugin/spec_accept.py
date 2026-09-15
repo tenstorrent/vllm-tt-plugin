@@ -112,8 +112,13 @@ def accept_speculated_tokens(
             distribution for the token at candidate position ``j``, so column 0
             scores the already-committed input token's successor and column
             ``j`` scores draft ``j``.
-        draft_token_ids: ``[B, K]``. Row ``i``'s pending drafts. Entries past
-            ``num_valid_drafts[i]`` are not read.
+        draft_token_ids: ``[B, K]``. Row ``i``'s pending drafts. Entries inside
+            ``num_valid_drafts[i]`` must be real token ids, because an accepted
+            draft commits as it arrived. Entries past it are padding and may
+            hold any value, including ``PLACEHOLDER_TOKEN_ID``: they are
+            processed, since the walk is vectorised over the whole block and
+            replaces them with an in-vocabulary id to gather with, but they
+            cannot commit.
         num_valid_drafts: ``[B]`` in ``[0, K]``. How many of a row's drafts are
             real. A row with 0 commits exactly its bonus token.
         temperature: ``[B]``. A value of 0 selects greedy acceptance for that
@@ -208,25 +213,39 @@ def _random_walk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
     probs = _constrained_probs(target_logits, temperature, top_k, top_p)
-    # Clamped into the vocabulary before any gather, because a draft column
-    # past its row's count holds padding and the runner pads with
-    # PLACEHOLDER_TOKEN_ID, which torch.gather rejects outright rather than
-    # ignoring. Clamping cannot leak a padding column into the output: every
-    # column past the row's count is masked away by the count, and the column
-    # at the count is overwritten by the bonus.
+    # Replaced inside the vocabulary before any gather, because a draft column
+    # past its row's count holds padding, the runner pads with
+    # PLACEHOLDER_TOKEN_ID, and torch.gather refuses a negative index rather
+    # than ignoring it. A replaced column cannot reach the output: every column
+    # past the row's count is masked away by the count, and the column at the
+    # count is overwritten by the bonus. Columns inside the count are already
+    # known to be real token ids, because _check_inputs validated them.
     draft_ids = draft_token_ids.to(torch.int64).clamp(0, probs.shape[-1] - 1)
+
+    # The bonus comes first, before any other draw, so a seeded row's bonus
+    # depends only on the generator state the call started from. Drawing it
+    # after the accept uniforms would make it depend on the block width and on
+    # how many drafts the row happened to receive, which is how a row carrying
+    # no drafts at all would stop agreeing with an ordinary sampled step.
+    # Upstream orders it the same way, sampling bonus tokens in
+    # RejectionSampler.forward before it calls rejection_sample.
+    bonus_probs = probs.gather(
+        1, num_valid_drafts.to(torch.int64).view(rows, 1, 1).expand(rows, 1, vocab)
+    )
+    bonus = _sample_per_row(bonus_probs, generators, rows, vocab).squeeze(1)
 
     # The accept test, upstream's form: accept when p/q >= u. q is 0 only for a
     # drafter that proposed a token its own distribution rules out, which is a
-    # drafter bug; rejecting keeps the division from producing a NaN that would
-    # compare false in one direction and true in the other.
+    # drafter bug. The division is evaluated for those entries too and yields a
+    # NaN or an infinity; the q > 0 term is what forces them to reject, rather
+    # than the division being avoided.
     target_of_draft = _gather_ids(probs[:, :num_drafts], draft_ids)
     if draft_probs is None:
         draft_of_draft = torch.ones_like(target_of_draft)
     else:
         _check_draft_probs(draft_probs, rows, num_drafts, vocab)
         draft_of_draft = _gather_ids(draft_probs, draft_ids)
-    uniform = _uniform(rows, num_drafts, generators)
+    uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
     accepted = (draft_of_draft > 0) & (
         target_of_draft.to(torch.float64) / draft_of_draft >= uniform
     )
@@ -238,15 +257,11 @@ def _random_walk(
         residual.scatter_(2, draft_ids.unsqueeze(2), 0.0)
     else:
         residual = (probs[:, :num_drafts] - draft_probs).clamp_min(0.0)
-    recovered = _sample_per_row(residual, generators, rows, vocab)
-
-    # The bonus, for a row that accepted everything. Drawn independently of the
-    # correction: sharing the draw would correlate the two, and only one of
-    # them is ever committed.
-    bonus_probs = probs.gather(
-        1, num_valid_drafts.to(torch.int64).view(rows, 1, 1).expand(rows, 1, vocab)
+    # A row with no drafts has nothing to correct, so its seeded generator must
+    # not advance here. Upstream skips the same draw for the same reason.
+    recovered = _sample_per_row(
+        residual, _drafting_rows(num_valid_drafts, generators), rows, vocab
     )
-    bonus = _sample_per_row(bonus_probs, generators, rows, vocab).squeeze(1)
 
     candidates = torch.cat(
         [
@@ -326,18 +341,44 @@ def _sample_per_row(
     return scored.argmax(dim=-1).to(torch.int32)
 
 
+def _drafting_rows(
+    num_valid_drafts: torch.Tensor, generators: dict[int, torch.Generator]
+) -> dict[int, torch.Generator]:
+    """The seeded rows that carry at least one draft.
+
+    A row with no drafts takes no part in the accept test or the correction, so
+    its generator must not advance for either. Its unseeded values are drawn
+    anyway and discarded, which costs nothing and keeps the shapes uniform.
+    """
+    return {
+        row: generator
+        for row, generator in generators.items()
+        if int(num_valid_drafts[row]) > 0
+    }
+
+
 def _uniform(
-    rows: int, num_drafts: int, generators: dict[int, torch.Generator]
+    rows: int,
+    num_drafts: int,
+    num_valid_drafts: torch.Tensor,
+    generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
     """Uniform values in [0, 1) for the accept test, one per drafted position.
+
+    A seeded row advances its generator by its own draft count and not by the
+    block width, so a row's stream does not depend on how wide the block it
+    happened to travel in was. Upstream draws per request for the same reason.
 
     float64 rather than float32 because float32 draws exact 0.0 often enough to
     matter, and a 0 would accept a draft the target assigns no probability.
     """
     uniform = torch.rand((rows, num_drafts), dtype=torch.float64)
     for row, generator in generators.items():
-        uniform[row] = torch.rand(
-            (num_drafts,), dtype=torch.float64, generator=generator
+        valid = int(num_valid_drafts[row])
+        if valid == 0:
+            continue
+        uniform[row, :valid] = torch.rand(
+            (valid,), dtype=torch.float64, generator=generator
         )
     return uniform
 
@@ -421,7 +462,39 @@ def _check_inputs(
             "accept_speculated_tokens num_valid_drafts entries must lie in "
             f"[0, {num_drafts}], got {out_of_range.tolist()}"
         )
+    _check_draft_ids(draft_token_ids, num_valid_drafts, num_drafts, vocab)
     return rows, width, vocab
+
+
+def _check_draft_ids(
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    num_drafts: int,
+    vocab: int,
+) -> None:
+    """Every draft inside a row's count must be a real token id.
+
+    Checked because an accepted draft commits as it arrived, so an id outside
+    the vocabulary would reach the detokenizer as an output token rather than
+    failing anywhere. Only the valid prefix is checked: the columns past it are
+    padding, whose value the caller is free to choose.
+    """
+    if num_drafts == 0:
+        return
+    valid = torch.arange(num_drafts).unsqueeze(0) < num_valid_drafts.unsqueeze(1)
+    bad = valid & ((draft_token_ids < 0) | (draft_token_ids >= vocab))
+    if not bool(bad.any()):
+        return
+    offenders = [
+        (int(row), int(column), int(draft_token_ids[row, column]))
+        for row, column in bad.nonzero().tolist()
+    ]
+    raise ValueError(
+        "accept_speculated_tokens draft_token_ids entries inside a row's "
+        f"num_valid_drafts must lie in [0, {vocab - 1}]; an accepted draft "
+        "commits as it arrived, so an id outside the vocabulary would be "
+        f"emitted as an output token. Offending (row, position, id): {offenders}"
+    )
 
 
 def _check_draft_probs(

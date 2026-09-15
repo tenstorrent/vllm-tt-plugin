@@ -23,7 +23,11 @@ randomness really is independent.
 import pytest
 import torch
 
-from vllm_tt_plugin.spec_accept import AcceptResult, accept_speculated_tokens
+from vllm_tt_plugin.spec_accept import (
+    AcceptResult,
+    _sample_per_row,
+    accept_speculated_tokens,
+)
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
 VOCAB = 8
@@ -369,6 +373,79 @@ def test_temperature_reshapes_the_target_before_the_accept_test():
     )
 
 
+@pytest.mark.parametrize("valid", [0, 1], ids=["no drafts", "one draft"])
+def test_a_seeded_row_s_stream_does_not_depend_on_the_block_width(valid: int):
+    """A seeded row draws the same values whatever K the block travelled in.
+
+    The block width is the runner's choice and can change between launches at
+    the same draft length, and a row's draft count varies step to step. If a
+    seeded row's bonus depended on either, the same seed would produce
+    different text, which is the one thing a seed is for. The bonus is drawn
+    before the accept uniforms and the correction so that it depends only on
+    the generator state the call started from, and a seeded row advances its
+    generator by its own draft count rather than by the width.
+
+    Two consecutive steps share one generator, so this also pins how far a step
+    leaves it advanced. A draw the row never uses, an accept uniform for a
+    position it has no draft at or a correction it cannot commit, would show up
+    in the second step's bonus rather than the first's.
+    """
+    target = torch.tensor([0.30, 0.25, 0.20, 0.15, 0.06, 0.03, 0.01, 0.00])
+
+    def run(num_drafts: int) -> list[int]:
+        generator = torch.Generator().manual_seed(1234)
+        logits = target.log().view(1, 1, VOCAB).expand(1, num_drafts + 1, VOCAB)
+        bonuses = []
+        for _ in range(2):
+            result = accept_speculated_tokens(
+                target_logits=logits.contiguous(),
+                draft_token_ids=torch.zeros(1, num_drafts, dtype=torch.int32),
+                num_valid_drafts=torch.tensor([valid], dtype=torch.int32),
+                temperature=torch.ones(1),
+                generators={0: generator},
+            )
+            # The bonus is the last committed token of a fully accepted row.
+            count = int(result.accepted_counts[0])
+            bonuses.append(int(result.committed_token_ids[0, count - 1]))
+        return bonuses
+
+    assert run(1) == run(5) == run(11)
+
+
+def test_a_draftless_seeded_row_consumes_only_its_bonus_draw():
+    """A row with no drafts leaves its generator where one bonus draw would.
+
+    It has no accept test to run and no correction it could commit, so drawing
+    for either would advance the request's generator past where an ordinary
+    sampled step leaves it. Nothing in the committed output of that step would
+    change; every later token of the same request would. Upstream states the
+    same rule twice, skipping both draws for a request with no draft tokens.
+
+    Deliberately white box: a generator-consumption contract is only visible in
+    the generator's state, so the test compares that state against the one
+    draw the row is permitted, using the same helper the walk draws with.
+    """
+    target = torch.tensor([0.30, 0.25, 0.20, 0.15, 0.06, 0.03, 0.01, 0.00])
+    logits = target.log().view(1, 1, VOCAB).expand(1, 4, VOCAB).contiguous()
+
+    walked = torch.Generator().manual_seed(99)
+    accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=torch.zeros(1, 3, dtype=torch.int32),
+        num_valid_drafts=torch.zeros(1, dtype=torch.int32),
+        temperature=torch.ones(1),
+        generators={0: walked},
+    )
+
+    bonus_only = torch.Generator().manual_seed(99)
+    _sample_per_row(target.view(1, 1, VOCAB), {0: bonus_only}, 1, VOCAB)
+
+    assert torch.equal(walked.get_state(), bonus_only.get_state()), (
+        "a draftless row advanced its generator past its bonus draw, so every "
+        "later token of that request would differ from an unspeculated run"
+    )
+
+
 def test_a_seeded_row_is_reproducible():
     """A request with a seed draws from its own generator, so it repeats."""
     logits = torch.randn(2, 3, VOCAB)
@@ -425,6 +502,55 @@ def test_top_k_of_one_makes_a_random_row_behave_greedily():
     assert torch.equal(greedy.committed_token_ids, constrained.committed_token_ids)
 
 
+def test_top_p_removes_tokens_from_the_committed_distribution():
+    """A token outside the nucleus can never commit, by either route.
+
+    top-p has to constrain the accept test and the correction alike: a draft
+    outside the nucleus must be rejected because the constrained target gives
+    it no probability, and the correction must be drawn from the constrained
+    residual. A top-p of 0.4 against a target whose top token holds 0.5 leaves
+    a nucleus of one, so every row commits that token whatever it drafted.
+    """
+    trials = 2000
+    target = torch.tensor([0.50, 0.30, 0.15, 0.05, 0.00, 0.00, 0.00, 0.00])
+    logits = target.log().view(1, 1, VOCAB).expand(trials, 2, VOCAB).contiguous()
+    drafts = torch.randint(0, 4, (trials, 1), dtype=torch.int32)
+
+    result = accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=drafts,
+        num_valid_drafts=torch.ones(trials, dtype=torch.int32),
+        temperature=torch.ones(trials),
+        top_p=torch.full((trials,), 0.4),
+    )
+
+    committed = result.committed_token_ids[:, 0]
+    assert (committed == 0).all(), (
+        "a token outside the nucleus committed: "
+        f"{sorted(set(committed.tolist()) - {0})}"
+    )
+
+
+def test_top_k_and_top_p_together_constrain_the_committed_distribution():
+    """Both constraints apply, so the tighter of the two decides the nucleus."""
+    trials = 2000
+    target = torch.tensor([0.30, 0.25, 0.20, 0.15, 0.06, 0.03, 0.01, 0.00])
+    logits = target.log().view(1, 1, VOCAB).expand(trials, 2, VOCAB).contiguous()
+    drafts = torch.randint(0, VOCAB, (trials, 1), dtype=torch.int32)
+
+    result = accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=drafts,
+        num_valid_drafts=torch.ones(trials, dtype=torch.int32),
+        temperature=torch.ones(trials),
+        top_k=torch.full((trials,), 2, dtype=torch.int32),
+        top_p=torch.full((trials,), 0.99),
+    )
+
+    committed = set(result.committed_token_ids[:, 0].tolist())
+    assert committed <= {0, 1}, f"committed outside the top 2: {sorted(committed)}"
+
+
 def test_the_caller_s_logits_are_not_modified():
     """A caller that also wants logprobs needs the raw logits afterwards."""
     logits = torch.randn(2, 3, VOCAB)
@@ -474,6 +600,39 @@ def test_a_draft_count_outside_the_block_is_refused(bad: int):
             draft_token_ids=torch.zeros(1, 2, dtype=torch.int32),
             num_valid_drafts=torch.tensor([bad], dtype=torch.int32),
             temperature=torch.ones(1),
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [-2, VOCAB, PLACEHOLDER_TOKEN_ID],
+    ids=["negative", "vocab", "placeholder"],
+)
+def test_a_draft_id_outside_the_vocabulary_is_refused(bad_id: int):
+    """An id inside a row's count must be a real token id.
+
+    An accepted draft commits exactly as it arrived, so an out-of-vocabulary id
+    inside the valid prefix would be emitted as an output token and reach the
+    detokenizer. Nothing downstream range-checks a committed id, so the check
+    belongs here. The padding marker is refused too when it appears inside the
+    prefix, because there it is a caller error rather than padding.
+    """
+    with pytest.raises(ValueError, match="inside a row's num_valid_drafts"):
+        accept_speculated_tokens(
+            target_logits=torch.randn(1, 3, VOCAB),
+            draft_token_ids=torch.tensor([[1, bad_id]], dtype=torch.int32),
+            num_valid_drafts=torch.tensor([2], dtype=torch.int32),
+            temperature=torch.ones(1),
+        )
+
+
+def test_the_offending_draft_is_named_by_row_and_position():
+    with pytest.raises(ValueError, match=r"\(1, 0, 99\)"):
+        accept_speculated_tokens(
+            target_logits=torch.randn(2, 3, VOCAB),
+            draft_token_ids=torch.tensor([[1, 2], [99, 2]], dtype=torch.int32),
+            num_valid_drafts=torch.tensor([2, 2], dtype=torch.int32),
+            temperature=torch.ones(2),
         )
 
 
