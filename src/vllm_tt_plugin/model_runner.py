@@ -1221,7 +1221,6 @@ class TTModelRunner:
                 drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
         return drafts, num_valid, counts
 
-    @staticmethod
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         """Hand the drafts proposed since the last call to the engine.
 
@@ -1273,6 +1272,7 @@ class TTModelRunner:
             if row_drafts:
                 self._proposed_draft_token_ids[req_id] = list(row_drafts)
 
+    @staticmethod
     def _spec_candidate_block(
         drafts: torch.Tensor,
         num_valid: torch.Tensor,
@@ -2121,9 +2121,17 @@ class TTModelRunner:
         """
         model_input = fwd.model_input
         row_req_ids = model_input.row_req_ids
-        assert row_req_ids is not None
-        assert model_input.draft_token_ids is not None
-        assert model_input.num_valid_drafts is not None
+        missing = [
+            name
+            for name in ("row_req_ids", "draft_token_ids", "num_valid_drafts")
+            if getattr(model_input, name) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"a speculative step in mode {model_input.spec_mode!r} reached "
+                f"the accept walk without {missing}; the builder sets all three "
+                "together whenever it sets spec_mode"
+            )
 
         argmax_ids = fwd.tt_out
         if not isinstance(argmax_ids, torch.Tensor):
@@ -2134,9 +2142,14 @@ class TTModelRunner:
         # Padding rows are verified along with the rest, because the block is
         # one fixed shape, and dropped here: only the live requests commit.
         rows = len(row_req_ids)
+        # The draft block is built at the full width K even on a narrow step,
+        # where the model was handed one column because no row carried a draft.
+        # The walk compares the two, so the drafts are trimmed to the width the
+        # verify actually answered at.
+        verified_drafts = int(argmax_ids.shape[1]) - 1
         committed, counts = accept_greedy_drafts(
             argmax_ids[:rows],
-            model_input.draft_token_ids[:rows],
+            model_input.draft_token_ids[:rows, :verified_drafts],
             model_input.num_valid_drafts[:rows],
         )
 
@@ -2190,7 +2203,13 @@ class TTModelRunner:
             req_state = self.requests.get(req_id)
             if batch_row is not None:
                 output_token_ids = self.input_batch.req_output_token_ids[batch_row]
-                assert output_token_ids is not None
+                if output_token_ids is None:
+                    raise RuntimeError(
+                        f"request {req_id} holds row {batch_row} of the "
+                        "persistent batch but that row has no output token "
+                        f"list, so its {len(block)} committed token(s) have "
+                        "nowhere to go"
+                    )
                 output_token_ids.extend(block)
             elif req_state is not None:
                 req_state.output_token_ids.extend(block)

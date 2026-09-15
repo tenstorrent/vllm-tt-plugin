@@ -25,7 +25,7 @@ from vllm_tt_plugin.config import (
 )
 
 
-def _speculative(vllm_config, *, method="mtp", requested_k=7):
+def _speculative(vllm_config, *, method="ngram", requested_k=7):
     vllm_config.speculative_config = SimpleNamespace(
         method=method, num_speculative_tokens=requested_k
     )
@@ -75,19 +75,19 @@ def test_an_admissible_launch_is_admitted(monkeypatch, vllm_config):
     assert plan.effective_k == 7
 
 
-def test_a_declaration_error_is_reported_before_the_execution_refusal(
+def test_a_declaration_error_is_reported_before_the_unproposable_refusal(
     monkeypatch, vllm_config
 ):
     # Ordering matters: a model author must see their own mistake, not the
-    # blanket "nothing can execute this" message.
+    # blanket refusal that no proposer drives their method.
     model = make_fake_spec_model(
         max_supported_num_seqs=4,
         model_capabilities={"supports_spec_decode": True, "spec_requirements": []},
     )
     with pytest.raises(ValueError) as excinfo:
-        _run_hook(monkeypatch, _speculative(vllm_config), model)
+        _run_hook(monkeypatch, _speculative(vllm_config, method="mtp"), model)
     assert "spec_requirements" in str(excinfo.value)
-    assert "take_draft_token_ids" not in str(excinfo.value)
+    assert "no proposer drives it" not in str(excinfo.value)
 
 
 def test_a_model_refusal_reaches_the_operator_through_the_hook(
@@ -192,3 +192,92 @@ def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
     message = str(excinfo.value)
     assert "lane mode" in message
     assert "TTLaneInputBatch" in message
+
+
+# region Per-request semantics
+
+
+def _greedy_params():
+    from vllm.sampling_params import SamplingParams
+
+    return SamplingParams(temperature=0.0)
+
+
+def _validate(params):
+    from vllm_tt_plugin.platform import TTPlatform
+
+    TTPlatform.validate_request({"prompt_token_ids": [1, 2, 3]}, params)
+
+
+def _speculating_platform(monkeypatch, vllm_config):
+    """Run the hook so a spec plan is live, and return the platform."""
+    from vllm_tt_plugin.platform import TTPlatform
+
+    model = make_fake_spec_model(max_supported_num_seqs=4)
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    assert get_tt_spec_plan(vllm_config) is not None
+    return TTPlatform
+
+
+def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
+    _speculating_platform(monkeypatch, vllm_config)
+    _validate(_greedy_params())
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("logprobs", 1),
+        ("presence_penalty", 0.5),
+        ("frequency_penalty", 0.5),
+        ("repetition_penalty", 1.1),
+        ("min_tokens", 4),
+        ("bad_words", ["no"]),
+    ],
+)
+def test_a_request_the_greedy_walk_cannot_serve_is_refused(
+    monkeypatch, vllm_config, field, value
+):
+    """Answering greedily anyway would change what was asked for, silently.
+
+    The accept walk compares token ids and never sees logits, so it cannot
+    arbitrate a token filter or a penalty, and it cannot produce logprobs. Each
+    of those would come back plausible and wrong.
+
+    ``min_p``, ``top_p`` and ``top_k`` are absent from this list because vLLM
+    neutralises them itself on a greedy request, so they can only arrive
+    alongside a temperature, which the next test covers.
+    """
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(monkeypatch, vllm_config)
+    params = SamplingParams(temperature=0.0, **{field: value})
+    with pytest.raises(ValueError) as excinfo:
+        _validate(params)
+    message = str(excinfo.value)
+    assert "greedy requests only" in message
+    assert field in message
+
+
+def test_a_sampled_request_is_refused_while_speculating(monkeypatch, vllm_config):
+    """A temperature is the case that would silently come back deterministic."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(monkeypatch, vllm_config)
+    with pytest.raises(ValueError) as excinfo:
+        _validate(SamplingParams(temperature=0.7))
+    assert "temperature=0.7" in str(excinfo.value)
+
+
+def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_config):
+    """The gate is speculation's, not the backend's."""
+    from vllm.sampling_params import SamplingParams
+
+    vllm_config.diffusion_config = None
+    vllm_config.parallel_config.distributed_executor_backend = None
+    _run_hook(monkeypatch, vllm_config, make_fake_spec_model())
+    assert get_tt_spec_plan(vllm_config) is None
+    _validate(SamplingParams(temperature=0.9, presence_penalty=0.3))
+
+
+# endregion Per-request semantics

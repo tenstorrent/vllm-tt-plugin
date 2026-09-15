@@ -336,6 +336,27 @@ def test_the_verify_is_asked_for_the_mode_the_runner_can_walk():
     assert model.verify_calls[0]["block_width"] == DRAFT_LEN + 1
 
 
+def test_a_narrow_step_finishes_and_commits_one_token():
+    """A model serving a narrow decode still completes a speculative step.
+
+    With ``supports_narrow_decode`` and no drafts in flight, the model is
+    handed one column instead of ``1+K``. The draft block is still built at the
+    full width, so the walk has to be given the width the verify answered at,
+    and it has to survive a draft count of zero.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "r")
+
+    output = _step(runner, "r")
+
+    assert len(output.sampled_token_ids[0]) == 1
+    assert runner._req_accepted_counts["r"] == 1
+    # One column, which is the narrow decode's own shape.
+    assert model.verify_calls[0]["block_width"] == 1
+
+
 # endregion The loop
 
 # region Equality with an unspeculated run

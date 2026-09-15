@@ -229,13 +229,27 @@ class FakeSpecModel:
         The width is derived here rather than unpacked by the caller, so a
         mis-ranked tensor produces the shape error naming the offender instead
         of a bare unpacking failure.
+
+        A narrow verify is the exception the contract carves out: a model
+        declaring ``supports_narrow_decode`` receives the plain decode's own
+        shapes on a step where no row carries a draft, which are ``[B, 1]``
+        tokens and a 1-D ``[B]`` positions. Requiring both to be 2-D here would
+        refuse the very call that declaration asks for.
         """
-        if tokens.dim() != 2 or positions.dim() != 2:
+        narrow = tokens.dim() == 2 and tokens.shape[1] == 1 and positions.dim() == 1
+        if narrow:
+            if tokens.shape[0] != positions.shape[0]:
+                raise ValueError(
+                    f"{call} narrow tokens {tuple(tokens.shape)} and positions "
+                    f"{tuple(positions.shape)} must agree on the row count"
+                )
+        elif tokens.dim() != 2 or positions.dim() != 2:
             raise ValueError(
-                f"{call} tokens and positions must both be 2-D [B, 1+K], got "
+                f"{call} tokens and positions must both be 2-D [B, 1+K], or "
+                f"[B, 1] against a 1-D [B] for a narrow step, got "
                 f"{tuple(tokens.shape)} and {tuple(positions.shape)}"
             )
-        if tokens.shape != positions.shape:
+        elif tokens.shape != positions.shape:
             raise ValueError(
                 f"{call} tokens {tuple(tokens.shape)} and positions "
                 f"{tuple(positions.shape)} must have the same shape"
