@@ -135,11 +135,12 @@ def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
     resolve with ``require_tt_spec_plan``: no speculation was requested, and
     admission has not run in this process.
 
-    Nothing reads this yet. It is the handoff slot the scheduler, worker and
-    runner read once the speculative execution path lands. Admission runs once
-    per process, not once per launch: ``TTWorker.init_device`` re-runs
-    ``TTPlatform.check_and_update_config``, so each process rebuilds its own
-    plan from the same declarations.
+    ``TTModelRunner.__init__`` reads it to learn the draft length and whether
+    the model serves a narrow decode, and ``TTPlatform.validate_request`` reads
+    it to decide whether a request's sampling parameters can be served.
+    Admission runs once per process, not once per launch:
+    ``TTWorker.init_device`` re-runs ``TTPlatform.check_and_update_config``, so
+    each process rebuilds its own plan from the same declarations.
     """
     additional = getattr(vllm_config, "additional_config", None) or {}
     stored = additional.get(_SPEC_PLAN_KEY)
