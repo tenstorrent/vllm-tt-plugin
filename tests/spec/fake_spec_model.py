@@ -40,6 +40,7 @@ from vllm_tt_plugin.spec_decode import (
     SpecPlan,
     SpecReject,
     VerifyOutput,
+    check_spec_side_tensors,
 )
 
 # Small enough to build dense logits for in a test, wide enough that a drafted
@@ -131,7 +132,13 @@ class FakeSpecModel:
         rows, _ = self._check_block(
             "propose", committed_tokens, committed_positions, 1 + num_drafts
         )
-        self._check_accepted_counts(accepted_counts, rows, num_drafts)
+        check_spec_side_tensors(
+            torch.zeros(rows, dtype=torch.int32),
+            accepted_counts,
+            rows,
+            num_drafts,
+            call="propose",
+        )
         self.propose_calls.append(
             {
                 "num_drafts": num_drafts,
@@ -186,20 +193,7 @@ class FakeSpecModel:
             )
         rows, block_width = self._check_block("verify", tokens, positions)
         num_drafts = block_width - 1
-        self._check_accepted_counts(accepted_counts, rows, num_drafts)
-        if num_valid_drafts.shape != (rows,):
-            raise ValueError(
-                f"verify num_valid_drafts must be [{rows}], got "
-                f"{tuple(num_valid_drafts.shape)}"
-            )
-        out_of_range = num_valid_drafts[
-            (num_valid_drafts < 0) | (num_valid_drafts > num_drafts)
-        ]
-        if out_of_range.numel():
-            raise ValueError(
-                f"verify num_valid_drafts entries must lie in [0, {num_drafts}], "
-                f"got {out_of_range.tolist()}"
-            )
+        check_spec_side_tensors(num_valid_drafts, accepted_counts, rows, num_drafts)
         self.verify_calls.append(
             {
                 "rows": rows,
@@ -265,30 +259,6 @@ class FakeSpecModel:
                 f"{call} expects the uniform width 1+K = {block_width}, got {width}"
             )
         return rows, width
-
-    def _check_accepted_counts(self, accepted_counts, rows: int, num_drafts: int):
-        if accepted_counts is None:
-            raise ValueError(
-                "accepted_counts may be None only after a fused_sample step, "
-                "which FakeSpecModel does not serve"
-            )
-        if accepted_counts.shape != (rows,):
-            raise ValueError(
-                f"accepted_counts must be [{rows}], got {tuple(accepted_counts.shape)}"
-            )
-        if accepted_counts.dtype != torch.int32:
-            raise ValueError(
-                f"accepted_counts must be int32, got {accepted_counts.dtype}"
-            )
-        low, high = 1, 1 + num_drafts
-        out_of_range = accepted_counts[
-            (accepted_counts < low) | (accepted_counts > high)
-        ]
-        if out_of_range.numel():
-            raise ValueError(
-                f"accepted_counts entries must lie in [{low}, {high}]; a count "
-                f"of 0 is never valid, got {out_of_range.tolist()}"
-            )
 
     # ---- deterministic arithmetic ---------------------------------------
 
