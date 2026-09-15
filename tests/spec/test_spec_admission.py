@@ -21,7 +21,6 @@ from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import get_tt_spec_plan, store_tt_spec_plan
 from vllm_tt_plugin.spec_admission import (
     method_requirements,
-    refuse_unimplemented_execution,
     resolve_speculative_plan,
 )
 from vllm_tt_plugin.spec_decode import (
@@ -361,24 +360,6 @@ def test_a_non_callable_spec_plan_is_refused_naming_what_was_found():
 
 
 # --- nothing can execute an admitted plan yet ------------------------------
-
-
-def test_resolution_accepts_what_execution_cannot_run():
-    # Resolution validates the declarations; the separate refusal keeps a
-    # server from starting with no execution path behind it. Deleting that one
-    # call is the whole change when the runner lands.
-    config = _config()
-    assert (
-        resolve_speculative_plan(
-            config, FakeSpecModel, FakeSpecModel.model_capabilities, 1
-        ).effective_k
-        == 7
-    )
-    with pytest.raises(ValueError) as excinfo:
-        refuse_unimplemented_execution(FakeSpecModel)
-    message = str(excinfo.value)
-    assert "take_draft_token_ids" in message
-    assert "verify-then-propose" in message
 
 
 # --- the paged-drafter gate cannot be walked around ------------------------

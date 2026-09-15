@@ -64,17 +64,15 @@ def test_an_unspeculative_launch_publishes_no_plan(monkeypatch, vllm_config):
     assert require_tt_spec_plan(vllm_config) is None
 
 
-def test_an_admissible_launch_is_refused_while_nothing_can_execute_it(
-    monkeypatch, vllm_config
-):
-    # The execution path does not exist, so admission resolves the plan and
-    # then refuses rather than starting a server that serves no speculation.
+def test_an_admissible_launch_is_admitted(monkeypatch, vllm_config):
+    # The execution path exists now: the worker publishes draft token ids and
+    # the runner drives the verify-then-propose loop, so a resolved plan is
+    # served rather than refused.
     model = make_fake_spec_model(max_supported_num_seqs=4)
-    with pytest.raises(ValueError) as excinfo:
-        _run_hook(monkeypatch, _speculative(vllm_config), model)
-    message = str(excinfo.value)
-    assert "take_draft_token_ids" in message
-    assert "verify-then-propose" in message
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    plan = get_tt_spec_plan(vllm_config)
+    assert plan is not None
+    assert plan.effective_k == 7
 
 
 def test_a_declaration_error_is_reported_before_the_execution_refusal(
@@ -105,8 +103,7 @@ def test_speculation_does_not_turn_on_the_block_output_rail(monkeypatch, vllm_co
     # The whole reason the plan is not stored as output_tokens_per_step: that
     # key selects a rail which neutralizes sampling controls.
     model = make_fake_spec_model(max_supported_num_seqs=4)
-    with pytest.raises(ValueError):
-        _run_hook(monkeypatch, _speculative(vllm_config), model)
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
     assert get_tt_output_tokens_per_step(vllm_config) == 1
 
 
@@ -139,8 +136,7 @@ def test_the_plan_is_resolved_against_the_concurrency_the_lane_fold_leaves(
             return super().spec_plan(config, max_num_seqs, requested_k)
 
     vllm_config.scheduler_config.max_num_seqs = 4
-    with pytest.raises(ValueError):
-        _run_hook(monkeypatch, _speculative(vllm_config), _RecordingModel)
+    _run_hook(monkeypatch, _speculative(vllm_config), _RecordingModel)
     assert seen == [vllm_config.scheduler_config.max_num_seqs]
 
 
@@ -151,16 +147,14 @@ def test_a_reduced_draft_length_is_published_to_the_field_vllm_budgets_on(
     # num_speculative_tokens, so a reduction the model made has to reach it or
     # the scheduler reserves for a draft length the model will not verify.
     model = make_fake_spec_model(max_supported_num_seqs=4)
-    with pytest.raises(ValueError):
-        _run_hook(monkeypatch, _speculative(vllm_config, requested_k=9), model)
+    _run_hook(monkeypatch, _speculative(vllm_config, requested_k=9), model)
     assert vllm_config.speculative_config.num_speculative_tokens == 7
     assert get_tt_spec_plan(vllm_config).effective_k == 7
 
 
 def test_an_unreduced_draft_length_is_left_alone(monkeypatch, vllm_config):
     model = make_fake_spec_model(max_supported_num_seqs=4)
-    with pytest.raises(ValueError):
-        _run_hook(monkeypatch, _speculative(vllm_config, requested_k=7), model)
+    _run_hook(monkeypatch, _speculative(vllm_config, requested_k=7), model)
     assert vllm_config.speculative_config.num_speculative_tokens == 7
 
 

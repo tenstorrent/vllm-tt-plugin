@@ -418,8 +418,11 @@ def test_each_row_accepts_to_its_own_valid_draft_count():
         torch.tensor([3, 0], dtype=torch.int32),
         _per_row(2, 1),
     ).argmax_ids
+    # Row 0 carries three drafts and all three stand, so its columns 0..2 are
+    # the drafts and its bonus sits at column 3. Row 1 carries none, so its
+    # bonus sits at column 0 and it has no draft verdict anywhere.
     assert torch.equal(ids[0][:3], tokens[0][1:])
-    assert int(ids[1][0]) != int(tokens[1][1])
+    assert int(ids[1][0]) == (int(tokens[1][0]) + 1) % FAKE_VOCAB_SIZE
 
 
 def test_a_row_with_fewer_valid_drafts_diverges_only_past_its_own_count():
@@ -432,8 +435,10 @@ def test_a_row_with_fewer_valid_drafts_diverges_only_past_its_own_count():
         torch.tensor([1, 3], dtype=torch.int32),
         _per_row(2, 1),
     ).argmax_ids
+    # Row 0 carries one draft, which stands, so column 0 is that draft and
+    # column 1 is its bonus. Row 1 carries three, all standing.
     assert int(ids[0][0]) == int(tokens[0][1])
-    assert int(ids[0][1]) != int(tokens[0][2])
+    assert int(ids[0][1]) == (int(tokens[0][0]) + 2) % FAKE_VOCAB_SIZE
     assert torch.equal(ids[1][:3], tokens[1][1:])
 
 

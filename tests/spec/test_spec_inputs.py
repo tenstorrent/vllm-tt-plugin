@@ -264,6 +264,25 @@ def test_side_tensors_are_int32():
     assert model_input.accepted_counts.dtype == torch.int32
 
 
+def test_the_drafts_are_padded_with_the_rows():
+    """The accept walk reads drafts against the verify's own row count.
+
+    The verify returns one row per padded decode row, so a draft block that
+    stopped at the real requests could not be compared against it without a
+    second row count to reconcile.
+    """
+    batch = _batch()
+    request = _add_decoding_request(batch, "r")
+    runner = _fake_runner(batch, {"r": request})
+
+    model_input = _decode(runner, "r", drafts=_drafts(r=[11, 12, 13]))
+
+    assert model_input.draft_token_ids.shape == (MAX_NUM_REQS, 3)
+    assert model_input.draft_token_ids[0].tolist() == [11, 12, 13]
+    assert model_input.draft_token_ids[1].tolist() == [PLACEHOLDER_TOKEN_ID] * 3
+    assert model_input.spec_mode == "argmax_ids"
+
+
 # endregion The candidate block
 
 # region Narrow decode
@@ -516,7 +535,7 @@ def test_the_contract_model_accepts_the_built_block():
     model = FakeSpecModel()
     verify = model.decode_forward(
         tokens=model_input.input_tokens,
-        positions=model_input.input_positions,
+        start_pos=model_input.input_positions,
         num_valid_drafts=model_input.num_valid_drafts,
         accepted_counts=model_input.accepted_counts,
         spec_mode=ACCEPT_MODE_ARGMAX_IDS,
