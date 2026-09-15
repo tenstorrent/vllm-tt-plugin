@@ -769,17 +769,17 @@ class TTScheduler(AsyncScheduler):
                 is_decode = (
                     request.num_computed_tokens - scheduled >= request.num_prompt_tokens
                 )
-                # Owning the model's single spec session is part of the
-                # gate: the model serves a solo decode as plain baseline
-                # whenever it has no session for THAT request, so reserving
-                # a block for a non-owner would reserve a width the model
-                # cannot emit (see _mirror_spec_session).
-                block_step = (
-                    solo
-                    and is_decode
-                    and self._spec_eligible(request)
-                    and self._spec_session_owner == req_id
-                )
+                # Owning the model's single spec session is the whole gate:
+                # the model serves a solo decode as plain baseline whenever it
+                # has no session for THAT request, so reserving a block for a
+                # non-owner would reserve a width the model cannot emit (see
+                # _mirror_spec_session). The capture frontier is deliberately
+                # NOT re-derived here -- it is a property of the PREFILL that
+                # armed the session, already recorded in the ownership mirror,
+                # and re-deriving it from the request's CURRENT length would
+                # flip a live session's reservation to width 1 mid-generation
+                # while the model keeps emitting blocks.
+                block_step = solo and is_decode and self._spec_session_owner == req_id
             else:
                 block_step = True
             if block_step:
@@ -787,11 +787,22 @@ class TTScheduler(AsyncScheduler):
             decisions[req_id] = block_step
         set_tt_block_step_decisions(scheduler_output, decisions)
 
-    def _spec_eligible(self, request: Request) -> bool:
-        """Prompt short enough for the model to arm a spec session for it."""
+    def _spec_frontier_ok(self, measured_len: int) -> bool:
+        """Whether the model arms a session for a prefill of ``measured_len``.
+
+        The model measures its capture frontier against the ``prompt_lens`` the
+        runner hands it, which is ``input_positions + chunk_lens`` -- the tokens
+        computed INCLUDING this step. On a replay resumed from preemption that
+        spans the generated output too, so it is NOT ``num_prompt_tokens``:
+        measuring the prompt alone let a resumed request cross the frontier on
+        the model side only, which drops the session while this scheduler still
+        reserved a block, and the width check then kills the engine core
+        (vllm-tt-plugin#118.2). The caller passes ``num_computed_tokens``, which
+        ``_update_after_schedule`` has already advanced by this step.
+        """
         return (
             self._adaptive_block_max_prompt == 0
-            or request.num_prompt_tokens <= self._adaptive_block_max_prompt
+            or measured_len <= self._adaptive_block_max_prompt
         )
 
     def _mirror_spec_session(self, scheduler_output, solo: bool) -> None:
@@ -812,8 +823,16 @@ class TTScheduler(AsyncScheduler):
           taps only ever come from a prefill. This is the case that made a
           benchmark sweep fail: as concurrency drains back to one request, that
           request is solo and eligible but no longer owns a session.
-        * a SOLO decode leaves ownership alone -- the owner bootstraps its
-          pending taps and keeps the session for the rest of its life.
+        * a SOLO decode by the OWNER leaves ownership alone -- it bootstraps
+          its pending taps and keeps the session for the rest of its life.
+        * a SOLO decode by ANY OTHER request destroys it. Async scheduling can
+          skip the owner once it has reached max_tokens (upstream guards that
+          skip on num_output_placeholders), leaving a different request alone
+          on the next step while the session is still armed. The model releases
+          the session on that step for the same reason -- it would otherwise
+          speculate from the owner's residual taps -- and this mirrors that
+          release, so the reserved width stays 1 for the non-owner
+          (vllm-tt-plugin#118.1).
 
         A TT step is never mixed prefill+decode (docs/SCHEDULING.md), so the
         first scheduled request classifies the whole step.
@@ -832,8 +851,14 @@ class TTScheduler(AsyncScheduler):
                 >= request.num_prompt_tokens
             )
             if not step_is_decode:
-                owner = first_id if (solo and self._spec_eligible(request)) else None
-            elif not solo:
+                # num_computed_tokens is advanced by this step already, so it is
+                # exactly the prompt_lens the model measures its frontier on.
+                owner = (
+                    first_id
+                    if (solo and self._spec_frontier_ok(request.num_computed_tokens))
+                    else None
+                )
+            elif not solo or first_id != owner:
                 owner = None
         self._spec_session_owner = owner
 

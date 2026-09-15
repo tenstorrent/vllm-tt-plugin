@@ -581,11 +581,23 @@ def _tt_model_class_overrides() -> dict[str, str]:
     Format: comma-separated ``Arch=module.path:Class`` entries, e.g.::
 
         TT_MODEL_CLASS_OVERRIDES = \
-            "Gemma4ForCausalLM=models.demos.gemma4.tt:Gemma4MTPForCausalLM"
+            "TTGemma4ForCausalLM=models.demos.gemma4.tt:Gemma4MTPForCausalLM"
 
-    Generic serving-class selection for ANY architecture: the override is
-    registered before the built-in targets, and ``_register_model_if_missing``
-    keeps the first registration authoritative for the rest of the process.
+    Generic serving-class selection for ANY architecture. Architecture names are
+    normalised to the ``TT``-prefixed form, which is the name vLLM actually
+    resolves: ``check_and_update_config`` rewrites every checkpoint architecture
+    in place with a ``TT`` prefix before registry lookup, so an override keyed on
+    the bare name would never be consulted. Either form may be written here.
+
+    Two caveats an operator needs. The override must name the architecture the
+    CHECKPOINT resolves to: several aliases can share one target (the built-in
+    map registers six names for Gemma4 alone), and overriding one alias leaves
+    the others on the default class. And the override is registered
+    UNCONDITIONALLY, ahead of bundles and built-ins, so it is authoritative for
+    the process -- registering it if-missing silently discarded every override
+    naming an architecture upstream vLLM already ships, which is most of them
+    (vllm-tt-plugin#118.3).
+
     Model-specific selection envs are deliberately not added per model type --
     behaviour keyed on model identity is against this repo's gating contract.
     """
@@ -1080,7 +1092,15 @@ def register_tt_models(register_test_models=False) -> None:
     # TT_MODEL_CLASS_OVERRIDES entry is the most specific intent and wins over
     # bundles and built-ins via the if-missing precedence below.
     for _arch, _target in _tt_model_class_overrides().items():
-        _register_model_if_missing(ModelRegistry, _arch, _target)
+        # UNCONDITIONAL: ModelRegistry already holds every architecture upstream
+        # vLLM ships (362 in vLLM 0.26.0), so if-missing would discard the
+        # override with no diagnostic. Upstream permits re-registration. The
+        # TT-prefixed form is the one vLLM resolves (see the parser docstring);
+        # register the bare form too so nothing depends on which one ran first.
+        _tt_arch = _arch if _arch.startswith("TT") else "TT" + _arch
+        for _name in dict.fromkeys((_tt_arch, _arch)):
+            ModelRegistry.register_model(_name, _target)
+        logger.info("Applied TT_MODEL_CLASS_OVERRIDES: %s -> %s", _tt_arch, _target)
 
     # Dynamic hook: register any bundles dropped under EXTRA_MODELS_DIR. Runs
     # before the built-ins so a distributed bundle can supply a model without
