@@ -40,6 +40,7 @@ from vllm_tt_plugin.spec_decode import (
     SpecPlan,
     SpecReject,
     VerifyOutput,
+    check_spec_side_tensors,
 )
 
 # Small enough to build dense logits for in a test, wide enough that a drafted
@@ -131,7 +132,13 @@ class FakeSpecModel:
         rows, _ = self._check_block(
             "propose", committed_tokens, committed_positions, 1 + num_drafts
         )
-        self._check_accepted_counts(accepted_counts, rows, num_drafts)
+        check_spec_side_tensors(
+            torch.zeros(rows, dtype=torch.int32),
+            accepted_counts,
+            rows,
+            num_drafts,
+            call="propose",
+        )
         self.propose_calls.append(
             {
                 "num_drafts": num_drafts,
@@ -150,20 +157,27 @@ class FakeSpecModel:
     def decode_forward(
         self,
         tokens,
-        positions,
+        start_pos,
         num_valid_drafts,
         accepted_counts,
         spec_mode: str,
-        page_tables_per_layer=None,
-        slot_mapping=None,
-        sampling_params=None,
+        **kwargs,
     ) -> VerifyOutput:
         """The verify primitive: one forward over the [B, 1+K] candidate block.
 
+        The signature is the plugin's ordinary decode call, ``tokens`` and
+        ``start_pos``, plus the three speculative arguments. That is what makes
+        the contract an extension of the existing call rather than a second one
+        every model would have to grow: a speculative block travels in the same
+        two tensors, only wider.
+
         ``spec_mode`` has no default, so a caller that forgets it fails rather
-        than silently receiving greedy ids.
+        than silently receiving greedy ids. Everything else the runner passes a
+        decode, the page tables, the kv cache and the reload commands, this
+        stand-in has no use for.
         """
-        del page_tables_per_layer, slot_mapping, sampling_params
+        del kwargs
+        positions = start_pos
         if spec_mode not in self.accept_modes:
             raise ValueError(
                 f"FakeSpecModel serves {list(self.accept_modes)}, "
@@ -179,20 +193,7 @@ class FakeSpecModel:
             )
         rows, block_width = self._check_block("verify", tokens, positions)
         num_drafts = block_width - 1
-        self._check_accepted_counts(accepted_counts, rows, num_drafts)
-        if num_valid_drafts.shape != (rows,):
-            raise ValueError(
-                f"verify num_valid_drafts must be [{rows}], got "
-                f"{tuple(num_valid_drafts.shape)}"
-            )
-        out_of_range = num_valid_drafts[
-            (num_valid_drafts < 0) | (num_valid_drafts > num_drafts)
-        ]
-        if out_of_range.numel():
-            raise ValueError(
-                f"verify num_valid_drafts entries must lie in [0, {num_drafts}], "
-                f"got {out_of_range.tolist()}"
-            )
+        check_spec_side_tensors(num_valid_drafts, accepted_counts, rows, num_drafts)
         self.verify_calls.append(
             {
                 "rows": rows,
@@ -222,13 +223,27 @@ class FakeSpecModel:
         The width is derived here rather than unpacked by the caller, so a
         mis-ranked tensor produces the shape error naming the offender instead
         of a bare unpacking failure.
+
+        A narrow verify is the exception the contract carves out: a model
+        declaring ``supports_narrow_decode`` receives the plain decode's own
+        shapes on a step where no row carries a draft, which are ``[B, 1]``
+        tokens and a 1-D ``[B]`` positions. Requiring both to be 2-D here would
+        refuse the very call that declaration asks for.
         """
-        if tokens.dim() != 2 or positions.dim() != 2:
+        narrow = tokens.dim() == 2 and tokens.shape[1] == 1 and positions.dim() == 1
+        if narrow:
+            if tokens.shape[0] != positions.shape[0]:
+                raise ValueError(
+                    f"{call} narrow tokens {tuple(tokens.shape)} and positions "
+                    f"{tuple(positions.shape)} must agree on the row count"
+                )
+        elif tokens.dim() != 2 or positions.dim() != 2:
             raise ValueError(
-                f"{call} tokens and positions must both be 2-D [B, 1+K], got "
+                f"{call} tokens and positions must both be 2-D [B, 1+K], or "
+                f"[B, 1] against a 1-D [B] for a narrow step, got "
                 f"{tuple(tokens.shape)} and {tuple(positions.shape)}"
             )
-        if tokens.shape != positions.shape:
+        elif tokens.shape != positions.shape:
             raise ValueError(
                 f"{call} tokens {tuple(tokens.shape)} and positions "
                 f"{tuple(positions.shape)} must have the same shape"
@@ -245,30 +260,6 @@ class FakeSpecModel:
             )
         return rows, width
 
-    def _check_accepted_counts(self, accepted_counts, rows: int, num_drafts: int):
-        if accepted_counts is None:
-            raise ValueError(
-                "accepted_counts may be None only after a fused_sample step, "
-                "which FakeSpecModel does not serve"
-            )
-        if accepted_counts.shape != (rows,):
-            raise ValueError(
-                f"accepted_counts must be [{rows}], got {tuple(accepted_counts.shape)}"
-            )
-        if accepted_counts.dtype != torch.int32:
-            raise ValueError(
-                f"accepted_counts must be int32, got {accepted_counts.dtype}"
-            )
-        low, high = 1, 1 + num_drafts
-        out_of_range = accepted_counts[
-            (accepted_counts < low) | (accepted_counts > high)
-        ]
-        if out_of_range.numel():
-            raise ValueError(
-                f"accepted_counts entries must lie in [{low}, {high}]; a count "
-                f"of 0 is never valid, got {out_of_range.tolist()}"
-            )
-
     # ---- deterministic arithmetic ---------------------------------------
 
     @staticmethod
@@ -279,11 +270,18 @@ class FakeSpecModel:
     def _verified_ids(self, tokens, num_valid_drafts):
         """Ids the verify claims, per row, agreeing up to that row's cap.
 
-        Column 0 always repeats the input token, which is already committed.
-        Row ``i`` agrees with its drafted column ``1+j`` while ``j`` is below
+        Column ``j`` is what this model would choose at candidate position
+        ``j``, which is the token draft ``j`` has to match, and the last column
+        is the bonus that follows a fully accepted row. That is upstream's
+        layout: its greedy kernel compares ``target_argmax[pos]`` against
+        ``draft_token_ids[pos]`` and writes the committed token at ``pos``, so
+        no column of the block is spent echoing an input the runner already
+        holds.
+
+        Row ``i`` agrees with its draft ``j`` while ``j`` is below
         ``min(accept_depth, num_valid_drafts[i])``, and otherwise returns an id
-        that differs from the draft at that column, so the accept walk for that
-        row stops there.
+        that differs from that draft, so the accept walk for that row stops
+        there.
 
         The cap is per row and never reduced across the batch. A batch-wide cap
         would let one grammar-truncated request destroy every other request's
@@ -296,8 +294,21 @@ class FakeSpecModel:
         drafted = tokens[:, 1:].to(torch.int64)
         columns = torch.arange(num_drafts, dtype=torch.int64)
         diverge = columns.unsqueeze(0) >= cap.unsqueeze(1)
-        verified = tokens.clone().to(torch.int64)
-        verified[:, 1:] = torch.where(diverge, (drafted + 1) % self.vocab_size, drafted)
+        verified = torch.empty_like(tokens, dtype=torch.int64)
+        verified[:, :num_drafts] = torch.where(
+            diverge, (drafted + 1) % self.vocab_size, drafted
+        )
+        # The bonus sits at each row's own valid draft count, which is where the
+        # contract says a row finds it, and not at a column fixed for the batch:
+        # a row carrying no drafts has its bonus at column 0.
+        #
+        # Its value continues this stand-in's own drafting arithmetic one step
+        # past that row's last draft. Its drafter proposes ``last + 1 + j``, so
+        # accepting n of them leaves ``last + n + 1`` next, which makes a
+        # speculated run and an unspeculated one walk the same token sequence.
+        valid = num_valid_drafts.to(torch.int64)
+        bonus = (tokens[:, 0].to(torch.int64) + valid + 1) % self.vocab_size
+        verified.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
         return verified.to(torch.int32)
 
 

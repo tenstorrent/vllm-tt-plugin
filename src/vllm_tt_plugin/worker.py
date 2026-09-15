@@ -52,6 +52,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.outputs import DraftTokenIds
 
 logger = init_tt_logger(__name__)
 
@@ -271,6 +272,15 @@ class TTWorker(WorkerBase):
 
     def load_model(self):
         self.model_runner.load_model()
+
+    def take_draft_token_ids(self) -> "DraftTokenIds | None":
+        """Hand the runner's proposed drafts to the engine.
+
+        ``EngineCore`` calls this on every step of a speculative run and there
+        is no base implementation, so without it a launch that passes
+        admission raises ``AttributeError`` on its first step.
+        """
+        return self.model_runner.take_draft_token_ids()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()

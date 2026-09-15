@@ -16,7 +16,31 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    MODE_REQUIRED_FIELDS,
+    VerifyOutput,
+)
 from vllm_tt_plugin.structured_output import has_structured_outputs
+
+
+def _verify_output_tensor(verify: VerifyOutput) -> torch.Tensor:
+    """The one tensor a verify's mode returns, unwrapped from ``VerifyOutput``.
+
+    Only ``argmax_ids`` is driven today, so a model that answers in another
+    mode is refused by name here rather than having its tensor silently read
+    as ids. ``VerifyOutput`` has already checked that the field its mode
+    declares is present.
+    """
+    if verify.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+        raise NotImplementedError(
+            f"TT decode asked for spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} and the "
+            f"model answered in {verify.spec_mode!r}, which carries "
+            f"{list(MODE_REQUIRED_FIELDS[verify.spec_mode])}; the runner drives "
+            "no accept walk for that mode yet"
+        )
+    return verify.argmax_ids
+
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -805,6 +829,7 @@ class TTAsyncDecodeController:
         if model_input.num_valid_drafts is not None:
             kwargs["num_valid_drafts"] = model_input.num_valid_drafts
             kwargs["accepted_counts"] = model_input.accepted_counts
+            kwargs["spec_mode"] = model_input.spec_mode
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -874,6 +899,12 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
+        if isinstance(tt_out, VerifyOutput):
+            # A verify returns its mode's tensor inside a VerifyOutput, which
+            # the read path below and every consumer above expect as a plain
+            # host tensor. Unwrapped here, at the one boundary the model
+            # returns through, rather than teaching each of them the type.
+            tt_out = _verify_output_tensor(tt_out)
         # Input construction only proposed this layout/remap. Commit both at
         # the boundary where the model accepted the decode submission.
         runner.note_decode_layout_consumed()

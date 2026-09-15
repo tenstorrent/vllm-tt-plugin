@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -67,7 +68,11 @@ from vllm_tt_plugin.model_input import (
 )
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
-from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    PLACEHOLDER_TOKEN_ID,
+    accept_greedy_drafts,
+)
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -174,6 +179,9 @@ class TTModelRunner:
         # reduction back, so the two agree.
         spec_plan = get_tt_spec_plan(vllm_config)
         self._num_speculative_tokens = spec_plan.effective_k if spec_plan else 0
+        self._spec_method = (
+            str(vllm_config.speculative_config.method) if spec_plan else None
+        )
         # A model that also serves a narrow [B, 1] decode lets a step on which
         # no request carries drafts keep the plain decode shape instead of
         # padding every row's draft columns away.
@@ -269,6 +277,15 @@ class TTModelRunner:
         # Pending drafts are not here: those are the scheduler's, and arrive on
         # the SchedulerOutput. An absent entry is the post-prefill default of 1.
         self._req_accepted_counts: dict[str, int] = {}
+
+        # Drafts this runner has proposed and not yet handed to the scheduler.
+        # ``EngineCore`` collects them with ``take_draft_token_ids`` after the
+        # step that produced them, and the scheduler is what decides how many
+        # of them the next step can afford and whether a grammar allows them.
+        self._proposed_draft_token_ids: dict[str, list[int]] = {}
+        # Built on first use rather than here, because constructing it compiles
+        # numba kernels and a launch that never speculates must not pay that.
+        self._ngram_proposer: Any = None
         self._pending_state_slot_settle: dict[str, int] | None = None
 
         # Every standard-DP rank owns its own mesh and therefore its own host
@@ -1142,6 +1159,57 @@ class TTModelRunner:
                 drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
         return drafts, num_valid, counts
 
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """Hand the drafts proposed since the last call to the engine.
+
+        ``EngineCore`` calls this on every step of a speculative run, and
+        ``Scheduler.update_draft_token_ids`` is what stores the result on each
+        request, truncates it to the lookahead it can budget, and runs it
+        through the grammar. Returning ``None`` is how a step that proposed
+        nothing says so.
+        """
+        if not self._proposed_draft_token_ids:
+            return None
+        req_ids = list(self._proposed_draft_token_ids)
+        drafts = [self._proposed_draft_token_ids[req_id] for req_id in req_ids]
+        self._proposed_draft_token_ids = {}
+        return DraftTokenIds(req_ids, drafts)
+
+    def _propose_ngram_drafts(self, committed: dict[str, list[int]]) -> None:
+        """Propose the next step's drafts from the tokens just committed.
+
+        The n-gram proposer searches the request's own text for a repeat of its
+        most recent tokens and drafts what followed last time, so it reads the
+        committed history and needs no model and no device. It runs after the
+        commit for that reason: ``token_ids_cpu`` and ``num_tokens`` have to
+        already hold this step's tokens.
+
+        Rows are the persistent batch's, because that is what the proposer
+        indexes; the result is re-keyed by request id, because that is what the
+        scheduler indexes.
+        """
+        if self._spec_method != "ngram" or not committed:
+            return
+        if self._ngram_proposer is None:
+            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+            self._ngram_proposer = NgramProposer(self.vllm_config)
+
+        num_reqs = self.input_batch.num_reqs
+        row_req_ids = list(self.input_batch.req_ids[:num_reqs])
+        # An empty list tells the proposer to skip that row, which is what a
+        # request that committed nothing this step needs.
+        sampled = [committed.get(req_id, []) for req_id in row_req_ids]
+        drafts = self._ngram_proposer.propose(
+            self._num_speculative_tokens,
+            sampled,
+            self.input_batch.num_tokens[:num_reqs],
+            self.input_batch.token_ids_cpu,
+        )
+        for req_id, row_drafts in zip(row_req_ids, drafts):
+            if row_drafts:
+                self._proposed_draft_token_ids[req_id] = list(row_drafts)
+
     @staticmethod
     def _spec_candidate_block(
         drafts: torch.Tensor,
@@ -1317,6 +1385,7 @@ class TTModelRunner:
         intermediate_prefill_mask: torch.Tensor | None = None
         num_valid_drafts: torch.Tensor | None = None
         accepted_counts: torch.Tensor | None = None
+        spec_drafts: torch.Tensor | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -1366,7 +1435,7 @@ class TTModelRunner:
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
             if self._num_speculative_tokens:
-                drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
+                spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
                     self._req_accepted_counts,
                     scheduler_output.scheduled_spec_decode_tokens,
                     row_req_ids,
@@ -1381,7 +1450,7 @@ class TTModelRunner:
                     num_valid_drafts.any()
                 ):
                     input_tokens, input_positions = self._spec_candidate_block(
-                        drafts, num_valid_drafts, input_tokens, input_positions
+                        spec_drafts, num_valid_drafts, input_tokens, input_positions
                     )
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
@@ -1409,6 +1478,19 @@ class TTModelRunner:
                         ),
                     ]
                 )
+                if spec_drafts is not None:
+                    # The accept walk reads the drafts against the verify's
+                    # own row count, so they pad with the rows.
+                    spec_drafts = torch.cat(
+                        [
+                            spec_drafts,
+                            torch.full(
+                                (batch_pad, spec_drafts.shape[1]),
+                                PLACEHOLDER_TOKEN_ID,
+                                dtype=torch.int32,
+                            ),
+                        ]
+                    )
                 if num_valid_drafts is not None:
                     # A padding row carries no draft and stands on its own
                     # input token, which is the count 1: ``accepted_counts`` is
@@ -1620,6 +1702,8 @@ class TTModelRunner:
             # request's speculative state down with it.
             num_valid_drafts=num_valid_drafts,
             accepted_counts=accepted_counts,
+            draft_token_ids=spec_drafts,
+            spec_mode=ACCEPT_MODE_ARGMAX_IDS if spec_drafts is not None else None,
         )
 
     def build_model_input(
@@ -1964,6 +2048,116 @@ class TTModelRunner:
             wrapper.set_grammar_bitmask(bitmask)
         return wrapper
 
+    def _finish_spec_decode(self, fwd: _SyncForward) -> ModelRunnerOutput:
+        """Accept, commit and re-propose for one speculative decode step.
+
+        Kept off the ordinary sampling tail deliberately. A verify's return is
+        not a sampled token: it is a candidate block whose committed length is
+        decided here, per row, by comparing what the model chose against what
+        was drafted. Routing it through ``_get_output_tokens`` would have that
+        function host-sample from a tensor that already holds token ids.
+        """
+        model_input = fwd.model_input
+        row_req_ids = model_input.row_req_ids
+        missing = [
+            name
+            for name in ("row_req_ids", "draft_token_ids", "num_valid_drafts")
+            if getattr(model_input, name) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"a speculative step in mode {model_input.spec_mode!r} reached "
+                f"the accept walk without {missing}; the builder sets all three "
+                "together whenever it sets spec_mode"
+            )
+
+        argmax_ids = fwd.tt_out
+        if not isinstance(argmax_ids, torch.Tensor):
+            raise TypeError(
+                "a verify in argmax_ids mode must return a token id tensor, got "
+                f"{type(argmax_ids).__name__}"
+            )
+        # Padding rows are verified along with the rest, because the block is
+        # one fixed shape, and dropped here: only the live requests commit.
+        rows = len(row_req_ids)
+        # The draft block is built at the full width K even on a narrow step,
+        # where the model was handed one column because no row carried a draft.
+        # The walk compares the two, so the drafts are trimmed to the width the
+        # verify actually answered at.
+        verified_drafts = int(argmax_ids.shape[1]) - 1
+        committed, counts = accept_greedy_drafts(
+            argmax_ids[:rows],
+            model_input.draft_token_ids[:rows, :verified_drafts],
+            model_input.num_valid_drafts[:rows],
+        )
+
+        committed_by_req = self._apply_committed_spec_tokens_to_state(
+            row_req_ids, committed, counts
+        )
+        self._propose_ngram_drafts(committed_by_req)
+        return ModelRunnerOutput(
+            req_ids=list(row_req_ids),
+            req_id_to_index={req: idx for idx, req in enumerate(row_req_ids)},
+            sampled_token_ids=[committed_by_req[req] for req in row_req_ids],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(row_req_ids, None),
+            pooler_output=[],
+        )
+
+    def _apply_committed_spec_tokens_to_state(
+        self,
+        row_req_ids: list[str],
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> dict[str, list[int]]:
+        """Commit each row's accepted prefix and record its count.
+
+        Separate from ``_apply_sampled_tokens_to_state`` rather than widening
+        it. That function commits one fixed width for every row of every step
+        of every model, twice over in two code paths, and a speculative step
+        commits a length that differs per row. Sharing it would put a variable
+        width through the one path that every non-speculating model depends on.
+
+        Returns the committed ids per request, which the proposer needs and
+        which become the step's output.
+        """
+        max_model_len = self.model_config.max_model_len
+        committed_np = committed.numpy()
+        committed_by_req: dict[str, list[int]] = {}
+        for row, req_id in enumerate(row_req_ids):
+            count = int(counts[row])
+            block = [int(token) for token in committed_np[row, :count]]
+            batch_row = self.input_batch.req_id_to_index.get(req_id)
+            if batch_row is not None:
+                start = int(self.input_batch.num_tokens[batch_row])
+                end = min(start + len(block), max_model_len)
+                block = block[: end - start]
+                self.input_batch.token_ids_cpu[batch_row, start:end] = block
+                self.input_batch.num_tokens[batch_row] = end
+            # Exactly one extend: ``InputBatch.add_request`` stores the
+            # request's own output list in ``req_output_token_ids``, so the two
+            # are the same object while the request holds a row and extending
+            # both would commit every token twice.
+            req_state = self.requests.get(req_id)
+            if batch_row is not None:
+                output_token_ids = self.input_batch.req_output_token_ids[batch_row]
+                if output_token_ids is None:
+                    raise RuntimeError(
+                        f"request {req_id} holds row {batch_row} of the "
+                        "persistent batch but that row has no output token "
+                        f"list, so its {len(block)} committed token(s) have "
+                        "nowhere to go"
+                    )
+                output_token_ids.extend(block)
+            elif req_state is not None:
+                req_state.output_token_ids.extend(block)
+            # The count the next verify reads, which is what selects the
+            # candidate state this step left the model holding. Length-capped
+            # rows record what they actually committed, never the full count.
+            self._req_accepted_counts[req_id] = max(len(block), 1)
+            committed_by_req[req_id] = block
+        return committed_by_req
+
     def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
     ) -> ModelRunnerOutput:
@@ -1978,6 +2172,9 @@ class TTModelRunner:
                 fwd.model_input, grammar_output, lane_total=None
             ),
         )
+        if fwd.model_input.spec_mode is not None:
+            return self._finish_spec_decode(fwd)
+
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
