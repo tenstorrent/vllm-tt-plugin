@@ -523,12 +523,11 @@ def test_the_contract_model_accepts_the_built_block():
     )
 
     assert verify.argmax_ids.shape == (MAX_NUM_REQS, 4)
-    # Column 0 is already committed, so a verify repeats it.
-    assert verify.argmax_ids[0, 0] == LAST_TOKEN
-    # Row 0 drafted 3 and the stand-in agrees with all of them; row 1 drafted
-    # 1, so its second draft column is a padding column and diverges.
-    assert verify.argmax_ids[0, 1:].tolist() == [11, 12, 13]
-    assert verify.argmax_ids[1, 1] == 21
+    # Column j is the choice draft j has to match, so a row the stand-in agrees
+    # with returns its own drafts. Row 0 drafted 3 and all three stand; row 1
+    # drafted 1, so only its column 0 is a real candidate.
+    assert verify.argmax_ids[0, :3].tolist() == [11, 12, 13]
+    assert verify.argmax_ids[1, 0] == 21
 
 
 def test_the_side_tensors_reach_the_model_s_decode_forward():

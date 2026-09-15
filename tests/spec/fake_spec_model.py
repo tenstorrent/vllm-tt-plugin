@@ -279,11 +279,18 @@ class FakeSpecModel:
     def _verified_ids(self, tokens, num_valid_drafts):
         """Ids the verify claims, per row, agreeing up to that row's cap.
 
-        Column 0 always repeats the input token, which is already committed.
-        Row ``i`` agrees with its drafted column ``1+j`` while ``j`` is below
+        Column ``j`` is what this model would choose at candidate position
+        ``j``, which is the token draft ``j`` has to match, and the last column
+        is the bonus that follows a fully accepted row. That is upstream's
+        layout: its greedy kernel compares ``target_argmax[pos]`` against
+        ``draft_token_ids[pos]`` and writes the committed token at ``pos``, so
+        no column of the block is spent echoing an input the runner already
+        holds.
+
+        Row ``i`` agrees with its draft ``j`` while ``j`` is below
         ``min(accept_depth, num_valid_drafts[i])``, and otherwise returns an id
-        that differs from the draft at that column, so the accept walk for that
-        row stops there.
+        that differs from that draft, so the accept walk for that row stops
+        there.
 
         The cap is per row and never reduced across the batch. A batch-wide cap
         would let one grammar-truncated request destroy every other request's
@@ -296,8 +303,15 @@ class FakeSpecModel:
         drafted = tokens[:, 1:].to(torch.int64)
         columns = torch.arange(num_drafts, dtype=torch.int64)
         diverge = columns.unsqueeze(0) >= cap.unsqueeze(1)
-        verified = tokens.clone().to(torch.int64)
-        verified[:, 1:] = torch.where(diverge, (drafted + 1) % self.vocab_size, drafted)
+        verified = torch.empty_like(tokens, dtype=torch.int64)
+        verified[:, :num_drafts] = torch.where(
+            diverge, (drafted + 1) % self.vocab_size, drafted
+        )
+        # The bonus continues this stand-in's own drafting arithmetic one step
+        # past the last draft, so a test can predict it from the input token.
+        verified[:, num_drafts] = (
+            tokens[:, 0].to(torch.int64) + num_drafts + 1
+        ) % self.vocab_size
         return verified.to(torch.int32)
 
 

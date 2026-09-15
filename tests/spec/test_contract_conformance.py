@@ -418,8 +418,8 @@ def test_each_row_accepts_to_its_own_valid_draft_count():
         torch.tensor([3, 0], dtype=torch.int32),
         _per_row(2, 1),
     ).argmax_ids
-    assert torch.equal(ids[0], tokens[0])
-    assert int(ids[1][1]) != int(tokens[1][1])
+    assert torch.equal(ids[0][:3], tokens[0][1:])
+    assert int(ids[1][0]) != int(tokens[1][1])
 
 
 def test_a_row_with_fewer_valid_drafts_diverges_only_past_its_own_count():
@@ -432,9 +432,9 @@ def test_a_row_with_fewer_valid_drafts_diverges_only_past_its_own_count():
         torch.tensor([1, 3], dtype=torch.int32),
         _per_row(2, 1),
     ).argmax_ids
-    assert int(ids[0][1]) == int(tokens[0][1])
-    assert int(ids[0][2]) != int(tokens[0][2])
-    assert torch.equal(ids[1], tokens[1])
+    assert int(ids[0][0]) == int(tokens[0][1])
+    assert int(ids[0][1]) != int(tokens[0][2])
+    assert torch.equal(ids[1][:3], tokens[1][1:])
 
 
 def test_accept_depth_caps_a_row_without_reducing_across_the_batch():
@@ -442,8 +442,8 @@ def test_accept_depth_caps_a_row_without_reducing_across_the_batch():
     tokens, positions = _block(2, 4)
     ids = _verify(model, tokens, positions, _per_row(2, 3), _per_row(2, 1)).argmax_ids
     for row in range(2):
-        assert int(ids[row][1]) == int(tokens[row][1])
-        assert int(ids[row][2]) != int(tokens[row][2])
+        assert int(ids[row][0]) == int(tokens[row][1])
+        assert int(ids[row][1]) != int(tokens[row][2])
 
 
 # --- the stand-in refuses every input the contract forbids ----------------
