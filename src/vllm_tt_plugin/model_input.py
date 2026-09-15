@@ -165,6 +165,17 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Decode-only, speculation only. ``num_valid_drafts[i]`` is how many of row
+    # i's ``input_tokens[i, 1:]`` columns are real drafts, in [0, K]; the
+    # columns past it carry a padding marker and must not be verified.
+    # ``accepted_counts[i]`` is how many tokens row i's previous step
+    # committed, in [1, 1+K] and never 0, which is what a model reads to select
+    # the candidate state slot it continues from. Both are ``[total_B]`` int32
+    # in the same row order as ``input_tokens``, including its padding rows.
+    # ``None`` on a prefill build and on a non-speculating launch.
+    num_valid_drafts: torch.Tensor | None = None
+    accepted_counts: torch.Tensor | None = None
+
     # Prefill only: rows whose forward writes KV state but must not emit a
     # sampled token, because more prompt tokens remain after this chunk.
     # ``None`` for decode.
