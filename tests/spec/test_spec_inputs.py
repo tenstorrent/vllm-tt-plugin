@@ -22,14 +22,16 @@ https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
-from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.model_runner import SpecRequestState, TTModelRunner
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
 
 from .fake_spec_model import FakeSpecModel
@@ -48,7 +50,7 @@ LAST_TOKEN = LAST_POSITION = PROMPT_LEN + OUTPUT_LEN - 1
 # region Test helpers
 
 
-def _batch(num_speculative_tokens: int) -> InputBatch:
+def _batch() -> InputBatch:
     return InputBatch(
         max_num_reqs=MAX_NUM_REQS,
         max_model_len=MAX_MODEL_LEN,
@@ -56,7 +58,6 @@ def _batch(num_speculative_tokens: int) -> InputBatch:
         vocab_size=VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],
-        num_speculative_tokens=num_speculative_tokens,
     )
 
 
@@ -84,13 +85,18 @@ def _fake_runner(
     batch: InputBatch,
     requests: dict[str, CachedRequestState],
     supports_narrow_decode: bool = False,
+    num_speculative_tokens: int = 3,
+    spec_state: dict[str, SpecRequestState] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         input_batch=batch,
         requests=requests,
         _output_tokens_per_step=1,
+        _num_speculative_tokens=num_speculative_tokens,
         _spec_supports_narrow_decode=supports_narrow_decode,
+        _req_spec_state=spec_state if spec_state is not None else {},
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
+        _spec_row_state=TTModelRunner._spec_row_state,
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -103,6 +109,28 @@ def _fake_runner(
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+
+
+def _spec(**by_req_id) -> dict[str, SpecRequestState]:
+    """Build the runner's per-request speculative store.
+
+    Each keyword names a request id and gives its ``(accepted_count, drafts)``.
+    """
+    return {
+        req_id: SpecRequestState(accepted_count=count, draft_token_ids=list(drafts))
+        for req_id, (count, drafts) in by_req_id.items()
+    }
+
+
+def _submit(runner: SimpleNamespace, model: object, model_input) -> None:
+    """Drive one decode submission, which is what calls the model."""
+    runner.model = model
+    runner.kv_caches = object()
+    runner.request_specific_rope = False
+    runner.trace_mode = "decode_only"
+    runner.note_decode_layout_consumed = lambda: None
+    runner.note_decode_state_slots_settled = lambda: None
+    TTAsyncDecodeController(runner).submit_decode(model_input, read_from_device=True)
 
 
 def _prepare(runner: SimpleNamespace, *rows: tuple[str, int, int]):
@@ -139,7 +167,7 @@ def test_decode_block_is_uniformly_wide_without_drafts():
     padding column: ``PLACEHOLDER_TOKEN_ID`` for the token and -1 for the
     position, which is the same no-position marker a padded row carries.
     """
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     request = _add_decoding_request(batch, "r")
     model_input = _decode(_fake_runner(batch, {"r": request}), "r")
 
@@ -153,12 +181,11 @@ def test_decode_block_is_uniformly_wide_without_drafts():
 
 def test_decode_block_carries_the_pending_drafts():
     """Columns 1..K are the row's drafts at the K positions that follow."""
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     request = _add_decoding_request(batch, "r")
-    batch.draft_token_ids[0] = [11, 12, 13]
-    batch.num_valid_drafts[0] = 3
+    runner = _fake_runner(batch, {"r": request}, spec_state=_spec(r=(1, [11, 12, 13])))
 
-    model_input = _decode(_fake_runner(batch, {"r": request}), "r")
+    model_input = _decode(runner, "r")
 
     assert model_input.input_tokens[0].tolist() == [LAST_TOKEN, 11, 12, 13]
     assert model_input.input_positions[0].tolist() == [
@@ -177,14 +204,13 @@ def test_each_row_pads_at_its_own_draft_count():
     carries fewer drafts, because its drafter ran out of history or a grammar
     truncated it, must not shorten any other request's speculation.
     """
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    batch.draft_token_ids[0] = [11, 12, 13]
-    batch.num_valid_drafts[0] = 3
-    batch.draft_token_ids[1] = [21, 22, 23]
-    batch.num_valid_drafts[1] = 1
+    runner = _fake_runner(
+        batch, requests, spec_state=_spec(a=(1, [11, 12, 13]), b=(1, [21]))
+    )
 
-    model_input = _decode(_fake_runner(batch, requests), "a", "b")
+    model_input = _decode(runner, "a", "b")
 
     assert model_input.input_tokens[0].tolist() == [LAST_TOKEN, 11, 12, 13]
     assert model_input.input_tokens[1].tolist() == [
@@ -210,11 +236,11 @@ def test_padding_rows_carry_a_valid_accepted_count():
     Rows past the active requests are padding, and they stand on their own
     input token, which is the count 1.
     """
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     request = _add_decoding_request(batch, "r")
-    batch.accepted_counts[0] = 4
+    runner = _fake_runner(batch, {"r": request}, spec_state=_spec(r=(4, [])))
 
-    model_input = _decode(_fake_runner(batch, {"r": request}), "r")
+    model_input = _decode(runner, "r")
 
     assert model_input.accepted_counts.tolist() == [4, 1, 1, 1]
     assert int(model_input.accepted_counts.min()) >= 1
@@ -225,7 +251,7 @@ def test_padding_rows_carry_a_valid_accepted_count():
 
 def test_side_tensors_are_int32():
     """The contract's ``[B]`` side tensors are int32, which a model checks."""
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     request = _add_decoding_request(batch, "r")
     model_input = _decode(_fake_runner(batch, {"r": request}), "r")
 
@@ -240,13 +266,16 @@ def test_side_tensors_are_int32():
 
 def test_narrow_decode_is_kept_when_no_row_carries_a_draft():
     """A model that also serves ``[B, 1]`` keeps it on a draftless step."""
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     request = _add_decoding_request(batch, "r")
     runner = _fake_runner(batch, {"r": request}, supports_narrow_decode=True)
 
     model_input = _decode(runner, "r")
 
+    # The plain decode's own shapes, so a model that declares narrow decode
+    # implements no third input shape: [B, 1] tokens and 1-D positions.
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1)
+    assert model_input.input_positions.shape == (MAX_NUM_REQS,)
     # Still sent: the model needs the count to pick the candidate state slot
     # its previous step committed from, whatever this step's width.
     assert model_input.accepted_counts.tolist() == [1] * MAX_NUM_REQS
@@ -254,11 +283,14 @@ def test_narrow_decode_is_kept_when_no_row_carries_a_draft():
 
 
 def test_narrow_decode_widens_when_any_row_carries_a_draft():
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    batch.draft_token_ids[1] = [21, 22, 23]
-    batch.num_valid_drafts[1] = 2
-    runner = _fake_runner(batch, requests, supports_narrow_decode=True)
+    runner = _fake_runner(
+        batch,
+        requests,
+        supports_narrow_decode=True,
+        spec_state=_spec(b=(1, [21, 22])),
+    )
 
     model_input = _decode(runner, "a", "b")
 
@@ -282,10 +314,11 @@ def test_a_non_speculating_decode_is_unchanged():
     ``num_speculative_tokens`` is 0 for every model shipping today, so this
     pins that the widening cannot reach them.
     """
-    batch = _batch(num_speculative_tokens=0)
+    batch = _batch()
     request = _add_decoding_request(batch, "r")
+    runner = _fake_runner(batch, {"r": request}, num_speculative_tokens=0)
 
-    model_input = _decode(_fake_runner(batch, {"r": request}), "r")
+    model_input = _decode(runner, "r")
 
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1)
     assert model_input.input_positions.shape == (MAX_NUM_REQS,)
@@ -303,97 +336,122 @@ def test_a_prefill_drops_stale_speculative_state():
     they were drafted for. A prefill build carries no candidate block, so the
     side tensors are absent from it.
     """
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     request = _request("r", num_computed_tokens=0)
     batch.add_request(request)
-    batch.draft_token_ids[0] = [11, 12, 13]
-    batch.num_valid_drafts[0] = 3
-    batch.accepted_counts[0] = 3
+    spec_state = _spec(r=(3, [11, 12, 13]))
+    runner = _fake_runner(batch, {"r": request}, spec_state=spec_state)
 
-    model_input = _prepare(_fake_runner(batch, {"r": request}), ("r", PROMPT_LEN, 0))
+    model_input = _prepare(runner, ("r", PROMPT_LEN, 0))
 
     assert model_input.prompt_lens.tolist() == [PROMPT_LEN]
     assert model_input.num_valid_drafts is None
     assert model_input.accepted_counts is None
-    assert batch.num_valid_drafts[0] == 0
-    assert batch.accepted_counts[0] == 1
-    assert batch.draft_token_ids[0].tolist() == [PLACEHOLDER_TOKEN_ID] * 3
+    # Dropping the entry is what restores the default: no drafts, count 1.
+    assert "r" not in spec_state
 
 
 # endregion The non-speculative path
 
-# region Row bookkeeping
+# region State ownership
 
 
-def test_condense_moves_speculative_state_with_the_request():
-    """``condense`` moves a surviving request's state down to its new row.
+def test_state_follows_the_request_across_a_condense():
+    """A request's state is keyed by its id, so a row move cannot lose it.
 
-    Leaving it behind would hand the moved request the accepted count and the
-    drafts of whichever request previously sat at the row it moves into.
+    ``condense`` moves a surviving request into a lower row when an earlier one
+    finishes. Holding the accepted count and the drafts by row would hand the
+    moved request whatever the row it moved into used to carry.
     """
-    batch = _batch(num_speculative_tokens=3)
-    for req_id in ("a", "b"):
-        _add_decoding_request(batch, req_id)
-    batch.draft_token_ids[1] = [21, 22, 23]
-    batch.num_valid_drafts[1] = 2
-    batch.accepted_counts[1] = 3
-
-    removed = batch.remove_request("a")
-    batch.condense([removed])
-
-    assert batch.req_id_to_index == {"b": 0}
-    assert batch.draft_token_ids[0].tolist() == [21, 22, 23]
-    assert batch.num_valid_drafts[0] == 2
-    assert batch.accepted_counts[0] == 3
-
-
-def test_a_reused_slot_does_not_inherit_speculative_state():
-    """``add_request`` resets the slot it lands in.
-
-    A row freed by a finished request keeps its arrays until something
-    overwrites them, and the next request to take that row would otherwise
-    verify tokens drafted for another sequence.
-    """
-    batch = _batch(num_speculative_tokens=3)
-    _add_decoding_request(batch, "a")
-    batch.draft_token_ids[0] = [11, 12, 13]
-    batch.num_valid_drafts[0] = 3
-    batch.accepted_counts[0] = 4
-
-    batch.remove_request("a")
-    _add_decoding_request(batch, "b")
-
-    assert batch.req_id_to_index == {"b": 0}
-    assert batch.draft_token_ids[0].tolist() == [PLACEHOLDER_TOKEN_ID] * 3
-    assert batch.num_valid_drafts[0] == 0
-    assert batch.accepted_counts[0] == 1
-
-
-def test_built_rows_follow_the_request_across_a_condense():
-    """The built block's row order is the post-condense order.
-
-    ``_prepare_model_inputs`` reads the persistent batch by row, so the move
-    ``condense`` performs is what puts a request's drafts and its accepted
-    count on the same row as its own last committed token.
-    """
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    batch.draft_token_ids[1] = [21, 22, 23]
-    batch.num_valid_drafts[1] = 3
-    batch.accepted_counts[1] = 2
+    spec_state = _spec(b=(2, [21, 22, 23]))
 
     removed = batch.remove_request("a")
     batch.condense([removed])
     del requests["a"]
 
-    model_input = _decode(_fake_runner(batch, requests), "b")
+    model_input = _decode(_fake_runner(batch, requests, spec_state=spec_state), "b")
 
     assert model_input.row_req_ids == ["b"]
     assert model_input.input_tokens[0].tolist() == [LAST_TOKEN, 21, 22, 23]
     assert model_input.accepted_counts[0] == 2
 
 
-# endregion Row bookkeeping
+def test_state_survives_a_request_being_unscheduled_for_one_step():
+    """A running request the scheduler skips for one step keeps its state.
+
+    ``_update_states`` removes every request absent from a step's scheduled set
+    and keeps its cached state, because a running request may simply be hidden
+    for that step rather than preempted. Only an explicit preemption releases
+    the model's candidate state, so a request that comes back must still be
+    told which candidate its last step committed from: losing the count would
+    have the model continue from the wrong candidate and corrupt its output
+    with no error anywhere.
+    """
+    batch = _batch()
+    requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
+    runner = _fake_runner(batch, requests, spec_state=_spec(b=(3, [21, 22, 23])))
+
+    # "b" is hidden for one step: out of the persistent batch and back in.
+    removed = batch.remove_request("b")
+    batch.condense([removed])
+    batch.add_request(requests["b"])
+
+    model_input = _decode(runner, "a", "b")
+
+    row = model_input.row_req_ids.index("b")
+    assert model_input.accepted_counts[row] == 3
+    assert model_input.input_tokens[row].tolist() == [LAST_TOKEN, 21, 22, 23]
+
+
+def test_a_reused_row_does_not_inherit_another_request_s_state():
+    """A new request in a freed row starts from the post-prefill default.
+
+    Nothing writes an entry for a request that has not speculated, so the
+    absence of one is the default rather than a stale neighbour's drafts.
+    """
+    batch = _batch()
+    request_a = _add_decoding_request(batch, "a")
+    spec_state = _spec(a=(4, [11, 12, 13]))
+    del request_a
+
+    batch.remove_request("a")
+    spec_state.pop("a")  # what _update_states does when "a" finishes
+    request_b = _add_decoding_request(batch, "b")
+
+    model_input = _decode(
+        _fake_runner(batch, {"b": request_b}, spec_state=spec_state), "b"
+    )
+
+    assert model_input.accepted_counts[0] == 1
+    assert model_input.num_valid_drafts[0] == 0
+    assert model_input.input_tokens[0].tolist() == [
+        LAST_TOKEN,
+        PLACEHOLDER_TOKEN_ID,
+        PLACEHOLDER_TOKEN_ID,
+        PLACEHOLDER_TOKEN_ID,
+    ]
+
+
+def test_more_drafts_than_the_block_can_carry_is_refused():
+    """A row cannot hold more pending drafts than the block has columns.
+
+    The runner writes this store itself, so an overflow is a drafter bug rather
+    than an input to tolerate. Truncating would hide it and silently forfeit
+    the speculation that overflowed.
+    """
+    batch = _batch()
+    request = _add_decoding_request(batch, "r")
+    runner = _fake_runner(
+        batch, {"r": request}, spec_state=_spec(r=(1, [11, 12, 13, 14]))
+    )
+
+    with pytest.raises(RuntimeError, match="above the block's 3"):
+        _decode(runner, "r")
+
+
+# endregion State ownership
 
 # region Conformance
 
@@ -407,15 +465,13 @@ def test_the_contract_model_accepts_the_built_block():
     built tensors, padding rows included, is what makes the build conformant
     rather than merely self-consistent.
     """
-    batch = _batch(num_speculative_tokens=3)
+    batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    batch.draft_token_ids[0] = [11, 12, 13]
-    batch.num_valid_drafts[0] = 3
-    batch.accepted_counts[0] = 2
-    batch.draft_token_ids[1] = [21, 22, 23]
-    batch.num_valid_drafts[1] = 1
+    runner = _fake_runner(
+        batch, requests, spec_state=_spec(a=(2, [11, 12, 13]), b=(1, [21]))
+    )
 
-    model_input = _decode(_fake_runner(batch, requests), "a", "b")
+    model_input = _decode(runner, "a", "b")
 
     model = FakeSpecModel()
     verify = model.decode_forward(
@@ -433,6 +489,59 @@ def test_the_contract_model_accepts_the_built_block():
     # 1, so its second draft column is a padding column and diverges.
     assert verify.argmax_ids[0, 1:].tolist() == [11, 12, 13]
     assert verify.argmax_ids[1, 1] == 21
+
+
+def test_the_side_tensors_reach_the_model_s_decode_forward():
+    """The two ``[B]`` tensors must cross the runner-to-model boundary.
+
+    Building them onto ``TTModelInput`` is not enough: every decode submission,
+    synchronous and asynchronous alike, goes through
+    ``TTAsyncDecodeController.submit_decode``, which assembles the kwargs the
+    model is actually called with. A model implementing the contract cannot
+    mask its padded candidates or advance to the accepted prefix without both.
+    """
+    calls = []
+
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": False}
+
+        def decode_forward(self, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros((MAX_NUM_REQS, 1))
+
+    batch = _batch()
+    requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
+    runner = _fake_runner(batch, requests, spec_state=_spec(a=(2, [11, 12, 13])))
+    model_input = _decode(runner, "a", "b")
+
+    _submit(runner, Model(), model_input)
+
+    assert torch.equal(calls[0]["num_valid_drafts"], model_input.num_valid_drafts)
+    assert torch.equal(calls[0]["accepted_counts"], model_input.accepted_counts)
+
+
+def test_a_non_speculating_decode_sends_no_side_tensors():
+    """A model that never speculates keeps the call shape it has today."""
+    calls = []
+
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": False}
+
+        def decode_forward(self, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros((MAX_NUM_REQS, 1))
+
+    batch = _batch()
+    request = _add_decoding_request(batch, "r")
+    runner = _fake_runner(batch, {"r": request}, num_speculative_tokens=0)
+    model_input = _decode(runner, "r")
+
+    _submit(runner, Model(), model_input)
+
+    assert "num_valid_drafts" not in calls[0]
+    assert "accepted_counts" not in calls[0]
 
 
 # endregion Conformance

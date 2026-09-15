@@ -123,10 +123,13 @@ drafts and resets its count to 1, because a request resumed from preemption
 replays its own history and its drafts no longer sit at the positions they were
 drafted for.
 
-A model that declares `supports_narrow_decode` receives `[B, 1]` tokens and
-positions on a step where no row carries a draft, and the two `[B]` side
-tensors regardless. A model that does not receives `[B, 1+K]` on every decode
-step, so it needs one decode shape rather than two.
+A model that declares `supports_narrow_decode` receives the plain decode's own
+shapes on a step where no row carries a draft, which are `[B, 1]` tokens and
+`[B]` positions, so the narrow step is the ordinary decode call and not a third
+shape to implement. It receives the two `[B]` side tensors on that step too,
+because the count is how it picks the candidate state slot its previous step
+committed from, whatever this step's width. A model that does not declare it
+receives `[B, 1+K]` on every decode step.
 
 ## 5. What the plugin does with a refusal
 
