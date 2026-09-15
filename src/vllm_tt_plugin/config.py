@@ -112,11 +112,13 @@ def is_tt_adaptive_block_output_model(vllm_config: "VllmConfig") -> bool:
     ``max_num_seqs 1`` / no data-parallelism. An ADAPTIVE block-output model
     emits its multi-token block only on steps that schedule exactly one decode
     request, and falls back to plain 1-token baseline decode whenever two or
-    more requests batch together. That lifts the ``max_num_seqs 1`` and (later)
+    more requests batch together. That lifts the ``max_num_seqs 1`` and
     data-parallel restrictions: at low concurrency each request gets the block
     speedup, at higher concurrency the server is a plain batched baseline
-    (never worse). The scheduler reserves the K-token placeholder block only for
-    a solo decode step (see TTScheduler), matching the model's batch gate.
+    (never worse). ``TTScheduler._update_after_schedule`` owns the reservation
+    predicate and reserves the K-token placeholder block only when the step is
+    solo, is a decode, is within ``tt_adaptive_block_max_prompt_tokens``, and
+    the request owns the model's speculative session.
     """
     additional = getattr(vllm_config, "additional_config", None) or {}
     return bool(additional.get(_ADAPTIVE_BLOCK_OUTPUT_KEY, False))
