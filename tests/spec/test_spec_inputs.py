@@ -31,7 +31,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
-from vllm_tt_plugin.model_runner import SpecRequestState, TTModelRunner
+from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
 
 from .fake_spec_model import FakeSpecModel
@@ -86,7 +86,7 @@ def _fake_runner(
     requests: dict[str, CachedRequestState],
     supports_narrow_decode: bool = False,
     num_speculative_tokens: int = 3,
-    spec_state: dict[str, SpecRequestState] | None = None,
+    accepted_counts: dict[str, int] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         input_batch=batch,
@@ -94,7 +94,9 @@ def _fake_runner(
         _output_tokens_per_step=1,
         _num_speculative_tokens=num_speculative_tokens,
         _spec_supports_narrow_decode=supports_narrow_decode,
-        _req_spec_state=spec_state if spec_state is not None else {},
+        # Shared, not copied: a test that watches the runner drop an entry
+        # needs to see the same dict the runner mutates.
+        _req_accepted_counts=accepted_counts if accepted_counts is not None else {},
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
         _spec_row_state=TTModelRunner._spec_row_state,
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
@@ -111,15 +113,9 @@ def _fake_runner(
     )
 
 
-def _spec(**by_req_id) -> dict[str, SpecRequestState]:
-    """Build the runner's per-request speculative store.
-
-    Each keyword names a request id and gives its ``(accepted_count, drafts)``.
-    """
-    return {
-        req_id: SpecRequestState(accepted_count=count, draft_token_ids=list(drafts))
-        for req_id, (count, drafts) in by_req_id.items()
-    }
+def _drafts(**by_req_id) -> dict[str, list[int]]:
+    """Drafts as the scheduler delivers them, on the ``SchedulerOutput``."""
+    return {req_id: list(ids) for req_id, ids in by_req_id.items()}
 
 
 def _submit(runner: SimpleNamespace, model: object, model_input) -> None:
@@ -133,9 +129,14 @@ def _submit(runner: SimpleNamespace, model: object, model_input) -> None:
     TTAsyncDecodeController(runner).submit_decode(model_input, read_from_device=True)
 
 
-def _prepare(runner: SimpleNamespace, *rows: tuple[str, int, int]):
+def _prepare(
+    runner: SimpleNamespace,
+    *rows: tuple[str, int, int],
+    drafts: dict[str, list[int]] | None = None,
+):
     """Run ``_prepare_model_inputs`` for ``(req_id, num_scheduled, num_computed)``."""
     scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_spec_decode_tokens = dict(drafts or {})
     scheduler_output.num_scheduled_tokens = {r: s for r, s, _ in rows}
     scheduler_output.total_num_scheduled_tokens = sum(s for _, s, _ in rows)
     scheduler_output.scheduled_cached_reqs = CachedRequestData(
@@ -150,8 +151,14 @@ def _prepare(runner: SimpleNamespace, *rows: tuple[str, int, int]):
     return TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
 
 
-def _decode(runner: SimpleNamespace, *req_ids: str):
-    return _prepare(runner, *((r, 1, PROMPT_LEN + OUTPUT_LEN - 1) for r in req_ids))
+def _decode(
+    runner: SimpleNamespace, *req_ids: str, drafts: dict[str, list[int]] | None = None
+):
+    return _prepare(
+        runner,
+        *((r, 1, PROMPT_LEN + OUTPUT_LEN - 1) for r in req_ids),
+        drafts=drafts,
+    )
 
 
 # endregion Test helpers
@@ -183,9 +190,9 @@ def test_decode_block_carries_the_pending_drafts():
     """Columns 1..K are the row's drafts at the K positions that follow."""
     batch = _batch()
     request = _add_decoding_request(batch, "r")
-    runner = _fake_runner(batch, {"r": request}, spec_state=_spec(r=(1, [11, 12, 13])))
+    runner = _fake_runner(batch, {"r": request})
 
-    model_input = _decode(runner, "r")
+    model_input = _decode(runner, "r", drafts=_drafts(r=[11, 12, 13]))
 
     assert model_input.input_tokens[0].tolist() == [LAST_TOKEN, 11, 12, 13]
     assert model_input.input_positions[0].tolist() == [
@@ -206,11 +213,9 @@ def test_each_row_pads_at_its_own_draft_count():
     """
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    runner = _fake_runner(
-        batch, requests, spec_state=_spec(a=(1, [11, 12, 13]), b=(1, [21]))
-    )
+    runner = _fake_runner(batch, requests)
 
-    model_input = _decode(runner, "a", "b")
+    model_input = _decode(runner, "a", "b", drafts=_drafts(a=[11, 12, 13], b=[21]))
 
     assert model_input.input_tokens[0].tolist() == [LAST_TOKEN, 11, 12, 13]
     assert model_input.input_tokens[1].tolist() == [
@@ -238,7 +243,7 @@ def test_padding_rows_carry_a_valid_accepted_count():
     """
     batch = _batch()
     request = _add_decoding_request(batch, "r")
-    runner = _fake_runner(batch, {"r": request}, spec_state=_spec(r=(4, [])))
+    runner = _fake_runner(batch, {"r": request}, accepted_counts={"r": 4})
 
     model_input = _decode(runner, "r")
 
@@ -289,10 +294,9 @@ def test_narrow_decode_widens_when_any_row_carries_a_draft():
         batch,
         requests,
         supports_narrow_decode=True,
-        spec_state=_spec(b=(1, [21, 22])),
     )
 
-    model_input = _decode(runner, "a", "b")
+    model_input = _decode(runner, "a", "b", drafts=_drafts(b=[21, 22]))
 
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 4)
     assert model_input.input_tokens[1].tolist() == [
@@ -339,16 +343,16 @@ def test_a_prefill_drops_stale_speculative_state():
     batch = _batch()
     request = _request("r", num_computed_tokens=0)
     batch.add_request(request)
-    spec_state = _spec(r=(3, [11, 12, 13]))
-    runner = _fake_runner(batch, {"r": request}, spec_state=spec_state)
+    accepted_counts = {"r": 3}
+    runner = _fake_runner(batch, {"r": request}, accepted_counts=accepted_counts)
 
-    model_input = _prepare(runner, ("r", PROMPT_LEN, 0))
+    model_input = _prepare(runner, ("r", PROMPT_LEN, 0), drafts=_drafts(r=[11, 12, 13]))
 
     assert model_input.prompt_lens.tolist() == [PROMPT_LEN]
     assert model_input.num_valid_drafts is None
     assert model_input.accepted_counts is None
-    # Dropping the entry is what restores the default: no drafts, count 1.
-    assert "r" not in spec_state
+    # Dropping the entry is what restores the default count of 1.
+    assert "r" not in accepted_counts
 
 
 # endregion The non-speculative path
@@ -365,13 +369,13 @@ def test_state_follows_the_request_across_a_condense():
     """
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    spec_state = _spec(b=(2, [21, 22, 23]))
+    runner = _fake_runner(batch, requests, accepted_counts={"b": 2})
 
     removed = batch.remove_request("a")
     batch.condense([removed])
     del requests["a"]
 
-    model_input = _decode(_fake_runner(batch, requests, spec_state=spec_state), "b")
+    model_input = _decode(runner, "b", drafts=_drafts(b=[21, 22, 23]))
 
     assert model_input.row_req_ids == ["b"]
     assert model_input.input_tokens[0].tolist() == [LAST_TOKEN, 21, 22, 23]
@@ -391,14 +395,14 @@ def test_state_survives_a_request_being_unscheduled_for_one_step():
     """
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    runner = _fake_runner(batch, requests, spec_state=_spec(b=(3, [21, 22, 23])))
+    runner = _fake_runner(batch, requests, accepted_counts={"b": 3})
 
     # "b" is hidden for one step: out of the persistent batch and back in.
     removed = batch.remove_request("b")
     batch.condense([removed])
     batch.add_request(requests["b"])
 
-    model_input = _decode(runner, "a", "b")
+    model_input = _decode(runner, "a", "b", drafts=_drafts(b=[21, 22, 23]))
 
     row = model_input.row_req_ids.index("b")
     assert model_input.accepted_counts[row] == 3
@@ -413,15 +417,15 @@ def test_a_reused_row_does_not_inherit_another_request_s_state():
     """
     batch = _batch()
     request_a = _add_decoding_request(batch, "a")
-    spec_state = _spec(a=(4, [11, 12, 13]))
+    accepted_counts = {"a": 4}
     del request_a
 
     batch.remove_request("a")
-    spec_state.pop("a")  # what _update_states does when "a" finishes
+    accepted_counts.pop("a")  # what the prune does once "a" has finished
     request_b = _add_decoding_request(batch, "b")
 
     model_input = _decode(
-        _fake_runner(batch, {"b": request_b}, spec_state=spec_state), "b"
+        _fake_runner(batch, {"b": request_b}, accepted_counts=accepted_counts), "b"
     )
 
     assert model_input.accepted_counts[0] == 1
@@ -443,12 +447,50 @@ def test_more_drafts_than_the_block_can_carry_is_refused():
     """
     batch = _batch()
     request = _add_decoding_request(batch, "r")
-    runner = _fake_runner(
-        batch, {"r": request}, spec_state=_spec(r=(1, [11, 12, 13, 14]))
-    )
+    runner = _fake_runner(batch, {"r": request})
 
     with pytest.raises(RuntimeError, match="above the block's 3"):
-        _decode(runner, "r")
+        _decode(runner, "r", drafts=_drafts(r=[11, 12, 13, 14]))
+
+
+def test_the_drafts_come_from_the_scheduler_and_not_from_the_runner():
+    """Only the scheduler's drafts are verified, and no others.
+
+    A proposer reports its drafts through ``take_draft_token_ids``; upstream's
+    ``Scheduler`` then stores them on the request, truncates them to the token
+    budget it can schedule, and runs them through the grammar for a request
+    using structured output. What survives arrives as
+    ``SchedulerOutput.scheduled_spec_decode_tokens``. Verifying a
+    runner-private copy instead would bypass both the budget and the grammar,
+    and grammar truncation is the reason a row's draft count is per row rather
+    than batch-wide.
+
+    So a step that schedules no drafts for a request verifies none for it, even
+    if that request speculated on the step before.
+    """
+    batch = _batch()
+    requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
+    runner = _fake_runner(batch, requests, accepted_counts={"a": 2, "b": 2})
+
+    first = _decode(runner, "a", "b", drafts=_drafts(a=[11, 12, 13], b=[21, 22, 23]))
+    assert first.num_valid_drafts[:2].tolist() == [3, 3]
+
+    # The scheduler drops "b"'s drafts, as it does for a prefill chunk or when
+    # a grammar rejects every one of them.
+    second = _decode(runner, "a", "b", drafts=_drafts(a=[11, 12, 13]))
+
+    row_a = second.row_req_ids.index("a")
+    row_b = second.row_req_ids.index("b")
+    assert int(second.num_valid_drafts[row_a]) == 3
+    assert int(second.num_valid_drafts[row_b]) == 0
+    assert second.input_tokens[row_b].tolist() == [
+        LAST_TOKEN,
+        PLACEHOLDER_TOKEN_ID,
+        PLACEHOLDER_TOKEN_ID,
+        PLACEHOLDER_TOKEN_ID,
+    ]
+    # The count is the runner's and is untouched by the scheduler dropping drafts.
+    assert int(second.accepted_counts[row_b]) == 2
 
 
 # endregion State ownership
@@ -467,11 +509,9 @@ def test_the_contract_model_accepts_the_built_block():
     """
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    runner = _fake_runner(
-        batch, requests, spec_state=_spec(a=(2, [11, 12, 13]), b=(1, [21]))
-    )
+    runner = _fake_runner(batch, requests, accepted_counts={"a": 2})
 
-    model_input = _decode(runner, "a", "b")
+    model_input = _decode(runner, "a", "b", drafts=_drafts(a=[11, 12, 13], b=[21]))
 
     model = FakeSpecModel()
     verify = model.decode_forward(
@@ -512,8 +552,8 @@ def test_the_side_tensors_reach_the_model_s_decode_forward():
 
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
-    runner = _fake_runner(batch, requests, spec_state=_spec(a=(2, [11, 12, 13])))
-    model_input = _decode(runner, "a", "b")
+    runner = _fake_runner(batch, requests, accepted_counts={"a": 2})
+    model_input = _decode(runner, "a", "b", drafts=_drafts(a=[11, 12, 13]))
 
     _submit(runner, Model(), model_input)
 

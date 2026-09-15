@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -103,24 +103,6 @@ def _parse_layer_index(layer_name: str) -> int:
             "TT spec hooks must use the '...layers.<idx>...' naming convention."
         )
     return int(match.group(1))
-
-
-@dataclass
-class SpecRequestState:
-    """One request's speculative state between steps.
-
-    ``accepted_count`` is how many tokens its last step committed, in
-    ``[1, 1+K]``, which is what a model reads to select the candidate state it
-    deferred. ``draft_token_ids`` are the drafts pending for its next verify;
-    its length is the row's valid draft count, so the two cannot disagree.
-
-    Keyed by request id on the runner rather than by row on the persistent
-    batch, because a row is not stable across the scheduler skipping a running
-    request for one step.
-    """
-
-    accepted_count: int = 1
-    draft_token_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -312,13 +294,14 @@ class TTModelRunner:
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
 
-        # req_id -> pending drafts and the count its last step committed, for
-        # the same reason: a running request the scheduler skips for one step
-        # is removed from the persistent batch and added back later, and only
-        # an explicit preemption releases the model's candidate state, so the
-        # count that selects among those candidates has to survive the row
-        # going away. An absent entry is the post-prefill default.
-        self._req_spec_state: dict[str, SpecRequestState] = {}
+        # req_id -> how many tokens its last step committed, for the same
+        # reason: a running request the scheduler skips for one step is removed
+        # from the persistent batch and added back later, and only an explicit
+        # preemption releases the model's candidate state, so the count that
+        # selects among those candidates has to survive the row going away.
+        # Pending drafts are not here: those are the scheduler's, and arrive on
+        # the SchedulerOutput. An absent entry is the post-prefill default of 1.
+        self._req_accepted_counts: dict[str, int] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
         # Slot-level ``old -> new`` for the same pending gather, forwarded to the
         # model once the decode is accepted so its recorded session owner follows
@@ -1169,21 +1152,33 @@ class TTModelRunner:
 
     @staticmethod
     def _spec_row_state(
-        spec_state: dict[str, SpecRequestState],
+        accepted_counts_by_req: dict[str, int],
+        scheduled_drafts: dict[str, list[int]],
         row_req_ids: list[str],
         num_drafts: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather ``(drafts, num_valid_drafts, accepted_counts)`` for these rows.
 
-        Read by request id rather than by row, because a running request that
-        one step does not schedule is removed from the persistent batch and
-        added back later. Keying on the row would lose its accepted count,
-        which is what selects the candidate state a model deferred, and the
-        model still holds that state because only an explicit preemption
-        releases it.
+        The two halves come from different owners, deliberately.
 
-        A request with no entry is one that has not speculated yet, and the
-        default is the same as after a prefill: no drafts and a count of 1.
+        The **drafts** are the scheduler's. A proposer reports them through
+        ``take_draft_token_ids``, upstream's ``Scheduler`` stores them on the
+        request, truncates them to the token budget it can actually schedule,
+        and runs them through the grammar when a request uses structured
+        output. What survives all that arrives as
+        ``SchedulerOutput.scheduled_spec_decode_tokens``, and only that is safe
+        to verify. A runner-private copy would bypass the budget and the
+        grammar, and grammar truncation is the reason ``num_valid_drafts`` is
+        per row rather than batch-wide in the first place.
+
+        The **accepted count** is the runner's, because nothing upstream models
+        it. It is keyed by request id rather than by row because a running
+        request that one step does not schedule leaves the persistent batch and
+        comes back, and only an explicit preemption releases the candidate
+        state the count selects.
+
+        A request absent from either mapping takes the post-prefill default: no
+        drafts, and a count of 1.
         """
         drafts = torch.full(
             (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
@@ -1191,24 +1186,22 @@ class TTModelRunner:
         num_valid = torch.zeros(len(row_req_ids), dtype=torch.int32)
         counts = torch.ones(len(row_req_ids), dtype=torch.int32)
         for row, req_id in enumerate(row_req_ids):
-            state = spec_state.get(req_id)
-            if state is None:
-                continue
-            counts[row] = state.accepted_count
-            valid = len(state.draft_token_ids)
+            counts[row] = accepted_counts_by_req.get(req_id, 1)
+            row_drafts = scheduled_drafts.get(req_id) or ()
+            valid = len(row_drafts)
             if valid > num_drafts:
-                # The runner writes this store itself, so more drafts than the
-                # block can carry is a drafter bug. Truncating would hide it and
-                # silently forfeit the speculation that overflowed.
+                # The scheduler truncates to the lookahead it budgeted, which
+                # the platform publishes as num_speculative_tokens, so a longer
+                # list means the two disagree about the draft length. Raised
+                # rather than truncated, because silently dropping the tail
+                # would verify a prefix at positions the block was built for.
                 raise RuntimeError(
-                    f"request {req_id} holds {valid} pending drafts, above the "
-                    f"block's {num_drafts}: {state.draft_token_ids}"
+                    f"request {req_id} was scheduled {valid} draft tokens, "
+                    f"above the block's {num_drafts}: {list(row_drafts)}"
                 )
             num_valid[row] = valid
             if valid:
-                drafts[row, :valid] = torch.tensor(
-                    state.draft_token_ids, dtype=torch.int32
-                )
+                drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
         return drafts, num_valid, counts
 
     @staticmethod
@@ -1290,9 +1283,9 @@ class TTModelRunner:
             # has to keep its state. ``self.requests`` is what says a request
             # is gone for good: ``_update_states`` drops it there only on
             # finish. A preempted request keeps its entry and loses it below,
-            # where the prefill it resumes with invalidates pending drafts.
-            for req_id in self._req_spec_state.keys() - self.requests.keys():
-                self._req_spec_state.pop(req_id, None)
+            # where the prefill it resumes with resets the count.
+            for req_id in self._req_accepted_counts.keys() - self.requests.keys():
+                self._req_accepted_counts.pop(req_id, None)
 
         # Pad decode to the per-rank wire capacity, which outside lane mode is
         # the whole engine capacity.
@@ -1413,14 +1406,15 @@ class TTModelRunner:
             ]
             decode_layout_changed = False
             if self._num_speculative_tokens:
-                # A prefilling row's pending drafts are stale: a request
-                # resumed from preemption replays its own history, and a
-                # chunked continuation has not reached its drafted positions.
-                # Dropping the entry restores the default, which is no drafts
-                # and a committed count of 1, so the first speculative step
-                # after a prefill needs no special case.
+                # A prefill commits one token, so its accepted count is 1,
+                # and a request resumed from preemption has no candidate state
+                # left to select anyway. Dropping the entry restores that
+                # default, so the first speculative step after a prefill needs
+                # no special case. The drafts a prefilling row may still carry
+                # are the scheduler's to drop, and it does: update_draft_token_ids
+                # clears spec_token_ids for a request in a prefill chunk.
                 for req_id in row_req_ids:
-                    self._req_spec_state.pop(req_id, None)
+                    self._req_accepted_counts.pop(req_id, None)
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1435,7 +1429,10 @@ class TTModelRunner:
 
             if self._num_speculative_tokens:
                 drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
-                    self._req_spec_state, row_req_ids, self._num_speculative_tokens
+                    self._req_accepted_counts,
+                    scheduler_output.scheduled_spec_decode_tokens,
+                    row_req_ids,
+                    self._num_speculative_tokens,
                 )
                 # Uniformly 1+K wide, so a model needs one verify shape rather
                 # than two, unless it declared a narrow decode as well and no
