@@ -364,6 +364,55 @@ def normalize_declared_values(
     return declared
 
 
+def check_spec_side_tensors(
+    num_valid_drafts: "torch.Tensor | None",
+    accepted_counts: "torch.Tensor | None",
+    rows: int,
+    num_drafts: int,
+    call: str = "verify",
+) -> None:
+    """Validate the two ``[B]`` tensors a verify receives beside its block.
+
+    Lives here, in the contract module both sides import, because every model
+    implementing the contract has to check the same domain and a model that
+    checks a weaker one is a poor witness for it. Two independent copies of
+    this drifted apart once already.
+
+    ``num_valid_drafts`` says how many of a row's draft columns are real, in
+    ``[0, num_drafts]``. ``accepted_counts`` says how many tokens that row's
+    previous step committed, in ``[1, 1 + num_drafts]``: a count and not an
+    index, so 0 is never valid and a model reading ``accepted_counts - 1`` to
+    select a candidate state never indexes -1.
+
+    Both are int32, because the runner builds them that way and a float or a
+    wider integer here means the caller built something else.
+    """
+    import torch
+
+    for name, tensor, low, high in (
+        ("num_valid_drafts", num_valid_drafts, 0, num_drafts),
+        ("accepted_counts", accepted_counts, 1, 1 + num_drafts),
+    ):
+        if tensor is None:
+            raise ValueError(
+                f"{call} {name} must be present; only accepted_counts may be "
+                "None, and only after a fused_sample step left an "
+                "authoritative count on the device"
+            )
+        if tensor.shape != (rows,):
+            raise ValueError(
+                f"{call} {name} must be [{rows}], got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{call} {name} must be int32, got {tensor.dtype}")
+        out_of_range = tensor[(tensor < low) | (tensor > high)]
+        if out_of_range.numel():
+            raise ValueError(
+                f"{call} {name} entries must lie in [{low}, {high}], got "
+                f"{out_of_range.tolist()}"
+            )
+
+
 def accept_greedy_drafts(
     argmax_ids: "torch.Tensor",
     draft_token_ids: "torch.Tensor",
@@ -469,5 +518,6 @@ __all__ = [
     "SpecReject",
     "VerifyOutput",
     "accept_greedy_drafts",
+    "check_spec_side_tensors",
     "normalize_declared_values",
 ]
