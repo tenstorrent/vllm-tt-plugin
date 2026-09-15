@@ -28,7 +28,6 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -212,14 +211,12 @@ class InputBatch:
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
-        num_speculative_tokens: int = 0,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.vocab_size = vocab_size
         self.disable_logprobs = disable_logprobs
         self.output_tokens_per_step = output_tokens_per_step
-        self.num_speculative_tokens = num_speculative_tokens
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -241,24 +238,6 @@ class InputBatch:
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_computed_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
-
-        # Per-row speculative state. ``accepted_counts[i]`` is how many tokens
-        # row i's previous step committed, in [1, 1 + num_speculative_tokens]
-        # and never 0, which is what a model reads to select the candidate
-        # state slot it continues from; 1 means only the input token stood.
-        # ``draft_token_ids[i]`` holds row i's pending drafts and
-        # ``num_valid_drafts[i]`` how many of them are real. All three are
-        # allocated unconditionally: ``num_speculative_tokens`` is 0 without
-        # speculation, which makes ``draft_token_ids`` zero-width, so the
-        # non-speculative case needs no separate branch anywhere that reads
-        # them.
-        self.accepted_counts = np.ones(max_num_reqs, dtype=np.int32)
-        self.draft_token_ids = np.full(
-            (max_num_reqs, num_speculative_tokens),
-            PLACEHOLDER_TOKEN_ID,
-            dtype=np.int32,
-        )
-        self.num_valid_drafts = np.zeros(max_num_reqs, dtype=np.int32)
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -353,14 +332,6 @@ class InputBatch:
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
-
-        # A reused slot must not inherit the previous request's speculative
-        # state: its drafts belong to another sequence, and its accepted count
-        # would make a model continue from a candidate slot this request never
-        # wrote. 1 is the count after a prefill.
-        self.accepted_counts[req_index] = 1
-        self.num_valid_drafts[req_index] = 0
-        self.draft_token_ids[req_index] = PLACEHOLDER_TOKEN_ID
 
         # Sampling-related.
         sampling_params = request.sampling_params
@@ -569,12 +540,6 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
-            # Speculative state follows the request to its new row. Leaving it
-            # behind would hand the moved request the accepted count and the
-            # drafts of whichever request previously sat at ``empty_index``.
-            self.accepted_counts[empty_index] = self.accepted_counts[last_req_index]
-            self.num_valid_drafts[empty_index] = self.num_valid_drafts[last_req_index]
-            self.draft_token_ids[empty_index] = self.draft_token_ids[last_req_index]
             self.block_table.move_row(last_req_index, empty_index)
 
             # Sampling-related.
