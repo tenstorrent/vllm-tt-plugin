@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -103,6 +103,24 @@ def _parse_layer_index(layer_name: str) -> int:
             "TT spec hooks must use the '...layers.<idx>...' naming convention."
         )
     return int(match.group(1))
+
+
+@dataclass
+class SpecRequestState:
+    """One request's speculative state between steps.
+
+    ``accepted_count`` is how many tokens its last step committed, in
+    ``[1, 1+K]``, which is what a model reads to select the candidate state it
+    deferred. ``draft_token_ids`` are the drafts pending for its next verify;
+    its length is the row's valid draft count, so the two cannot disagree.
+
+    Keyed by request id on the runner rather than by row on the persistent
+    batch, because a row is not stable across the scheduler skipping a running
+    request for one step.
+    """
+
+    accepted_count: int = 1
+    draft_token_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -293,6 +311,14 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+
+        # req_id -> pending drafts and the count its last step committed, for
+        # the same reason: a running request the scheduler skips for one step
+        # is removed from the persistent batch and added back later, and only
+        # an explicit preemption releases the model's candidate state, so the
+        # count that selects among those candidates has to survive the row
+        # going away. An absent entry is the post-prefill default.
+        self._req_spec_state: dict[str, SpecRequestState] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
         # Slot-level ``old -> new`` for the same pending gather, forwarded to the
         # model once the decode is accepted so its recorded session owner follows
@@ -451,9 +477,6 @@ class TTModelRunner:
                 kernel_block_sizes=per_group_block_sizes,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
-                # No num_speculative_tokens: the platform refuses a speculating
-                # lane launch, because lane mode builds its device input from
-                # TTLaneInputBatch, which has no candidate-block builder.
                 output_tokens_per_step=self._output_tokens_per_step,
             )
         else:
@@ -467,7 +490,6 @@ class TTModelRunner:
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
-                num_speculative_tokens=self._num_speculative_tokens,
             )
 
         # The block tables in the persistent input batch have
@@ -1146,9 +1168,53 @@ class TTModelRunner:
         return generators
 
     @staticmethod
+    def _spec_row_state(
+        spec_state: dict[str, SpecRequestState],
+        row_req_ids: list[str],
+        num_drafts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather ``(drafts, num_valid_drafts, accepted_counts)`` for these rows.
+
+        Read by request id rather than by row, because a running request that
+        one step does not schedule is removed from the persistent batch and
+        added back later. Keying on the row would lose its accepted count,
+        which is what selects the candidate state a model deferred, and the
+        model still holds that state because only an explicit preemption
+        releases it.
+
+        A request with no entry is one that has not speculated yet, and the
+        default is the same as after a prefill: no drafts and a count of 1.
+        """
+        drafts = torch.full(
+            (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+        )
+        num_valid = torch.zeros(len(row_req_ids), dtype=torch.int32)
+        counts = torch.ones(len(row_req_ids), dtype=torch.int32)
+        for row, req_id in enumerate(row_req_ids):
+            state = spec_state.get(req_id)
+            if state is None:
+                continue
+            counts[row] = state.accepted_count
+            valid = len(state.draft_token_ids)
+            if valid > num_drafts:
+                # The runner writes this store itself, so more drafts than the
+                # block can carry is a drafter bug. Truncating would hide it and
+                # silently forfeit the speculation that overflowed.
+                raise RuntimeError(
+                    f"request {req_id} holds {valid} pending drafts, above the "
+                    f"block's {num_drafts}: {state.draft_token_ids}"
+                )
+            num_valid[row] = valid
+            if valid:
+                drafts[row, :valid] = torch.tensor(
+                    state.draft_token_ids, dtype=torch.int32
+                )
+        return drafts, num_valid, counts
+
+    @staticmethod
     def _spec_candidate_block(
-        input_batch: InputBatch,
-        req_indices: list[int],
+        drafts: torch.Tensor,
+        num_valid: torch.Tensor,
         input_tokens: torch.Tensor,
         input_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1162,20 +1228,14 @@ class TTModelRunner:
         same no-position marker the unused rows of a padded decode carry. A
         padded column must therefore never be mistaken for a real candidate,
         which is what ``num_valid_drafts`` tells the model.
-
-        K comes from ``input_batch.draft_token_ids``, so the block width has
-        one source of truth: whatever width the persistent batch allocated for
-        this launch.
         """
-        num_drafts = input_batch.draft_token_ids.shape[1]
-        drafts = torch.from_numpy(input_batch.draft_token_ids[req_indices])
-        num_valid = torch.from_numpy(input_batch.num_valid_drafts[req_indices])
+        num_drafts = drafts.shape[1]
         columns = torch.arange(num_drafts, dtype=torch.int32)
         # True where a column lies past that row's valid draft count.
         padded_draft = columns.unsqueeze(0) >= num_valid.unsqueeze(1)
         # Column 0 is committed, so it is never padded.
         padded = torch.cat(
-            [torch.zeros(len(req_indices), 1, dtype=torch.bool), padded_draft], dim=1
+            [torch.zeros(drafts.shape[0], 1, dtype=torch.bool), padded_draft], dim=1
         )
 
         tokens = torch.cat([input_tokens, drafts], dim=1)
@@ -1223,6 +1283,16 @@ class TTModelRunner:
         # The whole local batch.
         req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
+        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        if self._num_speculative_tokens:
+            # Pruned here rather than where requests finish, because every
+            # other way a request leaves the persistent batch is temporary and
+            # has to keep its state. ``self.requests`` is what says a request
+            # is gone for good: ``_update_states`` drops it there only on
+            # finish. A preempted request keeps its entry and loses it below,
+            # where the prefill it resumes with invalidates pending drafts.
+            for req_id in self._req_spec_state.keys() - self.requests.keys():
+                self._req_spec_state.pop(req_id, None)
 
         # Pad decode to the per-rank wire capacity, which outside lane mode is
         # the whole engine capacity.
@@ -1342,15 +1412,15 @@ class TTModelRunner:
                 req_indices, :max_prefill_tokens
             ]
             decode_layout_changed = False
-            if input_batch.num_speculative_tokens:
+            if self._num_speculative_tokens:
                 # A prefilling row's pending drafts are stale: a request
                 # resumed from preemption replays its own history, and a
                 # chunked continuation has not reached its drafted positions.
-                # 1 is the committed count after a prefill, so the first
-                # speculative step after one needs no special case.
-                input_batch.accepted_counts[req_indices] = 1
-                input_batch.num_valid_drafts[req_indices] = 0
-                input_batch.draft_token_ids[req_indices] = PLACEHOLDER_TOKEN_ID
+                # Dropping the entry restores the default, which is no drafts
+                # and a committed count of 1, so the first speculative step
+                # after a prefill needs no special case.
+                for req_id in row_req_ids:
+                    self._req_spec_state.pop(req_id, None)
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1363,21 +1433,20 @@ class TTModelRunner:
             # explicit contract commands or the legacy ``reset_batch`` keyword.
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
-            if input_batch.num_speculative_tokens:
-                num_valid_drafts = torch.from_numpy(
-                    input_batch.num_valid_drafts[req_indices]
-                )
-                accepted_counts = torch.from_numpy(
-                    input_batch.accepted_counts[req_indices]
+            if self._num_speculative_tokens:
+                drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
+                    self._req_spec_state, row_req_ids, self._num_speculative_tokens
                 )
                 # Uniformly 1+K wide, so a model needs one verify shape rather
                 # than two, unless it declared a narrow decode as well and no
-                # row carries a draft this step.
+                # row carries a draft this step. A narrow step keeps the plain
+                # decode's shapes, so a model that declares it needs no second
+                # input shape at all.
                 if not self._spec_supports_narrow_decode or bool(
                     num_valid_drafts.any()
                 ):
                     input_tokens, input_positions = self._spec_candidate_block(
-                        input_batch, req_indices, input_tokens, input_positions
+                        drafts, num_valid_drafts, input_tokens, input_positions
                     )
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
