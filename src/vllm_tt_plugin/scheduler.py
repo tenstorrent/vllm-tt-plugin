@@ -613,11 +613,16 @@ class TTScheduler(AsyncScheduler):
                     )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """Reserve the complete physical output emitted by each block step.
+        """Reserve the physical output each scheduled step will commit.
 
-        The platform removes the upstream diffusion marker, so vLLM reserves
-        its normal one sampled-token placeholder. The TT adapter returns one
-        K-token canvas; reserve the remaining K-1 positions.
+        The platform removes the upstream diffusion marker, so vLLM reserves its
+        normal one sampled-token placeholder. A plain block-output model commits
+        a K-token canvas on every step, so reserve the remaining K-1 positions.
+        An adaptive block-output model commits K only on a step that satisfies
+        the ``block_step`` predicate below, and one token on every other step,
+        so the extra reservation is per step. Each step's decision is recorded
+        on its own SchedulerOutput because update_from_output must reconcile a
+        commit against the decision that produced it.
         """
         super()._update_after_schedule(scheduler_output)
         if not self._is_block_output_model:
@@ -631,11 +636,8 @@ class TTScheduler(AsyncScheduler):
         # This MUST match the model's own gate, which runs the spec block in
         # decode_forward when batch == 1 and a plain token otherwise:
         #   - solo == batch 1 (exactly one request scheduled this step);
-        #   - decode == the prompt is fully computed (a prefill step still has
-        #     num_computed_tokens < num_prompt_tokens, so it takes prefill_forward
-        #     and emits the single anchor). num_computed reflects prior committed
-        #     steps here, so it is 0<prompt on the prefill and >=prompt on the
-        #     first decode -- robust where an output-token count can still read 0.
+        #   - decode == the prompt was fully computed BEFORE this step (see the
+        #     decode test below, which subtracts this step's scheduled tokens).
         # The decision is attached to THIS step's SchedulerOutput (not a Request
         # slot): under async the next step's schedule() overwrites Request state
         # before this step's output commits, but the engine core hands the
