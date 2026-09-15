@@ -27,10 +27,7 @@ from vllm_tt_plugin.config import (
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.spec_admission import (
-    refuse_unimplemented_execution,
-    resolve_speculative_plan,
-)
+from vllm_tt_plugin.spec_admission import resolve_speculative_plan
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -1881,10 +1878,6 @@ class TTPlatform(Platform):
                     spec_plan.effective_k
                 )
         store_tt_spec_plan(vllm_config, spec_plan)
-        if spec_plan is not None:
-            # Delete this call, and nothing else here, when TTWorker publishes
-            # draft token ids and TTModelRunner drives the loop.
-            refuse_unimplemented_execution(model_class)
 
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
