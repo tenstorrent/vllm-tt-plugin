@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import inspect
+
 from torch import nn
 from vllm.config import ModelConfig, VllmConfig
 from vllm.model_executor.model_loader import BaseModelLoader
@@ -35,13 +37,28 @@ class TTModelLoader(BaseModelLoader):
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         max_batch_size = get_tt_max_batch_size(vllm_config)
 
-        model = model_class.initialize_vllm_model(
+        initializer = model_class.initialize_vllm_model
+        init_kwargs = {
+            "max_seq_len": model_config.max_model_len,
+            "tt_data_parallel": tt_data_parallel,
+            "optimizations": optimizations,
+        }
+        parameters = inspect.signature(initializer).parameters.values()
+        if any(
+            parameter.name == "vllm_config"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            # Generated backends validate their compiler-owned cache ABI
+            # against the scheduler configuration that will drive it.  Keep
+            # legacy model initializers compatible while forwarding the
+            # contract to every backend that declares the generic ABI.
+            init_kwargs["vllm_config"] = vllm_config
+        model = initializer(
             model_config.hf_config,
             device_config.device,
             max_batch_size,
-            max_seq_len=model_config.max_model_len,
-            tt_data_parallel=tt_data_parallel,
-            optimizations=optimizations,
+            **init_kwargs,
         )
         return model
 
