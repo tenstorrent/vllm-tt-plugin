@@ -411,10 +411,9 @@ class TTLaneCoordinator(SchedulerInterface):
         whole step is prefill-only; otherwise it is decode-only. Lanes without
         work for the chosen mode simply contribute an empty batch.
 
-        The decode-interleave policy overrides a prefill intent once a run of
-        prefill steps reaches its bound, so the decision stays a single
-        coordinator-level choice: taking it per lane would let lanes disagree
-        about the shared mode.
+        Decode interleaving is decided jointly for all lanes: the policy
+        overrides a prefill intent once a run of prefill steps reaches its
+        bound and some lane holds a decode that a decode step can advance.
         """
         intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
         if intent == 1 and self._decode_interleave.wants_decode_step(
@@ -563,6 +562,7 @@ class TTLaneCoordinator(SchedulerInterface):
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        prefill_intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
         forced_mode = self._negotiate_forced_mode()
         lane_outputs = self._schedule_all_lanes(forced_mode)
         merged = merge_lane_scheduler_outputs(lane_outputs)
@@ -612,7 +612,9 @@ class TTLaneCoordinator(SchedulerInterface):
                 set_tt_forced_reset_discard_counts(merged, current_reset_discards)
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
-        self._decode_interleave.record_step(is_decode=is_decode)
+        self._decode_interleave.record_step(
+            is_decode=is_decode, prefill_pending=bool(prefill_intent)
+        )
         plan = self._build_step_plan(lane_outputs, merged, is_decode)
         _set_tt_step_state(merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan))
         return merged

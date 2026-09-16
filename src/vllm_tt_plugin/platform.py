@@ -174,14 +174,11 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
 
 
 def _report_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
-    """Validate the decode-interleave settings and record the resolved policy.
+    """Validate the decode-interleave settings and log the resolved policy.
 
-    Called for its raising side effect as much as for the log line: an invalid
-    ``decode_interleave_*`` value must stop the server at config time rather
-    than at the first scheduler step in a worker subprocess. The scheduler
-    config is absent from ``/metrics`` and an interleaved decode step is
-    indistinguishable from an ordinary one in the iteration stats, so this line
-    is the only external signal of the active policy.
+    Called for its raising side effect too: an invalid ``decode_interleave_*``
+    value must fail at config time, not at the first scheduler step in a worker
+    subprocess. The log line is the only external signal of the active policy.
     """
     enabled, prefill_steps, decode_steps = get_tt_decode_interleave_config(vllm_config)
     if not enabled:

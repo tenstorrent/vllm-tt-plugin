@@ -49,7 +49,7 @@ def _run_phases(policy, steps, *, has_pending_prefill=True, has_running_decode=T
             has_pending_prefill=has_pending_prefill,
             has_running_decode=has_running_decode,
         )
-        policy.record_step(is_decode=is_decode)
+        policy.record_step(is_decode=is_decode, prefill_pending=has_pending_prefill)
         phases.append("D" if is_decode else "P")
     return "".join(phases)
 
@@ -159,12 +159,61 @@ def test_a_zero_token_decode_step_still_spends_its_allowance():
     policy = _policy(
         decode_interleave_prefill_steps=1, decode_interleave_decode_steps=1
     )
-    policy.record_step(is_decode=False)
+    policy.record_step(is_decode=False, prefill_pending=True)
     assert policy.wants_decode_step(has_pending_prefill=True, has_running_decode=True)
-    policy.record_step(is_decode=True)
+    policy.record_step(is_decode=True, prefill_pending=True)
     assert not policy.wants_decode_step(
         has_pending_prefill=True, has_running_decode=True
     )
+
+
+@pytest.mark.parametrize("decode_steps", [1, 2, 4])
+def test_ordinary_decode_does_not_cost_a_new_prompt_its_prefill_step(decode_steps):
+    """A decode step taken with nothing pending must not prime an insertion.
+
+    Sequence: enough prefill steps to reach the bound, then the pending work
+    runs out and the scheduler takes an ordinary decode step, then a new prompt
+    arrives. The new prompt has to get the next step. Counting that ordinary
+    decode against the insertion allowance would leave the prefill count at its
+    bound with the allowance part spent, and the arriving prompt would wait for
+    the rest of an insertion it was never part of.
+    """
+    policy = _policy(
+        decode_interleave_prefill_steps=2,
+        decode_interleave_decode_steps=decode_steps,
+    )
+    policy.record_step(is_decode=False, prefill_pending=True)
+    policy.record_step(is_decode=False, prefill_pending=True)
+    policy.record_step(is_decode=True, prefill_pending=False)
+
+    assert not policy.wants_decode_step(
+        has_pending_prefill=True, has_running_decode=True
+    )
+
+
+@pytest.mark.parametrize("decode_steps", [1, 2, 4])
+def test_a_run_of_ordinary_decodes_leaves_prefill_first(decode_steps):
+    policy = _policy(
+        decode_interleave_prefill_steps=2,
+        decode_interleave_decode_steps=decode_steps,
+    )
+    for _ in range(6):
+        policy.record_step(is_decode=True, prefill_pending=False)
+
+    assert not policy.wants_decode_step(
+        has_pending_prefill=True, has_running_decode=True
+    )
+
+
+def test_insertion_cadence_survives_an_idle_gap():
+    """An idle stretch resets the policy; the next run starts from prefill."""
+    policy = _policy(
+        decode_interleave_prefill_steps=2, decode_interleave_decode_steps=2
+    )
+    assert _run_phases(policy, 4) == "PPDD"
+    for _ in range(3):
+        policy.record_step(is_decode=True, prefill_pending=False)
+    assert _run_phases(policy, 4) == "PPDD"
 
 
 # --- TTScheduler integration ----------------------------------------------

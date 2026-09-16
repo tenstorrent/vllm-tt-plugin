@@ -176,7 +176,7 @@ def test_decode_interleave_overrides_a_prefill_intent_once_the_bound_is_hit():
     for _ in range(9):
         mode = coordinator._negotiate_forced_mode()
         coordinator._decode_interleave.record_step(
-            is_decode=mode == TTSchedulingMode.DECODE_ONLY
+            is_decode=mode == TTSchedulingMode.DECODE_ONLY, prefill_pending=True
         )
         modes.append(mode)
 
@@ -194,7 +194,7 @@ def test_decode_interleave_needs_a_lane_with_a_genuine_running_decode():
     for _ in range(4):
         mode = coordinator._negotiate_forced_mode()
         coordinator._decode_interleave.record_step(
-            is_decode=mode == TTSchedulingMode.DECODE_ONLY
+            is_decode=mode == TTSchedulingMode.DECODE_ONLY, prefill_pending=True
         )
         assert mode == TTSchedulingMode.PREFILL_ONLY
 

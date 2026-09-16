@@ -189,11 +189,7 @@ _DECODE_INTERLEAVE_PREFILL_STEPS_KEY = "decode_interleave_prefill_steps"
 _DECODE_INTERLEAVE_DECODE_STEPS_KEY = "decode_interleave_decode_steps"
 
 _DECODE_INTERLEAVE_ENABLED_DEFAULT = True
-# Measured on a T3K with Llama-3.1-8B-Instruct at max_num_batched_tokens=2048,
-# four 16384-token prompts arriving against four streaming decodes: 2 bounds
-# the worst decode gap at 899 ms against 11152 ms with the policy off, for 1.0%
-# on median time to first token. 1 reaches 523 ms but costs 7.4%; 4 leaves
-# 1603 ms.
+# docs/SCHEDULING.md records the measurements this default rests on.
 _DECODE_INTERLEAVE_PREFILL_STEPS_DEFAULT = 2
 _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT = 1
 

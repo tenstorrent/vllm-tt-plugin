@@ -75,8 +75,8 @@ class TTDecodeInterleavePolicy:
 
     - ``prefill_steps``: how many consecutive prefill steps run before a
       decode-only step is inserted.
-    - ``decode_steps``: how many decode-only steps that insertion runs before a
-      prefill step is required again.
+    - ``decode_steps``: how many decode-only steps one insertion runs before
+      the policy stops choosing decode and a prefill step may run again.
 
     Both bounds are step counts, not token counts, because the interleave
     granularity is a whole step. They give a two-sided guarantee: a running
@@ -86,10 +86,12 @@ class TTDecodeInterleavePolicy:
     policy cannot oscillate faster than that period.
 
     The policy only ever chooses a decode-only step in place of a prefill step.
-    It never chooses prefill, so it cannot delay a decode that would have run
-    anyway. The zero-progress fallback that turns a prefill step scheduling no
-    tokens into a decode step is a separate decision; the policy only records
-    the phase that fallback settled on.
+    It never forces prefill: reaching the decode allowance just stops it
+    choosing decode, and whether a prefill step then runs is up to the
+    scheduler and to whether prefill work is pending. The zero-progress
+    fallback that turns a prefill step scheduling no tokens into a decode step
+    is a separate decision; the policy only records the phase that fallback
+    settled on.
     """
 
     def __init__(self, vllm_config: "VllmConfig") -> None:
@@ -117,7 +119,7 @@ class TTDecodeInterleavePolicy:
             and self._decode_run < self._decode_steps
         )
 
-    def record_step(self, *, is_decode: bool) -> None:
+    def record_step(self, *, is_decode: bool, prefill_pending: bool) -> None:
         """Advance the counters with the phase the step actually ran.
 
         Called for every step, including one that scheduled no tokens. A
@@ -126,7 +128,18 @@ class TTDecodeInterleavePolicy:
         still consumes its decode allowance; leaving the counters untouched
         there would re-pick decode on every following step and livelock the
         engine on empty steps.
+
+        ``prefill_pending`` says whether any prefill work existed when the step
+        was chosen. A decode step taken with nothing pending is an ordinary
+        decode, not part of an insertion, so it clears both counters: counting
+        it would leave ``_prefill_run`` at its bound with part of the decode
+        allowance already spent, and the next arriving prompt would then lose
+        its first prefill step to an insertion it was never part of.
         """
+        if not prefill_pending:
+            self._prefill_run = 0
+            self._decode_run = 0
+            return
         if is_decode:
             self._decode_run += 1
             if self._decode_run >= self._decode_steps:
@@ -532,7 +545,9 @@ class TTScheduler(AsyncScheduler):
                 # on the running decodes so their inter-token latency does not
                 # scale with the pending prompt's length; the pending prefill
                 # resumes on the next step.
-                self._decode_interleave.record_step(is_decode=True)
+                self._decode_interleave.record_step(
+                    is_decode=True, prefill_pending=True
+                )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
             prefill_result = self._schedule_prefill_only()
@@ -540,14 +555,16 @@ class TTScheduler(AsyncScheduler):
             # decode. Fall back to decode-only so running requests can advance
             # and free capacity for a later prefill admission.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running_decode:
-                self._decode_interleave.record_step(is_decode=True)
+                self._decode_interleave.record_step(
+                    is_decode=True, prefill_pending=True
+                )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result)
-            self._decode_interleave.record_step(is_decode=False)
+            self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result)
 
         # No pending prefill work in default mode: run decode-only naturally.
-        self._decode_interleave.record_step(is_decode=True)
+        self._decode_interleave.record_step(is_decode=True, prefill_pending=False)
         result = super().schedule()
         return self._finalize_scheduler_output(result)
 
