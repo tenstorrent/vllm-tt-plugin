@@ -625,6 +625,22 @@ class TTScheduler(AsyncScheduler):
         commit against the decision that produced it.
         """
         super()._update_after_schedule(scheduler_output)
+        if self.num_spec_tokens:
+            # ``AsyncScheduler`` leaves every scheduled request holding
+            # ``[-1] * num_spec_tokens``, which upstream's GPU runner
+            # overwrites from its own state in ``_prepare_input_ids``. The TT
+            # runner has no such step: it verifies whatever the scheduler
+            # delivers, so a placeholder surviving here becomes a draft the
+            # accept walk compares against, matches (the model is handed the
+            # same placeholder), and commits as an output token.
+            #
+            # Cleared rather than restored to the ids just scheduled: a
+            # proposal is handed over once, so a request whose row proposed
+            # nothing this step must speculate on nothing next step rather
+            # than replay a spent proposal. Drafts reach a request only
+            # through ``update_draft_token_ids``.
+            for req_id in scheduler_output.num_scheduled_tokens:
+                self.requests[req_id].spec_token_ids = []
         if not self._is_block_output_model:
             return
         extra_placeholders = (

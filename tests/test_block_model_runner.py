@@ -33,6 +33,7 @@ def _runner(width: int, *, num_tokens: int = 0, max_model_len: int = 32):
     return (
         _bind_committed_width(
             SimpleNamespace(
+                _num_speculative_tokens=0,
                 _output_tokens_per_step=width,
                 input_batch=SimpleNamespace(
                     num_reqs=1,
@@ -88,6 +89,7 @@ def _captured_runner(width: int, num_tokens: tuple[int, int]):
     )
     runner = _bind_committed_width(
         SimpleNamespace(
+            _num_speculative_tokens=0,
             _output_tokens_per_step=width,
             requests={"a": state_a, "b": state_b},
             input_batch=SimpleNamespace(
@@ -321,6 +323,7 @@ def _extract(
 ):
     runner = _bind_committed_width(
         SimpleNamespace(
+            _num_speculative_tokens=0,
             _output_tokens_per_step=width,
             _is_block_output_model=width > 1,
             tt_per_lane_max_num_seqs=1,

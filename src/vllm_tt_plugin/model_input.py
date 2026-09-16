@@ -165,6 +165,25 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
+    # drafts the block's columns 1..K carry, kept alongside the block because
+    # the accept walk needs them again after the verify returns. ``spec_mode``
+    # names the accept mode the verify was asked for, and its presence is what
+    # marks a step speculative. Both ``None`` otherwise.
+    draft_token_ids: torch.Tensor | None = None
+    spec_mode: str | None = None
+
+    # Decode-only, speculation only. ``num_valid_drafts[i]`` is how many of row
+    # i's ``input_tokens[i, 1:]`` columns are real drafts, in [0, K]; the
+    # columns past it carry a padding marker and must not be verified.
+    # ``accepted_counts[i]`` is how many tokens row i's previous step
+    # committed, in [1, 1+K] and never 0, which is what a model reads to select
+    # the candidate state slot it continues from. Both are ``[total_B]`` int32
+    # in the same row order as ``input_tokens``, including its padding rows.
+    # ``None`` on a prefill build and on a non-speculating launch.
+    num_valid_drafts: torch.Tensor | None = None
+    accepted_counts: torch.Tensor | None = None
+
     # Prefill only: rows whose forward writes KV state but must not emit a
     # sampled token, because more prompt tokens remain after this chunk.
     # ``None`` for decode.
