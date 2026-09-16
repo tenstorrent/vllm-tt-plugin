@@ -102,18 +102,18 @@ def _parse_layer_index(layer_name: str) -> int:
     return int(match.group(1))
 
 
-def _single_attention_group_layer_count(
-    layer_names: list[str], num_layers: int
-) -> int:
+def _single_attention_group_layer_count(layer_names: list[str], num_layers: int) -> int:
     """Resolve legacy synthetic vs real sparse single-group layer counts."""
     if len(layer_names) == 1 and layer_names[0] == "foo":
         return num_layers
     layer_indices = sorted(_parse_layer_index(name) for name in layer_names)
-    if (len(set(layer_indices)) != len(layer_indices)
-            or any(not 0 <= index < num_layers for index in layer_indices)):
+    if len(set(layer_indices)) != len(layer_indices) or any(
+        not 0 <= index < num_layers for index in layer_indices
+    ):
         raise ValueError(
             "single KV cache group contains duplicate or out-of-range "
-            f"layer names: {layer_names}")
+            f"layer names: {layer_names}"
+        )
     return len(layer_indices)
 
 
@@ -609,10 +609,9 @@ class TTModelRunner:
                 # identical real specs into one group; expanding that group to
                 # ``num_layers`` invents KV buffers the model does not own.
                 cache_layer_count = _single_attention_group_layer_count(
-                    group.layer_names, num_layers)
-                return [
-                    (shape, spec.dtype, i) for i in range(cache_layer_count)
-                ]
+                    group.layer_names, num_layers
+                )
+                return [(shape, spec.dtype, i) for i in range(cache_layer_count)]
             # ``UniformTypeKVCacheSpecs``: one group / one block table, but the
             # wrapped per-layer specs have heterogeneous shapes (e.g. Gemma4
             # with hybrid groups disabled: sliding 8x256 vs full 1x512). Every

@@ -39,6 +39,7 @@ def test_single_attention_group_rejects_invalid_real_layer_names(names):
     with pytest.raises(ValueError, match="duplicate or out-of-range"):
         _single_attention_group_layer_count(names, 16)
 
+
 # region Test helpers
 
 
