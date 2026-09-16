@@ -36,7 +36,7 @@ jobs:
           set -euo pipefail
           # Source of truth for what the plugin currently targets. Capture the full
           # version token (not just X.Y.Z) so a .postN / rcN suffix is preserved.
-          pinned=$(sed -nE 's/.*vllm==([^[:space:]]+).*/\1/p' docs/install-vllm-tt.sh | head -1)
+          pinned=$(sed -nE 's/^VLLM_VERSION=([^[:space:]]+).*/\1/p' docs/install-vllm-tt.sh | head -1)
           # Latest stable upstream release (prereleases are excluded by the API).
           latest=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name | sed 's/^v//')
           if [ -z "$pinned" ] || [ -z "$latest" ]; then

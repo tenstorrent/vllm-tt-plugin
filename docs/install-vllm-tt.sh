@@ -11,9 +11,12 @@
 # set as a result: re-read common.txt when bumping the version below.
 # In a container, set UV_NO_CACHE=1 so the sdist and the wheel built from it do
 # not stay behind in the image layer.
+VLLM_REPOSITORY=https://github.com/tenstorrent/vllm.git
+VLLM_VERSION=0.26.0
+VLLM_COMMIT=9b497a72cd57a3483acad1a19a03309cf2a30655
 VLLM_COMMON_REQUIREMENTS=$(mktemp)
 curl -fsSL \
-    https://raw.githubusercontent.com/vllm-project/vllm/v0.26.0/requirements/common.txt \
+    "https://raw.githubusercontent.com/tenstorrent/vllm/${VLLM_COMMIT}/requirements/common.txt" \
     -o "$VLLM_COMMON_REQUIREMENTS" ||
     # `return`, not `exit`: this script is sourced into the caller's shell.
     { echo "install-vllm-tt: cannot fetch vLLM common.txt"; return 1; }
@@ -30,8 +33,9 @@ rm -f "$VLLM_COMMON_REQUIREMENTS"
 # CUDA build.
 uv pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
     torchvision==0.26.0   # keep in sync with tt-metal requirements-dev.txt
-# --no-binary vllm: the published wheel is the CUDA build, kernels included, so
-# vLLM has to come from source. vLLM ends up declaring no torch dependency, which
-# is intended; torch belongs to the tt-metal env this plugin runs inside.
-VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.26.0
+# The published wheel is the CUDA build, kernels included, so install the pinned
+# source commit. vLLM ends up declaring no torch dependency, which is intended;
+# torch belongs to the tt-metal env this plugin runs inside.
+VLLM_TARGET_DEVICE=empty uv pip install --no-deps \
+    "vllm @ git+${VLLM_REPOSITORY}@${VLLM_COMMIT}"
 uv pip install -e .
