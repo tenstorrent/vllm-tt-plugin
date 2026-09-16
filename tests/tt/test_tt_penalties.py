@@ -241,13 +241,17 @@ class TestFrequencyPenalty:
     """
 
     def test_frequency_penalty_changes_output(self, tt_server, tt_model_name):
-        """Frequency penalty must alter greedy output on the whole prompt set.
+        """Frequency penalty must alter greedy output on most of the prompt set.
 
-        This is the "the penalty reaches the sampler" assertion. Unlike presence,
-        frequency subtracts count * F, which grows without bound as a token repeats,
-        so no top-2 gap can hold out over a 24-token greedy continuation. That lets
-        this assert on EVERY prompt rather than voting, and it fails loudly if the
-        penalty never reaches the device.
+        This is the "the penalty reaches the sampler" assertion. count * F grows
+        without bound only while a token KEEPS repeating. A fluent greedy
+        continuation repeats a token once at most (Llama-3.3-70B on "She opened
+        the door and" repeats only ' the', once, in 24 tokens; Llama-3.1-8B shows
+        the same on one prompt of this set), so on such a prompt the penalty
+        degenerates to a single -F hit and is bounded by the same top-2 gap that
+        limits presence. Vote over the set, as the presence test does: a penalty
+        that never reaches the sampler still scores 0 and fails loudly, while one
+        confident non-repeating continuation no longer fails the whole test.
         """
         prompts = TestPresencePenalty.PRESENCE_PROMPTS
         changed, slot_noise, detail = count_prompts_changed_by(
@@ -257,15 +261,17 @@ class TestFrequencyPenalty:
             frequency_penalty=2.0,
         )
         total = len(prompts)
+        minimum = total // 2 + 1
         assert changed > slot_noise, (
             f"frequency_penalty=2.0 changed {changed}/{total} prompts but the "
             f"unpenalised control disagreed with itself on {slot_noise}/{total}; "
             f"not distinguishable from slot noise.\n" + "\n".join(detail)
         )
-        assert changed >= total - slot_noise, (
+        assert changed >= minimum, (
             f"frequency_penalty=2.0 changed greedy output on only {changed}/{total} "
-            f"prompts. count*F is unbounded, so every prompt should move unless the "
-            f"penalty is not reaching the sampler "
+            f"prompts (expected at least {minimum}). A penalty that is never applied "
+            f"scores 0; a low-but-nonzero score means the prompt set needs refreshing, "
+            f"not that sampling is broken "
             f"(control slot noise: {slot_noise}/{total}).\n" + "\n".join(detail)
         )
 
