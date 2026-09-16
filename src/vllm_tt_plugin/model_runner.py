@@ -1245,9 +1245,17 @@ class TTModelRunner:
         """
         if not self._proposed_draft_token_ids:
             return None
-        req_ids = list(self._proposed_draft_token_ids)
-        drafts = [self._proposed_draft_token_ids[req_id] for req_id in req_ids]
+        # Only requests the runner still holds. A request can finish in the
+        # step that proposed for it, and the runner drops it from
+        # ``self.requests`` before the engine collects; the scheduler tolerates
+        # a draft for a request it has finished, but the runner has no business
+        # reporting one for a request it has forgotten.
+        proposed = self._proposed_draft_token_ids
         self._proposed_draft_token_ids = {}
+        req_ids = [req_id for req_id in proposed if req_id in self.requests]
+        if not req_ids:
+            return None
+        drafts = [proposed[req_id] for req_id in req_ids]
         return DraftTokenIds(req_ids, drafts)
 
     def _propose_ngram_drafts(self, committed: dict[str, list[int]]) -> None:

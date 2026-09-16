@@ -34,6 +34,7 @@ def test_take_draft_token_ids_is_callable_on_an_instance():
     """vLLM reaches this through the worker on every speculative step."""
     runner = _bare_runner()
     runner._proposed_draft_token_ids = {"a": [11, 12], "b": [21]}
+    runner.requests = {"a": object(), "b": object()}
 
     drafts = runner.take_draft_token_ids()
 
@@ -47,6 +48,33 @@ def test_take_draft_token_ids_is_callable_on_an_instance():
 def test_take_draft_token_ids_reports_nothing_when_nothing_was_proposed():
     runner = _bare_runner()
     runner._proposed_draft_token_ids = {}
+    runner.requests = {}
+
+    assert runner.take_draft_token_ids() is None
+
+
+def test_take_draft_token_ids_drops_a_request_the_runner_no_longer_holds():
+    """A request can finish in the step that proposed for it.
+
+    The scheduler tolerates a draft for a request it has finished, but the
+    runner has no business reporting one for a request it has forgotten, and a
+    consumer that trusted the report would look the request up and fail.
+    """
+    runner = _bare_runner()
+    runner._proposed_draft_token_ids = {"live": [11], "finished": [21]}
+    runner.requests = {"live": object()}
+
+    drafts = runner.take_draft_token_ids()
+
+    assert drafts is not None
+    assert drafts.req_ids == ["live"]
+    assert drafts.draft_token_ids == [[11]]
+
+
+def test_take_draft_token_ids_reports_nothing_when_every_request_finished():
+    runner = _bare_runner()
+    runner._proposed_draft_token_ids = {"finished": [21]}
+    runner.requests = {}
 
     assert runner.take_draft_token_ids() is None
 
@@ -56,6 +84,7 @@ def test_the_worker_delegates_take_draft_token_ids_to_its_runner():
     worker = TTWorker.__new__(TTWorker)
     runner = _bare_runner()
     runner._proposed_draft_token_ids = {"r": [7]}
+    runner.requests = {"r": object()}
     worker.model_runner = runner
 
     drafts = worker.take_draft_token_ids()

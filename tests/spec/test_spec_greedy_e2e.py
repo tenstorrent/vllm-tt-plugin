@@ -386,50 +386,11 @@ def test_a_narrow_step_finishes_and_commits_one_token():
 
 # region Equality with an unspeculated run
 
-
-def test_speculation_emits_exactly_what_no_speculation_would():
-    """The only thing speculation may preserve is the token sequence.
-
-    Both runs drive the same stand-in over the same prompt. One receives the
-    drafts the stand-in's own proposer would produce and so accepts them; the
-    other receives none and commits one token per step. The sequences must be
-    identical, which is the whole correctness claim of the accept walk.
-    """
-    steps = 4
-
-    def run(with_drafts: bool) -> list[int]:
-        model = FakeSpecModel()
-        runner = _runner(model)
-        _add_request(runner, "r")
-        emitted: list[int] = []
-        for _ in range(steps):
-            drafts = None
-            if with_drafts:
-                row = runner.input_batch.req_id_to_index["r"]
-                last = int(
-                    runner.input_batch.token_ids_cpu[
-                        row, int(runner.input_batch.num_tokens[row]) - 1
-                    ]
-                )
-                drafts = {
-                    "r": [(last + 1 + j) % FAKE_VOCAB_SIZE for j in range(DRAFT_LEN)]
-                }
-            output = _step(runner, "r", drafts=drafts)
-            emitted.extend(output.sampled_token_ids[0])
-        return emitted
-
-    speculated = run(with_drafts=True)
-    plain = run(with_drafts=False)
-
-    # The speculated run commits more per step, so compare the common prefix:
-    # what both produced has to agree token for token.
-    shared = min(len(speculated), len(plain))
-    assert shared > 0
-    assert speculated[:shared] == plain[:shared]
-    assert len(speculated) > len(plain), (
-        "speculation committed no more tokens than plain decode, so the test "
-        "proves nothing about acceptance"
-    )
+# Losslessness against ordinary decoding lives in ``test_spec_lossless.py``,
+# which needs a target whose choice does not depend on what was drafted, a
+# genuinely unspeculated reference arm, and drafts that are deliberately wrong.
+# None of those can be built from ``FakeSpecModel``, whose verify returns each
+# draft unchanged wherever it agrees.
 
 
 # endregion Equality with an unspeculated run
