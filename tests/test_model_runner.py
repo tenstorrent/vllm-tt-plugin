@@ -11,7 +11,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
-from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.model_runner import (
+    TTModelRunner,
+    _single_attention_group_layer_count,
+)
 
 # region Constants
 VOCAB_SIZE = 64
@@ -21,6 +24,20 @@ MAX_NUM_SEQS = MAX_NUM_REQS = 4
 DP_SIZE = 1
 SAMPLED_TOKEN_ID = 42
 # endregion Constants
+
+
+def test_single_attention_group_preserves_sparse_real_layer_names():
+    names = [f"model.layers.{index}.self_attn" for index in (3, 7, 11, 15)]
+    assert _single_attention_group_layer_count(names, 16) == 4
+    assert _single_attention_group_layer_count(["foo"], 16) == 16
+
+
+@pytest.mark.parametrize(
+    "names", [["model.layers.3.x", "model.layers.3.y"], ["model.layers.16.x"]]
+)
+def test_single_attention_group_rejects_invalid_real_layer_names(names):
+    with pytest.raises(ValueError, match="duplicate or out-of-range"):
+        _single_attention_group_layer_count(names, 16)
 
 # region Test helpers
 

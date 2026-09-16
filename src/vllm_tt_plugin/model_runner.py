@@ -102,6 +102,21 @@ def _parse_layer_index(layer_name: str) -> int:
     return int(match.group(1))
 
 
+def _single_attention_group_layer_count(
+    layer_names: list[str], num_layers: int
+) -> int:
+    """Resolve legacy synthetic vs real sparse single-group layer counts."""
+    if len(layer_names) == 1 and layer_names[0] == "foo":
+        return num_layers
+    layer_indices = sorted(_parse_layer_index(name) for name in layer_names)
+    if (len(set(layer_indices)) != len(layer_indices)
+            or any(not 0 <= index < num_layers for index in layer_indices)):
+        raise ValueError(
+            "single KV cache group contains duplicate or out-of-range "
+            f"layer names: {layer_names}")
+    return len(layer_indices)
+
+
 @dataclass(frozen=True)
 class _SyncForward:
     """Materialized front-packed forward result awaiting sampling.
@@ -582,10 +597,22 @@ class TTModelRunner:
         kv_cache_groups = kv_cache_config.kv_cache_groups
 
         if len(kv_cache_groups) == 1:
-            spec = kv_cache_groups[0].kv_cache_spec
+            group = kv_cache_groups[0]
+            spec = group.kv_cache_spec
             if isinstance(spec, AttentionSpec):
                 shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
-                return [(shape, spec.dtype, i) for i in range(num_layers)]
+                # The legacy TT fallback advertises one synthetic ``foo``
+                # layer and intentionally expands it to every transformer
+                # layer.  A model hook, however, can advertise a real sparse
+                # subset of cache-owning layers (for example a hybrid stack
+                # whose other layers are recurrent).  Upstream may coalesce
+                # identical real specs into one group; expanding that group to
+                # ``num_layers`` invents KV buffers the model does not own.
+                cache_layer_count = _single_attention_group_layer_count(
+                    group.layer_names, num_layers)
+                return [
+                    (shape, spec.dtype, i) for i in range(cache_layer_count)
+                ]
             # ``UniformTypeKVCacheSpecs``: one group / one block table, but the
             # wrapped per-layer specs have heterogeneous shapes (e.g. Gemma4
             # with hybrid groups disabled: sliding 8x256 vs full 1x512). Every
