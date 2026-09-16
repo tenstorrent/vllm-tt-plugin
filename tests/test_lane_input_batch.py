@@ -756,3 +756,139 @@ def test_runner_is_lane_mode_property():
     assert not _runner_with(data_parallel_size=1, tt_data_parallel_size=1)._is_lane_mode
     # Standard multi-process DP: each rank is its own engine -> plain InputBatch.
     assert not _runner_with(data_parallel_size=4, tt_data_parallel_size=4)._is_lane_mode
+
+
+# --------------------------------------------------------------------------
+# The device-sampling predicate, driven on a real batch
+# --------------------------------------------------------------------------
+
+
+def _predicate_holder(batch, *, num_devices: int, supports_topk_logprobs=False):
+    """A runner stand-in whose input_batch is a *real* one; the predicate is
+    called unbound, since everything else it reads is scalar config."""
+    return SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=num_devices,
+        tt_data_parallel_size=1,
+        supports_topk_logprobs=supports_topk_logprobs,
+        model_config=SimpleNamespace(logits_processors=None),
+        input_batch=batch,
+    )
+
+
+@pytest.mark.parametrize("num_devices", [4, 8], ids=["p150x4", "logprobs-capable"])
+def test_requested_logprobs_force_host_sampling_off_capable_meshes(num_devices):
+    """Autoregressive path, for the record: a *requested* count is enough,
+    including the 0 that OpenAI ``logprobs: true`` produces, and four devices
+    is not one of the meshes that can sample logprobs on device.
+
+    Block-output models never reach this branch -- their batch is built with
+    ``disable_logprobs``, see the guard tests above -- which is why
+    neutralizing ``logprobs`` in TTScheduler is defence in depth rather than
+    the fix for a live crash.
+    """
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    batch = _plain_batch_of_one(
+        _make_req("ar", [1], [], dict(temperature=0.0, logprobs=0)),
+        with_custom=False,
+        disable_logprobs=False,
+    )
+    runner = _predicate_holder(batch, num_devices=num_devices)
+
+    assert batch.max_num_logprobs == 0
+    performs_device_sampling = TTModelRunner.check_perform_device_sampling(
+        runner, is_decode=True, has_structured_outputs=False
+    )
+
+    assert performs_device_sampling is (num_devices == 8)
+
+
+def test_repaired_bypassed_request_satisfies_the_device_sampling_predicate():
+    """The behavioral pin for the neutralization table: a request carrying every
+    field in it must, once TTScheduler has repaired it, satisfy the real
+    predicate on a real block ``InputBatch`` -- and must not before.
+
+    Run against both batch shapes: the production one is built with
+    ``disable_logprobs=True``, whose sentinel hides ``logprobs`` from the
+    predicate, so the second pass drops that guard to exercise it.
+
+    Not pinned here: ``bad_words``, ``prompt_logprobs`` and the penalties. The
+    predicate reads none of them (for bad words it sees only the tokenized
+    ``_bad_words_token_ids``), so their reset is covered by
+    ``test_add_request_strips_host_sampling_controls_from_bypassed_request``
+    alone. Nor is a new predicate branch whose field is absent from the table --
+    see the note next to ``check_perform_device_sampling``.
+    """
+    from vllm_tt_plugin.config import BLOCK_UNVALIDATED_SAMPLING_NEUTRAL
+    from vllm_tt_plugin.model_runner import TTModelRunner
+    from vllm_tt_plugin.scheduler import TTScheduler
+
+    non_neutral = {
+        "min_p": 0.2,
+        "min_tokens": 1,
+        "logit_bias": {2: 1.0},
+        "allowed_token_ids": [1, 2],
+        "bad_words": ["bad"],
+        "logprobs": 0,
+        "prompt_logprobs": 1,
+        "presence_penalty": 0.5,
+        "frequency_penalty": 0.5,
+        "repetition_penalty": 1.1,
+    }
+    # The batch reads the tokenized form; seed it by hand.
+    private_non_neutral = {"_bad_words_token_ids": [[7]]}
+
+    # Every table field must be exercised.
+    covered = set(non_neutral) | set(private_non_neutral)
+    table_fields = {field for field, _ in BLOCK_UNVALIDATED_SAMPLING_NEUTRAL}
+    assert table_fields == covered, (
+        f"update this test's non-neutral values for {sorted(table_fields ^ covered)}"
+    )
+
+    # NOT temperature=0.0: SamplingParams squashes min_p for a greedy request,
+    # which would leave these assertions passing with min_p out of the table.
+    params = SamplingParams(temperature=1.0, **non_neutral)
+    for field, value in private_non_neutral.items():
+        setattr(params, field, value)
+    # Every value must survive construction, or the field stops being covered.
+    for field, value in non_neutral.items():
+        assert getattr(params, field) == value, (
+            f"SamplingParams neutralized {field} at construction; this test "
+            "would not exercise it"
+        )
+    request = SimpleNamespace(
+        request_id="bypassed",
+        sampling_params=params,
+        structured_output_request=None,
+        resumable=False,
+    )
+
+    def _predicate(disable_logprobs=True):
+        req = _make_req("bypassed", [1], [], dict(temperature=1.0))
+        req.sampling_params = params
+        batch = _plain_batch_of_one(
+            req,
+            # No custom logitsproc: _predicate_holder reports
+            # model_config.logits_processors=None, and a batch with one active
+            # is a state a real block-output runner cannot be in.
+            with_custom=False,
+            disable_logprobs=disable_logprobs,
+            output_tokens_per_step=16,
+        )
+        return TTModelRunner.check_perform_device_sampling(
+            _predicate_holder(batch, num_devices=4),
+            is_decode=True,
+            has_structured_outputs=False,
+        )
+
+    # The production block batch, and the same block batch with the
+    # disable_logprobs sentinel off so the logprobs branch is visible: both
+    # must reject before the repair and accept after.
+    assert _predicate(disable_logprobs=True) is False
+    assert _predicate(disable_logprobs=False) is False
+
+    TTScheduler._neutralize_block_output_host_sampling(SimpleNamespace(), request)
+
+    assert _predicate(disable_logprobs=True) is True
+    assert _predicate(disable_logprobs=False) is True
