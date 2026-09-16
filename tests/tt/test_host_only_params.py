@@ -6,7 +6,11 @@ Tests for sampling parameters which require host ("compat") sampling.
 
 import string
 
-from tests.tt.utils import RequestConfig, run_concurrent_batch
+from tests.tt.utils import (
+    RequestConfig,
+    run_concurrent_batch,
+    run_concurrent_batch_tokens,
+)
 
 
 class TestHostOnlyParameters:
@@ -40,6 +44,7 @@ class TestHostOnlyParameters:
                 prompt="Say hello to me",
                 max_tokens=100,
                 bad_words=bad_words,
+                chat_template_kwargs={"enable_thinking": False},
                 temperature=1.0,
                 seed=i,
             )
@@ -95,12 +100,13 @@ class TestHostOnlyParameters:
                 prompt="Allowed: ", max_tokens=10, allowed_token_ids=[13, 14, 15]
             ),
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        # Allowed IDs may decode to invisible special tokens. Check the actual
+        # sampled IDs, not whether detokenization produces visible characters.
+        results = run_concurrent_batch_tokens(tt_server, tt_model_name, configs)
         assert len(results) == len(configs)
-        # With only 3 allowed tokens, output should be limited
-        for i, result in enumerate(results):
-            assert result is not None, f"should produce output for request {i}"
-            assert len(result) > 0, f"should produce non-empty output for request {i}"
+        for config, token_ids in zip(configs, results):
+            assert token_ids, "Expected at least one sampled token"
+            assert set(token_ids) <= set(config.allowed_token_ids)
 
     def test_min_tokens(self, tt_server, tt_model_name, max_batch_size):
         """Test min_tokens parameter ensures minimum output length."""

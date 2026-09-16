@@ -7,6 +7,7 @@ from tests.tt.utils import (
     assert_varied,
     count_prompts_changed_by,
     run_concurrent_batch,
+    run_concurrent_batch_tokens,
 )
 
 
@@ -315,23 +316,26 @@ class TestFrequencyPenalty:
                 )
             )
 
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
-
-        no_penalty = [results[i] for i in range(0, max_batch_size, 2)]
-        with_penalty = [results[i] for i in range(1, max_batch_size, 2)]
-
-        # Count "a"s in each output
-        no_penalty_a_count = no_penalty[0].count("a")
-        with_penalty_a_count = with_penalty[0].count("a")
-
-        assert no_penalty_a_count > with_penalty_a_count, (
-            f"Frequency penalty should reduce 'a' repetitions: "
-            f"no_penalty={no_penalty_a_count},"
-            f"with_penalty={with_penalty_a_count}"
-        )
-        assert_deterministic_allow_near_tie(
-            no_penalty, "No penalty requests should be identical."
-        )
-        assert_deterministic_allow_near_tie(
-            with_penalty, "With penalty requests should be identical."
-        )
+        mixed = run_concurrent_batch_tokens(tt_server, tt_model_name, configs)
+        # A model need not continue the literal "a" pattern. Compare each slot
+        # against the same-width homogeneous batch instead. The separate
+        # changes_output test verifies that the penalty alters generation.
+        for penalty in (0.0, 2.0):
+            baseline = run_concurrent_batch_tokens(
+                tt_server,
+                tt_model_name,
+                [
+                    RequestConfig(
+                        prompt=prompt,
+                        max_tokens=15,
+                        temperature=0,
+                        frequency_penalty=penalty,
+                    )
+                    for _ in range(max_batch_size)
+                ],
+            )
+            for slot, config in enumerate(configs):
+                if config.frequency_penalty == penalty:
+                    assert mixed[slot] == baseline[slot], (
+                        f"Slot {slot} changed with its neighbours' penalties"
+                    )

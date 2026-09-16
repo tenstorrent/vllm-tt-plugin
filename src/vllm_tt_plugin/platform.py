@@ -1241,6 +1241,12 @@ def register_tt_test_models():
 
 
 class TTPlatform(Platform):
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config):
+        from vllm_tt_plugin.whole_prompt_cache import register_whole_prompt_cache
+
+        register_whole_prompt_cache()
+
     _enum = PlatformEnum.OOT
     device_name: str = "tt"
     device_type: str = "tt"

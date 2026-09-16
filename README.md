@@ -338,6 +338,15 @@ the arguments. The plugin does not mutate the model's dictionary or store its
 TTNN objects in the serialized vLLM configuration. Single-device meshes do not
 initialize fabric. Models without this capability keep the hardware defaults.
 
+### Model Sampling Limits
+
+A model may declare `model_capabilities["max_device_top_k"]` to bound its
+on-device stochastic sampler. Requests above this bound, or with unrestricted
+top-k, use the host sampler. Greedy requests remain device-eligible. Routing
+checks only active request slots. Models without this declaration retain their
+existing behavior. Request seeds retain their signed 64-bit value until the
+model translates them for its device sampler.
+
 ### `max_model_len` And KV Cache Capacity
 
 TT does not profile device memory. `get_num_available_blocks_tt()` instead
@@ -592,19 +601,27 @@ a 6x reduction in KV cache memory.
 
 To enable hybrid KV cache support for a TT model:
 
-1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`
-   instead of `Generator`. The base class provides a default
-   `get_kv_cache_spec` classmethod that builds per-layer specs from
-   `hf_config.text_config.layer_types`.
+1. Implement the `get_kv_cache_spec` classmethod. Models may reuse
+   `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`, whose
+   default hook builds per-layer specs from `hf_config.text_config.layer_types`.
 2. Implement `prefill_forward` and `decode_forward` to consume the
-   `page_tables_per_group` kwarg and route each layer to the right group's page
+   `page_tables_per_layer` kwarg and route each layer to the right group's page
    table.
 3. Implement `allocate_kv_cache_per_layer(per_layer_specs)`. The base class
    default delegates to `allocate_vllm_kv_cache_per_layer`.
 
 Models that do not opt in stay on the legacy `Generator` path: uniform
 single-group KV cache, one page table, and no behavioral change. The plugin only
-sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
+sends `page_tables_per_layer` to model classes that expose `get_kv_cache_spec`.
+
+Models that compute whole-prompt attention from temporary K/V may return
+`WholePromptSlidingWindowSpec` from `vllm_tt_plugin.whole_prompt_cache` for their
+sliding layers. This spec reserves only the live tail, including a partial
+boundary page. The model must validate the supported configuration, fill that
+tail during prefill, and budget all sliding groups in its shared pool. Prefix
+caching, external prefill chunks, KV transfer, speculation, and context
+parallelism are rejected. The model still receives per-layer tables padded to
+the fixed decode batch; prefill's live rows form a compact prefix.
 
 Hybrid models with `data_parallel_size > 1` have not been validated on
 hardware. Both DP modes carry the full per-group block tables (a standard-DP

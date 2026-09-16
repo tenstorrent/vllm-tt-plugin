@@ -28,6 +28,7 @@ class RequestConfig:
     allowed_token_ids: list[int] | None = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 async def send_request(
@@ -88,6 +89,9 @@ async def send_chat_request(
         extra_body["logit_bias"] = config.logit_bias
     if config.allowed_token_ids is not None:
         extra_body["allowed_token_ids"] = config.allowed_token_ids
+
+    if config.chat_template_kwargs is not None:
+        extra_body["chat_template_kwargs"] = config.chat_template_kwargs
 
     response = await async_client.chat.completions.create(
         model=model,
