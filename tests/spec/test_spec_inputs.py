@@ -32,7 +32,11 @@ import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    PLACEHOLDER_TOKEN_ID,
+    VerifyOutput,
+)
 
 from .fake_spec_model import FakeSpecModel
 
@@ -262,6 +266,25 @@ def test_side_tensors_are_int32():
 
     assert model_input.num_valid_drafts.dtype == torch.int32
     assert model_input.accepted_counts.dtype == torch.int32
+
+
+def test_the_drafts_are_padded_with_the_rows():
+    """The accept walk reads drafts against the verify's own row count.
+
+    The verify returns one row per padded decode row, so a draft block that
+    stopped at the real requests could not be compared against it without a
+    second row count to reconcile.
+    """
+    batch = _batch()
+    request = _add_decoding_request(batch, "r")
+    runner = _fake_runner(batch, {"r": request})
+
+    model_input = _decode(runner, "r", drafts=_drafts(r=[11, 12, 13]))
+
+    assert model_input.draft_token_ids.shape == (MAX_NUM_REQS, 3)
+    assert model_input.draft_token_ids[0].tolist() == [11, 12, 13]
+    assert model_input.draft_token_ids[1].tolist() == [PLACEHOLDER_TOKEN_ID] * 3
+    assert model_input.spec_mode == "argmax_ids"
 
 
 # endregion The candidate block
@@ -516,19 +539,18 @@ def test_the_contract_model_accepts_the_built_block():
     model = FakeSpecModel()
     verify = model.decode_forward(
         tokens=model_input.input_tokens,
-        positions=model_input.input_positions,
+        start_pos=model_input.input_positions,
         num_valid_drafts=model_input.num_valid_drafts,
         accepted_counts=model_input.accepted_counts,
         spec_mode=ACCEPT_MODE_ARGMAX_IDS,
     )
 
     assert verify.argmax_ids.shape == (MAX_NUM_REQS, 4)
-    # Column 0 is already committed, so a verify repeats it.
-    assert verify.argmax_ids[0, 0] == LAST_TOKEN
-    # Row 0 drafted 3 and the stand-in agrees with all of them; row 1 drafted
-    # 1, so its second draft column is a padding column and diverges.
-    assert verify.argmax_ids[0, 1:].tolist() == [11, 12, 13]
-    assert verify.argmax_ids[1, 1] == 21
+    # Column j is the choice draft j has to match, so a row the stand-in agrees
+    # with returns its own drafts. Row 0 drafted 3 and all three stand; row 1
+    # drafted 1, so only its column 0 is a real candidate.
+    assert verify.argmax_ids[0, :3].tolist() == [11, 12, 13]
+    assert verify.argmax_ids[1, 0] == 21
 
 
 def test_the_side_tensors_reach_the_model_s_decode_forward():
@@ -548,7 +570,14 @@ def test_the_side_tensors_reach_the_model_s_decode_forward():
 
         def decode_forward(self, **kwargs):
             calls.append(kwargs)
-            return torch.zeros((MAX_NUM_REQS, 1))
+            # A verify's own return type, because the submission boundary
+            # requires one of every step that sends ``spec_mode``. A recording
+            # stub that answered with a plain decode's tensor would be
+            # refused there and never record anything.
+            return VerifyOutput(
+                spec_mode=kwargs["spec_mode"],
+                argmax_ids=torch.zeros(kwargs["tokens"].shape, dtype=torch.int32),
+            )
 
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}

@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, get_args
 
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
-    ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFFS,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
@@ -37,7 +36,19 @@ if TYPE_CHECKING:
 # Accept modes the runner can drive today. A plan offering none of these is
 # refused; a plan offering more keeps its extra modes and is still admitted,
 # so declaring a real capability never makes a model less admissible.
-_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_LOGITS, ACCEPT_MODE_ARGMAX_IDS)
+#
+# ``logits`` is a legal mode and a model may serve it, but the runner asks for
+# ``argmax_ids`` on every step and refuses any other answer, so admitting a
+# logits-only plan would pass a launch that fails on its first decode. The
+# sampled accept walk is what adds it back.
+_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
+
+# Methods the runner can actually propose drafts for. The requirements table
+# below says what a method needs *of the model*; this says what the plugin has
+# implemented. Admitting a method with no proposer would start a server that
+# takes the speculative flags, drafts nothing, and serves plain decoding while
+# reporting a speedup it never achieved.
+_PROPOSABLE_METHODS = ("ngram",)
 
 _DEVICE_DRAFTER = (SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED)
 
@@ -95,24 +106,6 @@ def method_requirements(method: str) -> tuple[str, ...]:
         f"speculative method {method!r} is not supported by the TT backend. "
         f"Set --spec-method, or the 'method' key inside --speculative-config, "
         f"to one of {sorted(table)}"
-    )
-
-
-def refuse_unimplemented_execution(model_class: type) -> None:
-    """Refuse a resolved plan, because nothing can execute it yet.
-
-    Called after resolution, the writeback and the store, so a model author
-    sees their own declaration error rather than this blanket refusal, and so
-    whoever implements the execution path deletes exactly one call.
-    """
-    raise ValueError(
-        f"{model_class.__name__} is admissible for speculative decoding, but "
-        "the TT backend cannot execute it yet: TTWorker implements no "
-        "take_draft_token_ids, which vLLM's EngineCore calls on every step of "
-        "a speculative run, and TTModelRunner drives no verify-then-propose "
-        "loop. Refused rather than started, because a server that accepts the "
-        "flags and serves no speculation reports a speedup it did not achieve. "
-        "Drop the speculative flags to serve this model"
     )
 
 
@@ -194,6 +187,17 @@ def resolve_speculative_plan(
             "--spec-method, or drop the speculative flags"
         )
 
+    if method not in _PROPOSABLE_METHODS:
+        raise ValueError(
+            f"speculative method {method!r} is known to the TT backend but no "
+            f"proposer drives it yet; the runner proposes for "
+            f"{list(_PROPOSABLE_METHODS)}. A host method needs its proposer "
+            "wired into the runner, and a device method needs that plus a call "
+            "to the model's propose_draft_tokens and the hidden-state handoff. "
+            "Set --spec-method, or the 'method' key inside "
+            "--speculative-config, or drop the speculative flags"
+        )
+
     spec_plan = getattr(model_class, "spec_plan", None)
     if not callable(spec_plan):
         raise ValueError(
@@ -247,6 +251,5 @@ def resolve_speculative_plan(
 
 __all__ = [
     "method_requirements",
-    "refuse_unimplemented_execution",
     "resolve_speculative_plan",
 ]
