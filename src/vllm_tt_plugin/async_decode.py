@@ -78,6 +78,11 @@ class TTDecodeSubmission:
     sampling_params: Any
     perform_device_sampling: bool
     reload_plan: TTDecodeReloadPlan | None = None
+    # The verify's opaque hidden handle, for a model whose drafter consumes it.
+    # Carried rather than stored on the runner so it cannot outlive the step it
+    # belongs to: the runner hands it straight back to ``propose_draft_tokens``
+    # without interpreting its dtype, layout or tensor-parallel fracturing.
+    spec_hidden: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -916,15 +921,19 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
+        spec_hidden = None
         requested_spec_mode = kwargs.get("spec_mode")
         if requested_spec_mode is not None:
             # A verify returns its mode's tensor inside a VerifyOutput, which
             # the read path below and every consumer above expect as a plain
             # host tensor. Unwrapped here, at the one boundary the model
             # returns through, rather than teaching each of them the type.
+            verify = tt_out
             tt_out = _verify_output_tensor(
                 tt_out, type(runner.model).__name__, requested_spec_mode
             )
+            # Safe after the unwrap, which refuses anything but a VerifyOutput.
+            spec_hidden = verify.hidden
         elif isinstance(tt_out, VerifyOutput):
             raise TypeError(
                 f"TT model {type(runner.model).__name__} returned a "
@@ -969,6 +978,7 @@ class TTAsyncDecodeController:
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
             reload_plan=reload_plan,
+            spec_hidden=spec_hidden,
         )
 
     def finalize_decode(

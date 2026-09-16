@@ -69,9 +69,12 @@ from vllm_tt_plugin.model_input import (
 )
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     PLACEHOLDER_TOKEN_ID,
+    SPEC_REQUIREMENT_DEVICE_PROPOSE,
+    DraftOutput,
     accept_greedy_drafts,
 )
 from vllm_tt_plugin.structured_output import (
@@ -125,6 +128,8 @@ class _SyncForward:
     batch_size_per_dp: list[int]
     perform_device_sampling: bool
     is_decode: bool
+    # The verify's hidden handle, for a model whose drafter consumes it.
+    spec_hidden: Any | None = None
 
 
 def _coerce_output_block(
@@ -220,6 +225,14 @@ class TTModelRunner:
         # padding every row's draft columns away.
         self._spec_supports_narrow_decode = bool(
             spec_plan and spec_plan.supports_narrow_decode
+        )
+        # Who proposes: the model's own drafter on device, or a host drafter.
+        # Read from the one requirements table rather than from a second list of
+        # method names, and once, because that table is rebuilt per call.
+        self._spec_drafts_from_model = bool(
+            self._spec_method
+            and SPEC_REQUIREMENT_DEVICE_PROPOSE
+            in method_requirements(self._spec_method)
         )
 
         if self.model_config.is_encoder_decoder:
@@ -1272,6 +1285,101 @@ class TTModelRunner:
             if row_drafts:
                 self._proposed_draft_token_ids[req_id] = list(row_drafts)
 
+    def _propose_model_drafts(
+        self,
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+        model_input: TTModelInput,
+        hidden: Any,
+        row_req_ids: list[str],
+    ) -> None:
+        """Ask the model's own drafter for the next step's drafts.
+
+        The drafter continues each row from the token that row just committed,
+        so it is handed the committed block and each row's count rather than a
+        single token: which entry of the block is that row's last is
+        ``counts - 1``, the same arithmetic the verify uses to pick a candidate
+        state slot. Rows are the verify's rows, padding included, because the
+        drafter's state is indexed by row and a device graph has one shape.
+
+        ``hidden`` is the verify's own handle, passed straight back. The runner
+        does not interpret it, and a drafter that needs none is handed whatever
+        its verify returned, which for a model that returns nothing is
+        ``None``.
+        """
+        num_drafts = self._num_speculative_tokens
+        positions = self._committed_positions(
+            model_input.input_positions, int(committed.shape[1])
+        )
+        drafted = self.model.propose_draft_tokens(
+            num_drafts,
+            committed,
+            positions,
+            counts,
+            hidden=hidden,
+        )
+        if not isinstance(drafted, DraftOutput):
+            raise TypeError(
+                f"TT model {type(self.model).__name__} declares "
+                f"{SPEC_REQUIREMENT_DEVICE_PROPOSE!r} and its "
+                "propose_draft_tokens returned "
+                f"{type(drafted).__name__}; a drafter returns a DraftOutput "
+                "from vllm_tt_plugin.spec_decode"
+            )
+        draft_token_ids = drafted.draft_token_ids
+        rows = int(committed.shape[0])
+        if tuple(draft_token_ids.shape) != (rows, num_drafts):
+            raise ValueError(
+                f"TT model {type(self.model).__name__} proposed drafts of "
+                f"shape {tuple(draft_token_ids.shape)}; the contract is "
+                f"[{rows}, {num_drafts}], one row per verified row"
+            )
+        # Range-checked before the ids reach the scheduler, because a draft it
+        # stores is verified next step and committed if the model agrees with
+        # it, and an id outside the vocabulary is not something any verify can
+        # have chosen. The placeholder is included in that: it marks the tail
+        # of a block and is never a candidate.
+        vocab = int(self.input_batch.vocab_size)
+        if bool(((draft_token_ids < 0) | (draft_token_ids >= vocab)).any()):
+            raise ValueError(
+                f"TT model {type(self.model).__name__} proposed a draft token "
+                f"id outside [0, {vocab}); a drafter that has nothing to "
+                "propose for a row still returns ids for it, and the runner "
+                "trims the row instead"
+            )
+        max_model_len = int(self.model_config.max_model_len)
+        for row, req_id in enumerate(row_req_ids):
+            # A row that committed nothing this step proposes nothing: there is
+            # no continuation to draft from.
+            if int(counts[row]) < 1:
+                continue
+            # Trimmed to what the request can still hold, the way the host
+            # proposer trims itself. Drafts past ``max_model_len`` would be
+            # verified and then dropped at the commit.
+            room = max_model_len - int(self.input_batch.num_tokens[row])
+            usable = max(0, min(num_drafts, room))
+            if usable:
+                self._proposed_draft_token_ids[req_id] = [
+                    int(token) for token in draft_token_ids[row, :usable]
+                ]
+
+    @staticmethod
+    def _committed_positions(input_positions: torch.Tensor, width: int) -> torch.Tensor:
+        """Absolute positions of one step's committed block.
+
+        The verify's input column 0 holds each row's last committed token at
+        its own position, and the verify's return column ``j`` is the model's
+        choice at candidate position ``j``, which follows that input. So the
+        committed block starts one position past the input's first column and
+        runs consecutively, whatever each row accepted.
+
+        Padding rows carry an input position of -1 and come out negative here,
+        which is what marks them as rows no request owns.
+        """
+        first = input_positions if input_positions.dim() == 1 else input_positions[:, 0]
+        offsets = torch.arange(1, width + 1, dtype=torch.int32)
+        return first.to(torch.int32).unsqueeze(1) + offsets.unsqueeze(0)
+
     @staticmethod
     def _spec_candidate_block(
         drafts: torch.Tensor,
@@ -2147,16 +2255,26 @@ class TTModelRunner:
         # The walk compares the two, so the drafts are trimmed to the width the
         # verify actually answered at.
         verified_drafts = int(argmax_ids.shape[1]) - 1
+        # Walked over every row the verify answered for, padding rows included,
+        # because a model-owned drafter is asked for the same rows the verify
+        # ran on: its per-row state is indexed by row, and a device graph has
+        # one shape. A padding row carries no draft, so the walk commits its
+        # column 0 and counts 1, and only the live rows below reach a request.
         committed, counts = accept_greedy_drafts(
-            argmax_ids[:rows],
-            model_input.draft_token_ids[:rows, :verified_drafts],
-            model_input.num_valid_drafts[:rows],
+            argmax_ids,
+            model_input.draft_token_ids[:, :verified_drafts],
+            model_input.num_valid_drafts,
         )
 
         committed_by_req = self._apply_committed_spec_tokens_to_state(
-            row_req_ids, committed, counts
+            row_req_ids, committed[:rows], counts[:rows]
         )
-        self._propose_ngram_drafts(committed_by_req)
+        if self._spec_drafts_from_model:
+            self._propose_model_drafts(
+                committed, counts, model_input, fwd.spec_hidden, row_req_ids
+            )
+        else:
+            self._propose_ngram_drafts(committed_by_req)
         return ModelRunnerOutput(
             req_ids=list(row_req_ids),
             req_id_to_index={req: idx for idx, req in enumerate(row_req_ids)},
@@ -2503,6 +2621,7 @@ class TTModelRunner:
         tt_log_probs = None
 
         # Execute model
+        spec_hidden = None
         if not is_decode:
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
             # Prefill returns the raw model output: an optional
@@ -2528,6 +2647,7 @@ class TTModelRunner:
             batch_size_per_dp = submission.batch_size_per_dp
             sampling_params = submission.sampling_params
             perform_device_sampling = submission.perform_device_sampling
+            spec_hidden = submission.spec_hidden
 
         return _SyncForward(
             tt_out=tt_out,
@@ -2537,6 +2657,7 @@ class TTModelRunner:
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
+            spec_hidden=spec_hidden,
         )
 
     def _sample_sync_forward(
