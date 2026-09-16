@@ -1323,6 +1323,7 @@ class TTModelRunner:
                 "propose for a row still returns ids for it, and the runner "
                 "trims the row instead"
             )
+        row_valid = drafted.num_valid
         max_model_len = int(self.model_config.max_model_len)
         for row, req_id in enumerate(row_req_ids):
             # A row that committed nothing this step proposes nothing: there is
@@ -1334,6 +1335,11 @@ class TTModelRunner:
             # verified and then dropped at the commit.
             room = max_model_len - int(self.input_batch.num_tokens[row])
             usable = max(0, min(num_drafts, room))
+            if row_valid is not None:
+                # A row the drafter declined records nothing, which is how the
+                # host n-gram proposer already expresses the same thing (it
+                # returns an empty list for the row).
+                usable = min(usable, int(row_valid[row]))
             if usable:
                 self._proposed_draft_token_ids[req_id] = [
                     int(token) for token in draft_token_ids[row, :usable]

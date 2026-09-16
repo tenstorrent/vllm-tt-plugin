@@ -200,3 +200,88 @@ def test_the_model_drafter_call_is_callable_on_an_instance():
     )
 
     assert runner._proposed_draft_token_ids == {"a": [11, 12], "b": [21, 22]}
+
+
+def _propose_with(drafted, counts=(2, 2), num_tokens=(8, 8), max_model_len=128):
+    """Drive ``_propose_model_drafts`` with one ``DraftOutput`` and report what
+    the runner recorded for the scheduler."""
+    from types import SimpleNamespace
+
+    runner = _bare_runner()
+    runner._num_speculative_tokens = 2
+    runner.input_batch = SimpleNamespace(
+        vocab_size=64, num_tokens=torch.tensor(num_tokens, dtype=torch.int32)
+    )
+    runner.model_config = SimpleNamespace(max_model_len=max_model_len)
+    runner.model = SimpleNamespace(propose_draft_tokens=lambda *a, **k: drafted)
+    runner._proposed_draft_token_ids = {}
+    runner._propose_model_drafts(
+        torch.tensor([[5, 6, 7], [5, 6, 7]], dtype=torch.int32),
+        torch.tensor(counts, dtype=torch.int32),
+        SimpleNamespace(
+            input_positions=torch.tensor([[3, 4, 5], [3, 4, 5]], dtype=torch.int32)
+        ),
+        None,
+        ["a", "b"],
+    )
+    return runner._proposed_draft_token_ids
+
+
+def test_a_row_the_drafter_declined_records_no_drafts():
+    """A drafter that verifies one request at a time declines the other rows.
+
+    Its ids cannot say so -- every column has to be a real in-vocabulary id --
+    so the count says it, and a declined row must reach the scheduler with
+    nothing. A row that kept its drafts would be verified next step by a
+    drafter that cannot speak for it.
+    """
+    import vllm_tt_plugin.spec_decode as spec_decode
+
+    recorded = _propose_with(
+        spec_decode.DraftOutput(
+            draft_token_ids=torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+            num_valid=torch.tensor([2, 0], dtype=torch.int32),
+        )
+    )
+    assert recorded == {"a": [11, 12]}
+
+
+def test_a_narrowed_row_keeps_only_the_drafts_it_produced():
+    import vllm_tt_plugin.spec_decode as spec_decode
+
+    recorded = _propose_with(
+        spec_decode.DraftOutput(
+            draft_token_ids=torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+            num_valid=torch.tensor([1, 2], dtype=torch.int32),
+        )
+    )
+    assert recorded == {"a": [11], "b": [21, 22]}
+
+
+def test_an_absent_num_valid_still_records_the_whole_row():
+    """The field is optional, so a drafter that always fills its block is
+    unaffected by its existence."""
+    import vllm_tt_plugin.spec_decode as spec_decode
+
+    recorded = _propose_with(
+        spec_decode.DraftOutput(
+            draft_token_ids=torch.tensor([[11, 12], [21, 22]], dtype=torch.int32)
+        )
+    )
+    assert recorded == {"a": [11, 12], "b": [21, 22]}
+
+
+def test_the_runners_own_room_trim_still_wins_over_num_valid():
+    """``num_valid`` narrows a row; it never widens one past what the request
+    can still hold."""
+    import vllm_tt_plugin.spec_decode as spec_decode
+
+    recorded = _propose_with(
+        spec_decode.DraftOutput(
+            draft_token_ids=torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+            num_valid=torch.tensor([2, 2], dtype=torch.int32),
+        ),
+        num_tokens=(127, 8),
+        max_model_len=128,
+    )
+    assert recorded == {"a": [11], "b": [21, 22]}

@@ -34,6 +34,7 @@ from vllm_tt_plugin.spec_decode import (
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENTS,
+    DraftOutput,
     SpecPlan,
     SpecReject,
     VerifyOutput,
@@ -618,3 +619,52 @@ def test_a_bare_string_declaration_is_refused_as_a_string():
     message = str(excinfo.value)
     assert "wrap it in a list" in message
     assert "device_propose" in message
+
+
+# ── DraftOutput.num_valid ───────────────────────────────────────────────────
+
+
+def _drafts(rows=2, k=3):
+    return torch.zeros((rows, k), dtype=torch.int32)
+
+
+def test_num_valid_must_be_int32():
+    """It comes back into the verify as ``num_valid_drafts``, which is int32,
+    and a float count would be read out with ``int()`` and truncated."""
+    with pytest.raises(ValueError, match="int32"):
+        DraftOutput(draft_token_ids=_drafts(), num_valid=torch.tensor([3.0, 0.0]))
+
+
+def test_num_valid_must_carry_one_count_per_row():
+    with pytest.raises(ValueError, match=r"\[2\]"):
+        DraftOutput(
+            draft_token_ids=_drafts(),
+            num_valid=torch.tensor([3, 0, 0], dtype=torch.int32),
+        )
+
+
+def test_num_valid_must_not_exceed_the_blocks_columns():
+    """A count past K would have the runner record a draft the block has no
+    column for, and the accept walk reads drafts against the verify width."""
+    with pytest.raises(ValueError, match=r"\[0, 3\]"):
+        DraftOutput(
+            draft_token_ids=_drafts(), num_valid=torch.tensor([4, 0], dtype=torch.int32)
+        )
+
+
+def test_num_valid_must_not_be_negative():
+    with pytest.raises(ValueError, match=r"\[0, 3\]"):
+        DraftOutput(
+            draft_token_ids=_drafts(),
+            num_valid=torch.tensor([-1, 0], dtype=torch.int32),
+        )
+
+
+def test_num_valid_is_optional_and_zero_is_a_valid_count():
+    """Zero is the whole point of the field: a drafter that verifies one
+    request at a time declines every other row with it."""
+    assert DraftOutput(draft_token_ids=_drafts()).num_valid is None
+    declined = DraftOutput(
+        draft_token_ids=_drafts(), num_valid=torch.tensor([3, 0], dtype=torch.int32)
+    )
+    assert declined.num_valid.tolist() == [3, 0]

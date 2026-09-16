@@ -283,17 +283,55 @@ class SpecReject:
 class DraftOutput:
     """What a device drafter returns for one step.
 
-    ``draft_token_ids`` is ``[B, K]`` and padded. How many of row ``i``'s
-    drafts are real is the runner's own bookkeeping, carried into the verify
-    call as ``num_valid_drafts``, not encoded in this tensor.
+    ``draft_token_ids`` is ``[B, K]`` and padded. What reaches the next verify
+    as ``num_valid_drafts`` is the runner's own bookkeeping -- it trims a row
+    to what the request can still hold -- and the ids themselves cannot narrow
+    it, because every column must be a real in-vocabulary id. ``num_valid``
+    below is how a drafter narrows its own row.
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
     An accept rule that needs the drafter distribution reads them; a runner
     that does not must not require them.
+
+    ``num_valid`` is ``[B]`` int32 in ``[0, K]``: how many of each row's K
+    columns the drafter actually produced. ``None`` means all K, which is the
+    behaviour a drafter that always fills its block already had. It exists
+    because the tensor cannot say it: every column must be a real in-vocabulary
+    id for the range check, so a row the drafter declined looks exactly like a
+    row it filled. A drafter whose device graph serves one request at a time
+    declines the other rows through this, and the runner then records nothing
+    for them -- the same thing the host n-gram proposer expresses by returning
+    an empty list for a row.
     """
 
     draft_token_ids: "torch.Tensor"
     draft_scores: "torch.Tensor | None" = None
+    num_valid: "torch.Tensor | None" = None
+
+    def __post_init__(self) -> None:
+        if self.num_valid is None:
+            return
+        import torch
+
+        rows, num_drafts = self.draft_token_ids.shape
+        if self.num_valid.dtype != torch.int32:
+            raise ValueError(
+                f"DraftOutput.num_valid must be int32 per-row counts, got "
+                f"{self.num_valid.dtype}; they come back into the verify as "
+                "num_valid_drafts, which is int32"
+            )
+        if tuple(self.num_valid.shape) != (rows,):
+            raise ValueError(
+                f"DraftOutput.num_valid must be [{rows}] to match "
+                f"draft_token_ids {tuple(self.draft_token_ids.shape)}, got "
+                f"{tuple(self.num_valid.shape)}"
+            )
+        if bool(((self.num_valid < 0) | (self.num_valid > num_drafts)).any()):
+            raise ValueError(
+                f"DraftOutput.num_valid must lie in [0, {num_drafts}]: a row "
+                "cannot have produced more drafts than its block has columns, "
+                f"got {self.num_valid.tolist()}"
+            )
 
 
 @dataclass(frozen=True)

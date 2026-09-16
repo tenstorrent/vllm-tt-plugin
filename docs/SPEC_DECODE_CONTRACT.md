@@ -222,6 +222,17 @@ the range before the scheduler stores them, because a stored draft is verified
 next step and committed if the model agrees with it, and a fractional value
 would be truncated on the way in.
 
+`DraftOutput.num_valid` is optional, `[B]` int32 in `[0, K]`: how many of each
+row's columns the drafter actually produced. Absent means all K. It exists
+because the ids cannot say it -- every column has to be a real in-vocabulary id
+to pass the range check, so a row the drafter declined is indistinguishable
+from one it filled -- and a drafter whose device graph verifies one request at a
+time has to be able to decline the other rows. The runner records nothing for a
+row whose count is 0, which is what the host n-gram proposer already expresses
+by returning an empty list for a row. A row that records nothing carries
+`num_valid_drafts` 0 into the next verify, and with `supports_narrow_decode` a
+step where that holds for every row is served at the plain decode's width.
+
 The call has one shape. A model that also declares `supports_narrow_decode`
 still receives `[B, 1+K]` here after a narrow verify, with the columns past
 each row's `accepted_counts` padded, exactly as a row that accepted less than
