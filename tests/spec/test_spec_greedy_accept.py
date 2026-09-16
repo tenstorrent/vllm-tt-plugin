@@ -169,3 +169,42 @@ def test_a_count_of_the_wrong_length_is_refused():
 
 
 # endregion Refusals
+
+
+def test_a_placeholder_draft_inside_the_valid_prefix_is_refused():
+    """The padding marker is not a token the model can have chosen.
+
+    Nothing downstream can catch it. The model is handed the same column, a
+    conformant model returns it unchanged, the walk's comparison matches, and
+    ``PLACEHOLDER_TOKEN_ID`` commits as an output token: an id the detokenizer
+    rejects, reached only after the whole response has been built. A row whose
+    ``num_valid_drafts`` counts more drafts than the caller delivered is a
+    caller defect, so it fails here by name.
+    """
+    argmax_ids = torch.tensor([[PLACEHOLDER_TOKEN_ID, 7, 8, 9]], dtype=torch.int32)
+    drafts = torch.tensor(
+        [[PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+    )
+
+    with pytest.raises(ValueError, match="PLACEHOLDER_TOKEN_ID as a draft"):
+        accept_greedy_drafts(argmax_ids, drafts, torch.tensor([3], dtype=torch.int32))
+
+
+def test_padding_past_a_row_s_count_is_still_allowed():
+    """The same marker outside the prefix is the builder's own padding.
+
+    A row carrying fewer drafts than the block is wide pads the rest, and that
+    is not an error: the walk never reads those columns.
+    """
+    argmax_ids = torch.tensor([[11, 7, 8, 9]], dtype=torch.int32)
+    drafts = torch.tensor(
+        [[11, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]], dtype=torch.int32
+    )
+
+    committed, counts = accept_greedy_drafts(
+        argmax_ids, drafts, torch.tensor([1], dtype=torch.int32)
+    )
+
+    assert int(counts[0]) == 2
+    assert committed[0, :2].tolist() == [11, 7]
