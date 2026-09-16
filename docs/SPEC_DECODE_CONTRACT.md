@@ -183,6 +183,17 @@ Everything a decode already receives it still receives, under the name it
 already has. A model implementing this grows three keyword arguments and a
 wider block; it does not grow a second call.
 
+The `VerifyOutput` return is required, not conventional. A step that sends
+`spec_mode` is refused at the submission boundary unless the model answers
+with one, so a model that declares `supports_spec_decode` and whose
+`decode_forward` serves no verify fails by name on its first speculative step.
+Nothing further down can catch it instead: a plain decode's `[B, 1]` id tensor
+has the two dimensions the accept walk expects, and the walk reads it as a
+verify that claimed one token on every row, so the server commits one token
+per step for its whole life and reports no error. The reverse is refused too:
+a `VerifyOutput` returned from a step that sent no `spec_mode` has no accepted
+count to be read against.
+
 ## 5. What a verify returns, column by column
 
 The input block's column `j` carries the token at candidate position `j`:

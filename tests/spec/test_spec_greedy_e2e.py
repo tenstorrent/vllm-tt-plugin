@@ -494,6 +494,71 @@ def test_the_proposer_sees_the_tokens_the_step_committed():
     assert proposer.calls == [[output.sampled_token_ids[0]]]
 
 
+# endregion Drafts handed back to the scheduler
+
+# region What a step may answer a verify with
+
+
+class _DeclaresSpecDecodeWithoutAVerify:
+    """A model class that declares the contract and implements no verify.
+
+    ``supports_spec_decode`` is a claim about ``decode_forward``, and a model
+    can be launched with the claim made and the verify unwritten: the
+    speculative keywords then land in ``**kwargs`` and are ignored, and the
+    step answers with the return an ordinary decode makes. Device sampling
+    makes that a ``[B, 1]`` tensor of token ids, which is what this returns.
+    """
+
+    def decode_forward(self, tokens, **kwargs):
+        del kwargs
+        return torch.zeros((int(tokens.shape[0]), 1), dtype=torch.int32)
+
+
+class _AnswersEveryStepWithAVerify:
+    """A model class that returns a ``VerifyOutput`` from a plain decode."""
+
+    def decode_forward(self, tokens, **kwargs):
+        del kwargs
+        return VerifyOutput(
+            spec_mode=ACCEPT_MODE_ARGMAX_IDS,
+            argmax_ids=torch.zeros((int(tokens.shape[0]), 1), dtype=torch.int32),
+        )
+
+
+def test_a_step_that_answers_a_verify_with_a_plain_decode_is_refused():
+    """The unimplemented verify has to stop the run, not shorten it.
+
+    Nothing below the submission boundary can catch this. A ``[B, 1]`` id
+    tensor has the two dimensions the accept walk expects and an integer
+    dtype, and the walk reads it as a verify that claimed one token on every
+    row: each step then commits a single token, the drafts are all rejected,
+    and the server produces correct text at a fraction of the speed with no
+    error anywhere. The refusal names the model class and the declaration that
+    is not backed.
+    """
+    runner = _runner(_DeclaresSpecDecodeWithoutAVerify())
+    _add_request(runner, "r")
+
+    with pytest.raises(TypeError, match="must not declare supports_spec_decode"):
+        _step(runner, "r", drafts={"r": [11, 12, 13]})
+
+
+def test_a_verify_output_from_an_unspeculated_step_is_refused():
+    """A verify's return has no accepted count to be read against here.
+
+    The runner sends ``spec_mode`` on every step it speculates on and on no
+    other, so a ``VerifyOutput`` arriving without one is the model answering a
+    question that was not asked.
+    """
+    runner = _runner(
+        _AnswersEveryStepWithAVerify(), num_speculative_tokens=0, method=None
+    )
+    _add_request(runner, "r")
+
+    with pytest.raises(TypeError, match="asked for no verify"):
+        _step(runner, "r")
+
+
 def test_a_verify_answering_in_another_mode_is_refused():
     """A mode the runner cannot walk fails by name, not by misreading ids.
 
@@ -507,7 +572,20 @@ def test_a_verify_answering_in_another_mode_is_refused():
     answer = VerifyOutput(spec_mode=ACCEPT_MODE_LOGITS, logits=logits)
 
     with pytest.raises(NotImplementedError, match="no accept walk for that mode"):
-        _verify_output_tensor(answer)
+        _verify_output_tensor(answer, "FakeSpecModel", ACCEPT_MODE_ARGMAX_IDS)
 
 
-# endregion Drafts handed back to the scheduler
+def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():
+    """A plain decode's other return shape is refused by type too.
+
+    Host sampling returns logits, and a model may return them beside other
+    tensors. Neither is a ``VerifyOutput``, and the guard is on the type
+    rather than on any shape, so neither reaches the accept walk.
+    """
+    answer = (torch.zeros(1, 1, FAKE_VOCAB_SIZE), None)
+
+    with pytest.raises(TypeError, match="returned tuple"):
+        _verify_output_tensor(answer, "SomeTTModel", ACCEPT_MODE_ARGMAX_IDS)
+
+
+# endregion What a step may answer a verify with
