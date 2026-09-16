@@ -32,7 +32,11 @@ import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    PLACEHOLDER_TOKEN_ID,
+    VerifyOutput,
+)
 
 from .fake_spec_model import FakeSpecModel
 
@@ -566,7 +570,14 @@ def test_the_side_tensors_reach_the_model_s_decode_forward():
 
         def decode_forward(self, **kwargs):
             calls.append(kwargs)
-            return torch.zeros((MAX_NUM_REQS, 1))
+            # A verify's own return type, because the submission boundary
+            # requires one of every step that sends ``spec_mode``. A recording
+            # stub that answered with a plain decode's tensor would be
+            # refused there and never record anything.
+            return VerifyOutput(
+                spec_mode=kwargs["spec_mode"],
+                argmax_ids=torch.zeros(kwargs["tokens"].shape, dtype=torch.int32),
+            )
 
     batch = _batch()
     requests = {req_id: _add_decoding_request(batch, req_id) for req_id in ("a", "b")}
