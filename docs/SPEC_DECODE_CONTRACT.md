@@ -14,9 +14,11 @@ https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
 A model implementing this contract serves speculative decoding, within one
 boundary. What runs:
 
-- the **n-gram** method, and no other. The runner proposes for `ngram` only, so
-  every other method vLLM knows is refused at configuration time rather than
-  admitted to draft nothing.
+- two drafting methods: **`ngram`**, which runs on the host and asks the model
+  for nothing, and **`custom_class`**, which is the model's own drafter
+  proposing on device through `propose_draft_tokens`. Every other method vLLM
+  knows is refused at configuration time rather than admitted to draft
+  nothing.
 - the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
   is refused, because the runner requests `argmax_ids` on every step.
 - **greedy requests**, and no others. A request carrying a temperature,
@@ -198,6 +200,38 @@ verify that claimed one token on every row, so the server commits one token
 per step for its whole life and reports no error. The reverse is refused too:
 a `VerifyOutput` returned from a step that sent no `spec_mode` has no accepted
 count to be read against.
+
+## 4b. The propose call, for a model that drafts
+
+A launch whose method requires `device_propose` calls the model after every
+commit:
+
+```python
+def propose_draft_tokens(
+    self,
+    num_drafts,            # K
+    committed_tokens,      # [B, 1+K] int32, this step's committed block
+    committed_positions,   # [B, 1+K] int32, where those tokens sit
+    accepted_counts,       # [B] int32 in [1, 1+K], how much of the block is real
+    hidden=None,           # the HiddenHandle this step's verify returned
+) -> DraftOutput
+```
+
+The rows are the verify's rows, padding included, because a drafter's state is
+indexed by row and a device graph has one shape. Which entry of the committed
+block is a row's last token is `accepted_counts - 1`, the same arithmetic the
+verify uses to select a candidate state slot; reading a fixed column instead
+continues every row from the same place. `DraftOutput.draft_token_ids` is
+`[B, K]`, every id inside the vocabulary: the runner range-checks them before
+the scheduler stores them, because a stored draft is verified next step and
+committed if the model agrees with it.
+
+`hidden` is whatever this step's own `VerifyOutput.hidden` carried, handed back
+without being interpreted. A model that needs none returns none and receives
+none. Selecting this drafter requires vLLM's `custom_class` method, whose
+`model` key must be exactly `vllm_tt_plugin.model_owned_drafter`: vLLM demands
+a dotted proposer path there and nothing imports it, because the drafter is the
+model.
 
 ## 5. What a verify returns, column by column
 

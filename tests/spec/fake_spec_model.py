@@ -85,6 +85,12 @@ class FakeSpecModel:
     def __init__(self) -> None:
         self.propose_calls: list[dict] = []
         self.verify_calls: list[dict] = []
+        # The handle the last verify returned. A fresh object per verify, and
+        # deliberately of no useful type: the contract is that the runner hands
+        # it back without interpreting it, so a test can only check identity,
+        # and anything the runner did to it would show up as a different
+        # object rather than as a wrong value.
+        self.verify_hidden: object | None = None
 
     # ---- config time -----------------------------------------------------
 
@@ -145,6 +151,9 @@ class FakeSpecModel:
                 "rows": rows,
                 "accepted_counts": accepted_counts.clone(),
                 "hidden_was_none": hidden is None,
+                "hidden": hidden,
+                "committed_tokens": committed_tokens.clone(),
+                "committed_positions": committed_positions.clone(),
             }
         )
         # Deterministic and derived only from the last committed token per row,
@@ -205,13 +214,18 @@ class FakeSpecModel:
         )
 
         verified = self._verified_ids(tokens, num_valid_drafts)
+        self.verify_hidden = object()
         if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
-            return VerifyOutput(spec_mode=spec_mode, argmax_ids=verified, hidden=None)
+            return VerifyOutput(
+                spec_mode=spec_mode, argmax_ids=verified, hidden=self.verify_hidden
+            )
         # The two modes must agree, or a test of one proves nothing about the
         # other: the logits argmax is the ids the other mode returns.
         logits = torch.zeros(rows, block_width, self.vocab_size)
         logits.scatter_(2, verified.to(torch.int64).unsqueeze(2), 1.0)
-        return VerifyOutput(spec_mode=spec_mode, logits=logits, hidden=None)
+        return VerifyOutput(
+            spec_mode=spec_mode, logits=logits, hidden=self.verify_hidden
+        )
 
     # ---- contract checks -------------------------------------------------
 

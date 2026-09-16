@@ -20,6 +20,8 @@ import vllm  # noqa: F401
 from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import get_tt_spec_plan, store_tt_spec_plan
 from vllm_tt_plugin.spec_admission import (
+    MODEL_OWNED_DRAFT_METHOD,
+    MODEL_OWNED_DRAFT_SENTINEL,
     method_requirements,
     resolve_speculative_plan,
 )
@@ -45,10 +47,19 @@ MTP_METHOD = "mtp"
 RUNNABLE_METHOD = "ngram"
 
 
-def _config(*, method=RUNNABLE_METHOD, requested_k=7, max_num_seqs=1, speculative=True):
+def _config(
+    *,
+    method=RUNNABLE_METHOD,
+    requested_k=7,
+    max_num_seqs=1,
+    speculative=True,
+    model=None,
+):
     return SimpleNamespace(
         speculative_config=(
-            SimpleNamespace(method=method, num_speculative_tokens=requested_k)
+            SimpleNamespace(
+                method=method, num_speculative_tokens=requested_k, model=model
+            )
             if speculative
             else None
         ),
@@ -170,7 +181,8 @@ def test_a_method_with_no_proposer_is_refused():
         _admit(_config(method="suffix"))
     message = str(excinfo.value)
     assert "no proposer drives it" in message
-    assert "['ngram']" in message
+    assert "ngram" in message
+    assert MODEL_OWNED_DRAFT_METHOD in message
 
 
 def test_a_device_method_is_refused_even_by_a_fully_declaring_model():
@@ -180,6 +192,69 @@ def test_a_device_method_is_refused_even_by_a_fully_declaring_model():
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(method=MTP_METHOD))
     assert "no proposer drives it" in str(excinfo.value)
+
+
+def test_the_model_owned_drafter_is_admitted():
+    """The method that means the model's own drafter proposes on device.
+
+    ``FakeSpecModel`` declares ``device_propose``, ``hidden_feed`` and a hidden
+    handoff, which is everything the method requires of a model, so the launch
+    is admitted and the runner calls ``propose_draft_tokens`` each step.
+    """
+    plan = _admit(
+        _config(method=MODEL_OWNED_DRAFT_METHOD, model=MODEL_OWNED_DRAFT_SENTINEL)
+    )
+
+    assert plan is not None
+    assert plan.effective_k == 7
+
+
+def test_the_model_owned_drafter_needs_its_documented_model_path():
+    """vLLM requires a dotted proposer path; on TT nothing imports it.
+
+    Any other value names a proposer that will never be loaded and would read
+    as the thing doing the drafting, so exactly one value is accepted.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(method=MODEL_OWNED_DRAFT_METHOD, model="some.other.Proposer"))
+
+    message = str(excinfo.value)
+    assert MODEL_OWNED_DRAFT_SENTINEL in message
+    assert "propose_draft_tokens" in message
+
+
+def test_the_model_owned_drafter_needs_a_declared_hidden_handoff():
+    """It is a device drafter, so the hidden-state handoff has to be declared."""
+    variant = make_fake_spec_model()
+    variant.model_capabilities = {
+        **FakeSpecModel.model_capabilities,
+        "spec_hidden_handoff": [],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        _admit(
+            _config(method=MODEL_OWNED_DRAFT_METHOD, model=MODEL_OWNED_DRAFT_SENTINEL),
+            model_class=variant,
+        )
+
+    assert "spec_hidden_handoff" in str(excinfo.value)
+
+
+def test_a_model_that_cannot_draft_is_refused_the_model_owned_method():
+    """A model declaring no ``device_propose`` cannot be asked to draft."""
+    variant = make_fake_spec_model()
+    variant.model_capabilities = {
+        **FakeSpecModel.model_capabilities,
+        "spec_requirements": [],
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        _admit(
+            _config(method=MODEL_OWNED_DRAFT_METHOD, model=MODEL_OWNED_DRAFT_SENTINEL),
+            model_class=variant,
+        )
+
+    assert SPEC_REQUIREMENT_DEVICE_PROPOSE in str(excinfo.value)
 
 
 def test_a_logits_only_plan_is_refused():

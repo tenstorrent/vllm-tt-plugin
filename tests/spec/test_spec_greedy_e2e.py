@@ -79,6 +79,7 @@ def _runner(
     model: FakeSpecModel,
     num_speculative_tokens: int = DRAFT_LEN,
     method: str | None = "ngram",
+    drafts_from_model: bool = False,
 ) -> SimpleNamespace:
     """A runner fake carrying only what the speculative step path reads."""
     batch = InputBatch(
@@ -100,6 +101,7 @@ def _runner(
         _num_speculative_tokens=num_speculative_tokens,
         _spec_method=method,
         _spec_supports_narrow_decode=False,
+        _spec_drafts_from_model=drafts_from_model,
         _req_accepted_counts={},
         _proposed_draft_token_ids={},
         _ngram_proposer=(
@@ -123,6 +125,7 @@ def _runner(
         _build_host_generators=TTModelRunner._build_host_generators,
         _spec_row_state=TTModelRunner._spec_row_state,
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
+        _committed_positions=TTModelRunner._committed_positions,
     )
     for name in (
         "_finish_spec_decode",
@@ -130,6 +133,7 @@ def _runner(
         "_apply_committed_spec_tokens_to_state",
         "_apply_grammar_to_input",
         "_propose_ngram_drafts",
+        "_propose_model_drafts",
         "_reorder_grammar_bitmask",
         "take_draft_token_ids",
     ):
@@ -195,6 +199,9 @@ def _step(
         batch_size_per_dp=[len(req_ids)],
         perform_device_sampling=False,
         is_decode=True,
+        # The real path carries the verify's handle from the submission to the
+        # accept walk; a test that built it by hand would not exercise that.
+        spec_hidden=submission.spec_hidden,
     )
     # Through the routing entry point, not straight into the speculative
     # finish: which of the two tails a step takes is itself part of the loop.
@@ -589,3 +596,200 @@ def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():
 
 
 # endregion What a step may answer a verify with
+
+# region The model's own drafter
+
+
+def _model_drafter_runner(model, num_speculative_tokens: int = DRAFT_LEN):
+    """A runner whose drafts come from the model, not from a host proposer."""
+    return _runner(
+        model,
+        num_speculative_tokens=num_speculative_tokens,
+        method="custom_class",
+        drafts_from_model=True,
+    )
+
+
+def test_the_model_is_asked_for_the_next_drafts():
+    """One propose per step, over the rows the verify ran on.
+
+    The drafter's state is indexed by row and a device graph has one shape, so
+    it is handed the verify's rows rather than only the live ones, and the
+    committed block plus each row's count rather than a single token.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    _step(runner, "r")
+
+    assert len(model.propose_calls) == 1
+    call = model.propose_calls[0]
+    assert call["num_drafts"] == DRAFT_LEN
+    # MAX_NUM_REQS rows: the one live request and the padding the verify saw.
+    assert call["rows"] == MAX_NUM_REQS
+    assert call["committed_tokens"].shape == (MAX_NUM_REQS, DRAFT_LEN + 1)
+    assert call["committed_positions"].shape == (MAX_NUM_REQS, DRAFT_LEN + 1)
+
+
+def test_the_drafts_the_model_proposed_reach_the_engine():
+    """``take_draft_token_ids`` hands over what the model proposed."""
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    output = _step(runner, "r")
+    drafts = runner.take_draft_token_ids()
+
+    assert drafts is not None
+    assert drafts.req_ids == ["r"]
+    # The stand-in drafts ``last + 1 + j`` from the row's last committed token,
+    # which is the same arithmetic its verify agrees with.
+    last = output.sampled_token_ids[0][-1]
+    assert drafts.draft_token_ids[0] == [
+        (last + 1 + j) % FAKE_VOCAB_SIZE for j in range(DRAFT_LEN)
+    ]
+
+
+def test_the_verify_hidden_handle_reaches_the_drafter_unchanged():
+    """The handoff no host fake can fake: identity, not value.
+
+    A real handle is a device tensor whose layout and tensor-parallel
+    fracturing the runner must not interpret, so the only thing that can be
+    checked is that the object the verify returned is the object the drafter
+    receives.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    _step(runner, "r")
+
+    assert model.verify_hidden is not None
+    assert model.propose_calls[0]["hidden"] is model.verify_hidden
+
+
+def test_the_drafter_continues_from_each_row_s_own_committed_token():
+    """Two rows that commit different lengths each draft from their own tail.
+
+    The committed block is one fixed width and each row's count says how much
+    of it is real, so a drafter reading the wrong entry would continue one row
+    from another row's token, or from padding.
+    """
+    model = make_fake_spec_model(accept_depth=0)()
+    runner = _model_drafter_runner(model)
+    for req_id in ("a", "b"):
+        _add_request(runner, req_id)
+
+    # Both rows commit one token, because the stand-in accepts no draft at
+    # depth 0, and each row's own committed token is what it drafts from.
+    output = _step(runner, "a", "b")
+    drafts = runner.take_draft_token_ids()
+
+    assert drafts is not None
+    committed = dict(zip(output.req_ids, output.sampled_token_ids))
+    by_req = dict(zip(drafts.req_ids, drafts.draft_token_ids))
+    for req_id in ("a", "b"):
+        expected = (committed[req_id][-1] + 1) % FAKE_VOCAB_SIZE
+        assert by_req[req_id][0] == expected
+
+
+def test_a_full_draft_set_commits_every_step_with_the_model_drafting():
+    """The property an n-gram drafter cannot give: no draftless step.
+
+    The stand-in proposes what its own verify accepts, so with every draft
+    accepted each step commits ``1+K`` tokens. An n-gram drafter stalls
+    whenever the text stops repeating, which is what made the device run's
+    accept-all measurement alternate between wide and narrow steps.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    widths = []
+    pending: dict[str, list[int]] = {}
+    for _ in range(4):
+        output = _step(runner, "r", drafts=dict(pending))
+        widths.append(len(output.sampled_token_ids[0]))
+        handed = runner.take_draft_token_ids()
+        pending = {"r": list(handed.draft_token_ids[0])} if handed else {}
+
+    # The first step has no drafts in flight yet, and every step after it does.
+    assert widths == [1] + [DRAFT_LEN + 1] * 3
+
+
+def test_a_drafter_returning_the_wrong_shape_is_refused():
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    def wrong_shape(num_drafts, committed, positions, counts, hidden=None):
+        from vllm_tt_plugin.spec_decode import DraftOutput
+
+        return DraftOutput(draft_token_ids=torch.zeros(1, 1, dtype=torch.int32))
+
+    model.propose_draft_tokens = wrong_shape
+
+    with pytest.raises(ValueError, match="one row per verified row"):
+        _step(runner, "r")
+
+
+def test_a_drafter_returning_a_bare_tensor_is_refused():
+    """The same fail-fast rule the verify return follows."""
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    model.propose_draft_tokens = lambda *a, **k: torch.zeros(
+        MAX_NUM_REQS, DRAFT_LEN, dtype=torch.int32
+    )
+
+    with pytest.raises(TypeError, match="returns a DraftOutput"):
+        _step(runner, "r")
+
+
+def test_a_draft_outside_the_vocabulary_is_refused():
+    """A drafted id is committed if the model agrees with it next step."""
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    def out_of_range(num_drafts, committed, positions, counts, hidden=None):
+        from vllm_tt_plugin.spec_decode import DraftOutput
+
+        return DraftOutput(
+            draft_token_ids=torch.full(
+                (MAX_NUM_REQS, num_drafts), FAKE_VOCAB_SIZE, dtype=torch.int32
+            )
+        )
+
+    model.propose_draft_tokens = out_of_range
+
+    with pytest.raises(ValueError, match="outside"):
+        _step(runner, "r")
+
+
+def test_the_committed_positions_follow_the_input_block():
+    """The drafter is told where each committed token sits.
+
+    The verify's input column 0 holds the row's last committed token at its own
+    position, and the return's column ``j`` is the choice that follows it, so
+    the committed block starts one past that and runs consecutively.
+    """
+    positions = TTModelRunner._committed_positions(
+        torch.tensor([[7, 8, 9, 10]], dtype=torch.int32), 4
+    )
+
+    assert positions.tolist() == [[8, 9, 10, 11]]
+
+
+def test_the_committed_positions_of_a_narrow_step():
+    """A narrow step's positions arrive 1-D, and still produce a block."""
+    positions = TTModelRunner._committed_positions(
+        torch.tensor([7, 11], dtype=torch.int32), 1
+    )
+
+    assert positions.tolist() == [[8], [12]]
+
+
+# endregion The model's own drafter
