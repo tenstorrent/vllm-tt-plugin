@@ -924,6 +924,90 @@ def _install_block_output_pause_guard_patch() -> None:
         cls.pause_scheduler = _wrap(original)
 
 
+def _drain_idle_admission_burst(
+    engine, *, quiet_s: float = 0.002, max_s: float = 0.050
+) -> int:
+    """Drain one bounded burst after an idle engine receives its first request."""
+    import queue
+    import time
+
+    started = time.monotonic()
+    hard_deadline = started + max_s
+    quiet_deadline = started + quiet_s
+    drained = 0
+    while engine.is_running():
+        remaining = min(quiet_deadline, hard_deadline) - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            request = engine.input_queue.get(timeout=remaining)
+        except queue.Empty:
+            break
+        engine._handle_client_request(*request)
+        drained += 1
+        quiet_deadline = min(time.monotonic() + quiet_s, hard_deadline)
+    return drained
+
+
+def _install_idle_admission_coalescing_patch() -> None:
+    """Drain a short burst of requests before an idle TT engine steps.
+
+    The multiprocessing EngineCore begins a synchronous device step as soon as
+    the first frontend request reaches its input queue.  A single OpenAI batch
+    fans out requests as separate asynchronous messages; without a bounded
+    idle-only grace period, the first message can start a long TT prefill while
+    its siblings remain in transport, turning a declared B-wide engine into
+    B=1 at runtime.  Coalesce only the transition from idle to active.  Once
+    work is running, decode scheduling and ordinary arrivals retain upstream
+    behavior.
+    """
+    import vllm.v1.engine.core as engine_core
+
+    marker = "_tt_original_process_input_queues"
+    if hasattr(engine_core, marker):
+        return
+
+    # Only multiprocessing cores interleave a transport queue with device
+    # steps. In-process ``EngineCore`` receives all synchronous LLM.generate
+    # requests before its first step and intentionally has no such method.
+    candidates = (engine_core.EngineCoreProc, engine_core.DPEngineCoreProc)
+    targets = tuple(
+        target for target in candidates if "_process_input_queue" in target.__dict__
+    )
+    originals = {target: target._process_input_queue for target in targets}
+    setattr(engine_core, marker, originals)
+
+    def wrap(original):
+        def process_input_queue_tt(self):
+            was_idle = not self.has_work()
+            original(self)
+            if not was_idle or not self.has_work():
+                return
+
+            # Wait for a two-millisecond quiet period, with a hard
+            # 50-millisecond cap paid only once per idle burst. Batch prompts
+            # have already been rendered; this covers only their per-request
+            # message fan-out.
+            _drain_idle_admission_burst(self)
+
+        return process_input_queue_tt
+
+    for target, original in originals.items():
+        target._process_input_queue = wrap(original)
+
+
+def _uninstall_idle_admission_coalescing_patch() -> None:
+    """Restore upstream EngineCore methods (test/process-lifecycle helper)."""
+    import vllm.v1.engine.core as engine_core
+
+    originals = getattr(engine_core, "_tt_original_process_input_queues", None)
+    if originals is None:
+        return
+    for target, original in originals.items():
+        target._process_input_queue = original
+    delattr(engine_core, "_tt_original_process_input_queues")
+
+
 def _iter_extra_model_bundles():
     """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
 
@@ -1645,6 +1729,8 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+
+        _install_idle_admission_coalescing_patch()
 
         if is_block_output_model:
             required_lifecycle_hooks = (

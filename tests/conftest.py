@@ -44,11 +44,18 @@ def reset_tt_platform_class_state():
     saved_reset_prefix_cache = engine_core.EngineCore.reset_prefix_cache
     saved_pause_scheduler = engine_core.EngineCore.pause_scheduler
     saved_proc_pause_scheduler = engine_core.EngineCoreProc.pause_scheduler
+    saved_proc_process_input_queue = engine_core.EngineCoreProc._process_input_queue
+    saved_dp_process_input_queue = engine_core.DPEngineCoreProc.__dict__.get(
+        "_process_input_queue", unset
+    )
     saved_original_reset_prefix_cache = engine_core.__dict__.get(
         "_tt_original_reset_prefix_cache", unset
     )
     saved_original_pause_scheduler = engine_core.__dict__.get(
         "_tt_original_pause_scheduler", unset
+    )
+    saved_original_process_input_queues = engine_core.__dict__.get(
+        "_tt_original_process_input_queues", unset
     )
 
     yield
@@ -56,6 +63,12 @@ def reset_tt_platform_class_state():
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
     engine_core.EngineCoreProc.pause_scheduler = saved_proc_pause_scheduler
+    engine_core.EngineCoreProc._process_input_queue = saved_proc_process_input_queue
+    if saved_dp_process_input_queue is unset:
+        if "_process_input_queue" in engine_core.DPEngineCoreProc.__dict__:
+            delattr(engine_core.DPEngineCoreProc, "_process_input_queue")
+    else:
+        engine_core.DPEngineCoreProc._process_input_queue = saved_dp_process_input_queue
     if saved_original_reset_prefix_cache is unset:
         engine_core.__dict__.pop("_tt_original_reset_prefix_cache", None)
     else:
@@ -64,6 +77,12 @@ def reset_tt_platform_class_state():
         engine_core.__dict__.pop("_tt_original_pause_scheduler", None)
     else:
         engine_core._tt_original_pause_scheduler = saved_original_pause_scheduler
+    if saved_original_process_input_queues is unset:
+        engine_core.__dict__.pop("_tt_original_process_input_queues", None)
+    else:
+        engine_core._tt_original_process_input_queues = (
+            saved_original_process_input_queues
+        )
 
     async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
     if saved_original_add_streaming_input_request is unset:
