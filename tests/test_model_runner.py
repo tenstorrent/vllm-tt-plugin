@@ -5,8 +5,14 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
@@ -30,6 +36,34 @@ def test_single_attention_group_preserves_sparse_real_layer_names():
     names = [f"model.layers.{index}.self_attn" for index in (3, 7, 11, 15)]
     assert _single_attention_group_layer_count(names, 16) == 4
     assert _single_attention_group_layer_count(["foo"], 16) == 16
+
+
+def test_single_attention_group_packs_sparse_real_layers_into_group_buffers():
+    runner = object.__new__(TTModelRunner)
+    runner._kv_cache_shape = lambda spec, num_blocks: (num_blocks, 2, 16, 64)
+    spec = AttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[
+                    f"model.layers.{index}.self_attn" for index in (3, 7, 11, 15)
+                ],
+                kv_cache_spec=spec,
+            )
+        ],
+    )
+
+    per_layer = runner._build_per_layer_specs(config, num_layers=16)
+
+    assert len(per_layer) == 4
+    assert [tensor_idx for _, _, tensor_idx in per_layer] == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize(
