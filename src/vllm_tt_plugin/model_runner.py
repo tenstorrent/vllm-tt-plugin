@@ -1246,9 +1246,27 @@ class TTModelRunner:
         ``None``.
         """
         num_drafts = self._num_speculative_tokens
-        positions = self._committed_positions(
-            model_input.input_positions, int(committed.shape[1])
-        )
+        width = num_drafts + 1
+        rows = int(committed.shape[0])
+        if int(committed.shape[1]) < width:
+            # A narrow verify answers one column wide, because the model
+            # declared it serves the plain decode's shapes on a step where no
+            # row carries a draft. The drafter is a separate call with one
+            # shape of its own, so the block is padded to the uniform 1+K,
+            # which is what a row that committed less than the full width
+            # already looks like after a wide step.
+            committed = torch.cat(
+                [
+                    committed,
+                    torch.full(
+                        (rows, width - int(committed.shape[1])),
+                        PLACEHOLDER_TOKEN_ID,
+                        dtype=committed.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+        positions = self._committed_positions(model_input.input_positions, width)
         drafted = self.model.propose_draft_tokens(
             num_drafts,
             committed,
@@ -1265,7 +1283,17 @@ class TTModelRunner:
                 "from vllm_tt_plugin.spec_decode"
             )
         draft_token_ids = drafted.draft_token_ids
-        rows = int(committed.shape[0])
+        if draft_token_ids.dtype != torch.int32:
+            # Checked before the range test below, which a fractional value
+            # passes: the ids are read out with ``int()``, so a float tensor
+            # would have every draft silently truncated and the scheduler would
+            # verify a token the drafter never proposed.
+            raise ValueError(
+                f"TT model {type(self.model).__name__} proposed drafts of "
+                f"dtype {draft_token_ids.dtype}; propose_draft_tokens returns "
+                "int32 token ids, as the candidate block and both side "
+                "tensors do"
+            )
         if tuple(draft_token_ids.shape) != (rows, num_drafts):
             raise ValueError(
                 f"TT model {type(self.model).__name__} proposed drafts of "
@@ -1314,9 +1342,16 @@ class TTModelRunner:
         Padding rows carry an input position of -1 and come out negative here,
         which is what marks them as rows no request owns.
         """
-        first = input_positions if input_positions.dim() == 1 else input_positions[:, 0]
+        first = (
+            input_positions if input_positions.dim() == 1 else input_positions[:, 0]
+        ).to(torch.int32)
         offsets = torch.arange(1, width + 1, dtype=torch.int32)
-        return first.to(torch.int32).unsqueeze(1) + offsets.unsqueeze(0)
+        positions = first.unsqueeze(1) + offsets.unsqueeze(0)
+        # A padding row's input position is -1, and the offsets would turn that
+        # into 0, 1, 2 and so on, which is exactly where a request starting
+        # from nothing would sit. The drafter is handed no live-row mask, so the
+        # position is the only thing that marks a row as owned by no request.
+        return positions.masked_fill((first < 0).unsqueeze(1), -1)
 
     @staticmethod
     def _spec_candidate_block(

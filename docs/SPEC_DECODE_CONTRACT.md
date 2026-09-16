@@ -33,9 +33,9 @@ boundary. What runs:
   from `TTLaneInputBatch`, which has no candidate-block builder.
 
 Every one of those is a refusal that raises with the offending values, never a
-silent fallback. A device drafter, the sampled accept walk, structured output
-over drafts, and `fused_sample` each need their own execution path before the
-matching refusal can go.
+silent fallback. The sampled accept walk, structured output over drafts,
+`fused_sample`, `drafter_scores` and a scheduler-owned paged drafter cache each
+need their own execution path before the matching refusal can go.
 
 ## 1. Capability declarations
 
@@ -217,9 +217,15 @@ indexed by row and a device graph has one shape. Which entry of the committed
 block is a row's last token is `accepted_counts - 1`, the same arithmetic the
 verify uses to select a candidate state slot; reading a fixed column instead
 continues every row from the same place. `DraftOutput.draft_token_ids` is
-`[B, K]`, every id inside the vocabulary: the runner range-checks them before
-the scheduler stores them, because a stored draft is verified next step and
-committed if the model agrees with it.
+`[B, K]` int32, every id inside the vocabulary: the runner checks the dtype and
+the range before the scheduler stores them, because a stored draft is verified
+next step and committed if the model agrees with it, and a fractional value
+would be truncated on the way in.
+
+The call has one shape. A model that also declares `supports_narrow_decode`
+still receives `[B, 1+K]` here after a narrow verify, with the columns past
+each row's `accepted_counts` padded, exactly as a row that accepted less than
+the full width looks after a wide verify.
 
 `hidden` is whatever this step's own `VerifyOutput.hidden` carried, handed back
 without being interpreted. A model that needs none returns none and receives
