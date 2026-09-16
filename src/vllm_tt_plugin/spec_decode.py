@@ -473,6 +473,18 @@ def accept_greedy_drafts(
     # A column past a row's own count holds padding, not a candidate, so it can
     # neither be accepted nor reject the row.
     valid = torch.arange(num_drafts).unsqueeze(0) < num_valid_drafts.unsqueeze(1)
+    if bool((draft_token_ids.eq(PLACEHOLDER_TOKEN_ID) & valid).any()):
+        # The padding marker inside a row's own count is not a token the model
+        # can have chosen, so nothing downstream can catch it: the model is
+        # handed the same column, returns it unchanged, the comparison above
+        # matches, and the marker commits as an output token. The caller
+        # counted more drafts than it delivered.
+        raise ValueError(
+            "accept_greedy_drafts was given PLACEHOLDER_TOKEN_ID as a draft "
+            "inside a row's num_valid_drafts prefix: num_valid_drafts "
+            f"{num_valid_drafts.tolist()} against draft_token_ids "
+            f"{draft_token_ids.tolist()}"
+        )
     rejected = valid & ~matched
     # argmax over an all-False row returns 0, so the index is only meaningful
     # once a rejection is known to exist.
