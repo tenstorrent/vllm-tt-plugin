@@ -1372,18 +1372,48 @@ class TTModelRunner:
                 f"shape {tuple(draft_token_ids.shape)}; the contract is "
                 f"[{rows}, {num_drafts}], one row per verified row"
             )
+        offered = drafted.num_valid
+        if offered is not None:
+            if offered.dtype != torch.int32:
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} returned "
+                    f"num_valid of dtype {offered.dtype}; propose_draft_tokens "
+                    "returns int32 counts, as both verify side tensors do"
+                )
+            if tuple(offered.shape) != (rows,):
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} returned "
+                    f"num_valid of shape {tuple(offered.shape)}; the contract "
+                    f"is [{rows}], one count per verified row"
+                )
+            if bool(((offered < 0) | (offered > num_drafts)).any()):
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} returned a "
+                    f"num_valid outside [0, {num_drafts}]: "
+                    f"{offered.tolist()}; a row offers at most the draft "
+                    "length the plan resolved, and 0 to offer nothing"
+                )
         # Range-checked before the ids reach the scheduler, because a draft it
         # stores is verified next step and committed if the model agrees with
         # it, and an id outside the vocabulary is not something any verify can
-        # have chosen. The placeholder is included in that: it marks the tail
-        # of a block and is never a candidate.
+        # have chosen. Only the offered entries are checked: a row's unoffered
+        # tail is never read, so a drafter may pad it with the placeholder or
+        # with anything else.
         vocab = int(self.input_batch.vocab_size)
-        if bool(((draft_token_ids < 0) | (draft_token_ids >= vocab)).any()):
+        if offered is None:
+            out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
+        else:
+            columns = torch.arange(num_drafts).unsqueeze(0)
+            is_offered = columns < offered.to(torch.int64).unsqueeze(1)
+            out_of_range = (
+                (draft_token_ids < 0) | (draft_token_ids >= vocab)
+            ) & is_offered
+        if bool(out_of_range.any()):
             raise ValueError(
                 f"TT model {type(self.model).__name__} proposed a draft token "
-                f"id outside [0, {vocab}); a drafter that has nothing to "
-                "propose for a row still returns ids for it, and the runner "
-                "trims the row instead"
+                f"id outside [0, {vocab}); a drafter offering nothing for a "
+                "row says so with num_valid, and the ids in that row are then "
+                "not read"
             )
         max_model_len = int(self.model_config.max_model_len)
         skipped = set(skip_req_ids or ())
@@ -1412,7 +1442,8 @@ class TTModelRunner:
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
             room = max_model_len - int(self.input_batch.num_tokens[batch_row])
-            usable = max(0, min(num_drafts, room))
+            row_offered = num_drafts if offered is None else int(offered[row])
+            usable = max(0, min(row_offered, room))
             if usable:
                 self._proposed_draft_token_ids[req_id] = [
                     int(token) for token in draft_token_ids[row, :usable]

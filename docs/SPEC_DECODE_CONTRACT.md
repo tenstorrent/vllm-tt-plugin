@@ -228,10 +228,22 @@ indexed by row and a device graph has one shape. Which entry of the committed
 block is a row's last token is `accepted_counts - 1`, the same arithmetic the
 verify uses to select a candidate state slot; reading a fixed column instead
 continues every row from the same place. `DraftOutput.draft_token_ids` is
-`[B, K]` int32, every id inside the vocabulary: the runner checks the dtype and
-the range before the scheduler stores them, because a stored draft is verified
-next step and committed if the model agrees with it, and a fractional value
-would be truncated on the way in.
+`[B, K]` int32, every offered id inside the vocabulary: the runner checks the
+dtype and the range before the scheduler stores them, because a stored draft is
+verified next step and committed if the model agrees with it, and a fractional
+value would be truncated on the way in.
+
+`DraftOutput.num_valid` is `[B]` int32 and optional, how many of each row's `K`
+drafts the drafter is offering. It is the only way to offer none: a row at 0 is
+drafted for nowhere, and the step those drafts would have been verified on runs
+as an ordinary decode instead (see section 4d). `None` means every row offers
+all `K`, which is what a drafter that always drafts returns, so a drafter
+written before this field keeps working. A drafter with nothing for a row still
+returns ids in that row, because a device graph has one shape; those ids are
+not read, and not range-checked either, so the row may be padded with
+`PLACEHOLDER_TOKEN_ID`. Never encode an empty proposal as a dummy token id:
+the runner cannot tell that from a real draft and would verify it. Each count
+is checked for dtype, shape and the range `[0, K]` before any of it is used.
 
 The call has one shape. A model that also declares `supports_narrow_decode`
 still receives `[B, 1+K]` here after a narrow verify, with the columns past

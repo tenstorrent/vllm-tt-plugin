@@ -776,6 +776,125 @@ def test_a_draft_outside_the_vocabulary_is_refused():
         _step(runner, "r")
 
 
+def test_a_drafter_offering_nothing_for_a_row_proposes_nothing():
+    """``num_valid`` is how a drafter declines, and it is per row.
+
+    A device graph has one shape, so a drafter with nothing to offer still
+    returns ids for every row. ``num_valid`` at 0 is what says those ids are
+    not a proposal; encoding the refusal as a dummy token id would be
+    indistinguishable from a real draft and the runner would verify it.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+    _add_request(runner, "s")
+
+    def declines_the_first_row(num_drafts, committed, positions, counts, hidden=None):
+        from vllm_tt_plugin.spec_decode import DraftOutput
+
+        rows = int(committed.shape[0])
+        offered = torch.zeros(rows, dtype=torch.int32)
+        # The second row offers one draft; every other row offers none.
+        offered[1] = 1
+        return DraftOutput(
+            draft_token_ids=torch.full((rows, num_drafts), 7, dtype=torch.int32),
+            num_valid=offered,
+        )
+
+    model.propose_draft_tokens = declines_the_first_row
+    _step(runner, "r", "s")
+
+    assert "r" not in runner._proposed_draft_token_ids
+    assert runner._proposed_draft_token_ids["s"] == [7]
+
+
+def test_an_unoffered_row_may_carry_any_ids_including_the_placeholder():
+    """The range check covers what can reach the scheduler, and no more.
+
+    A row the drafter is not offering is never read, so its ids are its own
+    business. Checking them would force a drafter with nothing to say to
+    fabricate in-vocabulary tokens.
+    """
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    def pads_with_the_placeholder(
+        num_drafts, committed, positions, counts, hidden=None
+    ):
+        from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID, DraftOutput
+
+        rows = int(committed.shape[0])
+        return DraftOutput(
+            draft_token_ids=torch.full(
+                (rows, num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+            ),
+            num_valid=torch.zeros(rows, dtype=torch.int32),
+        )
+
+    model.propose_draft_tokens = pads_with_the_placeholder
+    _step(runner, "r")
+
+    assert runner._proposed_draft_token_ids == {}
+
+
+def test_an_offered_row_is_still_range_checked():
+    """What a row does offer has to be a token the verify could choose."""
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    def offers_one_bad_id(num_drafts, committed, positions, counts, hidden=None):
+        from vllm_tt_plugin.spec_decode import DraftOutput
+
+        rows = int(committed.shape[0])
+        return DraftOutput(
+            draft_token_ids=torch.full(
+                (rows, num_drafts), FAKE_VOCAB_SIZE, dtype=torch.int32
+            ),
+            num_valid=torch.ones(rows, dtype=torch.int32),
+        )
+
+    model.propose_draft_tokens = offers_one_bad_id
+
+    with pytest.raises(ValueError, match="outside"):
+        _step(runner, "r")
+
+
+@pytest.mark.parametrize(
+    "bad, match",
+    [
+        ("dtype", "dtype"),
+        ("shape", "shape"),
+        ("range", r"outside \[0, 3\]"),
+    ],
+)
+def test_a_malformed_num_valid_is_refused_by_name(bad, match):
+    """Each way the count can be wrong is named, not inferred downstream."""
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    _add_request(runner, "r")
+
+    def malformed(num_drafts, committed, positions, counts, hidden=None):
+        from vllm_tt_plugin.spec_decode import DraftOutput
+
+        rows = int(committed.shape[0])
+        offered = {
+            "dtype": torch.zeros(rows, dtype=torch.float32),
+            "shape": torch.zeros(rows + 1, dtype=torch.int32),
+            "range": torch.full((rows,), num_drafts + 1, dtype=torch.int32),
+        }[bad]
+        return DraftOutput(
+            draft_token_ids=torch.zeros(rows, num_drafts, dtype=torch.int32),
+            num_valid=offered,
+        )
+
+    model.propose_draft_tokens = malformed
+
+    with pytest.raises(ValueError, match=match):
+        _step(runner, "r")
+
+
 def test_the_committed_positions_follow_the_input_block():
     """The drafter is told where each committed token sits.
 
