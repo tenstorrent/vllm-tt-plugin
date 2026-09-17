@@ -78,6 +78,10 @@ def _runner(model: DeterministicTarget, num_speculative_tokens: int) -> SimpleNa
         _output_tokens_per_step=1,
         _is_block_output_model=False,
         _num_speculative_tokens=num_speculative_tokens,
+        # Synchronous harness: the drafts reach the runner through the
+        # scheduler output, which is what ``_drafts_to_verify`` reads when
+        # asynchronous scheduling is off.
+        async_decode_scheduling=False,
         # No drafting method: the drafts come from each test, through the
         # scheduler output, so that a case can make them wrong exactly where it
         # means to. ``_propose_ngram_drafts`` returns immediately on this, which

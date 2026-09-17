@@ -1206,6 +1206,60 @@ class TTModelRunner:
         input_batch.advance_generators(rows_to_advance)
         return generators
 
+    def _drafts_to_verify(
+        self,
+        scheduler_output: SchedulerOutput,
+        row_req_ids: list[str],
+    ) -> dict[str, list[int]]:
+        """The drafts this step verifies, by request.
+
+        Synchronously, the scheduler's own list, and that is the whole story:
+        a proposer reports through ``take_draft_token_ids``, upstream stores
+        the ids on the request, budgets and grammar-checks them, and delivers
+        what survived.
+
+        Asynchronously, nothing arrives that way. ``EngineCore.post_step``
+        skips ``take_draft_token_ids`` entirely when asynchronous scheduling is
+        on, because a step's drafts are not known before it runs, and upstream
+        substitutes its own ids inside the worker instead.
+        ``AsyncScheduler`` still schedules the lookahead: it leaves each
+        scheduled request holding ``[-1] * num_spec_tokens_to_schedule``, which
+        is a reservation of that many positions rather than a proposal. So the
+        placeholders are read as the reservation they are, and the proposal the
+        runner published for that request is what gets verified, trimmed to
+        what the scheduler reserved.
+
+        The runner's entry is consumed here, keeping the rule the synchronous
+        path gets from ``take_draft_token_ids``: a proposal is handed over
+        once, so a row that proposed nothing this step verifies nothing next
+        step rather than replaying a spent proposal.
+        """
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        if not self.async_decode_scheduling:
+            return scheduled
+        drafts: dict[str, list[int]] = {}
+        for req_id in row_req_ids:
+            offered = list(scheduled.get(req_id) or ())
+            placeholders = sum(1 for token in offered if token == PLACEHOLDER_TOKEN_ID)
+            if placeholders and placeholders != len(offered):
+                raise RuntimeError(
+                    f"request {req_id} was scheduled a mix of placeholder and "
+                    f"real draft tokens: {offered}. A scheduled list is either "
+                    "the asynchronous lookahead reservation or a proposal, and "
+                    "the runner cannot tell which half to verify"
+                )
+            if not placeholders:
+                # Real ids, or nothing scheduled at all. Either way this is
+                # what the scheduler means to verify.
+                if offered:
+                    drafts[req_id] = offered
+                self._proposed_draft_token_ids.pop(req_id, None)
+                continue
+            proposed = self._proposed_draft_token_ids.pop(req_id, None)
+            if proposed:
+                drafts[req_id] = list(proposed[:placeholders])
+        return drafts
+
     @staticmethod
     def _spec_row_state(
         accepted_counts_by_req: dict[str, int],
@@ -1738,7 +1792,7 @@ class TTModelRunner:
             if self._num_speculative_tokens:
                 spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
                     self._req_accepted_counts,
-                    scheduler_output.scheduled_spec_decode_tokens,
+                    self._drafts_to_verify(scheduler_output, row_req_ids),
                     row_req_ids,
                     self._num_speculative_tokens,
                 )

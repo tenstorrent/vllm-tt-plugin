@@ -53,6 +53,7 @@ from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
 )
+from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
 from .deterministic_target import (
     TARGET_VOCAB_SIZE,
@@ -1505,3 +1506,138 @@ def test_a_peer_cancelled_mid_transition_leaves_the_solo_request_intact():
 
 
 # endregion Solo and batched transitions
+
+
+# region Drafts on an asynchronously scheduled launch
+
+
+def _reservation(runner, *req_ids):
+    """The lookahead ``AsyncScheduler`` leaves on a scheduled request.
+
+    ``[-1] * num_spec_tokens_to_schedule``, which is what the real scheduler
+    delivers under asynchronous scheduling: a reservation of that many
+    positions, not a proposal. ``TTScheduler`` leaves it standing there for
+    exactly this reason.
+    """
+    return {req_id: [PLACEHOLDER_TOKEN_ID] * DRAFT_LEN for req_id in req_ids}
+
+
+def test_the_runner_verifies_its_own_proposal_when_the_scheduler_sends_none():
+    """Where the drafts come from on an asynchronous launch.
+
+    ``EngineCore.post_step`` does not call ``take_draft_token_ids`` when
+    asynchronous scheduling is on, so nothing hands the scheduler a proposal
+    and nothing comes back. The runner holds the proposal its own drafter
+    published at the last commit, and that is what this step verifies. Without
+    this, a launch with speculation configured and asynchronous scheduling
+    enabled would decode every step plainly and never speculate, silently.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11))
+    expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)
+    runner._proposed_draft_token_ids["a"] = expected[:DRAFT_LEN]
+
+    wrapper = _submit_step(runner, "a", drafts=_reservation(runner, "a"))
+    model.release()
+    output = wrapper.get_output()
+    _drain(runner, "a")
+
+    assert model.verify_calls, "the step did not verify anything"
+    assert model.verify_calls[-1]["num_valid_drafts"].tolist()[0] == DRAFT_LEN
+    assert output.sampled_token_ids[0] == expected
+    # Handed over once: the entry is consumed by the step that verified it, so
+    # a later step cannot replay a spent proposal.
+    assert "a" not in runner._proposed_draft_token_ids
+
+
+def test_a_placeholder_is_never_verified_as_a_draft():
+    """The reservation is read as a count, never as token ids.
+
+    A ``-1`` reaching the accept walk matches whatever the model returns for
+    that column, because the model is handed the same placeholder, and commits
+    as an output token. With no proposal held, the step verifies nothing.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11))
+    assert not runner._proposed_draft_token_ids
+
+    wrapper = _submit_step(runner, "a", drafts=_reservation(runner, "a"))
+    model.release()
+    output = wrapper.get_output()
+    _drain(runner, "a")
+
+    assert model.verify_calls[-1]["num_valid_drafts"].tolist()[0] == 0
+    assert output.sampled_token_ids[0] == continuation(
+        11 + PROMPT_LEN - 1, PROMPT_LEN - 1, 1
+    )
+    assert PLACEHOLDER_TOKEN_ID not in runner.requests["a"].output_token_ids
+
+
+def test_a_proposal_longer_than_the_reservation_is_trimmed_to_it():
+    """The scheduler's reservation is the budget, and it wins.
+
+    The request was scheduled ``1 + reserved`` positions, so verifying a
+    longer block would write tokens into a row whose KV the scheduler budgeted
+    for fewer.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11))
+    expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)
+    runner._proposed_draft_token_ids["a"] = expected[:DRAFT_LEN]
+
+    reserved = 1
+    wrapper = _submit_step(runner, "a", drafts={"a": [PLACEHOLDER_TOKEN_ID] * reserved})
+    model.release()
+    output = wrapper.get_output()
+    _drain(runner, "a")
+
+    assert model.verify_calls[-1]["num_valid_drafts"].tolist()[0] == reserved
+    assert output.sampled_token_ids[0] == expected[: reserved + 1]
+
+
+def test_a_mixed_reservation_and_proposal_is_refused():
+    """Either the scheduler reserved positions or it delivered drafts.
+
+    A list holding both says the two conventions have been crossed, and the
+    runner cannot tell which half of it to verify. Raised by name rather than
+    guessed at, because guessing wrong commits a placeholder as a token.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11))
+
+    with pytest.raises(RuntimeError, match="mix of placeholder and real"):
+        _submit_step(runner, "a", drafts={"a": [PLACEHOLDER_TOKEN_ID, 11, 12]})
+
+
+def test_a_synchronous_launch_still_takes_the_scheduler_s_drafts():
+    """The other half of the switch, so neither path drifts into the other.
+
+    Synchronously the scheduler owns the drafts: it budgets them, runs them
+    through the grammar, and delivers what survived. A runner that preferred
+    its own copy there would bypass both.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner.async_decode_scheduling = False
+    _admit(runner, ("a", 11))
+    expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)
+    # Held by the runner and not delivered: this must not be verified.
+    runner._proposed_draft_token_ids["a"] = [expected[0] + 7] * DRAFT_LEN
+
+    scheduler_output = _scheduler_output(
+        runner, decoding=["a"], drafts={"a": expected[:DRAFT_LEN]}
+    )
+    row = runner.input_batch.req_id_to_index["a"]
+    runner.input_batch.num_computed_tokens_cpu[row] = runner.input_batch.num_tokens[row]
+    runner._update_states(scheduler_output)
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input.draft_token_ids[0, :DRAFT_LEN].tolist() == expected[:DRAFT_LEN]
+    assert runner._proposed_draft_token_ids["a"] == [expected[0] + 7] * DRAFT_LEN
+
+
+# endregion Drafts on an asynchronously scheduled launch
