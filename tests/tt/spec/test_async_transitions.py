@@ -173,7 +173,10 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
     solo_after = spec_server.metrics()
     solo_delta = acceptance_delta(solo_before, solo_after, spec_config.k)
 
-    long_tokens = MAX_TOKENS * 6
+    # Long enough to outlive the peer even while speculating, which makes it
+    # the faster of the two per step: it commits up to 1+K where the peer
+    # commits one.
+    long_tokens = MAX_TOKENS * 16
     with ThreadPoolExecutor(max_workers=2) as pool:
         long_future = pool.submit(
             spec_server.complete,
@@ -182,7 +185,7 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
         )
         time.sleep(0.4)
         peer = pool.submit(
-            spec_server.complete, ascending_prompt(64, start=900), max_tokens=16
+            spec_server.complete, ascending_prompt(64, start=900), max_tokens=MAX_TOKENS
         )
         peer_result = peer.result()
         after_peer = spec_server.metrics()
@@ -195,10 +198,16 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
         after_the_peer_left=resumed.as_dict(),
     )
 
-    assert solo_delta.drafts > 0, "a lone request was never drafted for"
-    assert solo_delta.accepted > 0
+    # Acceptance, not the draft counters. ``AsyncScheduler`` gives every
+    # scheduled request ``[-1] * num_spec_tokens`` as its lookahead
+    # reservation, and vLLM counts those as drafts, so on an asynchronous
+    # launch ``spec_decode_num_drafts_total`` moves whether or not a real
+    # draft was ever verified. What cannot move without real speculation is
+    # the accepted count.
+    assert solo_delta.accepted > 0, "a lone request never had a draft accepted"
+    assert solo_delta.mean_acceptance_length > 1.0
     assert resumed.steps > 0, "the long request finished before its peer"
-    assert resumed.drafts > 0, "speculation never resumed after the peer left"
+    assert resumed.accepted > 0, "speculation never resumed after the peer left"
 
 
 def test_the_asynchronous_output_is_the_rule_s_own_sequence(
@@ -222,9 +231,13 @@ def test_the_asynchronous_output_is_the_rule_s_own_sequence(
 
     ids = result.token_ids
     assert len(ids) >= MAX_TOKENS - spec_config.k
-    expected = []
-    token, position = prompt[-1], len(prompt) - 1
-    for _ in range(len(ids)):
+    # The first emitted token is the prefill's, and this model answers a
+    # prefill the way its base class does, with zero logits whose argmax is
+    # token 0. Every token after it is the rule applied to the one before,
+    # starting at the position that token occupies.
+    expected = [0]
+    token, position = 0, len(prompt)
+    while len(expected) < len(ids):
         token = (token * 31 + position * 7 + 11) % DUMMY_VOCAB_SIZE
         position += 1
         expected.append(token)
