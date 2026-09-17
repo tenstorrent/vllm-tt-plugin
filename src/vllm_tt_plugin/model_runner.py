@@ -76,6 +76,7 @@ from vllm_tt_plugin.spec_decode import (
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     SPEC_REQUIREMENT_HIDDEN_FEED,
+    SPEC_REQUIREMENTS,
     DraftOutput,
     accept_greedy_drafts,
     normalize_declared_values,
@@ -415,16 +416,30 @@ class TTModelRunner:
         it through the runner would then be asked to draft from nothing, so for
         that one pairing the step stays a verify and the launch keeps the
         ordinary decode's overlap only where it can serve it. A drafter that
-        needs no hidden feed, or one that keeps its own state on device, is
+        declares no hidden feed, or one that keeps its own state on device, is
         unaffected.
+
+        Read from what the model declares rather than from what the method
+        requires, because this is a property of the drafter: the model-owned
+        method demands only that the model propose, and what its drafter reads
+        is the model's own statement.
 
         Decided here rather than at step time: the alternative is handing that
         drafter ``None`` and hoping, which is the silent degradation this
         contract refuses everywhere else.
         """
-        if self._spec_method is None:
+        if not self._spec_drafts_from_model:
+            # A host proposer reads the request's own text and is handed no
+            # hidden state, so nothing here constrains it.
             return True
-        if SPEC_REQUIREMENT_HIDDEN_FEED not in method_requirements(self._spec_method):
+        declared_requirements = normalize_declared_values(
+            (getattr(type(self.model), "model_capabilities", None) or {}).get(
+                "spec_requirements"
+            ),
+            SPEC_REQUIREMENTS,
+            f"{type(self.model).__name__} model_capabilities['spec_requirements']",
+        )
+        if SPEC_REQUIREMENT_HIDDEN_FEED not in declared_requirements:
             return True
         declared = normalize_declared_values(
             (getattr(type(self.model), "model_capabilities", None) or {}).get(
