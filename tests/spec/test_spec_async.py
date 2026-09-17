@@ -49,6 +49,10 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    set_tt_forced_reset_discard_counts,
+)
 
 from .deterministic_target import (
     TARGET_VOCAB_SIZE,
@@ -88,6 +92,22 @@ class DeferredVerifyTarget(DeterministicTarget):
         self.reads = 0
         self.propose_calls: list[object] = []
         self.verify_hidden: object | None = None
+        self.wait_failure: BaseException | None = None
+        self._propose_failure: BaseException | None = None
+
+    def fail_the_readback(self, error: BaseException) -> None:
+        """Make the wait for this step's completion raise.
+
+        Where the deferral actually is: ``read_decode_output`` runs when the
+        step is submitted, and what happens later is the wait on the events it
+        returned. A failure raised there is a readback failure; one raised in
+        the hook would be a submission failure.
+        """
+        self.wait_failure = error
+
+    def fail_next_propose(self, error: BaseException) -> None:
+        """Make the next proposal raise, the way a device error would."""
+        self._propose_failure = error
 
     def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):
         """The rule's own answer, with a fresh hidden handle on each verify.
@@ -126,6 +146,9 @@ class DeferredVerifyTarget(DeterministicTarget):
         """
         from vllm_tt_plugin.spec_decode import DraftOutput
 
+        if self._propose_failure is not None:
+            error, self._propose_failure = self._propose_failure, None
+            raise error
         if hidden is not self.verify_hidden:
             raise AssertionError(
                 "propose_draft_tokens received a hidden handle that is not the "
@@ -146,6 +169,9 @@ class DeferredVerifyTarget(DeterministicTarget):
         """Make the oldest outstanding verify readable."""
         buffer, answer, event = self.pending.pop(0)
         buffer.copy_(answer)
+        if self.wait_failure is not None:
+            event.tt_test_failure = self.wait_failure
+            self.wait_failure = None
         event.set()
 
     @property
@@ -162,9 +188,15 @@ def wait_for_released_reads(monkeypatch):
     handing a Python event to a device.
     """
 
+    waits: list[threading.Event] = []
+
     def event_synchronize(event):
         if isinstance(event, threading.Event):
             assert event.wait(timeout=30), "a held verify was never released"
+            waits.append(event)
+            failure = getattr(event, "tt_test_failure", None)
+            if failure is not None:
+                raise failure
             return
         raise AssertionError(f"unexpected event {event!r}")
 
@@ -289,6 +321,7 @@ def _scheduler_output(
     decoding=(),
     finished=(),
     preempted=(),
+    resumed=(),
     drafts=None,
 ) -> SchedulerOutput:
     output = SchedulerOutput.make_empty()
@@ -296,10 +329,15 @@ def _scheduler_output(
     scheduled = [req_id for req_id, _ in new] + list(decoding)
     output.scheduled_cached_reqs = CachedRequestData(
         req_ids=list(decoding),
-        resumed_req_ids=set(),
+        resumed_req_ids=set(resumed),
         new_token_ids=[[] for _ in decoding],
         all_token_ids={},
-        new_block_ids=[None for _ in decoding],
+        # A resumed request carries fresh blocks, which
+        # ``apply_cached_req_state_update`` requires of a resume: the scheduler
+        # freed the request's blocks when it preempted it.
+        new_block_ids=[
+            ([1],) if req_id in set(resumed) else None for req_id in decoding
+        ],
         num_computed_tokens=[_computed_tokens(runner, req_id) for req_id in decoding],
         num_output_tokens=[
             len(runner.requests[req_id].output_token_ids) for req_id in decoding
@@ -342,7 +380,15 @@ def _submit_step(runner, *req_ids, drafts=None):
     return wrapper
 
 
-def _drain(runner, *req_ids, finished=(), preempted=()):
+def _drain(
+    runner,
+    *req_ids,
+    new=(),
+    finished=(),
+    preempted=(),
+    resumed=(),
+    forced_reset=None,
+):
     """The next step's start, where the engine thread applies what completed.
 
     The two calls ``build_model_input`` makes before it builds anything:
@@ -352,14 +398,23 @@ def _drain(runner, *req_ids, finished=(), preempted=()):
     counts a real scheduler output would carry.
     """
     scheduler_output = _scheduler_output(
-        runner, decoding=req_ids, finished=finished, preempted=preempted
+        runner,
+        new=new,
+        decoding=req_ids,
+        finished=finished,
+        preempted=preempted,
+        resumed=resumed,
     )
+    if forced_reset:
+        set_tt_forced_reset_discard_counts(scheduler_output, forced_reset)
     runner._update_states(scheduler_output)
     runner.async_decode.apply_ready_completed_decode_steps(
         suppress_output_req_ids=runner.async_decode.suppressed_output_req_ids(
             scheduler_output
         ),
-        forced_reset_discard_counts=None,
+        forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+            scheduler_output
+        ),
     )
 
 
@@ -742,3 +797,388 @@ def test_the_async_path_emits_exactly_what_ordinary_decoding_would(case):
 
 
 # endregion Output equality through the async path
+
+
+# region Adverse ordering
+
+
+def test_a_condensed_row_takes_its_own_late_result():
+    """A row that moved while its result was outstanding still gets it.
+
+    The step carries the row order it was built with. Between the submission
+    and the commit, ``_update_states`` removes the finished request and
+    ``InputBatch.condense`` slides the survivor down into the freed row, so the
+    row a request occupied when the verify ran is not the row it occupies when
+    the commit writes. The commit resolves each row through
+    ``req_id_to_index``, and this is what says so: a commit that trusted the
+    step's own row index would write the survivor's tokens into a row it no
+    longer owns.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11), ("b", 41))
+    assert runner.input_batch.req_id_to_index == {"a": 0, "b": 1}
+    expected_b = continuation(*_tail(runner, "b"), DRAFT_LEN + 1)
+
+    wrapper = _submit_step(
+        runner,
+        "a",
+        "b",
+        drafts={
+            "a": _accept_everything(runner, "a"),
+            "b": _accept_everything(runner, "b"),
+        },
+    )
+    model.release()
+    wrapper.get_output()
+    # "a" finishes while the result is outstanding, so the drain removes it and
+    # condense moves "b" into row 0 before the commit runs.
+    _drain(runner, "b", finished=["a"])
+
+    assert runner.input_batch.req_id_to_index == {"b": 0}, "condense did not move it"
+    row = runner.input_batch.req_id_to_index["b"]
+    length = int(runner.input_batch.num_tokens[row])
+    committed = runner.input_batch.token_ids_cpu[
+        row, length - len(expected_b) : length
+    ].tolist()
+    assert committed == expected_b
+    assert runner.requests["b"].output_token_ids == expected_b
+
+
+def test_a_late_result_does_not_revive_a_preempted_candidate_state():
+    """Preemption takes the state the late result would name, then a replay.
+
+    Two halves of one late result, and they are treated differently on
+    purpose. The accepted tokens are kept: the engine has them, an ordinary
+    preemption is not a cancellation, and the resume restores the request from
+    this history. The candidate state they named is not: ``_update_states``
+    released the request's device state slot and its row when it preempted the
+    request, so an accepted count recorded here would tell the next verify to
+    select a slot the model no longer holds, and a draft proposed here would
+    continue it.
+
+    Only the asynchronous path can reach this. On the synchronous path the
+    commit runs inside the step, before any preemption reaches the runner.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11))
+    runner._req_state_slot["a"] = 0
+    expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)
+
+    wrapper = _submit_step(runner, "a", drafts={"a": expected[:DRAFT_LEN]})
+    model.release()
+    wrapper.get_output()
+    _drain(runner, preempted=["a"])
+
+    assert "a" in runner.requests, "a preempted request keeps its cached state"
+    assert runner.requests["a"].output_token_ids == expected, (
+        "an ordinary preemption keeps the accepted tokens: the engine has them"
+    )
+    assert "a" not in runner.input_batch.req_id_to_index
+    assert "a" not in runner._req_state_slot
+    assert "a" not in runner._req_accepted_counts, (
+        "the late commit recorded a candidate state the preemption released"
+    )
+    assert "a" not in runner._proposed_draft_token_ids, (
+        "the late commit drafted a continuation of state that is gone"
+    )
+
+    # The resume: fresh blocks, and the row comes back. It speculates again,
+    # from the history the preemption kept.
+    runner._update_states(_scheduler_output(runner, decoding=["a"], resumed=["a"]))
+    assert "a" in runner.input_batch.req_id_to_index
+
+    next_expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)
+    wrapper = _submit_step(runner, "a", drafts={"a": next_expected[:DRAFT_LEN]})
+    model.release()
+    output = wrapper.get_output()
+    _drain(runner, "a")
+
+    assert output.sampled_token_ids[0] == next_expected
+    assert runner.requests["a"].output_token_ids == expected + next_expected
+
+
+def test_one_step_commits_zero_partial_and_full_acceptance_apart():
+    """Three rows, three acceptance outcomes, three histories, one step.
+
+    Every other acceptance case here runs one row at a time, which cannot
+    catch a walk that mixes rows: the same accepted count applied to every row
+    passes a single-row test. Each row starts from a different prompt and is
+    offered drafts that are wrong at a different position, so a row taking
+    another row's count or another row's tokens fails.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("none", 11), ("part", 41), ("full", 71))
+
+    truth = {
+        req_id: continuation(*_tail(runner, req_id), DRAFT_LEN + 1)
+        for req_id in ("none", "part", "full")
+    }
+    offered = {
+        # Wrong at the first draft, so the row commits the target's own choice
+        # there and stops.
+        "none": [truth["none"][0] + 1] + truth["none"][1:DRAFT_LEN],
+        # Right, then wrong: two tokens commit.
+        "part": [truth["part"][0], truth["part"][1] + 1, truth["part"][2]],
+        "full": truth["full"][:DRAFT_LEN],
+    }
+    expected = {
+        "none": truth["none"][:1],
+        "part": truth["part"][:2],
+        "full": truth["full"],
+    }
+
+    wrapper = _submit_step(runner, "none", "part", "full", drafts=offered)
+    model.release()
+    output = wrapper.get_output()
+    _drain(runner, "none", "part", "full")
+
+    for req_id, tokens in expected.items():
+        row = output.req_id_to_index[req_id]
+        assert output.sampled_token_ids[row] == tokens, req_id
+        assert runner.requests[req_id].output_token_ids == tokens, req_id
+        assert runner._req_accepted_counts[req_id] == len(tokens), req_id
+
+
+def test_each_step_proposes_from_its_own_hidden_handle():
+    """The handle the drafter receives belongs to the step being committed.
+
+    The runner holds a handle per outstanding step, not one field per runner.
+    Two steps in a row therefore have to reach the drafter with two different
+    handles, each the one its own verify returned. ``DeferredVerifyTarget``
+    raises if it is handed a handle it did not produce, so a runner that kept
+    the first step's handle would fail on the second step rather than commit a
+    wrong token.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11))
+
+    handles = []
+    for _ in range(2):
+        wrapper = _submit_step(
+            runner, "a", drafts={"a": _accept_everything(runner, "a")}
+        )
+        model.release()
+        wrapper.get_output()
+        handles.append(runner._completed_decode_steps[0].spec_hidden)
+        _drain(runner, "a")
+
+    assert len(model.propose_calls) == 2
+    assert handles[0] is not handles[1], "both steps carried one handle"
+    assert model.propose_calls == handles, (
+        "a step proposed from a handle that was not its own verify's"
+    )
+
+
+def test_a_failed_readback_is_terminal_and_commits_nothing():
+    """A readback that raises leaves no commit and no pending step.
+
+    The failure is cached as terminal rather than retried, because the
+    submission it belonged to was consumed: a second readback of the same
+    device submission corrupts it. So both callers see the same exception, the
+    device is read once, nothing reaches request state, and the step does not
+    stay pending and block every following build.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11))
+    wrapper = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+
+    failure = RuntimeError("the device read failed")
+    model.fail_the_readback(failure)
+    model.release()
+
+    with pytest.raises(RuntimeError) as first:
+        wrapper.get_output()
+    with pytest.raises(RuntimeError) as second:
+        wrapper.get_output()
+    assert first.value is failure
+    assert second.value is failure, "the failure was not cached as terminal"
+    assert model.reads == 1, "the same submission was read back twice"
+    assert not runner._completed_decode_steps, "a failed step enqueued a commit"
+
+    _drain(runner, "a")
+    assert runner.requests["a"].output_token_ids == []
+    assert not runner._pending_async_steps, (
+        "a failed step stayed pending, so every following build would drain it"
+    )
+
+
+def test_a_failed_proposal_does_not_commit_twice():
+    """A proposal that raises surfaces, and its step is not applied again.
+
+    ``commit_spec_acceptance`` writes the accepted prefix and then asks the
+    model to draft. A drafter that raises leaves the prefix written, which is
+    correct: those tokens were accepted. What must not happen is the same step
+    being applied a second time on a later drain, which would append the
+    prefix twice and corrupt the request's text.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11))
+    expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)
+
+    wrapper = _submit_step(runner, "a", drafts={"a": expected[:DRAFT_LEN]})
+    model.release()
+    wrapper.get_output()
+
+    failure = RuntimeError("the drafter failed")
+    model.fail_next_propose(failure)
+    with pytest.raises(RuntimeError) as raised:
+        _drain(runner, "a")
+    assert raised.value is failure
+
+    assert runner.requests["a"].output_token_ids == expected
+    # The queue was drained before the apply, so the next step cannot replay it.
+    assert not runner._completed_decode_steps
+    _drain(runner, "a")
+    assert runner.requests["a"].output_token_ids == expected, (
+        "the step was applied twice, so the prefix is in the history twice"
+    )
+
+
+def test_a_cancelled_request_s_row_is_taken_before_its_result_is_applied():
+    """The row belongs to someone else by the time the commit runs.
+
+    A cancellation reaches the runner the way a completion does, in
+    ``finished_req_ids``, and the scheduler is free to admit a new request in
+    the same step: ``_update_states`` removes the cancelled request, and the
+    new one takes the row it freed, all before
+    ``apply_ready_completed_decode_steps`` applies the step that was
+    outstanding. So the row named by the completed step now holds a different
+    request's prompt, and the cancelled request's tokens must reach neither it
+    nor the request that is gone.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    _admit(runner, ("a", 11))
+    runner._req_state_slot["a"] = 0
+    wrapper = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+    model.release()
+    wrapper.get_output()
+
+    # One step: "a" is cancelled and "z" takes its row, then the result lands.
+    _drain(runner, new=[("z", 151)], finished=["a"])
+
+    assert "a" not in runner.requests
+    assert runner.input_batch.req_id_to_index == {"z": 0}
+    assert runner.requests["z"].output_token_ids == [], (
+        "the cancelled request's tokens were written into the row it left"
+    )
+    row = runner.input_batch.req_id_to_index["z"]
+    assert int(runner.input_batch.num_tokens[row]) == PROMPT_LEN, (
+        "the new request's row grew by tokens it never generated"
+    )
+    assert "z" not in runner._req_accepted_counts
+    assert "z" not in runner._proposed_draft_token_ids
+
+    # And "z" then speculates from its own prompt tail.
+    expected = continuation(*_tail(runner, "z"), DRAFT_LEN + 1)
+    second = _submit_step(runner, "z", drafts={"z": expected[:DRAFT_LEN]})
+    model.release()
+    output = second.get_output()
+    _drain(runner, "z")
+    assert output.sampled_token_ids[0] == expected
+    assert runner.requests["z"].output_token_ids == expected
+
+
+def test_a_forced_reset_publishes_its_frame_without_applying_it():
+    """The one case where a live request's committed prefix is not written.
+
+    A forced prefix-cache reset calls
+    ``reset_prefix_cache(reset_running_requests=True)``, which preempts live
+    requests, frees their blocks, and records in
+    ``_tt_forced_reset_discard_counts`` how many in-flight results it made
+    stale. vLLM resumes each request from its saved history and discards that
+    many published outputs, so the runner must publish the frame and not apply
+    it: applying it would replay tokens the scheduler has already thrown away,
+    and recording its accepted count would name candidate state the reset
+    destroyed.
+
+    This request keeps its row, which is what separates this case from a
+    cancellation or an ordinary preemption, and is why the skip has to be
+    explicit rather than a consequence of the row being gone.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11))
+
+    wrapper = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+    model.release()
+    output = wrapper.get_output()
+    assert output.sampled_token_ids[0], "the frame has to be published"
+
+    row = runner.input_batch.req_id_to_index["a"]
+    length_before = int(runner.input_batch.num_tokens[row])
+    _drain(runner, "a", forced_reset={"a": 1})
+
+    assert runner.input_batch.req_id_to_index["a"] == row, (
+        "a forced reset keeps the request's row, unlike a cancellation"
+    )
+    assert runner.requests["a"].output_token_ids == [], (
+        "the discarded frame was applied, so these tokens are in the history "
+        "twice: once here and once in what vLLM replays"
+    )
+    assert int(runner.input_batch.num_tokens[row]) == length_before
+    assert "a" not in runner._req_accepted_counts
+    assert "a" not in runner._proposed_draft_token_ids
+
+
+def test_a_condensed_row_is_drafted_against_its_own_remaining_context():
+    """The proposal trims by the row the request holds now, not the step's.
+
+    Two row spaces meet in the proposal. The committed block and the accepted
+    counts are indexed by the step's rows, which is the order the model
+    answered in, while how much context the request has left is a property of
+    the row it occupies now. A completion between the submission and the commit
+    makes ``condense`` slide a request into another row, and the vacated row
+    keeps a stale copy of that request's pre-commit length.
+
+    Here "c" sits at step row 2, moves to row 0 when "a" finishes, and is close
+    enough to ``max_model_len`` that the two readings disagree: its own row
+    leaves room for two more tokens after this commit, the stale copy at row 2
+    leaves room for six. A proposal trimmed by the stale value drafts a third
+    token past the context, which the next verify spends a candidate column on
+    and the commit then drops.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11), ("b", 41), ("c", 71))
+    runner.input_batch.num_tokens[runner.input_batch.req_id_to_index["c"]] = (
+        MAX_MODEL_LEN - DRAFT_LEN - 3
+    )
+
+    wrapper = _submit_step(
+        runner,
+        "a",
+        "b",
+        "c",
+        drafts={req: _accept_everything(runner, req) for req in ("a", "b", "c")},
+    )
+    model.release()
+    wrapper.get_output()
+    _drain(runner, "b", "c", finished=["a"])
+
+    assert runner.input_batch.req_id_to_index == {"c": 0, "b": 1}, (
+        "condense did not move c out of the row its step was built with"
+    )
+    row = runner.input_batch.req_id_to_index["c"]
+    room = MAX_MODEL_LEN - int(runner.input_batch.num_tokens[row])
+    assert room == 2, "the test no longer places c where the two readings differ"
+    assert len(runner._proposed_draft_token_ids["c"]) == room
+    # The row c left still holds its pre-commit length, which is what a
+    # proposal indexed by the step's rows would have read.
+    assert int(runner.input_batch.num_tokens[2]) == MAX_MODEL_LEN - DRAFT_LEN - 3
+    # b did not move and has context to spare, so it keeps the full draft set.
+    assert len(runner._proposed_draft_token_ids["b"]) == DRAFT_LEN
+
+
+# endregion Adverse ordering
