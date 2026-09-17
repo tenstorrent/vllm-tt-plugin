@@ -183,7 +183,11 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
             ascending_prompt(64, start=300),
             max_tokens=long_tokens,
         )
-        time.sleep(0.4)
+        # Short, and it has to be: this model's forward is host arithmetic,
+        # so a step costs about a millisecond and a tenth of a second is a
+        # hundred steps. A longer pause and the long request finishes before
+        # its peer is even posted, leaving nothing to measure.
+        time.sleep(0.02)
         peer = pool.submit(
             spec_server.complete, ascending_prompt(64, start=900), max_tokens=MAX_TOKENS
         )
