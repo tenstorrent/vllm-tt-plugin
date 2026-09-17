@@ -2055,14 +2055,40 @@ class TTPlatform(Platform):
             vllm_config.speculative_config
             and vllm_config.scheduler_config.async_scheduling
         ):
-            raise ValueError(
-                "TT asynchronous scheduling and speculative decoding cannot be "
-                "combined. The verify-then-propose loop runs in the "
-                "synchronous decode tail, so an asynchronous step would return "
-                "the verify's candidate block through the ordinary sampler and "
-                "never walk acceptance. Launch with --no-async-scheduling, or "
-                "drop the speculative flags"
+            # The runner has a deferred speculative path: acceptance is walked
+            # where the readback completes, and the commit and the next
+            # proposal wait for the engine thread. That path places two demands
+            # on a model that supports_async_decode does not cover, because the
+            # decode reload contract was written for a decode committing one
+            # token per forward: read_decode_output is handed a [B, 1+K] verify
+            # whose committed length the host decides after the forward, and
+            # the verify's hidden handle must stay valid across the readback
+            # and until the next step's propose call. Declared separately
+            # rather than derived, so a model already declaring async decode
+            # does not silently acquire obligations it was never written to.
+            supports_async_spec_decode = bool(
+                (model_capabilities or {}).get("supports_async_spec_decode", False)
             )
+            if not supports_async_spec_decode:
+                raise ValueError(
+                    "TT asynchronous scheduling and speculative decoding "
+                    f"cannot be combined for {model_class.__name__}, which "
+                    "does not declare "
+                    "model_capabilities['supports_async_spec_decode']. The "
+                    "deferred speculative path hands read_decode_output a "
+                    "[B, 1+K] verify whose committed length is decided after "
+                    "the forward, and holds the verify's hidden handle across "
+                    "the readback until the next step's propose call; "
+                    "supports_async_decode covers neither. Launch with "
+                    "--no-async-scheduling, or drop the speculative flags"
+                )
+            # Upstream refuses the pairing first for most method names:
+            # ``VllmConfig.__post_init__`` admits asynchronous scheduling only
+            # with EAGLE, MTP, a draft model, NGram GPU or DSpark, and it runs
+            # before this hook. So a launch reaching here already named a
+            # method vLLM allows; ``custom_class``, the plugin's own
+            # model-owned drafter, is not one of them and fails upstream with a
+            # message about supported speculative kinds.
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(
