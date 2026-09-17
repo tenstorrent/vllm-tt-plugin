@@ -340,6 +340,12 @@ class TTAsyncDecodeController:
         self._previous_device_sampling: bool | None = None
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
         self._legacy_contract_warning_emitted = False
+        # How many submissions found a step already outstanding, and how many
+        # of those were not overlap-safe. The second is the serialization
+        # claim: a verify must never be submitted over an outstanding step, so
+        # this stays at zero for the life of the server.
+        self._overlapped_submissions = 0
+        self._overlapped_unsafe_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -615,8 +621,40 @@ class TTAsyncDecodeController:
         overlap_ok: bool,
     ) -> None:
         with self.runner._steady_decode_lock:
+            # Counted here because this is the one place that knows both
+            # facts: whether a step was already outstanding when this one was
+            # submitted, and whether this one is a verify. Nothing else
+            # reports overlap. A launch option does not prove it, a completed
+            # request does not prove it, and per-step wall clock cannot
+            # separate it from a faster model. The device suite reads these off
+            # the log line below and asserts that ordinary steps overlapped
+            # and that no verify ever did.
+            overlapped = bool(self.runner._pending_async_steps)
+            if overlapped:
+                self._overlapped_submissions += 1
+                if not overlap_ok:
+                    self._overlapped_unsafe_submissions += 1
             self.runner._pending_async_steps.append(step)
             self.runner._pending_async_overlap_ok.append(overlap_ok)
+        self._log_overlap_counters()
+
+    def _log_overlap_counters(self) -> None:
+        """Report the overlap counters, rarely enough to be readable.
+
+        Logged rather than exposed as a metric because vLLM's metrics are the
+        engine's and this is the runner's: the step it describes belongs to the
+        worker process, which publishes none of its own. Every power of two, so
+        a long run says what it did without one line per step.
+        """
+        total = self._overlapped_submissions
+        if total == 0 or total & (total - 1):
+            return
+        logger.info(
+            "TT async decode: %d submission(s) overlapped an outstanding step, "
+            "%d of them a step that was not overlap-safe",
+            total,
+            self._overlapped_unsafe_submissions,
+        )
 
     def prune_finished_async_events(self) -> None:
         with self.runner._steady_decode_lock:
@@ -757,9 +795,42 @@ class TTAsyncDecodeController:
                 return True
             if not steady_decode_candidate:
                 return True
-            return any(
+            if any(
                 not overlap_ok for overlap_ok in self.runner._pending_async_overlap_ok
-            )
+            ):
+                return True
+        # And the other direction, which the pending flags cannot express: the
+        # step about to be built may itself be a verify, and a verify's
+        # candidate block starts from each row's last committed token. An
+        # outstanding step holds one of those tokens, so building over it would
+        # verify a block starting one token behind. The flags above say whether
+        # what is pending tolerates company; this says whether what comes next
+        # does.
+        return self._next_step_verifies(scheduler_output)
+
+    def _next_step_verifies(self, scheduler_output: SchedulerOutput | None) -> bool:
+        """Whether the step about to be built will send the model a verify.
+
+        Decided from the scheduler output and the runner's own state, because
+        the persistent batch has not been updated yet when this is asked. It
+        errs towards True: a drain this did not need costs one step's overlap,
+        while a verify built over an outstanding step commits the wrong tokens.
+        """
+        runner = self.runner
+        if not runner._num_speculative_tokens or scheduler_output is None:
+            return False
+        if not runner._pending_async_steps:
+            return False
+        scheduled = scheduler_output.num_scheduled_tokens
+        drafts = scheduler_output.scheduled_spec_decode_tokens
+        for req_id in scheduled:
+            if drafts.get(req_id):
+                return True
+            if runner._proposed_draft_token_ids.get(req_id):
+                return True
+            if runner._req_accepted_counts.get(req_id, 1) > 1:
+                return True
+        return False
 
     def complete_decode_step(
         self,
