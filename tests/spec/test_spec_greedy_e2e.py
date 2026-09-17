@@ -134,6 +134,10 @@ def _runner(
     )
     for name in (
         "_finish_spec_decode",
+        "walk_spec_acceptance",
+        "spec_committed_prefixes",
+        "commit_spec_acceptance",
+        "build_spec_runner_output",
         "_finish_front_packed_sync",
         "_apply_committed_spec_tokens_to_state",
         "_apply_grammar_to_input",
