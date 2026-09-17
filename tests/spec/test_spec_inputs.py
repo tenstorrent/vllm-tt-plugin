@@ -92,17 +92,22 @@ def _fake_runner(
     num_speculative_tokens: int = 3,
     accepted_counts: dict[str, int] | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         input_batch=batch,
         requests=requests,
         _output_tokens_per_step=1,
         _num_speculative_tokens=num_speculative_tokens,
+        # Synchronous harness: the drafts reach the runner through the
+        # scheduler output, which is what ``_drafts_to_verify`` reads when
+        # asynchronous scheduling is off.
+        async_decode_scheduling=False,
         _spec_supports_narrow_decode=supports_narrow_decode,
         # Shared, not copied: a test that watches the runner drop an entry
         # needs to see the same dict the runner mutates.
         _req_accepted_counts=accepted_counts if accepted_counts is not None else {},
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
         _spec_row_state=TTModelRunner._spec_row_state,
+        _proposed_draft_token_ids={},
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -115,6 +120,10 @@ def _fake_runner(
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+    # Bound after construction because it reads runner state: which drafts a
+    # step verifies depends on whether this launch schedules asynchronously.
+    runner._drafts_to_verify = TTModelRunner._drafts_to_verify.__get__(runner)
+    return runner
 
 
 def _drafts(**by_req_id) -> dict[str, list[int]]:

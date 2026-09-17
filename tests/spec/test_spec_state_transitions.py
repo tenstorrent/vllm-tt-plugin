@@ -71,6 +71,10 @@ def _runner() -> SimpleNamespace:
         _output_tokens_per_step=1,
         _is_block_output_model=False,
         _num_speculative_tokens=DRAFT_LEN,
+        # Synchronous harness: the drafts reach the runner through the
+        # scheduler output, which is what ``_drafts_to_verify`` reads when
+        # asynchronous scheduling is off.
+        async_decode_scheduling=False,
         # The drafts come from each test, so no proposer runs.
         _spec_method=None,
         _spec_supports_narrow_decode=False,
