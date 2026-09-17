@@ -775,20 +775,29 @@ class TTScheduler(AsyncScheduler):
         commit against the decision that produced it.
         """
         super()._update_after_schedule(scheduler_output)
-        if self.num_spec_tokens:
+        if self.num_spec_tokens and not self.scheduler_config.async_scheduling:
             # ``AsyncScheduler`` leaves every scheduled request holding
             # ``[-1] * num_spec_tokens``, which upstream's GPU runner
-            # overwrites from its own state in ``_prepare_input_ids``. The TT
-            # runner has no such step: it verifies whatever the scheduler
-            # delivers, so a placeholder surviving here becomes a draft the
-            # accept walk compares against, matches (the model is handed the
-            # same placeholder), and commits as an output token.
+            # overwrites from its own state in ``_prepare_input_ids``. On a
+            # synchronous launch the TT runner has no such step: it verifies
+            # whatever the scheduler delivers, so a placeholder surviving here
+            # becomes a draft the accept walk compares against, matches (the
+            # model is handed the same placeholder), and commits as an output
+            # token.
             #
             # Cleared rather than restored to the ids just scheduled: a
             # proposal is handed over once, so a request whose row proposed
             # nothing this step must speculate on nothing next step rather
             # than replay a spent proposal. Drafts reach a request only
             # through ``update_draft_token_ids``.
+            #
+            # Left standing on an asynchronous launch, because there they are
+            # the only lookahead reservation the request gets: upstream stops
+            # routing drafts through the scheduler (``EngineCore.post_step``
+            # skips ``take_draft_token_ids``), the next schedule budgets
+            # ``1 + len(spec_token_ids)`` positions for the request, and
+            # ``TTModelRunner._drafts_to_verify`` reads the placeholders as
+            # that reservation and verifies the proposal the runner holds.
             for req_id in scheduler_output.num_scheduled_tokens:
                 self.requests[req_id].spec_token_ids = []
         if not self._is_block_output_model:
