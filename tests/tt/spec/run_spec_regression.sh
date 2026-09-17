@@ -92,13 +92,22 @@ run_config() {
     mkdir -p "$dir"
 
     local spec='{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":'"$K"'}'
+    # Device sampling is what any overlapped decode needs: the plugin's
+    # steady-decode fast path refuses a host-sampled step whatever else is
+    # true of it, because the token the next step reads has to be the one the
+    # device wrote. The asynchronous configuration therefore asks for it, and
+    # the others leave it alone so their measurements stay comparable.
+    local tt_config='{"tt": {"register_test_models": true}}'
+    if [ "$async" = "true" ]; then
+        tt_config='{"tt": {"register_test_models": true, "sample_on_device_mode": "decode_only"}}'
+    fi
     local args=(
         --model "$MODEL"
         --tokenizer "$TOKENIZER"
         --max_num_seqs "$max_num_seqs"
         --max_model_len "$max_model_len"
         --port "$PORT"
-        --additional-config '{"tt": {"register_test_models": true}}'
+        --additional-config "$tt_config"
         --speculative-config "$spec"
     )
     # Asynchronous scheduling is upstream's default when nothing objects, and

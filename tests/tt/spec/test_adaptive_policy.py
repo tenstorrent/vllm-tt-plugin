@@ -58,11 +58,10 @@ def test_a_lone_request_is_drafted_for_on_every_step(
     record(requests=[result.request], acceptance=delta.as_dict())
 
     assert result.completion_tokens >= MAX_TOKENS - spec_config.k
-    assert delta.drafts > 0, "a lone request was never drafted for"
-    assert delta.accepted > 0
-    # Every step that drafted offered the whole length: this policy declines by
-    # row, and with one row live there is nothing to decline.
-    assert delta.draft_tokens == delta.drafts * spec_config.k
+    assert delta.accepted > 0, "a lone request never had a draft accepted"
+    # Close to the full width per accepted step: this policy declines by row,
+    # and with one row live there is nothing to decline.
+    assert delta.mean_acceptance_length > 1.0
 
 
 def test_a_batch_is_not_drafted_for(
@@ -100,13 +99,21 @@ def test_a_batch_is_not_drafted_for(
     for result in results:
         assert result.completion_tokens >= MAX_TOKENS - spec_config.k
 
-    # With the drafter declining, a row commits one token per step, so the run
-    # costs about MAX_TOKENS steps per row. A drafter that drafted through the
-    # batch would have verified drafts on most of them.
-    plain_steps_per_row = MAX_TOKENS
-    assert delta.drafts < plain_steps_per_row * rows / 4, (
-        f"the drafter drafted on {delta.drafts} steps of a {rows}-row batch, "
-        "which is not a policy that declines for a batch"
+    # Acceptance rather than the draft counters, because those cannot be read
+    # the same way on both launches: under asynchronous scheduling
+    # ``AsyncScheduler`` gives every scheduled request ``[-1] * K`` as its
+    # lookahead reservation and vLLM counts that as drafts offered, whether or
+    # not a real draft was ever verified. Nothing accepts without a real
+    # draft, so the accepted count is the signal that means the same thing in
+    # both modes.
+    #
+    # A ratio, not a zero: the first request is alone until its peers arrive
+    # and the last is alone again once they finish, so the edges of the run
+    # legitimately speculate. A policy ignoring the batch would accept on
+    # nearly every step of it instead.
+    assert delta.accepted < MAX_TOKENS * rows / 4, (
+        f"{delta.accepted} token(s) were accepted from drafts across a "
+        f"{rows}-row batch, which is not a policy that declines for a batch"
     )
 
 
@@ -131,8 +138,8 @@ def test_speculation_resumes_when_the_batch_empties(
     # margin. It is the faster of the two per step while it speculates,
     # committing 1+K tokens where the peer commits one, so a peer asking for a
     # comparable length would finish second and leave nothing to measure.
-    long_tokens = MAX_TOKENS * 6
-    peer_tokens = 16
+    long_tokens = MAX_TOKENS * 16
+    peer_tokens = MAX_TOKENS
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         long_future = pool.submit(
@@ -162,6 +169,6 @@ def test_speculation_resumes_when_the_batch_empties(
         "the long request finished before its peer, so the window after the "
         "peer left holds no steps to draw a conclusion from"
     )
-    assert after_it_left.drafts > 0, (
+    assert after_it_left.accepted > 0, (
         "the request never speculated again after its peer finished"
     )
