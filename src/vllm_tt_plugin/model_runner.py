@@ -1300,6 +1300,8 @@ class TTModelRunner:
         model_input: TTModelInput,
         hidden: Any,
         row_req_ids: list[str],
+        *,
+        skip_req_ids: set[str] | None = None,
     ) -> None:
         """Ask the model's own drafter for the next step's drafts.
 
@@ -1384,15 +1386,32 @@ class TTModelRunner:
                 "trims the row instead"
             )
         max_model_len = int(self.model_config.max_model_len)
+        skipped = set(skip_req_ids or ())
         for row, req_id in enumerate(row_req_ids):
+            # A row whose committed prefix was not applied has nothing to
+            # continue: a forced prefix-cache reset discards those tokens, and
+            # a draft of what followed them would be verified against the
+            # history vLLM replays instead.
+            if req_id in skipped:
+                continue
             # A row that committed nothing this step proposes nothing: there is
             # no continuation to draft from.
             if int(counts[row]) < 1:
                 continue
+            # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
+            # indexed by the step's rows, which is the order the model answered
+            # in; the persistent batch is indexed by where the request sits
+            # now, and a completion between this step's submission and its
+            # commit makes ``condense`` slide a request into another row. A
+            # request with no row at all was preempted, and drafting for it
+            # would continue a candidate state the preemption released.
+            batch_row = self.input_batch.req_id_to_index.get(req_id)
+            if batch_row is None:
+                continue
             # Trimmed to what the request can still hold, the way the host
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
-            room = max_model_len - int(self.input_batch.num_tokens[row])
+            room = max_model_len - int(self.input_batch.num_tokens[batch_row])
             usable = max(0, min(num_drafts, room))
             if usable:
                 self._proposed_draft_token_ids[req_id] = [
@@ -2378,7 +2397,12 @@ class TTModelRunner:
         )
         if self._spec_drafts_from_model:
             self._propose_model_drafts(
-                committed, counts, model_input, spec_hidden, row_req_ids
+                committed,
+                counts,
+                model_input,
+                spec_hidden,
+                row_req_ids,
+                skip_req_ids=skip_req_ids,
             )
         else:
             self._propose_ngram_drafts(committed_by_req)
@@ -2457,6 +2481,18 @@ class TTModelRunner:
                 output_token_ids.extend(block)
             elif req_state is not None:
                 req_state.output_token_ids.extend(block)
+            if batch_row is None:
+                # Out of the batch but still known, which is an ordinary
+                # preemption: the tokens above are kept, because the engine has
+                # them and the resume restores from this history, but the
+                # candidate state they named is gone. ``_update_states``
+                # released the request's state slot when it preempted the
+                # request, so recording an accepted count or drafting a
+                # continuation here would tell the next verify to select
+                # candidate state the model no longer holds. On the
+                # synchronous path this cannot arise: the commit runs inside
+                # the step, before any preemption reaches the runner.
+                continue
             # The count the next verify reads, which is what selects the
             # candidate state this step left the model holding. Length-capped
             # rows record what they actually committed, never the full count.
