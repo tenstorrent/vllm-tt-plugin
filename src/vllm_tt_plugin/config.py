@@ -189,7 +189,6 @@ _DECODE_INTERLEAVE_PREFILL_STEPS_KEY = "decode_interleave_prefill_steps"
 _DECODE_INTERLEAVE_DECODE_STEPS_KEY = "decode_interleave_decode_steps"
 
 _DECODE_INTERLEAVE_ENABLED_DEFAULT = True
-# docs/SCHEDULING.md records the measurements this default rests on.
 _DECODE_INTERLEAVE_PREFILL_STEPS_DEFAULT = 2
 _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT = 1
 

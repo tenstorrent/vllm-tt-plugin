@@ -63,35 +63,21 @@ class TTDecodeInterleavePolicy:
     """Bounds how many consecutive prefill steps may stall running decodes.
 
     A TT step carries either prefill rows or decode rows, never both, so a
-    prompt that the base scheduler splits into N chunks occupies N consecutive
-    prefill steps and every running decode waits for all of them. The inter-token
-    latency a decode request observes therefore grows with the *other* requests'
-    prompt lengths. Splitting a long prompt does not fix that on its own: the
-    chunks are simply consecutive.
+    prompt split into N chunks occupies N consecutive prefill steps and every
+    running decode waits for all of them. This policy inserts decode-only steps
+    into such a run. ``docs/SCHEDULING.md`` covers why, how the two counts
+    interact, and what the defaults rest on.
 
-    This policy inserts decode-only steps into such a run. It holds two
-    counters and answers one question per step, from state the scheduler
-    already has:
+    Three invariants the code depends on:
 
-    - ``prefill_steps``: how many consecutive prefill steps run before a
-      decode-only step is inserted.
-    - ``decode_steps``: how many decode-only steps one insertion runs before
-      the policy stops choosing decode and a prefill step may run again.
-
-    Both bounds are step counts, not token counts, because the interleave
-    granularity is a whole step. They give a two-sided guarantee: a running
-    decode advances at least once every ``prefill_steps + decode_steps`` steps,
-    and pending prefill work gets a step at least once every
-    ``prefill_steps + decode_steps`` steps, so neither side starves and the
-    policy cannot oscillate faster than that period.
-
-    The policy only ever chooses a decode-only step in place of a prefill step.
-    It never forces prefill: reaching the decode allowance just stops it
-    choosing decode, and whether a prefill step then runs is up to the
-    scheduler and to whether prefill work is pending. The zero-progress
-    fallback that turns a prefill step scheduling no tokens into a decode step
-    is a separate decision; the policy only records the phase that fallback
-    settled on.
+    - Reaching the decode allowance never forces prefill. It only stops the
+      policy choosing decode; whether prefill then runs is up to the scheduler
+      and to whether prefill work is pending.
+    - ``has_running_decode`` must exclude partial-prefill continuations. A
+      decode step cannot advance one, so interleaving on its account trades a
+      productive prefill step for an empty one.
+    - A decode step taken with no prefill pending is an ordinary decode, not
+      part of an insertion, and clears both counters.
     """
 
     def __init__(self, vllm_config: "VllmConfig") -> None:

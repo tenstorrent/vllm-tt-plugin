@@ -220,26 +220,23 @@ has:
 - `decode_interleave_enabled` (default `true`): the off switch, which restores
   the strictly prefill-first policy.
 
-Both bounds are step counts, not token counts, because the interleave
-granularity is a whole step. They give a two-sided guarantee: a running decode
-advances at least once every `prefill_steps + decode_steps` steps, and pending
-prefill work gets a step at least once every `prefill_steps + decode_steps`
-steps. Neither side starves, and the policy cannot oscillate faster than that
-period.
+Both counts are step counts, not token counts, because the interleave
+granularity is a whole step. They bound each side separately: a running decode
+waits at most `decode_interleave_prefill_steps` steps for its next step, and
+pending prefill work waits at most `decode_interleave_decode_steps` steps for
+its next step. Neither side starves.
 
 Four properties keep the policy contained:
 
 - It only ever chooses decode *in place of* prefill. It never forces prefill,
   so it cannot delay a decode that would have run anyway.
-- It only counts a request that a decode step can advance. A partial-prefill
-  continuation does not count: `_schedule_decode_only` hides it, and it samples
-  no token, so inserting a decode step on its account would produce an empty
-  step.
-- The first step of any prefill run is never taken, so a prompt arriving while
-  decodes run gets its prefill step immediately. A decode step taken because
-  nothing was pending is an ordinary decode, not part of an insertion, and
-  clears both counters; counting it would leave the policy part-way through an
-  allowance and cost the next arriving prompt its first prefill step.
+- Only a running decode can be inserted. A partial-prefill continuation is not
+  one: `_schedule_decode_only` hides it and it samples no token, so a step
+  inserted on its account would be empty.
+- It never replaces the first step of a prefill run with a decode. That is what
+  keeps a new prompt's time to first token unaffected: a prompt arriving into
+  steady decode gets its prefill step on the next step, and the policy only
+  fires once a run of prefill steps is already under way.
 - An interleaved step goes through the same `_schedule_decode_only` pass as
   every other decode step, which hides both waiting queues and the partial
   prefills. Only step *ordering* changes, never any per-request state machine,
@@ -271,53 +268,55 @@ when tuning:
 `decode_interleave_decode_steps` therefore does not loosen the bound; it buys
 more decode progress per insertion, and it does so more cheaply than a short
 prefill run does, because the fixed cost of leaving and re-entering decode is
-spread over a longer decode run. Measured on the hardware below, the added
-time to first token per delivered decode token falls from 27.9 ms at 4 prefill
-steps with 1 decode step to 16.1 ms at 2 prefill steps with 4 decode steps.
+spread over a longer decode run. So the time to first token given up per decode
+token delivered falls as `decode_interleave_decode_steps` rises.
 
 One effect is worth knowing because it is not a scheduling effect at all. Under
-async scheduling a step's sampled token is not handed to the client when the
-step finishes; it is handed over when the engine processes that step's output,
-which happens after the *next* step has been submitted. On TT a prefill step is
-a whole synchronous chunk, so an insertion's last decode token reaches the
-client a chunk later than the tokens before it.
+async scheduling a step's sampled token is published once the *next* step has
+been submitted, not when the step itself finishes. Within one insertion, every
+decode token but the last is published as the following decode step is
+submitted, which is immediate. The last one waits for the following prefill
+step to be submitted, and on TT that call runs a whole chunk synchronously, so
+that token is published a chunk later than its siblings.
 
-That spreads an insertion's tokens out in time instead of delivering them
-together, which is why 2 prefill steps with 2 decode steps shows a 532 ms worst
-decode gap where 2 prefill steps with 1 decode step shows 902 ms. The device
-computed the same tokens at the same time in both cases; only the delivery
-times differ. Re-running both with `--no-async-scheduling` removes the effect
-and returns both to 1255 ms, which is what confirms the cause. A block-output
-model runs with `--no-async-scheduling` and would not see the improvement, but
-such a model never runs chunked prefill anyway.
+An insertion's tokens therefore reach the client spread out rather than
+together, which lowers the worst gap a decode request observes for a given
+`decode_interleave_prefill_steps`. The device computed the same tokens at the
+same time either way; only the publish times differ. Running with
+`--no-async-scheduling` removes the effect, which is what confirms the cause. A
+block-output model runs with `--no-async-scheduling` and so does not get it,
+but such a model never runs chunked prefill anyway.
 
-Measured on a T3K (4x n300) with `meta-llama/Llama-3.1-8B-Instruct` at
-`max_num_batched_tokens=2048`, four 16384-token prompts arriving against four
-streaming decodes, median of three reps:
+Turning chunked prefill on can make the worst decode gap *worse* than leaving
+it off, and the interleave is what removes that. Two effects compound, and the
+larger one is not chunking overhead:
 
-| `decode_interleave_prefill_steps` | worst decode gap | median TTFT | output throughput |
-| --- | --- | --- | --- |
-| policy off | 11152 ms | 4338 ms | 138.1 tok/s |
-| 4 | 1603 ms | 4228 ms | 137.3 tok/s |
-| 2 (default) | 899 ms | 4381 ms | 136.4 tok/s |
-| 1 | 523 ms | 4660 ms | 131.5 tok/s |
+- **Contiguity.** With chunked prefill off, `_disable_chunked_prefill` raises
+  `max_num_batched_tokens` to `max_model_len`, so one step can prefill a whole
+  prompt, and several whole prompts if they fit the budget. Prompts that arrive
+  spaced apart then leave gaps in which `_has_pending_prefill` is false and
+  decode steps run, so a decode request waits for one step at a time. Split
+  into chunks, the next prompt arrives before the previous one finishes,
+  pending prefill work never drains, and the runs merge: the decode request
+  waits for *every* queued prefill instead of one. This term grows with the
+  number of prompts whose prefills overlap.
+- **Chunking overhead.** A prompt split across steps costs more total prefill
+  time than the same prompt in one step. One contributor is padding:
+  `get_padded_prefill_len` in tt-metal rounds a chunk up to 128, to 1024, or to
+  the next power of two, so a chunk size that is not already such a length runs
+  padded work every step. This term is the smaller of the two.
 
-The same run with chunked prefill switched off entirely gives a 1853 ms worst
-decode gap, so at this token budget a run of prefill chunks makes the worst
-case six times worse than not splitting the prompt at all, and the default
-setting brings it two times below the unsplit figure. The benefit is
-proportional to how long the run of consecutive prefill steps actually is: at
-`max_num_batched_tokens=8192` the same arrival pattern never queues more than
-two chunks, and the policy then changes the worst gap by about one percent.
+The interleave attacks the first term, which is why it recovers more than
+chunking costs. The benefit is proportional to how long the run of consecutive
+prefill steps actually is, so at a token budget large enough that a prompt is
+one or two chunks and the queue drains between arrivals, the policy changes
+very little.
 
-Sweeping both counts on the same workload gives three settings worth knowing,
-written here as prefill steps / decode steps:
-
-| goal | setting | worst decode gap | median TTFT vs policy off |
-| --- | --- | --- | --- |
-| time to first token first | 4 / 1 | 1604 ms | -2.3% |
-| balanced, the default | 2 / 1 | 902 ms | +1.3% |
-| inter-token latency first | 2 / 2 | 532 ms | +5.9% |
+`decode_interleave_prefill_steps` is the knob to reach for: raise it to favour
+time to first token, lower it to favour inter-token latency, and raise
+`decode_interleave_decode_steps` to buy decode progress within a chosen bound.
+The measurements the defaults rest on are in the pull request that introduced
+this policy.
 
 In single-process lane-DP, decode interleaving is decided jointly for all
 lanes: `TTLaneCoordinator` holds one policy and `_negotiate_forced_mode`

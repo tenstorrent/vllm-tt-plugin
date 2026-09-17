@@ -173,13 +173,8 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     scheduler_config.long_prefill_token_threshold = 0
 
 
-def _report_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
-    """Validate the decode-interleave settings and log the resolved policy.
-
-    Called for its raising side effect too: an invalid ``decode_interleave_*``
-    value must fail at config time, not at the first scheduler step in a worker
-    subprocess. The log line is the only external signal of the active policy.
-    """
+def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
+    """Fail here rather than at the first scheduler step in a worker subprocess."""
     enabled, prefill_steps, decode_steps = get_tt_decode_interleave_config(vllm_config)
     if not enabled:
         logger.info(
@@ -1624,7 +1619,7 @@ class TTPlatform(Platform):
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
-        _report_decode_interleave_policy(vllm_config)
+        _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         is_block_output_model = is_tt_block_output_model(vllm_config)
