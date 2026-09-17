@@ -249,6 +249,27 @@ class TTScheduler(AsyncScheduler):
             self.vllm_config
         )
         if self._is_block_output_model:
+            # KV pages for the WHOLE step, not just the one token upstream
+            # counts. A block-output decode runs several internal verify
+            # iterations against vLLM-owned KV before it returns, and those
+            # iterations write past the position upstream allocated for:
+            # schedule() calls allocate_slots with num_lookahead_tokens, which
+            # is 0 here because there is no vLLM speculative_config, and
+            # raising Request.num_output_placeholders afterwards accounts for
+            # pending OUTPUT tokens without allocating anything. The model's
+            # refresh_page_tables then pads the missing columns with zero and
+            # the verify reads and writes the null block.
+            #
+            # Reserved as twice the emitted width: the committed block, plus
+            # headroom for the final iteration's verify positions and for
+            # accepted tokens carried past the emitted width. Both are bounded
+            # by the packed-verify width, which is far below the block width
+            # (6 against 64 at the shipped default), so this is generous and
+            # costs a page or two per request.
+            self.num_lookahead_tokens = max(
+                int(getattr(self, "num_lookahead_tokens", 0) or 0),
+                2 * int(self._output_tokens_per_step),
+            )
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "
                 "one sampled-token placeholder"

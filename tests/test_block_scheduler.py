@@ -1319,3 +1319,62 @@ def test_adaptive_frontier_is_measured_on_the_replayed_length():
         solo=True,
     )
     assert scheduler._spec_session_owner is None
+
+
+# ── KV pages must cover the whole adaptive block, not just one token ─────────
+
+
+def test_block_output_reserves_lookahead_for_the_whole_block():
+    """A block-output decode writes past the position upstream allocated for.
+
+    schedule() calls allocate_slots with num_lookahead_tokens, which is 0
+    without a vLLM speculative_config, and raising num_output_placeholders
+    afterwards accounts for pending output tokens without allocating pages.
+    The model then runs several verify iterations against vLLM-owned KV and
+    refresh_page_tables pads the missing columns with zero, so the verify
+    reads and writes the null block.
+    """
+    sched = _scheduler(output_width=CANVAS)
+    assert sched.num_lookahead_tokens >= CANVAS, (
+        "lookahead must cover at least the emitted block width"
+    )
+    assert sched.num_lookahead_tokens == 2 * CANVAS
+
+
+def test_adaptive_block_reserves_the_same_lookahead():
+    sched = _scheduler(output_width=CANVAS, adaptive=True, max_num_seqs=4)
+    assert sched.num_lookahead_tokens == 2 * CANVAS
+
+
+def test_allocate_slots_is_asked_for_the_block_footprint(monkeypatch):
+    """Victor's step 1, asserted where it happens.
+
+    schedule() passes num_lookahead_tokens straight to allocate_slots. With no
+    vLLM speculative_config that value is 0, so the first decode after prefill
+    reserves for ONE token while the step goes on to commit a whole block and
+    verify past it. Spying on the call is what discriminates: checking the
+    resulting page count does not, because the prefill already covers this
+    range and the shortfall only appears at a later page crossing.
+    """
+    sched = _scheduler(output_width=CANVAS, adaptive=True, max_num_seqs=4)
+    seen: list[int] = []
+    real = sched.kv_cache_manager.allocate_slots
+
+    def spy(request, num_new_tokens, *a, **k):
+        seen.append(int(k.get("num_lookahead_tokens", 0) or 0))
+        return real(request, num_new_tokens, *a, **k)
+
+    monkeypatch.setattr(sched.kv_cache_manager, "allocate_slots", spy)
+
+    req = _request(max_tokens=4 * CANVAS)
+    sched.add_request(req)
+    out = sched.schedule()  # prefill
+    sched.update_from_output(out, _runner_output(out, [1]))
+    seen.clear()
+    sched.schedule()  # first decode: this is the call that under-reserved
+
+    assert seen, "the first decode must allocate"
+    assert max(seen) >= CANVAS, (
+        f"allocate_slots asked for lookahead {seen}, but one block step commits "
+        f"CANVAS={CANVAS} tokens and verifies past them"
+    )
