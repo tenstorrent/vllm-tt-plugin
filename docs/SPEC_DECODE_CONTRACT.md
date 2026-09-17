@@ -26,6 +26,10 @@ boundary. What runs:
   request: the accept walk compares token ids and never sees logits, so it
   cannot arbitrate any of those, and answering greedily anyway would change
   what was asked for without saying so.
+- **ordinary decode steps inside a speculating launch**, for a model
+  declaring `supports_narrow_decode`: a step with nothing to verify is sent as
+  that model's own decode call and can overlap, so configuring speculation does
+  not cost a server its asynchronous batched decoding. Section 4d.
 - both decode tails. The **synchronous** tail accepts and commits inside the
   step. The **asynchronous** tail defers: acceptance is walked where the
   readback completes, and the commit and the next proposal run on the engine
@@ -145,28 +149,30 @@ drafted for.
 
 ### The two call shapes
 
-A model that does not declare `supports_narrow_decode` only ever sees the wide
-call. One that does sees the narrow one on a step where no row carries a draft.
+A model that does not declare `supports_narrow_decode` sees the verify call on
+every decode step of a speculating launch, including a step where no row
+carries a draft: that step's `num_valid_drafts` is 0 on every row and its
+verify commits one token per row.
 
-| | wide call | narrow call |
+A model that declares `supports_narrow_decode` also serves its **own ordinary
+decode call** inside a speculating launch, and a step with nothing to verify is
+sent as exactly that: no `spec_mode`, neither side tensor, and the sampling
+path a non-speculating launch uses. So such a model implements two calls and no
+third shape, and section 4d explains which steps take which.
+
+| | verify call | ordinary decode call |
 | --- | --- | --- |
 | `tokens` | `[B, 1+K]` int32 | `[B, 1]` int32 |
 | `start_pos` | `[B, 1+K]` int32 | `[B]` int32, 1-D |
-| `draft_token_ids` | `[B, K]` int32 | `[B, K]` int32, every entry padding |
-| `num_valid_drafts` | `[B]` int32 | `[B]` int32, every entry 0 |
-| `accepted_counts` | `[B]` int32 | `[B]` int32 |
-| `spec_mode` | present | present |
-| return | `VerifyOutput`, `argmax_ids` `[B, 1+K]` | `VerifyOutput`, `argmax_ids` `[B, 1]` |
+| `num_valid_drafts` | `[B]` int32 | absent |
+| `accepted_counts` | `[B]` int32 | absent |
+| `spec_mode` | present | absent |
+| `sampling_params` | present when the launch samples on device | present when the launch samples on device |
+| return | `VerifyOutput`, `argmax_ids` `[B, 1+K]` | whatever this model's decode already returns |
 
-The narrow call is the ordinary decode call: its `tokens` and `start_pos` are
-exactly the shapes a non-speculating decode sends, so a model that declares it
-implements no third shape. Both `[B]` side tensors still come with it, because
-`accepted_counts` is how a model picks the candidate state slot its previous
-step committed from whatever this step's width is.
-
-Its return carries one column, which is that step's committed token, and the
-runner reads it with an accepted count of 1. `SpecPlan.block_width` describes
-the wide call only.
+The three speculative arguments arrive together or not at all, so their
+absence is what makes a call the ordinary one. `SpecPlan.block_width`
+describes the verify call only.
 
 ## 4a. The verify call
 
@@ -241,9 +247,11 @@ the runner cannot tell that from a real draft and would verify it. Each count
 is checked for dtype, shape and the range `[0, K]` before any of it is used.
 
 The call has one shape. A model that also declares `supports_narrow_decode`
-still receives `[B, 1+K]` here after a narrow verify, with the columns past
-each row's `accepted_counts` padded, exactly as a row that accepted less than
-the full width looks after a wide verify.
+still receives `[B, 1+K]` here after an ordinary decode step, with the columns
+past each row's `accepted_counts` padded, exactly as a row that accepted less
+than the full width looks after a verify. After such a step `hidden` is `None`,
+which is why that path is closed to a drafter needing a fed hidden state: see
+section 4d.
 
 `hidden` is whatever this step's own `VerifyOutput.hidden` carried, handed back
 without being interpreted. A model that needs none returns none and receives
@@ -293,6 +301,48 @@ forward. A model can satisfy every one of them for an ordinary decode and be
 wrong for a deferred verify, which is why this is a separate declaration
 rather than the conjunction of the two existing ones. Deriving it would
 enlarge what a model that already declares `supports_async_decode` promised.
+
+## 4d. Which steps verify, and which are ordinary decodes
+
+Only for a model declaring `supports_narrow_decode`; for any other, every
+decode step of a speculating launch is a verify. A step is a verify when
+either of these holds, and an ordinary decode when neither does:
+
+1. **Some row carries a draft.** There is something to verify.
+2. **Some row's previous step committed more than one token.**
+   `accepted_counts` is how a model finds which candidate state slot that
+   commit landed on, so the step after such a commit carries the count even
+   when it drafts nothing. One step resolves it, because that step commits a
+   single token and records a count of 1, so leaving speculation costs exactly
+   one verify.
+
+This is what keeps ordinary batched decoding overlapped inside a server with
+speculation configured. A verify is never overlap-safe: the next candidate
+block is built from its committed tokens, so the runner drains it before
+building the next step. An ordinary decode is overlap-safe under the conditions
+that already govern every other decode, chiefly that the launch samples on
+device. A model whose drafter declines to draft for a batched step therefore
+gets the same asynchronous behavior a non-speculating launch would have, one
+resolving verify aside.
+
+Two obligations come with the declaration.
+
+**The drafter is still asked, after an ordinary decode too.** The proposer is
+called once per step, so a launch that skipped it on these steps would never
+draft again whatever the batch did afterwards. The committed block is one
+column wide, that column being the token the step committed, every
+`accepted_counts` is 1, and the runner pads the block to the uniform `1+K`
+before the call, so the drafter sees one shape. On an asynchronous launch this
+runs at the next step's drain, because the drafts continue a token that had to
+be read back first, so a drafter that starts offering again is acted on one
+step later.
+
+**The drafter must not need a fed hidden state.** An ordinary decode returns no
+`VerifyOutput`, so it produces no hidden handle, and `propose_draft_tokens`
+receives `None` after one. A model requiring `hidden_feed` and declaring
+`spec_hidden_handoff: ["roundtrip"]` is therefore kept off this path entirely:
+the plugin logs the reason when it loads the model and keeps every step a
+verify. A drafter that keeps its state on device, or needs none, is unaffected.
 
 ## 5. What a verify returns, column by column
 

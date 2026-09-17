@@ -126,6 +126,10 @@ class CompletedDecodeStep:
     context: SubmittedStepContext
     completion_time_ns: int
     runner_output: ModelRunnerOutput | None = None
+    # Kept for a speculating launch only, whose draftless decode steps owe the
+    # next proposal at their commit: the drafter is called with this step's own
+    # rows and positions, and the commit runs a step later than the build.
+    model_input: TTModelInput | None = None
 
 
 @dataclass
@@ -795,6 +799,7 @@ class TTAsyncDecodeController:
             logprobs=logprobs,
             context=context,
             completion_time_ns=time.perf_counter_ns(),
+            model_input=model_input,
         )
 
     def complete_spec_decode_step(
@@ -891,6 +896,18 @@ class TTAsyncDecodeController:
             req_ids=completed.context.req_ids,
             skip_req_ids=skipped_state,
         )
+        if self.runner._num_speculative_tokens and completed.model_input is not None:
+            # A speculating launch's draftless decode step is an ordinary step
+            # in every way but one: the proposer is asked once per step, so
+            # this step owes the next proposal or the launch never drafts
+            # again. It runs here, a step after the submission, because the
+            # drafts continue the token that just came back.
+            self.runner.propose_after_plain_step(
+                completed.model_input,
+                completed.sampled_token_ids,
+                completed.context.req_ids,
+                skip_req_ids=skipped_state,
+            )
 
     def submit_async_decode(
         self,
@@ -912,9 +929,11 @@ class TTAsyncDecodeController:
             # A speculative step resolves through the accept walk, not the
             # sampler. It is never overlap-safe: the next candidate block is
             # built from this step's committed tokens, so the build has to wait
-            # for this commit. ``can_use_steady_decode_fast_path`` already
-            # refuses it (a verify performs no device sampling); passing False
-            # here says so rather than relying on that.
+            # for this commit. This is the only thing that says so:
+            # ``check_perform_device_sampling`` does not look at speculation,
+            # so on a launch that samples on device a verify reaches
+            # ``can_use_steady_decode_fast_path`` with every condition met and
+            # comes back eligible.
             step = AsyncTTSpecDecodeOutput(
                 controller=self,
                 submission=submission,

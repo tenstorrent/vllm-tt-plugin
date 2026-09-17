@@ -93,6 +93,8 @@ class DeferredVerifyTarget(DeterministicTarget):
         self.propose_calls: list[object] = []
         self.verify_hidden: object | None = None
         self.wait_failure: BaseException | None = None
+        self.adaptive = False
+        self.device_sampled_calls = 0
         self._propose_failure: BaseException | None = None
 
     def fail_the_readback(self, error: BaseException) -> None:
@@ -116,6 +118,16 @@ class DeferredVerifyTarget(DeterministicTarget):
         distinct object per verify so that a runner holding the wrong step's
         handle is a failure rather than a coincidence.
         """
+        if spec_mode is None and kwargs.get("sampling_params") is not None:
+            # Device sampling, which is what the plugin requires before it
+            # overlaps a decode at all: the model returns the chosen ids, not
+            # logits for a host sampler to argmax.
+            self.device_sampled_calls += 1
+            self.plain_calls += 1
+            rows = int(tokens.shape[0])
+            positions = start_pos.reshape(rows, -1)[:, :1]
+            choice = self._choice(tokens.reshape(rows, -1)[:, :1], positions)
+            return choice.reshape(rows).to(torch.int32)
         out = super().decode_forward(tokens, start_pos, spec_mode=spec_mode, **kwargs)
         if spec_mode is None:
             return out
@@ -128,6 +140,24 @@ class DeferredVerifyTarget(DeterministicTarget):
         event = threading.Event()
         self.pending.append((buffer, tt_out.clone(), event))
         return buffer, [event]
+
+    def offer_drafts_only_when_solo(self) -> None:
+        """Draft for a lone request and for nobody else.
+
+        Ashai's workload in miniature: speculation is worth it for a solo
+        request and not for a batch, so the model offers ``K`` drafts when one
+        request is live and none when more are. Live requests are counted from
+        the committed positions, because the rows are padded to the wire width
+        and a padding row is not a request.
+
+        This mode also stops requiring a hidden handle, and that is not a
+        detail. A step with nothing to verify returns no ``VerifyOutput`` and
+        so produces no handle, so a drafter that is fed its target hidden state
+        through the runner cannot be asked to draft after one. A model wanting
+        drafts on both kinds of step therefore drafts from the committed block
+        alone, which is all this one's arithmetic needs.
+        """
+        self.adaptive = True
 
     def propose_draft_tokens(
         self,
@@ -149,12 +179,23 @@ class DeferredVerifyTarget(DeterministicTarget):
         if self._propose_failure is not None:
             error, self._propose_failure = self._propose_failure, None
             raise error
-        if hidden is not self.verify_hidden:
+        if self.adaptive and hidden is None:
+            # A step that verified nothing, in the mode that requires no
+            # hidden feed. Nothing to check, and nothing missing.
+            pass
+        elif hidden is not self.verify_hidden:
             raise AssertionError(
                 "propose_draft_tokens received a hidden handle that is not the "
                 "one this model's verify returned"
             )
         self.propose_calls.append(hidden)
+        rows = int(committed_tokens.shape[0])
+        offered = None
+        if self.adaptive:
+            live = int((committed_positions[:, 0] >= 0).sum())
+            offered = torch.full(
+                (rows,), num_drafts if live == 1 else 0, dtype=torch.int32
+            )
         index = (accepted_counts.to(torch.int64) - 1).unsqueeze(1)
         token = committed_tokens.to(torch.int64).gather(1, index)
         position = committed_positions.to(torch.int64).gather(1, index)
@@ -163,7 +204,10 @@ class DeferredVerifyTarget(DeterministicTarget):
             token = self._choice(token, position).to(torch.int64)
             position = position + 1
             columns.append(token)
-        return DraftOutput(draft_token_ids=torch.cat(columns, dim=1).to(torch.int32))
+        return DraftOutput(
+            draft_token_ids=torch.cat(columns, dim=1).to(torch.int32),
+            num_valid=offered,
+        )
 
     def release(self) -> None:
         """Make the oldest outstanding verify readable."""
@@ -254,7 +298,11 @@ def _runner(model: DeferredVerifyTarget) -> SimpleNamespace:
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         model_config=SimpleNamespace(
-            is_multimodal_model=False, max_model_len=MAX_MODEL_LEN
+            is_multimodal_model=False,
+            max_model_len=MAX_MODEL_LEN,
+            # Read by the steady-decode predicate: a launch carrying logits
+            # processors samples on the host whatever else is true of it.
+            logits_processors=None,
         ),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
@@ -416,6 +464,55 @@ def _drain(
             scheduler_output
         ),
     )
+
+
+def _baseline_runner(model: DeferredVerifyTarget) -> SimpleNamespace:
+    """A runner that can overlap: device sampling, and narrow steps allowed.
+
+    Two settings away from ``_runner``, and both are what the plugin already
+    requires of any overlapped decode. It samples on device, because
+    ``can_use_steady_decode_fast_path`` refuses a host-sampled step whatever
+    else is true of it. And the model declares that it serves its own decode
+    call inside a speculating launch, without which every step stays a verify.
+    """
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    runner._spec_drafts_from_model = True
+    runner._spec_method = "custom_class"
+    runner.check_perform_device_sampling = lambda **_: True
+    # The real one, because device sampling reads its fields as a dataclass.
+    del runner._sampling_params_for_padded_decode
+    runner._sampling_params_for_padded_decode = (
+        TTModelRunner._sampling_params_for_padded_decode.__get__(runner)
+    )
+    return runner
+
+
+def _settle_layout(runner) -> None:
+    """What a decode that consumed the layout leaves behind.
+
+    The persistent batch reports a changed layout after a request is admitted,
+    and an overlapped step requires a stable one. The real runner clears this
+    in ``note_decode_layout_consumed``, which this harness stubs out, so a test
+    that wants the steady state says so here.
+    """
+    runner._decode_layout_changed_since_last_decode = False
+
+
+def _submit_plain_step(runner, *req_ids):
+    """Run one asynchronous step that has nothing to verify."""
+    scheduler_output = _scheduler_output(runner, decoding=req_ids)
+    for req_id in req_ids:
+        row = runner.input_batch.req_id_to_index[req_id]
+        runner.input_batch.num_computed_tokens_cpu[row] = runner.input_batch.num_tokens[
+            row
+        ]
+    assert runner.execute_model(scheduler_output) is None
+    wrapper = runner.sample_tokens(None)
+    assert not isinstance(wrapper, AsyncTTSpecDecodeOutput), (
+        "a step with nothing to verify went down the speculative path"
+    )
+    return wrapper
 
 
 def _accept_everything(runner, req_id):
@@ -1182,3 +1279,229 @@ def test_a_condensed_row_is_drafted_against_its_own_remaining_context():
 
 
 # endregion Adverse ordering
+
+
+# region Solo and batched transitions
+
+
+def test_a_draftless_step_is_overlap_safe_and_a_verify_is_not():
+    """The two-sided barrier, asserted from both sides.
+
+    This is the milestone's performance objective reduced to the one decision
+    it rests on. A step with nothing to verify is registered as overlap-safe,
+    so the next build does not wait for it. A verify is registered as not
+    overlap-safe, so the next build does.
+
+    The second half is worth pinning because nothing else provides it:
+    ``check_perform_device_sampling`` does not look at speculation, so on a
+    launch that samples on device a verify satisfies every condition
+    ``can_use_steady_decode_fast_path`` checks and comes back eligible. The
+    explicit registration in ``submit_async_decode`` is the whole barrier.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+
+    plain = _submit_plain_step(runner, "a")
+    assert list(runner._pending_async_overlap_ok) == [True]
+    assert not runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True
+    ), "a step with nothing to verify made the next build wait"
+    model.release()
+    plain.get_output()
+    _drain(runner, "a")
+    assert model.device_sampled_calls == 1
+
+    # And a verify, on the same runner, with drafts in flight.
+    _settle_layout(runner)
+    drafted = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+    assert list(runner._pending_async_overlap_ok) == [False]
+    assert runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True
+    )
+    # The predicate the ordinary path would have used says otherwise, which is
+    # why the registration cannot be derived from it.
+    assert runner.async_decode.can_use_steady_decode_fast_path(drafted._model_input)
+    model.release()
+    drafted.get_output()
+    _drain(runner, "a")
+
+
+def test_a_second_baseline_step_submits_before_the_first_completes():
+    """Overlap, as an ordering fact rather than a launch option.
+
+    The first step's completion is held. The second step is then submitted and
+    reaches the model, which is what overlap means: the runner did not wait for
+    the outstanding readback before building and submitting the next forward.
+    The model's own call log is the evidence, and the hold is explicit, so this
+    is an ordering the test forces rather than one it hopes for.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+
+    first = _submit_plain_step(runner, "a")
+    assert model.outstanding == 1, "the first step's readback is not held"
+    assert model.device_sampled_calls == 1
+
+    second = _submit_plain_step(runner, "a")
+    assert model.device_sampled_calls == 2, (
+        "the second forward waited for the first step's readback"
+    )
+    assert model.outstanding == 2
+
+    # Both land, oldest first, which is the order the device stream permits.
+    model.release()
+    first.get_output()
+    model.release()
+    second.get_output()
+    _drain(runner, "a")
+    assert len(runner.requests["a"].output_token_ids) == 2
+
+
+def test_solo_speculation_yields_to_a_peer_and_resumes_when_it_leaves():
+    """The sequence the third milestone asks for, end to end.
+
+    A lone request speculates. A peer arrives, so the model's drafter offers
+    nothing and the batched steps run as ordinary overlapping decodes. The peer
+    leaves, the drafter offers again, and the solo request speculates from
+    where it got to. What the assertions hold onto is which call each step
+    made, because "a response came back" says nothing about whether the batch
+    spent those steps in a verify it did not need.
+    """
+    model = DeferredVerifyTarget()
+    model.offer_drafts_only_when_solo()
+    runner = _baseline_runner(model)
+    _admit(runner, ("solo", 11))
+    _settle_layout(runner)
+
+    # Solo: the drafter offered K at the last commit, so this step verifies.
+    plain = _submit_plain_step(runner, "solo")
+    model.release()
+    plain.get_output()
+    _drain(runner, "solo")
+    drafts = runner.take_draft_token_ids()
+    assert drafts is not None and drafts.draft_token_ids[0], (
+        "a solo request was offered no drafts"
+    )
+
+    _settle_layout(runner)
+    verified = _submit_step(
+        runner, "solo", drafts={"solo": list(drafts.draft_token_ids[0])}
+    )
+    model.release()
+    verified.get_output()
+    _drain(runner, "solo")
+    solo_tokens = len(runner.requests["solo"].output_token_ids)
+    assert solo_tokens > 2, "the verify committed no prefix"
+
+    # The peer arrives in a step that also schedules the solo request: a
+    # running request the scheduler output omits leaves the persistent batch,
+    # so admitting the peer on its own would take the solo request out of it.
+    _drain(runner, "solo", new=[("peer", 71)])
+    _settle_layout(runner)
+
+    # One verify first, and it is not speculation: the solo request's last
+    # commit was several tokens wide, and ``accepted_counts`` is how the model
+    # finds which candidate state slot that commit landed on. The step carries
+    # the count, drafts nothing, and resolves it. That is the fixed cost of
+    # leaving speculation, one step per transition.
+    resolving = _submit_step(runner, "solo", "peer")
+    assert model.verify_calls[-1]["num_valid_drafts"].tolist() == [0] * MAX_NUM_REQS
+    assert int(model.verify_calls[-1]["accepted_counts"][0]) > 1
+    model.release()
+    resolving.get_output()
+    _drain(runner, "solo", "peer")
+    _settle_layout(runner)
+
+    verifies_before = len(model.verify_calls)
+    for _ in range(3):
+        step = _submit_plain_step(runner, "solo", "peer")
+        model.release()
+        step.get_output()
+        _drain(runner, "solo", "peer")
+        _settle_layout(runner)
+    assert len(model.verify_calls) == verifies_before, (
+        "a batched baseline step ran a verify"
+    )
+    assert runner.take_draft_token_ids() is None, (
+        "the drafter offered drafts for a batch it declined"
+    )
+    # One token from the resolving verify plus one from each ordinary step.
+    assert len(runner.requests["peer"].output_token_ids) == 4
+
+    # The peer leaves. The drafter offers again, and the next step verifies.
+    _drain(runner, "solo", finished=["peer"])
+    _settle_layout(runner)
+    step = _submit_plain_step(runner, "solo")
+    model.release()
+    step.get_output()
+    _drain(runner, "solo")
+    drafts = runner.take_draft_token_ids()
+    assert drafts is not None and drafts.draft_token_ids[0], (
+        "speculation never resumed after the batch went solo again"
+    )
+
+    _settle_layout(runner)
+    verified = _submit_step(
+        runner, "solo", drafts={"solo": list(drafts.draft_token_ids[0])}
+    )
+    model.release()
+    verified.get_output()
+    _drain(runner, "solo")
+    assert len(model.verify_calls) == verifies_before + 1
+    # And every token the solo request emitted is still its own continuation.
+    assert runner.requests["solo"].output_token_ids == continuation(
+        11 + PROMPT_LEN - 1,
+        PROMPT_LEN - 1,
+        len(runner.requests["solo"].output_token_ids),
+    )
+
+
+def test_a_peer_cancelled_mid_transition_leaves_the_solo_request_intact():
+    """A cancellation at the transition, with a result outstanding.
+
+    The peer is cancelled while a batched step's result is still in flight, so
+    the runner applies that step to one request and not the other, and the
+    batch is solo again in the same scheduler step. The solo request has to
+    come out of it with its own continuation and with speculation able to
+    resume.
+    """
+    model = DeferredVerifyTarget()
+    model.offer_drafts_only_when_solo()
+    runner = _baseline_runner(model)
+    _admit(runner, ("solo", 11), ("peer", 71))
+    _settle_layout(runner)
+
+    step = _submit_plain_step(runner, "solo", "peer")
+    model.release()
+    step.get_output()
+    # The peer is cancelled before its result is applied.
+    _drain(runner, "solo", finished=["peer"])
+
+    assert "peer" not in runner.requests
+    assert "peer" not in runner._proposed_draft_token_ids
+    assert runner.requests["solo"].output_token_ids == continuation(
+        11 + PROMPT_LEN - 1, PROMPT_LEN - 1, 1
+    )
+    # The drafter decided during the step that ran, when two requests were
+    # live, so it offered nothing and there is nothing to report yet. One
+    # ordinary step later the batch is solo and it offers again: a transition
+    # costs one step before speculation resumes, which is inherent to deciding
+    # at the commit of the step that produced the token.
+    assert runner.take_draft_token_ids() is None
+
+    _settle_layout(runner)
+    step = _submit_plain_step(runner, "solo")
+    model.release()
+    step.get_output()
+    _drain(runner, "solo")
+
+    drafts = runner.take_draft_token_ids()
+    assert drafts is not None
+    assert drafts.req_ids == ["solo"]
+
+
+# endregion Solo and batched transitions
