@@ -1378,3 +1378,54 @@ def test_allocate_slots_is_asked_for_the_block_footprint(monkeypatch):
         f"allocate_slots asked for lookahead {seen}, but one block step commits "
         f"CANVAS={CANVAS} tokens and verifies past them"
     )
+
+
+def test_releasing_another_request_leaves_the_session_owners_block_intact():
+    """vllm-tt-plugin#118.2: adaptive serving admits several live requests while
+    the paired adapter keeps ONE spec session, so releasing a request that does
+    NOT own that session must leave the owner's width alone.
+
+    Before the adapters' ``release_request`` compared the released slot against
+    the session owner, any release cleared the global session: the owner then
+    decoded ONE baseline token against the block-width reservation this
+    scheduler had already made for it, and ``_update_request_with_output``
+    rejected the step. This pins the scheduler half of that contract -- the
+    width RESERVED for the owner and the width ACCEPTED from it, together --
+    across an abort of a different live request.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    req_b = _request(CANVAS * 2, request_id="req-b")
+
+    # A prefills and takes the session.
+    scheduler.add_request(req_a)
+    _adaptive_anchor(scheduler, req_a, token=5)
+    assert scheduler._spec_session_owner == "req-a"
+
+    # B prefills. A prefill re-seats the session, so B becomes the owner while
+    # A stays live -- exactly the state where a release can hit the wrong one.
+    scheduler.add_request(req_b)
+    submitted = scheduler.schedule()
+    assert list(submitted.num_scheduled_tokens) == ["req-b"], (
+        "a TT step is never mixed prefill+decode, so B's prefill must be solo"
+    )
+    scheduler.update_from_output(submitted, _runner_output(submitted, [6]))
+    assert scheduler._spec_session_owner == "req-b"
+
+    # The client aborts A before B's first decode.
+    scheduler.finish_requests("req-a", RequestStatus.FINISHED_ABORTED)
+    assert "req-a" not in scheduler.requests
+    assert scheduler._spec_session_owner == "req-b", (
+        "releasing a NON-owner must not move the session off its owner"
+    )
+
+    # B still gets the whole block reserved, and its full-width output is taken.
+    submitted = scheduler.schedule()
+    assert list(submitted.num_scheduled_tokens) == ["req-b"]
+    assert get_tt_block_step_decisions(submitted)["req-b"] is True
+    assert req_b.num_output_placeholders == CANVAS
+
+    block = list(range(20, 20 + CANVAS))
+    outputs = scheduler.update_from_output(submitted, _runner_output(submitted, block))
+    assert outputs[0].outputs[0].new_token_ids == block
+    assert req_b.num_output_placeholders == 0

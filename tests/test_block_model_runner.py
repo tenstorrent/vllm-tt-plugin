@@ -425,3 +425,47 @@ def test_non_adaptive_models_never_narrow_the_width():
     assert _committed_width(False, 16, tensor) == 16
     with pytest.raises(ValueError, match="output_tokens_per_step"):
         _coerce_output_block(tensor, 3, 16)
+
+
+def test_finishing_one_request_releases_only_its_own_slot():
+    """vllm-tt-plugin#118.2: the adapters keep ONE spec session and decide
+    whether a release is theirs by comparing the released slot against the
+    session owner. That comparison is only sound if the runner hands over the
+    slot of the request that actually finished, so with two live requests a
+    release must name A's slot and never touch B's -- otherwise the owner B
+    loses its session and decodes one baseline token against the block the
+    scheduler reserved for it.
+    """
+    released = []
+
+    class InputBatchSpy:
+        def __init__(self):
+            self.req_id_to_index = {"req-a": 0, "req-b": 1}
+
+        def remove_request(self, req_id):
+            return self.req_id_to_index.pop(req_id, None)
+
+        def condense(self, removed_req_indices):
+            pass
+
+        def refresh_logitsprocs(self):
+            pass
+
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.requests = {"req-a": object(), "req-b": object()}
+    runner.encoder_cache = {}
+    runner.input_batch = InputBatchSpy()
+    runner.model = SimpleNamespace(release_request=released.append)
+    runner._decode_layout_changed_since_last_decode = False
+    # Deliberately NOT equal to the batch rows: a release that leaked the row
+    # instead of the slot would name 0 here and look correct by accident.
+    runner._req_state_slot = {"req-a": 7, "req-b": 4}
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.finished_req_ids = {"req-a"}
+
+    runner._update_states(scheduler_output)
+
+    assert released == [7], "only the finished request's own slot may be released"
+    assert runner._req_state_slot == {"req-b": 4}, "B keeps its state slot"
+    assert "req-b" in runner.requests
