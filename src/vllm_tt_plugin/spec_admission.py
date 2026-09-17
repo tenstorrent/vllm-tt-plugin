@@ -97,8 +97,15 @@ def _build_method_requirements() -> dict[str, tuple[str, ...]]:
         "medusa": _DEVICE_DRAFTER,
         "mlp_speculator": _DEVICE_DRAFTER,
         # The model's own drafter, proposing on device through
-        # ``propose_draft_tokens``. Same requirements as any device drafter.
-        MODEL_OWNED_DRAFT_METHOD: _DEVICE_DRAFTER,
+        # ``propose_draft_tokens``. It proposes, and that is all this method
+        # can demand: what its drafter reads is the model's own business. An
+        # MTP head reads the target hidden state and declares
+        # ``hidden_feed`` for it, while a drafter continuing from the committed
+        # block alone declares nothing extra, and requiring the declaration
+        # here would have forced that model to claim a feed it never uses. The
+        # named upstream methods below are different: each one is a drafter
+        # architecture that reads the hidden state by construction.
+        MODEL_OWNED_DRAFT_METHOD: (SPEC_REQUIREMENT_DEVICE_PROPOSE,),
     }
     # EagleModelTypes flattens to EAGLE, every MTP variant and dFlash. All of
     # them draft on device from the target's hidden state.
@@ -173,12 +180,16 @@ def resolve_speculative_plan(
             "drop the speculative flags"
         )
 
-    # Validated only when the method needs it, so a typo in an unused
-    # declaration does not refuse an ngram launch. Which handoff the model
-    # declared is a real behavioural difference, on device or a host round
-    # trip, but nothing consumes it until the runner holds a HiddenHandle
-    # between propose and verify, so SpecPlan carries no field for it yet.
-    if SPEC_REQUIREMENT_HIDDEN_FEED in required:
+    # Validated when the hidden state is fed at all, whether the method
+    # demands it or the model volunteers it. A model declaring the feed and no
+    # handoff has not said how the state reaches its drafter, and the runner
+    # reads the handoff to decide whether a step that produces no hidden
+    # handle can still ask that drafter to propose. A typo in a declaration no
+    # launch uses stays unvalidated, so it cannot refuse an ngram launch.
+    if (
+        SPEC_REQUIREMENT_HIDDEN_FEED in required
+        or SPEC_REQUIREMENT_HIDDEN_FEED in declared
+    ):
         handoff = normalize_declared_values(
             capabilities.get("spec_hidden_handoff"),
             HIDDEN_HANDOFFS,

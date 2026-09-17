@@ -376,13 +376,13 @@ def test_a_roundtrip_hidden_drafter_keeps_every_step_a_verify():
 
     A step with nothing to verify returns no ``VerifyOutput``, so it produces
     no hidden handle. A drafter that is fed its target hidden state through the
-    runner would then be asked to draft from nothing, so a launch pairing that
-    drafter with this model keeps every step a verify instead. Decided when the
-    model is loaded, because a launch-time decision is checkable and passing
-    ``None`` to that drafter at step time is not.
+    runner would then be asked to draft from nothing, so a model declaring that
+    feed keeps every step a verify instead. Decided when the model is loaded,
+    because a launch-time decision is checkable and passing ``None`` to that
+    drafter at step time is not.
     """
     runner = TTModelRunner.__new__(TTModelRunner)
-    runner._spec_method = "custom_class"
+    runner._spec_drafts_from_model = True
 
     class RoundtripHidden:
         model_capabilities = {
@@ -412,8 +412,8 @@ def test_a_roundtrip_hidden_drafter_keeps_every_step_a_verify():
     assert runner._narrow_steps_serve_the_drafter() is True
 
     # And a launch that speculates with a host proposer needs nothing from the
-    # model here at all.
-    runner._spec_method = "ngram"
+    # model here at all: its drafter is never handed hidden state.
+    runner._spec_drafts_from_model = False
     runner.model = RoundtripHidden()
     assert runner._narrow_steps_serve_the_drafter() is True
 
