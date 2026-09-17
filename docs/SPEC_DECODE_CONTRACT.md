@@ -26,9 +26,14 @@ boundary. What runs:
   request: the accept walk compares token ids and never sees logits, so it
   cannot arbitrate any of those, and answering greedily anyway would change
   what was asked for without saying so.
-- the **synchronous** decode tail. A launch combining speculation with
-  asynchronous scheduling is refused, because the accept walk lives in the
-  synchronous path.
+- both decode tails. The **synchronous** tail accepts and commits inside the
+  step. The **asynchronous** tail defers: acceptance is walked where the
+  readback completes, and the commit and the next proposal run on the engine
+  thread at the top of the following step. A launch combining speculation with
+  asynchronous scheduling is admitted only for a model declaring
+  `supports_async_spec_decode`, which is about the model's readback and hidden
+  handle rather than about step order: a speculative step never overlaps the
+  next one, so verify, accept and propose stay ordered per request.
 - **front-packed** execution. Lane mode is refused: it builds its device input
   from `TTLaneInputBatch`, which has no candidate-block builder.
 
@@ -39,7 +44,7 @@ need their own execution path before the matching refusal can go.
 
 ## 1. Capability declarations
 
-Four `model_capabilities` entries, read only when the launch carries a
+Five `model_capabilities` entries, read only when the launch carries a
 `speculative_config`. Absent keys default as shown, following the plugin's
 existing default-if-absent convention.
 
@@ -49,6 +54,7 @@ existing default-if-absent convention.
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when the method needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
+| `supports_async_spec_decode` | `False` | The model's readback and hidden handle serve a deferred verify: see section 4c. Absent means a launch pairing speculation with `--async-scheduling` is refused. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -233,6 +239,48 @@ none. Selecting this drafter requires vLLM's `custom_class` method, whose
 `model` key must be exactly `vllm_tt_plugin.model_owned_drafter`: vLLM demands
 a dotted proposer path there and nothing imports it, because the drafter is the
 model.
+
+## 4c. The verify call under asynchronous scheduling
+
+Asynchronous scheduling changes when the runner applies a step, not what it
+sends. `execute_model` submits and returns nothing; the engine collects the
+output later, on a thread that is not the engine thread; and the runner applies
+it to request state at the top of the following step. For a speculative step
+the accept walk runs where the readback completes, and the commit of the
+accepted prefix plus the next proposal run on the engine thread when the next
+step drains this one.
+
+Ordering first, because it bounds everything below. A speculative step is
+registered as not overlap-safe, so the runner drains it before it builds the
+next step, and it applies the drained result before it builds. A verify is
+therefore never submitted while the previous verify's acceptance is still
+unapplied, and verify, accept and propose stay serialized per request. What
+this path defers is the readback and the commit, not the order of the steps.
+
+Two demands nevertheless reach the model, and they are what
+`supports_async_spec_decode` declares:
+
+1. **`read_decode_output` serves a verify.** On a synchronous speculative step
+   the hook is never called: the runner asks for the output with the
+   submission. On this path the runner calls
+   `read_decode_output(tt_out, async_read=True)` with the tensor unwrapped from
+   the `VerifyOutput`, so the hook is handed the mode's `[B, 1+K]` block rather
+   than a decode's single column, and the number of tokens per row that will
+   be committed out of it is decided by the host after the forward returns.
+2. **The hidden handle outlives the step's submission.** The model returns it
+   from `decode_forward`, the runner carries it across the readback and a
+   queue, and `propose_draft_tokens` receives it at the next step's drain. A
+   model declaring `spec_hidden_handoff: ["on_device"]` is promising that the
+   device state behind the handle is still valid then.
+
+Neither is covered by `supports_async_decode`, whose requirements in
+[`DECODE_RELOAD_CONTRACT.md`](DECODE_RELOAD_CONTRACT.md) are written for a
+decode that commits one token per forward: they speak of a persistent token
+buffer holding the selected token and of one resident position advance per
+forward. A model can satisfy every one of them for an ordinary decode and be
+wrong for a deferred verify, which is why this is a separate declaration
+rather than the conjunction of the two existing ones. Deriving it would
+enlarge what a model that already declares `supports_async_decode` promised.
 
 ## 5. What a verify returns, column by column
 

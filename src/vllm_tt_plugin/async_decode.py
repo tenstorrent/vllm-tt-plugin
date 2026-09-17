@@ -128,6 +128,36 @@ class CompletedDecodeStep:
     runner_output: ModelRunnerOutput | None = None
 
 
+@dataclass
+class CompletedSpecDecodeStep:
+    """An accepted speculative step, not yet applied to host state.
+
+    A speculative step cannot be finished where an ordinary one is. Its output
+    is not a sampled token but a candidate block whose committed length is
+    decided by the accept walk, and the walk's result then has to reach two
+    places that only the engine thread may touch: the request's token history,
+    and the next proposal. So the walk runs at completion and everything it
+    produced waits here until the next step drains it.
+
+    What it retains is what the commit and the proposal need after the runner
+    has moved on: the accepted block, each row's count, the step's own
+    ``model_input`` (its request identities, positions and drafts), and the
+    verify's hidden handle. Every tensor here belongs to this step. The
+    builder allocates the candidate block, the draft block and both side
+    tensors fresh per step, so none of them is a view into storage the next
+    step reuses.
+    """
+
+    committed: torch.Tensor
+    counts: torch.Tensor
+    prefixes: list[list[int]]
+    model_input: TTModelInput
+    spec_hidden: Any | None
+    context: SubmittedStepContext
+    completion_time_ns: int
+    runner_output: ModelRunnerOutput | None = None
+
+
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
     """Run the deferred device readback exactly once, from whichever caller
     reaches it first.
@@ -234,6 +264,60 @@ class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
         )
         runner_output = self._controller.build_runner_output_from_completed_step(
             completed
+        )
+        completed.runner_output = runner_output
+        self._controller.enqueue_completed_decode_step(completed)
+        return runner_output
+
+
+class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
+    """A deferred speculative step: read back, then walk acceptance.
+
+    Shares ``DeferredDecodeOutput``'s exactly-once resolution, because the same
+    two threads race for a speculative step as for an ordinary one and a second
+    readback of the same submission corrupts it. What differs is what resolving
+    it does: the accept walk instead of the sampler, and a published output
+    whose rows carry a committed prefix each rather than one token apiece.
+
+    It never mutates runner state. The walk reads only this step's own tensors,
+    and the commit waits in the completed queue for the engine thread.
+    """
+
+    def __init__(
+        self,
+        controller: TTAsyncDecodeController,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        completion_event: threading.Event,
+        context: SubmittedStepContext,
+    ):
+        self._controller = controller
+        self._submission = submission
+        self._model_input = model_input
+        self._completion_event = completion_event
+        self._context = context
+        self._init_deferred()
+
+    def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
+        """Refused: a grammar needs the logits a verify in this mode never returns.
+
+        Reachable only through a launch admission should have refused, so it
+        raises rather than dropping the mask and serving ungrammatical text.
+        """
+        raise NotImplementedError(
+            "structured output and speculative decoding cannot be combined on "
+            "this path: acceptance compares token ids and never sees the "
+            "logits a grammar bitmask applies to"
+        )
+
+    def _get_output_impl(self) -> ModelRunnerOutput:
+        completed = self._controller.complete_spec_decode_step(
+            submission=self._submission,
+            model_input=self._model_input,
+            context=self._context,
+        )
+        runner_output = self._controller.runner.build_spec_runner_output(
+            self._model_input.row_req_ids, completed.prefixes
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
@@ -713,6 +797,45 @@ class TTAsyncDecodeController:
             completion_time_ns=time.perf_counter_ns(),
         )
 
+    def complete_spec_decode_step(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+    ) -> CompletedSpecDecodeStep:
+        """Finalize a speculative read and walk acceptance over what came back.
+
+        Runs on whichever thread resolved the deferred output, so it reads the
+        step's own tensors and the immutable model config and nothing else. The
+        commit and the next proposal are left for the engine thread.
+        """
+        finalized = self.finalize_decode(submission)
+        if finalized is None:
+            rows = len(model_input.row_req_ids)
+            return CompletedSpecDecodeStep(
+                committed=torch.empty((0, 0), dtype=torch.int32),
+                counts=torch.empty((0,), dtype=torch.int32),
+                prefixes=[[] for _ in range(rows)],
+                model_input=model_input,
+                spec_hidden=submission.spec_hidden,
+                context=context,
+                completion_time_ns=time.perf_counter_ns(),
+            )
+        committed, counts = self.runner.walk_spec_acceptance(
+            model_input, finalized.tt_out
+        )
+        return CompletedSpecDecodeStep(
+            committed=committed,
+            counts=counts,
+            prefixes=self.runner.spec_committed_prefixes(
+                model_input, committed, counts
+            ),
+            model_input=model_input,
+            spec_hidden=submission.spec_hidden,
+            context=context,
+            completion_time_ns=time.perf_counter_ns(),
+        )
+
     def build_runner_output_from_completed_step(
         self,
         completed: CompletedDecodeStep,
@@ -726,7 +849,7 @@ class TTAsyncDecodeController:
 
     def apply_completed_decode_step(
         self,
-        completed: CompletedDecodeStep,
+        completed: CompletedDecodeStep | CompletedSpecDecodeStep,
         *,
         suppress_output_req_ids: set[str] | None = None,
         skip_state_req_ids: set[str] | None = None,
@@ -749,6 +872,20 @@ class TTAsyncDecodeController:
                 req_idx = completed.runner_output.req_id_to_index.get(req_id)
                 if req_idx is not None:
                     completed.runner_output.sampled_token_ids[req_idx] = []
+        if isinstance(completed, CompletedSpecDecodeStep):
+            # The commit and the next proposal, on the engine thread, for the
+            # step whose acceptance was walked at completion. The lifecycle
+            # sets above apply unchanged: a request finished, aborted or
+            # force-reset since submission is skipped here rather than having
+            # its tokens written and a continuation of them drafted.
+            self.runner.commit_spec_acceptance(
+                completed.model_input,
+                completed.committed,
+                completed.counts,
+                completed.spec_hidden,
+                skip_req_ids=skipped_state,
+            )
+            return
         self.runner._apply_sampled_tokens_to_state(
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
@@ -760,7 +897,7 @@ class TTAsyncDecodeController:
         model_input: TTModelInput,
         *,
         steady_decode_fast_path: bool,
-    ) -> AsyncTTModelRunnerOutput:
+    ) -> DeferredDecodeOutput:
         event = threading.Event()
         context = self.capture_submitted_step_context()
         submission = self.submit_decode(
@@ -770,6 +907,23 @@ class TTAsyncDecodeController:
         )
         if submission.tt_out is None:
             event.set()
+        step: DeferredDecodeOutput
+        if model_input.spec_mode is not None:
+            # A speculative step resolves through the accept walk, not the
+            # sampler. It is never overlap-safe: the next candidate block is
+            # built from this step's committed tokens, so the build has to wait
+            # for this commit. ``can_use_steady_decode_fast_path`` already
+            # refuses it (a verify performs no device sampling); passing False
+            # here says so rather than relying on that.
+            step = AsyncTTSpecDecodeOutput(
+                controller=self,
+                submission=submission,
+                model_input=model_input,
+                completion_event=event,
+                context=context,
+            )
+            self.register_pending_async_step(step, overlap_ok=False)
+            return step
         step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,

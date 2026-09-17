@@ -2202,13 +2202,26 @@ class TTModelRunner:
     def _finish_spec_decode(self, fwd: _SyncForward) -> ModelRunnerOutput:
         """Accept, commit and re-propose for one speculative decode step.
 
-        Kept off the ordinary sampling tail deliberately. A verify's return is
-        not a sampled token: it is a candidate block whose committed length is
-        decided here, per row, by comparing what the model chose against what
-        was drafted. Routing it through ``_get_output_tokens`` would have that
-        function host-sample from a tensor that already holds token ids.
+        The synchronous tail, where the forward has already completed: walk,
+        commit and publish in one go. The asynchronous path splits the same
+        three at the readback boundary, which is why the walk and the commit
+        are separate methods rather than one.
         """
-        model_input = fwd.model_input
+        committed, counts = self.walk_spec_acceptance(fwd.model_input, fwd.tt_out)
+        prefixes = self.spec_committed_prefixes(fwd.model_input, committed, counts)
+        self.commit_spec_acceptance(fwd.model_input, committed, counts, fwd.spec_hidden)
+        return self.build_spec_runner_output(fwd.model_input.row_req_ids, prefixes)
+
+    def walk_spec_acceptance(
+        self, model_input: TTModelInput, argmax_ids: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy acceptance over one verify's return. Touches no host state.
+
+        Separate from the commit because the asynchronous path runs this on
+        whichever thread resolves the readback, where the runner's own state is
+        one step behind and must not be read or written. Everything this needs
+        is the step's own: the block it submitted and what came back.
+        """
         row_req_ids = model_input.row_req_ids
         missing = [
             name
@@ -2221,16 +2234,13 @@ class TTModelRunner:
                 f"the accept walk without {missing}; the builder sets all three "
                 "together whenever it sets spec_mode"
             )
+        del row_req_ids
 
-        argmax_ids = fwd.tt_out
         if not isinstance(argmax_ids, torch.Tensor):
             raise TypeError(
                 "a verify in argmax_ids mode must return a token id tensor, got "
                 f"{type(argmax_ids).__name__}"
             )
-        # Padding rows are verified along with the rest, because the block is
-        # one fixed shape, and dropped here: only the live requests commit.
-        rows = len(row_req_ids)
         # The draft block is built at the full width K even on a narrow step,
         # where the model was handed one column because no row carried a draft.
         # The walk compares the two, so the drafts are trimmed to the width the
@@ -2240,26 +2250,91 @@ class TTModelRunner:
         # because a model-owned drafter is asked for the same rows the verify
         # ran on: its per-row state is indexed by row, and a device graph has
         # one shape. A padding row carries no draft, so the walk commits its
-        # column 0 and counts 1, and only the live rows below reach a request.
-        committed, counts = accept_greedy_drafts(
+        # column 0 and counts 1, and only the live rows reach a request.
+        return accept_greedy_drafts(
             argmax_ids,
             model_input.draft_token_ids[:, :verified_drafts],
             model_input.num_valid_drafts,
         )
 
+    def spec_committed_prefixes(
+        self,
+        model_input: TTModelInput,
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> list[list[int]]:
+        """Each live row's accepted prefix, as the step's published output.
+
+        Read off the step's own tensors and the immutable model config, never
+        off runner state, so this is safe on a readback thread.
+
+        The length cap is applied here rather than left to the commit, so both
+        paths publish the same thing. It can be: the block's own first column
+        sits at the position the row had reached when the block was built, and
+        a speculative step is drained before the next one is built, so that is
+        still the row's length when the commit runs. Publishing more than fits
+        would report tokens the commit then refuses to write, and the request's
+        own history and the engine's would disagree about its text.
+        """
+        rows = len(model_input.row_req_ids)
+        max_model_len = int(self.model_config.max_model_len)
+        positions = model_input.input_positions
+        first = positions if positions.dim() == 1 else positions[:, 0]
+        block = committed[:rows].tolist()
+        prefixes: list[list[int]] = []
+        for row, count in enumerate(counts[:rows].tolist()):
+            # One past the row's last committed token is where this step writes.
+            start = int(first[row]) + 1
+            room = max(0, max_model_len - start)
+            keep = min(int(count), room)
+            prefixes.append([int(token) for token in block[row][:keep]])
+        return prefixes
+
+    def commit_spec_acceptance(
+        self,
+        model_input: TTModelInput,
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+        spec_hidden: Any,
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> dict[str, list[int]]:
+        """Apply the accepted prefixes and publish the next proposal.
+
+        Mutates runner state, so it runs on the engine thread only: on the
+        synchronous path inside the sampling tail, and on the asynchronous path
+        when the next step drains this one. ``skip_req_ids`` is how a forced
+        prefix-cache reset drops a frame it has already accounted for.
+        """
+        row_req_ids = model_input.row_req_ids
+        rows = len(row_req_ids)
         committed_by_req = self._apply_committed_spec_tokens_to_state(
-            row_req_ids, committed[:rows], counts[:rows]
+            row_req_ids,
+            committed[:rows],
+            counts[:rows],
+            skip_req_ids=skip_req_ids,
         )
         if self._spec_drafts_from_model:
             self._propose_model_drafts(
-                committed, counts, model_input, fwd.spec_hidden, row_req_ids
+                committed, counts, model_input, spec_hidden, row_req_ids
             )
         else:
             self._propose_ngram_drafts(committed_by_req)
+        return committed_by_req
+
+    def build_spec_runner_output(
+        self, row_req_ids: list[str], prefixes: list[list[int]]
+    ) -> ModelRunnerOutput:
+        """One speculative step's output, with its per-row committed prefixes.
+
+        Not routed through ``_build_runner_output``: that coerces the sampled
+        ids to one fixed width for every row, and a speculative step commits a
+        width that differs per row.
+        """
         return ModelRunnerOutput(
             req_ids=list(row_req_ids),
             req_id_to_index={req: idx for idx, req in enumerate(row_req_ids)},
-            sampled_token_ids=[committed_by_req[req] for req in row_req_ids],
+            sampled_token_ids=[list(prefix) for prefix in prefixes],
             logprobs=None,
             prompt_logprobs_dict=dict.fromkeys(row_req_ids, None),
             pooler_output=[],
@@ -2270,6 +2345,8 @@ class TTModelRunner:
         row_req_ids: list[str],
         committed: torch.Tensor,
         counts: torch.Tensor,
+        *,
+        skip_req_ids: set[str] | None = None,
     ) -> dict[str, list[int]]:
         """Commit each row's accepted prefix and record its count.
 
@@ -2284,8 +2361,14 @@ class TTModelRunner:
         """
         max_model_len = self.model_config.max_model_len
         committed_np = committed.numpy()
+        skipped = set(skip_req_ids or ())
         committed_by_req: dict[str, list[int]] = {}
         for row, req_id in enumerate(row_req_ids):
+            if req_id in skipped:
+                # A forced prefix-cache reset already accounted for this frame.
+                # Writing it would replay tokens the scheduler has discarded,
+                # and proposing from it would draft a continuation of them.
+                continue
             count = int(counts[row])
             block = [int(token) for token in committed_np[row, :count]]
             batch_row = self.input_batch.req_id_to_index.get(req_id)
