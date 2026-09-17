@@ -108,6 +108,10 @@ def _runner(
         _is_block_output_model=False,
         _is_adaptive_block_output=False,
         _num_speculative_tokens=num_speculative_tokens,
+        # Synchronous harness: the drafts reach the runner through the
+        # scheduler output, which is what ``_drafts_to_verify`` reads when
+        # asynchronous scheduling is off.
+        async_decode_scheduling=False,
         _spec_method=method,
         _spec_supports_narrow_decode=False,
         _spec_drafts_from_model=drafts_from_model,

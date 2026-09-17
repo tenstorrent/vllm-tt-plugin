@@ -44,10 +44,18 @@ def _request(req_id: str, is_prefill_chunk: bool = False) -> SimpleNamespace:
     )
 
 
-def _scheduler(requests: dict[str, SimpleNamespace], num_spec_tokens: int):
+def _scheduler(
+    requests: dict[str, SimpleNamespace],
+    num_spec_tokens: int,
+    async_scheduling: bool = False,
+):
     scheduler = TTScheduler.__new__(TTScheduler)
     scheduler.requests = requests
     scheduler.num_spec_tokens = num_spec_tokens
+    # What decides who owns the drafts. Synchronously the scheduler delivers
+    # them and the placeholders must go; asynchronously nothing delivers them
+    # and the placeholders are the lookahead reservation.
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
     scheduler.num_sampled_tokens_per_step = 1
     scheduler.use_v2_model_runner = False
     scheduler.pp_size = 1
@@ -116,6 +124,32 @@ def test_a_spent_proposal_is_not_replayed():
     scheduler._update_after_schedule(_scheduler_output(["a"], {"a": [11, 12, 13]}))
 
     assert requests["a"].spec_token_ids == []
+
+
+def test_an_asynchronous_launch_keeps_the_placeholders():
+    """Asynchronously the placeholders are the reservation, not a proposal.
+
+    Upstream stops routing drafts through the scheduler when asynchronous
+    scheduling is on: ``EngineCore.post_step`` skips
+    ``take_draft_token_ids`` because a step's drafts are not known before it
+    runs. What ``AsyncScheduler`` leaves behind is then the only thing that
+    budgets lookahead positions for the request, since the next schedule
+    reserves ``1 + len(spec_token_ids)``. Clearing them there would leave the
+    runner verifying a candidate block in a row budgeted for one token.
+
+    ``TTModelRunner._drafts_to_verify`` is the other half: it reads a
+    placeholder list as that reservation and verifies the proposal the runner
+    holds, never the ``-1`` itself.
+    """
+    requests = {"a": _request("a"), "b": _request("b")}
+    scheduler = _scheduler(requests, NUM_SPEC_TOKENS, async_scheduling=True)
+
+    scheduler._update_after_schedule(
+        _scheduler_output(["a", "b"], {"a": [11, 12, 13], "b": []})
+    )
+
+    assert requests["a"].spec_token_ids == [-1] * NUM_SPEC_TOKENS
+    assert requests["b"].spec_token_ids == [-1] * NUM_SPEC_TOKENS
 
 
 def test_a_launch_without_speculation_is_untouched():
