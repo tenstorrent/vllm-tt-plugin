@@ -127,14 +127,20 @@ def test_speculation_resumes_when_the_batch_empties(
     long_prompt = ascending_prompt(64, start=100)
     peer_prompt = ascending_prompt(64, start=900)
 
-    # The long request runs alone, then with a peer, then alone again.
+    # The lengths are chosen so the long request outlives its peer by a wide
+    # margin. It is the faster of the two per step while it speculates,
+    # committing 1+K tokens where the peer commits one, so a peer asking for a
+    # comparable length would finish second and leave nothing to measure.
+    long_tokens = MAX_TOKENS * 6
+    peer_tokens = 16
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         long_future = pool.submit(
-            spec_server.complete, long_prompt, max_tokens=MAX_TOKENS * 3
+            spec_server.complete, long_prompt, max_tokens=long_tokens
         )
         time.sleep(0.4)
         peer_before = spec_server.metrics()
-        peer = pool.submit(spec_server.complete, peer_prompt, max_tokens=MAX_TOKENS)
+        peer = pool.submit(spec_server.complete, peer_prompt, max_tokens=peer_tokens)
         peer_result = peer.result()
         peer_after = spec_server.metrics()
         long_result = long_future.result()
@@ -148,7 +154,14 @@ def test_speculation_resumes_when_the_batch_empties(
         after_it_left=after_it_left.as_dict(),
     )
 
-    assert long_result.completion_tokens > MAX_TOKENS
+    assert long_result.completion_tokens > peer_tokens
+    # Checked before the claim below, because an empty window would satisfy
+    # "no drafts" for a reason that has nothing to do with the policy: the
+    # long request would simply have finished first.
+    assert after_it_left.steps > 0, (
+        "the long request finished before its peer, so the window after the "
+        "peer left holds no steps to draw a conclusion from"
+    )
     assert after_it_left.drafts > 0, (
         "the request never speculated again after its peer finished"
     )
