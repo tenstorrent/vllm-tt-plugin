@@ -106,6 +106,16 @@ def pytest_addoption(parser):
         ),
     )
     group.addoption(
+        "--tt-spec-draft-policy",
+        default="always",
+        help=(
+            "The launched TT_SPEC_DRAFT_POLICY: 'always' drafts on every step, "
+            "'solo' drafts only while one request is live. The adaptive tests "
+            "skip unless this is 'solo', because a launch that always drafts "
+            "cannot produce what they assert."
+        ),
+    )
+    group.addoption(
         "--tt-metal-home",
         default=None,
         help="tt-metal checkout whose commit and dirty diff go in the manifest.",
@@ -120,6 +130,7 @@ class SpecConfig:
     accept_depth: int | None
     target: str
     drafter: str
+    draft_policy: str = "always"
 
     @property
     def speculating(self) -> bool:
@@ -150,6 +161,7 @@ class SpecConfig:
             "accept_depth": "all" if self.accept_depth is None else self.accept_depth,
             "target": self.target,
             "drafter": self.drafter,
+            "draft_policy": self.draft_policy,
         }
 
 
@@ -162,6 +174,7 @@ def spec_config(request) -> SpecConfig:
         accept_depth=depth,
         target=str(request.config.getoption("--tt-spec-target")),
         drafter=str(request.config.getoption("--tt-spec-drafter")),
+        draft_policy=str(request.config.getoption("--tt-spec-draft-policy")),
     )
 
 
