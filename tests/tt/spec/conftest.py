@@ -106,6 +106,16 @@ def pytest_addoption(parser):
         ),
     )
     group.addoption(
+        "--tt-spec-async-scheduling",
+        default="false",
+        help=(
+            "Whether the launch kept asynchronous scheduling, i.e. was launched "
+            "without --no-async-scheduling. The transition tests skip unless "
+            "this is 'true', and they then check the server log for what the "
+            "engine actually resolved rather than trusting this."
+        ),
+    )
+    group.addoption(
         "--tt-spec-draft-policy",
         default="always",
         help=(

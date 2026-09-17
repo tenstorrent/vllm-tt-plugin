@@ -21,7 +21,7 @@ ARTIFACTS="${1:?usage: run_spec_regression.sh <artifacts-dir> [config ...]}"
 shift || true
 CONFIGS=("$@")
 if [ ${#CONFIGS[@]} -eq 0 ]; then
-    CONFIGS=(accept-all accept-2 accept-0 adaptive capacity lossless)
+    CONFIGS=(accept-all accept-2 accept-0 adaptive async capacity lossless)
 fi
 
 : "${TT_METAL_HOME:?TT_METAL_HOME must point at the tt-metal checkout}"
@@ -84,8 +84,8 @@ start_server() {
 
 run_config() {
     local label="$1" depth="$2" declared_depth="$3" max_model_len="$4" max_num_seqs="$5"
-    local blocks="$6" policy="${7:-always}"
-    shift 7
+    local blocks="$6" policy="${7:-always}" async="${8:-false}" target="${9:-depth}"
+    shift 9
     local selection=("$@")
     local dir="$ARTIFACTS/$label"
     local log="$dir/server.log"
@@ -99,9 +99,16 @@ run_config() {
         --max_model_len "$max_model_len"
         --port "$PORT"
         --additional-config '{"tt": {"register_test_models": true}}'
-        --no-async-scheduling
         --speculative-config "$spec"
     )
+    # Asynchronous scheduling is upstream's default when nothing objects, and
+    # for a speculating launch the plugin's own patch is what stops it from
+    # objecting. So the asynchronous configuration passes no flag at all and
+    # checks the server log for what the engine resolved; every other
+    # configuration asks for synchronous explicitly.
+    if [ "$async" != "true" ]; then
+        args+=(--no-async-scheduling)
+    fi
     # The KV budget, in tokens, which the model declares and the plugin turns
     # into the block pool. ``--num-gpu-blocks-override`` cannot be used for
     # this: the plugin writes that field itself from the model's declaration,
@@ -110,6 +117,7 @@ run_config() {
     echo "=== $label: accept_depth=$depth max_model_len=$max_model_len max_num_seqs=$max_num_seqs draft_policy=$policy"
     export TT_SPEC_ACCEPT_DEPTH="$depth"
     export TT_SPEC_DRAFT_POLICY="$policy"
+    export TT_SPEC_TARGET="$target"
     if [ "$blocks" != "-" ]; then
         export TT_SPEC_MAX_TOKENS_ALL_USERS="$blocks"
     else
@@ -117,7 +125,7 @@ run_config() {
     fi
     start_server "$label" "$log" "${args[@]}" || return 1
 
-    local launch_args="TT_SPEC_ACCEPT_DEPTH=$depth TT_SPEC_DRAFT_POLICY=$policy TT_SPEC_MAX_TOKENS_ALL_USERS=${TT_SPEC_MAX_TOKENS_ALL_USERS:-unset} MESH_DEVICE='$MESH_DEVICE' python examples/server_example_tt.py ${args[*]}"
+    local launch_args="TT_SPEC_ACCEPT_DEPTH=$depth TT_SPEC_DRAFT_POLICY=$policy TT_SPEC_TARGET=$target TT_SPEC_MAX_TOKENS_ALL_USERS=${TT_SPEC_MAX_TOKENS_ALL_USERS:-unset} MESH_DEVICE='$MESH_DEVICE' python examples/server_example_tt.py ${args[*]}"
     # Every option in ``--name=value`` form, not ``--name value``. These
     # options are registered in ``tests/tt/spec/conftest.py``, which pytest
     # loads after its first pass over argv, so on that pass an unknown
@@ -134,9 +142,10 @@ run_config() {
         --tt-max-num-seqs="$max_num_seqs" \
         --tt-spec-k="$K" \
         --tt-spec-accept-depth="$declared_depth" \
-        --tt-spec-target=depth \
+        --tt-spec-target="$target" \
         --tt-spec-drafter=model \
         --tt-spec-draft-policy="$policy" \
+        --tt-spec-async-scheduling="$async" \
         --tt-spec-artifacts="$dir" \
         --tt-spec-server-log="$log" \
         --tt-spec-launch-args="$launch_args" \
@@ -163,6 +172,7 @@ run_lossless() {
     # exported it, and these two servers must be launched from what this
     # function states rather than from what ran before them.
     unset TT_SPEC_DRAFT_POLICY
+    unset TT_SPEC_TARGET
     if engine_running; then
         echo "REFUSING lossless: an engine is already running" >&2
         return 1
@@ -226,21 +236,27 @@ BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurren
 OVERALL=0
 for config in "${CONFIGS[@]}"; do
     case "$config" in
-        accept-all) run_config accept-all -1 all 2048 8 - always "${BEHAVIOUR[@]}" ;;
-        accept-2)   run_config accept-2 2 2 2048 8 - always "${BEHAVIOUR[@]}" ;;
-        accept-0)   run_config accept-0 0 0 2048 8 - always "${BEHAVIOUR[@]}" ;;
+        accept-all) run_config accept-all -1 all 2048 8 - always false depth "${BEHAVIOUR[@]}" ;;
+        accept-2)   run_config accept-2 2 2 2048 8 - always false depth "${BEHAVIOUR[@]}" ;;
+        accept-0)   run_config accept-0 0 0 2048 8 - always false depth "${BEHAVIOUR[@]}" ;;
         # The adaptive drafter: it offers the full draft length while one
         # request is live and nothing while more are, so the batched steps of
         # this configuration are ordinary decodes rather than verifies. Its
         # tests assert the ratio between the two, which no other configuration
         # can produce.
-        adaptive)   run_config adaptive -1 all 2048 8 - solo tests/tt/spec/test_adaptive_policy.py ;;
+        adaptive)   run_config adaptive -1 all 2048 8 - solo false depth tests/tt/spec/test_adaptive_policy.py ;;
+        # The launch that was unreachable until the plugin admitted the
+        # model-owned drafter to asynchronous scheduling: no
+        # --no-async-scheduling, the adaptive drafter so the batched steps are
+        # ordinary decodes that can overlap, and the fixed target so the output
+        # can be checked against the rule rather than against another server.
+        async)      run_config async -1 all 2048 8 - solo true fixed tests/tt/spec/test_async_transitions.py tests/tt/spec/test_adaptive_policy.py ;;
         # A KV budget of 1024 tokens against eight requests that each want
         # 96 of prompt and 192 of output: all eight are admitted on their
         # prompts and then grow past the pool, so the scheduler has to preempt.
         # Sizing by max_model_len alone does not, because this model allocates
         # no real cache and its declared budget defaults to 131072 tokens.
-        capacity)   run_config capacity -1 all 512 8 1024 always tests/tt/spec/test_capacity.py ;;
+        capacity)   run_config capacity -1 all 512 8 1024 always false depth tests/tt/spec/test_capacity.py ;;
         lossless)   run_lossless ;;
         *) echo "unknown configuration: $config" >&2; OVERALL=1; continue ;;
     esac
