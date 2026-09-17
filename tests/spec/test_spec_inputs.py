@@ -292,22 +292,57 @@ def test_the_drafts_are_padded_with_the_rows():
 # region Narrow decode
 
 
-def test_narrow_decode_is_kept_when_no_row_carries_a_draft():
-    """A model that also serves ``[B, 1]`` keeps it on a draftless step."""
+def test_a_draftless_step_is_an_ordinary_decode_for_a_narrow_model():
+    """Nothing to verify means no verify, which is what lets the step overlap.
+
+    A step where no row carries a draft and no row has a multi-token commit to
+    resolve has nothing for a verify to do. For a model that declares
+    ``supports_narrow_decode`` it runs as the ordinary decode it is: the plain
+    decode's shapes, no ``spec_mode``, and neither side tensor. That is what
+    makes it eligible for asynchronous overlap, which a verify never is.
+    """
     batch = _batch()
     request = _add_decoding_request(batch, "r")
     runner = _fake_runner(batch, {"r": request}, supports_narrow_decode=True)
 
     model_input = _decode(runner, "r")
 
-    # The plain decode's own shapes, so a model that declares narrow decode
-    # implements no third input shape: [B, 1] tokens and 1-D positions.
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1)
     assert model_input.input_positions.shape == (MAX_NUM_REQS,)
-    # Still sent: the model needs the count to pick the candidate state slot
-    # its previous step committed from, whatever this step's width.
-    assert model_input.accepted_counts.tolist() == [1] * MAX_NUM_REQS
+    assert model_input.spec_mode is None
+    assert model_input.accepted_counts is None
+    assert model_input.num_valid_drafts is None
+
+
+def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
+    """The one draftless step that is still a verify, and why.
+
+    ``accepted_counts`` is how a model finds which candidate state slot its
+    previous step's commit landed on. A row whose last step committed more than
+    one token therefore has to be told, even on a step that drafts nothing, or
+    the model continues from the wrong slot. One step resolves it: that step
+    commits a single token and records a count of 1, and the step after it is
+    an ordinary decode.
+    """
+    batch = _batch()
+    request = _add_decoding_request(batch, "r")
+    runner = _fake_runner(
+        batch,
+        {"r": request},
+        supports_narrow_decode=True,
+        accepted_counts={"r": 3},
+    )
+
+    model_input = _decode(runner, "r")
+
+    assert model_input.spec_mode is not None
+    assert model_input.accepted_counts.tolist()[0] == 3
     assert model_input.num_valid_drafts.tolist() == [0] * MAX_NUM_REQS
+    # The wide block, with every row's draft columns padded. A model sees two
+    # call shapes and no third: this one, which it already implements for a
+    # step whose rows carry fewer drafts than the full width, and its own
+    # ordinary decode.
+    assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1 + 3)
 
 
 def test_narrow_decode_widens_when_any_row_carries_a_draft():
