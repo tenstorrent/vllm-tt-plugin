@@ -1641,3 +1641,127 @@ def test_a_synchronous_launch_still_takes_the_scheduler_s_drafts():
 
 
 # endregion Drafts on an asynchronously scheduled launch
+
+
+# region Serialization across a mixed sequence
+
+
+def test_a_verify_is_not_submitted_over_an_outstanding_ordinary_step():
+    """The drain the pending flags cannot ask for.
+
+    An ordinary step is overlap-safe, so nothing about it forces a drain. A
+    verify built while it is outstanding would start its candidate block from
+    each row's last committed token, and that token is the one the outstanding
+    step has not handed back yet: the block would begin one token behind and
+    the accept walk would commit for the wrong prefix. So the decision looks at
+    what the next step is going to be, not only at what is already pending.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+
+    outstanding = _submit_plain_step(runner, "a")
+    assert list(runner._pending_async_overlap_ok) == [True]
+
+    # A proposal in hand means the next step verifies.
+    runner._proposed_draft_token_ids["a"] = _accept_everything(runner, "a")
+    scheduler_output = _scheduler_output(runner, decoding=["a"])
+
+    assert runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True, scheduler_output=scheduler_output
+    ), "a verify would have been built over an outstanding step"
+
+    model.release()
+    outstanding.get_output()
+    _drain(runner, "a")
+
+
+def test_an_ordinary_step_still_overlaps_an_outstanding_ordinary_step():
+    """The overlap this must not cost: baseline steps still run together."""
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+
+    outstanding = _submit_plain_step(runner, "a")
+    scheduler_output = _scheduler_output(runner, decoding=["a"])
+
+    assert not runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True, scheduler_output=scheduler_output
+    )
+
+    model.release()
+    outstanding.get_output()
+    _drain(runner, "a")
+
+
+def test_an_unresolved_accepted_count_also_forces_the_drain():
+    """A step carrying a count is a verify too, drafts or not.
+
+    The step after a multi-token commit sends ``accepted_counts`` so the model
+    can find the candidate state slot that commit landed on, and it is built
+    from the row's last committed token like any other verify.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+
+    outstanding = _submit_plain_step(runner, "a")
+    runner._req_accepted_counts["a"] = 4
+    scheduler_output = _scheduler_output(runner, decoding=["a"])
+
+    assert runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True, scheduler_output=scheduler_output
+    )
+
+    model.release()
+    outstanding.get_output()
+    _drain(runner, "a")
+
+
+def test_overlapping_submissions_are_counted_and_unsafe_ones_are_not():
+    """The instrumentation a server has no other way to report.
+
+    Nothing else says whether a step overlapped: a launch option does not, a
+    completed request does not, and per-step wall clock cannot separate
+    overlap from a faster model. The device suite reads these counters, so what
+    they count has to be exactly this: a submission that found a step already
+    outstanding, and separately one of those that was not overlap-safe, which
+    must never happen.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+    controller = runner.async_decode
+    assert controller._overlapped_submissions == 0
+
+    first = _submit_plain_step(runner, "a")
+    assert controller._overlapped_submissions == 0, (
+        "the first submission of a chain overlapped nothing"
+    )
+    second = _submit_plain_step(runner, "a")
+
+    assert controller._overlapped_submissions == 1
+    assert controller._overlapped_unsafe_submissions == 0
+
+    model.release()
+    first.get_output()
+    model.release()
+    second.get_output()
+    _drain(runner, "a")
+
+    # And a verify, which drains first, so it overlaps nothing and the unsafe
+    # counter stays where it belongs.
+    _settle_layout(runner)
+    verified = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+    model.release()
+    verified.get_output()
+    _drain(runner, "a")
+
+    assert controller._overlapped_unsafe_submissions == 0
+
+
+# endregion Serialization across a mixed sequence
