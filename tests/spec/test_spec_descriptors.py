@@ -179,7 +179,11 @@ def test_the_model_drafter_call_is_callable_on_an_instance():
     runner = _bare_runner()
     runner._num_speculative_tokens = 2
     runner.input_batch = SimpleNamespace(
-        vocab_size=64, num_tokens=torch.tensor([8, 8], dtype=torch.int32)
+        vocab_size=64,
+        num_tokens=torch.tensor([8, 8], dtype=torch.int32),
+        # The proposal resolves each request's current row through this map,
+        # because a completion since the step's submission can have moved it.
+        req_id_to_index={"a": 0, "b": 1},
     )
     runner.model_config = SimpleNamespace(max_model_len=128)
     runner.model = SimpleNamespace(
