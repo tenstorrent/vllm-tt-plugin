@@ -273,6 +273,8 @@ def test_finish_front_packed_sync_applies_grammar_before_sampling():
         _apply_grammar_to_input=apply_grammar,
         _sample_sync_forward=sample_sync,
         apply_and_build_runner_output=build_output,
+        # This launch does not speculate, so the decode tail owes no proposal.
+        _num_speculative_tokens=0,
     )
     fwd = _sync_forward(_model_input())
 

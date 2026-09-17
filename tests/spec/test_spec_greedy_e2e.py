@@ -19,12 +19,14 @@ no speculation at all, because that equality is the only thing speculation is
 allowed to preserve.
 """
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
@@ -103,6 +105,8 @@ def _runner(
         trace_mode="decode_only",
         request_specific_rope=False,
         _output_tokens_per_step=1,
+        _is_block_output_model=False,
+        _is_adaptive_block_output=False,
         _num_speculative_tokens=num_speculative_tokens,
         _spec_method=method,
         _spec_supports_narrow_decode=False,
@@ -120,6 +124,9 @@ def _runner(
             is_multimodal_model=False, max_model_len=MAX_MODEL_LEN
         ),
         check_perform_device_sampling=lambda **_: False,
+        # A draftless step commits through the ordinary host-sampling tail, so
+        # the sampler has to be the real one.
+        host_sampler=Sampler(),
         _block_tables_per_layer=lambda _: None,
         _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
         _decode_state_slot_remap=lambda row_req_ids: None,
@@ -132,21 +139,20 @@ def _runner(
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
         _committed_positions=TTModelRunner._committed_positions,
     )
-    for name in (
-        "_finish_spec_decode",
-        "walk_spec_acceptance",
-        "spec_committed_prefixes",
-        "commit_spec_acceptance",
-        "build_spec_runner_output",
-        "_finish_front_packed_sync",
-        "_apply_committed_spec_tokens_to_state",
-        "_apply_grammar_to_input",
-        "_propose_ngram_drafts",
-        "_propose_model_drafts",
-        "_reorder_grammar_bitmask",
-        "take_draft_token_ids",
-    ):
-        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
+    # Every remaining method comes from the real class. A draftless step runs
+    # the ordinary sampling tail now, and that tail reaches a chain of helpers
+    # this test has no business enumerating. The attributes set above win, so
+    # the stubs stay stubs, and each descriptor keeps its own binding: copying
+    # a static method onto an instance as a bound one shifts every argument.
+    for name, member in vars(TTModelRunner).items():
+        if hasattr(runner, name):
+            continue
+        if isinstance(member, staticmethod):
+            setattr(runner, name, member.__func__)
+        elif isinstance(member, classmethod):
+            setattr(runner, name, member.__func__.__get__(TTModelRunner))
+        elif inspect.isfunction(member):
+            setattr(runner, name, member.__get__(runner))
     return runner
 
 
@@ -365,13 +371,62 @@ def test_the_verify_is_asked_for_the_mode_the_runner_can_walk():
     assert model.verify_calls[0]["block_width"] == DRAFT_LEN + 1
 
 
-def test_a_narrow_step_finishes_and_commits_one_token():
-    """A model serving a narrow decode still completes a speculative step.
+def test_a_roundtrip_hidden_drafter_keeps_every_step_a_verify():
+    """The gate on the plain path, and the reason for it.
 
-    With ``supports_narrow_decode`` and no drafts in flight, the model is
-    handed one column instead of ``1+K``. The draft block is still built at the
-    full width, so the walk has to be given the width the verify answered at,
-    and it has to survive a draft count of zero.
+    A step with nothing to verify returns no ``VerifyOutput``, so it produces
+    no hidden handle. A drafter that is fed its target hidden state through the
+    runner would then be asked to draft from nothing, so a launch pairing that
+    drafter with this model keeps every step a verify instead. Decided when the
+    model is loaded, because a launch-time decision is checkable and passing
+    ``None`` to that drafter at step time is not.
+    """
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner._spec_method = "custom_class"
+
+    class RoundtripHidden:
+        model_capabilities = {
+            "supports_spec_decode": True,
+            "spec_requirements": ["device_propose", "hidden_feed"],
+            "spec_hidden_handoff": ["roundtrip"],
+        }
+
+    class OnDeviceHidden:
+        model_capabilities = {
+            "supports_spec_decode": True,
+            "spec_requirements": ["device_propose", "hidden_feed"],
+            "spec_hidden_handoff": ["on_device"],
+        }
+
+    class NoHiddenFeed:
+        model_capabilities = {
+            "supports_spec_decode": True,
+            "spec_requirements": ["device_propose"],
+        }
+
+    runner.model = RoundtripHidden()
+    assert runner._narrow_steps_serve_the_drafter() is False
+    runner.model = OnDeviceHidden()
+    assert runner._narrow_steps_serve_the_drafter() is True
+    runner.model = NoHiddenFeed()
+    assert runner._narrow_steps_serve_the_drafter() is True
+
+    # And a launch that speculates with a host proposer needs nothing from the
+    # model here at all.
+    runner._spec_method = "ngram"
+    runner.model = RoundtripHidden()
+    assert runner._narrow_steps_serve_the_drafter() is True
+
+
+def test_a_draftless_step_commits_through_the_ordinary_decode_tail():
+    """With nothing to verify, the step is an ordinary decode.
+
+    ``supports_narrow_decode`` says the model also serves its own decode call
+    inside a speculating launch. A step where no row carries a draft and no row
+    has a multi-token commit to resolve has nothing for a verify to do, so it
+    is sent as that call and commits through the sampling tail. No verify runs,
+    and the accepted count stays at its post-prefill default of 1, which for
+    this map means absent.
     """
     model = FakeSpecModel()
     runner = _runner(model)
@@ -381,9 +436,38 @@ def test_a_narrow_step_finishes_and_commits_one_token():
     output = _step(runner, "r")
 
     assert len(output.sampled_token_ids[0]) == 1
+    assert model.verify_calls == [], "a step with nothing to verify verified"
+    assert len(model.plain_calls) == 1
+    assert model.plain_calls[0]["width"] == 1
+    assert "r" not in runner._req_accepted_counts
+
+
+def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
+    """The step after a multi-token commit carries the count that resolves it.
+
+    ``accepted_counts`` is how a model finds which candidate state slot its
+    previous step's commit landed on, so a row whose last step committed more
+    than one token has to be told even on a step that drafts nothing. One step
+    resolves it: that step commits a single token, and the step after it is an
+    ordinary decode.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "r")
+    runner._req_accepted_counts["r"] = 3
+
+    _step(runner, "r")
+
+    assert len(model.verify_calls) == 1, "the unresolved count was not carried"
+    assert model.verify_calls[0]["accepted_counts"][0] == 3
+    assert model.plain_calls == []
+
+    # Resolved: the next draftless step is an ordinary decode.
     assert runner._req_accepted_counts["r"] == 1
-    # One column, which is the narrow decode's own shape.
-    assert model.verify_calls[0]["block_width"] == 1
+    _step(runner, "r")
+    assert len(model.verify_calls) == 1
+    assert len(model.plain_calls) == 1
 
 
 # endregion The loop
@@ -934,21 +1018,21 @@ def test_a_padding_row_s_committed_positions_stay_negative():
     assert positions.tolist() == [[8, 9, 10], [-1, -1, -1]]
 
 
-def test_a_narrow_step_still_proposes_at_the_uniform_width():
-    """A model serving a narrow decode and its own drafter sees one shape.
+def test_a_draftless_step_still_proposes_at_the_uniform_width():
+    """A model serving its own decode and its own drafter sees one shape.
 
-    ``supports_narrow_decode`` lets a draftless step keep the plain decode's
-    ``[B, 1]`` shapes, so the committed block that step produces is one column
-    wide. The drafter is a separate call with a fixed shape of its own, and a
-    model implementing the documented ``[B, 1+K]`` contract refuses anything
-    narrower, so the runner pads before proposing.
+    ``supports_narrow_decode`` lets a step with nothing to verify run as the
+    ordinary decode it is, so the committed block that step produces is one
+    column wide. The drafter is a separate call with a fixed shape of its own,
+    and a model implementing the documented ``[B, 1+K]`` contract refuses
+    anything narrower, so the runner pads before proposing.
     """
     model = FakeSpecModel()
     runner = _model_drafter_runner(model)
     runner._spec_supports_narrow_decode = True
     _add_request(runner, "r")
 
-    # No drafts in flight, so this step is the narrow one.
+    # No drafts in flight, so this step is the ordinary one.
     output = _step(runner, "r")
 
     assert len(output.sampled_token_ids[0]) == 1
