@@ -384,7 +384,13 @@ class TTAsyncDecodeController:
             or sampling_mode_changed
         )
         reload_inputs = (
-            not device_sampling
+            # A verify's candidate block is assembled from this step's drafts
+            # and each row's last committed token, so it is new every step and
+            # can never be the resident input. The resident mode is for the
+            # plain decode, whose single token the device sampler writes into
+            # the buffer the next decode reads.
+            model_input.spec_mode is not None
+            or not device_sampling
             or transition
             or not supports_resident_decode
             or not decode_trace_enabled
