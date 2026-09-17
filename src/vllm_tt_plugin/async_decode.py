@@ -19,6 +19,7 @@ from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     MODE_REQUIRED_FIELDS,
+    PLACEHOLDER_TOKEN_ID,
     VerifyOutput,
 )
 from vllm_tt_plugin.structured_output import has_structured_outputs
@@ -824,7 +825,15 @@ class TTAsyncDecodeController:
         scheduled = scheduler_output.num_scheduled_tokens
         drafts = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduled:
-            if drafts.get(req_id):
+            offered = drafts.get(req_id) or ()
+            # Read the way ``TTModelRunner._drafts_to_verify`` reads it, and
+            # for the same reason: under asynchronous scheduling every
+            # scheduled request holds ``[-1] * num_spec_tokens_to_schedule``,
+            # which reserves lookahead rather than proposing anything. Taking
+            # that list for a proposal would make every step look like a
+            # verify, and every step would then drain, which is the whole
+            # overlap gone for a launch that drafts nothing.
+            if any(token != PLACEHOLDER_TOKEN_ID for token in offered):
                 return True
             if runner._proposed_draft_token_ids.get(req_id):
                 return True

@@ -1766,3 +1766,39 @@ def test_overlapping_submissions_are_counted_and_unsafe_ones_are_not():
 
 
 # endregion Serialization across a mixed sequence
+
+
+def test_a_reservation_alone_does_not_force_a_drain():
+    """The placeholder list is on every scheduled request, and means nothing.
+
+    Under asynchronous scheduling ``AsyncScheduler`` gives each scheduled
+    request ``[-1] * num_spec_tokens_to_schedule``, so a drain decision that
+    read that list as a proposal would drain on every step and the launch
+    would never overlap anything: exactly the behaviour this whole path exists
+    to remove. The signal is the proposal the runner holds, not the
+    reservation.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+
+    outstanding = _submit_plain_step(runner, "a")
+    assert not runner._proposed_draft_token_ids
+    reserved = _scheduler_output(
+        runner, decoding=["a"], drafts=_reservation(runner, "a")
+    )
+
+    assert not runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True, scheduler_output=reserved
+    ), "the lookahead reservation was read as a proposal"
+
+    # And with a proposal in hand, the same scheduler output does drain.
+    runner._proposed_draft_token_ids["a"] = _accept_everything(runner, "a")
+    assert runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True, scheduler_output=reserved
+    )
+
+    model.release()
+    outstanding.get_output()
+    _drain(runner, "a")
