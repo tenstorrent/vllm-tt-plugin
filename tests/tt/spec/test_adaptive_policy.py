@@ -145,7 +145,11 @@ def test_speculation_resumes_when_the_batch_empties(
         long_future = pool.submit(
             spec_server.complete, long_prompt, max_tokens=long_tokens
         )
-        time.sleep(0.4)
+        # Short, and it has to be: this model's forward is host arithmetic,
+        # so a step costs about a millisecond and a tenth of a second is a
+        # hundred steps. A longer pause and the long request finishes before
+        # its peer is even posted, leaving nothing to measure.
+        time.sleep(0.02)
         peer_before = spec_server.metrics()
         peer = pool.submit(spec_server.complete, peer_prompt, max_tokens=peer_tokens)
         peer_result = peer.result()
