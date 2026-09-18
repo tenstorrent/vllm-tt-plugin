@@ -57,6 +57,41 @@ def only_the_asynchronous_fixed_launch(request, spec_config):
         )
 
 
+def _diagnose(prompt, ids):
+    """Where a response leaves the rule, and what shape the departure has.
+
+    A bare inequality is useless here: the lists are hundreds of tokens long,
+    pytest truncates them, and every failure reads the same. What distinguishes
+    the causes is the shape. One token inserted mid-sequence and the rest
+    following the rule again means a frame was applied that should have been
+    discarded, which is what a replayed prefill after a preemption or a reset
+    produces. One token missing means a frame was dropped. Anything else means
+    the sequence diverged outright, which is a wrong commit rather than a
+    miscounted one.
+    """
+    rule = fixed_target_ids(prompt, len(ids) + 8)
+    at = next((i for i, (got, want) in enumerate(zip(ids, rule)) if got != want), None)
+    if at is None:
+        return None
+    without = ids[:at] + ids[at + 1 :]
+    inserted = without == rule[: len(without)]
+    with_extra = ids[:at] + [rule[at]] + ids[at:]
+    dropped = with_extra == rule[: len(with_extra)]
+    shape = (
+        "one token inserted"
+        if inserted
+        else "one token dropped"
+        if dropped
+        else "diverged outright"
+    )
+    return (
+        f"{shape} at index {at}: emitted {ids[at]}, rule says {rule[at]}; "
+        f"previous emitted {ids[at - 1] if at else None}; "
+        f"emitted[{at}:{at + 3}]={ids[at : at + 3]} "
+        f"rule[{at}:{at + 3}]={rule[at : at + 3]}"
+    )
+
+
 def _assert_is_the_rule(prompt, result, expected_length=None):
     """The whole response, token for token, against the target's own rule."""
     ids = result.token_ids
@@ -65,8 +100,9 @@ def _assert_is_the_rule(prompt, result, expected_length=None):
             f"asked for {expected_length} tokens and got {len(ids)}"
         )
     assert ids, "the request returned no tokens"
-    assert ids == fixed_target_ids(prompt, len(ids)), (
-        "the response is not the sequence this target's rule produces"
+    diagnosis = _diagnose(prompt, ids)
+    assert diagnosis is None, (
+        f"the response is not the sequence this target's rule produces: {diagnosis}"
     )
     return ids
 
@@ -267,8 +303,13 @@ def test_a_cancelled_row_is_reused_without_inheriting_anything(
     one inherited token would put it off the rule from that point on.
     """
     abandoned_prompt = ascending_prompt(64, start=3000)
+    # Long enough that the stream is still decoding when it is abandoned, and
+    # inside the context this launch has: the capacity configurations run a
+    # 512-token context deliberately, and a request asking past it is refused
+    # by the server rather than cancelled by this test.
+    room = spec_server.context_length() - len(abandoned_prompt) - 1
     chunks = spec_server.stream_and_abandon(
-        abandoned_prompt, after=4, max_tokens=MAX_TOKENS * 8
+        abandoned_prompt, after=4, max_tokens=min(MAX_TOKENS * 8, room)
     )
 
     successor_prompt = ascending_prompt(64, start=4000)
@@ -358,7 +399,12 @@ def test_distinct_histories_stay_distinct(
     rows = min(3, max_batch_size)
     if rows < 2:
         pytest.skip("this server serves one row at a time")
-    prompts = [ascending_prompt(64, start=7000 * (i + 1)) for i in range(rows)]
+    # Different lengths, not different contents. This target chooses from the
+    # token and its position, and the first token of every response is the
+    # prefill's own 0 whatever the prompt was, so two prompts of the same
+    # length produce the same sequence however different their tokens are.
+    # Length is what moves the starting position and so the whole sequence.
+    prompts = [ascending_prompt(48 + 16 * i, start=7000 * (i + 1)) for i in range(rows)]
 
     def send(prompt):
         return spec_server.complete(prompt, max_tokens=MAX_TOKENS)
