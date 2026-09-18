@@ -385,11 +385,14 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--prompt-length", type=int, default=64)
-    # Long enough that the per-process clock-tick quantization in the CPU
-    # figure is a per cent of the interval rather than a factor of two, and
-    # inside the context below.
-    parser.add_argument("--max-tokens", type=int, default=3900)
-    parser.add_argument("--max-model-len", type=int, default=4096)
+    # As long as the model's own context allows, because the per-process
+    # clock-tick quantization in the CPU figure is a fixed cost per interval:
+    # at a fifth of a second it moved that figure by a factor of two, and at a
+    # few seconds it is well under a per cent. The dummy's config.json
+    # declares max_position_embeddings 2048, which vLLM enforces as the
+    # ceiling on the context, so the interval is a prompt short of it.
+    parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=1900)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("configurations", nargs="+")
     args = parser.parse_args()
