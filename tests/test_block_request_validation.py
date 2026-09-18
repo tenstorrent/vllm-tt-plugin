@@ -306,6 +306,7 @@ class RequiredDeviceSamplingModel:
             "sampled_logprobs": False,
             "topk_logprobs": False,
             "max_top_k": 32,
+            "supports_unrestricted_top_k": False,
         },
     }
 
@@ -423,6 +424,9 @@ def _start_ar_model(monkeypatch, model_class):
             "required": declared["required"],
             "parameters": sorted(declared["parameters"]),
             "sampled_logprobs": declared["sampled_logprobs"],
+            "supports_unrestricted_top_k": declared.get(
+                "supports_unrestricted_top_k", True
+            ),
             "topk_logprobs": declared["topk_logprobs"],
         }
     return config
@@ -489,7 +493,7 @@ def test_required_device_sampler_accepts_declared_device_logprobs(monkeypatch):
     # this is not an end-to-end device-logprobs qualification.
     config = _start_ar_model(monkeypatch, DeviceLogprobsModel)
 
-    _validate(SamplingParams(max_tokens=16, logprobs=5))
+    _validate(SamplingParams(max_tokens=16, top_k=20, logprobs=5))
     assert TTPlatform._resolve_tt_admission_handle() is config
 
 
@@ -499,6 +503,60 @@ def test_required_device_sampler_enforces_declared_top_k_limit(monkeypatch):
     with pytest.raises(ValueError, match=r"top_k=33.*maximum: 32"):
         _validate(SamplingParams(max_tokens=16, top_k=33))
     assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+@pytest.mark.parametrize("top_k", [0, -1])
+def test_required_device_sampler_rejects_unrestricted_stochastic_top_k(
+    monkeypatch, top_k
+):
+    config = _start_ar_model(monkeypatch, RequiredDeviceSamplingModel)
+
+    with pytest.raises(
+        ValueError, match=rf"top_k={top_k}.*unrestricted sampling unsupported"
+    ):
+        _validate(SamplingParams(max_tokens=16, temperature=1.0, top_k=top_k))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+@pytest.mark.parametrize("top_k", [0, -1])
+def test_required_device_sampler_allows_unrestricted_top_k_for_greedy(
+    monkeypatch, top_k
+):
+    config = _start_ar_model(monkeypatch, RequiredDeviceSamplingModel)
+
+    _validate(SamplingParams(max_tokens=16, temperature=0.0, top_k=top_k))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_undeclared_unrestricted_top_k_support_preserves_compatibility(monkeypatch):
+    class LegacyContractModel(RequiredDeviceSamplingModel):
+        model_capabilities = {
+            **RequiredDeviceSamplingModel.model_capabilities,
+            "device_sampling": {
+                **RequiredDeviceSamplingModel.model_capabilities["device_sampling"],
+            },
+        }
+        model_capabilities["device_sampling"].pop("supports_unrestricted_top_k")
+
+    config = _start_ar_model(monkeypatch, LegacyContractModel)
+    _validate(SamplingParams(max_tokens=16, temperature=1.0, top_k=0))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_unrestricted_top_k_capability_must_be_boolean(monkeypatch):
+    class InvalidContractModel(RequiredDeviceSamplingModel):
+        model_capabilities = {
+            **RequiredDeviceSamplingModel.model_capabilities,
+            "device_sampling": {
+                **RequiredDeviceSamplingModel.model_capabilities["device_sampling"],
+                "supports_unrestricted_top_k": "no",
+            },
+        }
+
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, InvalidContractModel)
+    with pytest.raises(ValueError, match="supports_unrestricted_top_k.*boolean"):
+        TTPlatform.check_and_update_config(config)
 
 
 @pytest.mark.parametrize(
