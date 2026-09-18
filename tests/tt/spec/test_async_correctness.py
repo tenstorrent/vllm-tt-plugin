@@ -38,7 +38,10 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from tests.tt.spec.dummy_arithmetic import fixed_target_ids
-from tests.tt.spec.spec_client import acceptance_delta
+from tests.tt.spec.spec_client import (
+    acceptance_delta,
+    assert_full_length_completion,
+)
 
 MAX_TOKENS = 64
 
@@ -94,11 +97,11 @@ def _diagnose(prompt, ids):
 
 def _assert_is_the_rule(prompt, result, expected_length=None):
     """The whole response, token for token, against the target's own rule."""
-    ids = result.token_ids
     if expected_length is not None:
-        assert len(ids) == expected_length, (
-            f"asked for {expected_length} tokens and got {len(ids)}"
-        )
+        # Length, status and the termination reason first, from the shared
+        # check: a short response explains a content mismatch on its own.
+        assert_full_length_completion(result, expected_length)
+    ids = result.token_ids
     assert ids, "the request returned no tokens"
     diagnosis = _diagnose(prompt, ids)
     assert diagnosis is None, (

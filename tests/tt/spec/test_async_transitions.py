@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from tests.tt.spec.conftest import DUMMY_VOCAB_SIZE
+from tests.tt.spec.dummy_arithmetic import fixed_target_ids
 from tests.tt.spec.spec_client import (
     acceptance_delta,
     assert_full_length_completion,
@@ -228,15 +228,8 @@ def test_the_asynchronous_output_is_the_rule_s_own_sequence(
     record(requests=[result.request])
 
     assert_full_length_completion(result, MAX_TOKENS)
-    ids = result.token_ids
-    # The first emitted token is the prefill's, and this model answers a
-    # prefill the way its base class does, with zero logits whose argmax is
-    # token 0. Every token after it is the rule applied to the one before,
-    # starting at the position that token occupies.
-    expected = [0]
-    token, position = 0, len(prompt)
-    while len(expected) < MAX_TOKENS:
-        token = (token * 31 + position * 7 + 11) % DUMMY_VOCAB_SIZE
-        position += 1
-        expected.append(token)
-    assert ids == expected
+    # One rule from the prompt's last token onwards, the prefill's own choice
+    # included: this target follows it on every kind of step, which is what
+    # makes the whole response a property of the prompt tail and of nothing
+    # else that happened during the run.
+    assert result.token_ids == fixed_target_ids(prompt, MAX_TOKENS)

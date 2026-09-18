@@ -124,16 +124,18 @@ def fixed_target_choice(token: int, position: int) -> int:
 def fixed_target_ids(prompt: list[int], count: int) -> list[int]:
     """The first ``count`` ids a ``fixed`` target emits for ``prompt``.
 
-    The first is the prefill's own, which this model answers the way its base
-    class does: zero logits, whose argmax is token 0. Every later token is the
-    rule applied to the one before it, at the position that token occupies,
-    which is ``len(prompt)`` for the prefill's own token and one more for each
-    token after it.
+    One rule, from the prompt's last token at that token's position, and then
+    from each emitted token at its own. The prefill follows it too, which is
+    what lets this sequence describe a request that was preempted, reset or
+    replayed: each of those replays the history through a prefill, and a
+    prefill outside the rule would put a token in the middle of the response
+    that the rule cannot explain.
+
+    A replay emits no token of its own here. It recomputes the same choice from
+    the same tail, which is the token the request already had.
     """
-    if count <= 0:
-        return []
-    ids = [0]
-    token, position = 0, len(prompt)
+    ids: list[int] = []
+    token, position = prompt[-1], len(prompt) - 1
     while len(ids) < count:
         token = fixed_target_choice(token, position)
         position += 1
