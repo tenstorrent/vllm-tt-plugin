@@ -68,6 +68,12 @@ if TYPE_CHECKING:
 
 logger = init_tt_logger(__name__)
 
+# How often the submission counters are reported. A benchmark diffs the last
+# line before its measured interval against the last one after, so the cadence
+# bounds the error on that diff; a step costs about a millisecond on a model
+# with no device work, so 128 is a fraction of a second.
+_SUBMISSION_LOG_INTERVAL = 128
+
 
 @dataclass(frozen=True)
 class TTDecodeSubmission:
@@ -347,6 +353,11 @@ class TTAsyncDecodeController:
         # this stays at zero for the life of the server.
         self._overlapped_submissions = 0
         self._overlapped_unsafe_submissions = 0
+        # What was actually submitted, by kind. Read by the overhead
+        # benchmark, which cannot take these from the speculative metrics: those
+        # count the scheduler's lookahead reservation rather than a verify.
+        self._ordinary_decode_submissions = 0
+        self._verify_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -640,6 +651,37 @@ class TTAsyncDecodeController:
             self.runner._pending_async_steps.append(step)
             self.runner._pending_async_overlap_ok.append(overlap_ok)
         self._log_overlap_counters(force=unsafe_overlap)
+
+    def count_decode_submission(self, model_input: TTModelInput) -> None:
+        """Count what was actually submitted, and report it on a cadence.
+
+        A measurement cannot take these from vLLM's speculative metrics. Those
+        count what the scheduler reserved, and under asynchronous scheduling
+        ``AsyncScheduler`` reserves ``[-1] * K`` for every scheduled request
+        whether or not a draft was ever verified, so
+        ``spec_decode_num_drafts_total`` moves on a launch that verifies
+        nothing. What a cost-per-step comparison needs is how many verifies and
+        how many ordinary decodes the runner actually sent, which only the
+        runner knows.
+
+        Counted in ``submit_decode`` because that is the single funnel both
+        execution modes go through, so a synchronous run and an asynchronous
+        one are counted by the same code. Reported every
+        ``_SUBMISSION_LOG_INTERVAL`` submissions rather than per step: a
+        benchmark diffs the last line before its interval against the last one
+        after, and a line per step would cost more than the work it measures.
+        """
+        if model_input.spec_mode is None:
+            self._ordinary_decode_submissions += 1
+        else:
+            self._verify_submissions += 1
+        total = self._ordinary_decode_submissions + self._verify_submissions
+        if total % _SUBMISSION_LOG_INTERVAL == 0:
+            logger.info(
+                "TT submissions: %d ordinary decode, %d verify",
+                self._ordinary_decode_submissions,
+                self._verify_submissions,
+            )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
         """Report the overlap counters, rarely enough to be readable.
@@ -1104,6 +1146,7 @@ class TTAsyncDecodeController:
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
         contract_version = self.decode_input_update_contract_version()
+        self.count_decode_submission(model_input)
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
