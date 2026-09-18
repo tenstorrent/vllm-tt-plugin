@@ -1429,3 +1429,56 @@ def test_releasing_another_request_leaves_the_session_owners_block_intact():
     outputs = scheduler.update_from_output(submitted, _runner_output(submitted, block))
     assert outputs[0].outputs[0].new_token_ids == block
     assert req_b.num_output_placeholders == 0
+
+
+def test_a_block_width_output_on_a_baseline_step_is_refused():
+    """vllm-tt-plugin#118 review (r4045325441): when the adaptive scheduler
+    stamps a step width 1 -- batched, or a prompt over the spec frontier -- the
+    model owes exactly one baseline token.
+
+    The baseline branch used to delegate straight to super(), which appends
+    whatever it is handed. A model returning a BLOCK there would commit K tokens
+    against a single reserved placeholder, and the disagreement would surface
+    later as a placeholder leak or a corrupted continuation rather than at its
+    cause. Refuse it, naming the request and both widths.
+    """
+    scheduler = _scheduler(adaptive=True, max_num_seqs=2)
+    req_a = _request(CANVAS * 2, request_id="req-a")
+    req_b = _request(CANVAS * 2, request_id="req-b")
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    # Batched prefill: both commit their anchors, so neither owns the session
+    # and the next step is stamped width 1 for both.
+    submitted = scheduler.schedule()
+    assert len(submitted.num_scheduled_tokens) == 2
+    scheduler.update_from_output(
+        submitted,
+        ModelRunnerOutput(
+            req_ids=["req-a", "req-b"],
+            req_id_to_index={"req-a": 0, "req-b": 1},
+            sampled_token_ids=[[5], [6]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    submitted = scheduler.schedule()
+    for req in (req_a, req_b):
+        assert get_tt_block_step_decisions(submitted)[req.request_id] is False
+        assert req.num_output_placeholders == 1
+
+    # req-a returns a full block on a step scheduled for one token.
+    with pytest.raises(ValueError, match="violates the scheduled baseline width"):
+        scheduler.update_from_output(
+            submitted,
+            ModelRunnerOutput(
+                req_ids=["req-a", "req-b"],
+                req_id_to_index={"req-a": 0, "req-b": 1},
+                sampled_token_ids=[list(range(CANVAS)), [7]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )

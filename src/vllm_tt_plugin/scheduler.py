@@ -915,6 +915,24 @@ class TTScheduler(AsyncScheduler):
                     f"scheduling decision: req_id={request.request_id!r}"
                 )
             if not block_step:
+                # The scheduler stamped this step width 1, so the model owes
+                # exactly one token. Check before delegating: super() appends
+                # whatever it is handed, so a model that returned a BLOCK here
+                # would commit extra tokens against a single reserved
+                # placeholder and the mismatch would surface later as a
+                # placeholder leak or a corrupted continuation, far from its
+                # cause. This is the mirror of the block-width check below.
+                if len(new_token_ids) != self.num_sampled_tokens_per_step:
+                    raise ValueError(
+                        "Model output width violates the scheduled baseline "
+                        f"width: got {len(new_token_ids)}, expected "
+                        f"{self.num_sampled_tokens_per_step} "
+                        f"(req_id={request.request_id!r}); the scheduler "
+                        "stamped this step width 1 (batched, or a prompt over "
+                        "the spec frontier), so the model must return a single "
+                        "baseline token -- the scheduler and model block gates "
+                        "disagree"
+                    )
                 return super()._update_request_with_output(request, new_token_ids)
         if request.async_tokens_to_discard:
             # A block step reserved K placeholders; the AsyncScheduler discard
