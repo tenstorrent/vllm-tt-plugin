@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
 import asyncio
+import math
 from functools import cached_property
 from types import SimpleNamespace
 
@@ -559,8 +560,9 @@ def _domain_model(**domain_overrides):
 def test_parameter_domain_admits_only_declared_cross_product(
     monkeypatch, top_k, top_p, logprobs
 ):
-    _start_ar_model(monkeypatch, _domain_model())
+    config = _start_ar_model(monkeypatch, _domain_model())
     _validate(SamplingParams(top_k=top_k, top_p=top_p, logprobs=logprobs))
+    assert TTPlatform._resolve_tt_admission_handle() is config
 
 
 @pytest.mark.parametrize(
@@ -600,9 +602,56 @@ def test_parameter_domain_rejects_malformed_declarations(monkeypatch, override):
 
 
 def test_parameter_domain_does_not_restrict_bounded_sampling(monkeypatch):
-    _start_ar_model(monkeypatch, _domain_model())
+    config = _start_ar_model(monkeypatch, _domain_model())
     _validate(SamplingParams(top_k=16, top_p=0.95, logprobs=0))
     _validate(SamplingParams(temperature=0.0))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_parameter_domain_rejects_next_float_above_runtime_bound(monkeypatch):
+    config = _start_ar_model(monkeypatch, _domain_model())
+    _validate(SamplingParams(top_k=0, top_p=0.125))
+    with pytest.raises(ValueError, match="outside unrestricted sampling domain"):
+        _validate(SamplingParams(top_k=0, top_p=math.nextafter(0.125, 1.0)))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_parameter_domain_independent_sampling_subfeatures(monkeypatch):
+    config = _start_ar_model(
+        monkeypatch, _domain_model(top_p_one=False, sampled_logprobs=False)
+    )
+    _validate(SamplingParams(top_k=0, top_p=0.125))
+    with pytest.raises(ValueError, match="outside unrestricted sampling domain"):
+        _validate(SamplingParams(top_k=0, top_p=1.0))
+    with pytest.raises(ValueError, match="outside unrestricted sampling domain"):
+        _validate(SamplingParams(top_k=0, top_p=0.125, logprobs=0))
+    # The restricted path does not remove a bounded sampler's logprob support.
+    _validate(SamplingParams(top_k=16, top_p=0.95, logprobs=0))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_parameter_domain_zero_disables_nucleus_interval(monkeypatch):
+    config = _start_ar_model(monkeypatch, _domain_model(max_nucleus_top_p=0.0))
+    _validate(SamplingParams(top_k=0, top_p=1.0))
+    with pytest.raises(ValueError, match="outside unrestricted sampling domain"):
+        _validate(SamplingParams(top_k=0, top_p=0.0001))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_parameter_domain_is_copied_at_admission(monkeypatch):
+    model = _domain_model()
+    config = _start_ar_model(monkeypatch, model)
+    model.model_capabilities["device_sampling"]["unrestricted_top_k_domain"][
+        "max_nucleus_top_p"
+    ] = 0.99
+    assert (
+        get_tt_device_sampling_contract(config)["unrestricted_top_k_domain"][
+            "max_nucleus_top_p"
+        ]
+        == 0.125
+    )
+    with pytest.raises(ValueError, match="outside unrestricted sampling domain"):
+        _validate(SamplingParams(top_k=0, top_p=0.95))
 
 
 def test_undeclared_unrestricted_top_k_support_preserves_compatibility(monkeypatch):
