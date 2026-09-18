@@ -188,7 +188,7 @@ def _discover_standard_dp_visible_device_groups(
     [("0,1,2,3,4,5,6,7", (1, 8)), ...]
     """
     import ttnn
-    from models.tt_transformers.tt.generator import create_submeshes
+    from models.ttt_compat.tt.generator import create_submeshes
 
     mesh_device = None
     submeshes = []
