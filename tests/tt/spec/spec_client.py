@@ -25,10 +25,10 @@ The counters that matter, all per engine:
 ``vllm:num_preemptions_total``
     Preemptions. A capacity test that does not check this has not established
     that preemption happened.
-``vllm:iteration_tokens_total``
-    A histogram of tokens committed per engine step. Its buckets bound the
-    number of rows that ran in the same step from below, which is the only
-    instrumentation here that says anything about batch size.
+The server log reports ``TT scheduler: widest decode batch reached N request
+row(s)`` from the scheduler's actual decode batch. The concurrency regression
+uses that direct signal because ``vllm:iteration_tokens_total`` also counts
+prefill tokens and cannot establish decode batch width.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -46,6 +47,9 @@ TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 
 _SAMPLE = re.compile(
     r"^(?P<name>[a-zA-Z_:][^{\s]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)$"
+)
+_WIDEST_DECODE_BATCH = re.compile(
+    r"TT scheduler: widest decode batch reached (\d+) request row\(s\)"
 )
 
 
@@ -104,17 +108,6 @@ class Metrics:
 
     def per_position(self, name: str, positions: int) -> list[float]:
         return [self.get(name, position=str(index)) for index in range(positions)]
-
-    def iteration_token_buckets(self) -> list[tuple[float, float]]:
-        """``(upper bound, cumulative count)`` for the tokens-per-step histogram."""
-        found = [
-            (float(dict(labels)["le"]), value)
-            for (name, labels) in self.samples
-            if name == "vllm:iteration_tokens_total_bucket"
-            for value in [self.samples[(name, labels)]]
-            if "le" in dict(labels)
-        ]
-        return sorted(found)
 
 
 @dataclass
@@ -187,37 +180,23 @@ def acceptance_delta(before: Metrics, after: Metrics, positions: int) -> Accepta
     )
 
 
-def rows_in_the_widest_step(before: Metrics, after: Metrics, per_row_max: int) -> int:
-    """A lower bound on how many rows shared one engine step.
+def widest_decode_batch_size(server_log: Path) -> int:
+    """Return the largest decode row count reported by ``TTScheduler``."""
+    widest = 0
+    for line in server_log.read_text(errors="replace").splitlines():
+        if found := _WIDEST_DECODE_BATCH.search(line):
+            widest = max(widest, int(found.group(1)))
+    return widest
 
-    Derived from the tokens-per-step histogram rather than claimed: a step
-    counted above the bucket bound ``b`` committed more than ``b`` tokens, and
-    one row commits at most ``per_row_max`` in a step, so more than
-    ``b / per_row_max`` rows ran in it. This is the only batch-size statement
-    the server's instrumentation supports, and it is a bound, not a count.
-    """
-    before_buckets = dict(before.iteration_token_buckets())
-    after_buckets = after.iteration_token_buckets()
-    if not after_buckets:
-        return 0
-    deltas = [
-        (bound, count - before_buckets.get(bound, 0.0))
-        for bound, count in after_buckets
-    ]
-    # The counts are cumulative and the last bound holds every observation, so
-    # its delta is the number of new steps.
-    total = deltas[-1][1]
-    if total <= 0:
-        return 0
-    # The largest bound some new step exceeded: its delta is short of the
-    # total, which means a new step landed above it.
-    exceeded = 0.0
-    for bound, delta in deltas:
-        if delta < total:
-            exceeded = max(exceeded, bound)
-    if exceeded == 0.0:
-        return 0
-    return int(exceeded // per_row_max) + 1
+
+def assert_multirow_decode_was_scheduled(server_log: Path) -> int:
+    """Require direct evidence that at least two rows shared a decode step."""
+    widest = widest_decode_batch_size(server_log)
+    assert widest >= 2, (
+        "the TT scheduler reported no decode batch with at least two request "
+        f"rows; the widest reported decode batch contained {widest} row(s)"
+    )
+    return widest
 
 
 @dataclass
@@ -247,6 +226,14 @@ class Completion:
     @property
     def completion_tokens(self) -> int:
         return int(self.body["usage"]["completion_tokens"])
+
+
+def assert_full_length_completion(completion: Completion, requested: int) -> None:
+    """Require the full ignored-EOS completion and its length termination."""
+    assert completion.status == 200
+    assert completion.completion_tokens == requested
+    assert len(completion.token_ids) == requested
+    assert completion.finish_reason == "length"
 
 
 @dataclass

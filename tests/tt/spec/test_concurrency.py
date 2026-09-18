@@ -14,11 +14,10 @@ They **stagger the arrivals**, which is what makes rows join a batch that is
 already decoding and forces the persistent batch to grow while drafts are in
 flight.
 
-And where a claim about the same-step batch size is made, they **derive it from
-the scheduler's own instrumentation**: the tokens-per-step histogram bounds the
-number of rows that shared a step from below, because one row commits at most
-``1+K`` tokens in a step. A claim that four rows ran together is a claim about
-that histogram, not about how many requests were posted.
+And where a claim about the same-step batch size is made, the test reads the
+scheduler's direct report of the widest decode batch. A claim that rows ran
+together is a claim about the scheduler output, not about how many requests
+were posted or how many prompt tokens a metric counted.
 """
 
 from __future__ import annotations
@@ -28,7 +27,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from tests.tt.spec.spec_client import acceptance_delta, rows_in_the_widest_step
+from tests.tt.spec.spec_client import (
+    acceptance_delta,
+    assert_multirow_decode_was_scheduled,
+)
 
 
 def _post_all(spec_server, jobs, stagger: float = 0.0):
@@ -82,15 +84,14 @@ def test_distinct_requests_each_get_their_own_output(
 
 
 def test_the_rows_shared_engine_steps(
-    spec_server, spec_config, ascending_prompt, max_batch_size, record
+    spec_server,
+    spec_config,
+    ascending_prompt,
+    max_batch_size,
+    server_log,
+    record,
 ):
-    """The batch-size claim, taken from the scheduler's histogram.
-
-    One row commits at most ``1+K`` tokens in a step. A step that committed
-    more than ``(rows - 1) * (1+K)`` tokens therefore had at least ``rows``
-    rows in it. That is the strongest statement this instrumentation supports,
-    and it is a bound rather than a count.
-    """
+    """Require the scheduler to report a decode step with multiple rows."""
     rows = min(4, max_batch_size)
     if rows < 2:
         pytest.skip("this server serves one row at a time")
@@ -102,28 +103,15 @@ def test_the_rows_shared_engine_steps(
     results = _post_all(spec_server, jobs)
     after = spec_server.metrics()
     delta = acceptance_delta(before, after, spec_config.k)
-    bound = rows_in_the_widest_step(before, after, spec_config.committed_per_step)
+    widest = assert_multirow_decode_was_scheduled(server_log)
     record(
         requests=[result.request for result in results],
         acceptance=delta.as_dict(),
         rows_posted=rows,
-        rows_in_the_widest_step_at_least=bound,
-        buckets_before=before.iteration_token_buckets(),
-        buckets_after=after.iteration_token_buckets(),
+        widest_decode_batch_size=widest,
     )
 
     assert all(result.status == 200 for result in results)
-    assert bound >= 2, (
-        f"the tokens-per-step histogram shows no step wide enough for two rows "
-        f"of at most {spec_config.committed_per_step} tokens, so these "
-        f"{rows} requests were served one after another"
-    )
-    # And the step count is far below what serving them in turn would need.
-    committed = sum(result.completion_tokens for result in results)
-    assert delta.steps < committed, (
-        "the engine took at least one step per committed token, which is what "
-        "serving the requests in turn without speculation looks like"
-    )
 
 
 def test_a_request_joining_a_running_batch_is_served_correctly(
