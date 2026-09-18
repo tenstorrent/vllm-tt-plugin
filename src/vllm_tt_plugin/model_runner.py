@@ -41,6 +41,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
+    get_tt_device_sampling_contract,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
@@ -179,6 +180,7 @@ class TTModelRunner:
         self.enable_model_warmup = enable_model_warmup
         # Runtime-discovered physical device count, supplied by the worker.
         self.num_devices = num_devices
+        self.device_sampling_contract = get_tt_device_sampling_contract(vllm_config)
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
@@ -1951,8 +1953,9 @@ class TTModelRunner:
         if has_structured_outputs:
             return False
 
-        # Logprobs on device require multi-device setups (num_devices in {8,32}).
-        # On single device, all logprobs require host sampling.
+        # Models without an explicit contract retain the legacy device-count
+        # and model-type rules below. Declared capabilities take precedence.
+        # Historically device logprobs were enabled only on {8,32} devices.
         # https://github.com/tenstorrent/tt-metal/issues/34077
         #
         # Top-K logprobs (max_lp > 0) are only supported on device by models
@@ -1962,10 +1965,20 @@ class TTModelRunner:
         # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
         if max_lp is not None:
-            if num_devices not in (8, 32):
-                return False
-            if max_lp > 0 and not self.supports_topk_logprobs:
-                return False
+            contract = getattr(self, "device_sampling_contract", None)
+            if contract is not None:
+                # Use the same normalized declaration as request admission.
+                # A declaration is authoritative in both directions; legacy
+                # device/model heuristics apply only when none was supplied.
+                if not contract["sampled_logprobs"]:
+                    return False
+                if max_lp > 0 and not contract["topk_logprobs"]:
+                    return False
+            else:
+                if num_devices not in (8, 32):
+                    return False
+                if max_lp > 0 and not self.supports_topk_logprobs:
+                    return False
 
         return True
 
