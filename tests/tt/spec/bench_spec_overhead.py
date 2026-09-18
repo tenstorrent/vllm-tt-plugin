@@ -36,6 +36,13 @@ What it measures, and how:
     the only figure here that is a cost rather than a rate, and it is why the
     benchmark has to run on the machine under test.
 
+    The kernel reports those two in clock ticks of 10 ms, per process, so a
+    short interval measures quantization rather than cost: an interval of a
+    fifth of a second across half a dozen processes moved this figure by a
+    factor of two between repetitions of one configuration. The default
+    interval is long enough that the quantization is a per cent of it, which
+    is why the requests ask for thousands of tokens rather than dozens.
+
 ``ordinary decode and verify submissions``
     The runner's own counters, from its log. Not the speculative metrics:
     those count the scheduler's lookahead reservation, which under
@@ -289,7 +296,9 @@ def run_interval(
 # region Configurations
 
 
-def configuration(name: str, *, plugin: str, model: str, port: int) -> dict:
+def configuration(
+    name: str, *, plugin: str, model: str, port: int, max_model_len: int
+) -> dict:
     """The launches this benchmark compares, as command and environment.
 
     Every one of them shares the sampling mode, the context, the concurrency
@@ -307,7 +316,7 @@ def configuration(name: str, *, plugin: str, model: str, port: int) -> dict:
         "--max_num_seqs",
         "8",
         "--max_model_len",
-        "2048",
+        str(max_model_len),
         "--port",
         str(port),
         "--additional-config",
@@ -376,7 +385,11 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--prompt-length", type=int, default=64)
-    parser.add_argument("--max-tokens", type=int, default=128)
+    # Long enough that the per-process clock-tick quantization in the CPU
+    # figure is a per cent of the interval rather than a factor of two, and
+    # inside the context below.
+    parser.add_argument("--max-tokens", type=int, default=3900)
+    parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("configurations", nargs="+")
     args = parser.parse_args()
@@ -387,7 +400,13 @@ def main() -> int:
     results = {}
 
     for name in args.configurations:
-        plan = configuration(name, plugin=args.plugin, model=args.model, port=args.port)
+        plan = configuration(
+            name,
+            plugin=args.plugin,
+            model=args.model,
+            port=args.port,
+            max_model_len=args.max_model_len,
+        )
         log = artifacts / name / "server.log"
         print(f"=== {name}: {plan['describe']}", flush=True)
         print("    " + " ".join(shlex.quote(part) for part in plan["command"]))
@@ -454,8 +473,10 @@ def main() -> int:
             "concurrency": args.concurrency,
             "prompt_length": args.prompt_length,
             "max_tokens": args.max_tokens,
+            "max_model_len": args.max_model_len,
             "repeats": args.repeats,
             "model": args.model,
+            "clock_tick_seconds": 1.0 / CLOCK_TICKS,
         },
         "results": results,
     }
