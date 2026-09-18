@@ -1991,3 +1991,47 @@ def test_the_submission_counters_separate_verifies_from_ordinary_decodes():
 
     assert controller._ordinary_decode_submissions == 1
     assert controller._verify_submissions == 1
+
+
+def test_the_submission_report_is_the_line_the_benchmark_parses():
+    """The counters reach a measurement as text, so the text is the contract.
+
+    ``bench_spec_overhead`` has no access to the worker process that holds
+    ``TTAsyncDecodeController``; it diffs the last reported line before its
+    measured interval against the last one after. A reworded line does not
+    fail anything by itself: the benchmark's pattern stops matching, every
+    diff becomes zero, and the run still prints a result. This pins the
+    wording that pattern is compiled from, the cadence that decides which
+    submissions report, and the third count, which is what says whether a
+    configuration's extra cost is work it added or overlap it lost.
+    """
+    from tests.tt.spec.bench_spec_overhead import SUBMISSIONS
+
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    controller = runner.async_decode
+    # One short of ``_SUBMISSION_LOG_INTERVAL`` in total, so the next
+    # submission is the one that reports and the cadence itself is under test.
+    controller._ordinary_decode_submissions = 17
+    controller._verify_submissions = async_decode_module._SUBMISSION_LOG_INTERVAL - 18
+    controller._overlapped_submissions = 9
+    ordinary = SimpleNamespace(spec_mode=None)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    async_decode_module.logger.addHandler(handler)
+    try:
+        controller.count_decode_submission(ordinary)
+        controller.count_decode_submission(ordinary)
+    finally:
+        async_decode_module.logger.removeHandler(handler)
+
+    lines = stream.getvalue().splitlines()
+    reported = [found.groups() for line in lines if (found := SUBMISSIONS.search(line))]
+    assert reported == [
+        ("18", str(async_decode_module._SUBMISSION_LOG_INTERVAL - 18), "9")
+    ], (
+        "the submission report no longer matches the pattern the overhead "
+        f"benchmark parses, or no longer reports on the interval; the runner "
+        f"logged {lines!r}"
+    )

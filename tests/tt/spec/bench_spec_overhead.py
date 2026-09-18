@@ -43,11 +43,16 @@ What it measures, and how:
     interval is long enough that the quantization is a per cent of it, which
     is why the requests ask for thousands of tokens rather than dozens.
 
-``ordinary decode and verify submissions``
+``ordinary decode, verify and overlapped submissions``
     The runner's own counters, from its log. Not the speculative metrics:
     those count the scheduler's lookahead reservation, which under
     asynchronous scheduling exists for every scheduled request whether or not
-    a draft was ever verified.
+    a draft was ever verified. The overlap count says whether the extra cost
+    of a configuration is work it added or overlap it lost, which the wall
+    clock alone cannot separate. All three are reported on a cadence of
+    ``_SUBMISSION_LOG_INTERVAL`` submissions, so each diff is a multiple of
+    that interval and understates or overstates the true count by less than
+    one interval.
 
 What it deliberately does not do: sleep anywhere inside a measured interval,
 read the submission and completion timestamps as a per-step cost (they omit
@@ -74,7 +79,10 @@ from pathlib import Path
 import httpx
 
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
-SUBMISSIONS = re.compile(r"TT submissions: (\d+) ordinary decode, (\d+) verify")
+SUBMISSIONS = re.compile(
+    r"TT submissions: (\d+) ordinary decode, (\d+) verify, "
+    r"(\d+) overlapped an outstanding step"
+)
 GENERATION_TOKENS = "vllm:generation_tokens_total"
 DUMMY_VOCAB_SIZE = 128256
 
@@ -137,16 +145,25 @@ def generation_tokens(base_url: str) -> float:
     raise AssertionError(f"{GENERATION_TOKENS} is not in this server's metrics")
 
 
-def submission_counts(log: Path) -> tuple[int, int]:
-    """The runner's last reported ``(ordinary, verify)`` submission counts."""
-    last = (0, 0)
+def submission_counts(log: Path) -> tuple[int, int, int]:
+    """The runner's last ``(ordinary, verify, overlapped)`` counts.
+
+    All three come off one line so a diff across a measured interval divides
+    the overlaps by the submissions they were counted against. A synchronous
+    launch never overlaps and reports a third number of zero.
+    """
+    last = (0, 0, 0)
     try:
         text = log.read_text(errors="replace")
     except OSError:
         return last
     for line in text.splitlines():
         if found := SUBMISSIONS.search(line):
-            last = (int(found.group(1)), int(found.group(2)))
+            last = (
+                int(found.group(1)),
+                int(found.group(2)),
+                int(found.group(3)),
+            )
     return last
 
 
@@ -288,6 +305,7 @@ def run_interval(
         },
         "ordinary_decode_submissions": submissions_after[0] - submissions_before[0],
         "verify_submissions": submissions_after[1] - submissions_before[1],
+        "overlapped_submissions": submissions_after[2] - submissions_before[2],
     }
 
 
@@ -467,7 +485,8 @@ def main() -> int:
             f"    tokens/s {statistics.median(rates):.1f}"
             f"  cpu ms/token {statistics.median(costs):.3f}"
             f"  verify submissions {intervals[-1]['verify_submissions']}"
-            f"  ordinary {intervals[-1]['ordinary_decode_submissions']}",
+            f"  ordinary {intervals[-1]['ordinary_decode_submissions']}"
+            f"  overlapped {intervals[-1]['overlapped_submissions']}",
             flush=True,
         )
 

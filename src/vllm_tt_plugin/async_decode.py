@@ -670,6 +670,16 @@ class TTAsyncDecodeController:
         ``_SUBMISSION_LOG_INTERVAL`` submissions rather than per step: a
         benchmark diffs the last line before its interval against the last one
         after, and a line per step would cost more than the work it measures.
+
+        The line repeats ``_overlapped_submissions``, which
+        ``_log_overlap_counters`` also reports, because that one reports at
+        every power of two: between 4096 and 8191 overlaps it prints nothing,
+        so a diff across a measured interval cannot tell a launch that kept
+        overlapping from one that stopped. Here the same cadence carries the
+        overlap count and the submission count it divides by. The current
+        submission is not registered as pending until later in
+        ``submit_decode``, so the overlap count on a line covers the
+        submissions before this one.
         """
         if model_input.spec_mode is None:
             self._ordinary_decode_submissions += 1
@@ -678,9 +688,11 @@ class TTAsyncDecodeController:
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
             logger.info(
-                "TT submissions: %d ordinary decode, %d verify",
+                "TT submissions: %d ordinary decode, %d verify, "
+                "%d overlapped an outstanding step",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
+                self._overlapped_submissions,
             )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
