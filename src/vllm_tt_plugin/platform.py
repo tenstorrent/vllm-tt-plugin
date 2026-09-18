@@ -3,6 +3,7 @@
 
 import gc
 import json
+import math
 import multiprocessing
 import os
 import sys
@@ -118,7 +119,7 @@ def _normalize_device_sampling_contract(
             f"{model_class.__name__} must be an integer >= 1 or None, got "
             f"{max_top_k!r}"
         )
-    return {
+    normalized = {
         "max_top_k": max_top_k,
         "required": required,
         "parameters": sorted(set(parameters)),
@@ -126,6 +127,47 @@ def _normalize_device_sampling_contract(
         "supports_unrestricted_top_k": supports_unrestricted_top_k,
         "topk_logprobs": topk_logprobs,
     }
+    domain = contract.get("unrestricted_top_k_domain")
+    if domain is not None:
+        fields = {
+            "top_p_one",
+            "max_nucleus_top_p",
+            "sampled_logprobs",
+            "max_top_logprobs",
+        }
+        if not isinstance(domain, dict) or set(domain) != fields:
+            raise ValueError("unrestricted_top_k_domain has invalid fields")
+        if supports_unrestricted_top_k:
+            raise ValueError(
+                "a restricted domain requires supports_unrestricted_top_k=False"
+            )
+        if any(
+            type(domain[key]) is not bool for key in ("top_p_one", "sampled_logprobs")
+        ):
+            raise ValueError("unrestricted_top_k_domain flags must be booleans")
+        limit = domain["max_nucleus_top_p"]
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, (int, float))
+            or not math.isfinite(limit)
+            or not 0 <= limit < 1
+        ):
+            raise ValueError(
+                "unrestricted_top_k_domain max_nucleus_top_p must be finite in [0,1)"
+            )
+        top_n = domain["max_top_logprobs"]
+        if type(top_n) is not int or top_n < 0:
+            raise ValueError(
+                "unrestricted_top_k_domain max_top_logprobs must be nonnegative"
+            )
+        if (domain["sampled_logprobs"] and not sampled_logprobs) or (
+            top_n and (not domain["sampled_logprobs"] or not topk_logprobs)
+        ):
+            raise ValueError(
+                "unrestricted_top_k_domain logprobs exceed declared capabilities"
+            )
+        normalized["unrestricted_top_k_domain"] = dict(domain)
+    return normalized
 
 
 def _unsupported_required_device_sampling_params(params, contract: dict) -> list[str]:
@@ -153,7 +195,26 @@ def _unsupported_required_device_sampling_params(params, contract: dict) -> list
         and params.temperature > 0
         and params.top_k <= 0
     ):
-        unsupported.append(f"top_k={params.top_k} (unrestricted sampling unsupported)")
+        domain = contract.get("unrestricted_top_k_domain")
+        if domain is None:
+            unsupported.append(
+                f"top_k={params.top_k} (unrestricted sampling unsupported)"
+            )
+        else:
+            # The runtime derives this bound from its kernel capacity and
+            # vocabulary. Do not duplicate device planning in the frontend.
+            admitted_p = (
+                params.top_p == 1.0 and domain["top_p_one"]
+            ) or 0 < params.top_p <= domain["max_nucleus_top_p"]
+            if not admitted_p:
+                unsupported.append(
+                    f"top_p={params.top_p} (outside unrestricted sampling domain)"
+                )
+            if params.logprobs is not None and (
+                not domain["sampled_logprobs"]
+                or params.logprobs > domain["max_top_logprobs"]
+            ):
+                unsupported.append("logprobs (outside unrestricted sampling domain)")
 
     # These controls always select vLLM's host-logits path in the current TT
     # runner. A model declaration cannot make that path device-capable.

@@ -428,6 +428,11 @@ def _start_ar_model(monkeypatch, model_class):
                 "supports_unrestricted_top_k", True
             ),
             "topk_logprobs": declared["topk_logprobs"],
+            **(
+                {"unrestricted_top_k_domain": declared["unrestricted_top_k_domain"]}
+                if "unrestricted_top_k_domain" in declared
+                else {}
+            ),
         }
     return config
 
@@ -526,6 +531,78 @@ def test_required_device_sampler_allows_unrestricted_top_k_for_greedy(
 
     _validate(SamplingParams(max_tokens=16, temperature=0.0, top_k=top_k))
     assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def _domain_model(**domain_overrides):
+    class DomainModel(RequiredDeviceSamplingModel):
+        model_capabilities = {
+            **RequiredDeviceSamplingModel.model_capabilities,
+            "device_sampling": {
+                **RequiredDeviceSamplingModel.model_capabilities["device_sampling"],
+                "sampled_logprobs": True,
+                "unrestricted_top_k_domain": {
+                    "top_p_one": True,
+                    "max_nucleus_top_p": 0.125,
+                    "sampled_logprobs": True,
+                    "max_top_logprobs": 0,
+                    **domain_overrides,
+                },
+            },
+        }
+
+    return DomainModel
+
+
+@pytest.mark.parametrize("top_k", [0, -1])
+@pytest.mark.parametrize("top_p", [1.0, 0.125, 0.01])
+@pytest.mark.parametrize("logprobs", [None, 0])
+def test_parameter_domain_admits_only_declared_cross_product(
+    monkeypatch, top_k, top_p, logprobs
+):
+    _start_ar_model(monkeypatch, _domain_model())
+    _validate(SamplingParams(top_k=top_k, top_p=top_p, logprobs=logprobs))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"top_p": 0.126},
+        {"top_p": 0.95},
+        {"logprobs": 1},
+    ],
+)
+def test_parameter_domain_rejects_before_execution(monkeypatch, kwargs):
+    config = _start_ar_model(monkeypatch, _domain_model())
+    with pytest.raises(ValueError, match="outside unrestricted sampling domain"):
+        _validate(SamplingParams(top_k=0, **kwargs))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+    _validate(SamplingParams(top_k=0, top_p=1.0, logprobs=0))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"max_nucleus_top_p": float("nan")},
+        {"max_nucleus_top_p": float("inf")},
+        {"max_nucleus_top_p": True},
+        {"max_nucleus_top_p": -0.1},
+        {"max_nucleus_top_p": 1.0},
+        {"top_p_one": "yes"},
+        {"max_top_logprobs": True},
+        {"max_top_logprobs": -1},
+        {"max_top_logprobs": 1},
+        {"extra": 1},
+    ],
+)
+def test_parameter_domain_rejects_malformed_declarations(monkeypatch, override):
+    with pytest.raises(ValueError, match="unrestricted_top_k_domain"):
+        _start_ar_model(monkeypatch, _domain_model(**override))
+
+
+def test_parameter_domain_does_not_restrict_bounded_sampling(monkeypatch):
+    _start_ar_model(monkeypatch, _domain_model())
+    _validate(SamplingParams(top_k=16, top_p=0.95, logprobs=0))
+    _validate(SamplingParams(temperature=0.0))
 
 
 def test_undeclared_unrestricted_top_k_support_preserves_compatibility(monkeypatch):
