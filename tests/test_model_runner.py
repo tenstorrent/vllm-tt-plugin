@@ -389,3 +389,43 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     )
     expected = not (has_penalties and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+@pytest.mark.parametrize("num_devices", [1, 4, 8, 32])
+@pytest.mark.parametrize("max_lp", [None, 0, 5])
+@pytest.mark.parametrize(
+    "declared", [None, (False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("legacy_topk", [False, True])
+def test_device_logprobs_follow_resolved_contract(
+    num_devices, max_lp, declared, legacy_topk
+):
+    contract = (
+        None
+        if declared is None
+        else {"sampled_logprobs": declared[0], "topk_logprobs": declared[1]}
+    )
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=num_devices,
+        tt_data_parallel_size=1,
+        device_sampling_contract=contract,
+        supports_topk_logprobs=legacy_topk,
+        model=SimpleNamespace(model_capabilities={}),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            max_num_logprobs=max_lp,
+            sampling=SimpleNamespace(
+                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            ),
+        ),
+    )
+    if max_lp is None:
+        expected = True
+    elif declared is not None:
+        expected = declared[0] and (max_lp == 0 or declared[1])
+    else:
+        expected = num_devices in (8, 32) and (max_lp == 0 or legacy_topk)
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
