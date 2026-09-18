@@ -33,6 +33,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import store_tt_output_tokens_per_step
+from vllm_tt_plugin.input_batch import InputBatch
+from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
     get_tt_forced_reset_discard_counts,
@@ -81,6 +83,7 @@ def _scheduler(
     diffusion_checkpoint: bool = False,
     max_model_len: int = MAX_MODEL_LEN,
     async_scheduling: bool = False,
+    max_num_seqs: int = 1,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -90,7 +93,7 @@ def _scheduler(
     )
     model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_model_len,
         max_model_len=max_model_len,
         enable_chunked_prefill=False,
@@ -148,7 +151,13 @@ def _scheduler(
     )
 
 
-def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
+def _request(
+    max_tokens: int,
+    *,
+    ignore_eos: bool = True,
+    req_id: str = "req-0",
+    prompt_length: int = 32,
+) -> Request:
     init_none_hash(sha256)
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -156,8 +165,8 @@ def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
     )
     sampling_params.update_from_generation_config({}, eos_token_id=2)
     return Request(
-        request_id="req-0",
-        prompt_token_ids=[1] * 32,
+        request_id=req_id,
+        prompt_token_ids=[1] * prompt_length,
         sampling_params=sampling_params,
         pooling_params=None,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
@@ -189,6 +198,72 @@ def _runner_output(
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_prefill_fallback_releases_finished_runner_state(async_scheduling):
+    """KV pressure must not consume completion notifications before decode."""
+    scheduler = _scheduler(
+        output_width=1, max_num_seqs=2, async_scheduling=async_scheduling
+    )
+    # Four KV blocks include the reserved null block. A needs two usable
+    # blocks and B needs one, so finishing B cannot yet admit C's two blocks.
+    scheduler.add_request(_request(2, req_id="A", prompt_length=129))
+    scheduler.add_request(_request(1, req_id="B"))
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.tt_per_lane_max_num_seqs = 2
+    runner._req_state_slot = {}
+    runner._pending_state_slot_settle = None
+    runner.requests = {}
+    runner.encoder_cache = {}
+    runner._decode_layout_changed_since_last_decode = False
+    released_slots = []
+    runner.model = SimpleNamespace(release_request=released_slots.append)
+    runner.input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=64,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+    )
+
+    prefill = scheduler.schedule()
+    assert prefill.num_scheduled_tokens == {"A": 129, "B": 32}
+    runner._update_states(prefill)
+    assert runner._alloc_prefill_state_slots(["A", "B"]) == [0, 1]
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(
+            req_ids=["A", "B"],
+            req_id_to_index={"A": 0, "B": 1},
+            sampled_token_ids=[[2], [2]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert scheduler.finished_req_ids == {"B"}
+    scheduler.add_request(_request(10, req_id="C", prompt_length=129))
+
+    decode = scheduler.schedule()
+
+    assert decode.num_scheduled_tokens == {"A": 1}
+    assert decode.finished_req_ids == {"B"}
+    runner._update_states(decode)
+    assert set(runner.requests) == {"A"}
+    assert runner._req_state_slot == {"A": 0}
+    assert released_slots == [1]
+
+    scheduler.update_from_output(decode, _runner_output(decode, [2]))
+    scheduler.add_request(_request(10, req_id="D"))
+    next_prefill = scheduler.schedule()
+    assert next_prefill.num_scheduled_tokens == {"C": 129, "D": 32}
+    assert next_prefill.finished_req_ids == {"A"}
+    runner._update_states(next_prefill)
+    assert set(runner.requests) == {"C", "D"}
+    assert released_slots == [1, 0]
+    assert runner._alloc_prefill_state_slots(["C", "D"]) == [0, 1]
 
 
 @pytest.mark.parametrize(

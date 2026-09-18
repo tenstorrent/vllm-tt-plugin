@@ -545,6 +545,17 @@ class TTScheduler(AsyncScheduler):
                     is_decode=True, prefill_pending=True
                 )
                 result = self._schedule_decode_only()
+                # Even an empty prefill pass drains upstream cleanup events.
+                # The runner must receive them with the replacement decode.
+                result.finished_req_ids |= prefill_result.finished_req_ids
+                result.free_encoder_mm_hashes = (
+                    prefill_result.free_encoder_mm_hashes
+                    + result.free_encoder_mm_hashes
+                )
+                if prefill_result.preempted_req_ids:
+                    result.preempted_req_ids = (
+                        result.preempted_req_ids or set()
+                    ) | prefill_result.preempted_req_ids
                 return self._finalize_scheduler_output(result)
             self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result)
