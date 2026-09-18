@@ -87,3 +87,53 @@ def test_loader_keeps_legacy_model_initializer_compatible(monkeypatch):
     loader = object.__new__(TTModelLoader)
     assert loader.load_model(config, model_config) is sentinel
     assert received["values"] == ("hf", "mesh", 4, 8192, 1, None)
+
+
+def test_loader_forwards_explicit_keyword_only_runtime_config(monkeypatch):
+    received = {}
+    sentinel = object()
+
+    class GeneratedModel:
+        @classmethod
+        def initialize_vllm_model(
+            cls,
+            hf_config,
+            device,
+            max_batch_size,
+            *,
+            max_seq_len,
+            tt_data_parallel,
+            optimizations,
+            vllm_config,
+        ):
+            received["config"] = vllm_config
+            received["values"] = (
+                hf_config,
+                device,
+                max_batch_size,
+                max_seq_len,
+                tt_data_parallel,
+                optimizations,
+            )
+            return sentinel
+
+    config = SimpleNamespace(
+        device_config=SimpleNamespace(device="mesh"),
+        cache_config=SimpleNamespace(block_size=64),
+    )
+    model_config = SimpleNamespace(hf_config="hf", max_model_len=131072)
+    monkeypatch.setattr(
+        "vllm_tt_plugin.loader.get_model_architecture",
+        lambda _model_config: (GeneratedModel, None),
+    )
+    monkeypatch.setattr("vllm_tt_plugin.loader.get_tt_config", lambda _config: {})
+    monkeypatch.setattr(
+        "vllm_tt_plugin.loader.get_tt_data_parallel_size", lambda _config: 1
+    )
+    monkeypatch.setattr(
+        "vllm_tt_plugin.loader.get_tt_max_batch_size", lambda _config: 32
+    )
+    loader = object.__new__(TTModelLoader)
+    assert loader.load_model(config, model_config) is sentinel
+    assert received["config"] is config
+    assert received["values"] == ("hf", "mesh", 32, 131072, 1, None)
