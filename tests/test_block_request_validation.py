@@ -13,6 +13,7 @@ from vllm.sampling_params import (
 )
 
 from vllm_tt_plugin.config import (
+    get_tt_device_sampling_contract,
     get_tt_output_tokens_per_step,
     store_tt_output_tokens_per_step,
 )
@@ -288,6 +289,66 @@ class ARModel:
     }
 
 
+class RequiredDeviceSamplingModel:
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "device_sampling": {
+            "required": True,
+            "parameters": [
+                "temperature",
+                "top_k",
+                "top_p",
+                "seed",
+                "presence_penalty",
+                "frequency_penalty",
+                "repetition_penalty",
+            ],
+            "sampled_logprobs": False,
+            "topk_logprobs": False,
+            "max_top_k": 32,
+        },
+    }
+
+
+class HostLogitsModel(ARModel):
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "device_sampling": {
+            "required": False,
+            "parameters": [],
+            "sampled_logprobs": False,
+            "topk_logprobs": False,
+        },
+    }
+
+
+class DeviceLogprobsModel(RequiredDeviceSamplingModel):
+    model_capabilities = {
+        **RequiredDeviceSamplingModel.model_capabilities,
+        "device_sampling": {
+            **RequiredDeviceSamplingModel.model_capabilities["device_sampling"],
+            "sampled_logprobs": True,
+            "topk_logprobs": True,
+        },
+    }
+
+
+class MisdeclaredHostControlsModel(RequiredDeviceSamplingModel):
+    model_capabilities = {
+        **RequiredDeviceSamplingModel.model_capabilities,
+        "device_sampling": {
+            **RequiredDeviceSamplingModel.model_capabilities["device_sampling"],
+            "parameters": [
+                *RequiredDeviceSamplingModel.model_capabilities["device_sampling"][
+                    "parameters"
+                ],
+                "min_p",
+                "structured_outputs",
+            ],
+        },
+    }
+
+
 class _WeakrefableConfig(SimpleNamespace):
     """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
 
@@ -347,6 +408,126 @@ def _ar_config():
     config = _weakrefable_config()
     config.model_config.hf_config.canvas_length = None
     return config
+
+
+def _start_ar_model(monkeypatch, model_class):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, model_class)
+    TTPlatform.check_and_update_config(config)
+    declared = model_class.model_capabilities.get("device_sampling")
+    if declared is None:
+        assert get_tt_device_sampling_contract(config) is None
+    else:
+        assert get_tt_device_sampling_contract(config) == {
+            "max_top_k": declared.get("max_top_k"),
+            "required": declared["required"],
+            "parameters": sorted(declared["parameters"]),
+            "sampled_logprobs": declared["sampled_logprobs"],
+            "topk_logprobs": declared["topk_logprobs"],
+        }
+    return config
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"logprobs": 0}, "logprobs"),
+        ({"logprobs": 5}, "logprobs"),
+        ({"min_p": 0.1}, "min_p"),
+        ({"bad_words": ["forbidden"]}, "bad_words"),
+        (
+            {"structured_outputs": StructuredOutputsParams(json_object=True)},
+            "structured_outputs",
+        ),
+        ({"logit_bias": {2: -1.0}}, "logit_bias"),
+        ({"allowed_token_ids": [2, 3]}, "allowed_token_ids"),
+        ({"min_tokens": 1}, "min_tokens"),
+    ],
+)
+def test_required_device_sampler_rejects_host_logits_requests(
+    monkeypatch, kwargs, field
+):
+    config = _start_ar_model(monkeypatch, RequiredDeviceSamplingModel)
+
+    with pytest.raises(ValueError, match=field):
+        _validate(SamplingParams(max_tokens=16, **kwargs))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_required_device_sampler_accepts_declared_sampling_controls(monkeypatch):
+    config = _start_ar_model(monkeypatch, RequiredDeviceSamplingModel)
+
+    _validate(
+        SamplingParams(
+            max_tokens=16,
+            temperature=0.5,
+            top_k=10,
+            top_p=0.9,
+            seed=42,
+            presence_penalty=0.5,
+            frequency_penalty=0.5,
+            repetition_penalty=1.1,
+        )
+    )
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_required_device_sampler_rejects_frontend_that_bypasses_validation(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, RequiredDeviceSamplingModel)
+
+    with pytest.raises(ValueError, match="requires the Python frontend"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_required_device_sampler_accepts_declared_device_logprobs(monkeypatch):
+    # Frontend admission preserves a declared-capable provider. The runner still
+    # applies its physical-device and implementation gates before execution;
+    # this is not an end-to-end device-logprobs qualification.
+    config = _start_ar_model(monkeypatch, DeviceLogprobsModel)
+
+    _validate(SamplingParams(max_tokens=16, logprobs=5))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_required_device_sampler_enforces_declared_top_k_limit(monkeypatch):
+    config = _start_ar_model(monkeypatch, RequiredDeviceSamplingModel)
+
+    with pytest.raises(ValueError, match=r"top_k=33.*maximum: 32"):
+        _validate(SamplingParams(max_tokens=16, top_k=33))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_p": 0.1},
+        {"structured_outputs": StructuredOutputsParams(json_object=True)},
+    ],
+)
+def test_required_device_sampler_cannot_declare_host_only_controls(monkeypatch, kwargs):
+    config = _start_ar_model(monkeypatch, MisdeclaredHostControlsModel)
+
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        _validate(SamplingParams(max_tokens=16, **kwargs))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_optional_device_sampler_preserves_host_logits_fallback(monkeypatch):
+    config = _start_ar_model(monkeypatch, HostLogitsModel)
+
+    _validate(SamplingParams(max_tokens=16, min_p=0.1, logprobs=5))
+    assert TTPlatform._resolve_tt_admission_handle() is config
+
+
+def test_model_without_device_contract_preserves_host_logits_fallback(monkeypatch):
+    config = _start_ar_model(monkeypatch, ARModel)
+
+    _validate(SamplingParams(max_tokens=16, min_p=0.1, logprobs=5))
+    assert TTPlatform._resolve_tt_admission_handle() is config
 
 
 def test_admission_handle_releases_with_the_dead_engine(monkeypatch):
