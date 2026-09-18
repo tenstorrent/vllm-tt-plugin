@@ -37,12 +37,14 @@ from __future__ import annotations
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import pytest
 
 from tests.tt.spec.conftest import DUMMY_VOCAB_SIZE
-from tests.tt.spec.spec_client import acceptance_delta
+from tests.tt.spec.spec_client import (
+    acceptance_delta,
+    assert_full_length_completion,
+)
 
 MAX_TOKENS = 64
 OVERLAP_LINE = re.compile(
@@ -60,20 +62,12 @@ def only_the_asynchronous_launch(request):
         )
 
 
-@pytest.fixture
-def server_log(request):
-    path = request.config.getoption("--tt-spec-server-log")
-    if not path or not Path(path).exists():
-        pytest.skip("pass --tt-spec-server-log: these claims live in the log")
-    return Path(path)
-
-
 def _overlap_counts(server_log):
     """The plugin's last overlap report, or None if it never logged one.
 
-    Logged every power of two, so the last line is the largest count the run
-    reached. None means no submission ever found a step outstanding, which is
-    a server that never overlapped.
+    Safe overlaps report at every power of two, and every unsafe overlap reports
+    immediately. None means no submission ever found a step outstanding, which
+    is a server that never overlapped.
     """
     last = None
     for line in server_log.read_text(errors="replace").splitlines():
@@ -138,7 +132,7 @@ def test_ordinary_steps_overlap_and_no_verify_does(
     )
 
     for result in results:
-        assert result.completion_tokens >= MAX_TOKENS - spec_config.k
+        assert_full_length_completion(result, MAX_TOKENS)
 
     assert counts is not None, (
         "no submission ever overlapped an outstanding step, so this server "
@@ -233,15 +227,15 @@ def test_the_asynchronous_output_is_the_rule_s_own_sequence(
     result = spec_server.complete(prompt, max_tokens=MAX_TOKENS)
     record(requests=[result.request])
 
+    assert_full_length_completion(result, MAX_TOKENS)
     ids = result.token_ids
-    assert len(ids) >= MAX_TOKENS - spec_config.k
     # The first emitted token is the prefill's, and this model answers a
     # prefill the way its base class does, with zero logits whose argmax is
     # token 0. Every token after it is the rule applied to the one before,
     # starting at the position that token occupies.
     expected = [0]
     token, position = 0, len(prompt)
-    while len(expected) < len(ids):
+    while len(expected) < MAX_TOKENS:
         token = (token * 31 + position * 7 + 11) % DUMMY_VOCAB_SIZE
         position += 1
         expected.append(token)

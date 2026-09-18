@@ -197,7 +197,8 @@ def test_the_model_drafter_call_is_callable_on_an_instance():
         torch.tensor([[5, 6, 7], [5, 6, 7]], dtype=torch.int32),
         torch.tensor([2, 2], dtype=torch.int32),
         SimpleNamespace(
-            input_positions=torch.tensor([[3, 4, 5], [3, 4, 5]], dtype=torch.int32)
+            input_positions=torch.tensor([[3, 4, 5], [3, 4, 5]], dtype=torch.int32),
+            spec_mode=spec_decode.ACCEPT_MODE_ARGMAX_IDS,
         ),
         None,
         ["a", "b"],
