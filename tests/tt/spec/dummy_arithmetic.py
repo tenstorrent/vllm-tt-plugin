@@ -99,3 +99,43 @@ def discarded_after(k: int, depth: int | None, token: int) -> int:
         if token in block:
             return len(block) - block.index(token) - 1
     return 0
+
+
+# The ``fixed`` target's rule, which is a different instrument from the
+# ``depth`` target above. The depth target returns each draft unchanged up to
+# its accept depth, so its output is a function of what was drafted and the
+# depth is a knob for acceptance accounting. The fixed target chooses by one
+# rule for an ordinary decode and for a verify alike, reading only the token
+# and its position, so its output is a property of the prompt tail and of
+# nothing else: not of the accept depth, not of how much any step committed,
+# not of whether a step overlapped another, and not of whether the launch
+# schedules synchronously. That is what makes it the target for an equality
+# claim, and the accept depth then only decides how much of each step's block
+# the drafter gets right.
+
+FIXED_TARGET_VOCAB = 128256
+
+
+def fixed_target_choice(token: int, position: int) -> int:
+    """The one rule: what this target chooses after ``token`` at ``position``."""
+    return (token * 31 + position * 7 + 11) % FIXED_TARGET_VOCAB
+
+
+def fixed_target_ids(prompt: list[int], count: int) -> list[int]:
+    """The first ``count`` ids a ``fixed`` target emits for ``prompt``.
+
+    The first is the prefill's own, which this model answers the way its base
+    class does: zero logits, whose argmax is token 0. Every later token is the
+    rule applied to the one before it, at the position that token occupies,
+    which is ``len(prompt)`` for the prefill's own token and one more for each
+    token after it.
+    """
+    if count <= 0:
+        return []
+    ids = [0]
+    token, position = 0, len(prompt)
+    while len(ids) < count:
+        token = fixed_target_choice(token, position)
+        position += 1
+        ids.append(token)
+    return ids
