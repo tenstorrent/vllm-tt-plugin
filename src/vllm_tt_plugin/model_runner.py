@@ -143,6 +143,21 @@ def _coerce_output_block(
     return sampled_token_ids
 
 
+def _prefill_slot_map(runner) -> dict[str, int]:
+    """``req_id -> the slot that request was PREFILLED into``, created on first use.
+
+    Separate from ``_req_state_slot`` because the decode gather moves that one
+    while the model keys session ownership on the slot it was handed at prefill
+    (``empty_slots``); releasing by the moved slot made the two disagree and
+    leaked the owner's session past its request (vllm-tt-plugin#118 review).
+
+    Reached through ``runner.__dict__`` rather than an attribute so it also works
+    on a partially initialised runner and on the ``SimpleNamespace`` stand-ins the
+    state-slot tests pass as ``self`` when calling these methods unbound.
+    """
+    return runner.__dict__.setdefault("_req_prefill_state_slot", {})
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -246,6 +261,11 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # The slot each request was PREFILLED into, which is the identity the
+        # model recorded from ``empty_slots``. Unlike ``_req_state_slot`` this is
+        # NOT moved by the decode gather, so it still matches what the model
+        # holds when the request is released (vllm-tt-plugin#118 review).
+        self._req_prefill_state_slot: dict[str, int] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
 
         # Every standard-DP rank owns its own mesh and therefore its own host
@@ -663,11 +683,24 @@ class TTModelRunner:
     def _release_model_request(self, req_id: str) -> None:
         """Release model-owned state while the slot mapping is still valid.
 
-        State follows the request's ``_req_state_slot`` slot, not its batch
-        row: prefill can park a request at a slot other than its row when the
-        preferred row is held (``_alloc_prefill_state_slots``).
+        Released by the slot the request was PREFILLED into, because that is the
+        identity the model was given (``empty_slots``) and still holds. A decode
+        gather moves ``_req_state_slot`` but tells the model nothing it keys
+        ownership on, so releasing by the current slot made the model compare two
+        quantities the plugin does not keep equal: a request prefilled at slot 1
+        and later gathered to row 0 was released as 0, the model still held 1, and
+        its session -- ``_spec_pending``, ``_spec_active``, ``_spec_carry`` --
+        survived the request's death and leaked into the next one
+        (vllm-tt-plugin#118 review).
+
+        Prefill is the only writer of that identity, so a re-prefilled (preempted
+        then resumed) request correctly re-registers under its new slot.
         """
-        slot = self._req_state_slot.get(req_id)
+        # The fallback only fires when nothing was ever recorded at prefill --
+        # i.e. a partially initialised runner -- because every decoding request
+        # went through _alloc_prefill_state_slots (_decode_state_slot_remap
+        # raises otherwise).
+        slot = _prefill_slot_map(self).get(req_id, self._req_state_slot.get(req_id))
         release = getattr(getattr(self, "model", None), "release_request", None)
         if slot is not None and callable(release):
             release(slot)
@@ -922,8 +955,10 @@ class TTModelRunner:
         """
         for req_id in scheduler_output.finished_req_ids:
             self._req_state_slot.pop(req_id, None)
+            _prefill_slot_map(self).pop(req_id, None)
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
+            _prefill_slot_map(self).pop(req_id, None)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
@@ -965,6 +1000,7 @@ class TTModelRunner:
                 slot = free[0]
             held.add(slot)
             self._req_state_slot[req_id] = slot
+            _prefill_slot_map(self)[req_id] = slot
             slots.append(slot)
         return slots
 

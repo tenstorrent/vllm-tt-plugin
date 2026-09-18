@@ -469,3 +469,70 @@ def test_finishing_one_request_releases_only_its_own_slot():
     assert released == [7], "only the finished request's own slot may be released"
     assert runner._req_state_slot == {"req-b": 4}, "B keeps its state slot"
     assert "req-b" in runner.requests
+
+
+def test_release_uses_the_prefill_slot_not_the_gathered_row():
+    """vllm-tt-plugin#118 review: the model records its session's identity from
+    the ``empty_slots`` it got at PREFILL, and nothing tells it about a later
+    decode gather. Releasing by the post-gather slot therefore compared two
+    quantities this plugin does not keep equal, and the owner's session survived
+    its own request's death.
+
+    Victor's reachable sequence, driven through the real methods:
+      A prefills into slot 0. B prefills solo at row 0, finds 0 held, takes
+      slot 1 -- so the model recorded owner slot 1. A is aborted. B now decodes
+      solo at row 0, so the gather is non-identity and moves B's entry to 0.
+      When B finishes, the release must still name 1.
+    """
+    released = []
+
+    class InputBatchSpy:
+        def __init__(self):
+            self.req_id_to_index = {}
+
+        def remove_request(self, req_id):
+            return self.req_id_to_index.pop(req_id, None)
+
+        def condense(self, removed_req_indices):
+            pass
+
+        def refresh_logitsprocs(self):
+            pass
+
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.tt_per_lane_max_num_seqs = 4
+    runner.requests = {"req-a": object(), "req-b": object()}
+    runner.encoder_cache = {}
+    runner.input_batch = InputBatchSpy()
+    runner.model = SimpleNamespace(release_request=released.append)
+    runner._decode_layout_changed_since_last_decode = False
+    runner._req_state_slot = {}
+    runner._req_prefill_state_slot = {}
+    runner._pending_state_slot_settle = None
+
+    # A prefills into slot 0 (its own row).
+    assert runner._alloc_prefill_state_slots(["req-a"]) == [0]
+    # B prefills solo at row 0; slot 0 is held by live A, so B lands at slot 1.
+    # That 1 is what reaches the model as empty_slots -> its owner identity.
+    assert runner._alloc_prefill_state_slots(["req-b"]) == [1]
+    assert runner._req_prefill_state_slot == {"req-a": 0, "req-b": 1}
+
+    # The client aborts A.
+    del runner.requests["req-a"]
+    runner._req_state_slot.pop("req-a")
+    runner._req_prefill_state_slot.pop("req-a")
+
+    # B decodes solo at row 0: non-identity gather, then the runner commits it.
+    remap = runner._decode_state_slot_remap(["req-b"])
+    assert remap is not None, "slot 1 -> row 0 must produce a real gather"
+    runner.note_decode_state_slots_settled()
+    assert runner._req_state_slot["req-b"] == 0, "current slot moved with the gather"
+    assert runner._req_prefill_state_slot["req-b"] == 1, "prefill identity must not move"
+
+    # B finishes.
+    runner._release_model_request("req-b")
+
+    assert released == [1], (
+        "release must name the slot the model was given at prefill; naming the "
+        "gathered row 0 makes the ownership check skip its own teardown"
+    )
