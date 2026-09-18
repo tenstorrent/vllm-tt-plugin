@@ -67,7 +67,6 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -1424,7 +1423,17 @@ class TTModelRunner:
                 ],
                 dim=1,
             )
-        positions = self._committed_positions(model_input.input_positions, width)
+        if model_input.spec_mode is None:
+            positions = self._committed_positions_from_state(
+                row_req_ids,
+                counts,
+                submitted_positions=model_input.input_positions,
+                width=width,
+            )
+        else:
+            # A verify has authoritative submitted positions. Its physical
+            # acceptance count can exceed the prefix retained at max_model_len.
+            positions = self._committed_positions(model_input.input_positions, width)
         drafted = self.model.propose_draft_tokens(
             num_drafts,
             committed,
@@ -1519,8 +1528,9 @@ class TTModelRunner:
             # in; the persistent batch is indexed by where the request sits
             # now, and a completion between this step's submission and its
             # commit makes ``condense`` slide a request into another row. A
-            # request with no row at all was preempted, and drafting for it
-            # would continue a candidate state the preemption released.
+            # request with no row has no current length for max-model-length
+            # trimming, so this step records its retained accepted count but
+            # does not publish a proposal.
             batch_row = self.input_batch.req_id_to_index.get(req_id)
             if batch_row is None:
                 continue
@@ -1564,6 +1574,27 @@ class TTModelRunner:
         # from nothing would sit. The drafter is handed no live-row mask, so the
         # position is the only thing that marks a row as owned by no request.
         return positions.masked_fill((first < 0).unsqueeze(1), -1)
+
+    def _committed_positions_from_state(
+        self,
+        row_req_ids: list[str],
+        counts: torch.Tensor,
+        *,
+        submitted_positions: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        """Build committed positions from history after each applied result."""
+        positions = self._committed_positions(submitted_positions, width)
+        offsets = torch.arange(width, dtype=torch.int32)
+        requests = getattr(self, "requests", {})
+        for row, req_id in enumerate(row_req_ids):
+            req_state = requests.get(req_id)
+            count = int(counts[row])
+            if req_state is None or count < 1:
+                continue
+            first = req_state.num_tokens - count
+            positions[row] = first + offsets
+        return positions
 
     @staticmethod
     def _spec_candidate_block(
@@ -2102,14 +2133,7 @@ class TTModelRunner:
             # Preserve the legacy path's drain point: version-0 adapters still
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps()
-        self.async_decode.apply_ready_completed_decode_steps(
-            suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
-                scheduler_output
-            ),
-            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
-                scheduler_output
-            ),
-        )
+        self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
@@ -2171,14 +2195,7 @@ class TTModelRunner:
             self._decode_layout_changed_since_last_decode = True
             if self.async_decode.decode_input_update_contract_version() < 1:
                 self.async_decode.wait_for_all_pending_async_steps()
-        self.async_decode.apply_ready_completed_decode_steps(
-            suppress_output_req_ids=self.async_decode.suppressed_output_req_ids(
-                scheduler_output
-            ),
-            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
-                scheduler_output
-            ),
-        )
+        self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2675,17 +2692,10 @@ class TTModelRunner:
                 output_token_ids.extend(block)
             elif req_state is not None:
                 req_state.output_token_ids.extend(block)
-            if batch_row is None:
-                # Out of the batch but still known, which is an ordinary
-                # preemption: the tokens above are kept, because the engine has
-                # them and the resume restores from this history, but the
-                # candidate state they named is gone. ``_update_states``
-                # released the request's state slot when it preempted the
-                # request, so recording an accepted count or drafting a
-                # continuation here would tell the next verify to select
-                # candidate state the model no longer holds. On the
-                # synchronous path this cannot arise: the commit runs inside
-                # the step, before any preemption reaches the runner.
+            if batch_row is None and req_id not in self._req_state_slot:
+                # Explicit preemption releases the request's model state slot.
+                # The tokens remain valid for replay, but the accepted count
+                # would select candidate state the model no longer holds.
                 continue
             # The count the next verify reads, which is what selects the
             # candidate state this step left the model holding. Length-capped

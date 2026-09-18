@@ -27,6 +27,8 @@ below is a real point in the step, not a sleep.
 from __future__ import annotations
 
 import inspect
+import io
+import logging
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
@@ -92,6 +94,7 @@ class DeferredVerifyTarget(DeterministicTarget):
         self.pending: list[tuple[torch.Tensor, torch.Tensor, threading.Event]] = []
         self.reads = 0
         self.propose_calls: list[object] = []
+        self.proposal_positions: list[torch.Tensor] = []
         self.verify_hidden: object | None = None
         self.wait_failure: BaseException | None = None
         self.adaptive = False
@@ -190,6 +193,7 @@ class DeferredVerifyTarget(DeterministicTarget):
                 "one this model's verify returned"
             )
         self.propose_calls.append(hidden)
+        self.proposal_positions.append(committed_positions.clone())
         rows = int(committed_tokens.shape[0])
         offered = None
         if self.adaptive:
@@ -222,6 +226,36 @@ class DeferredVerifyTarget(DeterministicTarget):
     @property
     def outstanding(self) -> int:
         return len(self.pending)
+
+
+class ResidentDeferredTarget(DeferredVerifyTarget):
+    """A deferred target implementing resident decode input updates."""
+
+    decode_input_update_contract = 1
+    model_capabilities = {
+        "supports_async_decode": True,
+        "supports_spec_decode": True,
+        "spec_requirements": ["device_propose"],
+    }
+
+    def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):
+        if spec_mode is not None:
+            return super().decode_forward(tokens, start_pos, spec_mode, **kwargs)
+        if kwargs["reload_inputs"]:
+            self.resident_tokens = tokens.clone()
+            self.resident_positions = start_pos.clone()
+        self.executed_positions = getattr(self, "executed_positions", [])
+        self.executed_positions.append(self.resident_positions.clone())
+        answer = super().decode_forward(
+            self.resident_tokens, self.resident_positions, **kwargs
+        )
+        self.resident_tokens = answer.view(-1, 1)
+        self.resident_positions = torch.where(
+            self.resident_positions >= 0,
+            self.resident_positions + 1,
+            self.resident_positions,
+        )
+        return answer
 
 
 @pytest.fixture(autouse=True)
@@ -1666,7 +1700,9 @@ def test_a_verify_is_not_submitted_over_an_outstanding_ordinary_step():
 
     # A proposal in hand means the next step verifies.
     runner._proposed_draft_token_ids["a"] = _accept_everything(runner, "a")
-    scheduler_output = _scheduler_output(runner, decoding=["a"])
+    scheduler_output = _scheduler_output(
+        runner, decoding=["a"], drafts={"a": [PLACEHOLDER_TOKEN_ID] * DRAFT_LEN}
+    )
 
     assert runner.async_decode.must_drain_pending_async_steps(
         steady_decode_candidate=True, scheduler_output=scheduler_output
@@ -1694,6 +1730,93 @@ def test_an_ordinary_step_still_overlaps_an_outstanding_ordinary_step():
     model.release()
     outstanding.get_output()
     _drain(runner, "a")
+
+
+def test_a_proposal_created_during_apply_serializes_the_verify_transition():
+    """A newly published proposal drains every earlier plain submission."""
+    model = ResidentDeferredTarget()
+    model.offer_drafts_only_when_solo()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    warmup = _submit_plain_step(runner, "a")
+    model.release()
+    warmup.get_output()
+    _drain(runner, "a")
+    _settle_layout(runner)
+    expected_plain = continuation(*_tail(runner, "a"), 2)
+
+    first = _submit_plain_step(runner, "a")
+    second = _submit_plain_step(runner, "a")
+    model.release()
+    first.get_output()
+    model.release()
+
+    scheduler_output = _scheduler_output(
+        runner, decoding=["a"], drafts={"a": [PLACEHOLDER_TOKEN_ID] * DRAFT_LEN}
+    )
+    scheduler_output.scheduled_cached_reqs.num_computed_tokens[0] += 2
+    assert runner.execute_model(scheduler_output) is None
+    verified = runner.sample_tokens(None)
+    assert isinstance(verified, AsyncTTSpecDecodeOutput)
+
+    assert second.is_resolved(), "the earlier plain step was not drained"
+    assert runner.async_decode._overlapped_unsafe_submissions == 0
+    assert int(model.verify_calls[-1]["tokens"][0, 0]) == expected_plain[-1]
+
+    model.release()
+    verified.get_output()
+    _drain(runner, "a")
+
+
+def test_overlapped_plain_completions_report_authoritative_positions():
+    """Each proposal receives the position of its own committed plain token."""
+    model = ResidentDeferredTarget()
+    model.offer_drafts_only_when_solo()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    warmup = _submit_plain_step(runner, "a")
+    model.release()
+    warmup.get_output()
+    _drain(runner, "a")
+    _settle_layout(runner)
+    _, initial_position = _tail(runner, "a")
+
+    first = _submit_plain_step(runner, "a")
+    second = _submit_plain_step(runner, "a")
+    model.release()
+    first.get_output()
+    model.release()
+    second.get_output()
+    _drain(runner, "a")
+
+    positions = [int(value[0, 0]) for value in model.proposal_positions[-2:]]
+    assert positions == [initial_position + 1, initial_position + 2]
+
+
+def test_temporary_unscheduling_preserves_the_completed_accepted_count():
+    """A request that retains its model slot also retains candidate selection."""
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11))
+    runner._req_state_slot["a"] = 0
+
+    accepted = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+    model.release()
+    accepted.get_output()
+    _drain(runner, new=[("peer", 71)])
+
+    assert "a" not in runner.input_batch.req_id_to_index
+    assert runner._req_state_slot["a"] == 0
+    assert runner._req_accepted_counts["a"] == DRAFT_LEN + 1
+    assert runner.released_slots == []
+
+    runner.requests["a"].num_computed_tokens = runner.requests["a"].num_tokens
+    resumed_input = runner.build_model_input(
+        _scheduler_output(runner, decoding=["a"]), None
+    )
+    assert resumed_input is not None and resumed_input.prompt_lens is None
+    assert int(resumed_input.accepted_counts[0]) == DRAFT_LEN + 1
 
 
 def test_an_unresolved_accepted_count_also_forces_the_drain():
@@ -1762,6 +1885,35 @@ def test_overlapping_submissions_are_counted_and_unsafe_ones_are_not():
     _drain(runner, "a")
 
     assert controller._overlapped_unsafe_submissions == 0
+
+
+def test_an_unsafe_overlap_is_logged_at_its_exact_counter_value(tmp_path):
+    """The device parser must observe an unsafe non-power-of-two overlap."""
+    from tests.tt.spec.test_async_transitions import _overlap_counts
+
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    controller = runner.async_decode
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    async_decode_module.logger.addHandler(handler)
+    try:
+        for overlap_ok in (True, True, True, False):
+            controller.register_pending_async_step(object(), overlap_ok=overlap_ok)
+    finally:
+        async_decode_module.logger.removeHandler(handler)
+
+    server_log = tmp_path / "server.log"
+    server_log.write_text(stream.getvalue())
+    assert (
+        controller._overlapped_submissions,
+        controller._overlapped_unsafe_submissions,
+    ) == (
+        3,
+        1,
+    )
+    assert _overlap_counts(server_log) == (3, 1)
 
 
 # endregion Serialization across a mixed sequence

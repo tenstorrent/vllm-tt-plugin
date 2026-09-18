@@ -621,6 +621,7 @@ class TTAsyncDecodeController:
         *,
         overlap_ok: bool,
     ) -> None:
+        unsafe_overlap = False
         with self.runner._steady_decode_lock:
             # Counted here because this is the one place that knows both
             # facts: whether a step was already outstanding when this one was
@@ -635,20 +636,22 @@ class TTAsyncDecodeController:
                 self._overlapped_submissions += 1
                 if not overlap_ok:
                     self._overlapped_unsafe_submissions += 1
+                    unsafe_overlap = True
             self.runner._pending_async_steps.append(step)
             self.runner._pending_async_overlap_ok.append(overlap_ok)
-        self._log_overlap_counters()
+        self._log_overlap_counters(force=unsafe_overlap)
 
-    def _log_overlap_counters(self) -> None:
+    def _log_overlap_counters(self, *, force: bool = False) -> None:
         """Report the overlap counters, rarely enough to be readable.
 
         Logged rather than exposed as a metric because vLLM's metrics are the
         engine's and this is the runner's: the step it describes belongs to the
-        worker process, which publishes none of its own. Every power of two, so
-        a long run says what it did without one line per step.
+        worker process, which publishes none of its own. Safe overlaps report at
+        every power of two. Every unsafe overlap reports immediately because the
+        device regression reads the latest line as its serialization result.
         """
         total = self._overlapped_submissions
-        if total == 0 or total & (total - 1):
+        if not force and (total == 0 or total & (total - 1)):
             return
         logger.info(
             "TT async decode: %d submission(s) overlapped an outstanding step, "
@@ -767,6 +770,28 @@ class TTAsyncDecodeController:
             )
             remaining_results.subtract(published_req_ids)
         self.prune_finished_async_events()
+
+    def apply_completed_decode_steps_before_build(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Apply completed steps and serialize a newly visible verify.
+
+        A plain completion can publish a proposal while this method applies it.
+        The pre-build drain decision could not see that proposal. Recheck after
+        the apply so every remaining plain step commits before the candidate
+        block is built. A draftless next step keeps the existing overlap.
+        """
+        suppressed = self.suppressed_output_req_ids(scheduler_output)
+        self.apply_ready_completed_decode_steps(
+            suppress_output_req_ids=suppressed,
+            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ),
+        )
+        if not self._next_step_verifies(scheduler_output):
+            return
+        self.wait_for_all_pending_async_steps()
+        self.apply_ready_completed_decode_steps(suppress_output_req_ids=suppressed)
 
     def wait_for_all_pending_async_steps(self) -> None:
         """Finalize pending readbacks without applying them to runner state."""

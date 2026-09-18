@@ -198,6 +198,14 @@ def spec_server(tt_server_url, tt_model_name, spec_config) -> SpecServer:
     return SpecServer(tt_server_url, tt_model_name)
 
 
+@pytest.fixture
+def server_log(request) -> Path:
+    path = request.config.getoption("--tt-spec-server-log")
+    if not path or not Path(path).exists():
+        pytest.skip("pass --tt-spec-server-log: this claim lives in the server log")
+    return Path(path)
+
+
 @pytest.fixture(scope="session")
 def ascending_prompt():
     """The prompt the n-gram drafter needs, as a factory.
