@@ -192,7 +192,9 @@ class SamplingInputBatch:
         }
         result: dict[str, torch.Tensor] = {}
         for name, default_value in self.DEFAULTS.items():
-            dtype = dtype_map[type(default_value)]
+            # Preserve API seeds until the model's device-sampling boundary.
+            # Host generators also need the original value, including >2**31.
+            dtype = torch.int64 if name == "seed" else dtype_map[type(default_value)]
             result[name] = torch.full((self.max_num_reqs,), default_value, dtype=dtype)
         return result
 
