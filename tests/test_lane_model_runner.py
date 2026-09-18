@@ -412,6 +412,9 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         output_tokens=None,
         decode_layout_changed=False,
         num_valid_drafts=None,
+        # Not a verify: the submission counters read this to tell an ordinary
+        # decode from one.
+        spec_mode=None,
         accepted_counts=None,
         slot_remap=remap,
     )

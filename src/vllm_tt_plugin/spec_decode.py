@@ -283,9 +283,18 @@ class SpecReject:
 class DraftOutput:
     """What a device drafter returns for one step.
 
-    ``draft_token_ids`` is ``[B, K]`` and padded. How many of row ``i``'s
-    drafts are real is the runner's own bookkeeping, carried into the verify
-    call as ``num_valid_drafts``, not encoded in this tensor.
+    ``draft_token_ids`` is ``[B, K]`` and padded.
+
+    ``num_valid`` is ``[B]`` int32, how many of each row's ``K`` drafts the
+    drafter is actually offering, and it is the only way to offer none: a row
+    at 0 is drafted for nowhere, and the step it would have been verified on
+    runs as an ordinary decode instead. ``None`` means every row offers all
+    ``K``, which is what a drafter that always drafts returns. A drafter that
+    has nothing for a row still returns ids in that row, because a device graph
+    has one shape; the ids are then not read. Do not encode an empty proposal
+    as a dummy token id: the runner cannot tell that apart from a real draft
+    and would verify it.
+
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
     An accept rule that needs the drafter distribution reads them; a runner
@@ -293,6 +302,7 @@ class DraftOutput:
     """
 
     draft_token_ids: "torch.Tensor"
+    num_valid: "torch.Tensor | None" = None
     draft_scores: "torch.Tensor | None" = None
 
 

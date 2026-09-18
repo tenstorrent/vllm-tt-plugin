@@ -9,6 +9,8 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
@@ -26,6 +28,7 @@ logger = init_tt_logger(__name__)
 # request IDs, identify exactly how many newest in-flight frames a wholesale
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
+_TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
 
 
 def set_tt_forced_reset_discard_counts(
@@ -114,6 +117,8 @@ class TTScheduler(AsyncScheduler):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
+        self._pending_async_output_frames: dict[str, int] = {}
+        self._widest_decode_batch_size = 0
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         if self._is_block_output_model:
@@ -421,16 +426,16 @@ class TTScheduler(AsyncScheduler):
             # result unchanged so the coordinator can decide whether all lanes
             # should fall back to decode together.
             result = self._schedule_prefill_only()
-            return self._finalize_scheduler_output(result)
+            return self._finalize_scheduler_output(result, is_decode=False)
         if mode == TTSchedulingMode.DECODE_ONLY:
             if has_pending_prefill:
                 # Hide the waiting queues and partial prefills so the base
                 # scheduler cannot admit prefill work.
                 result = self._schedule_decode_only()
-                return self._finalize_scheduler_output(result)
+                return self._finalize_scheduler_output(result, is_decode=True)
             # No pending prefill: base scheduler naturally runs decode-only.
             result = super().schedule()
-            return self._finalize_scheduler_output(result)
+            return self._finalize_scheduler_output(result, is_decode=True)
 
         # Default mode:
         # Prefer prefill whenever prefill work is pending, so new requests are
@@ -442,16 +447,24 @@ class TTScheduler(AsyncScheduler):
             # and free capacity for a later prefill admission.
             if prefill_result.total_num_scheduled_tokens == 0 and has_running_decode:
                 result = self._schedule_decode_only()
-                return self._finalize_scheduler_output(result)
-            return self._finalize_scheduler_output(prefill_result)
+                return self._finalize_scheduler_output(result, is_decode=True)
+            return self._finalize_scheduler_output(prefill_result, is_decode=False)
 
         # No pending prefill work in default mode: run decode-only naturally.
         result = super().schedule()
-        return self._finalize_scheduler_output(result)
+        return self._finalize_scheduler_output(result, is_decode=True)
 
     def _finalize_scheduler_output(
-        self, scheduler_output: SchedulerOutput
+        self, scheduler_output: SchedulerOutput, *, is_decode: bool
     ) -> SchedulerOutput:
+        if is_decode:
+            rows = len(scheduler_output.num_scheduled_tokens)
+            if rows > getattr(self, "_widest_decode_batch_size", 0):
+                self._widest_decode_batch_size = rows
+                logger.info(
+                    "TT scheduler: widest decode batch reached %d request row(s)",
+                    rows,
+                )
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -540,14 +553,17 @@ class TTScheduler(AsyncScheduler):
                 logger.error("%s", message)
                 return False
             raise RuntimeError(message)
-        # AsyncScheduler turns every outstanding placeholder into one discard
-        # when it preempts all running requests. Preserve that scheduler-owned
-        # boundary for the runner: the stale frames must still be published so
-        # AsyncScheduler consumes its counters, but must not be appended to the
-        # runner's cached request state before resumed-prefill inputs are built.
+        # Upstream copies token reservations into ``async_tokens_to_discard``.
+        # TT receives one output frame for a speculative reservation of 1+K
+        # tokens, so publish frame counts to both the scheduler and runner. The
+        # stale frames remain visible to the scheduler but do not enter runner
+        # request state before resumed-prefill inputs are built.
         reset_candidates = (
             [
-                (request, request.num_output_placeholders)
+                (
+                    request,
+                    self._pending_async_output_frames.get(request.request_id, 0),
+                )
                 for request in self.running
                 if request.num_output_placeholders > 0
             ]
@@ -557,15 +573,13 @@ class TTScheduler(AsyncScheduler):
         try:
             return super().reset_prefix_cache(reset_running_requests, reset_connector)
         finally:
-            for request, placeholder_count in reset_candidates:
-                if (
-                    request.status == RequestStatus.PREEMPTED
-                    and request.async_tokens_to_discard > 0
-                ):
-                    count = min(placeholder_count, request.async_tokens_to_discard)
+            for request, frame_count in reset_candidates:
+                if request.status == RequestStatus.PREEMPTED:
+                    request.async_tokens_to_discard = frame_count
+                if request.status == RequestStatus.PREEMPTED and frame_count > 0:
                     pending = self._pending_forced_reset_discard_counts
                     pending[request.request_id] = (
-                        pending.get(request.request_id, 0) + count
+                        pending.get(request.request_id, 0) + frame_count
                     )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
@@ -576,20 +590,42 @@ class TTScheduler(AsyncScheduler):
         K-token canvas; reserve the remaining K-1 positions.
         """
         super()._update_after_schedule(scheduler_output)
-        if self.num_spec_tokens:
+        output_frame_req_ids = tuple(
+            req_id
+            for req_id in scheduler_output.num_scheduled_tokens
+            if not self.requests[req_id].is_prefill_chunk
+        )
+        # The parent computes whether this chunk produces output. Retain that
+        # decision on this step because a later schedule changes the request.
+        setattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids)
+        pending = getattr(self, "_pending_async_output_frames", None)
+        if pending is None:
+            pending = self._pending_async_output_frames = {}
+        for req_id in output_frame_req_ids:
+            pending[req_id] = pending.get(req_id, 0) + 1
+        if self.num_spec_tokens and not self.scheduler_config.async_scheduling:
             # ``AsyncScheduler`` leaves every scheduled request holding
             # ``[-1] * num_spec_tokens``, which upstream's GPU runner
-            # overwrites from its own state in ``_prepare_input_ids``. The TT
-            # runner has no such step: it verifies whatever the scheduler
-            # delivers, so a placeholder surviving here becomes a draft the
-            # accept walk compares against, matches (the model is handed the
-            # same placeholder), and commits as an output token.
+            # overwrites from its own state in ``_prepare_input_ids``. On a
+            # synchronous launch the TT runner has no such step: it verifies
+            # whatever the scheduler delivers, so a placeholder surviving here
+            # becomes a draft the accept walk compares against, matches (the
+            # model is handed the same placeholder), and commits as an output
+            # token.
             #
             # Cleared rather than restored to the ids just scheduled: a
             # proposal is handed over once, so a request whose row proposed
             # nothing this step must speculate on nothing next step rather
             # than replay a spent proposal. Drafts reach a request only
             # through ``update_draft_token_ids``.
+            #
+            # Left standing on an asynchronous launch, because there they are
+            # the only lookahead reservation the request gets: upstream stops
+            # routing drafts through the scheduler (``EngineCore.post_step``
+            # skips ``take_draft_token_ids``), the next schedule budgets
+            # ``1 + len(spec_token_ids)`` positions for the request, and
+            # ``TTModelRunner._drafts_to_verify`` reads the placeholders as
+            # that reservation and verifies the proposal the runner holds.
             for req_id in scheduler_output.num_scheduled_tokens:
                 self.requests[req_id].spec_token_ids = []
         if not self._is_block_output_model:
@@ -601,6 +637,23 @@ class TTScheduler(AsyncScheduler):
             request = self.requests[req_id]
             if not request.is_prefill_chunk:
                 request.num_output_placeholders += extra_placeholders
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs]:
+        """Consume only the output frames reserved by this scheduled step."""
+        try:
+            return super().update_from_output(scheduler_output, model_runner_output)
+        finally:
+            pending = self._pending_async_output_frames
+            for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
+                count = pending.get(req_id, 0)
+                if count <= 1:
+                    pending.pop(req_id, None)
+                else:
+                    pending[req_id] = count - 1
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

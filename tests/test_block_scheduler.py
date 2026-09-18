@@ -81,6 +81,7 @@ def _scheduler(
     diffusion_checkpoint: bool = False,
     max_model_len: int = MAX_MODEL_LEN,
     async_scheduling: bool = False,
+    max_num_seqs: int = 1,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -90,7 +91,7 @@ def _scheduler(
     )
     model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
-        max_num_seqs=1,
+        max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_model_len,
         max_model_len=max_model_len,
         enable_chunked_prefill=False,
@@ -148,7 +149,9 @@ def _scheduler(
     )
 
 
-def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
+def _request(
+    max_tokens: int, *, ignore_eos: bool = True, request_id: str = "req-0"
+) -> Request:
     init_none_hash(sha256)
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -156,7 +159,7 @@ def _request(max_tokens: int, *, ignore_eos: bool = True) -> Request:
     )
     sampling_params.update_from_generation_config({}, eos_token_id=2)
     return Request(
-        request_id="req-0",
+        request_id=request_id,
         prompt_token_ids=[1] * 32,
         sampling_params=sampling_params,
         pooling_params=None,
@@ -189,6 +192,30 @@ def _runner_output(
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+
+
+def test_scheduler_records_the_actual_widest_decode_batch():
+    scheduler = _scheduler(output_width=1, max_num_seqs=2)
+    first = _request(max_tokens=8, request_id="req-0")
+    second = _request(max_tokens=8, request_id="req-1")
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    prefill = scheduler.schedule()
+    req_ids = list(prefill.num_scheduled_tokens)
+    output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+        sampled_token_ids=[[7], [8]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(prefill, output)
+
+    decode = scheduler.schedule()
+
+    assert len(decode.num_scheduled_tokens) == 2
+    assert scheduler._widest_decode_batch_size == 2
 
 
 @pytest.mark.parametrize(
@@ -849,6 +876,32 @@ def test_forced_reset_discards_stale_frame_before_following_valid_frame():
     assert valid[0].outputs[0].new_token_ids == [8]
     assert list(request.output_token_ids) == [8]
     assert request.num_output_placeholders == 0
+
+
+def test_forced_reset_counts_one_speculative_forward_as_one_output_frame():
+    scheduler, request, prefill = _scheduled(output_width=1, async_scheduling=True)
+    scheduler.update_from_output(prefill, _runner_output(prefill, [7]))
+    scheduler.num_spec_tokens = 3
+    scheduler.num_lookahead_tokens = 3
+    request.spec_token_ids = [-1] * 3
+    submitted = scheduler.schedule()
+
+    assert request.num_output_placeholders == 4
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    resumed = scheduler.schedule()
+
+    assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
+    assert request.async_tokens_to_discard == 1
+
+    stale = scheduler.update_from_output(
+        submitted, _runner_output(submitted, [8, 9, 10, 11])
+    )
+    assert stale[0].outputs == []
+    assert request.async_tokens_to_discard == 0
+
+    valid = scheduler.update_from_output(resumed, _runner_output(resumed, [12]))
+    assert valid[0].outputs[0].new_token_ids == [12]
+    assert list(request.output_token_ids) == [7, 12]
 
 
 @pytest.mark.parametrize(

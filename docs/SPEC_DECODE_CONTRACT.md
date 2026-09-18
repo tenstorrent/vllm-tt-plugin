@@ -14,9 +14,11 @@ https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
 A model implementing this contract serves speculative decoding, within one
 boundary. What runs:
 
-- the **n-gram** method, and no other. The runner proposes for `ngram` only, so
-  every other method vLLM knows is refused at configuration time rather than
-  admitted to draft nothing.
+- two drafting methods: **`ngram`**, which runs on the host and asks the model
+  for nothing, and **`custom_class`**, which is the model's own drafter
+  proposing on device through `propose_draft_tokens`. Every other method vLLM
+  knows is refused at configuration time rather than admitted to draft
+  nothing.
 - the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
   is refused, because the runner requests `argmax_ids` on every step.
 - **greedy requests**, and no others. A request carrying a temperature,
@@ -24,20 +26,29 @@ boundary. What runs:
   request: the accept walk compares token ids and never sees logits, so it
   cannot arbitrate any of those, and answering greedily anyway would change
   what was asked for without saying so.
-- the **synchronous** decode tail. A launch combining speculation with
-  asynchronous scheduling is refused, because the accept walk lives in the
-  synchronous path.
+- **ordinary decode steps inside a speculating launch**, for a model
+  declaring `supports_narrow_decode`: a step with nothing to verify is sent as
+  that model's own decode call and can overlap, so configuring speculation does
+  not cost a server its asynchronous batched decoding. Section 4d.
+- both decode tails. The **synchronous** tail accepts and commits inside the
+  step. The **asynchronous** tail defers: acceptance is walked where the
+  readback completes, and the commit and the next proposal run on the engine
+  thread at the top of the following step. A launch combining speculation with
+  asynchronous scheduling is admitted only for a model declaring
+  `supports_async_spec_decode`, which is about the model's readback and hidden
+  handle rather than about step order: a speculative step never overlaps the
+  next one, so verify, accept and propose stay ordered per request.
 - **front-packed** execution. Lane mode is refused: it builds its device input
   from `TTLaneInputBatch`, which has no candidate-block builder.
 
 Every one of those is a refusal that raises with the offending values, never a
-silent fallback. A device drafter, the sampled accept walk, structured output
-over drafts, and `fused_sample` each need their own execution path before the
-matching refusal can go.
+silent fallback. The sampled accept walk, structured output over drafts,
+`fused_sample`, `drafter_scores` and a scheduler-owned paged drafter cache each
+need their own execution path before the matching refusal can go.
 
 ## 1. Capability declarations
 
-Four `model_capabilities` entries, read only when the launch carries a
+Five `model_capabilities` entries, read only when the launch carries a
 `speculative_config`. Absent keys default as shown, following the plugin's
 existing default-if-absent convention.
 
@@ -47,6 +58,7 @@ existing default-if-absent convention.
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when the method needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
+| `supports_async_spec_decode` | `False` | The model's readback and hidden handle serve a deferred verify: see section 4c. Absent means a launch pairing speculation with `--async-scheduling` is refused. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -137,28 +149,30 @@ drafted for.
 
 ### The two call shapes
 
-A model that does not declare `supports_narrow_decode` only ever sees the wide
-call. One that does sees the narrow one on a step where no row carries a draft.
+A model that does not declare `supports_narrow_decode` sees the verify call on
+every decode step of a speculating launch, including a step where no row
+carries a draft: that step's `num_valid_drafts` is 0 on every row and its
+verify commits one token per row.
 
-| | wide call | narrow call |
+A model that declares `supports_narrow_decode` also serves its **own ordinary
+decode call** inside a speculating launch, and a step with nothing to verify is
+sent as exactly that: no `spec_mode`, neither side tensor, and the sampling
+path a non-speculating launch uses. So such a model implements two calls and no
+third shape, and section 4d explains which steps take which.
+
+| | verify call | ordinary decode call |
 | --- | --- | --- |
 | `tokens` | `[B, 1+K]` int32 | `[B, 1]` int32 |
 | `start_pos` | `[B, 1+K]` int32 | `[B]` int32, 1-D |
-| `draft_token_ids` | `[B, K]` int32 | `[B, K]` int32, every entry padding |
-| `num_valid_drafts` | `[B]` int32 | `[B]` int32, every entry 0 |
-| `accepted_counts` | `[B]` int32 | `[B]` int32 |
-| `spec_mode` | present | present |
-| return | `VerifyOutput`, `argmax_ids` `[B, 1+K]` | `VerifyOutput`, `argmax_ids` `[B, 1]` |
+| `num_valid_drafts` | `[B]` int32 | absent |
+| `accepted_counts` | `[B]` int32 | absent |
+| `spec_mode` | present | absent |
+| `sampling_params` | present when the launch samples on device | present when the launch samples on device |
+| return | `VerifyOutput`, `argmax_ids` `[B, 1+K]` | whatever this model's decode already returns |
 
-The narrow call is the ordinary decode call: its `tokens` and `start_pos` are
-exactly the shapes a non-speculating decode sends, so a model that declares it
-implements no third shape. Both `[B]` side tensors still come with it, because
-`accepted_counts` is how a model picks the candidate state slot its previous
-step committed from whatever this step's width is.
-
-Its return carries one column, which is that step's committed token, and the
-runner reads it with an accepted count of 1. `SpecPlan.block_width` describes
-the wide call only.
+The three speculative arguments arrive together or not at all, so their
+absence is what makes a call the ordinary one. `SpecPlan.block_width`
+describes the verify call only.
 
 ## 4a. The verify call
 
@@ -193,6 +207,142 @@ verify that claimed one token on every row, so the server commits one token
 per step for its whole life and reports no error. The reverse is refused too:
 a `VerifyOutput` returned from a step that sent no `spec_mode` has no accepted
 count to be read against.
+
+## 4b. The propose call, for a model that drafts
+
+A launch whose method requires `device_propose` calls the model after every
+commit:
+
+```python
+def propose_draft_tokens(
+    self,
+    num_drafts,            # K
+    committed_tokens,      # [B, 1+K] int32, this step's committed block
+    committed_positions,   # [B, 1+K] int32, where those tokens sit
+    accepted_counts,       # [B] int32 in [1, 1+K], how much of the block is real
+    hidden=None,           # the HiddenHandle this step's verify returned
+) -> DraftOutput
+```
+
+The rows are the verify's rows, padding included, because a drafter's state is
+indexed by row and a device graph has one shape. Which entry of the committed
+block is a row's last token is `accepted_counts - 1`, the same arithmetic the
+verify uses to select a candidate state slot; reading a fixed column instead
+continues every row from the same place. `DraftOutput.draft_token_ids` is
+`[B, K]` int32, every offered id inside the vocabulary: the runner checks the
+dtype and the range before the scheduler stores them, because a stored draft is
+verified next step and committed if the model agrees with it, and a fractional
+value would be truncated on the way in.
+
+`DraftOutput.num_valid` is `[B]` int32 and optional, how many of each row's `K`
+drafts the drafter is offering. It is the only way to offer none: a row at 0 is
+drafted for nowhere, and the step those drafts would have been verified on runs
+as an ordinary decode instead (see section 4d). `None` means every row offers
+all `K`, which is what a drafter that always drafts returns, so a drafter
+written before this field keeps working. A drafter with nothing for a row still
+returns ids in that row, because a device graph has one shape; those ids are
+not read, and not range-checked either, so the row may be padded with
+`PLACEHOLDER_TOKEN_ID`. Never encode an empty proposal as a dummy token id:
+the runner cannot tell that from a real draft and would verify it. Each count
+is checked for dtype, shape and the range `[0, K]` before any of it is used.
+
+The call has one shape. A model that also declares `supports_narrow_decode`
+still receives `[B, 1+K]` here after an ordinary decode step, with the columns
+past each row's `accepted_counts` padded, exactly as a row that accepted less
+than the full width looks after a verify. After such a step `hidden` is `None`,
+which is why that path is closed to a drafter needing a fed hidden state: see
+section 4d.
+
+`hidden` is whatever this step's own `VerifyOutput.hidden` carried, handed back
+without being interpreted. A model that needs none returns none and receives
+none. Selecting this drafter requires vLLM's `custom_class` method, whose
+`model` key must be exactly `vllm_tt_plugin.model_owned_drafter`: vLLM demands
+a dotted proposer path there and nothing imports it, because the drafter is the
+model.
+
+## 4c. The verify call under asynchronous scheduling
+
+Asynchronous scheduling changes when the runner applies a step, not what it
+sends. `execute_model` submits and returns nothing; the engine collects the
+output later, on a thread that is not the engine thread; and the runner applies
+it to request state at the top of the following step. For a speculative step
+the accept walk runs where the readback completes, and the commit of the
+accepted prefix plus the next proposal run on the engine thread when the next
+step drains this one.
+
+Ordering first, because it bounds everything below. A speculative step is
+registered as not overlap-safe, so the runner drains it before it builds the
+next step, and it applies the drained result before it builds. A verify is
+therefore never submitted while the previous verify's acceptance is still
+unapplied, and verify, accept and propose stay serialized per request. What
+this path defers is the readback and the commit, not the order of the steps.
+
+Two demands nevertheless reach the model, and they are what
+`supports_async_spec_decode` declares:
+
+1. **`read_decode_output` serves a verify.** On a synchronous speculative step
+   the hook is never called: the runner asks for the output with the
+   submission. On this path the runner calls
+   `read_decode_output(tt_out, async_read=True)` with the tensor unwrapped from
+   the `VerifyOutput`, so the hook is handed the mode's `[B, 1+K]` block rather
+   than a decode's single column, and the number of tokens per row that will
+   be committed out of it is decided by the host after the forward returns.
+2. **The hidden handle outlives the step's submission.** The model returns it
+   from `decode_forward`, the runner carries it across the readback and a
+   queue, and `propose_draft_tokens` receives it at the next step's drain. A
+   model declaring `spec_hidden_handoff: ["on_device"]` is promising that the
+   device state behind the handle is still valid then.
+
+Neither is covered by `supports_async_decode`, whose requirements in
+[`DECODE_RELOAD_CONTRACT.md`](DECODE_RELOAD_CONTRACT.md) are written for a
+decode that commits one token per forward: they speak of a persistent token
+buffer holding the selected token and of one resident position advance per
+forward. A model can satisfy every one of them for an ordinary decode and be
+wrong for a deferred verify, which is why this is a separate declaration
+rather than the conjunction of the two existing ones. Deriving it would
+enlarge what a model that already declares `supports_async_decode` promised.
+
+## 4d. Which steps verify, and which are ordinary decodes
+
+Only for a model declaring `supports_narrow_decode`; for any other, every
+decode step of a speculating launch is a verify. A step is a verify when
+either of these holds, and an ordinary decode when neither does:
+
+1. **Some row carries a draft.** There is something to verify.
+2. **Some row's previous step committed more than one token.**
+   `accepted_counts` is how a model finds which candidate state slot that
+   commit landed on, so the step after such a commit carries the count even
+   when it drafts nothing. One step resolves it, because that step commits a
+   single token and records a count of 1, so leaving speculation costs exactly
+   one verify.
+
+This is what keeps ordinary batched decoding overlapped inside a server with
+speculation configured. A verify is never overlap-safe: the next candidate
+block is built from its committed tokens, so the runner drains it before
+building the next step. An ordinary decode is overlap-safe under the conditions
+that already govern every other decode, chiefly that the launch samples on
+device. A model whose drafter declines to draft for a batched step therefore
+gets the same asynchronous behavior a non-speculating launch would have, one
+resolving verify aside.
+
+Two obligations come with the declaration.
+
+**The drafter is still asked, after an ordinary decode too.** The proposer is
+called once per step, so a launch that skipped it on these steps would never
+draft again whatever the batch did afterwards. The committed block is one
+column wide, that column being the token the step committed, every
+`accepted_counts` is 1, and the runner pads the block to the uniform `1+K`
+before the call, so the drafter sees one shape. On an asynchronous launch this
+runs at the next step's drain, because the drafts continue a token that had to
+be read back first, so a drafter that starts offering again is acted on one
+step later.
+
+**The drafter must not need a fed hidden state.** An ordinary decode returns no
+`VerifyOutput`, so it produces no hidden handle, and `propose_draft_tokens`
+receives `None` after one. A model requiring `hidden_feed` and declaring
+`spec_hidden_handoff: ["roundtrip"]` is therefore kept off this path entirely:
+the plugin logs the reason when it loads the model and keeps every step a
+verify. A drafter that keeps its state on device, or needs none, is unaffected.
 
 ## 5. What a verify returns, column by column
 

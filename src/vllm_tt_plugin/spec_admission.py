@@ -43,12 +43,24 @@ if TYPE_CHECKING:
 # sampled accept walk is what adds it back.
 _RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
 
+# vLLM's name for a proposer vLLM does not own, which is what a TT model-owned
+# drafter is: the model proposes on device through ``propose_draft_tokens`` and
+# vLLM never sees a drafter of its own. It is the only method name upstream
+# accepts without a draft checkpoint (``eagle``, ``medusa`` and
+# ``mlp_speculator`` all demand a ``model`` path to load, and every ``*_mtp``
+# name resolves a draft architecture from the target's ``model_type``), and it
+# is also the truthful one. vLLM requires ``model`` to be a dotted path; on TT
+# it is a sentinel that nothing imports, so the plugin pins its one accepted
+# value rather than letting a path that goes nowhere look meaningful.
+MODEL_OWNED_DRAFT_METHOD = "custom_class"
+MODEL_OWNED_DRAFT_SENTINEL = "vllm_tt_plugin.model_owned_drafter"
+
 # Methods the runner can actually propose drafts for. The requirements table
 # below says what a method needs *of the model*; this says what the plugin has
 # implemented. Admitting a method with no proposer would start a server that
 # takes the speculative flags, drafts nothing, and serves plain decoding while
 # reporting a speedup it never achieved.
-_PROPOSABLE_METHODS = ("ngram",)
+_PROPOSABLE_METHODS = ("ngram", MODEL_OWNED_DRAFT_METHOD)
 
 _DEVICE_DRAFTER = (SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED)
 
@@ -84,6 +96,16 @@ def _build_method_requirements() -> dict[str, tuple[str, ...]]:
         # vLLM's EagleModelTypes grouping.
         "medusa": _DEVICE_DRAFTER,
         "mlp_speculator": _DEVICE_DRAFTER,
+        # The model's own drafter, proposing on device through
+        # ``propose_draft_tokens``. It proposes, and that is all this method
+        # can demand: what its drafter reads is the model's own business. An
+        # MTP head reads the target hidden state and declares
+        # ``hidden_feed`` for it, while a drafter continuing from the committed
+        # block alone declares nothing extra, and requiring the declaration
+        # here would have forced that model to claim a feed it never uses. The
+        # named upstream methods below are different: each one is a drafter
+        # architecture that reads the hidden state by construction.
+        MODEL_OWNED_DRAFT_METHOD: (SPEC_REQUIREMENT_DEVICE_PROPOSE,),
     }
     # EagleModelTypes flattens to EAGLE, every MTP variant and dFlash. All of
     # them draft on device from the target's hidden state.
@@ -158,12 +180,16 @@ def resolve_speculative_plan(
             "drop the speculative flags"
         )
 
-    # Validated only when the method needs it, so a typo in an unused
-    # declaration does not refuse an ngram launch. Which handoff the model
-    # declared is a real behavioural difference, on device or a host round
-    # trip, but nothing consumes it until the runner holds a HiddenHandle
-    # between propose and verify, so SpecPlan carries no field for it yet.
-    if SPEC_REQUIREMENT_HIDDEN_FEED in required:
+    # Validated when the hidden state is fed at all, whether the method
+    # demands it or the model volunteers it. A model declaring the feed and no
+    # handoff has not said how the state reaches its drafter, and the runner
+    # reads the handoff to decide whether a step that produces no hidden
+    # handle can still ask that drafter to propose. A typo in a declaration no
+    # launch uses stays unvalidated, so it cannot refuse an ngram launch.
+    if (
+        SPEC_REQUIREMENT_HIDDEN_FEED in required
+        or SPEC_REQUIREMENT_HIDDEN_FEED in declared
+    ):
         handoff = normalize_declared_values(
             capabilities.get("spec_hidden_handoff"),
             HIDDEN_HANDOFFS,
@@ -175,6 +201,22 @@ def resolve_speculative_plan(
                 f"to its drafter, but {model_class.__name__} declares no "
                 f"spec_hidden_handoff; expected one of "
                 f"{sorted(HIDDEN_HANDOFFS)}"
+            )
+
+    # vLLM's custom-class method carries a dotted proposer path it loads in its
+    # own runner. The TT runner loads nothing: the drafter is the model. So the
+    # path is pinned to one documented value, because any other one names a
+    # proposer that will never be imported and would read as the thing doing
+    # the drafting.
+    if method == MODEL_OWNED_DRAFT_METHOD:
+        declared_model = getattr(speculative_config, "model", None)
+        if declared_model != MODEL_OWNED_DRAFT_SENTINEL:
+            raise ValueError(
+                f"speculative method {method!r} means the model's own drafter, "
+                "so its 'model' key must be exactly "
+                f"{MODEL_OWNED_DRAFT_SENTINEL!r}, not {declared_model!r}. vLLM "
+                "requires a dotted path there and nothing imports it: the "
+                f"drafter is {model_class.__name__}.propose_draft_tokens"
             )
 
     # Refused on the requirement, not only on the returned plan, so a model
