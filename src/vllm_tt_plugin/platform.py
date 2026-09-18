@@ -83,11 +83,13 @@ def _normalize_device_sampling_contract(
     required = contract.get("required", False)
     sampled_logprobs = contract.get("sampled_logprobs", False)
     topk_logprobs = contract.get("topk_logprobs", False)
+    supports_unrestricted_top_k = contract.get("supports_unrestricted_top_k", True)
     max_top_k = contract.get("max_top_k")
     for name, value in (
         ("required", required),
         ("sampled_logprobs", sampled_logprobs),
         ("topk_logprobs", topk_logprobs),
+        ("supports_unrestricted_top_k", supports_unrestricted_top_k),
     ):
         if not isinstance(value, bool):
             raise ValueError(
@@ -120,6 +122,7 @@ def _normalize_device_sampling_contract(
         "required": required,
         "parameters": sorted(set(parameters)),
         "sampled_logprobs": sampled_logprobs,
+        "supports_unrestricted_top_k": supports_unrestricted_top_k,
         "topk_logprobs": topk_logprobs,
     }
 
@@ -144,6 +147,12 @@ def _unsupported_required_device_sampling_params(params, contract: dict) -> list
     max_top_k = contract["max_top_k"]
     if max_top_k is not None and params.top_k > max_top_k:
         unsupported.append(f"top_k={params.top_k} (maximum: {max_top_k})")
+    if (
+        not contract["supports_unrestricted_top_k"]
+        and params.temperature > 0
+        and params.top_k <= 0
+    ):
+        unsupported.append(f"top_k={params.top_k} (unrestricted sampling unsupported)")
 
     # These controls always select vLLM's host-logits path in the current TT
     # runner. A model declaration cannot make that path device-capable.
