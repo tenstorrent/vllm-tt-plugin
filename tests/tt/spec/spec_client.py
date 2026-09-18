@@ -338,5 +338,36 @@ class SpecServer:
                     break
         return read
 
+    def reset_prefix_cache(self, *, reset_running_requests: bool = True) -> bool:
+        """Ask the engine for a wholesale prefix-cache reset.
+
+        The path the plugin's forced-reset accounting exists for: with
+        ``reset_running_requests`` the engine preempts every running request
+        and frees its blocks, and each request's in-flight output frames become
+        stale. Returns what the engine reports, which is ``False`` while blocks
+        are still held, so a caller retries rather than assuming.
+
+        Behind ``VLLM_SERVER_DEV_MODE``, which the launch that uses this sets.
+        A server without it answers 404 and the test skips.
+        """
+        response = httpx.post(
+            f"{self.base_url}/reset_prefix_cache",
+            params={"reset_running_requests": str(reset_running_requests).lower()},
+            timeout=TIMEOUT,
+        )
+        if response.status_code == 404:
+            return False
+        response.raise_for_status()
+        return bool(response.json().get("success", False))
+
+    def prefix_cache_reset_is_available(self) -> bool:
+        """Whether this launch exposes the reset endpoint at all."""
+        response = httpx.post(
+            f"{self.base_url}/reset_prefix_cache",
+            params={"reset_running_requests": "false"},
+            timeout=TIMEOUT,
+        )
+        return response.status_code != 404
+
     def metrics(self) -> Metrics:
         return Metrics.scrape(self.base_url)

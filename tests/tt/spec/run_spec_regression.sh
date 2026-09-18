@@ -21,7 +21,11 @@ ARTIFACTS="${1:?usage: run_spec_regression.sh <artifacts-dir> [config ...]}"
 shift || true
 CONFIGS=("$@")
 if [ ${#CONFIGS[@]} -eq 0 ]; then
-    CONFIGS=(accept-all accept-2 accept-0 adaptive async capacity lossless)
+    CONFIGS=(
+        accept-all accept-2 accept-0 adaptive async capacity lossless
+        async-accept-0 async-accept-2 async-capacity async-reset
+        async-k1 async-k3
+    )
 fi
 
 : "${TT_METAL_HOME:?TT_METAL_HOME must point at the tt-metal checkout}"
@@ -85,13 +89,14 @@ start_server() {
 run_config() {
     local label="$1" depth="$2" declared_depth="$3" max_model_len="$4" max_num_seqs="$5"
     local blocks="$6" policy="${7:-always}" async="${8:-false}" target="${9:-depth}"
-    shift 9
+    local k="${10:-$K}" dev_mode="${11:-false}"
+    shift 11
     local selection=("$@")
     local dir="$ARTIFACTS/$label"
     local log="$dir/server.log"
     mkdir -p "$dir"
 
-    local spec='{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":'"$K"'}'
+    local spec='{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":'"$k"'}'
     # Device sampling is what any overlapped decode needs: the plugin's
     # steady-decode fast path refuses a host-sampled step whatever else is
     # true of it, because the token the next step reads has to be the one the
@@ -123,7 +128,15 @@ run_config() {
     # this: the plugin writes that field itself from the model's declaration,
     # so an operator's value is replaced.
 
-    echo "=== $label: accept_depth=$depth max_model_len=$max_model_len max_num_seqs=$max_num_seqs draft_policy=$policy"
+    echo "=== $label: k=$k accept_depth=$depth max_model_len=$max_model_len max_num_seqs=$max_num_seqs draft_policy=$policy async=$async target=$target"
+    # The wholesale prefix-cache reset is a development endpoint, so only the
+    # configuration that exercises it asks for one. A server without it answers
+    # 404 and that test skips.
+    if [ "$dev_mode" = "true" ]; then
+        export VLLM_SERVER_DEV_MODE=1
+    else
+        unset VLLM_SERVER_DEV_MODE
+    fi
     export TT_SPEC_ACCEPT_DEPTH="$depth"
     export TT_SPEC_DRAFT_POLICY="$policy"
     export TT_SPEC_TARGET="$target"
@@ -134,7 +147,7 @@ run_config() {
     fi
     start_server "$label" "$log" "${args[@]}" || return 1
 
-    local launch_args="TT_SPEC_ACCEPT_DEPTH=$depth TT_SPEC_DRAFT_POLICY=$policy TT_SPEC_TARGET=$target TT_SPEC_MAX_TOKENS_ALL_USERS=${TT_SPEC_MAX_TOKENS_ALL_USERS:-unset} MESH_DEVICE='$MESH_DEVICE' python examples/server_example_tt.py ${args[*]}"
+    local launch_args="TT_SPEC_ACCEPT_DEPTH=$depth TT_SPEC_DRAFT_POLICY=$policy TT_SPEC_TARGET=$target TT_SPEC_MAX_TOKENS_ALL_USERS=${TT_SPEC_MAX_TOKENS_ALL_USERS:-unset} VLLM_SERVER_DEV_MODE=${VLLM_SERVER_DEV_MODE:-unset} MESH_DEVICE='$MESH_DEVICE' python examples/server_example_tt.py ${args[*]}"
     # Every option in ``--name=value`` form, not ``--name value``. These
     # options are registered in ``tests/tt/spec/conftest.py``, which pytest
     # loads after its first pass over argv, so on that pass an unknown
@@ -149,7 +162,7 @@ run_config() {
         --tt-server-url="http://localhost:$PORT" \
         --tt-model-name="$MODEL" \
         --tt-max-num-seqs="$max_num_seqs" \
-        --tt-spec-k="$K" \
+        --tt-spec-k="$k" \
         --tt-spec-accept-depth="$declared_depth" \
         --tt-spec-target="$target" \
         --tt-spec-drafter=model \
@@ -182,6 +195,7 @@ run_lossless() {
     # function states rather than from what ran before them.
     unset TT_SPEC_DRAFT_POLICY
     unset TT_SPEC_TARGET
+    unset VLLM_SERVER_DEV_MODE
     if engine_running; then
         echo "REFUSING lossless: an engine is already running" >&2
         return 1
@@ -242,30 +256,51 @@ run_lossless() {
 }
 
 BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py tests/tt/spec/test_termination.py)
+ASYNC_CORRECTNESS=(tests/tt/spec/test_async_correctness.py)
 OVERALL=0
 for config in "${CONFIGS[@]}"; do
     case "$config" in
-        accept-all) run_config accept-all -1 all 2048 8 - always false depth "${BEHAVIOUR[@]}" ;;
-        accept-2)   run_config accept-2 2 2 2048 8 - always false depth "${BEHAVIOUR[@]}" ;;
-        accept-0)   run_config accept-0 0 0 2048 8 - always false depth "${BEHAVIOUR[@]}" ;;
+        accept-all) run_config accept-all -1 all 2048 8 - always false depth "$K" false "${BEHAVIOUR[@]}" ;;
+        accept-2)   run_config accept-2 2 2 2048 8 - always false depth "$K" false "${BEHAVIOUR[@]}" ;;
+        accept-0)   run_config accept-0 0 0 2048 8 - always false depth "$K" false "${BEHAVIOUR[@]}" ;;
         # The adaptive drafter: it offers the full draft length while one
         # request is live and nothing while more are, so the batched steps of
         # this configuration are ordinary decodes rather than verifies. Its
         # tests assert the ratio between the two, which no other configuration
         # can produce.
-        adaptive)   run_config adaptive -1 all 2048 8 - solo false depth tests/tt/spec/test_adaptive_policy.py ;;
+        adaptive)   run_config adaptive -1 all 2048 8 - solo false depth "$K" false tests/tt/spec/test_adaptive_policy.py ;;
         # The launch that was unreachable until the plugin admitted the
         # model-owned drafter to asynchronous scheduling: no
         # --no-async-scheduling, the adaptive drafter so the batched steps are
         # ordinary decodes that can overlap, and the fixed target so the output
         # can be checked against the rule rather than against another server.
-        async)      run_config async -1 all 2048 8 - solo true fixed tests/tt/spec/test_async_transitions.py tests/tt/spec/test_adaptive_policy.py ;;
+        async)      run_config async -1 all 2048 8 - solo true fixed "$K" false tests/tt/spec/test_async_transitions.py tests/tt/spec/test_adaptive_policy.py ;;
         # A KV budget of 1024 tokens against eight requests that each want
         # 96 of prompt and 192 of output: all eight are admitted on their
         # prompts and then grow past the pool, so the scheduler has to preempt.
         # Sizing by max_model_len alone does not, because this model allocates
         # no real cache and its declared budget defaults to 131072 tokens.
-        capacity)   run_config capacity -1 all 512 8 1024 always false depth tests/tt/spec/test_capacity.py ;;
+        capacity)   run_config capacity -1 all 512 8 1024 always false depth "$K" false tests/tt/spec/test_capacity.py ;;
+        # Zero and partial acceptance under asynchronous scheduling. The
+        # ``always`` policy rather than ``solo``, so every step carries drafts
+        # and the acceptance counters describe speculation rather than a
+        # drafter that declined; overlap is the async configuration's claim,
+        # not this one's.
+        async-accept-0) run_config async-accept-0 0 0 2048 8 - always true fixed "$K" false "${ASYNC_CORRECTNESS[@]}" ;;
+        async-accept-2) run_config async-accept-2 2 2 2048 8 - always true fixed "$K" false "${ASYNC_CORRECTNESS[@]}" ;;
+        # Preemption and replay under asynchronous scheduling, which the
+        # synchronous capacity configuration cannot reach: a late verify can
+        # complete after the preemption that freed the blocks it ran against.
+        async-capacity) run_config async-capacity -1 all 512 8 1024 always true fixed "$K" false "${ASYNC_CORRECTNESS[@]}" ;;
+        # The wholesale prefix-cache reset, cancellation, row reuse and
+        # prefills arriving mid-decode. The reset needs the development
+        # endpoint, which only this configuration asks for.
+        async-reset)    run_config async-reset -1 all 2048 8 - always true fixed "$K" true "${ASYNC_CORRECTNESS[@]}" ;;
+        # The draft-length boundaries. K=1 has a single candidate column, so a
+        # block is two tokens wide and every off-by-one in the walk shows;
+        # K=3 sits between that and the K=5 the other configurations run.
+        async-k1)       run_config async-k1 -1 all 2048 8 - always true fixed 1 false "${ASYNC_CORRECTNESS[@]}" ;;
+        async-k3)       run_config async-k3 -1 all 2048 8 - always true fixed 3 false "${ASYNC_CORRECTNESS[@]}" ;;
         lossless)   run_lossless ;;
         *) echo "unknown configuration: $config" >&2; OVERALL=1; continue ;;
     esac
