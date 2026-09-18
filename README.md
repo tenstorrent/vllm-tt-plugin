@@ -513,6 +513,30 @@ clear error before anything reaches the device:
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 
+### Partial device-sampling support
+
+A model requiring device sampling can declare a limited parameter domain under
+`model_capabilities["device_sampling"]["unrestricted_top_k_domain"]`. Keep
+`supports_unrestricted_top_k: false` when only part of unrestricted sampling is
+supported. The domain has exactly four fields:
+
+- `top_p_one`: boolean; admits unrestricted `top_p=1` when true.
+- `max_nucleus_top_p`: finite number in `[0, 1)`; admits
+  `0 < top_p <= max_nucleus_top_p`. Zero disables this interval.
+- `sampled_logprobs`: boolean; permits the selected-token logprob.
+- `max_top_logprobs`: nonnegative integer; zero permits only `logprobs=0`, not
+  additional top-token logprobs. Both logprob fields must stay within the outer
+  device-sampling capabilities.
+
+This domain applies to stochastic requests with `top_k <= 0`. Bounded top-k and
+greedy requests retain their existing validation. The runtime must derive a
+conservative nucleus bound from its actual vocabulary, kernel capacity and
+supported geometry; the plugin does not plan device operations. Unsupported
+combinations raise at request admission, without clamping parameters or selecting
+host sampling. The runtime must also validate its instantiated configuration.
+Without a domain, existing unrestricted-support boolean behavior is unchanged.
+Declaring capabilities is not evidence of numerical or endpoint qualification.
+
 ## Benchmarking
 
 Offline benchmarking is done by passing `--measure_perf` to
