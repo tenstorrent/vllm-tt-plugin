@@ -1953,3 +1953,40 @@ def test_a_reservation_alone_does_not_force_a_drain():
     model.release()
     outstanding.get_output()
     _drain(runner, "a")
+
+
+def test_the_submission_counters_separate_verifies_from_ordinary_decodes():
+    """What the overhead benchmark reads, and why it cannot read the metrics.
+
+    vLLM's speculative counters describe the scheduler's lookahead
+    reservation, which under asynchronous scheduling exists on every scheduled
+    request whether or not a draft was ever verified. A cost-per-step
+    comparison needs the two things only the runner knows: how many verifies it
+    sent and how many ordinary decodes. Counted in ``submit_decode``, which is
+    the one funnel both execution modes go through, so a synchronous run and an
+    asynchronous one are counted by the same code.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    _settle_layout(runner)
+    controller = runner.async_decode
+    assert controller._ordinary_decode_submissions == 0
+    assert controller._verify_submissions == 0
+
+    plain = _submit_plain_step(runner, "a")
+    model.release()
+    plain.get_output()
+    _drain(runner, "a")
+
+    assert controller._ordinary_decode_submissions == 1
+    assert controller._verify_submissions == 0
+
+    _settle_layout(runner)
+    verified = _submit_step(runner, "a", drafts={"a": _accept_everything(runner, "a")})
+    model.release()
+    verified.get_output()
+    _drain(runner, "a")
+
+    assert controller._ordinary_decode_submissions == 1
+    assert controller._verify_submissions == 1
