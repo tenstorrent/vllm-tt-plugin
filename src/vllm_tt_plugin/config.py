@@ -39,6 +39,7 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
 # get_tt_data_parallel_size.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
+_DEVICE_SAMPLING_CONTRACT_KEY = "_tt_device_sampling_contract"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -120,6 +121,29 @@ def store_tt_output_tokens_per_step(
         additional = {}
         vllm_config.additional_config = additional
     additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
+
+
+def store_tt_device_sampling_contract(
+    vllm_config: "VllmConfig", contract: dict[str, Any] | None
+) -> None:
+    """Record the normalized model-side sampling contract for frontends."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    if contract is None:
+        additional.pop(_DEVICE_SAMPLING_CONTRACT_KEY, None)
+    else:
+        additional[_DEVICE_SAMPLING_CONTRACT_KEY] = dict(contract)
+
+
+def get_tt_device_sampling_contract(
+    vllm_config: "VllmConfig",
+) -> dict[str, Any] | None:
+    """Return the model-side sampling contract stored during platform setup."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    contract = additional.get(_DEVICE_SAMPLING_CONTRACT_KEY)
+    return dict(contract) if isinstance(contract, dict) else None
 
 
 def get_tt_max_batch_size(vllm_config: "VllmConfig") -> int:

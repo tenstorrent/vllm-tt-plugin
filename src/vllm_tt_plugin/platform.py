@@ -16,9 +16,11 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_device_sampling_contract,
     get_tt_output_tokens_per_step,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    store_tt_device_sampling_contract,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
     uses_tt_lane_coordinator,
@@ -64,6 +66,107 @@ _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
     "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
     "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
 }
+
+
+def _normalize_device_sampling_contract(
+    model_capabilities: dict | None, model_class: type
+) -> dict | None:
+    """Validate the optional model-side sampling ABI used by request admission."""
+    if not model_capabilities or "device_sampling" not in model_capabilities:
+        return None
+    contract = model_capabilities["device_sampling"]
+    if not isinstance(contract, dict):
+        raise ValueError(
+            f"model_capabilities['device_sampling'] for {model_class.__name__} "
+            "must be a dictionary"
+        )
+    required = contract.get("required", False)
+    sampled_logprobs = contract.get("sampled_logprobs", False)
+    topk_logprobs = contract.get("topk_logprobs", False)
+    max_top_k = contract.get("max_top_k")
+    for name, value in (
+        ("required", required),
+        ("sampled_logprobs", sampled_logprobs),
+        ("topk_logprobs", topk_logprobs),
+    ):
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"model_capabilities['device_sampling']['{name}'] for "
+                f"{model_class.__name__} must be a boolean, got {value!r}"
+            )
+    parameters = contract.get("parameters", ())
+    if not isinstance(parameters, (list, tuple)) or any(
+        not isinstance(name, str) or not name for name in parameters
+    ):
+        raise ValueError(
+            "model_capabilities['device_sampling']['parameters'] for "
+            f"{model_class.__name__} must be a list of non-empty strings"
+        )
+    if topk_logprobs and not sampled_logprobs:
+        raise ValueError(
+            f"{model_class.__name__} declares topk_logprobs without "
+            "sampled_logprobs in model_capabilities['device_sampling']"
+        )
+    if max_top_k is not None and (
+        isinstance(max_top_k, bool) or not isinstance(max_top_k, int) or max_top_k < 1
+    ):
+        raise ValueError(
+            f"model_capabilities['device_sampling']['max_top_k'] for "
+            f"{model_class.__name__} must be an integer >= 1 or None, got "
+            f"{max_top_k!r}"
+        )
+    return {
+        "max_top_k": max_top_k,
+        "required": required,
+        "parameters": sorted(set(parameters)),
+        "sampled_logprobs": sampled_logprobs,
+        "topk_logprobs": topk_logprobs,
+    }
+
+
+def _unsupported_required_device_sampling_params(params, contract: dict) -> list[str]:
+    """Return active request controls outside a required device-sampler ABI."""
+    parameters = set(contract["parameters"])
+    device_parameters = {
+        "temperature": params.temperature != 1.0,
+        "top_p": params.top_p != 1.0,
+        "top_k": params.top_k != 0,
+        "seed": params.seed is not None,
+        "presence_penalty": params.presence_penalty != 0.0,
+        "frequency_penalty": params.frequency_penalty != 0.0,
+        "repetition_penalty": params.repetition_penalty != 1.0,
+    }
+    unsupported = [
+        name
+        for name, active in device_parameters.items()
+        if active and name not in parameters
+    ]
+    max_top_k = contract["max_top_k"]
+    if max_top_k is not None and params.top_k > max_top_k:
+        unsupported.append(f"top_k={params.top_k} (maximum: {max_top_k})")
+
+    # These controls always select vLLM's host-logits path in the current TT
+    # runner. A model declaration cannot make that path device-capable.
+    host_only_parameters = {
+        "min_p": params.min_p != 0.0,
+        "bad_words": bool(params.bad_words),
+        "structured_outputs": params.structured_outputs is not None,
+        "logit_bias": params.logit_bias is not None,
+        "allowed_token_ids": params.allowed_token_ids is not None,
+        "min_tokens": params.min_tokens != 0,
+    }
+    unsupported.extend(name for name, active in host_only_parameters.items() if active)
+
+    if params.logprobs is not None:
+        if not contract["sampled_logprobs"]:
+            unsupported.append("logprobs")
+        elif params.logprobs > 0 and not contract["topk_logprobs"]:
+            unsupported.append("top-k logprobs")
+    if params.logprob_token_ids is not None:
+        unsupported.append("logprob_token_ids")
+    if params.flat_logprobs:
+        unsupported.append("flat_logprobs")
+    return unsupported
 
 
 def _aligned_block_output_remaining(
@@ -1597,6 +1700,10 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+        device_sampling_contract = _normalize_device_sampling_contract(
+            model_capabilities, model_class
+        )
+        store_tt_device_sampling_contract(vllm_config, device_sampling_contract)
 
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
@@ -1799,6 +1906,27 @@ class TTPlatform(Platform):
                 f"({model_class.__module__}) does not support on-device sampling. "
                 "Unset sample_on_device_mode or use a model that supports it."
             )
+        if (
+            device_sampling_contract is not None
+            and device_sampling_contract["required"]
+        ):
+            if bool(int(os.environ.get("VLLM_USE_RUST_FRONTEND", "0"))):
+                raise ValueError(
+                    f"Model {model_class.__name__} requires the Python frontend "
+                    "to enforce its device-sampling request contract; unset "
+                    "VLLM_USE_RUST_FRONTEND"
+                )
+            if sample_on_device_mode != "all":
+                raise ValueError(
+                    f"Model {model_class.__name__} declares required device "
+                    "sampling and must use sample_on_device_mode='all'; got "
+                    f"{sample_on_device_mode!r}"
+                )
+            if model_config.logits_processors:
+                raise ValueError(
+                    f"Model {model_class.__name__} declares required device "
+                    "sampling and cannot use host logits processors"
+                )
         if is_block_output_model and sample_on_device_mode != "all":
             raise ValueError(
                 "Block-output models emit complete multi-token outputs from "
@@ -1982,6 +2110,24 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        if isinstance(params, SamplingParams):
+            vllm_config = cls._resolve_tt_admission_handle()
+            contract = (
+                get_tt_device_sampling_contract(vllm_config)
+                if vllm_config is not None
+                else None
+            )
+            if contract is not None and contract["required"]:
+                unsupported = _unsupported_required_device_sampling_params(
+                    params, contract
+                )
+                if unsupported:
+                    raise ValueError(
+                        "This model requires on-device sampling and has no host "
+                        "logits fallback for these request parameters: "
+                        + ", ".join(unsupported)
+                    )
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
