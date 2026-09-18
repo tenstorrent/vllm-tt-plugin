@@ -26,7 +26,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from tests.tt.spec.spec_client import acceptance_delta
+from tests.tt.spec.spec_client import (
+    acceptance_delta,
+    assert_full_length_completion,
+)
 
 MAX_TOKENS = 64
 
@@ -57,7 +60,7 @@ def test_a_lone_request_is_drafted_for_on_every_step(
     delta = acceptance_delta(before, after, spec_config.k)
     record(requests=[result.request], acceptance=delta.as_dict())
 
-    assert result.completion_tokens >= MAX_TOKENS - spec_config.k
+    assert_full_length_completion(result, MAX_TOKENS)
     assert delta.accepted > 0, "a lone request never had a draft accepted"
     # Close to the full width per accepted step: this policy declines by row,
     # and with one row live there is nothing to decline.
@@ -97,7 +100,7 @@ def test_a_batch_is_not_drafted_for(
     )
 
     for result in results:
-        assert result.completion_tokens >= MAX_TOKENS - spec_config.k
+        assert_full_length_completion(result, MAX_TOKENS)
 
     # Acceptance rather than the draft counters, because those cannot be read
     # the same way on both launches: under asynchronous scheduling
