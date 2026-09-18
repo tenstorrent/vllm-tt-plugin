@@ -527,7 +527,9 @@ def test_release_uses_the_prefill_slot_not_the_gathered_row():
     assert remap is not None, "slot 1 -> row 0 must produce a real gather"
     runner.note_decode_state_slots_settled()
     assert runner._req_state_slot["req-b"] == 0, "current slot moved with the gather"
-    assert runner._req_prefill_state_slot["req-b"] == 1, "prefill identity must not move"
+    assert runner._req_prefill_state_slot["req-b"] == 1, (
+        "prefill identity must not move"
+    )
 
     # B finishes.
     runner._release_model_request("req-b")
