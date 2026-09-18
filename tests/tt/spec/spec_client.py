@@ -338,6 +338,21 @@ class SpecServer:
                     break
         return read
 
+    def context_length(self) -> int:
+        """The context this server resolved, from its own model listing.
+
+        Asked rather than passed in: a test that needs to stay inside the
+        context should use the number the engine is enforcing, and the
+        capacity configurations run a deliberately small one.
+        """
+        response = httpx.get(f"{self.base_url}/v1/models", timeout=TIMEOUT)
+        response.raise_for_status()
+        for card in response.json().get("data", []):
+            length = card.get("max_model_len")
+            if length:
+                return int(length)
+        raise AssertionError("the server's model listing carries no max_model_len")
+
     def reset_prefix_cache(self, *, reset_running_requests: bool = True) -> bool:
         """Ask the engine for a wholesale prefix-cache reset.
 
