@@ -54,12 +54,12 @@ _DEVICE_DRAFTER = (SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED
 
 
 def _build_method_requirements() -> dict[str, tuple[str, ...]]:
-    """One table mapping every servable vLLM method name to its requirements.
+    """Map recognized vLLM method names to required model capabilities.
 
     Built once from vLLM's own literals rather than hand-copied, so an upstream
     rename drops a name out of this table instead of leaving the plugin mapping
-    a name vLLM no longer knows. Adding support for a method means adding one
-    entry here.
+    a name vLLM no longer knows. Execution also requires an implemented
+    proposer and admission through ``_PROPOSABLE_METHODS``.
     """
     # Imported lazily: vllm.config pulls in a module that resolves
     # current_platform at import time, which loads this plugin, so importing it

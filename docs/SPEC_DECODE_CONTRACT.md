@@ -80,8 +80,9 @@ when it cannot. It must not raise, and it must not return anything else.
 model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
-`accept_modes` must offer at least one of `logits` or `argmax_ids`; offering
-`fused_sample` in addition is fine and does not make the model less admissible.
+`accept_modes` must include `argmax_ids`, which is the only return format the
+runner executes. A model may also declare `logits` or `fused_sample`, but
+those declarations do not enable execution of either return format.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -144,11 +145,15 @@ call. One that does sees the narrow one on a step where no row carries a draft.
 | --- | --- | --- |
 | `tokens` | `[B, 1+K]` int32 | `[B, 1]` int32 |
 | `start_pos` | `[B, 1+K]` int32 | `[B]` int32, 1-D |
-| `draft_token_ids` | `[B, K]` int32 | `[B, K]` int32, every entry padding |
 | `num_valid_drafts` | `[B]` int32 | `[B]` int32, every entry 0 |
 | `accepted_counts` | `[B]` int32 | `[B]` int32 |
 | `spec_mode` | present | present |
 | return | `VerifyOutput`, `argmax_ids` `[B, 1+K]` | `VerifyOutput`, `argmax_ids` `[B, 1]` |
+
+`TTModelInput.draft_token_ids` is a separate `[B, K]` tensor retained by the
+runner for host acceptance. `submit_decode` does not pass
+`draft_token_ids` to the model; the wide call already carries draft IDs in
+`tokens[:, 1:]`.
 
 The narrow call is the ordinary decode call: its `tokens` and `start_pos` are
 exactly the shapes a non-speculating decode sends, so a model that declares it
@@ -218,7 +223,12 @@ admits an off-by-one that only shows up as wrong output text.
 
 ## 6. What the plugin does with a refusal
 
-Every refusal raises `ValueError` at configuration time, naming the offending
-values and the command-line flag that changes them. Speculation is never
-disabled silently, because a server that accepts the flags and serves no
-speculation reports a speedup it did not achieve.
+`resolve_speculative_plan` rejects unsupported launch settings during
+configuration. `TTPlatform.validate_request` rejects unsupported sampling
+controls when the server admits a request. At execution time, `submit_decode`
+validates that the model returns a `VerifyOutput` in the requested mode.
+These checks name the unsupported input or model response; runtime failures
+are not all configuration-time `ValueError` exceptions.
+
+Speculation is never disabled silently, because a server that accepts
+speculative settings and serves no speculation would misrepresent its behavior.
