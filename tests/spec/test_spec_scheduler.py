@@ -28,7 +28,12 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_tt_plugin.scheduler import TTScheduler
+from vllm_tt_plugin.scheduler import TTScheduler, spec_lookahead_tokens
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    DRAFTER_STATE_INTERNAL,
+    SpecPlan,
+)
 
 NUM_SPEC_TOKENS = 5
 
@@ -175,3 +180,38 @@ def test_the_output_placeholder_accounting_is_preserved():
 
     # One sampled token plus the three drafts actually scheduled.
     assert requests["a"].num_output_placeholders == 4
+
+
+# region Lookahead for a model-owned drafter
+
+
+def _plan(k: int) -> SpecPlan:
+    return SpecPlan(
+        effective_k=k,
+        lanes_per_request=1,
+        extra_bytes_per_seq=0,
+        extra_bytes_per_token=0,
+        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        drafter_state=DRAFTER_STATE_INTERNAL,
+        supports_narrow_decode=False,
+    )
+
+
+def test_a_model_owned_drafter_reserves_the_anchor_and_every_draft():
+    """The proposal that follows a commit writes K/V for the anchor plus K
+    drafts past the committed position, so the scheduler has to have those
+    K+1 slots allocated before the model runs."""
+    assert (
+        spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), NUM_SPEC_TOKENS)
+        == NUM_SPEC_TOKENS + 1
+    )
+
+
+def test_no_admitted_plan_reserves_nothing():
+    """An ngram launch verifies inside the step's own allocation and carries
+    no plan; a non-speculative launch has nothing to reserve for."""
+    assert spec_lookahead_tokens(None, NUM_SPEC_TOKENS) == 0
+    assert spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), 0) == 0
+
+
+# endregion Lookahead for a model-owned drafter
