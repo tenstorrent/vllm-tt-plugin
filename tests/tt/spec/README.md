@@ -16,6 +16,7 @@ A reserved Tenstorrent device is therefore required, and one Wormhole chip is en
 | `test_capacity.py` | preemption and replay occurred, and every preempted request still emitted its whole output |
 | `test_adaptive_policy.py` | the model drafter offers drafts for one live request, declines for a batch, and resumes after the batch returns to one row |
 | `test_async_transitions.py` | asynchronous scheduling remains enabled, ordinary decode overlaps, verify transitions serialize, and output follows the fixed target rule |
+| `test_async_correctness.py` | fixed-target async output equality, zero/partial acceptance, cancellation/reuse, preemption, reset, concurrent prefill, and K/length boundaries under the matching launch |
 
 No test treats a completed response as proof of anything. Each one reads vLLM's own counters across the work, and the capacity tests skip rather than pass when `vllm:num_preemptions_total` did not move.
 
@@ -43,7 +44,7 @@ Declaring the configuration wrongly makes tests fail rather than pass, because e
 
 `TT_SPEC_ACCEPT_DEPTH` makes acceptance a knob by having the verify return each draft unchanged up to that depth. That is what every acceptance-accounting assertion wants, and it is why `test_acceptance_metrics.py` can predict the per-position counters exactly. It cannot answer whether speculation is lossless: the output of that target is a function of what was drafted, so a speculated run and a plain run are meant to differ.
 
-`TT_SPEC_TARGET=fixed` chooses the next token by a rule the drafts never enter, `(token * 31 + position * 7 + 11) % vocab`, computed identically for an ordinary decode and for a verify. Its output is a property of the rule rather than of the drafting, so the same prompt served by a speculating server and by an unspeculated one has to produce the same tokens. In that mode the drafter walks the rule forward and bends the drafts past the accept depth, so wrongness lives in the drafter, which is where a real drafter's wrongness lives.
+`TT_SPEC_TARGET=fixed` applies the same causal successor rule to each input token and position in ordinary decode and verification: `(token * 31 + position * 7 + 11) % vocab`. Verification columns after column zero depend on preceding candidate tokens. The target does not use `TT_SPEC_ACCEPT_DEPTH` to echo a draft or force acceptance. The acceptance walk discards the suffix after rejection, so the committed sequence must match ordinary decoding. The fixed-target drafter follows the successor rule and changes proposals beyond the requested accept depth to exercise rejection.
 
 ## Launching
 
@@ -109,10 +110,11 @@ pytest tests/tt/spec/test_lossless_device.py \
 
 The two servers need two chips: give each one its own through `TT_VISIBLE_DEVICES`, which is what the driver does (`SPEC_CHIP` and `REFERENCE_CHIP`, defaulting to 0 and 1).
 
-**4. Constrained capacity, for preemption.** A small context and long requests, so the blocks do not all fit:
+**4. Constrained capacity, for preemption.** Set the dummy model's shared KV-token budget explicitly, so concurrent requests outgrow the pool:
 
 ```bash
-TT_SPEC_ACCEPT_DEPTH=-1 python $PLUGIN/examples/server_example_tt.py $COMMON \
+TT_SPEC_MAX_TOKENS_ALL_USERS=1024 TT_SPEC_ACCEPT_DEPTH=-1 \
+python $PLUGIN/examples/server_example_tt.py $COMMON \
     --no-async-scheduling --max_num_seqs 8 --max_model_len 512 --port 8100 \
     --speculative-config "$SPEC"
 
@@ -122,7 +124,7 @@ pytest tests/tt/spec/test_capacity.py \
     --tt-spec-artifacts=/tmp/spec-run/capacity
 ```
 
-If the capacity tests skip, the configuration did not reach preemption: lower `--max_model_len` further, or raise the requested `max_tokens`. They are written to skip rather than pass, so a skip is a real result and not a silent one.
+If the capacity tests skip, the run did not reach preemption. Tune `TT_SPEC_MAX_TOKENS_ALL_USERS` against the concurrent workload while keeping each request within `--max_model_len`. Reducing `--max_model_len` alone does not reduce the dummy model's declared shared pool, whose default is 131072 tokens. A skip does not validate preemption.
 
 **5. Adaptive model drafting.** Launch with a model drafter that offers drafts only when one request is live:
 
@@ -177,7 +179,7 @@ tests/tt/spec/run_spec_regression.sh /tmp/spec-run                  # every conf
 tests/tt/spec/run_spec_regression.sh /tmp/spec-run capacity         # or one of them
 ```
 
-The configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, and `lossless`. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
+The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, and `async-k3`. The six `async-*` correctness configurations run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
 
 ## The manifest
 
