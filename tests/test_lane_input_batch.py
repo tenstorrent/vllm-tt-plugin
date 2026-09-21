@@ -16,7 +16,7 @@ Covers the lane-chunked layout the batch owns on behalf of the model runner:
 No device / ttnn execution required.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -106,6 +106,16 @@ def _lane_batch(num_lanes, per_lane, with_custom=True, disable_logprobs=False):
         logitsprocs=_make_logitsprocs(num_lanes * per_lane, with_custom=with_custom),
         disable_logprobs=disable_logprobs,
     )
+
+
+def _host_runner(host_sampler=None, *, vocab=VOCAB, **attrs):
+    """Fake runner for host read-back, carrying the real logits-shape guard so
+    the well-formed shapes these tests use stay well-formed."""
+    runner = SimpleNamespace(
+        host_sampler=host_sampler, model=SimpleNamespace(), vocab_size=vocab, **attrs
+    )
+    runner._check_host_logits = MethodType(TTModelRunner._check_host_logits, runner)
+    return runner
 
 
 def _add_to_lane(batch, req, lane):
@@ -1019,7 +1029,7 @@ def test_compact_host_sampling_matches_full_slots_and_preserves_rng(
         else output.clone()
     )
     sampled, logprobs = batch.extract_output(
-        SimpleNamespace(host_sampler=capture),
+        _host_runner(capture),
         decoded,
         None,
         model_input,
@@ -1076,7 +1086,7 @@ def test_compact_host_sampling_keeps_stateful_processors_on_slot_rows(custom, sp
         intermediate_prefill_mask=None,
     )
     batch.extract_output(
-        SimpleNamespace(host_sampler=capture),
+        _host_runner(capture),
         torch.randn(8, VOCAB),
         None,
         inp,

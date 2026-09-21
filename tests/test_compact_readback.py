@@ -9,7 +9,7 @@ import torch
 from vllm.v1.sample.sampler import Sampler
 
 from tests.test_decode_reload_contract import _accepted_decode_hooks, _submission_input
-from tests.test_lane_input_batch import VOCAB, _lane_batch, _make_req
+from tests.test_lane_input_batch import VOCAB, _host_runner, _lane_batch, _make_req
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController, TTDecodeSubmission
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
 
@@ -73,7 +73,7 @@ def test_compact_readback_preserves_grammar_slot_alignment():
         logits[torch.arange(2), keep] = original
 
     result, _ = batch.extract_output(
-        SimpleNamespace(host_sampler=Sampler(), apply_grammar_bitmask=grammar),
+        _host_runner(Sampler(), apply_grammar_bitmask=grammar),
         TTCompactedHostLogits(torch.zeros(2, 1, VOCAB), tuple(rows)),
         None,
         SimpleNamespace(
@@ -100,7 +100,7 @@ def test_compact_readback_rejects_incompatible_output(invalid):
     count = 1 if invalid == "count" else 2
     with pytest.raises(ValueError):
         batch.extract_output(
-            SimpleNamespace(),
+            _host_runner(),
             TTCompactedHostLogits(torch.zeros(count, 1, VOCAB), output_rows),
             None,
             SimpleNamespace(
