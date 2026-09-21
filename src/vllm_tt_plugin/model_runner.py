@@ -143,19 +143,35 @@ def _coerce_output_block(
     return sampled_token_ids
 
 
-def _prefill_slot_map(runner) -> dict[str, int]:
-    """``req_id -> the slot that request was PREFILLED into``, created on first use.
+def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
+    """Tell the model that its per-slot state moved ``old -> new``.
 
-    Separate from ``_req_state_slot`` because the decode gather moves that one
-    while the model keys session ownership on the slot it was handed at prefill
-    (``empty_slots``); releasing by the moved slot made the two disagree and
-    leaked the owner's session past its request (vllm-tt-plugin#118 review).
+    The model keys B=1 session ownership on the slot it was handed at prefill
+    (``empty_slots``), and the decode gather permutes every slot. Two things have
+    to stay true for a release to identify the right request:
 
-    Reached through ``runner.__dict__`` rather than an attribute so it also works
-    on a partially initialised runner and on the ``SimpleNamespace`` stand-ins the
+    * the model's recorded owner slot must follow the gather -- otherwise a
+      request prefilled at slot 1 and gathered to row 0 is released as 0 while
+      the model still holds 1, and its session outlives the request;
+    * the release must then use the request's CURRENT slot.
+
+    Keying on the prefill slot instead (the first attempt at this) is not enough,
+    because slots are REUSED: a cancelled request frees its slot, a survivor is
+    gathered into it, and a new request is then prefilled into the survivor's old
+    slot and arms a session there. Releasing the survivor by its prefill slot
+    matches the newcomer's owner slot and clears a live session
+    (vllm-tt-plugin#118 review, finding 1).
+
+    The hook is optional -- models that hold no per-slot session do not define it.
+    Reached through ``runner.__dict__``/``getattr`` so it also works on a
+    partially initialised runner and on the ``SimpleNamespace`` stand-ins the
     state-slot tests pass as ``self`` when calling these methods unbound.
     """
-    return runner.__dict__.setdefault("_req_prefill_state_slot", {})
+    if not moves:
+        return
+    note = getattr(getattr(runner, "model", None), "note_state_slots_moved", None)
+    if callable(note):
+        note(dict(moves))
 
 
 class TTModelRunner:
@@ -261,12 +277,11 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
-        # The slot each request was PREFILLED into, which is the identity the
-        # model recorded from ``empty_slots``. Unlike ``_req_state_slot`` this is
-        # NOT moved by the decode gather, so it still matches what the model
-        # holds when the request is released (vllm-tt-plugin#118 review).
-        self._req_prefill_state_slot: dict[str, int] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
+        # Slot-level ``old -> new`` for the same pending gather, forwarded to the
+        # model once the decode is accepted so its recorded session owner follows
+        # the move (see ``_notify_model_slot_moves``).
+        self._pending_state_slot_moves: dict[int, int] | None = None
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
@@ -683,24 +698,18 @@ class TTModelRunner:
     def _release_model_request(self, req_id: str) -> None:
         """Release model-owned state while the slot mapping is still valid.
 
-        Released by the slot the request was PREFILLED into, because that is the
-        identity the model was given (``empty_slots``) and still holds. A decode
-        gather moves ``_req_state_slot`` but tells the model nothing it keys
-        ownership on, so releasing by the current slot made the model compare two
-        quantities the plugin does not keep equal: a request prefilled at slot 1
-        and later gathered to row 0 was released as 0, the model still held 1, and
-        its session -- ``_spec_pending``, ``_spec_active``, ``_spec_carry`` --
-        survived the request's death and leaked into the next one
-        (vllm-tt-plugin#118 review).
+        Released by the request's CURRENT slot, which is the identity the model
+        holds: it was handed the slot at prefill (``empty_slots``) and is told
+        about every subsequent gather through ``note_state_slots_moved``, so the
+        two agree at all times.
 
-        Prefill is the only writer of that identity, so a re-prefilled (preempted
-        then resumed) request correctly re-registers under its new slot.
+        Releasing by the PREFILL slot instead does not work, even though it
+        survives the gather: slots are reused, so one request's prefill slot can
+        be another live request's current owner slot, and the release then clears
+        the newcomer's session (vllm-tt-plugin#118 review, finding 1). See
+        ``_notify_model_slot_moves``.
         """
-        # The fallback only fires when nothing was ever recorded at prefill --
-        # i.e. a partially initialised runner -- because every decoding request
-        # went through _alloc_prefill_state_slots (_decode_state_slot_remap
-        # raises otherwise).
-        slot = _prefill_slot_map(self).get(req_id, self._req_state_slot.get(req_id))
+        slot = self._req_state_slot.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
         if slot is not None and callable(release):
             release(slot)
@@ -955,10 +964,8 @@ class TTModelRunner:
         """
         for req_id in scheduler_output.finished_req_ids:
             self._req_state_slot.pop(req_id, None)
-            _prefill_slot_map(self).pop(req_id, None)
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
-            _prefill_slot_map(self).pop(req_id, None)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
@@ -1000,7 +1007,6 @@ class TTModelRunner:
                 slot = free[0]
             held.add(slot)
             self._req_state_slot[req_id] = slot
-            _prefill_slot_map(self)[req_id] = slot
             slots.append(slot)
         return slots
 
@@ -1049,16 +1055,34 @@ class TTModelRunner:
             for req_id in by_slot.get(slot, ()):
                 moved[req_id] = row
         self._pending_state_slot_settle = moved
+        # Slot-level view of the SAME permutation, for the model's own per-slot
+        # state: row ``i`` reads slot ``remap[i]``, so slot ``remap[i]`` becomes
+        # slot ``i``. Handed over whole, not applied one pair at a time -- a
+        # sequential walk over a permutation can move the same state twice.
+        self._pending_state_slot_moves = {
+            remap[i]: i for i in range(n_slots) if remap[i] != i
+        }
         if all(remap[i] == i for i in range(n_slots)):
             self._pending_state_slot_settle = None
+            self._pending_state_slot_moves = None
             return None
         return torch.tensor(remap, dtype=torch.int32)
 
     def note_decode_state_slots_settled(self) -> None:
-        """Commit a remap only after the model accepted the decode."""
+        """Commit a remap only after the model accepted the decode.
+
+        The model is told about the move here, for the same reason the commit
+        happens here: a gather that the model refused never took effect on the
+        device, so telling it earlier would leave its owner slot describing a
+        permutation that did not happen.
+        """
         if self._pending_state_slot_settle is not None:
             self._req_state_slot = self._pending_state_slot_settle
             self._pending_state_slot_settle = None
+        moves = self.__dict__.get("_pending_state_slot_moves")
+        if moves:
+            _notify_model_slot_moves(self, moves)
+        self._pending_state_slot_moves = None
 
     def note_decode_layout_consumed(self) -> None:
         """Retire the sticky layout transition after an accepted decode."""

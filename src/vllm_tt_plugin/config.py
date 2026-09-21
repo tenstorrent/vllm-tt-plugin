@@ -184,6 +184,51 @@ def store_tt_adaptive_block_max_prompt_tokens(
     additional[_ADAPTIVE_BLOCK_MAX_PROMPT_KEY] = int(limit)
 
 
+# Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY.
+_BLOCK_KV_EXTENT_KEY = "_tt_block_kv_extent_tokens"
+
+
+def get_tt_block_kv_extent_tokens(vllm_config: "VllmConfig") -> int:
+    """Total KV positions ONE block-output decode step may touch (0 = undeclared).
+
+    A block-output step runs internal verify iterations against vLLM-owned KV, so
+    the positions it writes run past the tokens it commits. The emitted width does
+    not bound that: the physical extent is the committed block PLUS the last
+    iteration's verification rows plus any accepted tokens carried beyond the
+    emitted width, and a model may be configured with a verification width LARGER
+    than its output block (dFlash at ``SERVE_BLOCK=2``, ``VERIFY=7`` emits 2 and
+    writes 8 verification rows). Reserving a multiple of the output width then
+    under-allocates and the step writes positions with no request block
+    (vllm-tt-plugin#118 review, finding 2).
+
+    So the model declares the extent it actually touches and the scheduler
+    reserves at least that much lookahead. 0 means the model did not declare one,
+    and the scheduler falls back to its output-width multiple.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_BLOCK_KV_EXTENT_KEY, 0))
+
+
+def store_tt_block_kv_extent_tokens(vllm_config: "VllmConfig", extent: int) -> None:
+    """Record the block-output step's physical KV extent on the config.
+
+    Internal platform-to-runtime handoff: the value comes from the model's
+    ``tt_block_kv_extent_tokens`` capability. Validated here alongside its
+    siblings; the rule that it must cover the output width lives in the platform,
+    which is the only place that sees both.
+    """
+    if isinstance(extent, bool) or not isinstance(extent, int) or extent < 0:
+        raise ValueError(
+            "resolved TT block_kv_extent_tokens must be an integer >= 0, got "
+            f"{extent!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_BLOCK_KV_EXTENT_KEY] = int(extent)
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:

@@ -13,6 +13,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
+    get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     is_tt_adaptive_block_output_model,
@@ -266,9 +267,21 @@ class TTScheduler(AsyncScheduler):
             # by the packed-verify width, which is far below the block width
             # (6 against 64 at the shipped default), so this is generous and
             # costs a page or two per request.
+            #
+            # Twice the width is NOT a bound in general, though: it only covers
+            # the physical extent while the block is at least as wide as the
+            # verification. A model configured the other way round -- dFlash at
+            # GEMMA4_DFLASH_SERVE_BLOCK=2 with GEMMA4_DFLASH_VERIFY=7 emits 2
+            # tokens and writes 8 verification rows -- needs 2 + 8 while this
+            # reserves 4, and the step then writes positions that have no
+            # request block (vllm-tt-plugin#118 review, finding 2). So a model
+            # may declare the extent it actually touches and we honour whichever
+            # is larger.
+            declared_extent = get_tt_block_kv_extent_tokens(self.vllm_config)
             self.num_lookahead_tokens = max(
                 int(getattr(self, "num_lookahead_tokens", 0) or 0),
                 2 * int(self._output_tokens_per_step),
+                int(declared_extent),
             )
             assert self.num_sampled_tokens_per_step == 1, (
                 "Block-output accounting requires upstream to reserve exactly "

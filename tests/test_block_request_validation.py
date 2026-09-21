@@ -445,6 +445,68 @@ def test_startup_requires_block_model_lifecycle_hooks(monkeypatch):
         TTPlatform.check_and_update_config(config)
 
 
+def test_startup_requires_the_slot_move_hook_for_adaptive_block_models(monkeypatch):
+    """An adaptive block-output model admits several live requests, so the runner
+    can gather its per-slot state between steps and then releases a request by
+    its CURRENT slot. A model that keys a session on the slot must therefore
+    track the move, or a release identifies the wrong request and tears down a
+    live session (vllm-tt-plugin#118 review, finding 1).
+
+    Plain block-output is pinned to max_num_seqs=1 and cannot be gathered, so it
+    is deliberately NOT required there -- see the sibling test above, whose model
+    lacks the hook and is rejected only for the two older ones.
+    """
+
+    class AdaptiveBlockModelWithoutMoveHook:
+        model_capabilities = {
+            **BlockModel.model_capabilities,
+            "tt_adaptive_block_output": True,
+        }
+
+        @staticmethod
+        def release_request(_slot):
+            pass
+
+        @staticmethod
+        def release_persistent_capture():
+            pass
+
+    config = _config()
+    config.scheduler_config.max_num_seqs = 2
+    _patch_model_resolution(monkeypatch, AdaptiveBlockModelWithoutMoveHook)
+
+    with pytest.raises(ValueError, match=r"note_state_slots_moved"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_adaptive_block_model_with_the_move_hook_starts(monkeypatch):
+    """The same model, with the hook, is admitted at max_num_seqs > 1."""
+
+    class AdaptiveBlockModel:
+        model_capabilities = {
+            **BlockModel.model_capabilities,
+            "tt_adaptive_block_output": True,
+        }
+
+        @staticmethod
+        def release_request(_slot):
+            pass
+
+        @staticmethod
+        def release_persistent_capture():
+            pass
+
+        @staticmethod
+        def note_state_slots_moved(_moves):
+            pass
+
+    config = _config()
+    config.scheduler_config.max_num_seqs = 2
+    _patch_model_resolution(monkeypatch, AdaptiveBlockModel)
+
+    TTPlatform.check_and_update_config(config)
+
+
 @pytest.mark.parametrize(
     ("model_class", "expected_max_tokens", "expected_wrapped"),
     [

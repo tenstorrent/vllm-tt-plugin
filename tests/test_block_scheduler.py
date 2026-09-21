@@ -34,6 +34,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
+    store_tt_block_kv_extent_tokens,
     store_tt_output_tokens_per_step,
 )
 from vllm_tt_plugin.scheduler import (
@@ -87,6 +88,7 @@ def _scheduler(
     async_scheduling: bool = False,
     adaptive: bool = False,
     max_num_seqs: int = 1,
+    kv_extent: int = 0,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -130,6 +132,8 @@ def _scheduler(
     store_tt_output_tokens_per_step(config, output_width)
     if adaptive:
         store_tt_adaptive_block_output(config, True)
+    if kv_extent:
+        store_tt_block_kv_extent_tokens(config, kv_extent)
     num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
@@ -1482,3 +1486,48 @@ def test_a_block_width_output_on_a_baseline_step_is_refused():
                 pooler_output=[],
             ),
         )
+
+
+def test_a_narrow_block_with_a_wide_verify_reserves_the_physical_extent():
+    """Twice the output width is not a bound when verify is wider (#118 finding 2).
+
+    Victor's configuration and arithmetic: GEMMA4_DFLASH_SERVE_BLOCK=2 with
+    GEMMA4_DFLASH_VERIFY=7 emits an output width of 2 and uses eight physical
+    verification rows. A 123-token prompt in 128-token blocks then decodes with
+    ``123 + 1 + 2 * 2 = 128`` reserved positions, which is exactly one block
+    (0..127), while the decoder writes verification positions 123..130 -- so
+    128, 129 and 130 have no request block behind them.
+
+    Twice the width only covers the extent while the block is at least as wide
+    as the verification, which is true at the shipped default (64 vs 8) and
+    false here. The model declares what it actually touches, and the scheduler
+    honours whichever bound is larger.
+    """
+    # Undeclared: the old behaviour, which is short for this configuration.
+    bare = _scheduler(output_width=2, adaptive=True, max_num_seqs=4)
+    assert bare.num_lookahead_tokens == 4, "2 * output width"
+    assert bare.num_lookahead_tokens < 2 + 8, (
+        "this is the under-reservation: the step touches block + verify rows"
+    )
+
+    # Declared: block (2) + physical verification rows (V=7 -> N=8).
+    sched = _scheduler(output_width=2, adaptive=True, max_num_seqs=4, kv_extent=2 + 8)
+    assert sched.num_lookahead_tokens == 10, (
+        "the declared physical extent must win when it exceeds twice the width"
+    )
+    # 123 + 1 + 10 = 134 > 128, so a second block is allocated and positions
+    # 128..130 are backed.
+    assert 123 + 1 + sched.num_lookahead_tokens > 128
+
+
+def test_the_default_block_width_is_unchanged_by_the_declaration():
+    """At the shipped default the multiple already dominates, so nothing moves.
+
+    Guards against the extent declaration quietly inflating the reservation for
+    every request on the default configuration: 2 * 64 = 128 already exceeds
+    64 + 8, so the declared value must not change the answer.
+    """
+    sched = _scheduler(
+        output_width=CANVAS, adaptive=True, max_num_seqs=4, kv_extent=CANVAS + 8
+    )
+    assert sched.num_lookahead_tokens == 2 * CANVAS

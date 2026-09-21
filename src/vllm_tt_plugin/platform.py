@@ -23,6 +23,7 @@ from vllm_tt_plugin.config import (
     require_tt_output_tokens_per_step,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
+    store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
     uses_tt_lane_coordinator,
@@ -1717,6 +1718,29 @@ class TTPlatform(Platform):
         store_tt_adaptive_block_max_prompt_tokens(
             vllm_config, adaptive_block_max_prompt
         )
+        # Total KV positions ONE block-output step may touch. The emitted width
+        # does not bound this: a step's verification rows and carried tokens run
+        # past the tokens it commits, and a model may be configured with a
+        # verification width LARGER than its output block (dFlash at
+        # SERVE_BLOCK=2, VERIFY=7 emits 2 and writes 8 rows), in which case a
+        # multiple of the output width under-allocates and the step writes
+        # positions with no request block (vllm-tt-plugin#118 review, finding 2).
+        block_kv_extent = int(
+            (model_capabilities or {}).get("tt_block_kv_extent_tokens", 0)
+        )
+        if block_kv_extent < 0:
+            raise ValueError(
+                f"tt_block_kv_extent_tokens must be >= 0; got {block_kv_extent}"
+            )
+        if block_kv_extent and block_kv_extent < output_tokens_per_step:
+            # It must cover the committed block itself, or the declaration is
+            # describing something other than the step's whole KV extent.
+            raise ValueError(
+                "tt_block_kv_extent_tokens must cover the emitted block: "
+                f"{block_kv_extent} < output_tokens_per_step "
+                f"{output_tokens_per_step}"
+            )
+        store_tt_block_kv_extent_tokens(vllm_config, block_kv_extent)
         is_block_output_model = is_tt_block_output_model(vllm_config)
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
@@ -1765,6 +1789,23 @@ class TTPlatform(Platform):
                 "release_request",
                 "release_persistent_capture",
             )
+            # The runner permutes per-slot state between decode steps and then
+            # releases a request by its CURRENT slot. A model that keys per-slot
+            # state (a B=1 session, a per-row session dict) on the slot it was
+            # handed at prefill must therefore be told about the move, or a
+            # release stops matching its own request and tears down a live one
+            # (vllm-tt-plugin#118 review, finding 1).
+            #
+            # Only required where a gather can actually happen: a plain
+            # block-output model is pinned to max_num_seqs=1 below, so its
+            # permutation is always the identity and the current slot never
+            # diverges from the prefill slot. The ADAPTIVE variant is the one
+            # that admits several live requests, so it is the one that must
+            # track moves.
+            if adaptive_block_output and (
+                int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1) or 1) > 1
+            ):
+                required_lifecycle_hooks += ("note_state_slots_moved",)
             missing_hooks = [
                 hook
                 for hook in required_lifecycle_hooks
