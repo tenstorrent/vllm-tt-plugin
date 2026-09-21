@@ -2257,6 +2257,12 @@ class TTModelRunner:
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
             elif not perform_device_sampling:
+                self._check_host_logits(
+                    tt_out,
+                    rows_needed=start + sz,
+                    live_rows=sz,
+                    where="decode" if is_decode else "prefill",
+                )
                 logits = tt_out[rows, -1, :]
 
                 grammar_bitmask = model_input.grammar_bitmask[dp_rank]
@@ -2434,6 +2440,52 @@ class TTModelRunner:
                 start += sz
 
         return sampled_token_ids_per_dp, logprobs_per_dp
+
+    def _check_host_logits(
+        self,
+        tt_out: torch.Tensor,
+        *,
+        rows_needed: int,
+        live_rows: int,
+        where: str,
+    ) -> None:
+        """Refuse model logits the host sampler would read without noticing.
+
+        Host sampling indexes rows into the first dimension and token ids into
+        the last, and both succeed on any tensor that is merely large enough.
+        A model that returns one row of a wide vocabulary reshaped into many
+        narrow rows is therefore sampled with no error at all: the argmax runs
+        over whichever slice of the vocabulary the narrow width covers, and the
+        request answers with tokens that were never compared against the rest
+        of the vocabulary. Mapping a device output onto ``[rows, 1, vocab]`` is
+        the model adapter's work, so the plugin refuses what it cannot sample
+        rather than adapting to it.
+
+        ``rows_needed`` is the highest row the step reads plus one, which for a
+        decode over a padded slot batch exceeds ``live_rows``.
+        """
+        width = int(tt_out.shape[-1])
+        rows = int(tt_out.shape[0])
+        if width == self.vocab_size and rows >= rows_needed:
+            return
+        seen = (
+            f"TT model {type(self.model).__name__} returned {where} logits of "
+            f"shape {tuple(tt_out.shape)} for {live_rows} live row(s)"
+        )
+        hint = (
+            "The model adapter returned malformed logits; reshaping a device "
+            "output into [rows, 1, vocab] belongs to the adapter, not to the "
+            "plugin."
+        )
+        if width != self.vocab_size:
+            raise ValueError(
+                f"{seen}: its last dimension is {width}, but the vocabulary is "
+                f"{self.vocab_size} wide. {hint}"
+            )
+        raise ValueError(
+            f"{seen}: it holds {rows} rows, fewer than the {rows_needed} rows "
+            f"the step reads (vocabulary {self.vocab_size}). {hint}"
+        )
 
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor
