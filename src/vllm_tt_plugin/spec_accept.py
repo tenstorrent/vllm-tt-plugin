@@ -30,9 +30,10 @@ A drafter that reports no probabilities, such as an n-gram proposer, is handled
 as a point mass at the drafted id: ``q`` is 1, so the accept test reduces to
 ``p >= u``, and the residual is ``p`` with the drafted id removed.
 
-This module imports only torch. It reads no ``model_capabilities`` key and
-admits no configuration, so it can be exercised with nothing but synthetic
-distributions.
+The accept walk uses host PyTorch and the plugin's placeholder constant.
+Top-k/top-p filtering lazily imports vLLM's PyTorch helper. This module reads
+no ``model_capabilities`` key and admits no configuration, so synthetic
+distributions are sufficient to exercise the acceptance arithmetic.
 """
 
 from dataclasses import dataclass
@@ -288,8 +289,9 @@ def _constrained_probs(
 
     The distribution the accept walk must preserve is the one the operator
     asked for, so the constraints belong before the accept test rather than
-    after it. Greedy rows pass a temperature of 0 and are rescaled by 1, since
-    their path reads the raw logits and never reaches here.
+    after it. A mixed batch also computes probabilities for greedy rows using
+    a safe temperature of 1. The caller discards those random-path results and
+    selects the raw-logit argmax results for greedy rows.
 
     The caller's tensor is not modified: a caller that also wants logprobs
     needs the raw logits afterwards.
