@@ -147,10 +147,10 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 class SpecPlan:
     """What one model can serve at one ``(max_num_seqs, requested_k)`` point.
 
-    Returned by a model class's ``spec_plan`` classmethod at config time. The
-    runner budgets with these numbers and never inspects the physical verify
-    layout: a model's lane arithmetic, L1 fit and state budget stay private,
-    and only their consequences cross.
+    Returned by a model class's ``spec_plan`` classmethod at config time.
+    Resource fields describe the model's requirements, but the plugin does not
+    yet enforce their row or byte budgets. The physical verify layout stays
+    private to the model.
 
     ``accept_modes`` is stored as a tuple because the instance is frozen and a
     list field would be shared mutable state on a value object.
@@ -159,8 +159,8 @@ class SpecPlan:
     effective_k: int
     # Decode rows one speculating request occupies while verifying its
     # [B, 1+K] block. Unrelated to a lane-DP lane: this counts rows of the
-    # model's decode batch, not TT lanes in an engine. The runner checks it
-    # against its own row budget and never asks how the rows are arranged.
+    # model's decode batch, not TT lanes in an engine. The plugin validates
+    # this declaration but does not yet check it against a row budget.
     lanes_per_request: int
     # Fixed device bytes per speculating request, independent of sequence
     # length: candidate state slots, a conv stash, retained hidden rows.
