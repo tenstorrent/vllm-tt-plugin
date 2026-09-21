@@ -44,6 +44,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.input_batch import (
@@ -142,6 +143,37 @@ def _coerce_output_block(
     return sampled_token_ids
 
 
+def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
+    """Tell the model that its per-slot state moved ``old -> new``.
+
+    The model keys B=1 session ownership on the slot it was handed at prefill
+    (``empty_slots``), and the decode gather permutes every slot. Two things have
+    to stay true for a release to identify the right request:
+
+    * the model's recorded owner slot must follow the gather -- otherwise a
+      request prefilled at slot 1 and gathered to row 0 is released as 0 while
+      the model still holds 1, and its session outlives the request;
+    * the release must then use the request's CURRENT slot.
+
+    Keying on the prefill slot instead (the first attempt at this) is not enough,
+    because slots are REUSED: a cancelled request frees its slot, a survivor is
+    gathered into it, and a new request is then prefilled into the survivor's old
+    slot and arms a session there. Releasing the survivor by its prefill slot
+    matches the newcomer's owner slot and clears a live session
+    (vllm-tt-plugin#118 review, finding 1).
+
+    The hook is optional -- models that hold no per-slot session do not define it.
+    Reached through ``runner.__dict__``/``getattr`` so it also works on a
+    partially initialised runner and on the ``SimpleNamespace`` stand-ins the
+    state-slot tests pass as ``self`` when calling these methods unbound.
+    """
+    if not moves:
+        return
+    note = getattr(getattr(runner, "model", None), "note_state_slots_moved", None)
+    if callable(note):
+        note(dict(moves))
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -163,6 +195,7 @@ class TTModelRunner:
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
+        self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
         self._persistent_capture_released = False
 
         if self.model_config.is_encoder_decoder:
@@ -245,6 +278,10 @@ class TTModelRunner:
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
         self._pending_state_slot_settle: dict[str, int] | None = None
+        # Slot-level ``old -> new`` for the same pending gather, forwarded to the
+        # model once the decode is accepted so its recorded session owner follows
+        # the move (see ``_notify_model_slot_moves``).
+        self._pending_state_slot_moves: dict[int, int] | None = None
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
@@ -661,9 +698,16 @@ class TTModelRunner:
     def _release_model_request(self, req_id: str) -> None:
         """Release model-owned state while the slot mapping is still valid.
 
-        State follows the request's ``_req_state_slot`` slot, not its batch
-        row: prefill can park a request at a slot other than its row when the
-        preferred row is held (``_alloc_prefill_state_slots``).
+        Released by the request's CURRENT slot, which is the identity the model
+        holds: it was handed the slot at prefill (``empty_slots``) and is told
+        about every subsequent gather through ``note_state_slots_moved``, so the
+        two agree at all times.
+
+        Releasing by the PREFILL slot instead does not work, even though it
+        survives the gather: slots are reused, so one request's prefill slot can
+        be another live request's current owner slot, and the release then clears
+        the newcomer's session (vllm-tt-plugin#118 review, finding 1). See
+        ``_notify_model_slot_moves``.
         """
         slot = self._req_state_slot.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
@@ -1011,16 +1055,34 @@ class TTModelRunner:
             for req_id in by_slot.get(slot, ()):
                 moved[req_id] = row
         self._pending_state_slot_settle = moved
+        # Slot-level view of the SAME permutation, for the model's own per-slot
+        # state: row ``i`` reads slot ``remap[i]``, so slot ``remap[i]`` becomes
+        # slot ``i``. Handed over whole, not applied one pair at a time -- a
+        # sequential walk over a permutation can move the same state twice.
+        self._pending_state_slot_moves = {
+            remap[i]: i for i in range(n_slots) if remap[i] != i
+        }
         if all(remap[i] == i for i in range(n_slots)):
             self._pending_state_slot_settle = None
+            self._pending_state_slot_moves = None
             return None
         return torch.tensor(remap, dtype=torch.int32)
 
     def note_decode_state_slots_settled(self) -> None:
-        """Commit a remap only after the model accepted the decode."""
+        """Commit a remap only after the model accepted the decode.
+
+        The model is told about the move here, for the same reason the commit
+        happens here: a gather that the model refused never took effect on the
+        device, so telling it earlier would leave its owner slot describing a
+        permutation that did not happen.
+        """
         if self._pending_state_slot_settle is not None:
             self._req_state_slot = self._pending_state_slot_settle
             self._pending_state_slot_settle = None
+        moves = self.__dict__.get("_pending_state_slot_moves")
+        if moves:
+            _notify_model_slot_moves(self, moves)
+        self._pending_state_slot_moves = None
 
     def note_decode_layout_consumed(self) -> None:
         """Retire the sticky layout transition after an accepted decode."""
@@ -2156,7 +2218,14 @@ class TTModelRunner:
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
 
-            if not perform_device_sampling and self._is_block_output_model:
+            # An adaptive block model's PREFILL emits one plain host-sampled
+            # anchor token (its blocks come only from solo decode steps); any
+            # other host-sampled block step cannot construct the canvas.
+            if (
+                not perform_device_sampling
+                and self._is_block_output_model
+                and not (self._is_adaptive_block_output and not is_decode)
+            ):
                 raise ValueError(
                     "Block-output step fell back to host sampling; "
                     "host sampling cannot construct a multi-token canvas"
@@ -2304,11 +2373,15 @@ class TTModelRunner:
                 )
 
                 next_token_ids = _take(tt_out).reshape(sz, -1)
-                if next_token_ids.shape[1] != self._output_tokens_per_step:
+                allowed_widths = (
+                    (1, self._output_tokens_per_step)
+                    if self._is_adaptive_block_output
+                    else (self._output_tokens_per_step,)
+                )
+                if next_token_ids.shape[1] not in allowed_widths:
                     raise ValueError(
                         "Model output width violates output_tokens_per_step: "
-                        f"{next_token_ids.shape[1]} != "
-                        f"{self._output_tokens_per_step}"
+                        f"{next_token_ids.shape[1]} not in {allowed_widths}"
                     )
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
@@ -2394,7 +2467,7 @@ class TTModelRunner:
             else {req_id: idx for idx, req_id in enumerate(output_req_ids)}
         )
         sampled_token_ids = _coerce_output_block(
-            sampled_token_ids, num_reqs, self._output_tokens_per_step
+            sampled_token_ids, num_reqs, self._tt_committed_width(sampled_token_ids)
         )
 
         sampled_token_ids_np = sampled_token_ids.numpy()
@@ -2431,10 +2504,10 @@ class TTModelRunner:
         # truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
+        num_out_tokens = self._tt_committed_width(sampled_token_ids)
         sampled_token_ids = _coerce_output_block(
-            sampled_token_ids, num_reqs, self._output_tokens_per_step
+            sampled_token_ids, num_reqs, num_out_tokens
         )
-        num_out_tokens = self._output_tokens_per_step
 
         sampled_token_ids_np = sampled_token_ids.numpy()
         if sampled_token_ids_np.dtype != np.int32:
@@ -2536,6 +2609,23 @@ class TTModelRunner:
                 block = sampled_token_ids_np[req_idx]
 
             req_state.output_token_ids.extend(int(token_id) for token_id in block)
+
+    def _tt_committed_width(self, sampled_token_ids: torch.Tensor) -> int:
+        """Resolve one step's committed output width.
+
+        Fixed at ``output_tokens_per_step``, except an ADAPTIVE block model's
+        non-block steps (batched decodes and prefill anchors) emit exactly one
+        valid token per request -- the scheduler reserved exactly one
+        placeholder for those steps, so the emitted row length IS the step's
+        contract. Any other width still fails _coerce_output_block.
+        """
+        if (
+            self._is_adaptive_block_output
+            and sampled_token_ids.dim() == 2
+            and sampled_token_ids.shape[1] == 1
+        ):
+            return 1
+        return self._output_tokens_per_step
 
     def apply_and_build_runner_output(
         self,

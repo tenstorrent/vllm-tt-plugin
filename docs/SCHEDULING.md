@@ -109,7 +109,13 @@ choice depends on:
 vLLM normally enables async scheduling when the configuration is compatible.
 The TT platform turns it off when the selected model does not declare
 `supports_async_decode`. Block-output models are stricter: the platform
-refuses to start unless `--no-async-scheduling` is passed.
+refuses to start unless `--no-async-scheduling` is passed. The one exception
+is a model that also declares `tt_adaptive_block_output`; the gate in
+`TTPlatform.check_and_update_config` reads
+`async_scheduling and not adaptive_block_output`, so an adaptive block-output
+model starts with async scheduling ON. It can, because its reservation is
+decided per step rather than for the model as a whole -- see "Block-output
+reservation" below.
 
 With standard DP there is no global prefill/decode decision. One rank can run
 prefill while another runs decode.
@@ -338,6 +344,39 @@ block width. All placeholders are consumed when that block result is applied;
 client-visible output is still trimmed at EOS, stop tokens, and `max_tokens`.
 See [DiffusionGemma block serving](diffusion-gemma.md) for the current
 256-token block contract.
+
+#### Adaptive block-output reservation
+
+A model declaring `tt_adaptive_block_output` commits a block on SOME steps and
+a single baseline token on the others, so the reservation above is not the
+model-wide rule -- it is a per-step decision. `TTScheduler._update_after_schedule`
+adds the extra placeholders only when all four of these hold for the request:
+
+1. the step is **solo** -- exactly one request in `num_scheduled_tokens`;
+2. the step is a **decode** -- the prompt was fully computed BEFORE this step;
+3. the request is not a prefill chunk;
+4. the request **owns the model's single speculative session**, tracked in
+   `TTScheduler._spec_session_owner` by `_mirror_spec_session`.
+
+Every other step reserves one placeholder, matching the one baseline token the
+model emits for it. The capture frontier
+(`tt_adaptive_block_max_prompt_tokens`) is not a fifth condition: it is a
+property of the prefill that armed the session, applied once in
+`_mirror_spec_session` against the same `prompt_lens` quantity the model
+measures, and thereafter carried by ownership.
+
+Each step's decision is recorded on that step's own `SchedulerOutput`, in the
+`_tt_block_step_decisions` map (`set_tt_block_step_decisions` /
+`get_tt_block_step_decisions`), and bound in `update_from_output` before the
+base loop commits. That is the mechanism that makes async block serving safe:
+under async scheduling the next step's `schedule()` overwrites `Request` state
+before this step's output commits, so a decision stored on the request would be
+read against the wrong output, while the engine core always hands back the
+`SchedulerOutput` that produced the output being committed.
+`_update_request_with_output` raises rather than guesses when a request commits
+output with no recorded decision. It sits next to the forced-reset discard
+counts, which block steps reject outright: a stale async frame cannot balance a
+K-placeholder reservation.
 
 ### Why TT uses an async-style scheduler even in TT-specific flows
 

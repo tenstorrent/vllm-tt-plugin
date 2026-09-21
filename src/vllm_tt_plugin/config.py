@@ -102,6 +102,133 @@ def is_tt_block_output_model(vllm_config: "VllmConfig") -> bool:
     return get_tt_output_tokens_per_step(vllm_config) > 1
 
 
+# Platform-derived, like _RESOLVED_LANE_COUNT_KEY above: written from the
+# MODEL's declared capability, never read from operator input. The leading
+# underscore keeps an operator-passed --additional-config entry of the same
+# name from reading as configuration this code honours.
+_ADAPTIVE_BLOCK_OUTPUT_KEY = "_tt_adaptive_block_output"
+
+
+def is_tt_adaptive_block_output_model(vllm_config: "VllmConfig") -> bool:
+    """Whether the model commits a block ONLY when it decodes alone (batch==1).
+
+    A plain block-output model owns a single request state and requires
+    ``max_num_seqs 1`` / no data-parallelism. An ADAPTIVE block-output model
+    emits its multi-token block only on steps that schedule exactly one decode
+    request, and falls back to plain 1-token baseline decode whenever two or
+    more requests batch together. That lifts the ``max_num_seqs 1`` and
+    data-parallel restrictions: at low concurrency each request gets the block
+    speedup, at higher concurrency the server is a plain batched baseline
+    (never worse). ``TTScheduler._update_after_schedule`` owns the reservation
+    predicate and reserves the K-token placeholder block only when the step is
+    solo, is a decode, and the request owns the model's speculative session --
+    which is where ``tt_adaptive_block_max_prompt_tokens`` was already applied,
+    at the prefill that armed that session.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_ADAPTIVE_BLOCK_OUTPUT_KEY, False))
+
+
+def store_tt_adaptive_block_output(vllm_config: "VllmConfig", flag: bool) -> None:
+    """Record the model's adaptive block-output capability on the config.
+
+    Internal platform-to-runtime handoff, not user-facing: the value comes from
+    the model's ``tt_adaptive_block_output`` capability, which
+    ``TTPlatform.check_and_update_config`` has already validated against
+    ``output_tokens_per_step > 1``.
+    """
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_ADAPTIVE_BLOCK_OUTPUT_KEY] = bool(flag)
+
+
+# Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY.
+_ADAPTIVE_BLOCK_MAX_PROMPT_KEY = "_tt_adaptive_block_max_prompt_tokens"
+
+
+def get_tt_adaptive_block_max_prompt_tokens(vllm_config: "VllmConfig") -> int:
+    """Prompt-length frontier for the adaptive block path (0 = no limit).
+
+    An adaptive block model whose fused capture cannot fit beyond some prompt
+    length serves longer prompts as plain baseline (width-1 steps) for their
+    whole lifetime. The scheduler must reserve width-1 for those requests even
+    on solo decode steps, so the model declares the SAME frontier it gates on.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_ADAPTIVE_BLOCK_MAX_PROMPT_KEY, 0))
+
+
+def store_tt_adaptive_block_max_prompt_tokens(
+    vllm_config: "VllmConfig", limit: int
+) -> None:
+    """Record the adaptive block path's prompt-length frontier on the config.
+
+    Internal platform-to-runtime handoff, not user-facing: the value comes from
+    the model's ``tt_adaptive_block_max_prompt_tokens`` capability. Validated
+    here, next to its sibling ``store_tt_output_tokens_per_step``, rather than
+    in the platform -- the pairing rule that a non-zero frontier requires the
+    adaptive capability stays in the platform, because only the platform sees
+    both capabilities.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError(
+            "resolved TT adaptive_block_max_prompt_tokens must be an integer "
+            f">= 0, got {limit!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_ADAPTIVE_BLOCK_MAX_PROMPT_KEY] = int(limit)
+
+
+# Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY.
+_BLOCK_KV_EXTENT_KEY = "_tt_block_kv_extent_tokens"
+
+
+def get_tt_block_kv_extent_tokens(vllm_config: "VllmConfig") -> int:
+    """Total KV positions ONE block-output decode step may touch (0 = undeclared).
+
+    A block-output step runs internal verify iterations against vLLM-owned KV, so
+    the positions it writes run past the tokens it commits. The emitted width does
+    not bound that: the physical extent is the committed block PLUS the last
+    iteration's verification rows plus any accepted tokens carried beyond the
+    emitted width, and a model may be configured with a verification width LARGER
+    than its output block (dFlash at ``SERVE_BLOCK=2``, ``VERIFY=7`` emits 2 and
+    writes 8 verification rows). Reserving a multiple of the output width then
+    under-allocates and the step writes positions with no request block
+    (vllm-tt-plugin#118 review, finding 2).
+
+    So the model declares the extent it actually touches and the scheduler
+    reserves at least that much lookahead. 0 means the model did not declare one,
+    and the scheduler falls back to its output-width multiple.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_BLOCK_KV_EXTENT_KEY, 0))
+
+
+def store_tt_block_kv_extent_tokens(vllm_config: "VllmConfig", extent: int) -> None:
+    """Record the block-output step's physical KV extent on the config.
+
+    Internal platform-to-runtime handoff: the value comes from the model's
+    ``tt_block_kv_extent_tokens`` capability. Validated here alongside its
+    siblings; the rule that it must cover the output width lives in the platform,
+    which is the only place that sees both.
+    """
+    if isinstance(extent, bool) or not isinstance(extent, int) or extent < 0:
+        raise ValueError(
+            "resolved TT block_kv_extent_tokens must be an integer >= 0, got "
+            f"{extent!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_BLOCK_KV_EXTENT_KEY] = int(extent)
+
+
 def store_tt_output_tokens_per_step(
     vllm_config: "VllmConfig", output_tokens_per_step: int
 ) -> None:
