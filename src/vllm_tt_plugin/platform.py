@@ -747,10 +747,9 @@ def _install_tt_async_spec_method_patch() -> None:
     speculative method name, and it decides before ``check_and_update_config``
     runs: an explicit ``--async-scheduling`` raises for any method outside
     EAGLE/MTP/draft_model/NGram GPU/DSpark, and the default path rewrites the
-    setting to False for the same set. ``custom_class`` is the only name
-    upstream accepts for a proposer it does not own, so the plugin's
-    model-owned drafter is refused there, and the hook that knows this is a TT
-    launch runs too late to say otherwise.
+    setting to False for the same set. TT uses the ``custom_class`` extension
+    category for its model-owned drafter. The ordinary platform validation
+    hook runs too late to admit that category through the upstream check.
 
     Both predicates read one module-level name, ``EagleModelTypes``, which
     ``vllm.config.vllm`` imports and uses nowhere else. Rebinding that name to
@@ -2187,13 +2186,9 @@ class TTPlatform(Platform):
                     "supports_async_decode covers neither. Launch with "
                     "--no-async-scheduling, or drop the speculative flags"
                 )
-            # Upstream refuses the pairing first for most method names:
-            # ``VllmConfig.__post_init__`` admits asynchronous scheduling only
-            # with EAGLE, MTP, a draft model, NGram GPU or DSpark, and it runs
-            # before this hook. So a launch reaching here already named a
-            # method vLLM allows; ``custom_class``, the plugin's own
-            # model-owned drafter, is not one of them and fails upstream with a
-            # message about supported speculative kinds.
+            # The TT bootstrap patch admits custom_class through upstream's
+            # method check. These capability checks determine whether the
+            # selected model can serve the combined async speculative path.
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(

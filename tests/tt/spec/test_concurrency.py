@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Several requests speculate in the same steps without mixing up.
+"""Check per-request lengths and scheduler-observed multi-row decoding.
 
 Sending requests at once is not a concurrency test on its own: the server can
 serve them one after another and every response still arrives correct. So these
-tests do three things the earlier device experiment did not.
+tests check response lengths, staggered arrivals, and scheduled decode width.
 
-They give each request a **different prompt and a different output length**, so
-a row that read another row's state produces a detectably wrong answer rather
-than the same answer twice.
+Different requested output lengths check per-request completion accounting.
+The depth target does not provide prompt-dependent continuations, so these
+length checks do not establish token-content isolation. Fixed-target lossless
+and async correctness tests check complete token sequences.
 
 They **stagger the arrivals**, which is what makes rows join a batch that is
 already decoding and forces the persistent batch to grow while drafts are in
@@ -51,10 +52,9 @@ def test_distinct_requests_each_get_their_own_output(
 ):
     """Different prompts and different lengths, arriving together.
 
-    Each response has to answer its own prompt: under the ``depth`` target the
-    output is an ascending run seeded by the prefill rather than by the prompt,
-    so the check that distinguishes the rows is the requested length, and the
-    ids are checked for the shape the target produces.
+    Under the ``depth`` target, prefill seeds the same ascending continuation
+    for different prompts. This test checks each response's requested length
+    and aggregate drafting, not the contents of each token sequence.
     """
     rows = min(4, max_batch_size)
     if rows < 2:
