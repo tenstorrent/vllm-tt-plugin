@@ -9,14 +9,6 @@ below. The plugin side that reads it is
 The design this implements is
 https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
 
-## Status
-
-The plugin admits a configuration and then refuses the launch, because no
-execution path exists yet: `TTWorker` implements no `take_draft_token_ids` and
-`TTModelRunner` drives no verify-then-propose loop. Implementing this contract
-on a model is therefore useful now for validating declarations, and does not
-yet produce a speculating server.
-
 ## 1. Capability declarations
 
 Four `model_capabilities` entries, read only when the launch carries a
