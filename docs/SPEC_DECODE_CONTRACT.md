@@ -48,9 +48,10 @@ need their own execution path before the matching refusal can go.
 
 ## 1. Capability declarations
 
-Five `model_capabilities` entries, read only when the launch carries a
-`speculative_config`. Absent keys default as shown, following the plugin's
-existing default-if-absent convention.
+Speculative decoding uses the entries below together with the ordinary
+`supports_async_decode` capability. Absent keys default as shown.
+`supports_async_decode` is checked for every asynchronous launch, including
+launches without `speculative_config`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -58,7 +59,8 @@ existing default-if-absent convention.
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when the method needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
-| `supports_async_spec_decode` | `False` | The model's readback and hidden handle serve a deferred verify: see section 4c. Absent means a launch pairing speculation with `--async-scheduling` is refused. |
+| `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
+| `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -92,9 +94,9 @@ when it cannot. It must not raise, and it must not return anything else.
 model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
-`accept_modes` must include `argmax_ids`, which is the only return format the
-runner executes. A model may also declare `logits` or `fused_sample`, but
-those declarations do not enable execution of either return format.
+`accept_modes` must include `argmax_ids`, the return format the current runner
+executes. A model may also declare `logits` or `fused_sample`, but neither
+additional declaration enables an execution path for that return format.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -118,9 +120,9 @@ runner. Declare them accurately anyway: they are what the budgeting will read.
 
 ## 4. What the runner sends on a decode step
 
-Once a launch carries a resolved `SpecPlan`, `TTModelRunner` widens every
-decode step to the candidate block, whether or not any request has drafts
-pending. `TTModelInput` carries it as four values.
+For a verification step, `TTModelRunner` builds the candidate block described
+below. Section 4d defines when a speculative launch instead uses ordinary
+decode. `TTModelInput` carries the verification inputs as four values.
 
 | Value | Shape | Meaning |
 | --- | --- | --- |
@@ -241,9 +243,10 @@ verified next step and committed if the model agrees with it, and a fractional
 value would be truncated on the way in.
 
 `DraftOutput.num_valid` is `[B]` int32 and optional, how many of each row's `K`
-drafts the drafter is offering. It is the only way to offer none: a row at 0 is
-drafted for nowhere, and the step those drafts would have been verified on runs
-as an ordinary decode instead (see section 4d). `None` means every row offers
+drafts the drafter is offering. A count of 0 declines drafting for that row.
+A fully draftless batch can use ordinary decode only when narrow decoding is
+available and no live row has an unresolved multi-token commit (section 4d).
+Another row with drafts still requires a verification call. `None` means every row offers
 all `K`, which is what a drafter that always drafts returns, so a drafter
 written before this field keeps working. A drafter with nothing for a row still
 returns ids in that row, because a device graph has one shape; those ids are
@@ -263,15 +266,55 @@ section 4d.
 without being interpreted. A model that needs none returns none and receives
 none. Selecting this drafter requires vLLM's `custom_class` method, whose
 `model` key must be exactly `vllm_tt_plugin.model_owned_drafter`: vLLM demands
-a dotted proposer path there and nothing imports it, because the drafter is the
-model.
+a dotted proposer path for its custom-proposer extension. Upstream
+`create_custom_proposer` imports and constructs that class. The TT runner
+instead recognizes the fixed marker and calls the loaded model adapter; the TT
+runner does not import `vllm_tt_plugin.model_owned_drafter` or load a separate
+draft checkpoint from that value.
 
 ## 4c. The verify call under asynchronous scheduling
 
+`supports_async_decode` and `supports_async_spec_decode` are separate model
+promises. Neither capability enables scheduling by itself, and neither means
+the drafter and target may execute concurrently for the same request.
+
+- **`supports_async_decode` covers ordinary decode.** The model supports
+  `decode_forward(..., read_from_device=False)` followed by
+  `read_decode_output(..., async_read=True)`. When ordinary device sampling
+  permits overlap, the model also preserves resident forward inputs, token
+  feedback, positions, and reload behavior described in
+  [DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md).
+- **`supports_async_spec_decode` adds deferred verification support.** The same
+  readback mechanism must return the verification block, whose accepted length
+  the plugin decides later. The model must preserve verification output and
+  any hidden state needed by the subsequent proposal until their consumers
+  finish. Ordinary single-token decode support does not establish these
+  multi-token and lifetime requirements.
+
+For a launch requesting speculation and async scheduling, `TTPlatform` applies
+these checks in this order:
+
+1. `TTPlatform` checks `supports_async_decode`. If false or absent,
+   `TTPlatform` logs a warning and sets `async_scheduling=False`. The launch
+   can proceed synchronously if the remaining speculative checks pass, even
+   if `supports_async_spec_decode=True`.
+2. If async scheduling remains enabled, `TTPlatform` requires
+   `supports_async_spec_decode=True`. A missing or false declaration raises
+   `ValueError`; the operator can select `--no-async-scheduling`.
+3. `TTPlatform` also requires `supports_spec_decode` and an admissible
+   `SpecPlan`. Both async declarations are necessary for the combined path,
+   but do not replace the other admission checks.
+
+The TT compatibility patch admits `custom_class` through the upstream async
+method check before platform validation. The patch preserves the marker and
+capability checks. `--no-async-scheduling` still selects synchronous execution.
+
 Asynchronous scheduling changes when the runner applies a step, not what it
 sends. `execute_model` submits and returns nothing; the engine collects the
-output later, on a thread that is not the engine thread; and the runner applies
-it to request state at the top of the following step. For a speculative step
+output later when the deferred result is resolved; and the runner applies the
+result to request state at the top of the following step. Output resolution
+may run on the caller thread, depending on the executor; asynchronous
+scheduling does not require a separate output thread. For a speculative step
 the accept walk runs where the readback completes, and the commit of the
 accepted prefix plus the next proposal run on the engine thread when the next
 step drains this one.
@@ -376,10 +419,8 @@ admits an off-by-one that only shows up as wrong output text.
 
 `resolve_speculative_plan` rejects unsupported launch settings during
 configuration. `TTPlatform.validate_request` rejects unsupported sampling
-controls when the server admits a request. At execution time, `submit_decode`
-validates that the model returns a `VerifyOutput` in the requested mode.
-These checks name the unsupported input or model response; runtime failures
-are not all configuration-time `ValueError` exceptions.
-
-Speculation is never disabled silently, because a server that accepts
-speculative settings and serves no speculation would misrepresent its behavior.
+controls during request admission. `submit_decode` validates `VerifyOutput`
+at execution time and raises the corresponding type or mode error. These
+checks report the offending values rather than silently replacing the requested
+speculative behavior. The ordinary async capability check separately permits
+synchronous fallback with a warning, as specified in section 4c.

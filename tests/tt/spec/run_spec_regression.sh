@@ -8,7 +8,7 @@
 # invalidates everything that follows it.
 #
 # Usage: run_spec_regression.sh <artifacts-dir> [config ...]
-#   with no config names, runs: accept-all accept-2 accept-0 capacity lossless
+#   with no config names, runs every configuration in CONFIGS below
 #
 # Needs a reserved Tenstorrent device, TT_METAL_HOME set, and the plugin's
 # virtual environment active. The losslessness configuration needs two chips,

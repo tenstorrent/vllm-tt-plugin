@@ -353,14 +353,14 @@ class TTModelRunner:
         # from the persistent batch and added back later, and only an explicit
         # preemption releases the model's candidate state, so the count that
         # selects among those candidates has to survive the row going away.
-        # Pending drafts are not here: those are the scheduler's, and arrive on
-        # the SchedulerOutput. An absent entry is the post-prefill default of 1.
+        # Draft IDs are resolved separately by _drafts_to_verify according to
+        # scheduling mode. An absent accepted-count entry defaults to 1.
         self._req_accepted_counts: dict[str, int] = {}
 
-        # Drafts this runner has proposed and not yet handed to the scheduler.
-        # ``EngineCore`` collects them with ``take_draft_token_ids`` after the
-        # step that produced them, and the scheduler is what decides how many
-        # of them the next step can afford and whether a grammar allows them.
+        # Pending proposal IDs. Synchronous execution hands them to the
+        # scheduler through take_draft_token_ids. Asynchronous execution
+        # consumes them in _drafts_to_verify within the scheduled lookahead
+        # reservation. Each consumer takes a proposal only once.
         self._proposed_draft_token_ids: dict[str, list[int]] = {}
         # Built on first use rather than here, because constructing it compiles
         # numba kernels and a launch that never speculates must not pay that.
@@ -1332,15 +1332,12 @@ class TTModelRunner:
 
         The two halves come from different owners, deliberately.
 
-        The **drafts** are the scheduler's. A proposer reports them through
-        ``take_draft_token_ids``, upstream's ``Scheduler`` stores them on the
-        request, truncates them to the token budget it can actually schedule,
-        and runs them through the grammar when a request uses structured
-        output. What survives all that arrives as
-        ``SchedulerOutput.scheduled_spec_decode_tokens``, and only that is safe
-        to verify. A runner-private copy would bypass the budget and the
-        grammar, and grammar truncation is the reason ``num_valid_drafts`` is
-        per row rather than batch-wide in the first place.
+        ``scheduled_drafts`` contains actual IDs resolved by
+        ``_drafts_to_verify``. Synchronous execution receives scheduler-owned
+        IDs after the proposal handoff. Asynchronous execution substitutes
+        retained runner proposals within the scheduler's placeholder
+        reservation. Both paths obey the scheduled per-request draft budget;
+        structured speculative requests are not admitted.
 
         The **accepted count** is the runner's, because nothing upstream models
         it. It is keyed by request id rather than by row because a running
@@ -1378,11 +1375,11 @@ class TTModelRunner:
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         """Hand the drafts proposed since the last call to the engine.
 
-        ``EngineCore`` calls this on every step of a speculative run, and
-        ``Scheduler.update_draft_token_ids`` is what stores the result on each
-        request, truncates it to the lookahead it can budget, and runs it
-        through the grammar. Returning ``None`` is how a step that proposed
-        nothing says so.
+        On the synchronous path, ``EngineCore`` collects proposals and passes
+        them to ``Scheduler.update_draft_token_ids``. The supported async path
+        instead consumes retained proposals in ``_drafts_to_verify`` within
+        the scheduled lookahead reservation. Returning ``None`` reports that
+        no pending proposal is available for handoff.
         """
         if not self._proposed_draft_token_ids:
             return None

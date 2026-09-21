@@ -173,12 +173,10 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
     """Run the deferred device readback exactly once, from whichever caller
     reaches it first.
 
-    Two callers race for the same step from different threads: vLLM's
-    ``UniProcExecutor`` resolves it via ``get_output`` on its async-output
-    thread when async scheduling is on, while the runner's drain
-    (``TTAsyncDecodeController.wait_for_all_pending_async_steps``) resolves it
-    via ``ensure_finalized`` on the engine thread. ``_finalize_lock`` makes the
-    readback run exactly once across both threads; a second concurrent readback
+    The executor resolves the step through ``get_output``; the runner's drain
+    resolves it through ``ensure_finalized``. Depending on the executor, these
+    calls can share a thread or race across threads. ``_finalize_lock`` makes
+    either ordering resolve the readback exactly once; a second readback
     of the same device submission corrupts the decode output. The completion
     event is set here, when the readback actually runs, not only inside
     ``get_output``. That is the invariant the drain depends on: vLLM 0.22's
@@ -285,9 +283,9 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
     """A deferred speculative step: read back, then walk acceptance.
 
     Shares ``DeferredDecodeOutput``'s exactly-once resolution, because the same
-    two threads race for a speculative step as for an ordinary one and a second
-    readback of the same submission corrupts it. What differs is what resolving
-    it does: the accept walk instead of the sampler, and a published output
+    resolution entry points can race for a speculative step as for an ordinary
+    one, and a second readback of the same submission corrupts it. Resolution
+    differs: the accept walk instead of the sampler, and a published output
     whose rows carry a committed prefix each rather than one token apiece.
 
     It never mutates runner state. The walk reads only this step's own tensors,

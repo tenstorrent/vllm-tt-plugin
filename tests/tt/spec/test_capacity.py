@@ -17,9 +17,10 @@ invisible in a completed response unless the output is checked against what the
 request should have emitted.
 
 Reaching preemption needs a server launched with little KV capacity, which is
-what ``README.md`` calls the constrained configuration: a small
-``--max_model_len`` and enough concurrent long requests that their blocks do
-not fit at once.
+what ``README.md`` calls the constrained configuration:
+``TT_SPEC_MAX_TOKENS_ALL_USERS=1024`` and enough concurrent requests that
+their blocks do not fit at once. ``--max_model_len`` limits each request,
+not the dummy model's shared KV-token budget.
 """
 
 from __future__ import annotations
@@ -68,9 +69,9 @@ def test_preempted_requests_still_emit_their_full_output(
     if delta.preemptions == 0:
         pytest.skip(
             "no preemption occurred, so this run establishes nothing about it. "
-            "Launch the constrained configuration from README.md: a smaller "
-            "--max_model_len, or more concurrent requests asking for more "
-            "tokens each"
+            "Launch the constrained configuration from README.md with "
+            "TT_SPEC_MAX_TOKENS_ALL_USERS=1024, then tune the shared budget "
+            "against concurrency while keeping requests within --max_model_len"
         )
 
     for result in results:

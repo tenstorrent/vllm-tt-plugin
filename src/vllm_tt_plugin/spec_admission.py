@@ -43,15 +43,11 @@ if TYPE_CHECKING:
 # sampled accept walk is what adds it back.
 _RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
 
-# vLLM's name for a proposer vLLM does not own, which is what a TT model-owned
-# drafter is: the model proposes on device through ``propose_draft_tokens`` and
-# vLLM never sees a drafter of its own. It is the only method name upstream
-# accepts without a draft checkpoint (``eagle``, ``medusa`` and
-# ``mlp_speculator`` all demand a ``model`` path to load, and every ``*_mtp``
-# name resolves a draft architecture from the target's ``model_type``), and it
-# is also the truthful one. vLLM requires ``model`` to be a dotted path; on TT
-# it is a sentinel that nothing imports, so the plugin pins its one accepted
-# value rather than letting a path that goes nowhere look meaningful.
+# Upstream custom_class is a user-provided proposer extension that needs no
+# separate draft checkpoint configuration. The TT runner uses that category
+# to call the loaded model's propose_draft_tokens instead of importing and
+# constructing an upstream proposer. The model value is therefore a fixed TT
+# dispatch marker, not an executable class path or a weights location.
 MODEL_OWNED_DRAFT_METHOD = "custom_class"
 MODEL_OWNED_DRAFT_SENTINEL = "vllm_tt_plugin.model_owned_drafter"
 
@@ -66,12 +62,12 @@ _DEVICE_DRAFTER = (SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED
 
 
 def _build_method_requirements() -> dict[str, tuple[str, ...]]:
-    """Map recognized vLLM method names to required model capabilities.
+    """Map recognized vLLM method names to model capability requirements.
 
     Built once from vLLM's own literals rather than hand-copied, so an upstream
     rename drops a name out of this table instead of leaving the plugin mapping
-    a name vLLM no longer knows. Execution also requires an implemented
-    proposer and admission through ``_PROPOSABLE_METHODS``.
+    a name vLLM no longer knows. Execution also requires a proposer implemented
+    by the runner and admitted through ``_PROPOSABLE_METHODS``.
     """
     # Imported lazily: vllm.config pulls in a module that resolves
     # current_platform at import time, which loads this plugin, so importing it
