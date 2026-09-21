@@ -18,6 +18,7 @@ from vllm_tt_plugin.config import (
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
+    get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
 )
@@ -88,6 +89,22 @@ class TTSchedulingMode(Enum):
         if prefill_intent == 1:
             return cls.PREFILL_ONLY
         raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
+
+
+def spec_lookahead_tokens(plan, num_spec_tokens: int) -> int:
+    """KV slots to reserve past a step's own tokens for a model-owned drafter.
+
+    Such a drafter proposes for the next step inside the current one: after
+    the accept walk commits, its fused body runs over the anchor plus every
+    draft and writes K/V for those K+1 positions, none of which the current
+    step's allocation covers. Upstream reserves lookahead only for the drafter
+    methods it knows, and ``custom_class`` is not one of them, so without this
+    reservation the rows that cross into the next block land in the null block
+    and the first token that reads them diverges from plain decode.
+    """
+    if plan is None or num_spec_tokens <= 0:
+        return 0
+    return num_spec_tokens + 1
 
 
 class TTDecodeInterleavePolicy:
@@ -253,6 +270,12 @@ class TTScheduler(AsyncScheduler):
         # its steps reserve width-1 even when solo.
         self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
             self.vllm_config
+        )
+        self.num_lookahead_tokens = max(
+            self.num_lookahead_tokens,
+            spec_lookahead_tokens(
+                get_tt_spec_plan(self.vllm_config), self.num_spec_tokens
+            ),
         )
         if self._is_block_output_model:
             # KV pages for the WHOLE step, not just the one token upstream
