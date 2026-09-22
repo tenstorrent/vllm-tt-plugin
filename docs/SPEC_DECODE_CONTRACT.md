@@ -57,7 +57,7 @@ launches without `speculative_config`.
 | --- | --- | --- |
 | `supports_spec_decode` | `False` | Master gate. Absent means the model cannot serve any speculative configuration. |
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
-| `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when the method needs `hidden_feed`. |
+| `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when `speculative_config.method` needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
@@ -84,8 +84,9 @@ inside a launch that is otherwise speculating, and the adapter keeps or
 rebuilds whatever drafter state a later `propose_draft_tokens` call needs
 across such a step. `supports_narrow_decode` selects no batch size at which
 the plugin changes shape, enables no asynchronous scheduling, and does not
-promise that any step will actually be narrow: `TTModelRunner._step_verifies`
-decides that per step, from the runtime values of section 4d.
+promise that any step will actually be narrow:
+`vllm_tt_plugin.model_runner._step_verifies` decides that per step, from the
+runtime values of section 4d.
 `TTModelRunner.load_model` revokes `supports_narrow_decode` for exactly one
 declared pairing, named under `spec_hidden_handoff` below.
 
@@ -120,7 +121,7 @@ drafts.
 **`spec_hidden_handoff`** is a `model_capabilities` key naming how the target
 hidden state reaches the drafter: `on_device`, `roundtrip`.
 `resolve_speculative_plan` requires it to be non-empty whenever `hidden_feed`
-is required by the method or declared by the model.
+is required by `speculative_config.method` or declared by the model.
 `TTModelRunner._narrow_steps_serve_the_drafter`, which
 `TTModelRunner.load_model` runs once, reads `spec_requirements` and
 `spec_hidden_handoff` together: a model declaring `hidden_feed` and
@@ -451,11 +452,12 @@ enlarge what a model that already declares `supports_async_decode` promised.
 
 ## 4d. Which steps verify, and which are ordinary decodes
 
-`TTModelRunner._step_verifies` makes this choice once per decode step, from
-three values the input builder hands it: the effective
+`vllm_tt_plugin.model_runner._step_verifies` makes this choice once per decode
+step, from three values the input builder hands it: the effective
 `supports_narrow_decode`, the step's `num_valid_drafts` row vector, and the
-step's `accepted_counts` row vector. `TTModelRunner._step_verifies` returns
-true, and the step is a verify, when any one of the following holds.
+step's `accepted_counts` row vector.
+`vllm_tt_plugin.model_runner._step_verifies` returns true, and the step is a
+verify, when any one of the following holds.
 
 1. **Narrow decode is unavailable.** The `SpecPlan` did not set
    `supports_narrow_decode`, or `TTModelRunner.load_model` revoked it for the
@@ -469,8 +471,8 @@ true, and the step is a verify, when any one of the following holds.
 3. **Some live row's previous step committed more than one token.**
    `accepted_counts` is how a model finds which candidate state slot that
    commit landed on, so the step after such a commit carries the count even
-   when it drafts nothing. `TTModelRunner._step_verifies` reads only the live
-   rows: a padding row sits at the post-prefill default of 1 and owns no
+   when it drafts nothing. `vllm_tt_plugin.model_runner._step_verifies` reads
+   only the live rows: a padding row sits at the post-prefill default of 1 and owns no
    request. One step resolves it, because that step commits a single token and
    records a count of 1, so leaving speculation costs exactly one verify.
 
@@ -541,8 +543,8 @@ the new step has.
 So when request A holds five outstanding drafts and the scheduler adds request
 B before the next decode, `TTModelRunner._spec_row_state` places A's five
 drafts on A's row and zero on B's row,
-`TTModelRunner._step_verifies` sees a nonzero `num_valid_drafts` and selects a
-verify, and the adapter receives a `[B, 1+K]` block in which A's row carries
+`vllm_tt_plugin.model_runner._step_verifies` sees a nonzero `num_valid_drafts`
+and selects a verify, and the adapter receives a `[B, 1+K]` block in which A's row carries
 real drafts while B's row carries its own committed token in column 0 and
 `PLACEHOLDER_TOKEN_ID` with position -1 in columns 1..K. B joining does not
 turn A's existing drafts into an ordinary decode. The adapter must serve that
@@ -551,8 +553,8 @@ mixed block and must respect per-row `num_valid_drafts`.
 **Declining the next proposal is always available.** In that same step the
 adapter can return `DraftOutput.num_valid=[0, 0]`, offering nothing for either
 row. The following step is then an ordinary decode, unless A's commit was
-multi-token, in which case `TTModelRunner._step_verifies` sends one more
-verify to resolve A's `accepted_counts` and the ordinary decode follows it.
+multi-token, in which case `vllm_tt_plugin.model_runner._step_verifies` sends
+one more verify to resolve A's `accepted_counts` and the ordinary decode follows it.
 The plugin always resolves a multi-token acceptance before it selects an
 ordinary decode.
 
@@ -572,20 +574,27 @@ exercises none of this.
 `TTModelRunner._decode_state_slot_remap` builds the gather permutation
 `TTModelInput.slot_remap` from `TTModelRunner._req_state_slot`, where
 `slot_remap[i] = j` means decode row `i` reads the state currently in slot
-`j`. The adapter applies it exactly once per submission, as
+`j`. The adapter applies `slot_remap` exactly once per submission, as
 [DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md) specifies, and that
-duty covers drafter state as much as sampler or recurrent state. The plugin
-has no separate hook for moving drafter state.
-`TTModelRunner.note_decode_state_slots_settled` commits the new ownership map
-only after the adapter accepted the decode, so a refused submission does not
-leave the host believing a move happened.
+duty covers drafter state as much as sampler or recurrent state. After the
+adapter accepts the decode, `TTModelRunner.note_decode_state_slots_settled`
+commits `TTModelRunner._req_state_slot` and calls `_notify_model_slot_moves`
+when slots moved. `_notify_model_slot_moves` calls the optional model callback
+`note_state_slots_moved(old_to_new)` with the old-slot to new-slot mapping.
+The adapter uses `note_state_slots_moved` to update session ownership metadata;
+the callback does not replace the device gather performed for `slot_remap`.
+A refused submission produces no ownership update or movement notification.
 
-**Release is explicit, and it is the plugin's.**
-`TTModelRunner._release_dead_state_slots` drops the
-`TTModelRunner._req_state_slot` entry of every id in
-`SchedulerOutput.finished_req_ids` and of every id in
-`SchedulerOutput.preempted_req_ids`: a preempted request re-prefills its whole
-history and writes that slot's contents itself.
+**The plugin notifies the adapter before releasing a request's slot.**
+`TTModelRunner._update_states` calls `TTModelRunner._release_model_request`
+for every id in `SchedulerOutput.finished_req_ids` and
+`SchedulerOutput.preempted_req_ids`. If the request has a current slot and
+the adapter implements `release_request`,
+`TTModelRunner._release_model_request` calls `release_request(current_slot)`.
+The adapter releases the model-owned state associated with that current slot.
+`TTModelRunner._release_dead_state_slots` then removes those requests from
+`TTModelRunner._req_state_slot`. A preempted request re-prefills its history
+when the scheduler resumes it.
 `TTModelRunner._prepare_model_inputs` drops a request's
 `TTModelRunner._req_accepted_counts` entry once the request is gone from
 `TTModelRunner.requests`, and drops it for every request of a prefill step, so
@@ -599,11 +608,13 @@ no accepted count for a request whose slot a preemption already released.
 `spec_lookahead_tokens(get_tt_spec_plan(vllm_config), self.num_spec_tokens,
 speculative_config.method)`, and `spec_lookahead_tokens` returns
 `num_spec_tokens + 1` when a `SpecPlan` was admitted, `num_spec_tokens` is
-positive, and the method is the model-owned drafter (`custom_class`). An
+positive, and `speculative_config.method` is `custom_class`. An
 `ngram` launch also carries an admitted plan, but its drafts come from the
-plugin and its target verifies them inside the step's own allocation, so it
-reserves nothing. Those lookahead slots are KV
-block space the scheduler reserves past the tokens the step itself computes.
+plugin and its target verifies them inside the step's own allocation, so
+`spec_lookahead_tokens` returns zero for `ngram`. `TTScheduler.__init__` uses
+`max` to preserve any upstream reservation while adding the model-owned
+drafter's requirement. Lookahead slots reserve KV block space past the tokens
+the step itself computes.
 
 The reason is where a model-owned drafter writes. Such a drafter proposes for
 the next step from inside the current one: after the accept walk commits, the
@@ -613,10 +624,6 @@ step's own allocation covers. Upstream vLLM reserves lookahead only for the
 drafter methods it knows, and `custom_class` is not one of them, so without
 this reservation the rows that cross into the next block land in the null
 block and the first token that reads them diverges from an ordinary decode.
-`spec_lookahead_tokens` returns the same `num_spec_tokens + 1` for an `ngram`
-launch, which runs no device drafter at all; the value is sized for the
-model-owned case and an `ngram` launch simply receives one slot more than
-upstream would reserve.
 
 `K + 1` is the demonstrated bound for the drafter implementation this was
 measured against. It is not a proof about every adapter. An adapter whose
@@ -644,7 +651,7 @@ step names who acts.
    one token for A.
 2. First decode step. **`TTModelRunner._drafts_to_verify`** finds no draft for
    A, and **`TTModelRunner._spec_row_state`** produces `num_valid_drafts` 0 and
-   `accepted_counts` 1 on A's row. **`TTModelRunner._step_verifies`** returns
+   `accepted_counts` 1 on A's row. **`vllm_tt_plugin.model_runner._step_verifies`** returns
    false, because `supports_narrow_decode` holds and neither of the other two
    conditions of section 4d does, so **`TTModelRunner._prepare_model_inputs`**
    sends the ordinary `[B, 1]` decode call. A model that had not declared
@@ -665,7 +672,7 @@ step names who acts.
    and stores A's five ids in `TTModelRunner._proposed_draft_token_ids`.
 5. Verification. On the next decode step **`TTModelRunner._drafts_to_verify`**
    hands those five ids back inside the scheduler's lookahead reservation,
-   **`TTModelRunner._step_verifies`** returns true, and
+   **`vllm_tt_plugin.model_runner._step_verifies`** returns true, and
    **`TTModelRunner._spec_candidate_block`** widens A's row to `[1 + 5]`
    columns. **`TTAsyncDecodeController.submit_async_decode`** sees
    `TTModelInput.spec_mode` and registers the step with `overlap_ok=False`.
@@ -687,13 +694,18 @@ step names who acts.
    `DraftOutput.num_valid` 0 for A's row. After a zero, the next step is a
    verify if A's count from step 7 exceeds 1, and an ordinary decode
    afterwards.
-9. Release. When A finishes, **`TTModelRunner._release_dead_state_slots`**
-   drops A from `TTModelRunner._req_state_slot` on the strength of
-   `SchedulerOutput.finished_req_ids`, and
+9. Release. When `SchedulerOutput.finished_req_ids` contains A,
+   **`TTModelRunner._update_states`** calls
+   **`TTModelRunner._release_model_request`**, which calls **the adapter's**
+   optional `release_request(current_slot)` while A's current slot is known.
+   **The adapter** releases A's model-owned drafter state.
+   **`TTModelRunner._release_dead_state_slots`** then drops A from
+   `TTModelRunner._req_state_slot`, and
    **`TTModelRunner._prepare_model_inputs`** drops A from
    `TTModelRunner._req_accepted_counts` once A has left
-   `TTModelRunner.requests`. **The adapter** owns the release of its own
-   drafter state for A; the plugin makes no call to announce it.
+   `TTModelRunner.requests`. **`TTModelRunner._update_states`** also sends
+   the release notification when `SchedulerOutput.preempted_req_ids`
+   contains A.
 
 ## 6. What a verify returns, column by column
 
