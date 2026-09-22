@@ -627,6 +627,40 @@ is no capability key for a proposal write extent and `SpecPlan` has no field
 for one. An adapter in that position raises it with the plugin owner before it
 is admitted, because nothing detects the overrun at run time.
 
+## 4g. Lifecycle hooks the runner calls on any model that defines them
+
+Three model methods sit outside the per-step contract above but bear on any
+model-owned drafter that holds per-request state. `TTModelRunner` calls each
+only when the model defines it (`getattr(model, name, None)`). `TTPlatform`
+requires the first two for a block-output model (`output_tokens_per_step > 1`)
+and the third for an adaptive block-output model launched with
+`max_num_seqs > 1`. They come from the block-output serving work (#32) and the
+adaptive block-output gather (#118), and a contract implementer must know them.
+
+**`release_request(slot)`.** `TTModelRunner._update_states` calls
+`TTModelRunner._release_model_request(req_id)` for every id in
+`SchedulerOutput.finished_req_ids` and `SchedulerOutput.preempted_req_ids`,
+before it drops the id from `TTModelRunner._req_state_slot`; the model receives
+the request's current state slot. A model-owned drafter that keeps per-request
+state (a committed prefix, an outstanding proposal, a session) must implement
+it. The runner asks for a proposal after every step (section 4b), and the
+scheduler decides a request's finish after `execute_model` returns, so a
+finished request leaves its last proposal outstanding; nothing else tells the
+model the request is gone.
+
+**`note_state_slots_moved(moves)`.** After the model accepts a decode whose
+`slot_remap` is not the identity, `TTAsyncDecodeController.submit_decode`
+calls `TTModelRunner.note_decode_state_slots_settled`, which commits the new
+ownership map and calls the hook with `{old_slot: new_slot}` for every moved
+slot, the same permutation `slot_remap` carried. A model that applies
+`slot_remap` as section 4e requires needs nothing from this hook; a model that
+keys state on the slot it was handed at prefill uses it to follow the move.
+
+**`release_persistent_capture()`.** `TTModelRunner.shutdown`, reached from
+`TTWorker.shutdown` before the mesh closes, calls it once. The model releases
+model-lifetime traces and buffers here; a destructor may run after the mesh
+closed and must not touch the device.
+
 ## 5. One request, from prefill to release
 
 The sequence below follows a single request A on a launch that declares
@@ -687,13 +721,17 @@ step names who acts.
    `DraftOutput.num_valid` 0 for A's row. After a zero, the next step is a
    verify if A's count from step 7 exceeds 1, and an ordinary decode
    afterwards.
-9. Release. When A finishes, **`TTModelRunner._release_dead_state_slots`**
+9. Release. When A finishes, **`TTModelRunner._update_states`** calls
+   **`TTModelRunner._release_model_request`**, which calls the adapter's
+   `release_request(slot)` with A's current state slot if the adapter defines
+   that hook (section 4g); then **`TTModelRunner._release_dead_state_slots`**
    drops A from `TTModelRunner._req_state_slot` on the strength of
    `SchedulerOutput.finished_req_ids`, and
    **`TTModelRunner._prepare_model_inputs`** drops A from
    `TTModelRunner._req_accepted_counts` once A has left
-   `TTModelRunner.requests`. **The adapter** owns the release of its own
-   drafter state for A; the plugin makes no call to announce it.
+   `TTModelRunner.requests`. **The adapter** releases its own drafter state
+   for A inside `release_request`; an adapter without that hook is never told
+   that A is gone.
 
 ## 6. What a verify returns, column by column
 
