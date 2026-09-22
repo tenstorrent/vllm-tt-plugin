@@ -23,6 +23,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -91,7 +92,7 @@ class TTSchedulingMode(Enum):
         raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
 
 
-def spec_lookahead_tokens(plan, num_spec_tokens: int) -> int:
+def spec_lookahead_tokens(plan, num_spec_tokens: int, method: str | None) -> int:
     """KV slots to reserve past a step's own tokens for a model-owned drafter.
 
     Such a drafter proposes for the next step inside the current one: after
@@ -101,8 +102,12 @@ def spec_lookahead_tokens(plan, num_spec_tokens: int) -> int:
     methods it knows, and ``custom_class`` is not one of them, so without this
     reservation the rows that cross into the next block land in the null block
     and the first token that reads them diverges from plain decode.
+
+    An ngram launch also carries an admitted plan, but its drafts come from the
+    plugin and its target verifies them inside the step's own allocation, so it
+    reserves nothing here.
     """
-    if plan is None or num_spec_tokens <= 0:
+    if plan is None or num_spec_tokens <= 0 or method != MODEL_OWNED_DRAFT_METHOD:
         return 0
     return num_spec_tokens + 1
 
@@ -271,10 +276,13 @@ class TTScheduler(AsyncScheduler):
         self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
             self.vllm_config
         )
+        speculative_config = self.vllm_config.speculative_config
         self.num_lookahead_tokens = max(
             self.num_lookahead_tokens,
             spec_lookahead_tokens(
-                get_tt_spec_plan(self.vllm_config), self.num_spec_tokens
+                get_tt_spec_plan(self.vllm_config),
+                self.num_spec_tokens,
+                speculative_config.method if speculative_config is not None else None,
             ),
         )
         if self._is_block_output_model:
