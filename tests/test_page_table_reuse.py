@@ -157,7 +157,7 @@ def _assert_safe_export(
         )
         print(diagnostic)
         assert values[: len(expected)] == expected, diagnostic
-        assert values[len(expected) :] == [-1] * (width - len(expected)), diagnostic
+        assert values[len(expected) :] == [0] * (width - len(expected)), diagnostic
 
 
 @pytest.mark.parametrize("empty_batch_between_requests", [False, True])

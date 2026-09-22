@@ -687,9 +687,10 @@ class InputBatch:
         tracing: runtime block tables must match the traced width even when
         their underlying group is narrower.
 
-        Entries beyond each row's allocated blocks must use the cache-fill
-        kernel's skip sentinel. Reused rows can retain old block IDs there,
-        and padded prefill must not write through those stale entries.
+        Reused rows can retain live block IDs beyond their own allocation.
+        Restore the zero padding of a fresh row so padded prefill writes use
+        the reserved null block, never real KV. Keep these entries readable:
+        paged attention can read full chunks and does not support -1 IDs.
         """
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
@@ -701,7 +702,7 @@ class InputBatch:
                 bt_cpu = torch.cat([bt_cpu, pad], dim=1)
             num_blocks = torch.from_numpy(bt.num_blocks_per_row)[rows]
             unused = torch.arange(width).unsqueeze(0) >= num_blocks.unsqueeze(1)
-            bt_cpu.masked_fill_(unused, -1)
+            bt_cpu.masked_fill_(unused, 0)
             out.append(bt_cpu)
         return out
 
