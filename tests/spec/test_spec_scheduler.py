@@ -29,6 +29,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_tt_plugin.scheduler import TTScheduler, spec_lookahead_tokens
+from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     DRAFTER_STATE_INTERNAL,
@@ -202,16 +203,25 @@ def test_a_model_owned_drafter_reserves_the_anchor_and_every_draft():
     drafts past the committed position, so the scheduler has to have those
     K+1 slots allocated before the model runs."""
     assert (
-        spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), NUM_SPEC_TOKENS)
+        spec_lookahead_tokens(
+            _plan(NUM_SPEC_TOKENS), NUM_SPEC_TOKENS, MODEL_OWNED_DRAFT_METHOD
+        )
         == NUM_SPEC_TOKENS + 1
     )
 
 
 def test_no_admitted_plan_reserves_nothing():
-    """An ngram launch verifies inside the step's own allocation and carries
-    no plan; a non-speculative launch has nothing to reserve for."""
-    assert spec_lookahead_tokens(None, NUM_SPEC_TOKENS) == 0
-    assert spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), 0) == 0
+    """No admitted plan, or no drafts, leaves nothing to reserve for."""
+    assert spec_lookahead_tokens(None, NUM_SPEC_TOKENS, MODEL_OWNED_DRAFT_METHOD) == 0
+    assert (
+        spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), 0, MODEL_OWNED_DRAFT_METHOD) == 0
+    )
+
+
+def test_an_ngram_launch_reserves_nothing():
+    """ngram drafts come from the plugin and its target verifies them inside
+    the step's own allocation; the plan it carries reserves nothing."""
+    assert spec_lookahead_tokens(_plan(NUM_SPEC_TOKENS), NUM_SPEC_TOKENS, "ngram") == 0
 
 
 # endregion Lookahead for a model-owned drafter
