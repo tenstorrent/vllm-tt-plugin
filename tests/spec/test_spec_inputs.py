@@ -658,3 +658,31 @@ def test_a_non_speculating_decode_sends_no_side_tensors():
 
 
 # endregion Conformance
+
+
+def test_the_runner_only_truncates_a_proposal_before_the_verify():
+    """A model may answer a verify from a result it computed at proposal time
+    (SPEC_DECODE_CONTRACT.md 4a). That holds only if the block it is sent is a
+    prefix of what it proposed: the runner copies scheduled ids unchanged and,
+    on the asynchronous path, trims the retained proposal to the reservation."""
+    drafts, num_valid, counts = TTModelRunner._spec_row_state(
+        {"a": 3}, {"a": [11, 12, 13]}, ["a", "b"], 5
+    )
+    assert drafts[0].tolist() == [11, 12, 13, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]
+    assert drafts[1].tolist() == [PLACEHOLDER_TOKEN_ID] * 5
+    assert num_valid.tolist() == [3, 0]
+    assert counts.tolist() == [3, 1]
+
+    runner = SimpleNamespace(
+        async_decode_scheduling=True,
+        _proposed_draft_token_ids={"a": [21, 22, 23, 24, 25], "b": [31, 32]},
+    )
+    runner._drafts_to_verify = TTModelRunner._drafts_to_verify.__get__(runner)
+    reserved = SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            "a": [PLACEHOLDER_TOKEN_ID] * 3,  # a shorter reservation truncates
+            "b": [],  # nothing reserved: nothing verified, proposal spent
+        }
+    )
+    assert runner._drafts_to_verify(reserved, ["a", "b"]) == {"a": [21, 22, 23]}
+    assert runner._proposed_draft_token_ids == {}
