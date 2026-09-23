@@ -1403,6 +1403,12 @@ class TTLaneInputBatch(InputBatch):
 
         # Host sampling over the full slot batch.
         total = self.max_num_reqs
+        runner._check_host_logits(
+            tt_out,
+            rows_needed=total if is_decode else n,
+            live_rows=n,
+            where="lane decode" if is_decode else "lane prefill",
+        )
         logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
         bitmask = model_input.grammar_bitmask[0]
         if bitmask is not None:
