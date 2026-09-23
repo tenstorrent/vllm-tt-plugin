@@ -292,6 +292,19 @@ per step for its whole life and reports no error. The reverse is refused too:
 a `VerifyOutput` returned from a step that sent no `spec_mode` has no accepted
 count to be read against.
 
+**A verify may be answered from a result computed at proposal time.** A model
+whose drafter and target run in one device program can evaluate the block it
+proposes inside the `propose_draft_tokens` call that proposed it, keep the
+result, and answer the following `decode_forward` from it without a device
+forward. The permission is conditional on equivalence: the returned columns
+must equal what a target forward over the block as sent would produce. The
+block as sent has the row's committed token in column 0 at the position the
+proposal continued from, and the proposal's own drafts in columns
+`1..num_valid_drafts`, possibly fewer than were proposed (section 4e). A model
+answering this way checks all three before it answers, and raises rather than
+answer for a block it did not evaluate; the plugin cannot tell a kept result
+from a fresh one and does not try.
+
 ## 4b. The propose call, for a model that drafts
 
 A launch whose method requires `device_propose` calls the model after every
@@ -521,6 +534,17 @@ receives `None` after one. A model requiring `hidden_feed` and declaring
 `TTModelRunner.load_model` runs and keeps every step a verify. A drafter that
 keeps its state on device, or needs none, is unaffected.
 
+**An ordinary decode may return host token ids.** On a launch that samples on
+device, a model may answer an ordinary decode step for some or all rows from
+its own drafter path and return the step's token ids as a host tensor in the
+flat form the device sampler's readback produces, instead of a device output.
+`_is_host_decode_output` in `vllm_tt_plugin.async_decode` recognises a host
+tensor, and the runner then skips `read_decode_output` and
+`process_decode_output_host` for that step. Rows the model did not compute
+carry whatever id the model puts there; the runner reads only the live rows.
+This is how a drafter that starts a request from its prefill state serves the
+first step, which under narrow decode is an ordinary decode.
+
 ## 4e. Batch changes while a proposal is outstanding
 
 A proposal and the verify that consumes it are separated by a scheduler
@@ -555,6 +579,19 @@ multi-token, in which case `TTModelRunner._step_verifies` sends one more
 verify to resolve A's `accepted_counts` and the ordinary decode follows it.
 The plugin always resolves a multi-token acceptance before it selects an
 ordinary decode.
+
+**The runner truncates a proposal; it never rewrites it.** Between
+`propose_draft_tokens` and the verify that consumes its drafts, a stored draft
+list changes only by losing a suffix. `Scheduler.update_draft_token_ids`
+replaces it with the longest prefix the request's grammar accepts
+(`validate_tokens` returns an accepted prefix and stops at the first
+rejection), the scheduler budgets a prefix into
+`scheduled_spec_decode_tokens`, `TTModelRunner._spec_row_state` copies the
+scheduled ids into the block unchanged, and under asynchronous scheduling
+`TTModelRunner._drafts_to_verify` trims the retained proposal to the reserved
+placeholder count. The verify block's draft columns are therefore always a
+prefix of what the model proposed, which is what makes a result computed at
+proposal time (section 4a) valid for the block as sent.
 
 **Returning to drafting is a model obligation.** The plugin keeps asking:
 `TTModelRunner.propose_after_plain_step` calls `propose_draft_tokens` after an
