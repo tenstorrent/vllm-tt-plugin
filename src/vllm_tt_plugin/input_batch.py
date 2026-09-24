@@ -686,6 +686,11 @@ class InputBatch:
         Constant ``width`` (``max_num_blocks_per_req``) is required for ttnn
         tracing: runtime block tables must match the traced width even when
         their underlying group is narrower.
+
+        Reused rows can retain live block IDs beyond their own allocation.
+        Restore the zero padding of a fresh row so padded prefill writes use
+        the reserved null block, never real KV. Keep these entries readable:
+        paged attention can read full chunks and does not support -1 IDs.
         """
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
@@ -695,6 +700,9 @@ class InputBatch:
                     bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
                 )
                 bt_cpu = torch.cat([bt_cpu, pad], dim=1)
+            num_blocks = torch.from_numpy(bt.num_blocks_per_row)[rows]
+            unused = torch.arange(width).unsqueeze(0) >= num_blocks.unsqueeze(1)
+            bt_cpu.masked_fill_(unused, 0)
             out.append(bt_cpu)
         return out
 
