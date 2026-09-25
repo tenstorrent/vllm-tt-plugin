@@ -6,9 +6,11 @@ The contract these types encode is specified in
 https://github.com/tenstorrent/vllm-tt-plugin/issues/110. This module holds the
 wire surface and the validation of the values that cross it, so a model class
 and the runner can agree on shapes and modes before either side implements a
-step of the loop. It reads no ``model_capabilities`` key and admits no
-configuration: ``normalize_declared_values`` validates a declaration a caller
-has already read, and lives here next to the constant sets it validates.
+step of the loop. It reads no ``model_capabilities`` key, admits no
+configuration and imports nothing from vLLM at run time:
+``normalize_declared_values`` validates a declaration a caller has already
+read, and lives here next to the constant sets it validates. The plugin's own
+admission policy lives in ``spec_admission``, which imports from here.
 
 Per the contract, one step is verify then propose: the runner calls
 ``decode_forward`` over the ``[B, 1+K]`` candidate block, walks acceptance, and
@@ -145,10 +147,10 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 class SpecPlan:
     """What one model can serve at one ``(max_num_seqs, requested_k)`` point.
 
-    Returned by a model class's ``spec_plan`` classmethod at config time. The
-    runner budgets with these numbers and never inspects the physical verify
-    layout: a model's lane arithmetic, L1 fit and state budget stay private,
-    and only their consequences cross.
+    Returned by a model class's ``spec_plan`` classmethod at config time.
+    Resource fields describe the model's requirements, but the plugin does not
+    yet enforce their row or byte budgets. The physical verify layout stays
+    private to the model.
 
     ``accept_modes`` is stored as a tuple because the instance is frozen and a
     list field would be shared mutable state on a value object.
@@ -157,8 +159,8 @@ class SpecPlan:
     effective_k: int
     # Decode rows one speculating request occupies while verifying its
     # [B, 1+K] block. Unrelated to a lane-DP lane: this counts rows of the
-    # model's decode batch, not TT lanes in an engine. The runner checks it
-    # against its own row budget and never asks how the rows are arranged.
+    # model's decode batch, not TT lanes in an engine. The plugin validates
+    # this declaration but does not yet check it against a row budget.
     lanes_per_request: int
     # Fixed device bytes per speculating request, independent of sequence
     # length: candidate state slots, a conv stash, retained hidden rows.
@@ -343,6 +345,11 @@ def normalize_declared_values(
     """
     if values is None:
         return ()
+    if isinstance(values, str):
+        raise ValueError(
+            f"{label} must be a list of values, not the single string "
+            f"{values!r}; wrap it in a list"
+        )
     declared = tuple(values)
     unknown = [value for value in declared if value not in known]
     if unknown:
