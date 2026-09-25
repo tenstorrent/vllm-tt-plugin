@@ -19,6 +19,7 @@ from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     MODE_REQUIRED_FIELDS,
+    PLACEHOLDER_TOKEN_ID,
     VerifyOutput,
 )
 from vllm_tt_plugin.structured_output import has_structured_outputs
@@ -67,6 +68,12 @@ if TYPE_CHECKING:
 
 logger = init_tt_logger(__name__)
 
+# How often the submission counters are reported. A benchmark diffs the last
+# line before its measured interval against the last one after, so the cadence
+# bounds the error on that diff; a step costs about a millisecond on a model
+# with no device work, so 128 is a fraction of a second.
+_SUBMISSION_LOG_INTERVAL = 128
+
 
 @dataclass(frozen=True)
 class TTDecodeSubmission:
@@ -78,6 +85,11 @@ class TTDecodeSubmission:
     sampling_params: Any
     perform_device_sampling: bool
     reload_plan: TTDecodeReloadPlan | None = None
+    # The verify's opaque hidden handle, for a model whose drafter consumes it.
+    # Carried rather than stored on the runner so it cannot outlive the step it
+    # belongs to: the runner hands it straight back to ``propose_draft_tokens``
+    # without interpreting its dtype, layout or tensor-parallel fracturing.
+    spec_hidden: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -121,18 +133,50 @@ class CompletedDecodeStep:
     context: SubmittedStepContext
     completion_time_ns: int
     runner_output: ModelRunnerOutput | None = None
+    # Kept for a speculating launch only, whose draftless decode steps owe the
+    # next proposal at their commit: the drafter is called with this step's own
+    # rows and positions, and the commit runs a step later than the build.
+    model_input: TTModelInput | None = None
+
+
+@dataclass
+class CompletedSpecDecodeStep:
+    """An accepted speculative step, not yet applied to host state.
+
+    A speculative step cannot be finished where an ordinary one is. Its output
+    is not a sampled token but a candidate block whose committed length is
+    decided by the accept walk, and the walk's result then has to reach two
+    places that only the engine thread may touch: the request's token history,
+    and the next proposal. So the walk runs at completion and everything it
+    produced waits here until the next step drains it.
+
+    What it retains is what the commit and the proposal need after the runner
+    has moved on: the accepted block, each row's count, the step's own
+    ``model_input`` (its request identities, positions and drafts), and the
+    verify's hidden handle. Every tensor here belongs to this step. The
+    builder allocates the candidate block, the draft block and both side
+    tensors fresh per step, so none of them is a view into storage the next
+    step reuses.
+    """
+
+    committed: torch.Tensor
+    counts: torch.Tensor
+    prefixes: list[list[int]]
+    model_input: TTModelInput
+    spec_hidden: Any | None
+    context: SubmittedStepContext
+    completion_time_ns: int
+    runner_output: ModelRunnerOutput | None = None
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
     """Run the deferred device readback exactly once, from whichever caller
     reaches it first.
 
-    Two callers race for the same step from different threads: vLLM's
-    ``UniProcExecutor`` resolves it via ``get_output`` on its async-output
-    thread when async scheduling is on, while the runner's drain
-    (``TTAsyncDecodeController.wait_for_all_pending_async_steps``) resolves it
-    via ``ensure_finalized`` on the engine thread. ``_finalize_lock`` makes the
-    readback run exactly once across both threads; a second concurrent readback
+    The executor resolves the step through ``get_output``; the runner's drain
+    resolves it through ``ensure_finalized``. Depending on the executor, these
+    calls can share a thread or race across threads. ``_finalize_lock`` makes
+    either ordering resolve the readback exactly once; a second readback
     of the same device submission corrupts the decode output. The completion
     event is set here, when the readback actually runs, not only inside
     ``get_output``. That is the invariant the drain depends on: vLLM 0.22's
@@ -235,6 +279,60 @@ class AsyncTTModelRunnerOutput(DeferredDecodeOutput):
         return runner_output
 
 
+class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
+    """A deferred speculative step: read back, then walk acceptance.
+
+    Shares ``DeferredDecodeOutput``'s exactly-once resolution, because the same
+    resolution entry points can race for a speculative step as for an ordinary
+    one, and a second readback of the same submission corrupts it. Resolution
+    differs: the accept walk instead of the sampler, and a published output
+    whose rows carry a committed prefix each rather than one token apiece.
+
+    It never mutates runner state. The walk reads only this step's own tensors,
+    and the commit waits in the completed queue for the engine thread.
+    """
+
+    def __init__(
+        self,
+        controller: TTAsyncDecodeController,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        completion_event: threading.Event,
+        context: SubmittedStepContext,
+    ):
+        self._controller = controller
+        self._submission = submission
+        self._model_input = model_input
+        self._completion_event = completion_event
+        self._context = context
+        self._init_deferred()
+
+    def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
+        """Refused: a grammar needs the logits a verify in this mode never returns.
+
+        Reachable only through a launch admission should have refused, so it
+        raises rather than dropping the mask and serving ungrammatical text.
+        """
+        raise NotImplementedError(
+            "structured output and speculative decoding cannot be combined on "
+            "this path: acceptance compares token ids and never sees the "
+            "logits a grammar bitmask applies to"
+        )
+
+    def _get_output_impl(self) -> ModelRunnerOutput:
+        completed = self._controller.complete_spec_decode_step(
+            submission=self._submission,
+            model_input=self._model_input,
+            context=self._context,
+        )
+        runner_output = self._controller.runner.build_spec_runner_output(
+            self._model_input.row_req_ids, completed.prefixes
+        )
+        completed.runner_output = runner_output
+        self._controller.enqueue_completed_decode_step(completed)
+        return runner_output
+
+
 class TTAsyncDecodeController:
     """Own the TT async decode lifecycle for a `TTModelRunner`."""
 
@@ -247,6 +345,17 @@ class TTAsyncDecodeController:
         self._previous_device_sampling: bool | None = None
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
         self._legacy_contract_warning_emitted = False
+        # How many submissions found a step already outstanding, and how many
+        # of those were not overlap-safe. The second is the serialization
+        # claim: a verify must never be submitted over an outstanding step, so
+        # this stays at zero for the life of the server.
+        self._overlapped_submissions = 0
+        self._overlapped_unsafe_submissions = 0
+        # What was actually submitted, by kind. Read by the overhead
+        # benchmark, which cannot take these from the speculative metrics: those
+        # count the scheduler's lookahead reservation rather than a verify.
+        self._ordinary_decode_submissions = 0
+        self._verify_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -291,7 +400,13 @@ class TTAsyncDecodeController:
             or sampling_mode_changed
         )
         reload_inputs = (
-            not device_sampling
+            # A verify's candidate block is assembled from this step's drafts
+            # and each row's last committed token, so it is new every step and
+            # can never be the resident input. The resident mode is for the
+            # plain decode, whose single token the device sampler writes into
+            # the buffer the next decode reads.
+            model_input.spec_mode is not None
+            or not device_sampling
             or transition
             or not supports_resident_decode
             or not decode_trace_enabled
@@ -515,9 +630,87 @@ class TTAsyncDecodeController:
         *,
         overlap_ok: bool,
     ) -> None:
+        unsafe_overlap = False
         with self.runner._steady_decode_lock:
+            # Counted here because this is the one place that knows both
+            # facts: whether a step was already outstanding when this one was
+            # submitted, and whether this one is a verify. Nothing else
+            # reports overlap. A launch option does not prove it, a completed
+            # request does not prove it, and per-step wall clock cannot
+            # separate it from a faster model. The device suite reads these off
+            # the log line below and asserts that ordinary steps overlapped
+            # and that no verify ever did.
+            overlapped = bool(self.runner._pending_async_steps)
+            if overlapped:
+                self._overlapped_submissions += 1
+                if not overlap_ok:
+                    self._overlapped_unsafe_submissions += 1
+                    unsafe_overlap = True
             self.runner._pending_async_steps.append(step)
             self.runner._pending_async_overlap_ok.append(overlap_ok)
+        self._log_overlap_counters(force=unsafe_overlap)
+
+    def count_decode_submission(self, model_input: TTModelInput) -> None:
+        """Count what was actually submitted, and report it on a cadence.
+
+        A measurement cannot take these from vLLM's speculative metrics. Those
+        count what the scheduler reserved, and under asynchronous scheduling
+        ``AsyncScheduler`` reserves ``[-1] * K`` for every scheduled request
+        whether or not a draft was ever verified, so
+        ``spec_decode_num_drafts_total`` moves on a launch that verifies
+        nothing. What a cost-per-step comparison needs is how many verifies and
+        how many ordinary decodes the runner actually sent, which only the
+        runner knows.
+
+        Counted in ``submit_decode`` because that is the single funnel both
+        execution modes go through, so a synchronous run and an asynchronous
+        one are counted by the same code. Reported every
+        ``_SUBMISSION_LOG_INTERVAL`` submissions rather than per step: a
+        benchmark diffs the last line before its interval against the last one
+        after, and a line per step would cost more than the work it measures.
+
+        The line repeats ``_overlapped_submissions``, which
+        ``_log_overlap_counters`` also reports, because that one reports at
+        every power of two: between 4096 and 8191 overlaps it prints nothing,
+        so a diff across a measured interval cannot tell a launch that kept
+        overlapping from one that stopped. Here the same cadence carries the
+        overlap count and the submission count it divides by. The current
+        submission is not registered as pending until later in
+        ``submit_decode``, so the overlap count on a line covers the
+        submissions before this one.
+        """
+        if model_input.spec_mode is None:
+            self._ordinary_decode_submissions += 1
+        else:
+            self._verify_submissions += 1
+        total = self._ordinary_decode_submissions + self._verify_submissions
+        if total % _SUBMISSION_LOG_INTERVAL == 0:
+            logger.info(
+                "TT submissions: %d ordinary decode, %d verify, "
+                "%d overlapped an outstanding step",
+                self._ordinary_decode_submissions,
+                self._verify_submissions,
+                self._overlapped_submissions,
+            )
+
+    def _log_overlap_counters(self, *, force: bool = False) -> None:
+        """Report the overlap counters, rarely enough to be readable.
+
+        Logged rather than exposed as a metric because vLLM's metrics are the
+        engine's and this is the runner's: the step it describes belongs to the
+        worker process, which publishes none of its own. Safe overlaps report at
+        every power of two. Every unsafe overlap reports immediately because the
+        device regression reads the latest line as its serialization result.
+        """
+        total = self._overlapped_submissions
+        if not force and (total == 0 or total & (total - 1)):
+            return
+        logger.info(
+            "TT async decode: %d submission(s) overlapped an outstanding step, "
+            "%d of them a step that was not overlap-safe",
+            total,
+            self._overlapped_unsafe_submissions,
+        )
 
     def prune_finished_async_events(self) -> None:
         with self.runner._steady_decode_lock:
@@ -630,6 +823,28 @@ class TTAsyncDecodeController:
             remaining_results.subtract(published_req_ids)
         self.prune_finished_async_events()
 
+    def apply_completed_decode_steps_before_build(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Apply completed steps and serialize a newly visible verify.
+
+        A plain completion can publish a proposal while this method applies it.
+        The pre-build drain decision could not see that proposal. Recheck after
+        the apply so every remaining plain step commits before the candidate
+        block is built. A draftless next step keeps the existing overlap.
+        """
+        suppressed = self.suppressed_output_req_ids(scheduler_output)
+        self.apply_ready_completed_decode_steps(
+            suppress_output_req_ids=suppressed,
+            forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                scheduler_output
+            ),
+        )
+        if not self._next_step_verifies(scheduler_output):
+            return
+        self.wait_for_all_pending_async_steps()
+        self.apply_ready_completed_decode_steps(suppress_output_req_ids=suppressed)
+
     def wait_for_all_pending_async_steps(self) -> None:
         """Finalize pending readbacks without applying them to runner state."""
         # Drive each pending readback to completion here rather than blocking on
@@ -658,9 +873,50 @@ class TTAsyncDecodeController:
                 return True
             if not steady_decode_candidate:
                 return True
-            return any(
+            if any(
                 not overlap_ok for overlap_ok in self.runner._pending_async_overlap_ok
-            )
+            ):
+                return True
+        # And the other direction, which the pending flags cannot express: the
+        # step about to be built may itself be a verify, and a verify's
+        # candidate block starts from each row's last committed token. An
+        # outstanding step holds one of those tokens, so building over it would
+        # verify a block starting one token behind. The flags above say whether
+        # what is pending tolerates company; this says whether what comes next
+        # does.
+        return self._next_step_verifies(scheduler_output)
+
+    def _next_step_verifies(self, scheduler_output: SchedulerOutput | None) -> bool:
+        """Whether the step about to be built will send the model a verify.
+
+        Decided from the scheduler output and the runner's own state, because
+        the persistent batch has not been updated yet when this is asked. It
+        errs towards True: a drain this did not need costs one step's overlap,
+        while a verify built over an outstanding step commits the wrong tokens.
+        """
+        runner = self.runner
+        if not runner._num_speculative_tokens or scheduler_output is None:
+            return False
+        if not runner._pending_async_steps:
+            return False
+        scheduled = scheduler_output.num_scheduled_tokens
+        drafts = scheduler_output.scheduled_spec_decode_tokens
+        for req_id in scheduled:
+            offered = drafts.get(req_id) or ()
+            # Read the way ``TTModelRunner._drafts_to_verify`` reads it, and
+            # for the same reason: under asynchronous scheduling every
+            # scheduled request holds ``[-1] * num_spec_tokens_to_schedule``,
+            # which reserves lookahead rather than proposing anything. Taking
+            # that list for a proposal would make every step look like a
+            # verify, and every step would then drain, which is the whole
+            # overlap gone for a launch that drafts nothing.
+            if any(token != PLACEHOLDER_TOKEN_ID for token in offered):
+                return True
+            if runner._proposed_draft_token_ids.get(req_id):
+                return True
+            if runner._req_accepted_counts.get(req_id, 1) > 1:
+                return True
+        return False
 
     def complete_decode_step(
         self,
@@ -706,6 +962,46 @@ class TTAsyncDecodeController:
             logprobs=logprobs,
             context=context,
             completion_time_ns=time.perf_counter_ns(),
+            model_input=model_input,
+        )
+
+    def complete_spec_decode_step(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+    ) -> CompletedSpecDecodeStep:
+        """Finalize a speculative read and walk acceptance over what came back.
+
+        Runs on whichever thread resolved the deferred output, so it reads the
+        step's own tensors and the immutable model config and nothing else. The
+        commit and the next proposal are left for the engine thread.
+        """
+        finalized = self.finalize_decode(submission)
+        if finalized is None:
+            rows = len(model_input.row_req_ids)
+            return CompletedSpecDecodeStep(
+                committed=torch.empty((0, 0), dtype=torch.int32),
+                counts=torch.empty((0,), dtype=torch.int32),
+                prefixes=[[] for _ in range(rows)],
+                model_input=model_input,
+                spec_hidden=submission.spec_hidden,
+                context=context,
+                completion_time_ns=time.perf_counter_ns(),
+            )
+        committed, counts = self.runner.walk_spec_acceptance(
+            model_input, finalized.tt_out
+        )
+        return CompletedSpecDecodeStep(
+            committed=committed,
+            counts=counts,
+            prefixes=self.runner.spec_committed_prefixes(
+                model_input, committed, counts
+            ),
+            model_input=model_input,
+            spec_hidden=submission.spec_hidden,
+            context=context,
+            completion_time_ns=time.perf_counter_ns(),
         )
 
     def build_runner_output_from_completed_step(
@@ -721,7 +1017,7 @@ class TTAsyncDecodeController:
 
     def apply_completed_decode_step(
         self,
-        completed: CompletedDecodeStep,
+        completed: CompletedDecodeStep | CompletedSpecDecodeStep,
         *,
         suppress_output_req_ids: set[str] | None = None,
         skip_state_req_ids: set[str] | None = None,
@@ -744,18 +1040,44 @@ class TTAsyncDecodeController:
                 req_idx = completed.runner_output.req_id_to_index.get(req_id)
                 if req_idx is not None:
                     completed.runner_output.sampled_token_ids[req_idx] = []
+        if isinstance(completed, CompletedSpecDecodeStep):
+            # The commit and the next proposal, on the engine thread, for the
+            # step whose acceptance was walked at completion. The lifecycle
+            # sets above apply unchanged: a request finished, aborted or
+            # force-reset since submission is skipped here rather than having
+            # its tokens written and a continuation of them drafted.
+            self.runner.commit_spec_acceptance(
+                completed.model_input,
+                completed.committed,
+                completed.counts,
+                completed.spec_hidden,
+                skip_req_ids=skipped_state,
+            )
+            return
         self.runner._apply_sampled_tokens_to_state(
             sampled_token_ids=completed.sampled_token_ids,
             req_ids=completed.context.req_ids,
             skip_req_ids=skipped_state,
         )
+        if self.runner._num_speculative_tokens and completed.model_input is not None:
+            # A speculating launch's draftless decode step is an ordinary step
+            # in every way but one: the proposer is asked once per step, so
+            # this step owes the next proposal or the launch never drafts
+            # again. It runs here, a step after the submission, because the
+            # drafts continue the token that just came back.
+            self.runner.propose_after_plain_step(
+                completed.model_input,
+                completed.sampled_token_ids,
+                completed.context.req_ids,
+                skip_req_ids=skipped_state,
+            )
 
     def submit_async_decode(
         self,
         model_input: TTModelInput,
         *,
         steady_decode_fast_path: bool,
-    ) -> AsyncTTModelRunnerOutput:
+    ) -> DeferredDecodeOutput:
         event = threading.Event()
         context = self.capture_submitted_step_context()
         submission = self.submit_decode(
@@ -765,6 +1087,25 @@ class TTAsyncDecodeController:
         )
         if submission.tt_out is None:
             event.set()
+        step: DeferredDecodeOutput
+        if model_input.spec_mode is not None:
+            # A speculative step resolves through the accept walk, not the
+            # sampler. It is never overlap-safe: the next candidate block is
+            # built from this step's committed tokens, so the build has to wait
+            # for this commit. This is the only thing that says so:
+            # ``check_perform_device_sampling`` does not look at speculation,
+            # so on a launch that samples on device a verify reaches
+            # ``can_use_steady_decode_fast_path`` with every condition met and
+            # comes back eligible.
+            step = AsyncTTSpecDecodeOutput(
+                controller=self,
+                submission=submission,
+                model_input=model_input,
+                completion_event=event,
+                context=context,
+            )
+            self.register_pending_async_step(step, overlap_ok=False)
+            return step
         step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
@@ -815,6 +1156,7 @@ class TTAsyncDecodeController:
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
         contract_version = self.decode_input_update_contract_version()
+        self.count_decode_submission(model_input)
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
                 tt_out=None,
@@ -916,15 +1258,19 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
+        spec_hidden = None
         requested_spec_mode = kwargs.get("spec_mode")
         if requested_spec_mode is not None:
             # A verify returns its mode's tensor inside a VerifyOutput, which
             # the read path below and every consumer above expect as a plain
             # host tensor. Unwrapped here, at the one boundary the model
             # returns through, rather than teaching each of them the type.
+            verify = tt_out
             tt_out = _verify_output_tensor(
                 tt_out, type(runner.model).__name__, requested_spec_mode
             )
+            # Safe after the unwrap, which refuses anything but a VerifyOutput.
+            spec_hidden = verify.hidden
         elif isinstance(tt_out, VerifyOutput):
             raise TypeError(
                 f"TT model {type(runner.model).__name__} returned a "
@@ -969,6 +1315,7 @@ class TTAsyncDecodeController:
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
             reload_plan=reload_plan,
+            spec_hidden=spec_hidden,
         )
 
     def finalize_decode(

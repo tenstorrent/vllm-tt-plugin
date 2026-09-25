@@ -43,11 +43,17 @@ def _controller(*, trace_mode="decode_only", supports_async=True):
     return TTAsyncDecodeController(runner)
 
 
-def _decode_input(*, device_sampling=True, layout_changed=False, page=0):
+def _decode_input(
+    *, device_sampling=True, layout_changed=False, page=0, spec_mode=None
+):
     return SimpleNamespace(
         perform_device_sampling=device_sampling,
         decode_layout_changed=layout_changed,
         block_tables_per_group=[torch.tensor([[page, 0]], dtype=torch.int32)],
+        # A verify can never use resident inputs: its candidate block is
+        # assembled from this step's drafts. Default None, so every test here
+        # is about the plain decode unless it says otherwise.
+        spec_mode=spec_mode,
     )
 
 
@@ -87,6 +93,9 @@ def _submission_input(*, device_sampling=True, layout_changed=True, page=0):
         decode_layout_changed=layout_changed,
         num_valid_drafts=None,
         accepted_counts=None,
+        # Not a verify. The reload plan forces a full input upload for one,
+        # because a candidate block is assembled fresh every step.
+        spec_mode=None,
         slot_remap=torch.tensor([0], dtype=torch.int32),
     )
 
@@ -157,6 +166,29 @@ def test_page_table_only_refresh_is_overlap_safe():
     assert plan.overlap_safe
 
 
+def test_a_verify_always_reloads_its_inputs():
+    """A candidate block cannot be resident, so the commands say so.
+
+    The resident-input mode exists for the plain decode: the device sampler
+    writes the token it chose into the buffer the next decode reads, so the
+    host's copy is stale by design and the model is told to ignore it. A
+    verify's ``tokens`` are a block built this step from the scheduler's
+    drafts and each row's last committed token. A model told to ignore those
+    would verify whatever it happened to hold, so ``reload_inputs`` is true
+    for every verify however steady the batch is.
+    """
+    controller = _controller()
+    # A settled chain: the plain decode that follows this is overlap-safe with
+    # no input upload, which is what makes the verify's demand visible.
+    _commit(controller, _decode_input())
+    assert not _commit(controller, _decode_input()).reload_inputs
+
+    plan = _commit(controller, _decode_input(spec_mode="argmax_ids"))
+
+    assert plan.reload_inputs
+    assert not plan.reload_page_table
+
+
 def test_submit_decode_delivers_page_table_only_refresh():
     calls = []
 
@@ -201,6 +233,7 @@ def test_v0_preserves_host_to_device_overlap_predicate():
         prompt_lens=None,
         perform_device_sampling=True,
         decode_layout_changed=False,
+        spec_mode=None,
         grammar_bitmask=[None],
         prompt_tokens=None,
         output_tokens=None,

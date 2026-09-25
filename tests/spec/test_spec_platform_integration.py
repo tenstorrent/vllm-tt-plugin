@@ -158,11 +158,16 @@ def test_an_unreduced_draft_length_is_left_alone(monkeypatch, vllm_config):
     assert vllm_config.speculative_config.num_speculative_tokens == 7
 
 
-def test_async_scheduling_cannot_speculate(monkeypatch, vllm_config):
-    # The loop lives in the synchronous decode tail: _finish_async_decode has
-    # no accept walk, so an asynchronous speculative step would hand the
-    # verify's candidate block to the ordinary sampler and commit ids as
-    # though they had been sampled.
+def test_async_scheduling_cannot_speculate_for_an_undeclared_model(
+    monkeypatch, vllm_config
+):
+    # The runner defers a speculative step now, so the refusal is no longer
+    # about a missing accept walk: it is about the model. The deferred path
+    # hands read_decode_output a [B, 1+K] verify whose committed length the
+    # host decides after the forward, and holds the verify's hidden handle
+    # across the readback until the next step's propose call. The decode
+    # reload contract that supports_async_decode answers to covers neither,
+    # because it was written for a decode committing one token per forward.
     # A model that does not declare async-decode support has async scheduling
     # cleared for it earlier, so the pair only arises for one that does.
     vllm_config.scheduler_config.async_scheduling = True
@@ -176,8 +181,54 @@ def test_async_scheduling_cannot_speculate(monkeypatch, vllm_config):
     with pytest.raises(ValueError) as excinfo:
         _run_hook(monkeypatch, _speculative(vllm_config), model)
     message = str(excinfo.value)
-    assert "asynchronous scheduling" in message
+    assert "supports_async_spec_decode" in message
     assert "--no-async-scheduling" in message
+    # Async scheduling stays on in the config: the launch fails instead of
+    # quietly serving something the operator did not ask for.
+    assert vllm_config.scheduler_config.async_scheduling is True
+
+
+def test_async_scheduling_speculates_for_a_model_that_declares_it(
+    monkeypatch, vllm_config
+):
+    # The admitted combination: the model declares that its readback and its
+    # hidden handle serve a deferred verify, so the path is served and the plan
+    # is resolved as it is on a synchronous launch.
+    vllm_config.scheduler_config.async_scheduling = True
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4,
+        model_capabilities={
+            **FakeSpecModel.model_capabilities,
+            "supports_async_decode": True,
+            "supports_async_spec_decode": True,
+        },
+    )
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    assert vllm_config.scheduler_config.async_scheduling is True
+    plan = get_tt_spec_plan(vllm_config)
+    assert plan is not None
+    assert plan.effective_k == 7
+
+
+def test_declaring_async_spec_decode_does_not_admit_async_decode_itself(
+    monkeypatch, vllm_config
+):
+    # The two declarations answer different questions. supports_async_decode
+    # says the model's ordinary decode can be submitted and read back as two
+    # calls; supports_async_spec_decode says the same readback serves a verify
+    # block and holds its hidden handle. A model declaring only the second one
+    # still has async scheduling cleared, because the step it would defer
+    # first is an ordinary one.
+    vllm_config.scheduler_config.async_scheduling = True
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4,
+        model_capabilities={
+            **FakeSpecModel.model_capabilities,
+            "supports_async_spec_decode": True,
+        },
+    )
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    assert vllm_config.scheduler_config.async_scheduling is False
 
 
 def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):

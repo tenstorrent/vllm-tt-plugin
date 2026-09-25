@@ -7,7 +7,7 @@ import multiprocessing
 import os
 import sys
 import weakref
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 import torch
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -33,7 +33,10 @@ from vllm_tt_plugin.config import (
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.spec_admission import resolve_speculative_plan
+from vllm_tt_plugin.spec_admission import (
+    MODEL_OWNED_DRAFT_METHOD,
+    resolve_speculative_plan,
+)
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -69,6 +72,11 @@ TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # (_aligned_prefill_len and _round_down_to_tile), so admission and the adapter
 # must agree on this hardware-fixed value.
 _TT_TOKEN_TILE_SIZE = 32
+# The comparison ``_install_tt_async_spec_method_patch`` acts through, and how
+# many times ``VllmConfig.__post_init__`` makes it: once for an explicitly
+# requested asynchronous scheduling, once for the automatic selection.
+_ASYNC_SPEC_GATE_COMPARISON = "not in get_args(EagleModelTypes)"
+_ASYNC_SPEC_GATE_COMPARISONS = 2
 _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
     "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
     "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
@@ -730,6 +738,93 @@ def _install_tt_harmony_truncation_patch() -> None:
     renderer_registry = sys.modules.get("vllm.renderers.registry")
     if renderer_registry is not None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
+
+
+def _install_tt_async_spec_method_patch() -> None:
+    """Let the TT model-owned drafter through upstream's async-scheduling gate.
+
+    ``VllmConfig.__post_init__`` decides asynchronous scheduling against the
+    speculative method name, and it decides before ``check_and_update_config``
+    runs: an explicit ``--async-scheduling`` raises for any method outside
+    EAGLE/MTP/draft_model/NGram GPU/DSpark, and the default path rewrites the
+    setting to False for the same set. TT uses the ``custom_class`` extension
+    category for its model-owned drafter. The ordinary platform validation
+    hook runs too late to admit that category through the upstream check.
+
+    Both predicates read one module-level name, ``EagleModelTypes``, which
+    ``vllm.config.vllm`` imports and uses nowhere else. Rebinding that name to
+    a widened ``Literal`` changes exactly those two conditions, in that module,
+    and leaves every other consumer of the type alone: each imports it into its
+    own namespace. Everything else upstream checks stays in force, including
+    the executor's support, ``disable_padded_drafter_batch``, and the
+    configuration that follows from the resolved setting, and
+    ``--no-async-scheduling`` still disables.
+
+    Installed only in a process that selected the TT platform. Whether a given
+    model may serve the pairing is still the plugin's own admission decision.
+
+    TODO: remove this once vLLM admits a proposer-owning platform through a
+    hook of its own.
+    """
+    import vllm.config.vllm as vllm_config_module
+
+    if hasattr(vllm_config_module, "_tt_original_eagle_model_types"):
+        return
+
+    _check_async_spec_gate_shape(vllm_config_module)
+    original = vllm_config_module.EagleModelTypes
+    vllm_config_module._tt_original_eagle_model_types = original
+    vllm_config_module.EagleModelTypes = Literal[
+        tuple(get_args(original)) + (MODEL_OWNED_DRAFT_METHOD,)
+    ]
+
+
+def _check_async_spec_gate_shape(vllm_config_module: Any) -> None:
+    """Refuse to patch a gate that no longer looks like the one documented.
+
+    The rebind fails silently when it stops mattering: if upstream inlines the
+    method list, renames it, or routes the decision through a helper, the name
+    still exists and still holds ``custom_class`` while asynchronous scheduling
+    goes back to being disabled for this launch. A server that quietly serves
+    synchronously is what this patch exists to prevent, so the source is
+    checked for the two comparisons the patch acts through and a mismatch fails
+    the launch here rather than on a throughput graph.
+    """
+    import inspect
+
+    try:
+        source = inspect.getsource(vllm_config_module.VllmConfig.__post_init__)
+    except (OSError, TypeError) as error:  # pragma: no cover - source ships
+        raise RuntimeError(
+            "TT cannot verify vLLM's asynchronous-scheduling gate because "
+            f"VllmConfig.__post_init__ has no readable source: {error}. The TT "
+            "model-owned drafter needs that gate patched to serve speculative "
+            "decoding with asynchronous scheduling"
+        ) from error
+    comparisons = source.count(_ASYNC_SPEC_GATE_COMPARISON)
+    if comparisons != _ASYNC_SPEC_GATE_COMPARISONS:
+        raise RuntimeError(
+            "TT expects vLLM's asynchronous-scheduling gate to test the "
+            "speculative method with "
+            f"{_ASYNC_SPEC_GATE_COMPARISON!r} exactly "
+            f"{_ASYNC_SPEC_GATE_COMPARISONS} times in "
+            f"VllmConfig.__post_init__, and found {comparisons}. This vLLM has "
+            "restructured that decision, so the TT patch admitting the "
+            "model-owned drafter would apply and change nothing. Pin the "
+            "supported vLLM version, or update "
+            "_install_tt_async_spec_method_patch to the new structure"
+        )
+
+
+def _uninstall_tt_async_spec_method_patch() -> None:
+    """Restore the upstream name, for tests that assert the unpatched gate."""
+    import vllm.config.vllm as vllm_config_module
+
+    original = getattr(vllm_config_module, "_tt_original_eagle_model_types", None)
+    if original is None:
+        return
+    vllm_config_module.EagleModelTypes = original
+    del vllm_config_module._tt_original_eagle_model_types
 
 
 def _pin_v1_model_runner() -> None:
@@ -1402,6 +1497,10 @@ class TTPlatform(Platform):
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
+        # which is where upstream decides asynchronous scheduling against the
+        # speculative method name. This hook is that call's first statement.
+        _install_tt_async_spec_method_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
@@ -1478,6 +1577,11 @@ class TTPlatform(Platform):
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        # Too late to change this config's asynchronous setting, which upstream
+        # resolved before calling this hook. Installed anyway, for a process
+        # that reaches configuration without the CLI path: a second engine, or
+        # a direct VllmConfig construction, then finds the gate patched.
+        _install_tt_async_spec_method_patch()
         # The class carries process-level admission state, so a live
         # block-output engine cannot share the process with a second engine:
         # the reset below (and every class write after it) would corrupt the
@@ -2055,14 +2159,36 @@ class TTPlatform(Platform):
             vllm_config.speculative_config
             and vllm_config.scheduler_config.async_scheduling
         ):
-            raise ValueError(
-                "TT asynchronous scheduling and speculative decoding cannot be "
-                "combined. The verify-then-propose loop runs in the "
-                "synchronous decode tail, so an asynchronous step would return "
-                "the verify's candidate block through the ordinary sampler and "
-                "never walk acceptance. Launch with --no-async-scheduling, or "
-                "drop the speculative flags"
+            # The runner has a deferred speculative path: acceptance is walked
+            # where the readback completes, and the commit and the next
+            # proposal wait for the engine thread. That path places two demands
+            # on a model that supports_async_decode does not cover, because the
+            # decode reload contract was written for a decode committing one
+            # token per forward: read_decode_output is handed a [B, 1+K] verify
+            # whose committed length the host decides after the forward, and
+            # the verify's hidden handle must stay valid across the readback
+            # and until the next step's propose call. Declared separately
+            # rather than derived, so a model already declaring async decode
+            # does not silently acquire obligations it was never written to.
+            supports_async_spec_decode = bool(
+                (model_capabilities or {}).get("supports_async_spec_decode", False)
             )
+            if not supports_async_spec_decode:
+                raise ValueError(
+                    "TT asynchronous scheduling and speculative decoding "
+                    f"cannot be combined for {model_class.__name__}, which "
+                    "does not declare "
+                    "model_capabilities['supports_async_spec_decode']. The "
+                    "deferred speculative path hands read_decode_output a "
+                    "[B, 1+K] verify whose committed length is decided after "
+                    "the forward, and holds the verify's hidden handle across "
+                    "the readback until the next step's propose call; "
+                    "supports_async_decode covers neither. Launch with "
+                    "--no-async-scheduling, or drop the speculative flags"
+                )
+            # The TT bootstrap patch admits custom_class through upstream's
+            # method check. These capability checks determine whether the
+            # selected model can serve the combined async speculative path.
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(

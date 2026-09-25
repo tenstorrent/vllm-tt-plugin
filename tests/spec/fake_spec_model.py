@@ -85,6 +85,16 @@ class FakeSpecModel:
     def __init__(self) -> None:
         self.propose_calls: list[dict] = []
         self.verify_calls: list[dict] = []
+        # Recorded apart from the verifies, because "this step ran as an
+        # ordinary decode" is the property a speculating launch's overlap rests
+        # on, and a test that counted only verifies could not see it.
+        self.plain_calls: list[dict] = []
+        # The handle the last verify returned. A fresh object per verify, and
+        # deliberately of no useful type: the contract is that the runner hands
+        # it back without interpreting it, so a test can only check identity,
+        # and anything the runner did to it would show up as a different
+        # object rather than as a wrong value.
+        self.verify_hidden: object | None = None
 
     # ---- config time -----------------------------------------------------
 
@@ -145,6 +155,9 @@ class FakeSpecModel:
                 "rows": rows,
                 "accepted_counts": accepted_counts.clone(),
                 "hidden_was_none": hidden is None,
+                "hidden": hidden,
+                "committed_tokens": committed_tokens.clone(),
+                "committed_positions": committed_positions.clone(),
             }
         )
         # Deterministic and derived only from the last committed token per row,
@@ -158,9 +171,9 @@ class FakeSpecModel:
         self,
         tokens,
         start_pos,
-        num_valid_drafts,
-        accepted_counts,
-        spec_mode: str,
+        num_valid_drafts=None,
+        accepted_counts=None,
+        spec_mode: str | None = None,
         **kwargs,
     ) -> VerifyOutput:
         """The verify primitive: one forward over the [B, 1+K] candidate block.
@@ -178,6 +191,22 @@ class FakeSpecModel:
         """
         del kwargs
         positions = start_pos
+        if spec_mode is None:
+            # The ordinary decode call, which a model declaring
+            # ``supports_narrow_decode`` also serves: a speculating launch
+            # sends it on a step with nothing to verify, and that step is what
+            # can overlap. The three speculative arguments come together or
+            # not at all, so their absence is what makes this the plain call.
+            if num_valid_drafts is not None or accepted_counts is not None:
+                # A ``TypeError``, which is what the signature raised when
+                # ``spec_mode`` had no default: a caller that sends the side
+                # tensors and forgets the mode called this wrong, and must not
+                # receive greedy ids for it.
+                raise TypeError(
+                    "FakeSpecModel was sent a speculative side tensor with no "
+                    "spec_mode; the runner builds all three together"
+                )
+            return self._plain_decode(tokens, positions)
         if spec_mode not in self.accept_modes:
             raise ValueError(
                 f"FakeSpecModel serves {list(self.accept_modes)}, "
@@ -205,15 +234,35 @@ class FakeSpecModel:
         )
 
         verified = self._verified_ids(tokens, num_valid_drafts)
+        self.verify_hidden = object()
         if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
-            return VerifyOutput(spec_mode=spec_mode, argmax_ids=verified, hidden=None)
+            return VerifyOutput(
+                spec_mode=spec_mode, argmax_ids=verified, hidden=self.verify_hidden
+            )
         # The two modes must agree, or a test of one proves nothing about the
         # other: the logits argmax is the ids the other mode returns.
         logits = torch.zeros(rows, block_width, self.vocab_size)
         logits.scatter_(2, verified.to(torch.int64).unsqueeze(2), 1.0)
-        return VerifyOutput(spec_mode=spec_mode, logits=logits, hidden=None)
+        return VerifyOutput(
+            spec_mode=spec_mode, logits=logits, hidden=self.verify_hidden
+        )
 
     # ---- contract checks -------------------------------------------------
+
+    def _plain_decode(self, tokens, positions):
+        """``[B, 1, V]`` logits whose argmax is this row's next token.
+
+        The same rule the verify uses for the token that follows a row's last
+        committed one, so a plain step and a verify agree about what this model
+        would choose: the host sampling tail then commits ``last + 1``.
+        """
+        rows = int(tokens.shape[0])
+        self.plain_calls.append({"rows": rows, "width": int(tokens.shape[1])})
+        last = tokens.reshape(rows, -1)[:, 0].to(torch.int64)
+        choice = (last + 1) % self.vocab_size
+        logits = torch.zeros(rows, 1, self.vocab_size)
+        logits.scatter_(2, choice.unsqueeze(1).unsqueeze(2), 1.0)
+        return logits
 
     def _check_block(
         self, call: str, tokens, positions, block_width: int | None = None
