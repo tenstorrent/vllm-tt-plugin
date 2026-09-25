@@ -677,3 +677,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
   where specified
 - [LICENSE_understanding.txt](LICENSE_understanding.txt) — Tenstorrent's
   clarification of how the Apache 2.0 license applies to this repository
+
+## Request seeds
+
+Sampling batches preserve signed 64-bit request seeds, including through slot compaction. Host generators retain the original seed. A model whose device sampler requires a narrower seed remains responsible for conversion at its device boundary. Host and device samplers need not generate identical random streams.

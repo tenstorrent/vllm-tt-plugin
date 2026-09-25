@@ -192,7 +192,9 @@ class SamplingInputBatch:
         }
         result: dict[str, torch.Tensor] = {}
         for name, default_value in self.DEFAULTS.items():
-            dtype = dtype_map[type(default_value)]
+            # Keep the API seed intact through batching and host sampling.
+            # Models narrow it only at their device-sampling boundary.
+            dtype = torch.int64 if name == "seed" else dtype_map[type(default_value)]
             result[name] = torch.full((self.max_num_reqs,), default_value, dtype=dtype)
         return result
 
