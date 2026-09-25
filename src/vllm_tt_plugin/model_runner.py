@@ -1994,6 +1994,17 @@ class TTModelRunner:
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
+        max_top_k = self.model.model_capabilities.get("max_device_top_k")
+        if max_top_k is not None:
+            sampling = input_batch.sampling
+            active_rows = list(input_batch.req_id_to_index.values())
+            temperature = sampling.temperature[active_rows]
+            top_k = sampling.top_k[active_rows]
+            needs_unbounded_or_larger_k = (temperature != 0) & (
+                (top_k < 1) | (top_k > max_top_k)
+            )
+            if needs_unbounded_or_larger_k.any():
+                return False
         if not input_batch.no_penalties and not self.model.model_capabilities.get(
             "supports_device_penalties", True
         ):

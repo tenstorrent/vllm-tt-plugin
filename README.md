@@ -704,3 +704,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 ## Request seeds
 
 Sampling batches preserve signed 64-bit request seeds, including through slot compaction. Host generators retain the original seed. A model whose device sampler requires a narrower seed remains responsible for conversion at its device boundary. Host and device samplers need not generate identical random streams.
+
+## Sampling limits
+
+Models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Active requests outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing.
