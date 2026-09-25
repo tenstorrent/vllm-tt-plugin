@@ -85,6 +85,8 @@ def _submission_input(*, device_sampling=True, layout_changed=True, page=0):
         prompt_tokens=None,
         output_tokens=None,
         decode_layout_changed=layout_changed,
+        num_valid_drafts=None,
+        accepted_counts=None,
         slot_remap=torch.tensor([0], dtype=torch.int32),
     )
 
@@ -344,6 +346,7 @@ def test_transition_applies_drained_token_before_host_authoritative_reload():
     )
     runner = _bind_committed_width(
         SimpleNamespace(
+            _num_speculative_tokens=0,
             _output_tokens_per_step=1,
             requests={"request": request_state},
             input_batch=input_batch,
@@ -595,6 +598,7 @@ def _completed_step(token: int, runner_output=None) -> CompletedDecodeStep:
 def _async_apply_runner(request_state):
     runner = _bind_committed_width(
         SimpleNamespace(
+            _num_speculative_tokens=0,
             _output_tokens_per_step=1,
             scheduler_config=SimpleNamespace(async_scheduling=True),
             requests={"request": request_state},
@@ -769,6 +773,7 @@ def test_unscheduled_live_request_keeps_accepted_token_in_cached_state():
     request_state = SimpleNamespace(output_token_ids=[])
     runner = _bind_committed_width(
         SimpleNamespace(
+            _num_speculative_tokens=0,
             _output_tokens_per_step=1,
             requests={"request": request_state},
             input_batch=SimpleNamespace(req_id_to_index={}),

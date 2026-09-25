@@ -797,6 +797,14 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        # Speculative side tensors, sent only on a speculating decode step so a
+        # model that never speculates keeps its present call shape. Both or
+        # neither: the runner builds them together and a model needs the count
+        # to know which candidate state to continue from, not only the draft
+        # count to know how much of the block is real.
+        if model_input.num_valid_drafts is not None:
+            kwargs["num_valid_drafts"] = model_input.num_valid_drafts
+            kwargs["accepted_counts"] = model_input.accepted_counts
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (

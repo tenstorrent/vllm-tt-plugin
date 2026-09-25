@@ -9,6 +9,20 @@ below. The plugin side that reads it is
 The design this implements is
 https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
 
+## Status
+
+The plugin admits a configuration, builds the candidate block described in
+section 4, and then refuses the launch, because no execution path exists yet:
+`TTWorker` implements no `take_draft_token_ids` and `TTModelRunner` drives no
+verify-then-propose loop, so nothing proposes drafts or walks acceptance.
+Implementing this contract on a model is therefore useful now for validating
+declarations and input shapes, and does not yet produce a speculating server.
+
+Speculation and TT lane mode cannot be combined. Lane mode builds its device
+input from `TTLaneInputBatch`, which has no candidate-block builder, so the
+platform refuses that pair rather than serving plain decodes under speculative
+flags.
+
 ## 1. Capability declarations
 
 Four `model_capabilities` entries, read only when the launch carries a
@@ -77,7 +91,47 @@ declared but not yet budgeted against. The byte fields need a bytes-per-KV-token
 conversion the block-count function does not have, and the row check needs the
 runner. Declare them accurately anyway: they are what the budgeting will read.
 
-## 4. What the plugin does with a refusal
+## 4. What the runner sends on a decode step
+
+Once a launch carries a resolved `SpecPlan`, `TTModelRunner` widens every
+decode step to the candidate block, whether or not any request has drafts
+pending. `TTModelInput` carries it as four values.
+
+| Value | Shape | Meaning |
+| --- | --- | --- |
+| `input_tokens` | `[B, 1+K]` int32 | Column 0 is the row's last committed token; columns 1..K are its pending drafts |
+| `input_positions` | `[B, 1+K]` int32 | Column j is that row's position for column j's token |
+| `num_valid_drafts` | `[B]` int32 | How many of a row's K draft columns are real, in `[0, K]` |
+| `accepted_counts` | `[B]` int32 | How many tokens that row's previous step committed, in `[1, 1+K]` |
+
+`B` is the padded decode batch, the same capacity a plain decode is padded to,
+so the block carries rows for requests that do not exist. A padding row holds
+token 0 and position -1 in every column, `num_valid_drafts` 0, and
+`accepted_counts` 1.
+
+A row with fewer than K valid drafts pads its own tail columns, and the cap is
+per row: one request whose drafter ran short never shortens another request's
+speculation. A padded column carries `PLACEHOLDER_TOKEN_ID` for the token and
+-1 for the position, which is the same no-position marker a padding row
+carries. A padded column must not be verified, and `num_valid_drafts` is what
+says where a row's real columns stop.
+
+`accepted_counts` is a count and not an index. It is never 0, it is 1 after a
+prefill and after a non-speculating step, and a model selecting a per-candidate
+state slot selects slot `accepted_counts - 1`. A prefill drops a row's pending
+drafts and resets its count to 1, because a request resumed from preemption
+replays its own history and its drafts no longer sit at the positions they were
+drafted for.
+
+A model that declares `supports_narrow_decode` receives the plain decode's own
+shapes on a step where no row carries a draft, which are `[B, 1]` tokens and
+`[B]` positions, so the narrow step is the ordinary decode call and not a third
+shape to implement. It receives the two `[B]` side tensors on that step too,
+because the count is how it picks the candidate state slot its previous step
+committed from, whatever this step's width. A model that does not declare it
+receives `[B, 1+K]` on every decode step.
+
+## 5. What the plugin does with a refusal
 
 Every refusal raises `ValueError` at configuration time, naming the offending
 values and the command-line flag that changes them. Speculation is never
