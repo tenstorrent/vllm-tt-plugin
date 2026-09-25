@@ -677,3 +677,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
   where specified
 - [LICENSE_understanding.txt](LICENSE_understanding.txt) — Tenstorrent's
   clarification of how the Apache 2.0 license applies to this repository
+
+## Sampling limits
+
+Models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Active requests outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing.
