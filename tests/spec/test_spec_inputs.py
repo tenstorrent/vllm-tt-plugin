@@ -668,7 +668,13 @@ def test_the_runner_only_truncates_a_proposal_before_the_verify():
     drafts, num_valid, counts = TTModelRunner._spec_row_state(
         {"a": 3}, {"a": [11, 12, 13]}, ["a", "b"], 5
     )
-    assert drafts[0].tolist() == [11, 12, 13, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]
+    assert drafts[0].tolist() == [
+        11,
+        12,
+        13,
+        PLACEHOLDER_TOKEN_ID,
+        PLACEHOLDER_TOKEN_ID,
+    ]
     assert drafts[1].tolist() == [PLACEHOLDER_TOKEN_ID] * 5
     assert num_valid.tolist() == [3, 0]
     assert counts.tolist() == [3, 1]
