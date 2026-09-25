@@ -16,7 +16,48 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    MODE_REQUIRED_FIELDS,
+    VerifyOutput,
+)
 from vllm_tt_plugin.structured_output import has_structured_outputs
+
+
+def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
+    """The one tensor a verify's mode returns, unwrapped from ``VerifyOutput``.
+
+    A step that sent ``spec_mode`` asked the model to verify a candidate
+    block, and a ``VerifyOutput`` is the only answer to that question. A model
+    that declares ``supports_spec_decode`` and whose ``decode_forward`` does
+    not implement the verify answers with a plain decode's return instead, and
+    that return survives every check further down: device sampling produces a
+    ``[B, 1]`` id tensor, which the accept walk reads as a verify claiming one
+    token per row, so the run commits one token per step for its whole life
+    and reports nothing. Refused by type here, where the answer arrives.
+
+    Only ``argmax_ids`` is driven today, so a model that answers in another
+    mode is refused by name rather than having its tensor read as ids.
+    ``VerifyOutput`` has already checked that the field its mode declares is
+    present.
+    """
+    if not isinstance(tt_out, VerifyOutput):
+        raise TypeError(
+            f"TT model {model_name} was asked to verify in spec_mode "
+            f"{spec_mode!r} and its decode_forward returned "
+            f"{type(tt_out).__name__}; a verify returns a VerifyOutput from "
+            "vllm_tt_plugin.spec_decode, so a model whose decode_forward "
+            "serves no verify must not declare supports_spec_decode"
+        )
+    if tt_out.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+        raise NotImplementedError(
+            f"TT decode asked for spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} and the "
+            f"model answered in {tt_out.spec_mode!r}, which carries "
+            f"{list(MODE_REQUIRED_FIELDS[tt_out.spec_mode])}; the runner drives "
+            "no accept walk for that mode yet"
+        )
+    return tt_out.argmax_ids
+
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -805,6 +846,7 @@ class TTAsyncDecodeController:
         if model_input.num_valid_drafts is not None:
             kwargs["num_valid_drafts"] = model_input.num_valid_drafts
             kwargs["accepted_counts"] = model_input.accepted_counts
+            kwargs["spec_mode"] = model_input.spec_mode
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -874,6 +916,23 @@ class TTAsyncDecodeController:
             enable_trace=enable_trace,
             read_from_device=read_from_device,
         )
+        requested_spec_mode = kwargs.get("spec_mode")
+        if requested_spec_mode is not None:
+            # A verify returns its mode's tensor inside a VerifyOutput, which
+            # the read path below and every consumer above expect as a plain
+            # host tensor. Unwrapped here, at the one boundary the model
+            # returns through, rather than teaching each of them the type.
+            tt_out = _verify_output_tensor(
+                tt_out, type(runner.model).__name__, requested_spec_mode
+            )
+        elif isinstance(tt_out, VerifyOutput):
+            raise TypeError(
+                f"TT model {type(runner.model).__name__} returned a "
+                "VerifyOutput from a decode step that asked for no verify; "
+                "the runner sends spec_mode on every step it speculates on "
+                "and on no other, so this step's return has no accepted "
+                "count to be read against"
+            )
         # Input construction only proposed this layout/remap. Commit both at
         # the boundary where the model accepted the decode submission.
         runner.note_decode_layout_consumed()

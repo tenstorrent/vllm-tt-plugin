@@ -21,7 +21,6 @@ from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import get_tt_spec_plan, store_tt_spec_plan
 from vllm_tt_plugin.spec_admission import (
     method_requirements,
-    refuse_unimplemented_execution,
     resolve_speculative_plan,
 )
 from vllm_tt_plugin.spec_decode import (
@@ -41,8 +40,12 @@ _SENTINEL = object()
 # rewrites every other MTPModelTypes member to "mtp" during construction.
 MTP_METHOD = "mtp"
 
+# The method the runner can propose for, which is what most of these tests want
+# when their subject is something other than the method itself.
+RUNNABLE_METHOD = "ngram"
 
-def _config(*, method=MTP_METHOD, requested_k=7, max_num_seqs=1, speculative=True):
+
+def _config(*, method=RUNNABLE_METHOD, requested_k=7, max_num_seqs=1, speculative=True):
     return SimpleNamespace(
         speculative_config=(
             SimpleNamespace(method=method, num_speculative_tokens=requested_k)
@@ -155,6 +158,51 @@ def test_speculation_is_never_disabled_silently():
             _admit(config)
 
 
+def test_a_method_with_no_proposer_is_refused():
+    """A method the runner cannot draft for must not start a server.
+
+    Admission knowing a method is not the same as the runner being able to
+    propose for it. A suffix or device method admitted here would take the
+    speculative flags, draft nothing, commit one token per step, and report a
+    speedup it never achieved.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(method="suffix"))
+    message = str(excinfo.value)
+    assert "no proposer drives it" in message
+    assert "['ngram']" in message
+
+
+def test_a_device_method_is_refused_even_by_a_fully_declaring_model():
+    # FakeSpecModel declares device_propose and hidden_feed, so nothing in its
+    # declarations refuses an MTP launch. Nothing calls propose_draft_tokens,
+    # so the runner must.
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(method=MTP_METHOD))
+    assert "no proposer drives it" in str(excinfo.value)
+
+
+def test_a_logits_only_plan_is_refused():
+    """A mode the runner never asks for cannot be the only one offered.
+
+    The runner requests ``argmax_ids`` on every step and refuses any other
+    answer, so a plan offering only ``logits`` would pass admission and fail on
+    its first decode.
+    """
+    variant = make_fake_spec_model(accept_modes=("logits",))
+    with pytest.raises(ValueError) as excinfo:
+        _admit(_config(), model_class=variant)
+    message = str(excinfo.value)
+    assert "logits" in message
+    assert "argmax_ids" in message
+
+
+def test_a_plan_offering_more_than_the_runner_drives_is_still_admitted():
+    # Declaring a real capability must never make a model less admissible.
+    variant = make_fake_spec_model(accept_modes=("logits", ACCEPT_MODE_ARGMAX_IDS))
+    assert _admit(_config(), model_class=variant).effective_k == 7
+
+
 # --- capability declarations the model must carry -------------------------
 
 
@@ -173,8 +221,10 @@ def test_a_model_missing_a_required_capability_is_refused_naming_it():
             "spec_hidden_handoff": [HIDDEN_HANDOFF_ON_DEVICE],
         }
     )
+    # Named explicitly, for the same reason: the runnable default requires
+    # nothing of the model, so it can miss nothing.
     with pytest.raises(ValueError) as excinfo:
-        _admit(_config(), model_class=variant)
+        _admit(_config(method=MTP_METHOD), model_class=variant)
     assert SPEC_REQUIREMENT_HIDDEN_FEED in str(excinfo.value)
 
 
@@ -188,8 +238,10 @@ def test_a_hidden_feed_method_needs_a_declared_handoff():
             ],
         }
     )
+    # A hidden-feed method, named explicitly: the default is the one method the
+    # runner can propose for, and that one feeds nothing to a device drafter.
     with pytest.raises(ValueError) as excinfo:
-        _admit(_config(), model_class=variant)
+        _admit(_config(method=MTP_METHOD), model_class=variant)
     assert "spec_hidden_handoff" in str(excinfo.value)
 
 
@@ -361,24 +413,6 @@ def test_a_non_callable_spec_plan_is_refused_naming_what_was_found():
 
 
 # --- nothing can execute an admitted plan yet ------------------------------
-
-
-def test_resolution_accepts_what_execution_cannot_run():
-    # Resolution validates the declarations; the separate refusal keeps a
-    # server from starting with no execution path behind it. Deleting that one
-    # call is the whole change when the runner lands.
-    config = _config()
-    assert (
-        resolve_speculative_plan(
-            config, FakeSpecModel, FakeSpecModel.model_capabilities, 1
-        ).effective_k
-        == 7
-    )
-    with pytest.raises(ValueError) as excinfo:
-        refuse_unimplemented_execution(FakeSpecModel)
-    message = str(excinfo.value)
-    assert "take_draft_token_ids" in message
-    assert "verify-then-propose" in message
 
 
 # --- the paged-drafter gate cannot be walked around ------------------------

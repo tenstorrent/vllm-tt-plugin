@@ -19,6 +19,7 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
+    get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
@@ -32,10 +33,7 @@ from vllm_tt_plugin.config import (
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.spec_admission import (
-    refuse_unimplemented_execution,
-    resolve_speculative_plan,
-)
+from vllm_tt_plugin.spec_admission import resolve_speculative_plan
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -1321,6 +1319,16 @@ def register_tt_test_models():
         "models.vllm_test_utils.no_op_test.test_model:DummyNoOpModel",
     )
 
+    # The same, implementing the speculative-decoding contract: the only way to
+    # exercise the plugin's speculative path against a real engine, scheduler
+    # and worker, and the instrument for measuring what a speculative step
+    # costs on the host with no device work under it.
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTDummySpecDecodeModel",
+        "models.vllm_test_utils.spec_test.test_model:DummySpecDecodeModel",
+    )
+
     # Fake model for testing multi-host inference on dual Galaxy
     _register_model_if_missing(
         ModelRegistry,
@@ -2043,6 +2051,19 @@ class TTPlatform(Platform):
         # selected. model_class carries the single-execute decision for GPT-OSS.
         _convert_dp_to_lanes(vllm_config, model_class)
 
+        if (
+            vllm_config.speculative_config
+            and vllm_config.scheduler_config.async_scheduling
+        ):
+            raise ValueError(
+                "TT asynchronous scheduling and speculative decoding cannot be "
+                "combined. The verify-then-propose loop runs in the "
+                "synchronous decode tail, so an asynchronous step would return "
+                "the verify's candidate block through the ordinary sampler and "
+                "never walk acceptance. Launch with --no-async-scheduling, or "
+                "drop the speculative flags"
+            )
+
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(
                 "TT lane mode and speculative decoding cannot be combined. "
@@ -2082,10 +2103,6 @@ class TTPlatform(Platform):
                     spec_plan.effective_k
                 )
         store_tt_spec_plan(vllm_config, spec_plan)
-        if spec_plan is not None:
-            # Delete this call, and nothing else here, when TTWorker publishes
-            # draft token ids and TTModelRunner drives the loop.
-            refuse_unimplemented_execution(model_class)
 
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
@@ -2221,6 +2238,61 @@ class TTPlatform(Platform):
         )
 
     @classmethod
+    def _reject_unsupported_speculative_request(cls, params) -> None:
+        """Refuse a request the greedy accept walk cannot serve faithfully.
+
+        Speculation runs in the ``argmax_ids`` mode, where no logits cross the
+        boundary: the runner compares drafted ids against the target's argmax
+        and commits ids. That serves plain greedy decoding exactly, and nothing
+        else. A request asking for more would be answered greedily anyway, and
+        silently: random sampling would come back deterministic, a grammar or a
+        token filter would go unapplied at the position that rejected, and
+        requested logprobs would arrive empty.
+
+        Refused per request rather than at config time because these are
+        per-request controls, and a launch may legitimately mix requests that
+        speculate with requests that cannot. Once the sampled accept walk
+        drives ``logits``, this narrows to what that path cannot serve.
+        """
+        vllm_config = cls._resolve_tt_admission_handle()
+        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+            return
+
+        unsupported = []
+        if params.temperature != 0.0:
+            unsupported.append(f"temperature={params.temperature!r}")
+        if params.logprobs is not None:
+            unsupported.append(f"logprobs={params.logprobs!r}")
+        if getattr(params, "structured_outputs", None) is not None:
+            unsupported.append("structured_outputs")
+        if params.min_p:
+            unsupported.append(f"min_p={params.min_p!r}")
+        if params.logit_bias:
+            unsupported.append("logit_bias")
+        if params.bad_words:
+            unsupported.append("bad_words")
+        if params.allowed_token_ids:
+            unsupported.append("allowed_token_ids")
+        if params.min_tokens:
+            unsupported.append(f"min_tokens={params.min_tokens!r}")
+        for name in ("presence_penalty", "frequency_penalty"):
+            if getattr(params, name) != 0.0:
+                unsupported.append(f"{name}={getattr(params, name)!r}")
+        if params.repetition_penalty != 1.0:
+            unsupported.append(f"repetition_penalty={params.repetition_penalty!r}")
+
+        if unsupported:
+            raise ValueError(
+                f"Speculative decoding on {cls.device_name} serves greedy "
+                f"requests only, and this request asks for {unsupported}. The "
+                "accept walk compares token ids and never sees logits, so it "
+                "cannot arbitrate any of those; answering greedily anyway "
+                "would change what was asked for without saying so. Send the "
+                "request with temperature 0 and none of the above, or drop the "
+                "speculative flags from the server"
+            )
+
+    @classmethod
     def validate_request(
         cls,
         processed_inputs: "EngineInput",
@@ -2236,6 +2308,9 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        if isinstance(params, SamplingParams):
+            cls._reject_unsupported_speculative_request(params)
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
