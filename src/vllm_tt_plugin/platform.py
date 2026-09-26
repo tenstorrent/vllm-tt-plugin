@@ -2365,34 +2365,40 @@ class TTPlatform(Platform):
 
     @classmethod
     def _reject_unsupported_speculative_request(cls, params) -> None:
-        """Refuse a request the greedy accept walk cannot serve faithfully.
+        """Refuse a request this launch cannot serve faithfully at all.
 
         Speculation runs in the ``argmax_ids`` mode, where no logits cross the
         boundary: the runner compares drafted ids against the target's argmax
-        and commits ids. That serves plain greedy decoding exactly, and nothing
-        else. A request asking for more would be answered greedily anyway, and
-        silently: random sampling would come back deterministic, a grammar or a
-        token filter would go unapplied at the position that rejected, and
-        requested logprobs would arrive empty.
+        and commits ids. That certifies plain greedy decoding exactly, and
+        nothing else.
+
+        Controls the ORDINARY decode path can honour are no longer refused --
+        a non-zero temperature and the penalties are served by simply not
+        speculating for that request (``TTModelRunner._request_is_speculable``
+        offers no drafts, and the runner applies its full sampling). Refusing
+        them made a speculating launch unusable for any sampled client and, in
+        our case, failed every prompt of two standard evals with HTTP 400.
+
+        What remains here is what no path on this launch serves: controls that
+        need logits or a token filter the model-owned sampler does not apply.
+        A request asking for those would be answered without them, silently --
+        a grammar or token filter unapplied, requested logprobs arriving empty.
 
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
-        speculate with requests that cannot. Once the sampled accept walk
-        drives ``logits``, this narrows to what that path cannot serve.
+        speculate with requests that cannot.
         """
         vllm_config = cls._resolve_tt_admission_handle()
         if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
             return
 
         unsupported = []
-        if params.temperature != 0.0:
-            unsupported.append(f"temperature={params.temperature!r}")
+        # temperature / min_p / the penalties are intentionally absent: those
+        # requests are decoded without speculation instead of being refused.
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r}")
         if getattr(params, "structured_outputs", None) is not None:
             unsupported.append("structured_outputs")
-        if params.min_p:
-            unsupported.append(f"min_p={params.min_p!r}")
         if params.logit_bias:
             unsupported.append("logit_bias")
         if params.bad_words:
@@ -2401,20 +2407,15 @@ class TTPlatform(Platform):
             unsupported.append("allowed_token_ids")
         if params.min_tokens:
             unsupported.append(f"min_tokens={params.min_tokens!r}")
-        for name in ("presence_penalty", "frequency_penalty"):
-            if getattr(params, name) != 0.0:
-                unsupported.append(f"{name}={getattr(params, name)!r}")
-        if params.repetition_penalty != 1.0:
-            unsupported.append(f"repetition_penalty={params.repetition_penalty!r}")
 
         if unsupported:
             raise ValueError(
-                f"Speculative decoding on {cls.device_name} serves greedy "
-                f"requests only, and this request asks for {unsupported}. The "
-                "accept walk compares token ids and never sees logits, so it "
-                "cannot arbitrate any of those; answering greedily anyway "
-                "would change what was asked for without saying so. Send the "
-                "request with temperature 0 and none of the above, or drop the "
+                f"Speculative decoding on {cls.device_name} cannot serve this "
+                f"request's {unsupported}. No path on this launch applies "
+                "those, so answering without them would change what was asked "
+                "for without saying so. Sampled requests (temperature, "
+                "min_p, the penalties) ARE served here -- they simply decode "
+                "without speculation. Drop the controls above, or drop the "
                 "speculative flags from the server"
             )
 

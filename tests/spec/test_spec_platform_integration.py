@@ -279,9 +279,6 @@ def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
     "field, value",
     [
         ("logprobs", 1),
-        ("presence_penalty", 0.5),
-        ("frequency_penalty", 0.5),
-        ("repetition_penalty", 1.1),
         ("min_tokens", 4),
         ("bad_words", ["no"]),
     ],
@@ -306,18 +303,37 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     with pytest.raises(ValueError) as excinfo:
         _validate(params)
     message = str(excinfo.value)
-    assert "greedy requests only" in message
+    assert "cannot serve" in message
     assert field in message
 
 
-def test_a_sampled_request_is_refused_while_speculating(monkeypatch, vllm_config):
-    """A temperature is the case that would silently come back deterministic."""
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("temperature", 0.7),
+        ("presence_penalty", 0.5),
+        ("frequency_penalty", 0.5),
+        ("repetition_penalty", 1.1),
+    ],
+)
+def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
+    monkeypatch, vllm_config, field, value
+):
+    """Sampling the walk cannot certify is served WITHOUT speculation.
+
+    Refusing these made a speculating launch unusable for any sampled client:
+    every prompt of r1_gpqa_diamond and mmlu_pro came back HTTP 400, because
+    both send temperature=1.0. The ordinary decode path applies the full
+    sampling the runner implements, so the request gets what it asked for at
+    baseline speed; only the drafts are withheld
+    (TTModelRunner._request_is_speculable).
+    """
     from vllm.sampling_params import SamplingParams
 
     _speculating_platform(monkeypatch, vllm_config)
-    with pytest.raises(ValueError) as excinfo:
-        _validate(SamplingParams(temperature=0.7))
-    assert "temperature=0.7" in str(excinfo.value)
+    kwargs = {"temperature": 0.0} if field != "temperature" else {}
+    kwargs[field] = value
+    _validate(SamplingParams(**kwargs))  # must not raise
 
 
 def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_config):
@@ -332,3 +348,79 @@ def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_con
 
 
 # endregion Per-request semantics
+
+
+class _FakeBatch:
+    def __init__(self, random=(), presence=(), frequency=(), repetition=()):
+        self.random_reqs = set(random)
+        self.presence_penalties_reqs = set(presence)
+        self.frequency_penalties_reqs = set(frequency)
+        self.repetition_penalties_reqs = set(repetition)
+
+
+def _speculable(**batch_kwargs):
+    """Call the runner's gate without building a runner."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch(**batch_kwargs)
+    return TTModelRunner._request_is_speculable(runner, "r0")
+
+
+def test_a_greedy_request_is_speculable():
+    assert _speculable() is True
+
+
+@pytest.mark.parametrize(
+    "batch_kwargs",
+    [
+        {"random": ["r0"]},
+        {"presence": ["r0"]},
+        {"frequency": ["r0"]},
+        {"repetition": ["r0"]},
+    ],
+    ids=["temperature", "presence", "frequency", "repetition"],
+)
+def test_sampling_the_walk_cannot_certify_is_not_speculable(batch_kwargs):
+    """accept_greedy_drafts compares ids, so it can only certify argmax.
+
+    Proposing for these and accepting on id equality would return greedy text
+    for a request that asked to sample -- the silent failure the refusal was
+    protecting against. Withholding the drafts keeps that protection without
+    refusing the request.
+    """
+    assert _speculable(**batch_kwargs) is False
+
+
+def test_another_request_being_sampled_does_not_block_this_one():
+    """The gate is per request: a mixed batch still speculates where it can."""
+    assert _speculable(random=["other"]) is True
+
+
+def _publish(tokens, **batch_kwargs):
+    """Drive the single publish choke point every proposer goes through."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch(**batch_kwargs)
+    runner._proposed_draft_token_ids = {"r0": [9, 9]}  # a stale earlier offer
+    TTModelRunner._publish_draft(runner, "r0", tokens)
+    return runner._proposed_draft_token_ids
+
+
+def test_a_greedy_request_publishes_its_drafts():
+    assert _publish([1, 2, 3]) == {"r0": [1, 2, 3]}
+
+
+def test_a_sampled_request_publishes_nothing_and_erases_the_stale_offer():
+    """Both proposers route through here, so neither can bypass the gate.
+
+    The erase matters as much as the withholding: this map is what the
+    scheduler verifies next, so a stale entry would be verified against a
+    token the request has already moved past.
+    """
+    assert _publish([1, 2, 3], random=["r0"]) == {}
+
+
+def test_an_empty_offer_erases_the_stale_offer():
+    assert _publish([]) == {}
