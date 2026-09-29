@@ -545,6 +545,12 @@ clear error before anything reaches the device:
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
+  Sliding-window models must additionally declare
+  `model_capabilities['supports_sliding_window_prefix_caching'] = True`.
+  This promises that cached-prefix resumes restore every required sliding
+  attention state, including a prefix hit after its original request released
+  the device slot. It does not enable caching when the operator disables it.
+  Models without this declaration retain the existing sliding-window guard.
 - Async decode overlap is enabled only for models that declare the capability.
 - Multi-host MPI data parallelism is not supported.
 - vLLM's V2 model runner. The plugin implements only the V1 model-runner

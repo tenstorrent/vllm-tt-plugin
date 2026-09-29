@@ -1772,11 +1772,13 @@ class TTPlatform(Platform):
                     model_class.__module__,
                 )
                 _renormalize_mamba_cache_config(vllm_config)
-            elif model_config.get_sliding_window() is not None:
+            elif model_config.get_sliding_window() is not None and not (
+                model_capabilities or {}
+            ).get("supports_sliding_window_prefix_caching", False):
                 vllm_config.cache_config.enable_prefix_caching = False
                 logger.warning(
                     "Prefix caching is not supported in TT backend for "
-                    "models with sliding window, disabling it"
+                    "models without sliding-window prefix-cache support, disabling it"
                 )
                 _renormalize_mamba_cache_config(vllm_config)
         logger.info(

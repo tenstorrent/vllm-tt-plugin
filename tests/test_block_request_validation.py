@@ -788,6 +788,43 @@ def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("sliding_window", "prefix_support", "sliding_support", "requested", "expected"),
+    [
+        (128, True, None, True, False),
+        (128, True, False, True, False),
+        (128, True, True, True, True),
+        (128, True, True, False, False),
+        (128, False, True, True, False),
+        (None, True, None, True, True),
+        (None, False, None, True, False),
+    ],
+)
+def test_prefix_cache_requires_explicit_sliding_support(
+    monkeypatch, sliding_window, prefix_support, sliding_support, requested, expected
+):
+    class PrefixModel(ARModel):
+        model_capabilities = {
+            **ARModel.model_capabilities,
+            "supports_prefix_caching": prefix_support,
+        }
+
+    if sliding_support is not None:
+        PrefixModel.model_capabilities["supports_sliding_window_prefix_caching"] = (
+            sliding_support
+        )
+    config = _config()
+    config.model_config.hf_config.model_type = "future_model"
+    config.model_config.hf_config.canvas_length = None
+    config.model_config.get_sliding_window = lambda: sliding_window
+    config.cache_config.enable_prefix_caching = requested
+    _patch_model_resolution(monkeypatch, PrefixModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching is expected
+
+
+@pytest.mark.parametrize(
     ("prompt_lens", "expected"),
     [
         ((200, 600), (768, 256)),
