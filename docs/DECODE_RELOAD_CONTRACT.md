@@ -328,3 +328,16 @@ The paired tt-metal implementation initializes decode-only seed state
 unconditionally when `reset_sampling_state=True`, including `seed=None`. It
 implements the same correctness fix as tt-metal#51556 but does not depend on
 that PR.
+
+## Deferred host-logits output shape
+
+A single-rank adapter whose physical decode rows vary by batch bucket can
+declare `model_capabilities["supports_decode_output_batch_size"] = True` and
+implement `process_decode_output_host_for_batch(output, *, batch_size_per_model,
+is_tokens=False)`. The plugin snapshots the submitted input row count and passes
+it to this method when finalizing host-logits readback. The adapter must use that
+immutable width to reshape logits, even if a later submission has switched its
+active bucket. The live request count can be smaller than the padded row count.
+
+This opt-in currently supports one model rank. Device-token readback and adapters
+without the capability retain `process_decode_output_host(output, is_tokens=...)`.

@@ -95,6 +95,97 @@ def _accepted_decode_hooks(runner):
     return runner
 
 
+@pytest.mark.parametrize("widths", [(32, 1), (1, 32)])
+def test_deferred_host_logits_keep_the_submitted_physical_width(widths):
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {
+            "supports_async_decode": True,
+            "supports_decode_output_batch_size": True,
+        }
+
+        def decode_forward(self, **kwargs):
+            self.current_width = kwargs["tokens"].shape[0]
+            # An opaque readback payload: the plugin only forwards it. Flattened
+            # logits model the adapter's responsibility to restore row/vocab axes.
+            return {"flat": torch.arange(self.current_width * 128)}
+
+        def read_decode_output(self, output, *, async_read):
+            return output, []
+
+        def process_decode_output_host_for_batch(
+            self, output, *, batch_size_per_model, is_tokens
+        ):
+            assert not is_tokens
+            return output["flat"].reshape(batch_size_per_model[0], 1, -1)
+
+        def process_decode_output_host(self, *args, **kwargs):
+            raise AssertionError("Width-aware adapter must use the submission snapshot")
+
+    runner = _accepted_decode_hooks(
+        SimpleNamespace(
+            model=Model(),
+            trace_mode="decode_only",
+            kv_caches=object(),
+            request_specific_rope=False,
+        )
+    )
+    controller = TTAsyncDecodeController(runner)
+    submitted = []
+    for width in widths:
+        model_input = _submission_input(device_sampling=False)
+        model_input.input_tokens = torch.zeros(width, 1, dtype=torch.int32)
+        live_counts = [1]
+        model_input.unpadded_batch_size = live_counts
+        submission = controller.submit_decode(
+            model_input, read_from_device=False, async_read=True
+        )
+        live_counts[0] = 17
+        assert submission.batch_size_per_dp == (1,)
+        assert submission.output_batch_size_per_model == (width,)
+        submitted.append(submission)
+    # Complete the older call after another bucket has changed the model state.
+    for width, submission in zip(widths, submitted):
+        logits = controller.finalize_decode(submission).tt_out
+        assert logits.shape == (width, 1, 128)
+        assert logits[-1, 0, -1] == width * 128 - 1
+
+
+@pytest.mark.parametrize("device_sampling", [False, True])
+def test_legacy_output_processor_is_unchanged_without_width_capability(device_sampling):
+    calls = []
+
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": True}
+
+        def decode_forward(self, **kwargs):
+            return {"opaque": object()}
+
+        def process_decode_output_host(self, output, *, is_tokens):
+            calls.append(is_tokens)
+            return torch.tensor([[123]])
+
+        def process_decode_output_host_for_batch(self, *args, **kwargs):
+            raise AssertionError("The hook alone must not opt a model in")
+
+    runner = _accepted_decode_hooks(
+        SimpleNamespace(
+            model=Model(),
+            trace_mode="decode_only",
+            kv_caches=object(),
+            request_specific_rope=False,
+        )
+    )
+    controller = TTAsyncDecodeController(runner)
+    submission = controller.submit_decode(
+        _submission_input(device_sampling=device_sampling), read_from_device=False
+    )
+    assert submission.output_batch_size_per_model is None
+    assert controller.finalize_decode(submission).tt_out.item() == 123
+    assert calls == [device_sampling]
+
+
 def _cached_reqs(req_ids, *, context_phase=(), resumed=()):
     req_ids = list(req_ids)
     context_phase = set(context_phase)

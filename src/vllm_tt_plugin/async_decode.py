@@ -33,10 +33,23 @@ class TTDecodeSubmission:
 
     tt_out: Any | None
     read_events: list[Any] | None
-    batch_size_per_dp: list[int]
+    batch_size_per_dp: tuple[int, ...]
     sampling_params: Any
     perform_device_sampling: bool
     reload_plan: TTDecodeReloadPlan | None = None
+    output_batch_size_per_model: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        # Input-batch lists may change before asynchronous readback completes.
+        object.__setattr__(self, "batch_size_per_dp", tuple(self.batch_size_per_dp))
+        widths = self.output_batch_size_per_model
+        if widths is not None:
+            if len(widths) != len(self.batch_size_per_dp):
+                raise ValueError(
+                    f"Output widths {widths} must match the "
+                    f"{len(self.batch_size_per_dp)} decode ranks"
+                )
+            object.__setattr__(self, "output_batch_size_per_model", tuple(widths))
 
 
 @dataclass(frozen=True)
@@ -770,6 +783,17 @@ class TTAsyncDecodeController:
         batch_size_per_dp = model_input.unpadded_batch_size
         if not isinstance(batch_size_per_dp, list):
             batch_size_per_dp = [batch_size_per_dp]
+        # A single-rank model may pad to a declared decode bucket. Preserve
+        # that physical row count separately from the live request count.
+        capabilities = getattr(runner.model, "model_capabilities", {}) or {}
+        output_batch_size_per_model = None
+        if capabilities.get("supports_decode_output_batch_size", False):
+            if len(batch_size_per_dp) != 1:
+                raise ValueError(
+                    "supports_decode_output_batch_size currently requires one "
+                    f"model rank, got {len(batch_size_per_dp)}"
+                )
+            output_batch_size_per_model = (int(model_input.input_tokens.shape[0]),)
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
@@ -902,6 +926,7 @@ class TTAsyncDecodeController:
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
             reload_plan=reload_plan,
+            output_batch_size_per_model=output_batch_size_per_model,
         )
 
     def finalize_decode(
@@ -920,7 +945,17 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
 
         is_host_output = _is_host_decode_output(tt_out)
-        if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
+        if (
+            not is_host_output
+            and not submission.perform_device_sampling
+            and submission.output_batch_size_per_model is not None
+        ):
+            tt_out = runner.model.process_decode_output_host_for_batch(
+                tt_out,
+                batch_size_per_model=submission.output_batch_size_per_model,
+                is_tokens=False,
+            )
+        elif not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             tt_out = runner.model.process_decode_output_host(
                 tt_out,
                 is_tokens=submission.perform_device_sampling,
