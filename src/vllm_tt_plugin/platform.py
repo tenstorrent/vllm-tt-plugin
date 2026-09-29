@@ -760,8 +760,10 @@ def _install_tt_async_spec_method_patch() -> None:
     configuration that follows from the resolved setting, and
     ``--no-async-scheduling`` still disables.
 
-    Installed only in a process that selected the TT platform. Whether a given
-    model may serve the pairing is still the plugin's own admission decision.
+    Installed only in a process that can serve TT models: from the TT platform
+    hooks, and from the general-plugin entry point once ttnn imports. Whether a
+    given model may serve the pairing is still the plugin's own admission
+    decision.
 
     TODO: remove this once vLLM admits a proposer-owning platform through a
     hook of its own.
