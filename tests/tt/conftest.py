@@ -40,6 +40,17 @@ def pytest_addoption(parser):
         help="Max batch size for testing (default: 32)",
     )
     parser.addoption(
+        "--tt-reasoning-token-budget",
+        action="store",
+        type=int,
+        default=0,
+        help=(
+            "Additional generated tokens for reasoning before final-answer "
+            "assertions in bad-word and mixed structured/plain chat tests. "
+            "Use an allowance measured on a native reference (default: 0)."
+        ),
+    )
+    parser.addoption(
         "--tt-chunked-prefill-budget",
         action="store",
         type=int,
@@ -74,6 +85,15 @@ def max_batch_size(request):
 def chunked_prefill_budget(request):
     """The served ``max_num_batched_tokens``, or 0 when chunked prefill is off."""
     return request.config.getoption("--tt-chunked-prefill-budget")
+
+
+@pytest.fixture(scope="session")
+def reasoning_token_budget(request):
+    """Extra tokens added to the original total generation caps."""
+    budget = request.config.getoption("--tt-reasoning-token-budget")
+    if budget < 0:
+        raise pytest.UsageError("--tt-reasoning-token-budget must be non-negative")
+    return budget
 
 
 @pytest.fixture(scope="session")

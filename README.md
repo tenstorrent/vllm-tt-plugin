@@ -597,6 +597,23 @@ pytest tests/tt -v \
   --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
+For reasoning models, pass `--tt-reasoning-token-budget=N` to add `N` to the
+total generation cap in the bad-word and mixed structured/plain chat tests.
+Their original caps (100 tokens for bad words; 8/16/64/16 for
+choice/regex/JSON/plain) form the base allowance, and all output assertions
+remain in place. Reasoning and answer tokens share the resulting total cap.
+The default is 0, preserving existing runs. This option does not change
+raw-completion, recall, penalty or token-count tests.
+
+Choose `N` from matched native-reference completions with a generous discovery
+ceiling and normal EOS stopping; record reasoning and answer counts separately.
+A safety allowance of twice the largest completed reasoning count is a useful
+starting point, not a guarantee for unseen prompts or seeds. Include enough
+space for the final answer and framing when choosing the extra allowance.
+A reference that hits its discovery ceiling or runtime limit has not established
+a usable limit. Keep its failure
+visible and investigate it before treating a larger test budget as a fix.
+
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 

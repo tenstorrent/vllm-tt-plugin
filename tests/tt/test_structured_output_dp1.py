@@ -19,7 +19,9 @@ JSON_SCHEMA = {
 }
 
 
-async def _send_choice_request(async_client, model: str, request_id: int) -> str:
+async def _send_choice_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> str:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -28,7 +30,7 @@ async def _send_choice_request(async_client, model: str, request_id: int) -> str
                 "content": f"Pick one color for request {request_id}.",
             }
         ],
-        max_completion_tokens=8,
+        max_completion_tokens=8 + reasoning_token_budget,
         temperature=0,
         extra_body={"structured_outputs": {"choice": CHOICES}},
     )
@@ -37,7 +39,9 @@ async def _send_choice_request(async_client, model: str, request_id: int) -> str
     return content
 
 
-async def _send_regex_request(async_client, model: str, request_id: int) -> str:
+async def _send_regex_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> str:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -48,7 +52,7 @@ async def _send_regex_request(async_client, model: str, request_id: int) -> str:
                 ),
             }
         ],
-        max_completion_tokens=16,
+        max_completion_tokens=16 + reasoning_token_budget,
         temperature=0,
         extra_body={"structured_outputs": {"regex": REGEX}},
     )
@@ -58,7 +62,9 @@ async def _send_regex_request(async_client, model: str, request_id: int) -> str:
     return content
 
 
-async def _send_json_request(async_client, model: str, request_id: int) -> dict:
+async def _send_json_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> dict:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -70,7 +76,7 @@ async def _send_json_request(async_client, model: str, request_id: int) -> dict:
                 ),
             }
         ],
-        max_completion_tokens=64,
+        max_completion_tokens=64 + reasoning_token_budget,
         temperature=0,
         extra_body={"structured_outputs": {"json": JSON_SCHEMA}},
     )
@@ -84,7 +90,9 @@ async def _send_json_request(async_client, model: str, request_id: int) -> dict:
     return parsed
 
 
-async def _send_plain_request(async_client, model: str, request_id: int) -> str:
+async def _send_plain_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> str:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -93,7 +101,7 @@ async def _send_plain_request(async_client, model: str, request_id: int) -> str:
                 "content": f"Reply with a short sentence for request {request_id}.",
             }
         ],
-        max_completion_tokens=16,
+        max_completion_tokens=16 + reasoning_token_budget,
         temperature=0,
     )
     content = response.choices[0].message.content
@@ -105,6 +113,7 @@ def test_dp1_full_capacity_mixes_structured_and_plain_requests(
     tt_server,
     tt_model_name,
     max_batch_size,
+    reasoning_token_budget,
 ):
     async def _run() -> None:
         async_client = tt_server.get_async_client()
@@ -121,6 +130,7 @@ def test_dp1_full_capacity_mixes_structured_and_plain_requests(
                 async_client,
                 tt_model_name,
                 request_id,
+                reasoning_token_budget,
             )
             for request_id in range(request_count)
         ]
