@@ -941,3 +941,12 @@ def test_default_max_tokens_without_canvas_room_is_rejected_at_validation():
         _validate(params, prompt_len=1000)
 
     assert params.max_tokens is None
+
+
+def test_startup_rejects_top_k_host_fallback_for_block_output(monkeypatch):
+    class BoundedBlockModel(BlockModel):
+        model_capabilities = {**BlockModel.model_capabilities, "max_device_top_k": 32}
+
+    _patch_model_resolution(monkeypatch, BoundedBlockModel)
+    with pytest.raises(ValueError, match="max_device_top_k.*block-output"):
+        TTPlatform.check_and_update_config(_config())

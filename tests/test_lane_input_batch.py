@@ -756,3 +756,55 @@ def test_runner_is_lane_mode_property():
     assert not _runner_with(data_parallel_size=1, tt_data_parallel_size=1)._is_lane_mode
     # Standard multi-process DP: each rank is its own engine -> plain InputBatch.
     assert not _runner_with(data_parallel_size=4, tt_data_parallel_size=4)._is_lane_mode
+
+
+@pytest.mark.parametrize("scheduled_top_k", [20, 64])
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    batch = _lane_batch(num_lanes=2, per_lane=2, with_custom=False)
+    prompt = _make_req(
+        "prompt", [1, 2, 3], [], dict(temperature=0.7, top_k=scheduled_top_k)
+    )
+    waiting = _make_req("waiting", [4, 5], [6], dict(temperature=0.7, top_k=64))
+    prompt.num_computed_tokens = 2 if is_decode else 0
+    row = _add_to_lane(batch, prompt, lane=0)
+    _add_to_lane(batch, waiting, lane=1)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"prompt": 1 if is_decode else 3}
+    output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
+    plan = TTStepPlan(
+        is_decode=is_decode,
+        capacity=4,
+        scheduled_req_ids=("prompt",),
+        scheduled_rows=(row,),
+        input_rows=tuple(range(4)) if is_decode else (row,),
+        req_id_to_row={"prompt": row},
+        batch_size_per_dp=(1, 1) if is_decode else (1, 0),
+        prefill_empty_slots=None if is_decode else (row,),
+    )
+    runner = SimpleNamespace(
+        input_batch=batch,
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=2,
+        model=SimpleNamespace(model_capabilities={"max_device_top_k": 32}),
+        model_config=SimpleNamespace(is_multimodal_model=False, logits_processors=[]),
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _decode_layout_changed_since_last_decode=False,
+        _block_tables_per_layer=lambda _: None,
+        requests={"prompt": prompt, "waiting": waiting},
+    )
+    runner.check_perform_device_sampling = (
+        lambda **kwargs: TTModelRunner.check_perform_device_sampling(runner, **kwargs)
+    )
+    result = batch.build_model_input(runner, output, None, plan)
+    # Prefill submits only the selected row; merged decode submits every
+    # occupied slot, including the waiting top-k 64 request in the other lane.
+    assert result.perform_device_sampling is (not is_decode and scheduled_top_k <= 32)
+    if not is_decode:
+        assert result.input_tokens.tolist() == [[1, 2, 3]]

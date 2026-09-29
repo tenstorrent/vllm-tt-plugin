@@ -1368,6 +1368,7 @@ class TTModelRunner:
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
+            sampling_rows=req_indices,
         )
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,
@@ -1980,7 +1981,11 @@ class TTModelRunner:
         return finish(grammar_output)
 
     def check_perform_device_sampling(
-        self, is_decode: bool, has_structured_outputs: bool
+        self,
+        is_decode: bool,
+        has_structured_outputs: bool,
+        *,
+        sampling_rows: list[int] | None = None,
     ) -> bool:
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -1997,9 +2002,16 @@ class TTModelRunner:
         max_top_k = self.model.model_capabilities.get("max_device_top_k")
         if max_top_k is not None:
             sampling = input_batch.sampling
-            active_rows = list(input_batch.req_id_to_index.values())
-            temperature = sampling.temperature[active_rows]
-            top_k = sampling.top_k[active_rows]
+            # Prefill can submit only a subset of the resident lane requests.
+            # An unscheduled decode request must not change its sampling route.
+            # Steady decode omits the selection because it submits all occupants.
+            rows = (
+                list(input_batch.req_id_to_index.values())
+                if sampling_rows is None
+                else sampling_rows
+            )
+            temperature = sampling.temperature[rows]
+            top_k = sampling.top_k[rows]
             needs_unbounded_or_larger_k = (temperature != 0) & (
                 (top_k < 1) | (top_k > max_top_k)
             )
