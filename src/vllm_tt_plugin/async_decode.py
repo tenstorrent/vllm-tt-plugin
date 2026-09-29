@@ -362,6 +362,12 @@ class TTAsyncDecodeController:
         )
         if legacy_prompt or runner._decode_layout_changed_since_last_decode:
             return False
+        # A changed page mapping needs a reset even with unchanged batch rows
+        # (K2-Horizon bring-up: page growth must not reuse a stale device table).
+        if any(
+            groups is not None and any(groups) for groups in cached_reqs.new_block_ids
+        ):
+            return False
         if self.decode_input_update_contract_version() >= 1:
             if self.scheduler_output_has_prefill_work(scheduler_output):
                 return False

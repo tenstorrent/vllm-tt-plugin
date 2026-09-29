@@ -1991,6 +1991,11 @@ class TTModelRunner:
         # Calculate number of devices per DP rank
         num_devices = self.num_devices // self.tt_data_parallel_size
 
+        # Explicit model compatibility mode keeps a seeded request on one RNG
+        # implementation when a workload mixes device and host-only parameters.
+        if getattr(self.model, "force_host_sampling", False):
+            return False
+
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
@@ -1998,6 +2003,15 @@ class TTModelRunner:
             "supports_device_penalties", True
         ):
             return False
+        # Models may bound the device sampler's top-k; wider stochastic rows go to host.
+        max_device_top_k = self.model.model_capabilities.get("max_device_top_k")
+        if max_device_top_k is not None:
+            sampling = input_batch.sampling
+            if any(
+                sampling.temperature[row] != 0 and sampling.top_k[row] > max_device_top_k
+                for row in input_batch.req_id_to_index.values()
+            ):
+                return False
         has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set
@@ -2360,7 +2374,10 @@ class TTModelRunner:
                     logitsprocs=logitsprocs,
                 )
 
-                sampler_output = self.host_sampler(
+                # Models may supply a numerically equivalent host sampler;
+                # the default remains the upstream sampler for other models.
+                host_sampler = getattr(self.model, "host_sampler", None) or self.host_sampler
+                sampler_output = host_sampler(
                     logits=logits,
                     sampling_metadata=sampling_metadata,
                 )

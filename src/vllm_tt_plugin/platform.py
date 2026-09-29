@@ -3,6 +3,7 @@
 
 import gc
 import json
+import math
 import multiprocessing
 import os
 import sys
@@ -1292,6 +1293,19 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
+    # K2-Horizon-7B (IFM) model-local autoport, TP4 on Blackhole QB2
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTK2HorizonForCausalLM",
+        "models.autoports.ifm_k2_horizon_7b.tt.generator_vllm:K2HorizonForCausalLM",
+    )
+    # Upstream resolves the HF name before the TT platform prefixes it.
+    _register_model_if_missing(
+        ModelRegistry,
+        "K2HorizonForCausalLM",
+        "models.autoports.ifm_k2_horizon_7b.tt.generator_vllm:K2HorizonForCausalLM",
+    )
+
     # Optionally register test models if explicitly enabled
     if register_test_models:
         register_tt_test_models()
@@ -1331,6 +1345,10 @@ class TTPlatform(Platform):
     _standard_dp_visible_device_groups: ClassVar[list[str] | None] = None
     _standard_dp_mesh_grids: ClassVar[dict[str, tuple[int, int]]] = {}
     sample_on_device_mode: ClassVar[Literal["all", "decode_only"] | None] = None
+    # K2-Horizon request admission (see validate_request).
+    _k2_model: ClassVar[bool] = False
+    _strict_k2_sampling: ClassVar[bool] = False
+    _k2_custom_logits_processors: ClassVar[bool] = False
     # Stored as a weakref in production so a torn-down engine's config stops
     # tripping the one-engine-per-process guard once nothing else holds it;
     # tests may seed a direct config object.
@@ -1674,7 +1692,14 @@ class TTPlatform(Platform):
         # must perform local import to get around circular import
         from vllm.model_executor.model_loader.utils import get_model_architecture
 
-        model_class, _ = get_model_architecture(vllm_config.model_config)
+        model_class, selected_arch = get_model_architecture(vllm_config.model_config)
+        # Scope K2 admission to the selected model, including explicit host mode.
+        # Refresh on every config so another model cannot inherit K2 restrictions.
+        cls._k2_model = selected_arch in ("TTK2HorizonForCausalLM", "K2HorizonForCausalLM")
+        cls._strict_k2_sampling = (
+            cls._k2_model and os.environ.get("K2_VLLM_ALLOW_HOST_SAMPLING", "0") != "1"
+        )
+        cls._k2_custom_logits_processors = bool(vllm_config.model_config.logits_processors)
 
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
@@ -2163,6 +2188,66 @@ class TTPlatform(Platform):
         )
 
     @classmethod
+    def _validate_k2_request(cls, params) -> None:
+        """Reject K2-Horizon requests the strict device sampler cannot serve.
+
+        Raising here returns an HTTP error for one request instead of letting
+        an unsupported sampling path fail inside EngineCore (fatal for the engine).
+        """
+        from vllm.sampling_params import SamplingParams
+
+        if not cls._k2_model or not isinstance(params, SamplingParams):
+            return
+        # InputBatch uses int32 seeds and float32 temperatures even in host
+        # compatibility mode. Parallel sampling increments the seed after this hook.
+        if params.seed is not None and not (
+            -(2**31) <= params.seed and params.seed + params.n - 1 < 2**31
+        ):
+            raise ValueError("K2 sampling requires seed through seed+n-1 within signed int32")
+        if not math.isfinite(params.temperature) or not (
+            0 <= params.temperature <= torch.finfo(torch.float32).max
+        ):
+            raise ValueError("K2 sampling requires a finite float32 temperature")
+        if not cls._strict_k2_sampling:
+            return
+        # Keep aligned with TTModelRunner.check_perform_device_sampling for K2 TP4.
+        unsupported = []
+        if cls.sample_on_device_mode != "all":
+            unsupported.append("sample_on_device_mode must be 'all'")
+        if params.temperature != 0 and not 1 <= params.top_k <= 32:
+            unsupported.append("stochastic sampling requires top_k in [1, 32]")
+        if params.presence_penalty != 0:
+            unsupported.append("presence_penalty")
+        if params.frequency_penalty != 0:
+            unsupported.append("frequency_penalty")
+        if params.repetition_penalty != 1:
+            unsupported.append("repetition_penalty")
+        if params.min_p != 0:
+            unsupported.append("min_p")
+        if params.logprobs is not None:
+            unsupported.append("logprobs")
+        if params.allowed_token_ids:
+            unsupported.append("allowed_token_ids")
+        if params.bad_words or params.bad_words_token_ids:
+            unsupported.append("bad_words")
+        if params.logit_bias:
+            unsupported.append("logit_bias")
+        if params.min_tokens != 0:
+            unsupported.append("min_tokens")
+        if params.structured_outputs is not None:
+            unsupported.append("structured_outputs")
+        if cls._k2_custom_logits_processors:
+            unsupported.append("custom logits processors")
+        if unsupported:
+            raise ValueError(
+                "K2 strict device sampling does not support this request: "
+                + ", ".join(unsupported)
+                + ". Use temperature=0 or top_k in [1, 32] without host-only "
+                "sampling features. Host compatibility requires server startup "
+                "with K2_VLLM_ALLOW_HOST_SAMPLING=1."
+            )
+
+    @classmethod
     def validate_request(
         cls,
         processed_inputs: "EngineInput",
@@ -2178,6 +2263,8 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        cls._validate_k2_request(params)
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
