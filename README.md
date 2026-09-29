@@ -597,6 +597,23 @@ pytest tests/tt -v \
   --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
+For reasoning models, pass `--tt-reasoning-token-budget=N` to add `N` to the
+total generation cap in the bad-word and mixed structured/plain chat tests.
+Their original caps (100 tokens for bad words; 8/16/64/16 for
+choice/regex/JSON/plain) form the base allowance, and all output assertions
+remain in place. Reasoning and answer tokens share the resulting total cap.
+The default is 0, preserving existing runs. This option does not change
+raw-completion, recall, penalty or token-count tests.
+
+Choose `N` from matched native-reference completions with a generous discovery
+ceiling and normal EOS stopping; record reasoning and answer counts separately.
+A safety allowance of twice the largest completed reasoning count is a useful
+starting point, not a guarantee for unseen prompts or seeds. Include enough
+space for the final answer and framing when choosing the extra allowance.
+A reference that hits its discovery ceiling or runtime limit has not established
+a usable limit. Keep its failure
+visible and investigate it before treating a larger test budget as a fix.
+
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
@@ -683,3 +700,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing.
 
 Block-output models (`output_tokens_per_step > 1`) cannot declare this capability: their model-owned sampler produces a complete canvas, which the host sampler cannot replace. The combination is rejected at startup.
+
+## Request seeds
+
+Sampling batches preserve signed 64-bit request seeds, including through slot compaction. Host generators retain the original seed. A model whose device sampler requires a narrower seed remains responsible for conversion at its device boundary. Host and device samplers need not generate identical random streams.
