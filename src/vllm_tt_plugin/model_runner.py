@@ -803,6 +803,10 @@ class TTModelRunner:
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+                # Page growth changes decode inputs even when rows stay fixed;
+                # legacy reset_batch adapters must reload their device page table.
+                if any(new_block_ids):
+                    persistent_batch_layout_changed = True
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
