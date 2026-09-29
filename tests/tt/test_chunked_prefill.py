@@ -24,7 +24,7 @@ import random
 
 import pytest
 
-from tests.tt.utils import RequestConfig, run_concurrent_batch
+from tests.tt.utils import RequestConfig, recalled_passphrase, run_concurrent_batch
 
 # The passphrase sits this far into the filler. A prompt of about one budget
 # plants it in the first chunk, so the resumed tail must attend back to the
@@ -84,10 +84,6 @@ def _needle_prompt(num_words: int, passphrase: str, seed: int, nonce: str) -> st
     )
 
 
-def _recalled(output: str | None, passphrase: str) -> bool:
-    return passphrase.lower() in (output or "").lower()
-
-
 @pytest.fixture(scope="module")
 def budget(chunked_prefill_budget):
     """The served ``max_num_batched_tokens``.
@@ -128,7 +124,7 @@ def test_a_solo_split_prefill_recalls_its_needle(tt_server, tt_model_name, budge
         [RequestConfig(prompt=prompt, max_tokens=24, temperature=0)],
     )
 
-    assert _recalled(output, passphrase), (
+    assert recalled_passphrase(output, passphrase), (
         f"a solo split prefill lost the passphrase planted {NEEDLE_POSITION:.0%} "
         f"into its prompt: want {passphrase!r}, got {output!r}"
     )
@@ -151,7 +147,7 @@ def test_a_long_split_prefill_recalls_its_needle(tt_server, tt_model_name, budge
         [RequestConfig(prompt=prompt, max_tokens=24, temperature=0)],
     )
 
-    assert _recalled(output, passphrase), (
+    assert recalled_passphrase(output, passphrase), (
         f"a long split prefill lost the passphrase planted {NEEDLE_POSITION:.0%} "
         f"into its prompt: want {passphrase!r}, got {output!r}"
     )
@@ -187,13 +183,12 @@ def test_prefills_sharing_a_step_each_recall_their_own_needle(
         outputs = run_concurrent_batch(tt_server, tt_model_name, configs)
         total += len(outputs)
         for i, (passphrase, output) in enumerate(zip(passphrases, outputs)):
-            if not _recalled(output, passphrase):
+            if not recalled_passphrase(output, passphrase):
                 misses.append(
                     f"round {rnd} request {i}: want {passphrase!r}, got {output!r}"
                 )
 
     assert not misses, (
-        f"{len(misses)} of {total} concurrent split prefills answered with a "
-        "passphrase that is not the one planted in their own prompt, so they "
-        "attended the wrong prefix:\n  " + "\n  ".join(misses)
+        f"{len(misses)} of {total} concurrent split prefills did not return the "
+        "passphrase planted in their own prompt:\n  " + "\n  ".join(misses)
     )
