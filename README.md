@@ -701,6 +701,12 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 - [LICENSE_understanding.txt](LICENSE_understanding.txt) — Tenstorrent's
   clarification of how the Apache 2.0 license applies to this repository
 
+## Sampling limits
+
+Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing.
+
+Block-output models (`output_tokens_per_step > 1`) cannot declare this capability: their model-owned sampler produces a complete canvas, which the host sampler cannot replace. The combination is rejected at startup.
+
 ## Request seeds
 
 Sampling batches preserve signed 64-bit request seeds, including through slot compaction. Host generators retain the original seed. A model whose device sampler requires a narrower seed remains responsible for conversion at its device boundary. Host and device samplers need not generate identical random streams.

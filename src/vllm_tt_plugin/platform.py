@@ -1686,6 +1686,15 @@ class TTPlatform(Platform):
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
+        if (
+            output_tokens_per_step > 1
+            and model_capabilities is not None
+            and model_capabilities.get("max_device_top_k") is not None
+        ):
+            raise ValueError(
+                "max_device_top_k requires host sampling fallback and cannot be "
+                "used by block-output models (output_tokens_per_step > 1)."
+            )
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         # Adaptive block-output: the model emits its block ONLY when it decodes
         # alone (batch==1) and falls back to plain batched baseline otherwise,
