@@ -27,6 +27,7 @@ from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
+    store_tt_lane_prefill_group,
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     uses_tt_lane_coordinator,
@@ -492,6 +493,16 @@ def _model_folds_dp_into_lanes(model_class) -> bool:
     """
     if _galaxy_generator_version() is not None:
         return True
+    # Model classes may declare the fold themselves (e.g. gemma4's galaxy
+    # one-instance lanes gate): a callable marker is consulted at config time,
+    # so an env-gated rail can opt in without a plugin change per model.
+    marker = getattr(model_class, "_tt_folds_dp_into_lanes", None)
+    if callable(marker):
+        try:
+            if bool(marker()):
+                return True
+        except Exception:
+            pass
     return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
 
 
@@ -564,6 +575,24 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     global_max_num_seqs = per_lane_max_num_seqs * lanes
 
     store_tt_lane_count(vllm_config, lanes)
+    # Optional capability: a model that prefills whole lane groups in one
+    # multi-pipe walk declares ``_tt_lane_prefill_group`` (attr or callable,
+    # mirroring the fold marker). The lane schedulers then admit at most one
+    # new prefill per step and the coordinator gathers lanes briefly, so
+    # merged prefill steps arrive as pure groups. Model-agnostic: only the
+    # marker and the lane fold are consulted.
+    group_marker = getattr(model_class, "_tt_lane_prefill_group", None)
+    try:
+        group_on = bool(group_marker() if callable(group_marker) else group_marker)
+    except Exception:
+        group_on = False
+    if group_on:
+        store_tt_lane_prefill_group(vllm_config)
+        logger.info(
+            "Model %s declares lane-group prefill: capping new prefill "
+            "admissions at one per lane per step.",
+            getattr(model_class, "__name__", model_class),
+        )
     scheduler_config.max_num_seqs = global_max_num_seqs
     _collapse_parallel_config_to_single_process(parallel_config)
 
