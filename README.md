@@ -544,6 +544,7 @@ clear error before anything reaches the device:
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
+- Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
 - Multi-host MPI data parallelism is not supported.
 - vLLM's V2 model runner. The plugin implements only the V1 model-runner

@@ -1772,15 +1772,16 @@ class TTPlatform(Platform):
                 "but block-output models (output_tokens_per_step > 1) bypass "
                 "the vLLM prefix cache; fix the model's capability declaration"
             )
-        if vllm_config.cache_config.enable_prefix_caching:
-            if not supports_prefix_caching:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported in TT backend for %s, "
-                    "disabling it",
-                    model_class.__module__,
-                )
-                _renormalize_mamba_cache_config(vllm_config)
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            and not supports_prefix_caching
+        ):
+            vllm_config.cache_config.enable_prefix_caching = False
+            logger.warning(
+                "Prefix caching is not supported in TT backend for %s, disabling it",
+                model_class.__module__,
+            )
+            _renormalize_mamba_cache_config(vllm_config)
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
