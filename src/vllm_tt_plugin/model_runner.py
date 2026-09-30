@@ -1096,10 +1096,8 @@ class TTModelRunner:
     ) -> dict[int, torch.Generator]:
         """Re-key generators (batch row -> Generator) to this build's rows.
 
-        The host sampler draws once per generator it is handed, so each request
-        must appear exactly once per step: this build's generators are advanced
-        here, and lane builds pass only their own ``req_indices`` so a generator
-        advances once per step rather than once per lane.
+        The sampler advances the request's live generator. Preparing inputs
+        must not consume random values before an output is sampled.
 
         An intermediate-prefill row's token is discarded, so it gets a clone
         and its request's real RNG state is left untouched.
@@ -1110,7 +1108,6 @@ class TTModelRunner:
             else set()
         )
         generators: dict[int, torch.Generator] = {}
-        rows_to_advance: list[int] = []
         for local_row, batch_row in enumerate(req_indices):
             generator = input_batch.sampling.generators.get(batch_row)
             if generator is None:
@@ -1119,10 +1116,6 @@ class TTModelRunner:
                 generators[local_row] = clone_torch_generator(generator)
             else:
                 generators[local_row] = generator
-                rows_to_advance.append(batch_row)
-        # Technically this advances the generator before it is copied, but it's
-        # ok because this happens consistently.
-        input_batch.advance_generators(rows_to_advance)
         return generators
 
     def _prepare_model_inputs(

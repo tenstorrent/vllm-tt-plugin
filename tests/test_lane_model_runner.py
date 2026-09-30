@@ -238,10 +238,6 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     class FakeInputBatch:
         sampling = SimpleNamespace(generators={0: intermediate, 1: final})
 
-        def advance_generators(self, rows):
-            for row in rows:
-                torch.rand(1, generator=self.sampling.generators[row])
-
     generators = TTModelRunner._build_host_generators(
         FakeInputBatch(), [0, 1], torch.tensor([True, False])
     )
@@ -250,7 +246,7 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     assert torch.equal(generators[0].get_state(), intermediate_before)
     assert generators[1] is final
     assert torch.equal(intermediate.get_state(), intermediate_before)
-    assert not torch.equal(final.get_state(), final_before)
+    assert torch.equal(final.get_state(), final_before)
 
 
 def test_get_output_tokens_skips_all_intermediate_prefill_rows():

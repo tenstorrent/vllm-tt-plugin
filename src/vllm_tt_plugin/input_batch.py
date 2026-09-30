@@ -700,30 +700,6 @@ class InputBatch:
             out.append(bt_cpu)
         return out
 
-    def advance_generators(self, req_indices: list[int] | None = None) -> None:
-        # This relies on the fact, that for a torch all_gather_object,
-        # the local object is also copied,
-        # so the original object is not modified.
-        # Otherwise, the generator at local_rank 0
-        # would get out of sync with the others.
-        #
-        # ``req_indices`` restricts advancement to the build's own requests.
-        # Each generator belongs to a single request, so lane-DP (which calls
-        # this once per lane) passes the lane's indices to advance every
-        # generator exactly once per step rather than once per lane. ``None``
-        # advances all generators (whole-batch build, called once per step).
-        if req_indices is None:
-            generators = list(self.sampling.generators.values())
-        else:
-            generators = [
-                self.sampling.generators[i]
-                for i in req_indices
-                if i in self.sampling.generators
-            ]
-        for generator in generators:
-            # Sample once from the generator to advance its state.
-            torch.rand(1, generator=generator)
-
 
 class TTLaneInputBatch(InputBatch):
     """Persistent input batch for single-process multi-lane (lane-DP) execution.
