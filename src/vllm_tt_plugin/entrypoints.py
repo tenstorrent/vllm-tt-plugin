@@ -12,6 +12,7 @@ def register() -> None:
 
     register_tt_models_from_plugin()
     _register_tt_reasoning_parsers()
+    _register_tt_tool_parsers()
 
 
 def _register_tt_reasoning_parsers() -> None:
@@ -31,6 +32,26 @@ def _register_tt_reasoning_parsers() -> None:
         name,
         "vllm_tt_plugin.k2_horizon_reasoning_parser",
         "K2HorizonReasoningParser",
+    )
+
+
+def _register_tt_tool_parsers() -> None:
+    """Register tool-call parsers for TT-served models that vLLM lacks.
+
+    Lazy, and only when the name is free, so a future upstream parser wins.
+    """
+    try:
+        from vllm.tool_parsers import ToolParserManager
+    except Exception as exc:  # pragma: no cover - vLLM without tool-parser support
+        logger.debug("Skipping TT tool parser registration: %s", exc)
+        return
+    name = "k2_horizon"
+    if name in ToolParserManager.list_registered():
+        return
+    ToolParserManager.register_lazy_module(
+        name,
+        "vllm_tt_plugin.k2_horizon_tool_parser",
+        "K2HorizonToolParser",
     )
 
 
