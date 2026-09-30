@@ -787,31 +787,19 @@ def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
         TTPlatform.check_and_update_config(config)
 
 
-@pytest.mark.parametrize(
-    ("sliding_window", "prefix_support", "sliding_support", "requested", "expected"),
-    [
-        (128, True, None, True, False),
-        (128, True, False, True, False),
-        (128, True, True, True, True),
-        (128, True, True, False, False),
-        (128, False, True, True, False),
-        (None, True, None, True, True),
-        (None, False, None, True, False),
-    ],
-)
-def test_prefix_cache_requires_explicit_sliding_support(
-    monkeypatch, sliding_window, prefix_support, sliding_support, requested, expected
+@pytest.mark.parametrize("sliding_window", [None, 128])
+@pytest.mark.parametrize("prefix_support", [None, False, True])
+@pytest.mark.parametrize("requested", [False, True])
+def test_prefix_cache_uses_adapter_capability(
+    monkeypatch, sliding_window, prefix_support, requested
 ):
     class PrefixModel(ARModel):
-        model_capabilities = {
-            **ARModel.model_capabilities,
-            "supports_prefix_caching": prefix_support,
-        }
+        model_capabilities = dict(ARModel.model_capabilities)
 
-    if sliding_support is not None:
-        PrefixModel.model_capabilities["supports_sliding_window_prefix_caching"] = (
-            sliding_support
-        )
+    if prefix_support is None:
+        PrefixModel.model_capabilities.pop("supports_prefix_caching", None)
+    else:
+        PrefixModel.model_capabilities["supports_prefix_caching"] = prefix_support
     config = _config()
     config.model_config.hf_config.model_type = "future_model"
     config.model_config.hf_config.canvas_length = None
@@ -821,7 +809,9 @@ def test_prefix_cache_requires_explicit_sliding_support(
 
     TTPlatform.check_and_update_config(config)
 
-    assert config.cache_config.enable_prefix_caching is expected
+    assert config.cache_config.enable_prefix_caching is (
+        requested and prefix_support is True
+    )
 
 
 @pytest.mark.parametrize(
