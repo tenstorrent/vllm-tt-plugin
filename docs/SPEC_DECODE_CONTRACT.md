@@ -21,11 +21,15 @@ boundary. What runs:
   nothing.
 - the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
   is refused, because the runner requests `argmax_ids` on every step.
-- **greedy requests**, and no others. A request carrying a temperature,
-  logprobs, structured output, a token filter or a penalty is refused per
-  request: the accept walk compares token ids and never sees logits, so it
-  cannot arbitrate any of those, and answering greedily anyway would change
-  what was asked for without saying so.
+- **speculation for greedy requests**, and no others. The accept walk
+  compares token ids and never sees logits, so it can certify only an argmax
+  continuation. A request with a non-zero temperature or a penalty is admitted
+  and decoded without speculation: `TTModelRunner._publish_draft` offers no
+  drafts for it. `min_p`, `top_p` and `top_k` alone do not change the argmax,
+  so they do not stop a request speculating. A request carrying logprobs,
+  structured output or a token filter is refused per request, because no path
+  on the launch applies those. A request without drafts can still be part of a
+  verify step, and there it commits the target argmax. Section 4d.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does
@@ -42,9 +46,12 @@ boundary. What runs:
   from `TTLaneInputBatch`, which has no candidate-block builder.
 
 Every one of those is a refusal that raises with the offending values, never a
-silent fallback. The sampled accept walk, structured output over drafts,
-`fused_sample`, `drafter_scores` and a scheduler-owned paged drafter cache each
-need their own execution path before the matching refusal can go.
+silent fallback. The one exception is a request that is not speculable inside
+a verify step: it commits the target argmax, and the runner logs that
+(section 4d). Structured output over drafts, `fused_sample`, `drafter_scores`
+and a scheduler-owned paged drafter cache each need their own execution path
+before the matching refusal can go. The sampled accept walk needs one before a
+sampled request can speculate.
 
 ## 1. Capability declarations
 
@@ -494,6 +501,23 @@ When none of the three holds, the step is an ordinary decode.
 would have built and sends the plain `[B, 1]` tokens and 1-D `start_pos`, with
 no `spec_mode`, neither side tensor, and the sampling path a non-speculating
 launch uses.
+
+**A request that is not speculable is still verified with its step.**
+`TTModelRunner._request_is_speculable` is false for a request with a non-zero
+temperature or a penalty, and `TTModelRunner._publish_draft` then offers no
+drafts for it. That keeps the request from causing a verify, but
+`vllm_tt_plugin.model_runner._step_verifies` decides for the whole step, not
+per row. When another row's drafts, an unresolved commit, or a model without
+`supports_narrow_decode` makes the step a verify, the request's row is in it.
+A verify in `argmax_ids` mode returns the target argmax for every row, so that
+row commits the argmax, not a token drawn with the request's temperature and
+penalties. Without `supports_narrow_decode` this happens on every decode step;
+with it, on every step that the request shares with a row carrying drafts or
+an unresolved commit. `TTModelRunner._note_unspeculable_verify_rows` counts
+these rows and warns once, and `TTModelRunner.shutdown` logs the total.
+Removing the limit needs stochastic acceptance (accept a draft with
+probability `min(1, p_target / p_draft)`, and on rejection sample from the
+normalized residual), which needs the target distribution, not `argmax_ids`.
 
 **Overlap follows from that choice, and only an ordinary decode is eligible.**
 `TTAsyncDecodeController.submit_async_decode` reads `TTModelInput.spec_mode`:

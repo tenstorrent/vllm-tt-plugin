@@ -65,12 +65,14 @@ def _batch() -> InputBatch:
     )
 
 
-def _request(req_id: str, num_computed_tokens: int) -> CachedRequestState:
+def _request(
+    req_id: str, num_computed_tokens: int, temperature: float = 0.0
+) -> CachedRequestState:
     return CachedRequestState(
         req_id=req_id,
         prompt_token_ids=list(range(PROMPT_LEN)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(temperature=temperature),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -78,9 +80,13 @@ def _request(req_id: str, num_computed_tokens: int) -> CachedRequestState:
     )
 
 
-def _add_decoding_request(batch: InputBatch, req_id: str) -> CachedRequestState:
+def _add_decoding_request(
+    batch: InputBatch, req_id: str, temperature: float = 0.0
+) -> CachedRequestState:
     """Add a request whose whole history is computed, so it decodes next."""
-    request = _request(req_id, num_computed_tokens=PROMPT_LEN + OUTPUT_LEN - 1)
+    request = _request(
+        req_id, num_computed_tokens=PROMPT_LEN + OUTPUT_LEN - 1, temperature=temperature
+    )
     batch.add_request(request)
     return request
 
@@ -108,6 +114,7 @@ def _fake_runner(
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
         _spec_row_state=TTModelRunner._spec_row_state,
         _proposed_draft_token_ids={},
+        _num_unspeculable_verify_rows=0,
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -123,6 +130,10 @@ def _fake_runner(
     # Bound after construction because it reads runner state: which drafts a
     # step verifies depends on whether this launch schedules asynchronously.
     runner._drafts_to_verify = TTModelRunner._drafts_to_verify.__get__(runner)
+    runner._request_is_speculable = TTModelRunner._request_is_speculable.__get__(runner)
+    runner._note_unspeculable_verify_rows = (
+        TTModelRunner._note_unspeculable_verify_rows.__get__(runner)
+    )
     return runner
 
 
@@ -375,6 +386,74 @@ def test_narrow_decode_widens_when_any_row_carries_a_draft():
 
 
 # endregion Narrow decode
+
+# region A request that is not speculable
+
+
+def _record_warnings(monkeypatch, name: str) -> list[str]:
+    """Capture what the runner's module logger emits through ``name``."""
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        f"vllm_tt_plugin.model_runner.logger.{name}",
+        lambda msg, *args: emitted.append(msg % args),
+    )
+    return emitted
+
+
+def test_a_verify_counts_a_sampled_row_it_answers_by_argmax(monkeypatch):
+    """Withholding drafts does not keep a sampled request out of a verify.
+
+    The greedy row's drafts make the whole step a verify, and a verify in
+    ``argmax_ids`` mode commits the target's argmax on every row, so the
+    sampled row gets a greedy token on this step. The runner counts each such
+    row and warns.
+    """
+    warnings = _record_warnings(monkeypatch, "warning_once")
+    batch = _batch()
+    requests = {
+        "greedy": _add_decoding_request(batch, "greedy"),
+        "sampled": _add_decoding_request(batch, "sampled", temperature=1.0),
+    }
+    runner = _fake_runner(batch, requests, supports_narrow_decode=True)
+
+    for _ in range(2):
+        model_input = _decode(
+            runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22])
+        )
+        assert model_input.spec_mode is not None
+
+    assert runner._num_unspeculable_verify_rows == 2
+    assert len(warnings) == 2
+
+
+def test_an_ordinary_decode_does_not_count_a_sampled_row(monkeypatch):
+    """With nothing to verify, the step is not a verify and nothing is counted."""
+    warnings = _record_warnings(monkeypatch, "warning_once")
+    batch = _batch()
+    requests = {
+        "greedy": _add_decoding_request(batch, "greedy"),
+        "sampled": _add_decoding_request(batch, "sampled", temperature=1.0),
+    }
+    runner = _fake_runner(batch, requests, supports_narrow_decode=True)
+
+    model_input = _decode(runner, "greedy", "sampled")
+
+    assert model_input.spec_mode is None
+    assert runner._num_unspeculable_verify_rows == 0
+    assert warnings == []
+
+
+def test_shutdown_reports_the_sampled_rows_a_verify_answered(monkeypatch):
+    warnings = _record_warnings(monkeypatch, "warning")
+    runner = SimpleNamespace(_num_unspeculable_verify_rows=3)
+
+    TTModelRunner.shutdown(runner)
+
+    assert len(warnings) == 1
+    assert "3 row(s)" in warnings[0]
+
+
+# endregion A request that is not speculable
 
 # region The non-speculative path
 
