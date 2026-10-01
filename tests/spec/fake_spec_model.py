@@ -81,6 +81,7 @@ class FakeSpecModel:
     # How many of the K drafts the verify agrees with. The rest diverge, so a
     # test can predict the accepted count exactly. None accepts every draft.
     accept_depth: int | None = None
+    supports_narrow_decode: bool = False
 
     def __init__(self) -> None:
         self.propose_calls: list[dict] = []
@@ -126,7 +127,7 @@ class FakeSpecModel:
             extra_bytes_per_token=cls.extra_bytes_per_token,
             accept_modes=cls.accept_modes,
             drafter_state=cls.drafter_state,
-            supports_narrow_decode=False,
+            supports_narrow_decode=cls.supports_narrow_decode,
         )
 
     # ---- the primitives --------------------------------------------------

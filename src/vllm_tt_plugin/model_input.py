@@ -173,6 +173,17 @@ class TTModelInput:
     draft_token_ids: torch.Tensor | None = None
     spec_mode: str | None = None
 
+    # Admission-pinned homogeneous decode lane for this step. ``None`` keeps
+    # the historical runner policy for callers that do not use scheduler lane
+    # metadata. Prefill steps use ``"prefill"`` and may carry both request
+    # classes; their per-row lanes are supplied separately below.
+    spec_decode_lane: str | None = None
+
+    # Prefill-only lane for each live forward row, in ``row_req_ids`` order.
+    # Models that need lane-specific state initialization consume this list;
+    # ordinary models ignore it. Decode is homogeneous and leaves this None.
+    request_spec_decode_lanes: list[str] | None = None
+
     # Decode-only, speculation only. ``num_valid_drafts[i]`` is how many of row
     # i's ``input_tokens[i, 1:]`` columns are real drafts, in [0, K]; the
     # columns past it carry a padding marker and must not be verified.

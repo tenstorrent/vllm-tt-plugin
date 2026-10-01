@@ -89,6 +89,37 @@ def test_accepted_counts_range_is_one_based_and_never_zero(effective_k):
     assert plan.block_width == 1 + effective_k
 
 
+def test_k_by_rows_selects_the_first_cap_covering_the_live_batch():
+    plan = _plan(effective_k=7, k_by_rows=((4, 7), (8, 3)))
+    assert plan.draft_cap(1) == 7
+    assert plan.draft_cap(4) == 7
+    assert plan.draft_cap(5) == 3
+    assert plan.draft_cap(8) == 3
+    with pytest.raises(ValueError, match="does not cover 9"):
+        plan.draft_cap(9)
+
+
+def test_k_by_rows_normalizes_json_lists_to_tuples():
+    plan = _plan(effective_k=7, k_by_rows=[[4, 7], [8, 3]])
+    assert plan.k_by_rows == ((4, 7), (8, 3))
+
+
+@pytest.mark.parametrize(
+    "k_by_rows",
+    [
+        ((4,),),
+        ((0, 3),),
+        ((4, 3), (4, 2)),
+        ((4, 0),),
+        ((4, 4),),
+        ((4, 3), (8, 8)),
+    ],
+)
+def test_k_by_rows_rejects_malformed_or_inconsistent_caps(k_by_rows):
+    with pytest.raises(ValueError, match="k_by_rows"):
+        _plan(effective_k=7, k_by_rows=k_by_rows)
+
+
 # --- SpecPlan rejects what the runner cannot budget with ------------------
 
 

@@ -68,7 +68,7 @@ def test_an_admissible_launch_is_admitted(monkeypatch, vllm_config):
     # The execution path exists now: the worker publishes draft token ids and
     # the runner drives the verify-then-propose loop, so a resolved plan is
     # served rather than refused.
-    model = make_fake_spec_model(max_supported_num_seqs=4)
+    model = make_fake_spec_model(max_supported_num_seqs=4, supports_narrow_decode=True)
     _run_hook(monkeypatch, _speculative(vllm_config), model)
     plan = get_tt_spec_plan(vllm_config)
     assert plan is not None
@@ -264,14 +264,15 @@ def _speculating_platform(monkeypatch, vllm_config):
     """Run the hook so a spec plan is live, and return the platform."""
     from vllm_tt_plugin.platform import TTPlatform
 
-    model = make_fake_spec_model(max_supported_num_seqs=4)
+    model = make_fake_spec_model(max_supported_num_seqs=4, supports_narrow_decode=True)
     _run_hook(monkeypatch, _speculative(vllm_config), model)
     assert get_tt_spec_plan(vllm_config) is not None
     return TTPlatform
 
 
 def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
-    _speculating_platform(monkeypatch, vllm_config)
+    platform = _speculating_platform(monkeypatch, vllm_config)
+    assert platform.supports_per_request_spec_decode_fallback()
     _validate(_greedy_params())
 
 
@@ -279,14 +280,15 @@ def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
     "field, value",
     [
         ("logprobs", 1),
+        ("logprobs", 0),
         ("min_tokens", 4),
         ("bad_words", ["no"]),
     ],
 )
-def test_a_request_the_greedy_walk_cannot_serve_is_refused(
+def test_a_request_the_greedy_walk_cannot_serve_uses_ordinary_fallback(
     monkeypatch, vllm_config, field, value
 ):
-    """Answering greedily anyway would change what was asked for, silently.
+    """Controls the id-equality walk cannot serve use width-one decode.
 
     The accept walk compares token ids and never sees logits, so it cannot
     arbitrate a token filter or a penalty, and it cannot produce logprobs. Each
@@ -299,12 +301,21 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     from vllm.sampling_params import SamplingParams
 
     _speculating_platform(monkeypatch, vllm_config)
-    params = SamplingParams(temperature=0.0, **{field: value})
-    with pytest.raises(ValueError) as excinfo:
-        _validate(params)
-    message = str(excinfo.value)
-    assert "cannot serve" in message
-    assert field in message
+    _validate(SamplingParams(temperature=0.0, **{field: value}))
+
+
+def test_an_ordinary_request_is_refused_when_the_model_has_no_narrow_path(
+    monkeypatch, vllm_config
+):
+    from vllm.sampling_params import SamplingParams
+
+    model = make_fake_spec_model(max_supported_num_seqs=4, supports_narrow_decode=False)
+    _run_hook(monkeypatch, _speculative(vllm_config), model)
+    from vllm_tt_plugin.platform import TTPlatform
+
+    assert not TTPlatform.supports_per_request_spec_decode_fallback()
+    with pytest.raises(ValueError, match="supports_narrow_decode"):
+        _validate(SamplingParams(temperature=0.7))
 
 
 @pytest.mark.parametrize(
@@ -325,8 +336,7 @@ def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
     every prompt of r1_gpqa_diamond and mmlu_pro came back HTTP 400, because
     both send temperature=1.0. The ordinary decode path applies the full
     sampling the runner implements, so the request gets what it asked for at
-    baseline speed; only the drafts are withheld
-    (TTModelRunner._request_is_speculable).
+    baseline speed in homogeneous ordinary steps.
     """
     from vllm.sampling_params import SamplingParams
 

@@ -23,7 +23,12 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
+from vllm_tt_plugin.spec_admission import (
+    MODEL_OWNED_DRAFT_METHOD,
+    SPEC_DECODE_LANE_ORDINARY,
+    SPEC_DECODE_LANE_SPECULATIVE,
+    classify_spec_decode_lane,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -38,6 +43,30 @@ logger = init_tt_logger(__name__)
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
 _TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
+_TT_SPEC_DECODE_LANE_ATTR = "_tt_spec_decode_lane"
+_TT_REQUEST_SPEC_DECODE_LANES_ATTR = "_tt_request_spec_decode_lanes"
+
+
+def set_tt_spec_decode_lane(
+    scheduler_output: SchedulerOutput, lane: str | None
+) -> None:
+    setattr(scheduler_output, _TT_SPEC_DECODE_LANE_ATTR, lane)
+
+
+def get_tt_spec_decode_lane(scheduler_output: SchedulerOutput) -> str | None:
+    return getattr(scheduler_output, _TT_SPEC_DECODE_LANE_ATTR, None)
+
+
+def set_tt_request_spec_decode_lanes(
+    scheduler_output: SchedulerOutput, lanes: dict[str, str]
+) -> None:
+    setattr(scheduler_output, _TT_REQUEST_SPEC_DECODE_LANES_ATTR, dict(lanes))
+
+
+def get_tt_request_spec_decode_lanes(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, str]:
+    return dict(getattr(scheduler_output, _TT_REQUEST_SPEC_DECODE_LANES_ATTR, {}))
 
 
 def set_tt_forced_reset_discard_counts(
@@ -277,6 +306,18 @@ class TTScheduler(AsyncScheduler):
             self.vllm_config
         )
         speculative_config = self.vllm_config.speculative_config
+        self._spec_plan = get_tt_spec_plan(self.vllm_config)
+        self._separate_spec_decode_lanes = bool(
+            self._spec_plan and self._spec_plan.supports_narrow_decode
+        )
+        self._request_spec_decode_lane: dict[str, str] = {}
+        self._request_spec_decode_reason: dict[str, str] = {}
+        self._last_spec_decode_lane: str | None = None
+        # A speculative request still owns its prompt GDN state in the shared
+        # target-model rows until its first verify step seeds the private
+        # speculative state. Do not let an opposing ordinary step advance a
+        # padded/HOLD copy of that row before the seed has happened.
+        self._pending_spec_seed_req_ids: set[str] = set()
         self.num_lookahead_tokens = max(
             self.num_lookahead_tokens,
             spec_lookahead_tokens(
@@ -353,6 +394,26 @@ class TTScheduler(AsyncScheduler):
     )
 
     def add_request(self, request: Request) -> None:
+        if self._spec_plan is not None:
+            lane, reason = classify_spec_decode_lane(request.sampling_params)
+            if (
+                lane == SPEC_DECODE_LANE_ORDINARY
+                and not self._separate_spec_decode_lanes
+            ):
+                raise ValueError(
+                    "This speculative TT model has no ordinary width-one "
+                    f"fallback for request {request.request_id!r} ({reason}). "
+                    "Use greedy-compatible parameters or a model whose "
+                    "SpecPlan declares supports_narrow_decode=True."
+                )
+            self._request_spec_decode_lane[request.request_id] = lane
+            self._request_spec_decode_reason[request.request_id] = reason
+            logger.info(
+                "TT request %s routed to %s decode lane (%s)",
+                request.request_id,
+                lane,
+                reason,
+            )
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
@@ -628,10 +689,10 @@ class TTScheduler(AsyncScheduler):
             if has_pending_prefill:
                 # Hide the waiting queues and partial prefills so the base
                 # scheduler cannot admit prefill work.
-                result = self._schedule_decode_only()
+                result = self._schedule_decode_lane()
                 return self._finalize_scheduler_output(result, is_decode=True)
             # No pending prefill: base scheduler naturally runs decode-only.
-            result = super().schedule()
+            result = self._schedule_decode_lane()
             return self._finalize_scheduler_output(result, is_decode=True)
 
         # Default mode:
@@ -648,7 +709,7 @@ class TTScheduler(AsyncScheduler):
                 self._decode_interleave.record_step(
                     is_decode=True, prefill_pending=True
                 )
-                result = self._schedule_decode_only()
+                result = self._schedule_decode_lane()
                 return self._finalize_scheduler_output(result, is_decode=True)
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g. KV pressure), do not stall
@@ -658,7 +719,7 @@ class TTScheduler(AsyncScheduler):
                 self._decode_interleave.record_step(
                     is_decode=True, prefill_pending=True
                 )
-                result = self._schedule_decode_only()
+                result = self._schedule_decode_lane()
                 # Even an empty prefill pass drains upstream cleanup events.
                 # The runner must receive them with the replacement decode.
                 result.finished_req_ids |= prefill_result.finished_req_ids
@@ -676,12 +737,101 @@ class TTScheduler(AsyncScheduler):
 
         # No pending prefill work in default mode: run decode-only naturally.
         self._decode_interleave.record_step(is_decode=True, prefill_pending=False)
-        result = super().schedule()
+        result = self._schedule_decode_lane()
         return self._finalize_scheduler_output(result, is_decode=True)
+
+    def _decode_lanes_with_work(self) -> list[str]:
+        lanes = {
+            self._request_spec_decode_lane.get(
+                request.request_id, SPEC_DECODE_LANE_SPECULATIVE
+            )
+            for request in self.running
+            if not request.is_prefill_chunk
+        }
+        return [
+            lane
+            for lane in (SPEC_DECODE_LANE_SPECULATIVE, SPEC_DECODE_LANE_ORDINARY)
+            if lane in lanes
+        ]
+
+    def _schedule_decode_lane(self) -> SchedulerOutput:
+        """Schedule one homogeneous speculative output contract.
+
+        When both lanes are runnable they alternate. A request can therefore
+        wait for at most one opposing decode invocation, while every device
+        call still has one width and one sampling contract.
+        """
+        if not getattr(self, "_separate_spec_decode_lanes", False):
+            result = self._schedule_decode_only()
+            set_tt_spec_decode_lane(
+                result,
+                SPEC_DECODE_LANE_SPECULATIVE
+                if getattr(self, "_spec_plan", None) is not None
+                else None,
+            )
+            return result
+
+        lanes = self._decode_lanes_with_work()
+        running_spec_ids = {
+            request.request_id
+            for request in self.running
+            if not request.is_prefill_chunk
+            and self._request_spec_decode_lane.get(
+                request.request_id, SPEC_DECODE_LANE_SPECULATIVE
+            )
+            == SPEC_DECODE_LANE_SPECULATIVE
+        }
+        pending_seed_ids = getattr(self, "_pending_spec_seed_req_ids", set())
+        pending_seed_ids.intersection_update(running_spec_ids)
+        if not lanes:
+            result = self._schedule_decode_only()
+            set_tt_spec_decode_lane(result, None)
+            return result
+        if pending_seed_ids:
+            lane = SPEC_DECODE_LANE_SPECULATIVE
+        elif len(lanes) == 1:
+            lane = lanes[0]
+        else:
+            lane = (
+                SPEC_DECODE_LANE_ORDINARY
+                if self._last_spec_decode_lane == SPEC_DECODE_LANE_SPECULATIVE
+                else SPEC_DECODE_LANE_SPECULATIVE
+            )
+        result = self._schedule_decode_only(lane)
+        if result.total_num_scheduled_tokens:
+            self._last_spec_decode_lane = lane
+            if lane == SPEC_DECODE_LANE_SPECULATIVE:
+                pending_seed_ids.difference_update(result.num_scheduled_tokens)
+        set_tt_spec_decode_lane(result, lane)
+        return result
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool
     ) -> SchedulerOutput:
+        if not is_decode:
+            set_tt_spec_decode_lane(scheduler_output, "prefill")
+        request_lanes = getattr(self, "_request_spec_decode_lane", {})
+        if not is_decode:
+            pending_seed_ids = getattr(self, "_pending_spec_seed_req_ids", None)
+            if pending_seed_ids is None:
+                pending_seed_ids = self._pending_spec_seed_req_ids = set()
+            requests = getattr(self, "requests", {})
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = requests.get(req_id)
+                if (
+                    request is not None
+                    and not request.is_prefill_chunk
+                    and request_lanes.get(req_id, SPEC_DECODE_LANE_SPECULATIVE)
+                    == SPEC_DECODE_LANE_SPECULATIVE
+                ):
+                    pending_seed_ids.add(req_id)
+        set_tt_request_spec_decode_lanes(
+            scheduler_output,
+            {
+                req_id: request_lanes.get(req_id, SPEC_DECODE_LANE_SPECULATIVE)
+                for req_id in scheduler_output.num_scheduled_tokens
+            },
+        )
         if is_decode:
             rows = len(scheduler_output.num_scheduled_tokens)
             if rows > getattr(self, "_widest_decode_batch_size", 0):
@@ -696,6 +846,9 @@ class TTScheduler(AsyncScheduler):
         if pending_reset_discards:
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
+        for req_id in scheduler_output.finished_req_ids:
+            request_lanes.pop(req_id, None)
+            getattr(self, "_request_spec_decode_reason", {}).pop(req_id, None)
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
@@ -706,8 +859,11 @@ class TTScheduler(AsyncScheduler):
         admits new ones.  Adjusts max_num_running_reqs so the waiting loop
         respects the true capacity with the decodes hidden.
         """
-        pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
-        partial_prefills = [r for r in self.running if r.is_prefill_chunk]
+        original_running = list(self.running)
+        original_ids = {id(request) for request in original_running}
+        pure_decodes = [r for r in original_running if not r.is_prefill_chunk]
+        pure_decode_ids = {id(request) for request in pure_decodes}
+        partial_prefills = [r for r in original_running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
@@ -715,11 +871,27 @@ class TTScheduler(AsyncScheduler):
         try:
             result = super().schedule()
         finally:
-            self.running.extend(pure_decodes)
+            scheduled_running = list(self.running)
+            scheduled_ids = {id(request) for request in scheduled_running}
+            # Reinsert hidden decodes at their original positions. New prefills
+            # admitted by the base scheduler remain after the pre-existing
+            # requests, while preempted partial prefills remain removed.
+            self.running = [
+                request
+                for request in original_running
+                if id(request) in pure_decode_ids or id(request) in scheduled_ids
+            ]
+            self.running.extend(
+                request
+                for request in scheduled_running
+                if id(request) not in original_ids
+            )
             self.max_num_running_reqs = saved_max
         return result
 
-    def _schedule_decode_only(self) -> SchedulerOutput:
+    def _schedule_decode_only(
+        self, spec_decode_lane: str | None = None
+    ) -> SchedulerOutput:
         """Schedule only running decode requests.
 
         Temporarily hides both the ``waiting`` and ``skipped_waiting`` queues
@@ -729,15 +901,30 @@ class TTScheduler(AsyncScheduler):
         either.  Any requests that get preempted during decode scheduling are
         merged back into the original queues afterwards.
         """
-        partial_prefills = [r for r in self.running if r.is_prefill_chunk]
+        original_running = list(self.running)
+        original_ids = {id(request) for request in original_running}
+        request_lanes = getattr(self, "_request_spec_decode_lane", {})
+        hidden_requests = [
+            request
+            for request in self.running
+            if request.is_prefill_chunk
+            or (
+                spec_decode_lane is not None
+                and request_lanes.get(request.request_id, SPEC_DECODE_LANE_SPECULATIVE)
+                != spec_decode_lane
+            )
+        ]
 
         saved_waiting = self.waiting
         saved_skipped = getattr(self, "skipped_waiting", None)
         self.waiting = create_request_queue(self.policy)
         if saved_skipped is not None:
             self.skipped_waiting = create_request_queue(self.policy)
-        if partial_prefills:
-            self.running = [r for r in self.running if not r.is_prefill_chunk]
+        if hidden_requests:
+            hidden_ids = {id(request) for request in hidden_requests}
+            self.running = [
+                request for request in self.running if id(request) not in hidden_ids
+            ]
         try:
             result = super().schedule()
         finally:
@@ -748,8 +935,22 @@ class TTScheduler(AsyncScheduler):
                     saved_skipped.prepend_requests(self.skipped_waiting)
                 self.skipped_waiting = saved_skipped
             self.waiting = saved_waiting
-            if partial_prefills:
-                self.running.extend(partial_prefills)
+            if hidden_requests:
+                scheduled_running = list(self.running)
+                scheduled_ids = {id(request) for request in scheduled_running}
+                hidden_ids = {id(request) for request in hidden_requests}
+                # Preserve the global running order while leaving visible
+                # requests that the base scheduler preempted out of the list.
+                self.running = [
+                    request
+                    for request in original_running
+                    if id(request) in hidden_ids or id(request) in scheduled_ids
+                ]
+                self.running.extend(
+                    request
+                    for request in scheduled_running
+                    if id(request) not in original_ids
+                )
         return result
 
     def reset_prefix_cache(

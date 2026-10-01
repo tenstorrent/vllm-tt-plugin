@@ -40,7 +40,9 @@ from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
+    DRAFTER_STATE_INTERNAL,
     PLACEHOLDER_TOKEN_ID,
+    SpecPlan,
     VerifyOutput,
 )
 
@@ -260,6 +262,54 @@ def test_a_speculative_step_commits_its_accepted_prefix():
     assert output.sampled_token_ids[0][:DRAFT_LEN] == drafts
     assert len(output.sampled_token_ids[0]) == DRAFT_LEN + 1
     assert runner._req_accepted_counts["r"] == DRAFT_LEN + 1
+
+
+def test_batch_growth_truncates_an_outstanding_proposal_to_the_plan_cap():
+    """Four-row K=7 drafts safely become K=3 when a fifth row joins."""
+    plan = SpecPlan(
+        effective_k=7,
+        lanes_per_request=8,
+        extra_bytes_per_seq=0,
+        extra_bytes_per_token=0,
+        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        drafter_state=DRAFTER_STATE_INTERNAL,
+        k_by_rows=((4, 7), (8, 3)),
+    )
+    scheduled = {"a": list(range(10, 17))}
+    drafts, num_valid, _counts = TTModelRunner._spec_row_state(
+        {}, scheduled, ["a", "b", "c", "d", "e"], 7, plan.draft_cap(5)
+    )
+
+    assert plan.draft_cap(4) == 7
+    assert plan.draft_cap(5) == 3
+    assert num_valid.tolist() == [3, 0, 0, 0, 0]
+    assert drafts[0].tolist() == [10, 11, 12, -1, -1, -1, -1]
+
+
+def test_input_builder_applies_the_live_row_cap_before_verify():
+    runner = _runner(FakeSpecModel())
+    runner._spec_plan = SpecPlan(
+        effective_k=3,
+        lanes_per_request=4,
+        extra_bytes_per_seq=0,
+        extra_bytes_per_token=0,
+        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        drafter_state=DRAFTER_STATE_INTERNAL,
+        k_by_rows=((1, 3), (2, 1)),
+    )
+    _add_request(runner, "a")
+    _add_request(runner, "b", first_token=20)
+    scheduler_output = _scheduler_output_for(
+        runner,
+        "a",
+        "b",
+        drafts={"a": [10, 11, 12], "b": [20, 21, 22]},
+    )
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input.num_valid_drafts.tolist() == [1, 1]
+    assert model_input.draft_token_ids.tolist() == [[10, -1, -1], [20, -1, -1]]
 
 
 def test_a_rejected_draft_stops_the_row_and_still_commits_one_token():

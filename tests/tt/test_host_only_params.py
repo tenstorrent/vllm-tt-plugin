@@ -48,11 +48,21 @@ class TestHostOnlyParameters:
             for i in range(5)
         ]
         # bad_words is only available in chat completions API
-        results = run_concurrent_batch(tt_server, tt_model_name, configs, use_chat=True)
+        results = run_concurrent_batch(
+            tt_server,
+            tt_model_name,
+            configs,
+            use_chat=True,
+            return_full_response=True,
+        )
         assert len(results) == len(configs)
 
-        for i, text in enumerate(results):
-            assert text is not None, f"Response {i} content is None"
+        for i, response in enumerate(results):
+            message = response.choices[0].message
+            reasoning = getattr(message, "reasoning", None) or ""
+            content = message.content or ""
+            text = "\n".join(part for part in (reasoning, content) if part)
+            assert text, f"Response {i} contains no reasoning or final content"
             # Strip punctuation except '>' to avoid false positives from
             # BPE-merged tokens like ">Hello" (a single token distinct from "Hello")
             punct = string.punctuation.replace(">", "")

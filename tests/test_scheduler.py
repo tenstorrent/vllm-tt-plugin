@@ -165,9 +165,30 @@ def test_prefill_only_hides_decodes_but_keeps_continuations(monkeypatch):
     assert seen["running"] == [continuation]
     # One slot is held by the hidden decode, so the waiting loop sees 8 - 1.
     assert seen["max_num_running_reqs"] == 7
-    # Restored: the hidden decodes are appended back after the base pass.
-    assert scheduler.running == [continuation, decode]
+    # Restored in the original global order, so a later stateful decode does
+    # not needlessly permute physical request slots.
+    assert scheduler.running == [decode, continuation]
     assert scheduler.max_num_running_reqs == 8
+
+
+def test_prefill_only_restores_global_order_before_newly_admitted_request(monkeypatch):
+    decode = _running()
+    continuation = _running(is_prefill_chunk=True)
+    newly_admitted = _running(is_prefill_chunk=True)
+    scheduler = _scheduler(
+        running=[decode, continuation], waiting=1, mode=TTSchedulingMode.PREFILL_ONLY
+    )
+
+    def fake_base_schedule(self, throttle_prefills=False):
+        assert self.running == [continuation]
+        self.running.append(newly_admitted)
+        return SchedulerOutput.make_empty()
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_base_schedule)
+
+    scheduler.schedule()
+
+    assert scheduler.running == [decode, continuation, newly_admitted]
 
 
 def test_decode_only_hides_continuations_and_restores_them(monkeypatch):

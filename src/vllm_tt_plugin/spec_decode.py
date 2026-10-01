@@ -177,11 +177,15 @@ class SpecPlan:
     # target's caches. Empty for the two states that carry a cost.
     drafter_target_cache_requires: tuple[str, ...] = ()
     # Whether the model also serves a narrow [B, 1] decode alongside the wide
-    # [B, 1+K] one. Speculative decode calls are uniformly 1+K wide even on a
-    # step where no request carries drafts, so that a model needs one verify
-    # shape rather than two; a model that sets this offers a second, narrower
-    # shape and the runner prefers it on those steps.
+    # [B, 1+K] one. Lane-aware scheduling sends requests whose semantics need
+    # full sampling through this second shape; speculative-lane calls remain
+    # uniformly 1+K wide, including their first draftless verify.
     supports_narrow_decode: bool = False
+    # Per-step draft cap by live batch rows. Entries are ``(max_rows, k)`` in
+    # strictly ascending ``max_rows`` order. A verify with R live rows carries
+    # at most the k from the first entry whose max_rows is >= R. Empty means
+    # ``effective_k`` at every batch size.
+    k_by_rows: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
@@ -225,6 +229,46 @@ class SpecPlan:
                 f"{list(requires)}"
             )
 
+        try:
+            k_by_rows = tuple(tuple(entry) for entry in self.k_by_rows)
+        except TypeError as exc:
+            raise ValueError(
+                "SpecPlan.k_by_rows must be a sequence of (max_rows, k) pairs"
+            ) from exc
+        previous_max_rows = 0
+        for entry in k_by_rows:
+            if len(entry) != 2:
+                raise ValueError(
+                    "SpecPlan.k_by_rows entries must be (max_rows, k) pairs, "
+                    f"got {entry!r}"
+                )
+            max_rows, k = entry
+            if (
+                isinstance(max_rows, bool)
+                or not isinstance(max_rows, int)
+                or max_rows <= previous_max_rows
+            ):
+                raise ValueError(
+                    "SpecPlan.k_by_rows max_rows must be positive and strictly "
+                    f"ascending, got {k_by_rows!r}"
+                )
+            if (
+                isinstance(k, bool)
+                or not isinstance(k, int)
+                or not 1 <= k <= self.effective_k
+            ):
+                raise ValueError(
+                    "SpecPlan.k_by_rows draft caps must be integers in "
+                    f"[1, effective_k={self.effective_k}], got {entry!r}"
+                )
+            previous_max_rows = max_rows
+        if k_by_rows and max(k for _max_rows, k in k_by_rows) != self.effective_k:
+            raise ValueError(
+                "SpecPlan.k_by_rows never exposes effective_k="
+                f"{self.effective_k}: {k_by_rows!r}"
+            )
+        object.__setattr__(self, "k_by_rows", k_by_rows)
+
     @property
     def accepted_counts_range(self) -> tuple[int, int]:
         """Inclusive range a valid ``accepted_counts`` entry lies in.
@@ -241,13 +285,30 @@ class SpecPlan:
     def block_width(self) -> int:
         """Row width of a **wide** speculative decode call, ``1 + effective_k``.
 
-        Every speculative step is this wide, including a step where no request
-        carries drafts, so a model needs one verify shape and not two. The one
-        exception is a model that sets ``supports_narrow_decode``: it also
-        receives the plain decode's own shapes on a draftless step, and this
-        property does not describe that call.
+        Every speculative-lane step is this wide, including a step where no
+        request carries drafts. A model that sets ``supports_narrow_decode``
+        also receives the plain decode's own shape for ordinary-lane requests;
+        this property does not describe that call.
         """
         return 1 + self.effective_k
+
+    def draft_cap(self, live_rows: int) -> int:
+        """Maximum draft count per row for this invocation's live batch."""
+        if (
+            isinstance(live_rows, bool)
+            or not isinstance(live_rows, int)
+            or live_rows < 1
+        ):
+            raise ValueError(f"live_rows must be a positive integer, got {live_rows!r}")
+        if not self.k_by_rows:
+            return self.effective_k
+        for max_rows, k in self.k_by_rows:
+            if live_rows <= max_rows:
+                return k
+        raise ValueError(
+            f"SpecPlan.k_by_rows {self.k_by_rows!r} does not cover "
+            f"{live_rows} live rows"
+        )
 
 
 @dataclass(frozen=True)

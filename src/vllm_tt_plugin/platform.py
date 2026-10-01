@@ -2393,59 +2393,34 @@ class TTPlatform(Platform):
 
     @classmethod
     def _reject_unsupported_speculative_request(cls, params) -> None:
-        """Refuse a request this launch cannot serve faithfully at all.
+        """Route unsupported greedy-verify semantics to ordinary decode."""
+        from vllm_tt_plugin.spec_admission import (
+            SPEC_DECODE_LANE_ORDINARY,
+            classify_spec_decode_lane,
+        )
 
-        Speculation runs in the ``argmax_ids`` mode, where no logits cross the
-        boundary: the runner compares drafted ids against the target's argmax
-        and commits ids. That certifies plain greedy decoding exactly, and
-        nothing else.
-
-        Controls the ORDINARY decode path can honour are no longer refused --
-        a non-zero temperature and the penalties are served by simply not
-        speculating for that request (``TTModelRunner._request_is_speculable``
-        offers no drafts, and the runner applies its full sampling). Refusing
-        them made a speculating launch unusable for any sampled client and, in
-        our case, failed every prompt of two standard evals with HTTP 400.
-
-        What remains here is what no path on this launch serves: controls that
-        need logits or a token filter the model-owned sampler does not apply.
-        A request asking for those would be answered without them, silently --
-        a grammar or token filter unapplied, requested logprobs arriving empty.
-
-        Refused per request rather than at config time because these are
-        per-request controls, and a launch may legitimately mix requests that
-        speculate with requests that cannot.
-        """
         vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+        plan = get_tt_spec_plan(vllm_config) if vllm_config is not None else None
+        if plan is None:
             return
+        lane, reason = classify_spec_decode_lane(params)
+        if lane != SPEC_DECODE_LANE_ORDINARY:
+            return
+        if plan.supports_narrow_decode:
+            return
+        raise ValueError(
+            f"Speculative decoding on {cls.device_name} cannot serve this "
+            f"request ({reason}): its SpecPlan does not advertise "
+            "supports_narrow_decode=True, so there is no ordinary fallback. "
+            "Use greedy-compatible parameters or drop the speculative flags."
+        )
 
-        unsupported = []
-        # temperature / min_p / the penalties are intentionally absent: those
-        # requests are decoded without speculation instead of being refused.
-        if params.logprobs is not None:
-            unsupported.append(f"logprobs={params.logprobs!r}")
-        if getattr(params, "structured_outputs", None) is not None:
-            unsupported.append("structured_outputs")
-        if params.logit_bias:
-            unsupported.append("logit_bias")
-        if params.bad_words:
-            unsupported.append("bad_words")
-        if params.allowed_token_ids:
-            unsupported.append("allowed_token_ids")
-        if params.min_tokens:
-            unsupported.append(f"min_tokens={params.min_tokens!r}")
-
-        if unsupported:
-            raise ValueError(
-                f"Speculative decoding on {cls.device_name} cannot serve this "
-                f"request's {unsupported}. No path on this launch applies "
-                "those, so answering without them would change what was asked "
-                "for without saying so. Sampled requests (temperature, "
-                "min_p, the penalties) ARE served here -- they simply decode "
-                "without speculation. Drop the controls above, or drop the "
-                "speculative flags from the server"
-            )
+    @classmethod
+    def supports_per_request_spec_decode_fallback(cls) -> bool:
+        """Advertise ordinary-lane fallback only for an admitted lane plan."""
+        vllm_config = cls._resolve_tt_admission_handle()
+        plan = get_tt_spec_plan(vllm_config) if vllm_config is not None else None
+        return bool(plan is not None and plan.supports_narrow_decode)
 
     @classmethod
     def validate_request(

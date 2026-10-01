@@ -330,7 +330,7 @@ def test_interleaved_decode_step_hides_prefill_work(monkeypatch):
     scheduler.schedule()
 
     assert seen == [(False, [decode])]
-    assert scheduler.running == [decode, continuation]
+    assert scheduler.running == [continuation, decode]
     assert bool(scheduler.waiting)
 
 

@@ -15,7 +15,7 @@ The model-side contract this admits against, which a tt-metal model class must
 implement, is documented in ``docs/SPEC_DECODE_CONTRACT.md``.
 """
 
-from typing import TYPE_CHECKING, get_args
+from typing import TYPE_CHECKING, Any, get_args
 
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -50,6 +50,72 @@ _RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
 # dispatch marker, not an executable class path or a weights location.
 MODEL_OWNED_DRAFT_METHOD = "custom_class"
 MODEL_OWNED_DRAFT_SENTINEL = "vllm_tt_plugin.model_owned_drafter"
+
+# A speculative launch can still serve requests whose semantics cannot be
+# certified by the greedy id-equality accept walk, provided the model exposes
+# its ordinary width-one decode. Requests are classified once at admission and
+# remain on that lane for their lifetime; the scheduler never mixes the two
+# output contracts in one device invocation.
+SPEC_DECODE_LANE_SPECULATIVE = "speculative"
+SPEC_DECODE_LANE_ORDINARY = "ordinary"
+
+
+def classify_spec_decode_lane(params: Any) -> tuple[str, str]:
+    """Return the request's immutable decode lane and a stable reason.
+
+    ``argmax_ids`` verifies only greedy target semantics. Anything that asks
+    vLLM to sample, reshape/filter logits, report probabilities, or return
+    multiple choices must use the ordinary path. Unknown extension arguments
+    are also routed ordinarily rather than being silently ignored.
+
+    Top-p/top-k/min-p are intentionally not checked separately. vLLM
+    neutralizes them when ``temperature == 0``; with non-zero temperature the
+    temperature check already selects the ordinary lane.
+    """
+    if int(getattr(params, "n", 1) or 1) != 1:
+        return SPEC_DECODE_LANE_ORDINARY, "multiple_outputs"
+    if float(getattr(params, "temperature", 0.0) or 0.0) != 0.0:
+        return SPEC_DECODE_LANE_ORDINARY, "sampling_temperature"
+
+    neutral_controls = (
+        ("presence_penalty", 0.0),
+        ("frequency_penalty", 0.0),
+        ("repetition_penalty", 1.0),
+        ("min_tokens", 0),
+    )
+    for name, neutral in neutral_controls:
+        if getattr(params, name, neutral) != neutral:
+            return SPEC_DECODE_LANE_ORDINARY, name
+
+    # ``0`` still requests the chosen token's logprob, so these use an
+    # explicit None check instead of the generic false/empty test below.
+    for name in ("logprobs", "prompt_logprobs"):
+        if getattr(params, name, None) is not None:
+            return SPEC_DECODE_LANE_ORDINARY, name
+
+    optional_controls = (
+        "logprob_token_ids",
+        "structured_outputs",
+        "logit_bias",
+        "allowed_token_ids",
+        "repetition_detection",
+        "thinking_token_budget",
+        "extra_args",
+    )
+    for name in optional_controls:
+        value = getattr(params, name, None)
+        if value not in (None, False, (), [], {}):
+            return SPEC_DECODE_LANE_ORDINARY, name
+
+    if bool(getattr(params, "flat_logprobs", False)):
+        return SPEC_DECODE_LANE_ORDINARY, "flat_logprobs"
+    if getattr(params, "bad_words", None):
+        return SPEC_DECODE_LANE_ORDINARY, "bad_words"
+    if getattr(params, "bad_words_token_ids", None):
+        return SPEC_DECODE_LANE_ORDINARY, "bad_words_token_ids"
+
+    return SPEC_DECODE_LANE_SPECULATIVE, "greedy_compatible"
+
 
 # Methods the runner can actually propose drafts for. The requirements table
 # below says what a method needs *of the model*; this says what the plugin has
@@ -270,6 +336,12 @@ def resolve_speculative_plan(
             f"{model_class.__name__}.spec_plan returned effective_k="
             f"{outcome.effective_k}, above the requested "
             f"num_speculative_tokens={requested_k}"
+        )
+    if outcome.k_by_rows and outcome.k_by_rows[-1][0] < max_num_seqs:
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan k_by_rows ends at "
+            f"max_rows={outcome.k_by_rows[-1][0]}, below max_num_seqs="
+            f"{max_num_seqs}; every admitted live batch size needs a draft cap"
         )
     if outcome.drafter_state == DRAFTER_STATE_PAGED:
         raise ValueError(

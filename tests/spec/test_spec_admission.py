@@ -22,6 +22,8 @@ from vllm_tt_plugin.config import get_tt_spec_plan, store_tt_spec_plan
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     MODEL_OWNED_DRAFT_SENTINEL,
+    SPEC_DECODE_LANE_ORDINARY,
+    classify_spec_decode_lane,
     method_requirements,
     resolve_speculative_plan,
 )
@@ -45,6 +47,18 @@ MTP_METHOD = "mtp"
 # The method the runner can propose for, which is what most of these tests want
 # when their subject is something other than the method itself.
 RUNNABLE_METHOD = "ngram"
+
+
+@pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs"])
+def test_zero_logprob_counts_still_select_the_ordinary_lane(field):
+    """Zero asks for the selected token only; it does not disable logprobs."""
+    from vllm.sampling_params import SamplingParams
+
+    lane, reason = classify_spec_decode_lane(
+        SamplingParams(temperature=0.0, **{field: 0})
+    )
+    assert lane == SPEC_DECODE_LANE_ORDINARY
+    assert reason == field
 
 
 def _config(
@@ -397,6 +411,28 @@ def test_a_plan_above_the_requested_draft_length_is_refused():
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(requested_k=7), model_class=_GreedyPlanModel)
     assert "8" in str(excinfo.value)
+
+
+def test_k_by_rows_must_cover_the_admitted_concurrency():
+    class _UncoveredRowsModel(FakeSpecModel):
+        @classmethod
+        def spec_plan(cls, vllm_config, max_num_seqs, requested_k):
+            del vllm_config, max_num_seqs, requested_k
+            return SpecPlan(
+                effective_k=7,
+                lanes_per_request=8,
+                extra_bytes_per_seq=0,
+                extra_bytes_per_token=0,
+                accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+                drafter_state="internal",
+                k_by_rows=((4, 7),),
+            )
+
+    with pytest.raises(ValueError, match="below max_num_seqs=8"):
+        _admit(
+            _config(requested_k=7, max_num_seqs=8),
+            model_class=_UncoveredRowsModel,
+        )
 
 
 def test_a_plan_of_the_wrong_type_is_refused():

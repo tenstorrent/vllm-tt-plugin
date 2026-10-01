@@ -68,7 +68,15 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.spec_admission import method_requirements
+from vllm_tt_plugin.scheduler import (
+    get_tt_request_spec_decode_lanes,
+    get_tt_spec_decode_lane,
+)
+from vllm_tt_plugin.spec_admission import (
+    SPEC_DECODE_LANE_ORDINARY,
+    SPEC_DECODE_LANE_SPECULATIVE,
+    method_requirements,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     HIDDEN_HANDOFF_ROUNDTRIP,
@@ -248,14 +256,14 @@ class TTModelRunner:
         # a model that reduced it -- though the platform publishes the
         # reduction back, so the two agree.
         spec_plan = get_tt_spec_plan(vllm_config)
+        self._spec_plan = spec_plan
         self._num_speculative_tokens = spec_plan.effective_k if spec_plan else 0
         self._spec_method = (
             str(vllm_config.speculative_config.method) if spec_plan else None
         )
-        # A model that also serves a narrow [B, 1] decode lets a step on which
-        # no request carries drafts run as the ordinary decode it is, which is
-        # what keeps batched baseline decoding overlapped inside a speculating
-        # server. ``load_model`` narrows this further, once the model exists.
+        # A model that also serves a narrow [B, 1] decode can host the ordinary
+        # request lane alongside speculative batches. ``load_model`` narrows
+        # this further once the model exists.
         self._spec_supports_narrow_decode = bool(
             spec_plan and spec_plan.supports_narrow_decode
         )
@@ -1331,6 +1339,7 @@ class TTModelRunner:
         scheduled_drafts: dict[str, list[int]],
         row_req_ids: list[str],
         num_drafts: int,
+        draft_cap: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather ``(drafts, num_valid_drafts, accepted_counts)`` for these rows.
 
@@ -1352,6 +1361,9 @@ class TTModelRunner:
         A request absent from either mapping takes the post-prefill default: no
         drafts, and a count of 1.
         """
+        draft_cap = num_drafts if draft_cap is None else int(draft_cap)
+        if not 1 <= draft_cap <= num_drafts:
+            raise ValueError(f"draft_cap must be in [1, {num_drafts}], got {draft_cap}")
         drafts = torch.full(
             (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
         )
@@ -1359,18 +1371,25 @@ class TTModelRunner:
         counts = torch.ones(len(row_req_ids), dtype=torch.int32)
         for row, req_id in enumerate(row_req_ids):
             counts[row] = accepted_counts_by_req.get(req_id, 1)
-            row_drafts = scheduled_drafts.get(req_id) or ()
-            valid = len(row_drafts)
-            if valid > num_drafts:
+            scheduled = scheduled_drafts.get(req_id) or ()
+            scheduled_count = len(scheduled)
+            if scheduled_count > num_drafts:
                 # The scheduler truncates to the lookahead it budgeted, which
                 # the platform publishes as num_speculative_tokens, so a longer
                 # list means the two disagree about the draft length. Raised
                 # rather than truncated, because silently dropping the tail
                 # would verify a prefix at positions the block was built for.
                 raise RuntimeError(
-                    f"request {req_id} was scheduled {valid} draft tokens, "
-                    f"above the block's {num_drafts}: {list(row_drafts)}"
+                    f"request {req_id} was scheduled {scheduled_count} draft tokens, "
+                    f"above the block's {num_drafts}: {list(scheduled)}"
                 )
+            # Proposals outlive batch changes. A request can have K=7 drafts
+            # stored when enough peers join to select a K=3 verify bucket.
+            # Truncating only the suffix preserves the contract's proposal
+            # ownership while guaranteeing the model never has to verify more
+            # than its plan declared for this live row count.
+            row_drafts = scheduled[:draft_cap]
+            valid = len(row_drafts)
             num_valid[row] = valid
             if valid:
                 drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
@@ -1530,7 +1549,7 @@ class TTModelRunner:
         width = num_drafts + 1
         rows = int(committed.shape[0])
         if int(committed.shape[1]) < width:
-            # A narrow verify answers one column wide, because the model
+            # An ordinary step answers one column wide, because the model
             # declared it serves the plain decode's shapes on a step where no
             # row carries a draft. The drafter is a separate call with one
             # shape of its own, so the block is padded to the uniform 1+K,
@@ -1798,6 +1817,8 @@ class TTModelRunner:
         req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        spec_decode_lane = get_tt_spec_decode_lane(scheduler_output)
+        request_spec_decode_lanes = get_tt_request_spec_decode_lanes(scheduler_output)
         if self._num_speculative_tokens:
             # Pruned here rather than where requests finish, because every
             # other way a request leaves the persistent batch is temporary and
@@ -1949,20 +1970,41 @@ class TTModelRunner:
             # explicit contract commands or the legacy ``reset_batch`` keyword.
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
-            if self._num_speculative_tokens:
+            if (
+                self._num_speculative_tokens
+                and spec_decode_lane != SPEC_DECODE_LANE_ORDINARY
+            ):
                 spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
                     self._req_accepted_counts,
                     self._drafts_to_verify(scheduler_output, row_req_ids),
                     row_req_ids,
                     self._num_speculative_tokens,
+                    (
+                        self._spec_plan.draft_cap(len(row_req_ids))
+                        if getattr(self, "_spec_plan", None) is not None
+                        else self._num_speculative_tokens
+                    ),
                 )
-                if _step_verifies(
-                    self._spec_supports_narrow_decode,
-                    num_valid_drafts,
-                    accepted_counts,
-                    len(row_req_ids),
-                ):
-                    self._note_unspeculable_verify_rows(row_req_ids)
+                # A lane-aware scheduler has already separated requests by
+                # output contract. Its speculative lane always verifies,
+                # including the first draftless step: model-owned drafters use
+                # that call to seed their state. Legacy callers with no lane
+                # metadata retain the historical draft-driven decision.
+                verifies = spec_decode_lane == SPEC_DECODE_LANE_SPECULATIVE or (
+                    spec_decode_lane is None
+                    and _step_verifies(
+                        self._spec_supports_narrow_decode,
+                        num_valid_drafts,
+                        accepted_counts,
+                        len(row_req_ids),
+                    )
+                )
+                if verifies:
+                    if spec_decode_lane is None:
+                        # Compatibility diagnostic for callers that construct
+                        # SchedulerOutput without the lane contract. The real
+                        # TT scheduler never mixes these rows.
+                        self._note_unspeculable_verify_rows(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
@@ -2101,6 +2143,7 @@ class TTModelRunner:
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
             sampling_rows=req_indices,
+            spec_decode_lane=spec_decode_lane,
         )
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,
@@ -2236,6 +2279,15 @@ class TTModelRunner:
             accepted_counts=accepted_counts,
             draft_token_ids=spec_drafts,
             spec_mode=ACCEPT_MODE_ARGMAX_IDS if spec_drafts is not None else None,
+            spec_decode_lane=spec_decode_lane,
+            request_spec_decode_lanes=(
+                [
+                    request_spec_decode_lanes.get(req_id, SPEC_DECODE_LANE_SPECULATIVE)
+                    for req_id in row_req_ids
+                ]
+                if is_prompt and request_spec_decode_lanes
+                else None
+            ),
         )
 
     def build_model_input(
@@ -2608,11 +2660,19 @@ class TTModelRunner:
                 "a verify in argmax_ids mode must return a token id tensor, got "
                 f"{type(argmax_ids).__name__}"
             )
-        # The draft block is built at the full width K even on a narrow step,
-        # where the model was handed one column because no row carried a draft.
-        # The walk compares the two, so the drafts are trimmed to the width the
-        # verify actually answered at.
-        verified_drafts = int(argmax_ids.shape[1]) - 1
+        if argmax_ids.dim() != 2:
+            raise ValueError(
+                "a verify in argmax_ids mode must return a 2-D [B, 1+K] tensor, "
+                f"got shape {tuple(argmax_ids.shape)}"
+            )
+        expected_rows = int(model_input.draft_token_ids.shape[0])
+        expected_width = int(model_input.draft_token_ids.shape[1]) + 1
+        if tuple(argmax_ids.shape) != (expected_rows, expected_width):
+            raise ValueError(
+                "a verify in argmax_ids mode returned shape "
+                f"{tuple(argmax_ids.shape)}; expected "
+                f"[{expected_rows}, {expected_width}]"
+            )
         # Walked over every row the verify answered for, padding rows included,
         # because a model-owned drafter is asked for the same rows the verify
         # ran on: its per-row state is indexed by row, and a device graph has
@@ -2620,7 +2680,7 @@ class TTModelRunner:
         # column 0 and counts 1, and only the live rows reach a request.
         return accept_greedy_drafts(
             argmax_ids,
-            model_input.draft_token_ids[:, :verified_drafts],
+            model_input.draft_token_ids,
             model_input.num_valid_drafts,
         )
 
@@ -2720,6 +2780,10 @@ class TTModelRunner:
         produced no handle. ``load_model`` keeps a drafter that is fed its
         hidden state through the runner off this path entirely.
         """
+        if model_input.spec_decode_lane == SPEC_DECODE_LANE_ORDINARY:
+            for req_id in row_req_ids:
+                self._proposed_draft_token_ids.pop(req_id, None)
+            return
         skipped = set(skip_req_ids or ())
         live = len(row_req_ids)
         sampled = _coerce_output_block(sampled_token_ids, live, 1).to(torch.int32)
@@ -2988,7 +3052,13 @@ class TTModelRunner:
         has_structured_outputs: bool,
         *,
         sampling_rows: list[int] | None = None,
+        spec_decode_lane: str | None = None,
     ) -> bool:
+        # The ordinary lane exists specifically to preserve the complete vLLM
+        # sampling contract. Keep it on the reference host sampler instead of
+        # silently depending on a model's partial device-sampling surface.
+        if spec_decode_lane == SPEC_DECODE_LANE_ORDINARY:
+            return False
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
         )
@@ -3110,6 +3180,11 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        request_spec_decode_lanes = getattr(
+            model_input, "request_spec_decode_lanes", None
+        )
+        if request_spec_decode_lanes is not None:
+            kwargs["request_spec_decode_lanes"] = list(request_spec_decode_lanes)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

@@ -194,7 +194,9 @@ def _scheduler(*, admitted: bool) -> TTScheduler:
 
 def _request(prompt_len: int) -> Request:
     init_none_hash(sha256)
-    sampling_params = SamplingParams(max_tokens=64, ignore_eos=True)
+    # This fixture exercises the speculative lookahead path. Keep it on the
+    # greedy contract rather than relying on SamplingParams' sampled default.
+    sampling_params = SamplingParams(max_tokens=64, ignore_eos=True, temperature=0.0)
     sampling_params.update_from_generation_config({}, eos_token_id=2)
     return Request(
         request_id="req-0",
