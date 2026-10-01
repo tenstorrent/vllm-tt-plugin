@@ -29,6 +29,9 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
 |   +-- config.py            # TT plugin config access
+|   +-- spec_admission.py    # Speculative configuration and model-plan validation
+|   +-- spec_decode.py       # Candidate/verification types and greedy acceptance
+|   +-- spec_accept.py       # CPU sampled-acceptance helper (not yet used by the runner)
 |   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
@@ -344,13 +347,13 @@ initialize fabric. Models without this capability keep the hardware defaults.
 ### `max_model_len` And KV Cache Capacity
 
 TT does not profile device memory. `get_num_available_blocks_tt()` instead
-derives a block count from the model's `max_tokens_all_users` — a per-model,
+derives a block count from the model's `max_tokens_all_users`, a per-model,
 per-device token budget declared by the model class in tt-metal
 (`get_max_tokens_all_users`, default 131072, sometimes exposed as an environment
 override such as `GEMMA4_MAX_TOKENS_ALL_USERS`), plus headroom for vLLM's
 worst-case block allocation and for sliding-window groups on hybrid models.
 `TTWorker.determine_available_memory()` publishes that count both as
-`cache_config.num_gpu_blocks_override` and as an equivalent byte budget — the
+`cache_config.num_gpu_blocks_override` and as an equivalent byte budget. The
 latter is what reaches the engine-side KV planner, which in standard DP runs in
 a different process from the worker that set the override.
 
@@ -389,8 +392,9 @@ The execution model matches TT hardware characteristics:
 - Token-chunked prefill is available to any model whose tt-metal class declares
   `model_capabilities['supports_chunked_prefill']`: a long prompt is split across
   prefill steps and only the chunk that completes the prompt emits a token.
-  Today that is the `tt_transformers` Llama, Qwen and Mistral text bridges plus
-  Gemma 4. Every other model keeps prefill unsplit.
+  Support belongs to the selected tt-metal serving class, including any
+  `TT_MODEL_CLASS_OVERRIDES` selection. Model-family registration alone does
+  not establish chunked-prefill support.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
 - For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
@@ -409,6 +413,8 @@ For a deeper walk-through of the scheduling and execution model, read
 [`docs/SCHEDULING.md`](docs/SCHEDULING.md). The model-facing rules that make
 resident async decode safe are documented in
 [`docs/DECODE_RELOAD_CONTRACT.md`](docs/DECODE_RELOAD_CONTRACT.md).
+The defaults, validation and consumers of each `model_capabilities` key are
+documented in [`docs/MODEL_CAPABILITIES.md`](docs/MODEL_CAPABILITIES.md).
 
 ## Single-Process Galaxy Serving
 
@@ -522,6 +528,131 @@ The registration environment variables, in the order they are consulted:
 `TT_QWEN3_TEXT_VER` and `TT_QWEN35_TEXT_VER` select a version WITHIN a built-in
 family and are unrelated to the above.
 
+## Speculative Decoding
+
+The plugin supports greedy speculative decoding through a runner-model
+contract. `TTModelRunner` builds candidate blocks, asks the selected tt-metal
+adapter to verify candidates, accepts matching draft tokens, and reports
+committed tokens to vLLM. The selected adapter must declare
+`supports_spec_decode=True` and return an admissible `SpecPlan` from
+`spec_plan`. Architecture registration alone does not enable speculation.
+
+Two drafting methods execute today:
+
+| `speculative_config.method` | Proposal source | Required model implementation |
+| --- | --- | --- |
+| `ngram` | vLLM's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
+| `custom_class` | The selected adapter's `propose_draft_tokens` | `spec_plan`, multi-position verification and `device_propose` in `spec_requirements` |
+
+Both methods currently use `argmax_ids` verification and host greedy
+acceptance. `docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`.
+The CPU sampled-acceptance helper exists in `spec_accept.py`, but
+`TTModelRunner` does not call it. `logits` and `fused_sample` execution,
+lossless sampled speculation, scheduler-owned paged drafter caches and
+`TTLaneCoordinator` execution are not implemented for this contract.
+
+### Model selection and launch settings
+
+The following distinctions describe the Gemma serving classes in tt-metal as
+of 2026-10-01 ([Gemma4 source](https://github.com/tenstorrent/tt-metal/blob/06f224434f2b5e3f4a9a048de5e049cedd626343/models/demos/gemma4/tt/generator_vllm.py),
+[DiffusionGemma source](https://github.com/tenstorrent/tt-metal/blob/06f224434f2b5e3f4a9a048de5e049cedd626343/models/experimental/diffusion_gemma/tt/generator_vllm.py)).
+The tt-metal model recipe determines supported checkpoints,
+hardware, batch sizes and context lengths; these declarations alone do not
+establish validation for every configuration.
+
+| tt-metal serving class | Execution path | How the operator selects speculation |
+| --- | --- | --- |
+| `Gemma4DFlashContractForCausalLM` | Runner-model contract, `output_tokens_per_step=1` | Select this class and pass the `custom_class` settings below |
+| `Gemma4DFlashForCausalLM` | Adaptive block output; the model owns its draft/verify loop | Select this class without `speculative_config` |
+| `Gemma4MTPForCausalLM` | Adaptive block output; no MTP contract adapter is present | Select this class without `speculative_config` |
+| `DiffusionGemmaForCausalLM` | Fixed block output, not speculative decoding | Follow [DiffusionGemma](docs/diffusion-gemma.md); do not pass `speculative_config` |
+
+New speculative adapters should implement the runner-model contract. Migrating
+the existing dFlash and MTP speculative block-output classes does not require
+removing DiffusionGemma's fixed block output.
+
+`Gemma4DFlashContractForCausalLM` admits `max_num_seqs > 1`, but the current
+adapter speculates only for a request that decodes alone. Shared prefill or a
+peer joining the request's decode step ends speculation for that request;
+the request continues ordinary decode and does not resume drafting when the
+peer leaves. Temporary unscheduling alone preserves the request's retained
+proposal. Admitting concurrent requests does not establish batched dFlash
+speculation.
+
+For a compatible Gemma4 dFlash model recipe, select the contract class for the
+architecture the checkpoint uses. For example, a checkpoint that resolves to
+`TTGemma4ForCausalLM` uses:
+
+```bash
+export TT_MODEL_CLASS_OVERRIDES="TTGemma4ForCausalLM=models.demos.gemma4.tt.generator_vllm:Gemma4DFlashContractForCausalLM"
+export GEMMA4_DFLASH_VERIFY=5
+export GEMMA4_CHUNKED_PREFILL_TRACE=0
+```
+
+Add the following arguments to the compatible model's server command. The
+`model` value is a dispatch marker, not a checkpoint or an importable proposer:
+
+```text
+--speculative-config '{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":5}'
+--no-async-scheduling
+```
+
+`Gemma4DFlashContractForCausalLM.spec_plan` uses
+`effective_k=GEMMA4_DFLASH_VERIFY` (default 5). `spec_plan` rejects smaller
+requested draft lengths, and `TTPlatform` reduces larger requested draft
+lengths to `effective_k`. To request async scheduling, set
+`GEMMA4_CONTRACT_ASYNC=1` before model import and replace
+`--no-async-scheduling` with `--async-scheduling`. Both
+`supports_async_decode` and `supports_async_spec_decode` must be true.
+Verification steps remain serialized through acceptance and proposal;
+eligible ordinary decode steps can overlap. Standard multi-process DP is
+distinct from the unsupported `TTLaneCoordinator` path. Device validation of
+contract async execution with DP greater than one remains unverified here.
+
+Two model-side limits require attention in current dFlash recipes:
+
+- Keep `GEMMA4_CHUNKED_PREFILL_TRACE=0`: traced prefill replay does not capture
+  the dFlash hidden-state taps
+  ([tt-metal #58432](https://github.com/tenstorrent/tt-metal/issues/58432)).
+- A bounded sliding KV ring needs enough capacity to preserve the attention
+  window during verification. The contract adapter declines drafting when the
+  bounded sliding KV ring cannot safely hold the candidate block; this can
+  reduce long-context generation to ordinary decode. The
+  [contract CI recipe proposed in tt-metal #57855](https://github.com/tenstorrent/tt-metal/blob/b927276ee8f8c3f0b07e02934d1f69fc15faad17/tests/pipeline_reorg/vllm_model_tests.yaml#L206-L226)
+  uses `GEMMA4_SPEC_RING_HEADROOM_BLOCKS=16` with a 64-token page size.
+  Extra ring capacity consumes KV memory, so use the model recipe's matching
+  memory budget. Automatic sizing remains tracked by
+  [tt-metal #57788](https://github.com/tenstorrent/tt-metal/pull/57788).
+  The adaptive block-output dFlash class only warns about insufficient ring
+  capacity and can corrupt in-window KV
+  ([tt-metal #57701](https://github.com/tenstorrent/tt-metal/issues/57701)).
+
+### Request controls and sampling limits
+
+Use `temperature=0` with no penalties to exercise greedy speculation.
+`TTModelRunner._publish_draft` withholds drafts for requests with non-zero
+temperature or penalties. When the model supports narrow decode and the whole
+step has no drafts or unresolved multi-token commit, `TTModelRunner` uses
+ordinary decode and the selected model's normal sampling path.
+
+**Sampled requests can still receive greedy tokens.** If any row requires
+verification, every row enters the `argmax_ids` call. A sampled row then
+commits the target argmax without applying that row's temperature or penalties.
+`TTModelRunner._note_unspeculable_verify_rows` warns once and counts affected
+rows; `TTModelRunner.shutdown` logs the total. A model without narrow decode
+uses verification on every decode step. Use a server without
+`speculative_config` when sampled-request semantics must hold on every step.
+
+`TTPlatform.validate_request` rejects logprobs, structured output,
+`logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
+speculative launch. Prompt logprobs remain unsupported for all TT models.
+
+See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
+acceptance, K+1 lookahead reservation and lifecycle hooks. See
+[the capability reference](docs/MODEL_CAPABILITIES.md) for defaults and
+validation, and [the speculative server tests](tests/tt/spec/README.md) for
+the dummy model's validation scope.
+
 ## Operational Constraints
 
 `TTPlatform` rejects or adjusts unsupported feature combinations early, giving a
@@ -529,7 +660,10 @@ clear error before anything reaches the device:
 
 - Tensor parallel and pipeline parallel execution are provided by the models
   internal implementation, not exposed at the vLLM level.
-- Speculative decoding is not currently supported.
+- Speculative decoding supports greedy `argmax_ids` verification with `ngram`
+  or the model-owned `custom_class` drafter on a compatible tt-metal adapter.
+  See [Speculative Decoding](#speculative-decoding) for launch settings,
+  model selection and sampling limits.
 - LoRA is not currently supported.
 - Chunked prefill is gated on the model's declared capability, not on a
   `model_type` allowlist. vLLM enables it by default; pass
@@ -625,7 +759,7 @@ pytest tests/test_lane_scheduler.py
 ```
 
 These need no Tenstorrent hardware, only an importable `ttnn`. On a host without
-tt-metal, put the CI stub on the path instead — this is what the `unit-tests`
+tt-metal, put the CI stub on the path instead. This is what the `unit-tests`
 workflow job runs:
 
 ```bash
@@ -690,9 +824,9 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 
-- [LICENSE](LICENSE) — Overall license for this project (Apache 2.0), except
+- [LICENSE](LICENSE): Overall license for this project (Apache 2.0), except
   where specified
-- [LICENSE_understanding.txt](LICENSE_understanding.txt) — Tenstorrent's
+- [LICENSE_understanding.txt](LICENSE_understanding.txt): Tenstorrent's
   clarification of how the Apache 2.0 license applies to this repository
 
 ## Sampling limits

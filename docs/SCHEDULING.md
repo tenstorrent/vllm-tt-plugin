@@ -14,6 +14,11 @@ Code pointers are intentionally minimal. The main entry points are
 `src/vllm_tt_plugin/model_runner.py`, `src/vllm_tt_plugin/async_decode.py`, and
 `src/vllm_tt_plugin/utils/dp_discovery.py`.
 
+The [model capability reference](MODEL_CAPABILITIES.md) lists the declarations
+that enable each execution path. Generic speculative decoding follows the
+[speculative decoding contract](SPEC_DECODE_CONTRACT.md) and can combine
+ordinary single-token decoding with multi-token verification in one launch.
+
 ## Short Version
 
 The current TT path is more specialized than upstream vLLM:
@@ -110,12 +115,16 @@ vLLM normally enables async scheduling when the configuration is compatible.
 The TT platform turns it off when the selected model does not declare
 `supports_async_decode`. Block-output models are stricter: the platform
 refuses to start unless `--no-async-scheduling` is passed. The one exception
-is a model that also declares `tt_adaptive_block_output`; the gate in
-`TTPlatform.check_and_update_config` reads
-`async_scheduling and not adaptive_block_output`, so an adaptive block-output
-model starts with async scheduling ON. It can, because its reservation is
-decided per step rather than for the model as a whole -- see "Block-output
-reservation" below.
+is a model that also declares `tt_adaptive_block_output`. That declaration
+removes the block-output refusal, but the model must still declare
+`supports_async_decode` for async scheduling to remain enabled. Adaptive
+block-output reservation is decided per step; see "Block-output reservation"
+below.
+
+A generic speculative launch has another requirement: when async scheduling
+remains enabled, `TTPlatform.check_and_update_config` requires
+`supports_async_spec_decode` as well. `supports_async_decode` alone does not
+cover deferred verification or the lifetime of the target hidden state.
 
 With standard DP there is no global prefill/decode decision. One rank can run
 prefill while another runs decode.
@@ -331,6 +340,54 @@ advance. Every lane executes the one negotiated mode, so a per-lane decision
 would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
 each rank runs the policy on its own scheduler state.
 
+### Generic speculative decoding
+
+The generic speculative path uses `speculative_config` and a model's
+`spec_plan` admission result. `TTPlatform.check_and_update_config` rejects
+speculation for lane-DP and for models with `output_tokens_per_step > 1`.
+Standard multi-process DP keeps speculation local to each independent rank.
+The [speculative decoding contract](SPEC_DECODE_CONTRACT.md) defines supported
+methods, model hooks, request controls, and acceptance semantics.
+
+The scheduler and runner divide the work as follows:
+
+1. `TTPlatform.check_and_update_config` writes `spec_plan.effective_k` back to
+   `speculative_config.num_speculative_tokens`, so the scheduler reserves the
+   admitted draft width.
+2. `TTScheduler` reserves `K+1` additional KV positions for a model-owned
+   `custom_class` drafter, where `K` is the admitted draft width. The drafter
+   can write its next proposal over the committed anchor and `K` candidates.
+   The host `ngram` drafter needs no additional proposal-side KV reservation.
+3. `TTModelRunner` builds a candidate block of width `1+K` when a decode step
+   carries drafts or unresolved multi-token acceptance. `TTModelRunner` also
+   uses that width when the model cannot serve ordinary narrow decode within
+   the speculative launch.
+4. `TTModelRunner` uses an ordinary width-1 decode when no row carries drafts,
+   no row has unresolved multi-token acceptance, and the admitted model can
+   serve narrow decode. Ordinary decode can use the existing async overlap
+   path when the reload and sampling conditions permit it.
+5. `TTAsyncDecodeController` drains pending work before verification.
+   Verification can defer readback, but verification does not overlap another
+   outstanding step. The host acceptance result must be available before
+   `TTModelRunner` builds the next candidate block.
+
+For synchronous scheduling, `EngineCore` transfers proposed token IDs through
+`TTScheduler.update_draft_token_ids`. For async scheduling, `TTModelRunner`
+retains the proposals and uses the scheduler's placeholder reservation to
+limit the next verification. A forced prefix-cache reset counts pending
+output frames, not reserved token positions: one speculative output frame can
+contain several committed tokens.
+
+The current `argmax_ids` acceptance path certifies greedy requests.
+`TTModelRunner._publish_draft` withholds proposals from requests with nonzero
+temperature or penalties. Such requests use their sampling controls on
+ordinary decode steps. A shared verification step can still include those
+requests, because another request has drafts or because the model requires a
+wide verification step. `TTModelRunner` then commits target argmax IDs for
+those rows and logs that temperature and penalties were not applied. Use a
+separate non-speculative launch when those controls must be preserved for
+every step.
+
 ### Block-output reservation
 
 Output placeholders (see "Why TT uses an async-style scheduler even in
@@ -343,7 +400,10 @@ sampled-token placeholder and `TTScheduler` reserves the remaining physical
 block width. All placeholders are consumed when that block result is applied;
 client-visible output is still trimmed at EOS, stop tokens, and `max_tokens`.
 See [DiffusionGemma block serving](diffusion-gemma.md) for the current
-256-token block contract.
+256-token block contract. Block-output reservation is separate from generic
+speculative decoding: the block-output model owns its committed token block,
+and a launch cannot combine `output_tokens_per_step > 1` with
+`speculative_config`.
 
 #### Adaptive block-output reservation
 
