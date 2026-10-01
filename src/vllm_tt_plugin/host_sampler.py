@@ -169,8 +169,23 @@ class TTTopKTopPSampler(TopKTopPSampler):
         return tokens, scores
 
 
+class TTHostSampler(Sampler):
+    @staticmethod
+    def apply_temperature(logits, temp, all_random):
+        # CPU metadata needs no synchronization. Avoid touching the entire
+        # vocabulary when division would leave every value unchanged.
+        if (
+            all_random
+            and logits.device.type == "cpu"
+            and temp.device.type == "cpu"
+            and torch.all(temp == 1.0).item()
+        ):
+            return logits
+        return Sampler.apply_temperature(logits, temp, all_random)
+
+
 def create_host_sampler():
-    sampler = Sampler()
+    sampler = TTHostSampler()
     sampler.topk_topp_sampler = TTTopKTopPSampler(
         sampler.logprobs_mode, sampler.use_fp64_gumbel
     )

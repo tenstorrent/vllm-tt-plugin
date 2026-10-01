@@ -1634,7 +1634,10 @@ class TTModelRunner:
                 )
                 return None
             submission = self.async_decode.submit_decode(
-                model_input, read_from_device=True, async_read=False
+                model_input,
+                read_from_device=True,
+                async_read=False,
+                sampling_rows=scheduled_rows,
             )
             finalized = self.async_decode.finalize_decode(
                 submission, sampling_rows=scheduled_rows

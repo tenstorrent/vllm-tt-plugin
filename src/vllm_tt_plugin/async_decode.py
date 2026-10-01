@@ -38,6 +38,7 @@ class TTDecodeSubmission:
     sampling_params: Any
     perform_device_sampling: bool
     reload_plan: TTDecodeReloadPlan | None = None
+    readback_rows: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -745,7 +746,10 @@ class TTAsyncDecodeController:
         overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(
-            model_input, read_from_device=False, async_read=True
+            model_input,
+            read_from_device=False,
+            async_read=True,
+            sampling_rows=scheduled_rows,
         )
         if submission.tt_out is None:
             completion_event.set()
@@ -766,6 +770,7 @@ class TTAsyncDecodeController:
         *,
         read_from_device: bool,
         async_read: bool = False,
+        sampling_rows: list[int] | None = None,
     ) -> TTDecodeSubmission:
         runner = self.runner
         batch_size_per_dp = model_input.unpadded_batch_size
@@ -774,6 +779,20 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        readback_rows = None
+        if (
+            sampling_rows is not None
+            and not perform_device_sampling
+            and getattr(runner.model, "model_capabilities", {}).get(
+                "supports_selective_host_readback", False
+            )
+            and runner.lane_batch.can_compact_host_sampling()
+        ):
+            readback_rows = tuple(sampling_rows)
+            # Select rows before the adapter initiates a full output read.
+            # Synchronous callers wait for these same events in finalize_decode.
+            read_from_device = False
+            async_read = True
         contract_version = self.decode_input_update_contract_version()
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
@@ -883,7 +902,15 @@ class TTAsyncDecodeController:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
-                    runner.model.read_decode_output(tt_out, async_read=True),
+                    runner.model.read_decode_output(
+                        tt_out,
+                        async_read=True,
+                        **(
+                            {"sample_rows": list(readback_rows)}
+                            if readback_rows is not None
+                            else {}
+                        ),
+                    ),
                 )
             else:
                 is_host_tensor = isinstance(tt_out, torch.Tensor)
@@ -903,6 +930,7 @@ class TTAsyncDecodeController:
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
             reload_plan=reload_plan,
+            readback_rows=readback_rows,
         )
 
     def finalize_decode(
@@ -914,6 +942,14 @@ class TTAsyncDecodeController:
         runner = self.runner
         if submission.tt_out is None:
             return None
+
+        if submission.readback_rows is not None and (
+            sampling_rows is None or tuple(sampling_rows) != submission.readback_rows
+        ):
+            raise ValueError(
+                f"Sampling rows {sampling_rows} differ from submitted readback "
+                f"rows {submission.readback_rows}"
+            )
 
         if submission.read_events is not None:
             for read_event in submission.read_events:
@@ -932,7 +968,10 @@ class TTAsyncDecodeController:
                 and getattr(runner.model, "model_capabilities", {}).get(
                     "supports_compact_host_logits", False
                 )
-                and runner.lane_batch.can_compact_host_sampling()
+                and (
+                    submission.readback_rows is not None
+                    or runner.lane_batch.can_compact_host_sampling()
+                )
             ):
                 compact_rows = tuple(sampling_rows)
                 kwargs["sample_rows"] = list(compact_rows)
