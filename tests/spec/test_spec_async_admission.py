@@ -461,24 +461,61 @@ def test_the_patch_widens_the_gate_and_nothing_else():
     assert get_args(vllm_config_module.EagleModelTypes) == before
 
 
-def test_a_restructured_upstream_gate_fails_the_launch(monkeypatch):
-    """The failure this patch must never have is the silent one.
+@pytest.fixture
+def restructured_gate(monkeypatch):
+    """An upstream gate that no longer matches the shape the patch acts through.
 
-    If upstream stops routing the decision through the name the patch rebinds,
-    the rebind still applies and asynchronous scheduling goes quietly back to
-    disabled. So installation checks the shape of the gate and refuses, naming
-    what it expected.
+    Returns the warnings the TT hook emits, recorded directly: the TT logger
+    does not propagate to caplog, and ``warning_once`` would deduplicate across
+    tests.
     """
     from vllm_tt_plugin import platform as platform_module
 
     monkeypatch.setattr(platform_module, "_ASYNC_SPEC_GATE_COMPARISONS", 99)
+    warnings = []
+    monkeypatch.setattr(
+        platform_module.logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message),
+    )
+    return warnings
 
-    with pytest.raises(RuntimeError) as excinfo:
-        _install_tt_async_spec_method_patch()
 
-    message = str(excinfo.value)
-    assert "restructured" in message
-    assert "_install_tt_async_spec_method_patch" in message
+def test_a_restructured_upstream_gate_is_left_unpatched(restructured_gate):
+    """The rebind would change nothing on such a gate, so it is not applied.
+
+    Installation runs in every TT process, so it must not raise either.
+    """
+    import vllm.config.vllm as vllm_config_module
+
+    _install_tt_async_spec_method_patch()
+
+    assert MODEL_OWNED_DRAFT_METHOD not in get_args(vllm_config_module.EagleModelTypes)
+
+
+def test_a_launch_without_speculation_starts_on_a_restructured_gate(
+    checkpoint, restructured_gate
+):
+    """A vLLM that restructured the gate must not stop ordinary serving."""
+    _install_tt_async_spec_method_patch()
+
+    config = _build_config(checkpoint, async_scheduling=None, speculative=False)
+
+    assert config.speculative_config is None
+    assert restructured_gate == []
+
+
+def test_a_model_owned_drafter_on_a_restructured_gate_serves_synchronously(
+    checkpoint, restructured_gate
+):
+    """Upstream disables async for the unpatched method; the TT hook says why."""
+    _install_tt_async_spec_method_patch()
+
+    config = _build_config(checkpoint, async_scheduling=None)
+
+    assert config.scheduler_config.async_scheduling is False
+    assert get_tt_spec_plan(config) is not None
+    assert len(restructured_gate) == 1
 
 
 # endregion The patch itself

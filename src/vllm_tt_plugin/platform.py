@@ -772,8 +772,18 @@ def _install_tt_async_spec_method_patch() -> None:
 
     if hasattr(vllm_config_module, "_tt_original_eagle_model_types"):
         return
+    if hasattr(vllm_config_module, "_tt_async_spec_gate_problem"):
+        return
 
-    _check_async_spec_gate_shape(vllm_config_module)
+    problem = _async_spec_gate_shape_problem(vllm_config_module)
+    if problem is not None:
+        # This runs in every TT process, including launches that never
+        # speculate, so an unrecognized gate must not fail them. Unpatched,
+        # upstream refuses an explicit --async-scheduling for the model-owned
+        # drafter and otherwise serves it synchronously;
+        # _warn_unpatched_async_spec_gate tells that launch why.
+        vllm_config_module._tt_async_spec_gate_problem = problem
+        return
     original = vllm_config_module.EagleModelTypes
     vllm_config_module._tt_original_eagle_model_types = original
     vllm_config_module.EagleModelTypes = Literal[
@@ -781,47 +791,59 @@ def _install_tt_async_spec_method_patch() -> None:
     ]
 
 
-def _check_async_spec_gate_shape(vllm_config_module: Any) -> None:
-    """Refuse to patch a gate that no longer looks like the one documented.
+def _async_spec_gate_shape_problem(vllm_config_module: Any) -> str | None:
+    """Why the gate no longer looks like the one documented, or None.
 
-    The rebind fails silently when it stops mattering: if upstream inlines the
-    method list, renames it, or routes the decision through a helper, the name
-    still exists and still holds ``custom_class`` while asynchronous scheduling
-    goes back to being disabled for this launch. A server that quietly serves
-    synchronously is what this patch exists to prevent, so the source is
-    checked for the two comparisons the patch acts through and a mismatch fails
-    the launch here rather than on a throughput graph.
+    The rebind has no effect when upstream inlines the method list, renames it,
+    or routes the decision through a helper: the name still exists and still
+    holds ``custom_class`` while asynchronous scheduling stays disabled for the
+    model-owned drafter. The source is checked for the two comparisons the
+    patch acts through, so that case is reported instead of passing as patched.
     """
     import inspect
 
     try:
         source = inspect.getsource(vllm_config_module.VllmConfig.__post_init__)
     except (OSError, TypeError) as error:  # pragma: no cover - source ships
-        raise RuntimeError(
+        return (
             "TT cannot verify vLLM's asynchronous-scheduling gate because "
             f"VllmConfig.__post_init__ has no readable source: {error}. The TT "
-            "model-owned drafter needs that gate patched to serve speculative "
-            "decoding with asynchronous scheduling"
-        ) from error
+            "patch admitting the model-owned drafter is not applied, so it "
+            "serves without asynchronous scheduling"
+        )
     comparisons = source.count(_ASYNC_SPEC_GATE_COMPARISON)
     if comparisons != _ASYNC_SPEC_GATE_COMPARISONS:
-        raise RuntimeError(
+        return (
             "TT expects vLLM's asynchronous-scheduling gate to test the "
             "speculative method with "
             f"{_ASYNC_SPEC_GATE_COMPARISON!r} exactly "
             f"{_ASYNC_SPEC_GATE_COMPARISONS} times in "
             f"VllmConfig.__post_init__, and found {comparisons}. This vLLM has "
             "restructured that decision, so the TT patch admitting the "
-            "model-owned drafter would apply and change nothing. Pin the "
-            "supported vLLM version, or update "
-            "_install_tt_async_spec_method_patch to the new structure"
+            "model-owned drafter is not applied and it serves without "
+            "asynchronous scheduling. Pin the supported vLLM version, or "
+            "update _install_tt_async_spec_method_patch to the new structure"
         )
+    return None
+
+
+def _warn_unpatched_async_spec_gate(vllm_config: Any) -> None:
+    """Tell a model-owned drafter launch why it runs without async scheduling."""
+    import vllm.config.vllm as vllm_config_module
+
+    problem = getattr(vllm_config_module, "_tt_async_spec_gate_problem", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    method = getattr(speculative_config, "method", None)
+    if problem is not None and method == MODEL_OWNED_DRAFT_METHOD:
+        logger.warning_once(problem)
 
 
 def _uninstall_tt_async_spec_method_patch() -> None:
-    """Restore the upstream name, for tests that assert the unpatched gate."""
+    """Restore the upstream gate, for tests that assert the unpatched one."""
     import vllm.config.vllm as vllm_config_module
 
+    if hasattr(vllm_config_module, "_tt_async_spec_gate_problem"):
+        del vllm_config_module._tt_async_spec_gate_problem
     original = getattr(vllm_config_module, "_tt_original_eagle_model_types", None)
     if original is None:
         return
@@ -1584,6 +1606,7 @@ class TTPlatform(Platform):
         # that reaches configuration without the CLI path: a second engine, or
         # a direct VllmConfig construction, then finds the gate patched.
         _install_tt_async_spec_method_patch()
+        _warn_unpatched_async_spec_gate(vllm_config)
         # The class carries process-level admission state, so a live
         # block-output engine cannot share the process with a second engine:
         # the reset below (and every class write after it) would corrupt the
