@@ -977,3 +977,56 @@ def test_startup_rejects_top_k_host_fallback_for_block_output(monkeypatch):
     _patch_model_resolution(monkeypatch, BoundedBlockModel)
     with pytest.raises(ValueError, match="max_device_top_k.*block-output"):
         TTPlatform.check_and_update_config(_config())
+
+
+def test_startup_rejects_seeded_host_policy_for_block_output(monkeypatch):
+    _patch_model_resolution(monkeypatch, BlockModel)
+    config = _config()
+    config.additional_config["tt"]["seeded_sampling_policy"] = "host"
+    with pytest.raises(ValueError, match="seeded_sampling_policy.*single-token"):
+        TTPlatform.check_and_update_config(config)
+
+
+@pytest.mark.parametrize("output_tokens_per_step", [1, 256])
+def test_seeded_host_policy_rejects_speculation_before_model_registration(
+    monkeypatch, output_tokens_per_step
+):
+    model = ARModel if output_tokens_per_step == 1 else BlockModel
+    _patch_model_resolution(monkeypatch, model)
+    config = _ar_config()
+    config.additional_config["tt"]["seeded_sampling_policy"] = "host"
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    registrations = []
+
+    def register(*_args, **_kwargs):
+        registrations.append(True)
+        pytest.fail("Incompatible policy must reject before model registration")
+
+    monkeypatch.setattr(
+        "vllm_tt_plugin.platform.register_tt_models",
+        register,
+    )
+    with pytest.raises(ValueError):
+        TTPlatform.check_and_update_config(config)
+    assert registrations == []
+
+
+@pytest.mark.parametrize("policy", [None, "auto"])
+def test_auto_seeded_policy_leaves_speculative_model_registration_unchanged(
+    monkeypatch, policy
+):
+    _patch_model_resolution(monkeypatch, ARModel)
+    config = _ar_config()
+    if policy is not None:
+        config.additional_config["tt"]["seeded_sampling_policy"] = policy
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+
+    class RegistrationReached(Exception):
+        pass
+
+    def register(*_args, **_kwargs):
+        raise RegistrationReached
+
+    monkeypatch.setattr("vllm_tt_plugin.platform.register_tt_models", register)
+    with pytest.raises(RegistrationReached):
+        TTPlatform.check_and_update_config(config)

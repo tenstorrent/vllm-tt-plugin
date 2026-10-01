@@ -330,6 +330,7 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     capabilities = {} if declared is None else {"supports_device_penalties": declared}
     runner = SimpleNamespace(
         sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
         num_devices=4,
         tt_data_parallel_size=1,
         model=SimpleNamespace(model_capabilities=capabilities),

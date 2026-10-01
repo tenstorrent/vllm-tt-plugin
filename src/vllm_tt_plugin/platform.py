@@ -19,6 +19,7 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
+    get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -1739,6 +1740,17 @@ class TTPlatform(Platform):
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
         tt_config = get_tt_config(vllm_config)
+        seeded_sampling_policy = get_tt_seeded_sampling_policy(vllm_config)
+        if (
+            seeded_sampling_policy == "host"
+            and vllm_config.speculative_config is not None
+        ):
+            # A speculative verify commits through the model-owned accept walk,
+            # bypassing the host sampler even when the model's base width is 1.
+            raise ValueError(
+                "seeded_sampling_policy='host' requires single-token sampling "
+                "and cannot be combined with speculative decoding."
+            )
         register_test_models = False
         if tt_config and "register_test_models" in tt_config:
             register_test_models = tt_config["register_test_models"]
@@ -1826,6 +1838,11 @@ class TTPlatform(Platform):
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
+        if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
+            raise ValueError(
+                "seeded_sampling_policy='host' requires single-token model "
+                "output; block-output models own their sampling."
+            )
         if (
             output_tokens_per_step > 1
             and model_capabilities is not None
