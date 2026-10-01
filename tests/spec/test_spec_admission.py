@@ -257,19 +257,24 @@ def test_a_model_that_cannot_draft_is_refused_the_model_owned_method():
     assert SPEC_REQUIREMENT_DEVICE_PROPOSE in str(excinfo.value)
 
 
-def test_a_logits_only_plan_is_refused():
+def test_a_logits_only_plan_is_admitted():
+    """The host accept walk drives ``logits`` on its own, greedy rows included."""
+    variant = make_fake_spec_model(accept_modes=("logits",))
+    assert _admit(_config(), model_class=variant).accept_modes == ("logits",)
+
+
+def test_a_fused_sample_only_plan_is_refused():
     """A mode the runner never asks for cannot be the only one offered.
 
-    The runner requests ``argmax_ids`` on every step and refuses any other
-    answer, so a plan offering only ``logits`` would pass admission and fail on
-    its first decode.
+    No runner path consumes ``fused_sample``, so a plan offering only it would
+    pass admission and fail on its first decode.
     """
-    variant = make_fake_spec_model(accept_modes=("logits",))
+    variant = make_fake_spec_model(accept_modes=("fused_sample",))
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(), model_class=variant)
     message = str(excinfo.value)
-    assert "logits" in message
-    assert "argmax_ids" in message
+    assert "fused_sample" in message
+    assert "argmax_ids" in message and "logits" in message
 
 
 def test_a_plan_offering_more_than_the_runner_drives_is_still_admitted():

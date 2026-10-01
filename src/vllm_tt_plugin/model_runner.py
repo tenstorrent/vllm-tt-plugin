@@ -31,7 +31,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.sampler import _SAMPLING_EPS, Sampler
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -68,9 +68,15 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.spec_accept import (
+    SpecPenalties,
+    SpecSamplingInputs,
+    accept_sampled_drafts,
+)
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_LOGITS,
     HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
     PLACEHOLDER_TOKEN_ID,
@@ -187,6 +193,77 @@ def _coerce_output_block(
     return sampled_token_ids
 
 
+def _penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
+    """Each row's committed output, with TT's -1 padding removed."""
+    return [[token for token in row.tolist() if token != -1] for row in output_tokens]
+
+
+def _penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Prompt ids as vLLM's penalty op reads them.
+
+    int64, with TT's -1 padding replaced by the vocabulary size, which is the
+    one index the op's bin count ignores.
+    """
+    ids = prompt_tokens.to(torch.int64)
+    return ids.masked_fill(ids == -1, vocab_size)
+
+
+def _spec_sampling_inputs(
+    model_input: TTModelInput, vocab_size: int
+) -> SpecSamplingInputs:
+    """The sampling a ``logits`` verify walks under, for the step's live rows.
+
+    Every field is read off what ``_prepare_model_inputs`` copied when it built
+    the step, and copied again here, so a walk on the readback thread reads
+    nothing the persistent batch can have changed since. Padding rows are left
+    out: they own no request, and sampling them would cost a vocabulary's work
+    per row for tokens nothing reads.
+
+    min_p is not carried: vLLM refuses it on a speculating launch.
+    """
+    live = len(model_input.row_req_ids)
+    params = model_input.tt_sampling_params
+
+    def per_row(values: Any, dtype: torch.dtype) -> torch.Tensor:
+        tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
+        return (
+            tensor.expand(live).clone()
+            if tensor.numel() == 1
+            else tensor[:live].clone()
+        )
+
+    # vLLM's sampler samples a row below this temperature greedily, and the
+    # persistent batch keeps the raw value, so the walk is told the same.
+    temperature = per_row(params.temperature, torch.float32)
+    temperature = temperature.masked_fill(temperature < _SAMPLING_EPS, 0.0)
+    top_k = per_row(params.top_k, torch.int32)
+    top_p = per_row(params.top_p, torch.float32)
+
+    penalties = None
+    if model_input.prompt_tokens is not None and model_input.output_tokens is not None:
+        penalties = SpecPenalties(
+            prompt_token_ids=_penalty_prompt_ids(
+                model_input.prompt_tokens[:live], vocab_size
+            ),
+            output_token_ids=_penalty_history(model_input.output_tokens[:live]),
+            presence=per_row(params.presence_penalty, torch.float32),
+            frequency=per_row(params.frequency_penalty, torch.float32),
+            repetition=per_row(params.repetition_penalty, torch.float32),
+        )
+    return SpecSamplingInputs(
+        vocab_size=vocab_size,
+        temperature=temperature,
+        # Left out when no row restricts them, which skips a sort of the whole
+        # vocabulary per candidate column and changes no probability.
+        top_k=top_k if bool((top_k < vocab_size).any()) else None,
+        top_p=top_p if bool((top_p < 1.0).any()) else None,
+        # ``_build_host_generators`` keys only live rows. The generators are
+        # the requests' own, so the walk advances them.
+        generators=dict(model_input.generators_list[0]),
+        penalties=penalties,
+    )
+
+
 def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
     """Tell the model that its per-slot state moved ``old -> new``.
 
@@ -259,6 +336,11 @@ class TTModelRunner:
         self._spec_supports_narrow_decode = bool(
             spec_plan and spec_plan.supports_narrow_decode
         )
+        # What the model's verify can return. ``_spec_mode_for_step`` picks one
+        # per step from the rows that step carries.
+        self._spec_accept_modes: tuple[str, ...] = (
+            tuple(spec_plan.accept_modes) if spec_plan else ()
+        )
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -266,6 +348,13 @@ class TTModelRunner:
             self._spec_method
             and SPEC_REQUIREMENT_DEVICE_PROPOSE
             in method_requirements(self._spec_method)
+        )
+        # Whether a draft is a deterministic function of the committed context,
+        # which is what lets a logits walk treat it as a point mass. The n-gram
+        # proposer's are; a model's drafter's are only by declaration, which
+        # ``load_model`` reads.
+        self._spec_drafts_are_point_masses = bool(
+            self._spec_method and not self._spec_drafts_from_model
         )
 
         if self.model_config.is_encoder_decoder:
@@ -362,8 +451,9 @@ class TTModelRunner:
         # consumes them in _drafts_to_verify within the scheduled lookahead
         # reservation. Each consumer takes a proposal only once.
         self._proposed_draft_token_ids: dict[str, list[int]] = {}
-        # Rows a verify answered by argmax although their request is not
-        # speculable. See _note_unspeculable_verify_rows; reported at shutdown.
+        # Rows of a sampled or penalized request that an argmax_ids verify
+        # committed by argmax. See _note_unspeculable_verify_rows; reported at
+        # shutdown.
         self._num_unspeculable_verify_rows = 0
         # Built on first use rather than here, because constructing it compiles
         # numba kernels and a launch that never speculates must not pay that.
@@ -403,9 +493,8 @@ class TTModelRunner:
         unspeculable_rows = getattr(self, "_num_unspeculable_verify_rows", 0)
         if unspeculable_rows:
             logger.warning(
-                "Speculative verify steps committed a greedy token for %d "
-                "row(s) whose request is not speculable (non-zero temperature "
-                "or a penalty).",
+                "Speculative verify steps in argmax_ids mode committed a greedy "
+                "token for %d row(s) of a sampled or penalized request.",
                 unspeculable_rows,
             )
         release = getattr(
@@ -454,6 +543,21 @@ class TTModelRunner:
         )
         if self._spec_supports_narrow_decode:
             self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
+        if self._spec_drafts_from_model:
+            capabilities = getattr(type(self.model), "model_capabilities", None) or {}
+            self._spec_drafts_are_point_masses = bool(
+                capabilities.get("spec_deterministic_drafts", False)
+            )
+            if ACCEPT_MODE_LOGITS in self._spec_accept_modes and not (
+                self._spec_drafts_are_point_masses
+            ):
+                logger.info(
+                    "TT speculative decoding: %s serves logits but does not "
+                    "declare spec_deterministic_drafts, so sampled requests get "
+                    "no drafts from its drafter. Their verifies stay lossless; "
+                    "they do not speculate.",
+                    type(self.model).__name__,
+                )
 
     def _narrow_steps_serve_the_drafter(self) -> bool:
         """Whether a step that verifies nothing can still feed the drafter.
@@ -1379,9 +1483,9 @@ class TTModelRunner:
     def _publish_draft(self, req_id: str, tokens) -> None:
         """Record this step's proposal for ``req_id``, or erase the last one.
 
-        Every proposer publishes through here so the speculability gate cannot
-        be bypassed by adding one: there is a single accept walk behind all of
-        them, and it certifies by id equality only.
+        Every proposer publishes through here, so ``_request_is_speculable``
+        applies to all of them, and a new proposer cannot offer drafts that
+        this launch's accept walks cannot certify.
 
         Erasing on an empty offer is not optional. This map is what the
         scheduler is told to verify next, so an entry nothing rewrote would be
@@ -1393,14 +1497,50 @@ class TTModelRunner:
             self._proposed_draft_token_ids.pop(req_id, None)
 
     def _request_is_speculable(self, req_id: str) -> bool:
+        """False when no accept walk this launch drives can certify the request.
+
+        A model that serves ``logits`` lets a verify walk acceptance against
+        the target distribution under the request's own temperature, top-k,
+        top-p, penalties and seed, which covers every control admission lets
+        through on a speculating launch. That walk treats each draft as a point
+        mass, so it certifies only drafts that are a deterministic function of
+        the committed context. Otherwise only the greedy walk certifies.
+        """
+        if ACCEPT_MODE_LOGITS in getattr(self, "_spec_accept_modes", ()) and getattr(
+            self, "_spec_drafts_are_point_masses", False
+        ):
+            return True
+        return self._request_is_argmax_certifiable(req_id)
+
+    def _spec_mode_for_step(self, row_req_ids: list[str]) -> str:
+        """The accept mode one verify asks for, from the rows it carries.
+
+        ``argmax_ids`` while every row is greedy and unpenalized, because it
+        reads back ``[B, 1+K]`` ids rather than ``[B, 1+K, V]`` logits. One row
+        that needs its target distribution makes the whole step ``logits``:
+        the mode is per step, and that row would otherwise commit the argmax
+        even with no draft of its own.
+        """
+        modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
+        if ACCEPT_MODE_LOGITS not in modes:
+            return ACCEPT_MODE_ARGMAX_IDS
+        if ACCEPT_MODE_ARGMAX_IDS not in modes:
+            return ACCEPT_MODE_LOGITS
+        if all(self._request_is_argmax_certifiable(req_id) for req_id in row_req_ids):
+            return ACCEPT_MODE_ARGMAX_IDS
+        return ACCEPT_MODE_LOGITS
+
+    def _request_is_argmax_certifiable(self, req_id: str) -> bool:
         """False when this request's sampling cannot be certified by id equality.
 
         ``accept_greedy_drafts`` compares token ids, so it can only certify a
-        greedy continuation. Anything that makes the target distribution differ
-        from argmax -- a non-zero temperature, or a penalty that reshapes the
-        logits -- has to be decoded ordinarily. top_p/top_k need no entry: they
-        only narrow a distribution that temperature 0 has already collapsed to a
-        point, so a greedy request carrying them is still greedy.
+        greedy continuation. A non-zero temperature, or a penalty that reshapes
+        the logits, makes the target distribution differ from argmax. On a
+        model without ``logits`` such a request is offered no drafts; on a model
+        with it, the request makes its verify ask for ``logits``
+        (``_spec_mode_for_step``). top_p/top_k need no entry: they only narrow a
+        distribution that temperature 0 has already collapsed to a point, so a
+        greedy request carrying them is still greedy.
         """
         batch = self.input_batch
         # getattr rather than attribute access: the gate has to stay total for
@@ -1418,9 +1558,12 @@ class TTModelRunner:
         return True
 
     def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
-        """Count the live rows of a verify whose request is not speculable.
+        """Count the live rows of an ``argmax_ids`` verify that need sampling.
 
-        ``_publish_draft`` keeps drafts off such a request, but it cannot keep
+        Counts rows only on a model that does not serve ``logits``: on a model
+        serving both modes, ``_spec_mode_for_step`` picks ``argmax_ids`` only
+        when every live row is certifiable. ``_publish_draft`` keeps drafts
+        off such a request, but it cannot keep
         the request out of a verify: another row's drafts, an unresolved
         multi-token commit, or a model without ``supports_narrow_decode`` makes
         the whole step one. A verify in ``argmax_ids`` mode answers every row
@@ -1428,17 +1571,21 @@ class TTModelRunner:
         drawn with its request's temperature and penalties.
         """
         rows = sum(
-            1 for req_id in row_req_ids if not self._request_is_speculable(req_id)
+            1
+            for req_id in row_req_ids
+            if not self._request_is_argmax_certifiable(req_id)
         )
         if not rows:
             return
         self._num_unspeculable_verify_rows += rows
+        # tests/tt/spec/test_sampled_speculation.py asserts this text never
+        # appears on a launch serving logits; keep the two in step.
         logger.warning_once(
-            "A speculative verify step included a request that is not "
-            "speculable (non-zero temperature or a penalty). A verify returns "
-            "the target argmax for every row, so on that step the request "
-            "committed the argmax and its temperature and penalties were not "
-            "applied. The total count is logged at shutdown."
+            "A speculative verify in argmax_ids mode included a sampled or "
+            "penalized request. A verify in this mode returns the target "
+            "argmax for every row, so on that step the request committed the "
+            "argmax and its temperature and penalties were not applied. The "
+            "total count is logged at shutdown."
         )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -1658,17 +1805,11 @@ class TTModelRunner:
             batch_row = self.input_batch.req_id_to_index.get(req_id)
             if batch_row is None:
                 continue
-            # A request whose sampling the accept walk cannot arbitrate is
-            # served WITHOUT speculation rather than refused. The walk compares
-            # token ids and never sees logits, so it can only certify a greedy
-            # continuation; proposing for a sampled request and accepting on id
-            # equality would silently return greedy text for a request that
-            # asked to sample. Offering nothing instead routes the request down
-            # the ordinary decode path, where the runner applies the full
-            # sampling it already implements (temperature, top_p/top_k, the
-            # penalties, seeds), so the caller gets what it asked for at
-            # baseline speed. Lossless speculation for these requests needs the
-            # target probabilities (rejection sampling), not this walk.
+            # A request whose sampling no accept walk on this launch can
+            # arbitrate is served WITHOUT speculation rather than refused:
+            # ``_publish_draft`` offers nothing for it, which routes it down the
+            # ordinary decode path and its full sampling. On a model that does
+            # not serve ``logits`` that is every sampled or penalized request.
 
             # Trimmed to what the request can still hold, the way the host
             # proposer trims itself. Drafts past ``max_model_len`` would be
@@ -1901,6 +2042,7 @@ class TTModelRunner:
         num_valid_drafts: torch.Tensor | None = None
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
+        spec_mode: str | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -1962,7 +2104,9 @@ class TTModelRunner:
                     accepted_counts,
                     len(row_req_ids),
                 ):
-                    self._note_unspeculable_verify_rows(row_req_ids)
+                    spec_mode = self._spec_mode_for_step(row_req_ids)
+                    if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+                        self._note_unspeculable_verify_rows(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
@@ -2107,6 +2251,11 @@ class TTModelRunner:
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
             perform_device_sampling = False
+        if spec_mode == ACCEPT_MODE_LOGITS:
+            # The host walk samples from the logits this verify returns, so the
+            # model must not sample on device, and the rows' generators have
+            # to be the requests' own.
+            perform_device_sampling = False
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only).
@@ -2235,7 +2384,7 @@ class TTModelRunner:
             num_valid_drafts=num_valid_drafts,
             accepted_counts=accepted_counts,
             draft_token_ids=spec_drafts,
-            spec_mode=ACCEPT_MODE_ARGMAX_IDS if spec_drafts is not None else None,
+            spec_mode=spec_mode if spec_drafts is not None else None,
         )
 
     def build_model_input(
@@ -2580,14 +2729,21 @@ class TTModelRunner:
         return self.build_spec_runner_output(fwd.model_input.row_req_ids, prefixes)
 
     def walk_spec_acceptance(
-        self, model_input: TTModelInput, argmax_ids: Any
+        self, model_input: TTModelInput, tt_out: Any
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Greedy acceptance over one verify's return. Touches no host state.
+        """Acceptance over one verify's return. Touches no runner state.
 
         Separate from the commit because the asynchronous path runs this on
         whichever thread resolves the readback, where the runner's own state is
         one step behind and must not be read or written. Everything this needs
-        is the step's own: the block it submitted and what came back.
+        is the step's own: the block it submitted, the sampling it was built
+        with, and what came back. ``tt_out`` is the tensor the step's mode
+        returns, already unwrapped from its ``VerifyOutput``.
+
+        An ``argmax_ids`` walk is pure. A ``logits`` walk draws: it advances
+        the generators of the step's seeded requests and the global torch
+        stream, so it must run exactly once per step, which
+        ``DeferredDecodeOutput`` guarantees on the asynchronous path.
         """
         row_req_ids = model_input.row_req_ids
         missing = [
@@ -2603,6 +2759,14 @@ class TTModelRunner:
             )
         del row_req_ids
 
+        if model_input.spec_mode == ACCEPT_MODE_LOGITS:
+            return self._walk_sampled_acceptance(model_input, tt_out)
+        if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+            raise NotImplementedError(
+                f"the runner drives no accept walk for spec_mode "
+                f"{model_input.spec_mode!r}"
+            )
+        argmax_ids = tt_out
         if not isinstance(argmax_ids, torch.Tensor):
             raise TypeError(
                 "a verify in argmax_ids mode must return a token id tensor, got "
@@ -2623,6 +2787,55 @@ class TTModelRunner:
             model_input.draft_token_ids[:, :verified_drafts],
             model_input.num_valid_drafts,
         )
+
+    def _walk_sampled_acceptance(
+        self, model_input: TTModelInput, logits: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rejection-sample one ``logits`` verify under the step's own sampling.
+
+        The shape is checked against what was submitted rather than against
+        itself, because a return that is internally consistent can still be
+        wrong in a way the walk would not notice: a readback folded to fewer
+        vocabulary columns samples from a truncated vocabulary, and a block
+        narrower than the submitted one shifts the bonus column.
+        """
+        sampling = _spec_sampling_inputs(model_input, int(self.vocab_size))
+        if not isinstance(logits, torch.Tensor) or not logits.is_floating_point():
+            raise TypeError(
+                "a verify in logits mode must return a floating point "
+                f"[B, 1+K, V] tensor, got {type(logits).__name__}"
+                + (
+                    f" of dtype {logits.dtype}"
+                    if isinstance(logits, torch.Tensor)
+                    else ""
+                )
+            )
+        rows, width = (int(size) for size in model_input.input_tokens.shape)
+        expected = (rows, width, sampling.vocab_size)
+        if tuple(logits.shape) != expected:
+            raise ValueError(
+                f"a verify in logits mode must return [B, 1+K, V] = {expected}: "
+                "every submitted row, every candidate column, and the whole "
+                f"vocabulary. Got {tuple(logits.shape)}; a narrower last "
+                "dimension is a truncated or row-folded readback, which cannot "
+                "be sampled as the vocabulary"
+            )
+        live = len(model_input.row_req_ids)
+        result = accept_sampled_drafts(
+            logits[:live],
+            model_input.draft_token_ids[:live],
+            model_input.num_valid_drafts[:live],
+            sampling,
+        )
+        # A padding row carries no draft and is greedy, so it commits its own
+        # column 0 argmax, which is what the greedy walk gives it too; the
+        # drafter is called with every row, and no request reads these.
+        committed = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+        committed[:live] = result.committed_token_ids
+        committed[live:, 0] = logits[live:, 0].argmax(dim=-1).to(torch.int32)
+        counts = torch.ones(rows, dtype=torch.int32)
+        counts[:live] = result.accepted_counts
+        return committed, counts
 
     def spec_committed_prefixes(
         self,
@@ -3314,12 +3527,9 @@ class TTModelRunner:
                 # Output history as list[list[int]] (filter TT -1 padding).
                 output_token_ids: list[list[int]] = []
                 if is_decode and model_input.output_tokens is not None:
-                    output_tokens = _take(model_input.output_tokens)
-                    for i in range(sz):
-                        output_tokens_i = output_tokens[i].tolist()
-                        output_token_ids.append(
-                            [tok for tok in output_tokens_i if tok != -1]
-                        )
+                    output_token_ids = _penalty_history(
+                        _take(model_input.output_tokens)
+                    )
                 else:
                     output_token_ids = [[] for _ in range(sz)]
 
@@ -3328,11 +3538,8 @@ class TTModelRunner:
                 prompt_token_ids: torch.Tensor | None = None
                 if not no_penalties:
                     if is_decode and model_input.prompt_tokens is not None:
-                        prompt_token_ids = _take(model_input.prompt_tokens).to(
-                            torch.int64
-                        )
-                        prompt_token_ids = prompt_token_ids.masked_fill(
-                            prompt_token_ids == -1, self.vocab_size
+                        prompt_token_ids = _penalty_prompt_ids(
+                            _take(model_input.prompt_tokens), self.vocab_size
                         )
                     elif not is_decode:
                         prompt_token_ids = model_input.input_tokens[
