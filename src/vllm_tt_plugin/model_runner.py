@@ -362,6 +362,9 @@ class TTModelRunner:
         # consumes them in _drafts_to_verify within the scheduled lookahead
         # reservation. Each consumer takes a proposal only once.
         self._proposed_draft_token_ids: dict[str, list[int]] = {}
+        # Rows a verify answered by argmax although their request is not
+        # speculable. See _note_unspeculable_verify_rows; reported at shutdown.
+        self._num_unspeculable_verify_rows = 0
         # Built on first use rather than here, because constructing it compiles
         # numba kernels and a launch that never speculates must not pay that.
         self._ngram_proposer: Any = None
@@ -397,6 +400,14 @@ class TTModelRunner:
         """
         if getattr(self, "_persistent_capture_released", False):
             return
+        unspeculable_rows = getattr(self, "_num_unspeculable_verify_rows", 0)
+        if unspeculable_rows:
+            logger.warning(
+                "Speculative verify steps committed a greedy token for %d "
+                "row(s) whose request is not speculable (non-zero temperature "
+                "or a penalty).",
+                unspeculable_rows,
+            )
         release = getattr(
             getattr(self, "model", None), "release_persistent_capture", None
         )
@@ -1413,6 +1424,30 @@ class TTModelRunner:
                 return False
         return True
 
+    def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
+        """Count the live rows of a verify whose request is not speculable.
+
+        ``_publish_draft`` keeps drafts off such a request, but it cannot keep
+        the request out of a verify: another row's drafts, an unresolved
+        multi-token commit, or a model without ``supports_narrow_decode`` makes
+        the whole step one. A verify in ``argmax_ids`` mode answers every row
+        with the target's argmax, so the row commits that argmax, not a token
+        drawn with its request's temperature and penalties.
+        """
+        rows = sum(
+            1 for req_id in row_req_ids if not self._request_is_speculable(req_id)
+        )
+        if not rows:
+            return
+        self._num_unspeculable_verify_rows += rows
+        logger.warning_once(
+            "A speculative verify step included a request that is not "
+            "speculable (non-zero temperature or a penalty). A verify returns "
+            "the target argmax for every row, so on that step the request "
+            "committed the argmax and its temperature and penalties were not "
+            "applied. The total count is logged at shutdown."
+        )
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         """Hand the drafts proposed since the last call to the engine.
 
@@ -1934,6 +1969,7 @@ class TTModelRunner:
                     accepted_counts,
                     len(row_req_ids),
                 ):
+                    self._note_unspeculable_verify_rows(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
