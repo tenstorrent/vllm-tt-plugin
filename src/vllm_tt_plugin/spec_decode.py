@@ -35,11 +35,13 @@ if TYPE_CHECKING:
 # device argmax followed by a host walk, which is what both existing tt-metal
 # implementations do.
 #
-#   "logits"       returns logits [B, 1+K, V]. The host walks acceptance, so
-#                  this is the only mode that can serve a request needing host
-#                  arbitration: structured output, host logits processors,
-#                  min_p, logit_bias, bad_words, allowed_token_ids, min_tokens
-#                  or logprobs. It pays a [B, 1+K, V] readback.
+#   "logits"       returns logits [B, 1+K, V]. The host rejection-samples
+#                  acceptance, which serves greedy and sampled rows under
+#                  temperature, top-k, top-p and the penalties. It is also the
+#                  only mode that could serve a request needing host
+#                  arbitration (structured output, token filters, logprobs),
+#                  but each of those needs an execution path of its own and is
+#                  refused today. It pays a [B, 1+K, V] readback.
 #   "argmax_ids"   returns the verify argmax ids [B, 1+K]. The host walks
 #                  acceptance greedily, comparing ids, so no logits cross. This
 #                  mode is greedy only.
@@ -297,8 +299,14 @@ class DraftOutput:
 
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
-    An accept rule that needs the drafter distribution reads them; a runner
-    that does not must not require them.
+    No accept walk reads them: rejection sampling needs the drafter's whole
+    ``[B, K, V]`` distribution, not its top scores.
+
+    A ``logits`` verify treats every draft as a point mass at its id, which is
+    exact only for a proposal that is a deterministic function of the
+    committed context. A drafter that samples its proposals makes sampled
+    output lossy, and nothing detects it, so such a model must not declare
+    ``logits`` for its own drafter.
     """
 
     draft_token_ids: "torch.Tensor"
