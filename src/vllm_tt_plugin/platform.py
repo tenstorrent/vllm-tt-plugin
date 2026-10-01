@@ -48,6 +48,7 @@ from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
 )
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -2364,8 +2365,9 @@ class TTPlatform(Platform):
             # proposal wait for the engine thread. That path places two demands
             # on a model that supports_async_decode does not cover, because the
             # decode reload contract was written for a decode committing one
-            # token per forward: read_decode_output is handed a [B, 1+K] verify
-            # whose committed length the host decides after the forward, and
+            # token per forward: read_decode_output is handed a verify's return
+            # in its mode, [B, 1+K] ids or [B, 1+K, V] logits, whose committed
+            # length the host decides after the forward, and
             # the verify's hidden handle must stay valid across the readback
             # and until the next step's propose call. Declared separately
             # rather than derived, so a model already declaring async decode
@@ -2380,8 +2382,9 @@ class TTPlatform(Platform):
                     "does not declare "
                     "model_capabilities['supports_async_spec_decode']. The "
                     "deferred speculative path hands read_decode_output a "
-                    "[B, 1+K] verify whose committed length is decided after "
-                    "the forward, and holds the verify's hidden handle across "
+                    "verify's [B, 1+K] ids or [B, 1+K, V] logits, whose "
+                    "committed length is decided after the forward, and holds "
+                    "the verify's hidden handle across "
                     "the readback until the next step's propose call; "
                     "supports_async_decode covers neither. Launch with "
                     "--no-async-scheduling, or drop the speculative flags"
@@ -2590,21 +2593,20 @@ class TTPlatform(Platform):
     def _reject_unsupported_speculative_request(cls, params) -> None:
         """Refuse a request this launch cannot serve faithfully at all.
 
-        Speculation runs in the ``argmax_ids`` mode, where no logits cross the
-        boundary: the runner compares drafted ids against the target's argmax
-        and commits ids. That certifies plain greedy decoding exactly, and
-        nothing else.
-
-        A non-zero temperature and the penalties are served without
-        speculation where the launch has an ordinary decode to serve them
-        with. On a model that declares ``supports_narrow_decode``,
-        ``TTModelRunner._publish_draft`` offers such a request no drafts, and
-        every step it shares runs as the ordinary decode, which applies its
-        full sampling (``_step_verifies`` in the runner). Refusing them would
-        make a speculating launch unusable for any sampled client. A model
-        without ``supports_narrow_decode`` sends every decode step as a verify,
-        which commits the target argmax on every row, so there the request is
-        refused.
+        A model serving ``logits`` speculates for a request with a non-zero
+        temperature, top-k, top-p or the penalties: the runner
+        rejection-samples against the target distribution under those
+        controls. A model serving only ``argmax_ids`` certifies plain greedy
+        decoding and nothing else. Where such a model declares
+        ``supports_narrow_decode``, ``TTModelRunner._publish_draft`` offers a
+        sampled or penalized request no drafts, and every step it shares runs
+        as the ordinary decode, which applies its full sampling
+        (``_step_verifies`` in the runner). Refusing these controls would fail
+        every ordinary sampled client with HTTP 400, so they are served. A
+        model serving only ``argmax_ids`` without ``supports_narrow_decode``
+        sends every decode step as a verify, which commits the target argmax
+        on every row, so there the request is refused. vLLM itself refuses
+        min_p and logit_bias on a speculating launch before this runs.
 
         Refused on every speculating launch: controls that need logits or a
         token filter the model-owned sampler does not apply. A request asking
@@ -2627,6 +2629,9 @@ class TTPlatform(Platform):
             return
 
         unsupported = []
+        # temperature and the penalties are absent: those requests speculate
+        # in logits mode, or decode without speculation. ``sampled`` below
+        # covers a launch that has neither.
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r}")
         if getattr(params, "structured_outputs", None) is not None:
@@ -2645,7 +2650,8 @@ class TTPlatform(Platform):
         # TTModelRunner._request_is_speculable reads. min_p, top_p and top_k
         # are absent because they do not move a greedy request's argmax.
         sampled = []
-        if not spec_plan.supports_narrow_decode:
+        serves_logits = ACCEPT_MODE_LOGITS in spec_plan.accept_modes
+        if not spec_plan.supports_narrow_decode and not serves_logits:
             if params.sampling_type != SamplingType.GREEDY:
                 sampled.append(f"temperature={params.temperature!r}")
             for name, neutral in (
@@ -2668,9 +2674,15 @@ class TTPlatform(Platform):
         if sampled:
             reasons.append(
                 "This launch's model sends every decode step as a verify (its "
-                "SpecPlan does not keep supports_narrow_decode), and a verify "
-                f"commits the target argmax on every row, so {sampled} would "
-                "not be applied. Send temperature 0 without penalties."
+                "SpecPlan does not keep supports_narrow_decode) and does not "
+                "serve logits, so a verify commits the target argmax on every "
+                f"row, and {sampled} would not be applied. Send temperature 0 "
+                "without penalties."
+            )
+        elif serves_logits:
+            reasons.append(
+                "Sampled requests (temperature, top-k, top-p, the penalties) "
+                "ARE served here -- they speculate in logits mode."
             )
         elif spec_plan.supports_narrow_decode:
             reasons.append(

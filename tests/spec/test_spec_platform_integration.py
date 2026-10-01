@@ -283,12 +283,17 @@ def _validate(params):
     TTPlatform.validate_request({"prompt_token_ids": [1, 2, 3]}, params)
 
 
-def _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=True):
+def _speculating_platform(
+    monkeypatch, vllm_config, supports_narrow_decode=True, accept_modes=None
+):
     """Run the hook so a spec plan is live, and return the platform."""
     from vllm_tt_plugin.platform import TTPlatform
 
+    knobs = {} if accept_modes is None else {"accept_modes": accept_modes}
     model = make_fake_spec_model(
-        max_supported_num_seqs=4, supports_narrow_decode=supports_narrow_decode
+        max_supported_num_seqs=4,
+        supports_narrow_decode=supports_narrow_decode,
+        **knobs,
     )
     _run_hook(monkeypatch, _speculative(vllm_config), model)
     plan = get_tt_spec_plan(vllm_config)
@@ -326,7 +331,12 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     """
     from vllm.sampling_params import SamplingParams
 
-    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=narrow)
+    _speculating_platform(
+        monkeypatch,
+        vllm_config,
+        supports_narrow_decode=narrow,
+        accept_modes=("argmax_ids",),
+    )
     params = SamplingParams(temperature=0.0, **{field: value})
     with pytest.raises(VLLMValidationError) as excinfo:
         _validate(params)
@@ -381,12 +391,29 @@ def test_a_sampled_request_is_refused_where_every_step_verifies(
     ``argmax_ids`` mode commits the target argmax on every row. The request
     would come back as greedy text with a 200, so it is refused instead.
     """
-    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    _speculating_platform(
+        monkeypatch,
+        vllm_config,
+        supports_narrow_decode=False,
+        accept_modes=("argmax_ids",),
+    )
     with pytest.raises(VLLMValidationError) as excinfo:
         _validate(_sampled_params(field, value))
     message = str(excinfo.value)
     assert f"{field}={value!r}" in message
     assert "supports_narrow_decode" in message
+
+
+@pytest.mark.parametrize("modes", [("argmax_ids", "logits"), ("logits",)])
+@pytest.mark.parametrize("field, value", _SAMPLED)
+def test_a_sampled_request_is_admitted_where_every_step_verifies_logits(
+    monkeypatch, vllm_config, modes, field, value
+):
+    """A verify in ``logits`` mode samples every row under its own params."""
+    _speculating_platform(
+        monkeypatch, vllm_config, supports_narrow_decode=False, accept_modes=modes
+    )
+    _validate(_sampled_params(field, value))  # must not raise
 
 
 def test_a_greedy_request_is_served_where_every_step_verifies(monkeypatch, vllm_config):
@@ -454,7 +481,14 @@ def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
     runner.input_batch = batch
     speculable = TTModelRunner._request_is_speculable(runner, "r0")
 
-    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    # The runner above holds no accept modes, so it judges as an argmax_ids
+    # launch does.
+    _speculating_platform(
+        monkeypatch,
+        vllm_config,
+        supports_narrow_decode=False,
+        accept_modes=("argmax_ids",),
+    )
     try:
         _validate(params)
         admitted = True
@@ -489,8 +523,12 @@ def _input_processor_for_launch(monkeypatch, vllm_config, launch):
     vllm_config.parallel_config.local_engines_only = False
     if launch != "ordinary":
         _speculative(vllm_config)
+    # argmax_ids only, where the two speculating launches admit sampled
+    # requests differently.
     model = make_fake_spec_model(
-        max_supported_num_seqs=4, supports_narrow_decode=launch == "narrow"
+        max_supported_num_seqs=4,
+        supports_narrow_decode=launch == "narrow",
+        accept_modes=("argmax_ids",),
     )
     _run_hook(monkeypatch, vllm_config, model)
     monkeypatch.setattr(input_processor, "current_platform", TTPlatform)
