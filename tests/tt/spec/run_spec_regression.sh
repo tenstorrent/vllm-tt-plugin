@@ -15,6 +15,12 @@
 # because it runs a speculating server and an unspeculated one side by side;
 # it takes them through TT_VISIBLE_DEVICES, overridable with SPEC_CHIP and
 # REFERENCE_CHIP. README.md beside this file carries every recipe.
+#
+# Three settings are read from the environment of a run_config call rather
+# than its arguments: SPEC_ACCEPT_MODES (the dummy's TT_SPEC_ACCEPT_MODES,
+# default argmax_ids), SPEC_DRAFTER (model or ngram, default model) and
+# SPEC_HOST_SAMPLING (1 keeps an asynchronous launch on host sampling for every
+# step, rather than device-sampling the greedy ones).
 set -uo pipefail
 
 ARTIFACTS="${1:?usage: run_spec_regression.sh <artifacts-dir> [config ...]}"
@@ -25,6 +31,9 @@ if [ ${#CONFIGS[@]} -eq 0 ]; then
         accept-all accept-2 accept-0 adaptive async capacity lossless
         async-accept-0 async-accept-2 async-capacity async-reset
         async-k1 async-k3
+        sampled sampled-async sampled-async-device sampled-solo-async
+        sampled-accept-2 sampled-capacity sampled-logits-only sampled-ngram
+        async-logits-only
     )
 fi
 
@@ -96,14 +105,21 @@ run_config() {
     local log="$dir/server.log"
     mkdir -p "$dir"
 
+    local accept_modes="${SPEC_ACCEPT_MODES:-argmax_ids}"
+    local drafter="${SPEC_DRAFTER:-model}"
     local spec='{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":'"$k"'}'
+    if [ "$drafter" = "ngram" ]; then
+        spec='{"method":"ngram","num_speculative_tokens":'"$k"',"prompt_lookup_min":2,"prompt_lookup_max":4}'
+    fi
     # Device sampling is what any overlapped decode needs: the plugin's
     # steady-decode fast path refuses a host-sampled step whatever else is
     # true of it, because the token the next step reads has to be the one the
     # device wrote. The asynchronous configuration therefore asks for it, and
-    # the others leave it alone so their measurements stay comparable.
+    # the others leave it alone so their measurements stay comparable. A
+    # sampled configuration keeps host sampling instead: the dummy's device
+    # answer is the argmax, which is no sample.
     local tt_config='{"tt": {"register_test_models": true}}'
-    if [ "$async" = "true" ]; then
+    if [ "$async" = "true" ] && [ "${SPEC_HOST_SAMPLING:-0}" != "1" ]; then
         tt_config='{"tt": {"register_test_models": true, "sample_on_device_mode": "decode_only"}}'
     fi
     local args=(
@@ -128,7 +144,7 @@ run_config() {
     # this: the plugin writes that field itself from the model's declaration,
     # so an operator's value is replaced.
 
-    echo "=== $label: k=$k accept_depth=$depth max_model_len=$max_model_len max_num_seqs=$max_num_seqs draft_policy=$policy async=$async target=$target"
+    echo "=== $label: k=$k accept_depth=$depth max_model_len=$max_model_len max_num_seqs=$max_num_seqs draft_policy=$policy async=$async target=$target accept_modes=$accept_modes drafter=$drafter"
     # The wholesale prefix-cache reset is a development endpoint, so only the
     # configuration that exercises it asks for one. A server without it answers
     # 404 and that test skips.
@@ -140,6 +156,7 @@ run_config() {
     export TT_SPEC_ACCEPT_DEPTH="$depth"
     export TT_SPEC_DRAFT_POLICY="$policy"
     export TT_SPEC_TARGET="$target"
+    export TT_SPEC_ACCEPT_MODES="$accept_modes"
     if [ "$blocks" != "-" ]; then
         export TT_SPEC_MAX_TOKENS_ALL_USERS="$blocks"
     else
@@ -147,7 +164,7 @@ run_config() {
     fi
     start_server "$label" "$log" "${args[@]}" || return 1
 
-    local launch_args="TT_SPEC_ACCEPT_DEPTH=$depth TT_SPEC_DRAFT_POLICY=$policy TT_SPEC_TARGET=$target TT_SPEC_MAX_TOKENS_ALL_USERS=${TT_SPEC_MAX_TOKENS_ALL_USERS:-unset} VLLM_SERVER_DEV_MODE=${VLLM_SERVER_DEV_MODE:-unset} MESH_DEVICE='$MESH_DEVICE' python examples/server_example_tt.py ${args[*]}"
+    local launch_args="TT_SPEC_ACCEPT_DEPTH=$depth TT_SPEC_DRAFT_POLICY=$policy TT_SPEC_TARGET=$target TT_SPEC_ACCEPT_MODES=$accept_modes TT_SPEC_MAX_TOKENS_ALL_USERS=${TT_SPEC_MAX_TOKENS_ALL_USERS:-unset} VLLM_SERVER_DEV_MODE=${VLLM_SERVER_DEV_MODE:-unset} MESH_DEVICE='$MESH_DEVICE' python examples/server_example_tt.py ${args[*]}"
     # Every option in ``--name=value`` form, not ``--name value``. These
     # options are registered in ``tests/tt/spec/conftest.py``, which pytest
     # loads after its first pass over argv, so on that pass an unknown
@@ -165,8 +182,9 @@ run_config() {
         --tt-spec-k="$k" \
         --tt-spec-accept-depth="$declared_depth" \
         --tt-spec-target="$target" \
-        --tt-spec-drafter=model \
+        --tt-spec-drafter="$drafter" \
         --tt-spec-draft-policy="$policy" \
+        --tt-spec-accept-modes="$accept_modes" \
         --tt-spec-async-scheduling="$async" \
         --tt-spec-artifacts="$dir" \
         --tt-spec-server-log="$log" \
@@ -195,6 +213,7 @@ run_lossless() {
     # function states rather than from what ran before them.
     unset TT_SPEC_DRAFT_POLICY
     unset TT_SPEC_TARGET
+    unset TT_SPEC_ACCEPT_MODES
     unset VLLM_SERVER_DEV_MODE
     if engine_running; then
         echo "REFUSING lossless: an engine is already running" >&2
@@ -257,6 +276,7 @@ run_lossless() {
 
 BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py tests/tt/spec/test_termination.py)
 ASYNC_CORRECTNESS=(tests/tt/spec/test_async_correctness.py)
+SAMPLED=(tests/tt/spec/test_sampled_speculation.py)
 OVERALL=0
 for config in "${CONFIGS[@]}"; do
     case "$config" in
@@ -301,6 +321,33 @@ for config in "${CONFIGS[@]}"; do
         # K=3 sits between that and the K=5 the other configurations run.
         async-k1)       run_config async-k1 -1 all 2048 8 - always true fixed 1 false "${ASYNC_CORRECTNESS[@]}" ;;
         async-k3)       run_config async-k3 -1 all 2048 8 - always true fixed 3 false "${ASYNC_CORRECTNESS[@]}" ;;
+        # Sampled speculation, which needs a model serving logits and the fixed
+        # target's distribution. Both modes declared, so greedy-only verifies
+        # keep argmax_ids and a sampled row switches its step to logits.
+        sampled)        SPEC_ACCEPT_MODES=argmax_ids,logits run_config sampled -1 all 2048 8 - always false fixed "$K" false "${SAMPLED[@]}" ;;
+        # The deferred path. Host sampling, so ordinary decodes do not overlap;
+        # what is under test is the readback-time walk and its commit.
+        sampled-async)  SPEC_ACCEPT_MODES=argmax_ids,logits SPEC_HOST_SAMPLING=1 run_config sampled-async -1 all 2048 8 - always true fixed "$K" false "${SAMPLED[@]}" ;;
+        # The mix a production logits model runs: batched greedy steps are
+        # ordinary decodes sampled on the device, and a step with a sampled row
+        # moves to the host, where a verify asks for logits. The solo policy is
+        # what makes batched steps ordinary decodes.
+        sampled-async-device) SPEC_ACCEPT_MODES=argmax_ids,logits run_config sampled-async-device -1 all 2048 8 - solo true fixed "$K" false "${SAMPLED[@]}" ;;
+        # Transitions between ordinary host-sampled decodes and sampled verifies.
+        sampled-solo-async) SPEC_ACCEPT_MODES=argmax_ids,logits SPEC_HOST_SAMPLING=1 run_config sampled-solo-async -1 all 2048 8 - solo true fixed "$K" false "${SAMPLED[@]}" ;;
+        # Deliberately wrong drafts: past depth 2 the model drafter bends each
+        # draft to a token the target rules out, so sampled rows reject there.
+        sampled-accept-2) SPEC_ACCEPT_MODES=argmax_ids,logits run_config sampled-accept-2 2 2 2048 8 - always false fixed "$K" false "${SAMPLED[@]}" ;;
+        # Preemption and replay of sampled requests: the same KV budget the
+        # capacity configuration uses.
+        sampled-capacity) SPEC_ACCEPT_MODES=argmax_ids,logits run_config sampled-capacity -1 all 512 8 1024 always false fixed "$K" false "${SAMPLED[@]}" ;;
+        # A model that never returns ids: greedy speculation through logits.
+        sampled-logits-only) SPEC_ACCEPT_MODES=logits run_config sampled-logits-only -1 all 2048 8 - always false fixed "$K" false "${SAMPLED[@]}" ;;
+        # Host proposals verified against the sampled target.
+        sampled-ngram)  SPEC_ACCEPT_MODES=argmax_ids,logits SPEC_DRAFTER=ngram run_config sampled-ngram -1 all 2048 8 - always false fixed "$K" false "${SAMPLED[@]}" ;;
+        # The asynchronous correctness suite and the sampled suite, with logits
+        # as the only mode.
+        async-logits-only) SPEC_ACCEPT_MODES=logits SPEC_HOST_SAMPLING=1 run_config async-logits-only -1 all 2048 8 - always true fixed "$K" false "${ASYNC_CORRECTNESS[@]}" "${SAMPLED[@]}" ;;
         lossless)   run_lossless ;;
         *) echo "unknown configuration: $config" >&2; OVERALL=1; continue ;;
     esac
