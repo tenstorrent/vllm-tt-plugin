@@ -9,7 +9,7 @@ fake runner/model collaborators. Lane-specific input/output shaping lives on
 environment because importing the plugin modules pulls in ttnn.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -61,6 +61,18 @@ def _capturing_host_sampler(captured: dict):
         )
 
     return sampler
+
+
+def _host_runner(captured: dict) -> SimpleNamespace:
+    """Fake runner for host read-back, carrying the real logits-shape guard so
+    the well-formed shapes these tests use stay well-formed."""
+    runner = SimpleNamespace(
+        host_sampler=_capturing_host_sampler(captured),
+        model=SimpleNamespace(),
+        vocab_size=VOCAB,
+    )
+    runner._check_host_logits = MethodType(TTModelRunner._check_host_logits, runner)
+    return runner
 
 
 # --------------------------------------------------------------------------
@@ -151,7 +163,7 @@ def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
     batch.build_merged_sampling_metadata = (
         lambda rows, non_sampling_rows=None: None
     )  # sampler ignores it
-    runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
+    runner = _host_runner(captured)
     # Full slot logits: row r's argmax is token r (vocab>=5).
     logits = torch.full((5, VOCAB), -10.0)
     for r in range(5):
@@ -171,7 +183,7 @@ def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     captured: dict = {}
     batch = _lane_batch()
     batch.build_merged_sampling_metadata = lambda rows, non_sampling_rows=None: None
-    runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
+    runner = _host_runner(captured)
     # Prefill logits: one row per scheduled request (front-packed, plan order).
     prefill_logits = torch.full((2, VOCAB), -10.0)
     prefill_logits[0, 3] = 5.0  # scheduled request 0 -> token 3
