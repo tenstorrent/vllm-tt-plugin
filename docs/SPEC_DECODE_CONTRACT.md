@@ -43,10 +43,12 @@ serve speculative decoding within the following execution limits:
 - in both modes, a request carrying logprobs, structured output or a token
   filter (`logit_bias`, `bad_words`, `allowed_token_ids`, `min_tokens`) is
   refused per request, because no path on the launch applies those. vLLM's own
-  request validation refuses `min_p` and `logit_bias` whenever speculation is
-  configured, before the plugin sees the request, and vLLM's
-  `build_logitsprocs` refuses a speculating launch with custom logits
-  processors (`--logits-processors`) when `TTModelRunner` is constructed.
+  request validation refuses `logit_bias`, and a `min_p` above 1e-5, whenever
+  speculation is configured, before the plugin sees the request. vLLM's
+  `build_logitsprocs` builds no min_p processor for a speculating launch, so a
+  smaller `min_p` changes neither the ordinary sampler nor the accept walk, and
+  it refuses custom logits processors (`--logits-processors`) when
+  `TTModelRunner` is constructed.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does
@@ -819,10 +821,12 @@ none. Greedy rows, including greedy rows with penalties, accept by comparing
 each draft with the penalized argmax. Random rows accept draft `j` with
 probability `min(1, p/q)` and on a rejection commit a token drawn from the
 positive part of `p - q`; a row that accepts every draft commits a bonus drawn
-from the target at its own `num_valid_drafts` column. vLLM refuses `min_p` on
-a speculating launch, so the runner never passes it; `accept_speculated_tokens`
-applies it at every position when a caller does, as the ordinary sampler does,
-where upstream's rejection sampler skips it at the drafted positions.
+from the target at its own `num_valid_drafts` column. vLLM refuses a `min_p`
+above 1e-5 on a speculating launch and builds no min_p processor there, so the
+ordinary sampler ignores a smaller one and the runner never passes it;
+`accept_speculated_tokens` applies it at every position when a caller does, as
+the ordinary sampler does, where upstream's rejection sampler skips it at the
+drafted positions.
 
 **Proposals are point masses.** `draft_probs` is `None` on this path, so `q`
 is 1 at the drafted token and 0 elsewhere: the walk accepts draft `d` with

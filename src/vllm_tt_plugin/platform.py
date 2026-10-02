@@ -2496,8 +2496,8 @@ class TTPlatform(Platform):
         speculating for them (``TTModelRunner._request_is_speculable`` offers
         no drafts, and the runner applies its full sampling). Refusing these
         controls would fail every ordinary sampled client with HTTP 400, so
-        they are served. vLLM itself refuses min_p and logit_bias on a
-        speculating launch before this runs.
+        they are served. vLLM itself refuses logit_bias, and a min_p above
+        1e-5, on a speculating launch before this runs.
 
         What remains here is what no path on this launch serves: controls that
         need logits or a token filter the model-owned sampler does not apply.
