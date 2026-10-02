@@ -453,8 +453,9 @@ def test_logprobs_report_the_target_s_raw_distribution(
 # region Structured output
 
 
-def _token_texts_fit(text: str, pattern: str) -> bool:
-    return re.fullmatch(pattern, text) is not None
+def _spells(spec_server, result, pattern: str) -> bool:
+    """Whether the committed tokens spell a string of ``pattern``'s language."""
+    return re.fullmatch(pattern, spec_server.detokenize(result.token_ids)) is not None
 
 
 @pytest.mark.parametrize("temperature", [1.0, 0.0], ids=["sampled", "greedy"])
@@ -463,8 +464,8 @@ def test_structured_output_speculates_and_follows_each_request_s_grammar(
 ):
     """Two grammars in one batch, half the requests each.
 
-    Each response's text must match its own grammar in full, which a bitmask
-    row shifted onto the other request breaks: the grammars share 17 and
+    What each response's tokens spell must match its own grammar in full,
+    which a bitmask row shifted onto the other request breaks: the grammars share 17 and
     differ in the other token. Among a response's 17s and its grammar's other
     token, 17 commits with probability 0.3 / (0.3 + 0.2) or 0.3 / (0.3 + 0.1),
     whatever else the grammar admits, which the pooled counts check.
@@ -501,7 +502,7 @@ def test_structured_output_speculates_and_follows_each_request_s_grammar(
         name = names[index % 2]
         pattern, tokens = GRAMMARS[name]
         assert_full_length_completion(result, max_tokens)
-        assert _token_texts_fit(result.text, pattern), (name, result.text)
+        assert _spells(spec_server, result, pattern), (name, result.token_ids)
         other = (tokens - {TWO}).pop()
         assert other in tokens and not (
             set(result.token_ids) & (set(FIXED_SHARED_ALTERNATIVES) - tokens)
@@ -581,7 +582,7 @@ def test_requests_with_different_controls_keep_their_own_in_one_verify(
             raw = fixed_target_distribution(token, position)
             assert value == pytest.approx(math.log(raw[emitted]), abs=1e-3)
             token, position = emitted, position + 1
-    assert _token_texts_fit(structured.text, pattern), structured.text
+    assert _spells(spec_server, structured, pattern), structured.token_ids
     assert set(combined.token_ids) <= set(ALLOWED)
     assert tuple(BAD_WORD_IDS) not in _bigrams(combined.token_ids)
     _assert_no_greedy_fallback(log_path)
