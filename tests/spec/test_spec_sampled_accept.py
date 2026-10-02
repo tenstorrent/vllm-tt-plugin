@@ -554,11 +554,11 @@ def _reference_joint(table, controls, length):
 def _simulate(table, controls, drafter, length, rows, k, seed):
     """Draft, verify and commit until every row has ``length`` tokens.
 
-    Each step proposes up to ``k`` drafts per row with a deterministic drafter,
-    builds the target's logits for every candidate column from the column's
-    own input token and position, and walks acceptance. The draft count varies
-    by row and by step so short prefixes, zero-draft rows and full blocks all
-    occur in one batch.
+    Each step proposes up to ``k`` drafts per row with ``drafter``, builds the
+    target's logits for every candidate column from the column's own input
+    token and position, and walks acceptance. The draft count varies by row and
+    by step so short prefixes, zero-draft rows and full blocks all occur in one
+    batch.
     """
     torch.manual_seed(seed)
     outputs = [[] for _ in range(rows)]
@@ -637,6 +637,23 @@ def _wrong_drafter(token, position):
     return (token * 5 + position * 3 + 1) % SMALL_VOCAB
 
 
+def _sampling_drafter(table):
+    """Samples each draft from a distribution unlike the target, with its own RNG.
+
+    The walk treats every draft as a point mass, which is lossless for any
+    draft its own random draws did not choose. This drafter is the case that
+    claim has to survive: random drafts from a ``q`` far from ``p``.
+    """
+    generator = torch.Generator().manual_seed(123)
+
+    def drafter(token, position):
+        logits = table[token, position.clamp(max=table.shape[1] - 1)]
+        q = (-0.7 * logits.nan_to_num(neginf=-30.0)).softmax(dim=-1)
+        return torch.multinomial(q, 1, generator=generator).squeeze(1)
+
+    return drafter
+
+
 @pytest.mark.parametrize(
     "controls",
     [
@@ -658,7 +675,7 @@ def _wrong_drafter(token, position):
         "min-p-order",
     ],
 )
-@pytest.mark.parametrize("drafter_name", ["argmax", "wrong"])
+@pytest.mark.parametrize("drafter_name", ["argmax", "wrong", "sampling"])
 def test_the_committed_sequences_follow_the_target_joint_distribution(
     controls, drafter_name
 ):
@@ -670,7 +687,11 @@ def test_the_committed_sequences_follow_the_target_joint_distribution(
     mix zero, partial and full draft counts in every step.
     """
     table = _causal_table(seed=11)
-    drafter = _argmax_drafter(table) if drafter_name == "argmax" else _wrong_drafter
+    drafter = {
+        "argmax": lambda: _argmax_drafter(table),
+        "wrong": lambda: _wrong_drafter,
+        "sampling": lambda: _sampling_drafter(table),
+    }[drafter_name]()
     rows = 24000
     sequences = _simulate(table, controls, drafter, length=3, rows=rows, k=3, seed=5)
     observed: dict = {}
