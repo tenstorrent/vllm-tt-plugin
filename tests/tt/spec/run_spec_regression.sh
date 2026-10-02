@@ -274,10 +274,10 @@ run_lossless() {
     return "$status"
 }
 
-BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py tests/tt/spec/test_termination.py tests/tt/spec/test_mixed_sampling.py)
+BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py tests/tt/spec/test_termination.py tests/tt/spec/test_mixed_sampling.py tests/tt/spec/test_request_admission.py)
 MIXED=(tests/tt/spec/test_mixed_sampling.py)
 ASYNC_CORRECTNESS=(tests/tt/spec/test_async_correctness.py)
-SAMPLED=(tests/tt/spec/test_sampled_speculation.py)
+SAMPLED=(tests/tt/spec/test_sampled_speculation.py tests/tt/spec/test_sampled_controls.py tests/tt/spec/test_request_admission.py)
 OVERALL=0
 for config in "${CONFIGS[@]}"; do
     case "$config" in

@@ -28,6 +28,7 @@ counts up by one inside each accepted prefix and by two across each rejection.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 
 
 def depth_target_blocks(k: int, depth: int | None, steps: int) -> list[list[int]]:
@@ -176,6 +177,7 @@ def fixed_target_distribution(
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
+    excluded: Iterable[int] = (),
 ) -> dict[int, float]:
     """What vLLM's ordinary sampler draws from after ``token`` at ``position``.
 
@@ -185,6 +187,11 @@ def fixed_target_distribution(
     frequency and presence over the output, then temperature, top-k and top-p.
     ``temperature`` 0 returns the greedy point mass. Tokens outside the
     support stay at probability 0 under every control.
+
+    ``excluded`` is what a grammar, an allowlist, a bad word or a pending
+    ``min_tokens`` rules out at this position. The sampler sets those logits
+    to ``-inf`` before the temperature, so they are dropped here before it too,
+    which is what keeps top-k and top-p reading only what remains.
     """
     weights: dict[int, float] = {}
     for candidate, probability in zip(
@@ -202,6 +209,13 @@ def fixed_target_distribution(
         value -= frequency_penalty * count
         value -= presence_penalty * (1.0 if count else 0.0)
         logits[candidate] = value
+    for candidate in excluded:
+        logits.pop(candidate, None)
+    if not logits:
+        raise ValueError(
+            f"every support member after {token} at position {position} is "
+            f"excluded by {sorted(set(excluded))}; the test has no distribution"
+        )
     if temperature == 0:
         best = max(logits, key=lambda candidate: logits[candidate])
         return {best: 1.0}
