@@ -378,15 +378,17 @@ limit the next verification. A forced prefix-cache reset counts pending
 output frames, not reserved token positions: one speculative output frame can
 contain several committed tokens.
 
-The current `argmax_ids` acceptance path certifies greedy requests.
-`TTModelRunner._publish_draft` withholds proposals from requests with nonzero
+On a model that serves only `argmax_ids`, the acceptance path certifies greedy
+requests. `TTModelRunner._publish_draft` withholds proposals from requests with nonzero
 temperature or penalties. Such requests use their sampling controls on
 ordinary decode steps. A shared verification step can still include those
 requests, because another request has drafts or because the model requires a
 wide verification step. `TTModelRunner` then commits target argmax IDs for
 those rows and logs that temperature and penalties were not applied. Use a
 separate non-speculative launch when those controls must be preserved for
-every step.
+every step. A model that also serves `logits` verifies a step with such a row
+in `logits` mode, and `TTModelRunner` samples each row on the host under its
+own controls.
 
 ### Block-output reservation
 
