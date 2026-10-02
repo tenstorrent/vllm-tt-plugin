@@ -271,6 +271,15 @@ def resolve_speculative_plan(
             f"{outcome.effective_k}, above the requested "
             f"num_speculative_tokens={requested_k}"
         )
+    # Checked here rather than in SpecPlan, which does not know the launch's
+    # concurrency. Without it the first step with more live rows than the
+    # mapping covers would raise inside the runner.
+    if outcome.k_by_rows and outcome.k_by_rows[-1][0] < max_num_seqs:
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan k_by_rows ends at max_rows="
+            f"{outcome.k_by_rows[-1][0]}, below max_num_seqs={max_num_seqs}; "
+            "every live batch size the launch admits needs a draft cap"
+        )
     if outcome.drafter_state == DRAFTER_STATE_PAGED:
         raise ValueError(
             f"{model_class.__name__}.spec_plan declares drafter_state "

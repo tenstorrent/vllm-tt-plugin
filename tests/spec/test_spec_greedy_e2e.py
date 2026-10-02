@@ -40,7 +40,9 @@ from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
+    DRAFTER_STATE_INTERNAL,
     PLACEHOLDER_TOKEN_ID,
+    SpecPlan,
     VerifyOutput,
 )
 
@@ -323,6 +325,69 @@ def test_one_row_s_rejection_does_not_shorten_another():
     by_req = dict(zip(output.req_ids, output.sampled_token_ids))
     assert len(by_req["a"]) == DRAFT_LEN + 1
     assert len(by_req["b"]) == 1
+
+
+def test_the_draft_cap_drops_only_the_suffix_of_a_proposal():
+    drafts, num_valid, counts = TTModelRunner._spec_row_state(
+        {"a": 4}, {"a": [10, 11, 12], "b": [20]}, ["a", "b", "c"], 3, 2
+    )
+
+    assert drafts.tolist() == [[10, 11, -1], [20, -1, -1], [-1, -1, -1]]
+    assert num_valid.tolist() == [2, 1, 0]
+    assert counts.tolist() == [4, 1, 1]
+
+
+@pytest.mark.parametrize("draft_cap", [0, 4])
+def test_a_draft_cap_outside_the_block_width_is_refused(draft_cap):
+    with pytest.raises(ValueError, match="draft_cap"):
+        TTModelRunner._spec_row_state({}, {}, ["a"], 3, draft_cap)
+
+
+@pytest.mark.parametrize(
+    "req_ids, committed_per_row",
+    [
+        pytest.param(("a",), DRAFT_LEN + 1, id="one-row-full-k"),
+        pytest.param(("a", "b"), 2, id="two-rows-capped-to-one"),
+    ],
+)
+def test_the_plan_s_draft_cap_follows_the_live_rows(req_ids, committed_per_row):
+    """A proposal made for one row is truncated when a second row joins.
+
+    Every draft offered here is one the model agrees with, so the committed
+    length shows how many drafts the verify was allowed to carry.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_plan = SpecPlan(
+        effective_k=DRAFT_LEN,
+        lanes_per_request=DRAFT_LEN + 1,
+        extra_bytes_per_seq=0,
+        extra_bytes_per_token=0,
+        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        drafter_state=DRAFTER_STATE_INTERNAL,
+        k_by_rows=((1, DRAFT_LEN), (MAX_NUM_REQS, 1)),
+    )
+    drafts = {}
+    for i, req_id in enumerate(req_ids):
+        # Distinct histories, so a row reading another row's drafts fails.
+        _add_request(runner, req_id, first_token=1 + 20 * i)
+        last = int(runner.input_batch.token_ids_cpu[i, PROMPT_LEN - 1])
+        drafts[req_id] = [(last + 1 + j) % FAKE_VOCAB_SIZE for j in range(DRAFT_LEN)]
+
+    output = _step(runner, *req_ids, drafts=drafts)
+
+    call = model.verify_calls[0]
+    # The call shape stays 1+K wide; only the per-row count shrinks.
+    assert call["block_width"] == 1 + DRAFT_LEN
+    assert call["num_valid_drafts"][: len(req_ids)].tolist() == [
+        committed_per_row - 1
+    ] * len(req_ids)
+    by_req = dict(zip(output.req_ids, output.sampled_token_ids))
+    for req_id in req_ids:
+        assert by_req[req_id] == drafts[req_id][: committed_per_row - 1] + [
+            (drafts[req_id][committed_per_row - 2] + 1) % FAKE_VOCAB_SIZE
+        ]
+        assert runner._req_accepted_counts[req_id] == committed_per_row
 
 
 def test_the_committed_tokens_reach_the_persistent_batch_and_the_request():
