@@ -28,6 +28,7 @@ accepts as often at the last position as at the first.
 
 from __future__ import annotations
 
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -42,7 +43,11 @@ from tests.tt.spec.dummy_arithmetic import (
     fixed_target_ids,
     fixed_target_support,
 )
-from tests.tt.spec.spec_client import acceptance_delta, assert_full_length_completion
+from tests.tt.spec.spec_client import (
+    acceptance_delta,
+    assert_full_length_completion,
+    assert_rejections_happened,
+)
 
 CONCURRENCY = 8
 # Upper critical values of chi-square for a tail of 1e-4, by degrees of
@@ -157,20 +162,6 @@ def _chi_square(observed, expected):
     return statistic, len(kept) - 1
 
 
-def _assert_rejections_happened(delta, asynchronous):
-    """Some draft was rejected, read in the way the scheduling mode allows."""
-    assert delta.accepted > 0, "no draft was accepted"
-    if not asynchronous:
-        assert delta.accepted < delta.draft_tokens, (
-            "every draft was accepted, so no sampled rejection was exercised"
-        )
-    first, last = delta.per_position[0], delta.per_position[-1]
-    assert last < first, (
-        "the last draft position was accepted as often as the first, so no "
-        f"step stopped at a rejection: per-position acceptance {delta.per_position}"
-    )
-
-
 def _assert_no_greedy_fallback(log_path):
     if log_path is None:
         return
@@ -263,7 +254,7 @@ def test_sampled_requests_speculate_and_commit_the_target_distribution(
     )
 
     assert delta.drafts > 0, "nothing was drafted, so nothing was speculated"
-    _assert_rejections_happened(delta, asynchronous)
+    assert_rejections_happened(delta, asynchronous)
     assert statistic < CHI_SQUARE_CRITICAL[df], (
         f"the committed support members {observed} do not match the expected "
         f"{[round(value, 1) for value in expected]} (chi-square {statistic:.1f} "
@@ -369,7 +360,7 @@ def test_a_greedy_penalized_request_speculates_to_its_exact_output(
 
     assert_full_length_completion(result, max_tokens)
     assert result.token_ids == expected
-    _assert_rejections_happened(delta, asynchronous)
+    assert_rejections_happened(delta, asynchronous)
 
 
 def test_a_seeded_sampled_request_repeats_alone_and_in_company(
@@ -557,9 +548,13 @@ def test_verifies_ask_for_logits_only_when_a_row_needs_them(
     if spec_server.context_length() < 1024:
         pytest.skip("the phases need a context of at least 1024 tokens")
 
-    def phase(temperature, max_tokens):
+    def phase(temperature, max_tokens, tokens_per_verify):
+        # Two reports inside the phase can need 256 submissions, and after its
+        # prefill token a lone request commits up to tokens_per_verify tokens
+        # per submission.
+        requests = max(3, math.ceil(256 * tokens_per_verify / (max_tokens - 1)))
         start = len(log_path.read_text(errors="replace").splitlines())
-        for index in range(3):
+        for index in range(requests):
             prompt = _prompt(spec_config, ascending_prompt, 600 + index)
             spec_server.complete(
                 prompt, max_tokens=max_tokens, temperature=temperature, seed=index
@@ -572,10 +567,10 @@ def test_verifies_ask_for_logits_only_when_a_row_needs_them(
         (verify_0, logits_0), (verify_1, logits_1) = reports[0], reports[-1]
         return verify_1 - verify_0, logits_1 - logits_0
 
-    # Sized for at least 256 submissions each: the greedy phase commits about
-    # 1+K tokens per verify, the sampled one under two.
-    greedy_verifies, greedy_logits = phase(0, 900)
-    sampled_verifies, sampled_logits = phase(1.0, 300)
+    # A greedy verify commits up to 1+K tokens, a sampled one under two on
+    # average.
+    greedy_verifies, greedy_logits = phase(0, 900, spec_config.k + 1)
+    sampled_verifies, sampled_logits = phase(1.0, 300, 2)
     record(
         greedy=(greedy_verifies, greedy_logits),
         sampled=(sampled_verifies, sampled_logits),
