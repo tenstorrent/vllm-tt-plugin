@@ -12,6 +12,12 @@ The adapter owns the Gumbel sampler and temperature schedule, prompt and canvas
 KV state, denoise loop, and persistent Metal captures. vLLM schedules physical
 canvases and trims the final canvas to the request's logical `max_tokens`.
 
+The [model capability reference](MODEL_CAPABILITIES.md) describes how the
+plugin consumes these declarations. DiffusionGemma's block-output path is
+separate from [generic speculative decoding](SPEC_DECODE_CONTRACT.md):
+`TTPlatform.check_and_update_config` rejects `speculative_config` when
+`output_tokens_per_step > 1`.
+
 ## Installation
 
 Follow [Environment Setup in the main README](../README.md#environment-setup):
@@ -105,7 +111,7 @@ ceil(prompt_tokens / 32) * 32
 
 The historical `/v1/completions` default `max_tokens=16` remains valid. It
 runs one physical canvas and returns at most 16 logical tokens. Over the
-OpenAI endpoints any output limit — omitted or explicit — is capped to the
+OpenAI endpoints any output limit, omitted or explicit, is capped to the
 largest whole-canvas capacity that fits; the formula rejects an oversized
 `max_tokens` only for offline `SamplingParams` callers.
 
@@ -130,9 +136,9 @@ Do not report autoregressive TPOT for this model.
 - The serving constraints in [Request Contract](#request-contract) apply;
   speculative decoding and preemption overlap are additionally unsupported.
 - A forced prefix-cache reset aborts running block requests instead of
-  resuming them: a half-generated canvas cannot resume, so the engine — a
+  resuming them: a half-generated canvas cannot resume, so the engine (a
   background `EngineCoreProc` for the api_server and the default offline
-  `LLM` alike — finishes those requests with an abort before resetting. Only
+  `LLM` alike) finishes those requests with an abort before resetting. Only
   an in-process engine (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) has no client
   stream to notify and refuses the reset with an error instead.
   `pause_generation(mode="keep", clear_cache=True)` is refused while a block

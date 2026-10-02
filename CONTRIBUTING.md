@@ -27,7 +27,15 @@ Pull requests are reviewed on a **weekly basis**.
 - Keep PRs focused on a single logical change to simplify review.
 - Ensure existing tests pass before submitting.
 - Add tests for new functionality where applicable.
-- Follow the existing code style; run `pre-commit` checks if configured.
+- Follow the existing code style and run `pre-commit run` explicitly before
+  every commit. Run `pre-commit run --all-files` to check the complete checkout.
+  Record the commands and results in the pull request's Validation section.
+- For model integrations, use the
+  [model capability reference](docs/MODEL_CAPABILITIES.md) and
+  [speculative decoding contract](docs/SPEC_DECODE_CONTRACT.md) to identify the
+  plugin and tt-metal responsibilities. Keep plugin changes in this repository
+  and model adapter changes in `tenstorrent/tt-metal`; cross-link paired pull
+  requests.
 - Write clear commit messages in the imperative mood (e.g., "Fix scheduler edge
   case" rather than "Fixed scheduler edge case").
 

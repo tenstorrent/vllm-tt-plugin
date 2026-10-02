@@ -7,20 +7,26 @@ below. The plugin side that reads it is
 `src/vllm_tt_plugin/spec_decode.py`.
 
 The design this implements is
-https://github.com/tenstorrent/vllm-tt-plugin/issues/110.
+https://github.com/tenstorrent/vllm-tt-plugin/issues/110. For launch settings and
+current model adapters, see [Speculative Decoding](../README.md#speculative-decoding).
+For every `model_capabilities` key consumed by the plugin, see
+[MODEL_CAPABILITIES.md](MODEL_CAPABILITIES.md).
 
 ## Status
 
-A model implementing this contract serves speculative decoding, within one
-boundary. What runs:
+Plugin `main` includes configuration admission, candidate construction, greedy
+acceptance and model-owned proposals. A model implementing this contract can
+serve speculative decoding within the following execution limits:
 
-- two drafting methods: **`ngram`**, which runs on the host and asks the model
-  for nothing, and **`custom_class`**, which is the model's own drafter
+- two drafting methods: **`ngram`**, which runs on the host and needs no
+  model-side proposer (the target still implements `spec_plan` and verification),
+  and **`custom_class`**, which is the model's own drafter
   proposing on device through `propose_draft_tokens`. Every other method vLLM
   knows is refused at configuration time rather than admitted to draft
   nothing.
 - the **`argmax_ids`** accept mode, and no other. A plan offering only `logits`
-  is refused, because the runner requests `argmax_ids` on every step.
+  is refused, because `TTModelRunner` requests `argmax_ids` on every verification
+  step. An ordinary narrow decode does not send `spec_mode`.
 - **speculation for greedy requests**, and no others. The accept walk
   compares token ids and never sees logits, so it can certify only an argmax
   continuation. A request with a non-zero temperature or a penalty is admitted
@@ -45,13 +51,22 @@ boundary. What runs:
 - **front-packed** execution. Lane mode is refused: it builds its device input
   from `TTLaneInputBatch`, which has no candidate-block builder.
 
-Every one of those is a refusal that raises with the offending values, never a
-silent fallback. The one exception is a request that is not speculable inside
-a verify step: it commits the target argmax, and the runner logs that
-(section 4d). Structured output over drafts, `fused_sample`, `drafter_scores`
-and a scheduler-owned paged drafter cache each need their own execution path
-before the matching refusal can go. The sampled accept walk needs one before a
-sampled request can speculate.
+`resolve_speculative_plan` rejects unsupported speculative configurations.
+`TTPlatform.validate_request` rejects request controls that the speculative
+launch cannot apply. Temperature and penalties instead suppress draft
+publication; ordinary decode uses the selected model's normal sampling path.
+When a sampled request enters a verification step, `TTModelRunner` commits the
+target argmax and logs the sampling limitation (section 4d). Separately,
+`TTPlatform` can disable async scheduling when `supports_async_decode` is absent
+(section 4c).
+
+The CPU acceptance helper `spec_accept.accept_speculated_tokens` is implemented,
+but `TTModelRunner` does not call it. `TTModelRunner` uses
+`spec_decode.accept_greedy_drafts`. Lossless sampled speculation, structured
+output over drafts, `logits` and `fused_sample` execution, use of
+`DraftOutput.draft_scores`, and scheduler-owned paged drafter caches still need
+runner integration and end-to-end validation. Declaring those types or modes
+does not enable them.
 
 ## 1. Capability declarations
 
@@ -157,11 +172,13 @@ against, and it is the value that is final for the launch, after the platform
 has folded data parallelism into lanes. `requested_k` is the operator's
 `num_speculative_tokens`.
 
-**`vllm_config` carries no Tenstorrent platform state.** A `spec_plan`
-implementation must not call `get_tt_output_tokens_per_step`,
-`get_tt_data_parallel_size` or any other `get_tt_*` helper on it: the platform
-has not stored them at that point, so two of those return a default of 1
-silently and `require_tt_output_tokens_per_step` raises.
+**Tenstorrent platform state on `vllm_config` is not guaranteed during
+`spec_plan`.** A `spec_plan` implementation must not depend on
+`get_tt_output_tokens_per_step`, `get_tt_data_parallel_size`, or other
+`get_tt_*` helpers. Some platform values may already exist in a particular
+call path, but speculative admission does not guarantee complete resolved TT
+state. Use the supplied `max_num_seqs`, `requested_k`, and ordinary
+`vllm_config` fields to determine feasibility.
 
 **Returns** a `SpecPlan` when the model can serve that point, or a `SpecReject`
 when it cannot. It must not raise, and it must not return anything else.
@@ -424,9 +441,15 @@ these checks in this order:
    `SpecPlan`. Both async declarations are necessary for the combined path,
    but do not replace the other admission checks.
 
-The TT compatibility patch admits `custom_class` through the upstream async
-method check before platform validation. The patch preserves the marker and
-capability checks. `--no-async-scheduling` still selects synchronous execution.
+`_install_tt_async_spec_method_patch` admits `custom_class` through the upstream
+async method check before platform validation. TT plugin bootstrap installs
+`_install_tt_async_spec_method_patch` in each TT process, including engine-core
+processes. The patch preserves the dispatch marker and capability checks.
+If the installed vLLM implementation has an unrecognized async admission check,
+TT leaves that check unchanged and warns on a `custom_class` launch. Upstream
+vLLM can then reject an explicit `--async-scheduling` request or select
+synchronous execution by default. `--no-async-scheduling` selects synchronous
+execution explicitly.
 
 Asynchronous scheduling changes when the runner applies a step, not what it
 sends. `execute_model` submits and returns nothing; the engine collects the
@@ -709,9 +732,10 @@ is admitted, because nothing detects the overrun at run time.
 Three model methods sit outside the per-step contract above but bear on any
 model-owned drafter that holds per-request state. `TTModelRunner` calls each
 only when the model defines it (`getattr(model, name, None)`). `TTPlatform`
-requires the first two for a block-output model (`output_tokens_per_step > 1`)
-and the third for an adaptive block-output model launched with
-`max_num_seqs > 1`. They come from the block-output serving work (#32) and the
+requires `release_request` and `release_persistent_capture` for a block-output
+model (`output_tokens_per_step > 1`). `TTPlatform` additionally requires
+`note_state_slots_moved` for an adaptive block-output model launched with
+`max_num_seqs > 1`. These hooks come from the block-output serving work (#32) and the
 adaptive block-output gather (#118), and a contract implementer must know them.
 
 **`release_request(slot)`.** `TTModelRunner._update_states` calls
@@ -841,6 +865,7 @@ admits an off-by-one that only shows up as wrong output text.
 configuration. `TTPlatform.validate_request` rejects unsupported sampling
 controls during request admission. `submit_decode` validates `VerifyOutput`
 at execution time and raises the corresponding type or mode error. These
-checks report the offending values rather than silently replacing the requested
-speculative behavior. The ordinary async capability check separately permits
+checks report the offending values. A non-zero temperature or a penalty is
+admitted without draft publication, with the verification-step sampling limit
+in section 4d. The ordinary async capability check separately permits
 synchronous fallback with a warning, as specified in section 4c.
