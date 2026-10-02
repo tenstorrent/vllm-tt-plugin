@@ -205,7 +205,7 @@ pytest tests/tt/spec/test_sampled_speculation.py \
     --tt-spec-artifacts=/tmp/spec-run/sampled
 ```
 
-The distribution tests are statistical, each against a chi-square tail of 1e-4. The seeded ones draw the same tokens on every run of a correct server, so a seeded failure repeats on a rerun and needs investigating; only the unseeded check draws afresh. The deterministic checks beside them are exact: every committed token must be in its context's support, and a greedy penalized request must equal its reference.
+The distribution tests are statistical, each against a chi-square tail of 1e-4. On a synchronous launch the seeded ones draw the same tokens on every run of a correct server, so a seeded failure repeats on a rerun and needs investigating; only the unseeded check draws afresh. Under asynchronous scheduling a prefill-only step drops the model proposal of every request it hides, so arrival timing changes the draft counts and the seeded checks draw afresh too. The deterministic checks beside them are exact: every committed token must be in its context's support, and a greedy penalized request must equal its reference.
 
 **8. The host n-gram drafter.** Replace the speculative config with
 `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_min":2,"prompt_lookup_max":4}`

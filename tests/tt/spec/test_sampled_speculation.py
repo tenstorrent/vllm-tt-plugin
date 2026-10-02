@@ -47,8 +47,10 @@ from tests.tt.spec.spec_client import acceptance_delta, assert_full_length_compl
 CONCURRENCY = 8
 # Upper critical values of chi-square for a tail of 1e-4, by degrees of
 # freedom. A seeded check draws the same tokens on every run of a correct
-# server, so a seeded failure repeats and needs investigating; only the
-# unseeded check draws afresh each run.
+# synchronous server, so a seeded failure there repeats and needs
+# investigating. Under asynchronous scheduling a prefill-only step drops the
+# model proposal of every request it hides, and arrival timing decides how
+# often, so seeded counts vary between runs as the unseeded check's do.
 CHI_SQUARE_CRITICAL = {1: 15.14, 2: 18.42, 3: 21.11}
 _SUBMISSIONS = re.compile(
     r"TT submissions: \d+ ordinary decode, (\d+) verify, \d+ overlapped an "
@@ -223,7 +225,7 @@ def test_sampled_requests_speculate_and_commit_the_target_distribution(
 ):
     """Many seeded sampled requests, pooled, against the expected counts.
 
-    Seeded so a failing run repeats. The penalties case has a different
+    Seeded so a failing synchronous run repeats. The penalties case has a different
     distribution at every step, read from each request's own history, which is
     why the expected counts are summed per token rather than taken from a
     fixed table.
@@ -371,13 +373,16 @@ def test_a_greedy_penalized_request_speculates_to_its_exact_output(
 
 
 def test_a_seeded_sampled_request_repeats_alone_and_in_company(
-    spec_server, spec_config, ascending_prompt, record
+    spec_server, spec_config, asynchronous, ascending_prompt, record
 ):
     """Same seed, same output, whoever else shares its verifies.
 
     A row's generator advances by its own draft counts only, and the model
-    drafter under ``always`` offers every row its full draft length, so other
-    requests in the batch cannot change what a seeded request reads.
+    drafter under ``always`` offers every row its full draft length, so on a
+    synchronous launch other requests in the batch cannot change what a seeded
+    request reads. Under asynchronous scheduling a later arrival's prefill-only
+    step hides the request and drops that step's proposal, so its draft counts
+    depend on its company.
     """
     prompt = _prompt(spec_config, ascending_prompt, 11)
     body = {"max_tokens": 48, "temperature": 0.9, "top_p": 0.9, "seed": 1234}
@@ -387,11 +392,15 @@ def test_a_seeded_sampled_request_repeats_alone_and_in_company(
     assert_full_length_completion(alone, 48)
     assert again.token_ids == alone.token_ids
 
-    if spec_config.draft_policy != "always" or spec_config.drafter != "model":
+    if (
+        spec_config.draft_policy != "always"
+        or spec_config.drafter != "model"
+        or asynchronous
+    ):
         record(alone=alone.token_ids)
         pytest.skip(
-            "under this drafter a request's draft counts depend on its "
-            "company, so only the solo repeat is claimed"
+            "under this drafter or asynchronous scheduling a request's draft "
+            "counts depend on its company, so only the solo repeat is claimed"
         )
     others = [
         _prompt(spec_config, ascending_prompt, 300 + i) for i in range(CONCURRENCY - 1)
