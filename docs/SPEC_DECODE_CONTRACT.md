@@ -844,7 +844,9 @@ advances its generator exactly as one ordinary sampled step does and commits
 the same token that step would. A seeded request's output is reproducible for
 a fixed sequence of per-step draft counts; a drafter whose offers depend on
 the batch, such as the dummy's `solo` policy, changes those counts and with
-them the stream.
+them the stream. So does asynchronous scheduling: a request that a
+prefill-only step hides gets no model proposal from its last verify, so it
+verifies its next step with no drafts, and arrival timing decides how often.
 
 **Live rows only.** The walk samples the live rows. A padding row commits its
 column 0 argmax with a count of 1, as the greedy walk gives it, because the
