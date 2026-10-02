@@ -3,12 +3,17 @@
 
 from types import SimpleNamespace
 
+import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import RequestStatus
 
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTDecodeInterleavePolicy,
+    TTScheduler,
+    TTSchedulingMode,
+)
 
 
 def _running(is_prefill_chunk=False):
@@ -33,6 +38,11 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
     scheduler._forced_mode = mode
+    # Production defaults; the decode-interleave cadence itself is covered in
+    # tests/test_decode_interleave.py.
+    scheduler._decode_interleave = TTDecodeInterleavePolicy(
+        SimpleNamespace(additional_config={})
+    )
     return scheduler
 
 
@@ -51,6 +61,40 @@ def test_forced_prefill_does_not_fallback_to_decode_per_lane(monkeypatch):
     output = scheduler.schedule()
 
     assert output.total_num_scheduled_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("prefill_preemptions", "decode_preemptions"),
+    [(None, None), ({"prefill"}, None), (None, {"decode"}), ({"prefill"}, {"decode"})],
+)
+def test_decode_fallback_preserves_cleanup_from_both_outputs(
+    monkeypatch, prefill_preemptions, decode_preemptions
+):
+    scheduler = _scheduler(
+        running=[_running()], waiting=1, mode=TTSchedulingMode.DEFAULT
+    )
+    prefill = SchedulerOutput.make_empty()
+    prefill.finished_req_ids = {"finished-prefill", "shared"}
+    prefill.preempted_req_ids = prefill_preemptions
+    prefill.free_encoder_mm_hashes = ["image-prefill"]
+    decode = SchedulerOutput.make_empty()
+    decode.num_scheduled_tokens = {"running": 1}
+    decode.total_num_scheduled_tokens = 1
+    decode.finished_req_ids = {"finished-decode", "shared"}
+    decode.preempted_req_ids = decode_preemptions
+    decode.free_encoder_mm_hashes = ["image-decode"]
+    monkeypatch.setattr(scheduler, "_schedule_prefill_only", lambda: prefill)
+    monkeypatch.setattr(scheduler, "_schedule_decode_only", lambda: decode)
+
+    result = scheduler.schedule()
+
+    assert result.num_scheduled_tokens == {"running": 1}
+    assert result.total_num_scheduled_tokens == 1
+    assert result.finished_req_ids == {"finished-prefill", "finished-decode", "shared"}
+    assert (result.preempted_req_ids or set()) == (prefill_preemptions or set()) | (
+        decode_preemptions or set()
+    )
+    assert result.free_encoder_mm_hashes == ["image-prefill", "image-decode"]
 
 
 def test_forced_decode_hides_and_restores_skipped_waiting(monkeypatch):

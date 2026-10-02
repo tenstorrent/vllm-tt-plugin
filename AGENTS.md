@@ -235,20 +235,18 @@ trigger never fires.
 New behaviour is gated on capabilities a model class declares, not on a new
 model-type allowlist. `TTPlatform.check_and_update_config` reads a
 `model_capabilities` dictionary off the model class at config time, before an
-instance exists. Downstream code reads rewritten scheduler and cache fields,
+instance exists. The authoritative key inventory, absent-value defaults,
+validation rules, and `SpecPlan` fields are in
+[docs/MODEL_CAPABILITIES.md](docs/MODEL_CAPABILITIES.md). Update that reference
+when changing a capability consumer or a model declaration.
+
+Downstream code reads rewritten scheduler and cache fields,
 `store_tt_*` / `get_tt_*` on `VllmConfig`, or `TTPlatform` class attributes.
-It does not re-read the dict.
-
-Keys currently consumed by `src/vllm_tt_plugin/platform.py`:
-
-| Key | Default if absent | Effect |
-|---|---|---|
-| `supports_chunked_prefill` | `False` | Whether scheduler-driven chunked prefill is enabled |
-| `supports_prefix_caching` | `False` | Whether the vLLM prefix cache may be used |
-| `output_tokens_per_step` | `1` | Committed output width per step. `1` is token-at-a-time; `>1` is block-output width |
-| `supports_sample_on_device` | `False` | Opt-in for on-device sampling. A requested `sample_on_device_mode` is rejected when `False` |
-| `supports_device_grammar` | `False` | Whether decode sampling can accept vLLM's packed grammar bitmask after forward. Requires `supports_sample_on_device`; structured prefill remains host-sampled |
-| `supports_async_decode` | `False` | Whether async scheduling may stay on. When `False`, the platform warns and clears `async_scheduling` |
+Some consumers also read `model_capabilities` directly: `TTWorker.init_device`
+uses `fabric_config`, `TTModelRunner` checks sampling and hidden-state
+declarations, and `TTAsyncDecodeController.plan_decode_reload` checks
+`supports_async_decode`. Do not assume config-time resolution eliminates all
+runtime reads. Keep class and instance declarations consistent.
 
 Absent keys default via `.get`. That is the live contract. Do not add
 fail-on-missing for a new key unless the matching tt-metal generators will
@@ -264,9 +262,13 @@ not remove them in an unrelated pull request:
 - GPT-OSS top-K logprobs: `hf_config.model_type == "gpt_oss"`
 - hybrid KV: `get_kv_cache_spec` on the model class, not `model_capabilities`
 
-Two more contracts are methods, not dict keys: hybrid KV opt-in is
-`get_kv_cache_spec`; block-output lifecycle is `release_request` and
-`release_persistent_capture`.
+Other contracts are methods, not dictionary keys: hybrid KV opt-in is
+`get_kv_cache_spec`; block-output lifecycle uses `release_request`,
+`release_persistent_capture`, and, for adaptive block output with multiple
+requests, `note_state_slots_moved`; speculative feasibility is `spec_plan`, a
+classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRACT.md).
+`supports_narrow_decode` belongs to `SpecPlan`, not `model_capabilities`.
+`SpecPlan` resource declarations do not yet enforce row or byte budgets.
 
 The model classes and their capability declarations live in **tt-metal**, under
 `models.tt_transformers.tt.generator_vllm` and the per-demo generators such as

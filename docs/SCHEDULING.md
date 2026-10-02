@@ -14,15 +14,21 @@ Code pointers are intentionally minimal. The main entry points are
 `src/vllm_tt_plugin/model_runner.py`, `src/vllm_tt_plugin/async_decode.py`, and
 `src/vllm_tt_plugin/utils/dp_discovery.py`.
 
+The [model capability reference](MODEL_CAPABILITIES.md) lists the declarations
+that enable each execution path. Generic speculative decoding follows the
+[speculative decoding contract](SPEC_DECODE_CONTRACT.md) and can combine
+ordinary single-token decoding with multi-token verification in one launch.
+
 ## Short Version
 
 The current TT path is more specialized than upstream vLLM:
 
 - A TT step is treated as either all-prefill or all-decode.
 - TT does not support mixed prefill+decode batches.
-- Token-chunked prefill is supported, but only for model types whose tt-metal
-  generator can resume a prefill (never for block-output models); a chunk
-  continuation is prefill work and only ever runs in a prefill step.
+- Token-chunked prefill is supported, but only for models whose tt-metal class
+  declares that its generator can resume a prefill (never for block-output
+  models); a chunk continuation is prefill work and only ever runs in a prefill
+  step.
 - CPU-device work overlap is a decode optimization.
 - Standard multi-process DP runs independent per-rank engines.
 - Single-process lane-DP coordinates lanes within one process and executes one
@@ -108,7 +114,17 @@ choice depends on:
 vLLM normally enables async scheduling when the configuration is compatible.
 The TT platform turns it off when the selected model does not declare
 `supports_async_decode`. Block-output models are stricter: the platform
-refuses to start unless `--no-async-scheduling` is passed.
+refuses to start unless `--no-async-scheduling` is passed. The one exception
+is a model that also declares `tt_adaptive_block_output`. That declaration
+removes the block-output refusal, but the model must still declare
+`supports_async_decode` for async scheduling to remain enabled. Adaptive
+block-output reservation is decided per step; see "Block-output reservation"
+below.
+
+A generic speculative launch has another requirement: when async scheduling
+remains enabled, `TTPlatform.check_and_update_config` requires
+`supports_async_spec_decode` as well. `supports_async_decode` alone does not
+cover deferred verification or the lifetime of the target hidden state.
 
 With standard DP there is no global prefill/decode decision. One rank can run
 prefill while another runs decode.
@@ -153,23 +169,31 @@ The TT scheduler behaves like this:
 - if pending prefill work cannot be admitted, fall back to decode to free
   capacity. Partial prefills do not make this fallback viable: a decode step
   cannot advance them, so only genuine running decodes count.
+- once `decode_interleave_prefill_steps` consecutive prefill steps have run,
+  spend the next `decode_interleave_decode_steps` steps on decode anyway, so a
+  running request's inter-token latency does not scale with another request's
+  prompt length. Both counts default to 1 decode step after 2 prefill steps.
+  See "Decode interleave" below.
 
 The reason for this policy is simple: TT wants a homogeneous batch type per
 step.
 
 At configuration time the platform turns requested chunked prefill off for
-every model type whose tt-metal generator cannot resume a prefill — and for
-every block-output model, which cannot resume a split prompt — and zeroes
+every model that does not declare
+`model_capabilities['supports_chunked_prefill']`, and for every block-output
+model, which cannot resume a split prompt, and zeroes
 `long_prefill_token_threshold` (the base scheduler applies that cap before it
 consults `enable_chunked_prefill`, so leaving it set would still split a
-prefill). When chunked prefill is off and `max_num_batched_tokens` is smaller
-than `max_model_len`, it raises that token budget to `max_model_len` so a full
-prompt can be admitted instead of leaving an unschedulable request in
-`waiting`.
+prefill). When chunked prefill stays on, `max_num_batched_tokens` is left as
+vLLM set it (2048 for `vllm serve` / `server_example_tt.py`, 8192 for `LLM()`,
+or an explicit `--max-num-batched-tokens`). When chunked prefill is off and
+`max_num_batched_tokens` is smaller than `max_model_len`, it raises that token
+budget to `max_model_len` so a full prompt can be admitted instead of leaving
+an unschedulable request in `waiting`.
 
 ### Chunked prefill
 
-For a model type that supports it, the base scheduler may give a long prompt
+For a model that declares support, the base scheduler may give a long prompt
 only part of the token budget. The request then moves to `running` with
 `is_prefill_chunk` set, and later prefill steps schedule the next chunk until
 the prompt is fully computed.
@@ -186,6 +210,184 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+### Decode interleave
+
+Preferring prefill whenever prefill work is pending has one bad consequence.
+A step carries either prefill rows or decode rows, so a prompt the base
+scheduler splits into N chunks occupies N *consecutive* prefill steps, and
+every running decode waits for all of them. The inter-token latency a decode
+request observes therefore grows with the other requests' prompt lengths.
+Splitting a long prompt does not fix that by itself: the chunks are simply
+consecutive. Upstream vLLM has no equivalent problem, because its token-budget
+scheduler puts one prefill chunk and the running decodes in the same step; TT
+cannot mix, so the interleave granularity is a whole step and the scheduler
+has to choose to alternate.
+
+`TTDecodeInterleavePolicy` (in `scheduler.py`) bounds that run. It holds two
+counters and answers one question per step, from state the scheduler already
+has:
+
+- `decode_interleave_prefill_steps` (default 2): consecutive prefill steps
+  allowed before a decode-only step is inserted.
+- `decode_interleave_decode_steps` (default 1): how many decode-only steps
+  one insertion runs. Reaching this count stops the policy choosing decode; it
+  never forces a prefill step.
+- `decode_interleave_enabled` (default `true`): the off switch, which restores
+  the strictly prefill-first policy.
+
+Both counts are step counts, not token counts, because the interleave
+granularity is a whole step. They bound each side separately: a running decode
+waits at most `decode_interleave_prefill_steps` steps for its next step, and
+pending prefill work waits at most `decode_interleave_decode_steps` steps for
+its next step. Neither side starves.
+
+Four properties keep the policy contained:
+
+- It only ever chooses decode *in place of* prefill. It never forces prefill,
+  so it cannot delay a decode that would have run anyway.
+- Only a running decode can be inserted. A partial-prefill continuation is not
+  one: `_schedule_decode_only` hides it and it samples no token, so a step
+  inserted on its account would be empty.
+- It never replaces the first step of a prefill run with a decode. That is what
+  keeps a new prompt's time to first token unaffected: a prompt arriving into
+  steady decode gets its prefill step on the next step, and the policy only
+  fires once a run of prefill steps is already under way.
+- An interleaved step goes through the same `_schedule_decode_only` pass as
+  every other decode step, which hides both waiting queues and the partial
+  prefills. Only step *ordering* changes, never any per-request state machine,
+  so greedy output is identical with the policy on and off.
+
+The zero-progress fallback above is separate and unchanged: a prefill pass that
+schedules no tokens still falls back to decode on its own account.
+
+Mode switches are not free. Entering prefill drains pending async decode
+overlap (the steady-decode fast path; see
+[DECODE_RELOAD_CONTRACT](DECODE_RELOAD_CONTRACT.md)), and the decode step after
+a prefill step reloads its full forward inputs instead of taking the fast path.
+The policy therefore trades some decode-overlap efficiency and some time to
+first token for a bounded inter-token latency.
+
+Two relations describe what each count does, and they are what to reason with
+when tuning:
+
+- **A run of consecutive prefill steps is `decode_interleave_prefill_steps`
+  steps long**, so the gap a decode request sees spans that many chunks. This
+  count sets the inter-token-latency bound.
+- **The share of steps spent on prefill is `prefill_steps / (prefill_steps +
+  decode_steps)`**, so the *ratio* sets how device time splits between
+  admitting new prompts and advancing running ones. That is what moves time to
+  first token and throughput.
+
+`decode_interleave_prefill_steps` appears in both relations and
+`decode_interleave_decode_steps` in only the second. Raising
+`decode_interleave_decode_steps` therefore does not loosen the bound; it buys
+more decode progress per insertion, and it does so more cheaply than a short
+prefill run does, because the fixed cost of leaving and re-entering decode is
+spread over a longer decode run. So the time to first token given up per decode
+token delivered falls as `decode_interleave_decode_steps` rises.
+
+One effect is worth knowing because it is not a scheduling effect at all. Under
+async scheduling a step's sampled token is published once the *next* step has
+been submitted, not when the step itself finishes. Within one insertion, every
+decode token but the last is published as the following decode step is
+submitted, which is immediate. The last one waits for the following prefill
+step to be submitted, and on TT that call runs a whole chunk synchronously, so
+that token is published a chunk later than its siblings.
+
+An insertion's tokens therefore reach the client spread out rather than
+together, which lowers the worst gap a decode request observes for a given
+`decode_interleave_prefill_steps`. The device computed the same tokens at the
+same time either way; only the publish times differ. Running with
+`--no-async-scheduling` removes the effect, which is what confirms the cause. A
+block-output model runs with `--no-async-scheduling` and so does not get it,
+but such a model never runs chunked prefill anyway.
+
+Turning chunked prefill on can make the worst decode gap *worse* than leaving
+it off, and the interleave is what removes that. Two effects compound, and the
+larger one is not chunking overhead:
+
+- **Contiguity.** With chunked prefill off, `_disable_chunked_prefill` raises
+  `max_num_batched_tokens` to `max_model_len`, so one step can prefill a whole
+  prompt, and several whole prompts if they fit the budget. Prompts that arrive
+  spaced apart then leave gaps in which `_has_pending_prefill` is false and
+  decode steps run, so a decode request waits for one step at a time. Split
+  into chunks, the next prompt arrives before the previous one finishes,
+  pending prefill work never drains, and the runs merge: the decode request
+  waits for *every* queued prefill instead of one. This term grows with the
+  number of prompts whose prefills overlap.
+- **Chunking overhead.** A prompt split across steps costs more total prefill
+  time than the same prompt in one step. One contributor is padding:
+  `get_padded_prefill_len` in tt-metal rounds a chunk up to 128, to 1024, or to
+  the next power of two, so a chunk size that is not already such a length runs
+  padded work every step. This term is the smaller of the two.
+
+The interleave attacks the first term, which is why it recovers more than
+chunking costs. The benefit is proportional to how long the run of consecutive
+prefill steps actually is, so at a token budget large enough that a prompt is
+one or two chunks and the queue drains between arrivals, the policy changes
+very little.
+
+`decode_interleave_prefill_steps` is the knob to reach for: raise it to favour
+time to first token, lower it to favour inter-token latency, and raise
+`decode_interleave_decode_steps` to buy decode progress within a chosen bound.
+The measurements the defaults rest on are in the pull request that introduced
+this policy.
+
+In single-process lane-DP, decode interleaving is decided jointly for all
+lanes: `TTLaneCoordinator` holds one policy and `_negotiate_forced_mode`
+inserts a decode step when some lane has a decode that a decode step can
+advance. Every lane executes the one negotiated mode, so a per-lane decision
+would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
+each rank runs the policy on its own scheduler state.
+
+### Generic speculative decoding
+
+The generic speculative path uses `speculative_config` and a model's
+`spec_plan` admission result. `TTPlatform.check_and_update_config` rejects
+speculation for lane-DP and for models with `output_tokens_per_step > 1`.
+Standard multi-process DP keeps speculation local to each independent rank.
+The [speculative decoding contract](SPEC_DECODE_CONTRACT.md) defines supported
+methods, model hooks, request controls, and acceptance semantics.
+
+The scheduler and runner divide the work as follows:
+
+1. `TTPlatform.check_and_update_config` writes `spec_plan.effective_k` back to
+   `speculative_config.num_speculative_tokens`, so the scheduler reserves the
+   admitted draft width.
+2. `TTScheduler` reserves `K+1` additional KV positions for a model-owned
+   `custom_class` drafter, where `K` is the admitted draft width. The drafter
+   can write its next proposal over the committed anchor and `K` candidates.
+   The host `ngram` drafter needs no additional proposal-side KV reservation.
+3. `TTModelRunner` builds a candidate block of width `1+K` when a decode step
+   carries drafts or unresolved multi-token acceptance. `TTModelRunner` also
+   uses that width when the model cannot serve ordinary narrow decode within
+   the speculative launch.
+4. `TTModelRunner` uses an ordinary width-1 decode when no row carries drafts,
+   no row has unresolved multi-token acceptance, and the admitted model can
+   serve narrow decode. Ordinary decode can use the existing async overlap
+   path when the reload and sampling conditions permit it.
+5. `TTAsyncDecodeController` drains pending work before verification.
+   Verification can defer readback, but verification does not overlap another
+   outstanding step. The host acceptance result must be available before
+   `TTModelRunner` builds the next candidate block.
+
+For synchronous scheduling, `EngineCore` transfers proposed token IDs through
+`TTScheduler.update_draft_token_ids`. For async scheduling, `TTModelRunner`
+retains the proposals and uses the scheduler's placeholder reservation to
+limit the next verification. A forced prefix-cache reset counts pending
+output frames, not reserved token positions: one speculative output frame can
+contain several committed tokens.
+
+The current `argmax_ids` acceptance path certifies greedy requests.
+`TTModelRunner._publish_draft` withholds proposals from requests with nonzero
+temperature or penalties. Such requests use their sampling controls on
+ordinary decode steps. A shared verification step can still include those
+requests, because another request has drafts or because the model requires a
+wide verification step. `TTModelRunner` then commits target argmax IDs for
+those rows and logs that temperature and penalties were not applied. Use a
+separate non-speculative launch when those controls must be preserved for
+every step.
+
 ### Block-output reservation
 
 Output placeholders (see "Why TT uses an async-style scheduler even in
@@ -198,7 +400,43 @@ sampled-token placeholder and `TTScheduler` reserves the remaining physical
 block width. All placeholders are consumed when that block result is applied;
 client-visible output is still trimmed at EOS, stop tokens, and `max_tokens`.
 See [DiffusionGemma block serving](diffusion-gemma.md) for the current
-256-token block contract.
+256-token block contract. Block-output reservation is separate from generic
+speculative decoding: the block-output model owns its committed token block,
+and a launch cannot combine `output_tokens_per_step > 1` with
+`speculative_config`.
+
+#### Adaptive block-output reservation
+
+A model declaring `tt_adaptive_block_output` commits a block on SOME steps and
+a single baseline token on the others, so the reservation above is not the
+model-wide rule -- it is a per-step decision. `TTScheduler._update_after_schedule`
+adds the extra placeholders only when all four of these hold for the request:
+
+1. the step is **solo** -- exactly one request in `num_scheduled_tokens`;
+2. the step is a **decode** -- the prompt was fully computed BEFORE this step;
+3. the request is not a prefill chunk;
+4. the request **owns the model's single speculative session**, tracked in
+   `TTScheduler._spec_session_owner` by `_mirror_spec_session`.
+
+Every other step reserves one placeholder, matching the one baseline token the
+model emits for it. The capture frontier
+(`tt_adaptive_block_max_prompt_tokens`) is not a fifth condition: it is a
+property of the prefill that armed the session, applied once in
+`_mirror_spec_session` against the same `prompt_lens` quantity the model
+measures, and thereafter carried by ownership.
+
+Each step's decision is recorded on that step's own `SchedulerOutput`, in the
+`_tt_block_step_decisions` map (`set_tt_block_step_decisions` /
+`get_tt_block_step_decisions`), and bound in `update_from_output` before the
+base loop commits. That is the mechanism that makes async block serving safe:
+under async scheduling the next step's `schedule()` overwrites `Request` state
+before this step's output commits, so a decision stored on the request would be
+read against the wrong output, while the engine core always hands back the
+`SchedulerOutput` that produced the output being committed.
+`_update_request_with_output` raises rather than guesses when a request commits
+output with no recorded decision. It sits next to the forced-reset discard
+counts, which block steps reject outright: a stale async frame cannot balance a
+K-placeholder reservation.
 
 ### Why TT uses an async-style scheduler even in TT-specific flows
 
@@ -483,8 +721,8 @@ The current TT path is more constrained:
 
 - it treats prefill and decode as separate batch modes
 - it avoids mixed prefill+decode batches
-- it allows chunked prefill only for model types validated for it, and always
-  on the prefill side of the split
+- it allows chunked prefill only for models that declare support for it, and
+  always on the prefill side of the split
 
 ### 2. Async queueing model
 

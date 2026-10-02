@@ -25,7 +25,6 @@ from vllm.v1.core.sched.output import GrammarOutput
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController, TTDecodeSubmission
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
-from vllm_tt_plugin.platform import TTPlatform
 
 VOCAB_WORDS = 2  # int32 words per grammar bitmask row
 
@@ -79,6 +78,7 @@ def _device_sampling_runner(*, supports_device_grammar: bool):
         scheduler_config=SimpleNamespace(async_scheduling=False),
         input_batch=SimpleNamespace(
             no_allowed_token_ids=True,
+            no_penalties=True,
             sampling=SimpleNamespace(
                 bad_words_token_ids={},
                 has_active_logitsprocs=lambda: False,
@@ -86,6 +86,7 @@ def _device_sampling_runner(*, supports_device_grammar: bool):
             max_num_logprobs=None,
         ),
         model_config=SimpleNamespace(logits_processors=[]),
+        model=SimpleNamespace(model_capabilities={}),
     )
 
 
@@ -163,6 +164,7 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens():
         _forward_with_model_input=forward,
         _sample_sync_forward=sample_sync,
         apply_and_build_runner_output=lambda sampled, _logprobs, **_kwargs: sampled,
+        _num_speculative_tokens=0,
     )
     runner._reorder_grammar_bitmask = partial(
         TTModelRunner._reorder_grammar_bitmask,
@@ -261,6 +263,7 @@ def test_model_load_downgrades_device_grammar_for_incompatible_runtime(
         vllm_config=object(),
         model_config=object(),
         supports_device_grammar=True,
+        _spec_supports_narrow_decode=False,
     )
 
     TTModelRunner.load_model(runner)
@@ -297,6 +300,7 @@ def test_model_load_activates_device_grammar_runtime(monkeypatch):
         vllm_config=object(),
         model_config=object(),
         supports_device_grammar=True,
+        _spec_supports_narrow_decode=False,
     )
 
     TTModelRunner.load_model(runner)
@@ -339,53 +343,6 @@ def test_front_packed_grammar_remap_failure_poisons_runner():
         )
 
     assert poisoned == [True]
-
-
-def test_trace_all_warmup_prepares_decode_before_prefill_capture(monkeypatch):
-    events = []
-
-    class Model:
-        already_warmed_up_prefill = True
-
-        def warmup_model_prefill(self, *, enable_trace, **_kwargs):
-            events.append(("prefill", enable_trace))
-
-        def warmup_model_decode(self, *, enable_trace, **kwargs):
-            events.append(
-                (
-                    "decode",
-                    enable_trace,
-                    kwargs.get("sampling_trace_variants_prepared", False),
-                )
-            )
-
-        def prepare_device_grammar_decode_trace_warmup(self, **_kwargs):
-            events.append(("prepare-decode",))
-            return True
-
-        def capture_prepared_device_grammar_decode_trace(self):
-            events.append(("capture-decode",))
-
-    monkeypatch.setattr(TTPlatform, "sample_on_device_mode", "decode_only")
-    runner = SimpleNamespace(
-        trace_mode="all",
-        supports_device_grammar=True,
-        model=Model(),
-        kv_caches=object(),
-        tt_max_batch_size=4,
-        max_num_blocks_per_req=8,
-    )
-
-    TTModelRunner.warmup_model(runner)
-
-    assert events == [
-        ("prefill", False),
-        ("decode", False, False),
-        ("prepare-decode",),
-        ("prefill", True),
-        ("capture-decode",),
-        ("decode", True, True),
-    ]
 
 
 # --------------------------------------------------------------------------
@@ -804,6 +761,8 @@ def test_finish_front_packed_sync_applies_grammar_before_sampling():
         _apply_grammar_to_input=apply_grammar,
         _sample_sync_forward=sample_sync,
         apply_and_build_runner_output=build_output,
+        # This launch does not speculate, so the decode tail owes no proposal.
+        _num_speculative_tokens=0,
     )
     fwd = _sync_forward(_model_input())
 

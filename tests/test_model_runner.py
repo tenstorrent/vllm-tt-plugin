@@ -60,10 +60,12 @@ def _batch_with_one_request(
 
 def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamespace:
     """Creates a fake runner with the given batch and request, for testing purposes."""
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         input_batch=batch,
         requests={"r": request},
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
+        _is_adaptive_block_output=False,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -76,6 +78,12 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+    # The output-commit methods resolve the step's committed width through
+    # _tt_committed_width (reads _is_adaptive_block_output + _output_tokens_per_step).
+    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
+        runner, toks
+    )
+    return runner
 
 
 def _prepare(runner, *rows):
@@ -346,3 +354,26 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+
+@pytest.mark.parametrize("declared", [None, True, False])
+@pytest.mark.parametrize("has_penalties", [False, True])
+def test_device_penalties_follow_model_capability(declared, has_penalties):
+    capabilities = {} if declared is None else {"supports_device_penalties": declared}
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        model=SimpleNamespace(model_capabilities=capabilities),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_penalties=not has_penalties,
+            no_allowed_token_ids=True,
+            max_num_logprobs=None,
+            sampling=SimpleNamespace(
+                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            ),
+        ),
+    )
+    expected = not (has_penalties and declared is False)
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected

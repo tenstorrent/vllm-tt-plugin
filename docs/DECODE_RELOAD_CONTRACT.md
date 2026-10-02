@@ -173,8 +173,8 @@ current scheduler allocation even when token and position tensors are stale.
 
 The `tokens` and `start_pos` arguments are authoritative only when
 `reload_inputs` is true. When it is false they are deliberately one step
-behind. An adapter must derive nothing from them—not forward inputs, sampling
-state, or RNG counters.
+behind. An adapter must derive no forward inputs, sampling state, or RNG
+counters from `tokens` or `start_pos` when `reload_inputs=False`.
 
 For example, an adapter that ties seeded sampling to the absolute decode
 position must align its counter from `start_pos` on a reloading step and then
@@ -191,7 +191,7 @@ must be consumed by step `k+1`.
 The base case is a full reload. Before issuing it, the runner finalizes the
 older step, suppresses late results for request IDs already reported finished,
 excludes explicitly marked forced-reset results from runner state, and applies
-every accepted token—including an ordinary preemption's in-flight token—to
+every accepted token, including an ordinary preemption's in-flight token, to
 host request state. It then copies the authoritative token, position, layout,
 and requested sampling state.
 
@@ -272,6 +272,24 @@ following are true:
 The capability is fail-closed. Without it, the plugin disables async scheduling
 for that model and requests a full forward-input reload on every version-1
 decode.
+
+This document defines the ordinary single-token decode contract only: a launch
+that also configures speculative decoding adds a wider verify call, a
+`supports_async_spec_decode` capability and the step-selection and KV
+reservation rules that go with them, all stated in
+[SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
+
+For a speculative verification step, `TTAsyncDecodeController.plan_decode_reload`
+always sets `reload_inputs=True`: `TTModelRunner` builds the candidate block
+from the current drafts and each request's last committed token.
+`TTAsyncDecodeController` drains pending work before verification and marks
+deferred verification output as ineligible for overlap. Deferred readback
+therefore does not imply concurrent verification steps. A speculative launch
+can also issue ordinary width-1 decode steps when the admitted model supports
+that transition; those ordinary steps follow the reload rules in this
+document. See [Generic speculative decoding](SCHEDULING.md#generic-speculative-decoding)
+for step selection and [Model capabilities](MODEL_CAPABILITIES.md) for the
+separate ordinary and speculative async declarations.
 
 ## Negotiation and rollout
 

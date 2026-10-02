@@ -195,7 +195,9 @@ class SamplingInputBatch:
         }
         result: dict[str, torch.Tensor] = {}
         for name, default_value in self.DEFAULTS.items():
-            dtype = dtype_map[type(default_value)]
+            # Keep the API seed intact through batching and host sampling.
+            # Models narrow it only at their device-sampling boundary.
+            dtype = torch.int64 if name == "seed" else dtype_map[type(default_value)]
             result[name] = torch.full((self.max_num_reqs,), default_value, dtype=dtype)
         return result
 
@@ -701,30 +703,6 @@ class InputBatch:
             out.append(bt_cpu)
         return out
 
-    def advance_generators(self, req_indices: list[int] | None = None) -> None:
-        # This relies on the fact, that for a torch all_gather_object,
-        # the local object is also copied,
-        # so the original object is not modified.
-        # Otherwise, the generator at local_rank 0
-        # would get out of sync with the others.
-        #
-        # ``req_indices`` restricts advancement to the build's own requests.
-        # Each generator belongs to a single request, so lane-DP (which calls
-        # this once per lane) passes the lane's indices to advance every
-        # generator exactly once per step rather than once per lane. ``None``
-        # advances all generators (whole-batch build, called once per step).
-        if req_indices is None:
-            generators = list(self.sampling.generators.values())
-        else:
-            generators = [
-                self.sampling.generators[i]
-                for i in req_indices
-                if i in self.sampling.generators
-            ]
-        for generator in generators:
-            # Sample once from the generator to advance its state.
-            torch.rand(1, generator=generator)
-
 
 class TTLaneInputBatch(InputBatch):
     """Persistent input batch for single-process multi-lane (lane-DP) execution.
@@ -1219,7 +1197,9 @@ class TTLaneInputBatch(InputBatch):
             lane_batch.req_ids[:total],
         )
         perform_device_sampling = runner.check_perform_device_sampling(
-            is_decode=True, has_structured_outputs=has_structured
+            is_decode=True,
+            has_structured_outputs=has_structured,
+            sampling_rows=occupied,
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
@@ -1328,7 +1308,9 @@ class TTLaneInputBatch(InputBatch):
             runner.requests, scheduler_output, bitmask
         )
         perform_device_sampling = runner.check_perform_device_sampling(
-            is_decode=False, has_structured_outputs=has_structured
+            is_decode=False,
+            has_structured_outputs=has_structured,
+            sampling_rows=rows,
         )
         if intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,

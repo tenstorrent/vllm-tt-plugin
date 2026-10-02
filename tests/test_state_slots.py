@@ -28,8 +28,42 @@ def _runner(slots=SLOTS):
         tt_per_lane_max_num_seqs=slots,
         _req_state_slot={},
         _pending_state_slot_settle=None,
+        _pending_state_slot_moves=None,
         requests={},
     )
+
+
+class _SessionModel:
+    """A model holding ONE B=1 session, keyed on the slot it was armed at.
+
+    Mirrors ``Gemma4DFlashForCausalLM``: arming records the owner slot, a release
+    for a different slot is ignored so a live owner is not torn down, and the
+    runner reports every gather so the owner slot follows its state.
+    """
+
+    def __init__(self):
+        self.owner_slot = None
+        self.session_of = None  # which req_id the live session belongs to
+        self.moves_seen: list[dict[int, int]] = []
+
+    def arm(self, req_id, slot):
+        self.owner_slot = int(slot)
+        self.session_of = req_id
+
+    def note_state_slots_moved(self, moves):
+        self.moves_seen.append(dict(moves))
+        if self.owner_slot is not None and int(self.owner_slot) in moves:
+            self.owner_slot = int(moves[int(self.owner_slot)])
+
+    def release_request(self, row):
+        if (
+            self.owner_slot is not None
+            and row is not None
+            and int(row) != int(self.owner_slot)
+        ):
+            return
+        self.owner_slot = None
+        self.session_of = None
 
 
 def _prefill(runner, row_req_ids):
@@ -293,3 +327,125 @@ def test_a_decoding_request_without_a_slot_raises():
     _prefill(r, ["A"])
     with pytest.raises(RuntimeError, match="'GHOST' has no device state slot"):
         _decode(r, ["A", "GHOST"])
+
+
+def test_cancelling_an_older_request_keeps_a_reused_slots_live_session():
+    """Slot movement + slot REUSE + cancelling the older request (#118 finding 1).
+
+    Releasing by the slot a request was PREFILLED into is not enough, because
+    slots are reused. Victor's sequence:
+
+      1. X prefills into slot 0, A into slot 1.
+      2. X is cancelled; its slot records are dropped and slot 0 frees.
+      3. A is gathered 1 -> 0.
+      4. B prefills into the now-free slot 1 and ARMS the session there.
+      5. A is cancelled before B ever decodes.
+      6. B must still own its session -- otherwise its next solo decode returns
+         one token against a reserved block and the scheduler rejects the width.
+
+    With release-by-prefill-slot, step 5 released A as slot 1, matched B's owner
+    slot and cleared B. The fix is that the model is told about step 3's move and
+    the release uses the CURRENT slot.
+    """
+    r = _runner()
+    model = _SessionModel()
+    r.model = model
+
+    assert _prefill(r, ["X", "A"]) == [0, 1]
+    state = ["X", "A"] + [None] * (SLOTS - 2)
+
+    # A is the solo owner at this point; arm it where it was prefilled.
+    model.arm("A", r._req_state_slot["A"])
+    assert model.owner_slot == 1
+
+    # 2. X is cancelled. A is not the released slot, so its session survives.
+    TTModelRunner._release_model_request(r, "X")
+    _release(r, finished=["X"])
+    r.requests.pop("X")
+    assert model.session_of == "A", "releasing X must not clear A's session"
+
+    # 3. A decodes alone and is gathered into row 0.
+    remap = _decode(r, ["A"])
+    state = _gather(state, remap)
+    _assert_state_found(r, state)
+    assert r._req_state_slot["A"] == 0, "A moved to row 0"
+    assert model.owner_slot == 0, (
+        "the model was told about the gather, so its owner slot follows A"
+    )
+
+    # 4. B takes the freed slot 1 and arms the session there.
+    assert _prefill(r, ["B"]) == [1]
+    state[1] = "B"
+    model.arm("B", r._req_state_slot["B"])
+    assert model.owner_slot == 1 and model.session_of == "B"
+
+    # 5. A is cancelled. A's PREFILL slot was 1 -- which is now B's owner slot.
+    TTModelRunner._release_model_request(r, "A")
+    _release(r, finished=["A"])
+    r.requests.pop("A")
+
+    # 6. The live owner keeps its session.
+    assert model.session_of == "B", (
+        "cancelling A cleared B's session: the release identified B by a slot A "
+        "merely used to be prefilled into"
+    )
+    assert model.owner_slot == 1, "B still owns slot 1"
+    _assert_state_found(r, state)
+
+    # And B's own release still works.
+    TTModelRunner._release_model_request(r, "B")
+    assert model.session_of is None, "B's own release clears B"
+
+
+def test_the_model_is_told_about_a_gather_only_once_it_is_accepted():
+    """A refused decode never moved anything, so the model must not be told.
+
+    ``note_decode_state_slots_settled`` is the commit point for the plugin's own
+    ownership map; the model's owner slot has to move on exactly the same event
+    or the two describe different permutations.
+    """
+    r = _runner()
+    model = _SessionModel()
+    r.model = model
+    _prefill(r, ["A", "B"])
+    model.arm("B", r._req_state_slot["B"])
+    assert model.owner_slot == 1
+
+    # Build a remap that moves B, then DROP it without settling.
+    remap = TTModelRunner._decode_state_slot_remap(r, ["B"])
+    assert remap is not None, "B at slot 1 decoding at row 0 is a real move"
+    assert model.moves_seen == [], "nothing is reported before the decode is accepted"
+    assert model.owner_slot == 1, "and the owner slot has not moved"
+
+    # Now accept it.
+    TTModelRunner.note_decode_state_slots_settled(r)
+    # The gather is a whole permutation, not just the batch row: B's slot 1 goes
+    # to row 0 and A's slot 0 goes to row 1, so BOTH are reported. That is why
+    # the mapping is handed over at once -- walking the pairs in sequence would
+    # move an owner twice.
+    assert model.moves_seen == [{1: 0, 0: 1}], "the accepted gather is reported once"
+    assert model.owner_slot == 0
+
+
+def test_identity_gathers_report_nothing_to_the_model():
+    """The steady state moves nothing, so it must not churn the model's owner."""
+    r = _runner()
+    model = _SessionModel()
+    r.model = model
+    _prefill(r, ["A", "B"])
+    model.arm("A", 0)
+    assert _decode(r, ["A", "B"]) is None, "already in place"
+    assert model.moves_seen == []
+    assert model.owner_slot == 0
+
+
+def test_a_model_without_the_move_hook_still_releases():
+    """The hook is optional on the runner side (the platform requires it only for
+    multi-sequence block-output models), so a model without it must not crash."""
+    r = _runner()
+    released: list[int] = []
+    r.model = SimpleNamespace(release_request=released.append)
+    _prefill(r, ["A", "B"])
+    _decode(r, ["B"])  # a real gather, with nothing to notify
+    TTModelRunner._release_model_request(r, "B")
+    assert released == [0], "released by B's current slot"

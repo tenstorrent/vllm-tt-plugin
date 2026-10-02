@@ -19,7 +19,9 @@ JSON_SCHEMA = {
 }
 
 
-async def _send_choice_request(async_client, model: str, request_id: int) -> str:
+async def _send_choice_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> str:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -28,7 +30,7 @@ async def _send_choice_request(async_client, model: str, request_id: int) -> str
                 "content": f"Pick one color for request {request_id}.",
             }
         ],
-        max_completion_tokens=8,
+        max_completion_tokens=8 + reasoning_token_budget,
         temperature=0,
         presence_penalty=0.5,
         extra_body={"structured_outputs": {"choice": CHOICES}},
@@ -38,7 +40,9 @@ async def _send_choice_request(async_client, model: str, request_id: int) -> str
     return content
 
 
-async def _send_regex_request(async_client, model: str, request_id: int) -> str:
+async def _send_regex_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> str:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -49,7 +53,7 @@ async def _send_regex_request(async_client, model: str, request_id: int) -> str:
                 ),
             }
         ],
-        max_completion_tokens=16,
+        max_completion_tokens=16 + reasoning_token_budget,
         temperature=0,
         extra_body={"structured_outputs": {"regex": REGEX}},
     )
@@ -59,7 +63,9 @@ async def _send_regex_request(async_client, model: str, request_id: int) -> str:
     return content
 
 
-async def _send_json_request(async_client, model: str, request_id: int) -> dict:
+async def _send_json_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> dict:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -71,7 +77,7 @@ async def _send_json_request(async_client, model: str, request_id: int) -> dict:
                 ),
             }
         ],
-        max_completion_tokens=64,
+        max_completion_tokens=64 + reasoning_token_budget,
         temperature=0,
         extra_body={"structured_outputs": {"json": JSON_SCHEMA}},
     )
@@ -85,7 +91,9 @@ async def _send_json_request(async_client, model: str, request_id: int) -> dict:
     return parsed
 
 
-async def _send_plain_request(async_client, model: str, request_id: int) -> str:
+async def _send_plain_request(
+    async_client, model: str, request_id: int, reasoning_token_budget: int = 0
+) -> str:
     response = await async_client.chat.completions.create(
         model=model,
         messages=[
@@ -94,7 +102,7 @@ async def _send_plain_request(async_client, model: str, request_id: int) -> str:
                 "content": f"Reply with a short sentence for request {request_id}.",
             }
         ],
-        max_completion_tokens=16,
+        max_completion_tokens=16 + reasoning_token_budget,
         temperature=0,
     )
     content = response.choices[0].message.content
@@ -106,6 +114,7 @@ def _run_mixed_request_wave(
     tt_server,
     tt_model_name: str,
     max_batch_size: int,
+    reasoning_token_budget: int,
     wave: int,
 ) -> None:
     async def _run() -> None:
@@ -123,6 +132,7 @@ def _run_mixed_request_wave(
                 async_client,
                 tt_model_name,
                 request_id,
+                reasoning_token_budget,
             )
             for request_id in request_ids
         ]
@@ -137,13 +147,19 @@ def test_dp1_full_capacity_mixes_structured_and_plain_requests_first_wave(
     tt_server,
     tt_model_name,
     max_batch_size,
+    reasoning_token_budget,
 ):
-    _run_mixed_request_wave(tt_server, tt_model_name, max_batch_size, wave=0)
+    _run_mixed_request_wave(
+        tt_server, tt_model_name, max_batch_size, reasoning_token_budget, wave=0
+    )
 
 
 def test_dp1_full_capacity_reuses_slots_for_second_mixed_wave(
     tt_server,
     tt_model_name,
     max_batch_size,
+    reasoning_token_budget,
 ):
-    _run_mixed_request_wave(tt_server, tt_model_name, max_batch_size, wave=1)
+    _run_mixed_request_wave(
+        tt_server, tt_model_name, max_batch_size, reasoning_token_budget, wave=1
+    )

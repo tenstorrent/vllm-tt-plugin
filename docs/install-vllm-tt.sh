@@ -30,6 +30,12 @@ rm -f "$VLLM_COMMON_REQUIREMENTS"
 # CUDA build.
 uv pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
     torchvision==0.26.0   # keep in sync with tt-metal requirements-dev.txt
+# numba is absent from common.txt for the same reason as torchvision: vLLM
+# carries it in requirements/cuda.txt, labelled "Required for N-gram
+# speculative decoding". It is platform independent, and vllm.v1.spec_decode.
+# ngram_proposer imports it at module scope, so without it the ngram drafter
+# cannot be constructed and ngram speculation cannot run on TT at all.
+uv pip install numba==0.61.2   # matches vLLM's own requirements/cuda.txt pin
 # --no-binary vllm: the published wheel is the CUDA build, kernels included, so
 # vLLM has to come from source. vLLM ends up declaring no torch dependency, which
 # is intended; torch belongs to the tt-metal env this plugin runs inside.

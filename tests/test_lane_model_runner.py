@@ -238,10 +238,6 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     class FakeInputBatch:
         sampling = SimpleNamespace(generators={0: intermediate, 1: final})
 
-        def advance_generators(self, rows):
-            for row in rows:
-                torch.rand(1, generator=self.sampling.generators[row])
-
     generators = TTModelRunner._build_host_generators(
         FakeInputBatch(), [0, 1], torch.tensor([True, False])
     )
@@ -250,13 +246,14 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     assert torch.equal(generators[0].get_state(), intermediate_before)
     assert generators[1] is final
     assert torch.equal(intermediate.get_state(), intermediate_before)
-    assert not torch.equal(final.get_state(), final_before)
+    assert torch.equal(final.get_state(), final_before)
 
 
 def test_get_output_tokens_skips_all_intermediate_prefill_rows():
     runner = SimpleNamespace(
         host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run"),
         _is_block_output_model=False,
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
     )
     model_input = SimpleNamespace(intermediate_prefill_mask=torch.tensor([True]))
@@ -301,6 +298,7 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
             num_tokens=[8],
         ),
         apply_and_build_runner_output=unexpected_final_output,
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
     )
 
@@ -409,6 +407,11 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         prompt_tokens=None,
         output_tokens=None,
         decode_layout_changed=False,
+        num_valid_drafts=None,
+        # Not a verify: the submission counters read this to tell an ordinary
+        # decode from one.
+        spec_mode=None,
+        accepted_counts=None,
         slot_remap=remap,
     )
 
