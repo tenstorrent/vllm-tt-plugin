@@ -16,14 +16,17 @@ _RECALL_EQUIVALENT_CHARACTERS = str.maketrans(
 
 
 def recalled_passphrase(output: str | None, passphrase: str) -> bool:
-    """Case-insensitively find a passphrase after accepted character folding.
+    """Find a complete passphrase after case and accepted character folding.
 
     Add observed variants to ``_RECALL_EQUIVALENT_CHARACTERS``. Other characters
     remain exact, and a missing output is treated as empty text.
     """
     expected = passphrase.translate(_RECALL_EQUIVALENT_CHARACTERS).lower()
     actual = (output or "").translate(_RECALL_EQUIVALENT_CHARACTERS).lower()
-    return expected in actual
+    return (
+        re.search(r"(?<![\w-])" + re.escape(expected) + r"(?![\w-])", actual)
+        is not None
+    )
 
 
 @dataclass
