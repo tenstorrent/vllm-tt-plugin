@@ -596,12 +596,13 @@ first step, which under narrow decode is an ordinary decode.
 
 The model then owns that row's device-resident decode inputs. The runner's
 reload plan ([DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md)) reloads
-host tokens and positions on layout changes and the other listed transitions;
-it does not know that a row's committed tokens came from the drafter rather
-than from the plain decode trace. A model whose plain decode keeps tokens and
-positions resident on the device must reload them itself on that row's first
-plain decode after a drafter-served step, or that decode continues from stale
-state.
+host tokens and positions on layout changes and the other listed transitions,
+including the first ordinary decode after a verify, which the runner sees. It
+does not know that an ordinary decode's committed tokens came from the drafter
+rather than from the plain decode trace. A model whose plain decode keeps
+tokens and positions resident on the device must reload them itself on that
+row's first plain decode after a drafter-served step, or that decode continues
+from stale state.
 
 ## 4e. Batch changes while a proposal is outstanding
 
