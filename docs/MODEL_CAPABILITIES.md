@@ -95,8 +95,11 @@ Device sampling also falls back to the host for supported host-only sampling
 controls, structured output without an eligible `supports_device_grammar`
 decode, and unsupported logprob requests. These runtime
 restrictions remain in force when `supports_sample_on_device=True`. Generic
-speculative request restrictions remain separate from ordinary sampling:
-the current speculative acceptance path requires greedy requests. See
+speculative request restrictions remain separate from ordinary sampling: a
+model whose `spec_plan` offers only `argmax_ids` speculates for greedy
+requests only and refuses logprobs, structured output and token filters on a
+speculating launch, while a model that also offers `logits` speculates for
+sampled requests and applies all of those on the host. See
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
 
 Sources: [platform.py](../src/vllm_tt_plugin/platform.py),

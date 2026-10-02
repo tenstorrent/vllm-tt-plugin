@@ -28,10 +28,13 @@ serve speculative decoding within the following execution limits:
   what the model declares (section 4h). A plan must offer at least one of
   them; `fused_sample` has no runner path. An ordinary narrow decode does not
   send `spec_mode`.
-- **speculation for sampled requests, on a model serving `logits`.** The runner
-  rejection-samples each verify row on the host against the target
+- **speculation for every admitted request, on a model serving `logits`.** The
+  runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
-  frequency and repetition penalties and seed (section 4h).
+  frequency and repetition penalties and seed, its grammar bitmask,
+  `allowed_token_ids`, `bad_words` and `min_tokens`, and returns the logprobs
+  of every committed token (section 4h). These are the controls upstream's
+  rejection sampler applies under speculation.
 - **speculation for greedy requests only, on a model serving only
   `argmax_ids`.** That accept walk compares token ids and never sees logits,
   so it can certify only an argmax continuation. A request with a non-zero
@@ -40,15 +43,17 @@ serve speculative decoding within the following execution limits:
   `top_k` alone do not change the argmax, so they do not stop a request
   speculating. A request without drafts can still be part of a verify step,
   and there it commits the target argmax. Section 4d.
-- in both modes, a request carrying logprobs, structured output or a token
-  filter (`logit_bias`, `bad_words`, `allowed_token_ids`, `min_tokens`) is
-  refused per request, because no path on the launch applies those. vLLM's own
-  request validation refuses `logit_bias`, and a `min_p` above 1e-5, whenever
-  speculation is configured, before the plugin sees the request. vLLM's
-  `build_logitsprocs` builds no min_p processor for a speculating launch, so a
-  smaller `min_p` changes neither the ordinary sampler nor the accept walk, and
-  it refuses custom logits processors (`--logits-processors`) when
-  `TTModelRunner` is constructed.
+- on a model serving only `argmax_ids`, a request carrying logprobs, structured
+  output, `bad_words`, `allowed_token_ids` or a nonzero `min_tokens` is refused
+  per request: such a request can share an `argmax_ids` verify with a row that
+  has drafts, and there it would commit the target argmax without them. In
+  both modes `logit_bias` is refused. vLLM's own request validation refuses
+  `logit_bias`, and a `min_p` above 1e-5, whenever speculation is configured,
+  before the plugin sees the request. vLLM's `build_logitsprocs` builds no
+  min_p processor for a speculating launch, so a smaller `min_p` changes
+  neither the ordinary sampler nor the accept walk, and it refuses custom
+  logits processors (`--logits-processors`) when `TTModelRunner` is
+  constructed.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does
@@ -71,10 +76,10 @@ The one exception does not raise: on a model that does not serve `logits`,
 temperature and penalties suppress draft publication, and a sampled or
 penalized request inside an `argmax_ids` verify commits the target argmax; the
 runner logs that (section 4d). Separately, `TTPlatform` can disable async
-scheduling when `supports_async_decode` is absent (section 4c). Structured
-output over drafts, `fused_sample`, use of `DraftOutput.draft_scores` and a
-scheduler-owned paged drafter cache each need their own execution path before
-the matching refusal can go.
+scheduling when `supports_async_decode` is absent (section 4c).
+`fused_sample`, use of `DraftOutput.draft_scores` and a scheduler-owned paged
+drafter cache each need their own execution path before the matching refusal
+can go.
 
 The plugin's `logits` path is validated against tt-metal's
 `DummySpecDecodeModel` (host tests in `tests/spec/`, server tests in
@@ -787,11 +792,15 @@ closed and must not touch the device.
 **When the runner asks for it.** `TTModelRunner._spec_mode_for_step` chooses
 per verify step from `SpecPlan.accept_modes` and the step's live rows. A model
 offering only `logits` is always asked for `logits`. A model offering both is
-asked for `argmax_ids` while every live row is greedy and unpenalized, and for
-`logits` as soon as one live row has a non-zero temperature or a penalty: the
-mode is per step, and that row would otherwise commit the target argmax even
-with no draft of its own. Padding rows do not decide the mode. The runner
-reports the count of `logits` verifies in its `TT submissions:` log line.
+asked for `argmax_ids` while every live row is certifiable by id equality, and
+for `logits` as soon as one live row is not:
+`TTModelRunner._request_is_argmax_certifiable` is false for a non-zero
+temperature, a penalty, logprobs (including `logprobs=0`), structured output,
+`allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not
+reached yet. The mode is per step, and that row would otherwise commit the
+target argmax even with no draft of its own. Padding rows do not decide the
+mode. The runner reports the count of `logits` verifies in its
+`TT submissions:` log line.
 
 **What the model returns.** `VerifyOutput(spec_mode="logits", logits=...)`,
 with `logits` a floating point `[B, 1+K, V]` tensor: every submitted row,
@@ -812,16 +821,34 @@ host tensors from `read_decode_output` for a verify. The readback is
 temporaries.
 
 **What the host computes.** `vllm_tt_plugin.spec_accept.accept_sampled_drafts`
-builds the distribution vLLM's ordinary sampler would use, in its order:
-presence, frequency and repetition penalties on the raw logits, then
-temperature, then top-k and top-p. The penalties of column `j`
-read the row's committed output plus its first `min(j, num_valid_drafts)`
-drafts, so the bonus column reads every valid draft and a padding column reads
-none. Greedy rows, including greedy rows with penalties, accept by comparing
-each draft with the penalized argmax. Random rows accept draft `j` with
+builds the distribution vLLM's ordinary sampler would use, in its order: the
+grammar bitmask, which the runner applies to the logits before vLLM's sampler
+on an ordinary step; then `allowed_token_ids`, `bad_words` and `min_tokens`;
+then presence, frequency and repetition penalties; then temperature, then
+top-k and top-p. Each control reads column `j`'s own state, which is the row's
+committed output plus its first `min(j, num_valid_drafts)` drafts, so the
+bonus column reads every valid draft and a padding column reads none:
+
+- the grammar bitmask of column `j` is the scheduler's bitmask row for that
+  state (see **Structured output** below);
+- `allowed_token_ids` is the same at every column;
+- a `bad_words` sequence bans its last token at a column whose history ends
+  with the sequence's other tokens, through vLLM's own `apply_bad_words`;
+- `min_tokens` masks the request's `all_stop_token_ids`, which holds the
+  end-of-sequence id even under `ignore_eos`, at column `j` while the
+  committed output length plus `j` is below `min_tokens`. Upstream's
+  rejection sampler masks the bonus position whenever the committed output is
+  below `min_tokens`, even where the drafts before it reach it; this walk
+  masks where the ordinary sampler would;
+- the penalties read the same history as `bad_words`.
+
+Greedy rows, including greedy rows with any of these, accept by comparing each
+draft with the argmax of the filtered and penalized logits. Random rows accept draft `j` with
 probability `min(1, p/q)` and on a rejection commit a token drawn from the
 positive part of `p - q`; a row that accepts every draft commits a bonus drawn
-from the target at its own `num_valid_drafts` column. vLLM refuses a `min_p`
+from the target at its own `num_valid_drafts` column. A draft the filters gave
+probability 0 is always rejected, also on a uniform draw of exactly 0, because
+a draft the grammar forbids can reach the walk. vLLM refuses a `min_p`
 above 1e-5 on a speculating launch and builds no min_p processor there, so the
 ordinary sampler ignores a smaller one and the runner never passes it;
 `accept_speculated_tokens` applies it at every position when a caller does, as
@@ -852,14 +879,64 @@ them the stream. So does asynchronous scheduling: a request that a
 prefill-only step hides gets no model proposal from its last verify, so it
 verifies its next step with no drafts, and arrival timing decides how often.
 
+**Logprobs.** When any live row asked for logprobs, the walk returns, for
+every committed token, its logprob, its rank, and the top
+`max_num_logprobs` of its own column, computed by vLLM's
+`Sampler.compute_logprobs` and `Sampler.gather_logprobs`. They are the raw
+logprobs: after the grammar bitmask and before every other control, which is
+what the plugin's ordinary host sampler reports, because it runs vLLM's
+`Sampler` in its default `raw_logprobs` mode on logits the grammar has already
+masked. `ModelRunnerOutput.logprobs` carries one row per published token, row
+0's tokens first, and `LogprobsLists.cu_num_generated_tokens` gives where
+each request's rows start; the scheduler slices a request's rows by the number
+of tokens it was published. A prefix the length cap shortened publishes fewer
+rows (`TTModelRunner.spec_committed_logprobs`).
+
+**Structured output.** On a speculating launch vLLM's
+`StructuredOutputManager.grammar_bitmask` writes each structured request
+`1 + len(scheduled_spec_decode_tokens[req])` consecutive bitmask rows: row `j`
+is the grammar after the request's first `j` scheduled drafts, the last row is
+the bonus, and the grammar is rolled back afterwards.
+`vllm_tt_plugin.structured_output.spec_grammar_bitmask_for_tt_batch` unpacks
+that into `[B, 1+K, W]`, column `j` from row `j`, using the per-request row
+counts `TTModelRunner._prepare_model_inputs` recorded in
+`TTModelInput.grammar_rows_per_request` from the step's scheduler output. It
+raises if those counts do not account for the bitmask exactly, because one
+wrong count shifts every later request's mask. Every step of a speculating
+launch reads its bitmask this way, prefill and ordinary decode included,
+because an asynchronous scheduler reserves `[-1] * K` for every scheduled
+request; a step that commits one token per row reads each request's row 0.
+
+Synchronously the drafts a verify carries are the scheduler's, and
+`Scheduler.update_draft_token_ids` has already cut them to the longest prefix
+the grammar accepts, so every row is the grammar at that column. Asynchronously
+the scheduler holds placeholders and the runner verifies its own proposals.
+For a step with a structured request, `EngineCore.step_with_batch_queue`
+defers sampling until the previous output has advanced the grammar, takes
+drafts back through `take_draft_token_ids`, validates them
+(`Scheduler.update_draft_token_ids_in_output`, which pads the rejected tail
+with `-1`) and fills the bitmask from them. Under asynchronous scheduling
+`TTModelRunner.take_draft_token_ids` returns exactly the drafts the latest
+verify submitted for its structured rows, and leaves the runner's retained
+proposals alone. The row at the first rejected draft is the grammar there, so
+that draft has probability 0 and the walk rejects it. A structured row whose
+drafts were not handed over, because the step was not deferred, has a
+bitmask filled from placeholders and only row 0 is the grammar:
+`TTModelRunner._grammar_validated_drafts` sets its `num_valid_drafts` to 0 for
+the walk, which then commits one token drawn from column 0.
+
 **Live rows only.** The walk samples the live rows. A padding row commits its
 column 0 argmax with a count of 1, as the greedy walk gives it, because the
 drafter is called with every row; no request reads it.
 
 **Capture.** The walk reads only the step's own `TTModelInput`, which
 `TTModelRunner._prepare_model_inputs` built with copies of the rows: the
-sampling tensors, each row's prompt and committed output for the penalties,
-and the map from verify row to the request's generator. The asynchronous path
+sampling tensors, each row's prompt and committed output for the penalties and
+`bad_words`, the allowlist rows, each row's remaining `min_tokens` and stop
+ids (`TTModelInput.spec_min_tokens`), the batch's `max_num_logprobs`, and the
+map from verify row to the request's generator. The grammar bitmask is the
+one thing attached later: the scheduler computes it while the verify runs, and
+`sample_tokens` attaches it to the step's input before any walk reads it. The asynchronous path
 walks acceptance on whichever thread resolves the readback, after the
 persistent batch may have moved on, and reads nothing else. The walk draws
 from the requests' own generators, so it must run once per step;
@@ -974,6 +1051,8 @@ controls during request admission. `submit_decode` validates `VerifyOutput`
 at execution time and raises the corresponding type or mode error. These
 checks report the offending values. On a model that does not serve `logits`,
 a non-zero temperature or a penalty is admitted without draft publication,
-with the verification-step sampling limit in section 4d; a model that serves
-`logits` speculates for it (section 4h). The ordinary async capability check separately permits
+with the verification-step sampling limit in section 4d, and logprobs,
+structured output, `bad_words`, `allowed_token_ids` and `min_tokens` are
+refused; a model that serves `logits` speculates for all of them (section
+4h). The ordinary async capability check separately permits
 synchronous fallback with a warning, as specified in section 4c.
