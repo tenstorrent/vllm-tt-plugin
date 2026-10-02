@@ -407,3 +407,19 @@ class SpecServer:
 
     def metrics(self) -> Metrics:
         return Metrics.scrape(self.base_url)
+
+    def detokenize(self, token_ids: list[int]) -> str:
+        """The server tokenizer's text for ``token_ids``, decoded in one piece.
+
+        A completion's own ``text`` comes from vLLM's incremental detokenizer,
+        which for some of this suite's prompts, ascending id runs that end
+        inside a multi-byte character, prepends the prompt's text to the
+        output's. A check on what the tokens spell reads this instead.
+        """
+        response = httpx.post(
+            f"{self.base_url}/detokenize",
+            json={"model": self.model, "tokens": list(token_ids)},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()["prompt"]
