@@ -77,6 +77,12 @@ start_server() {
         echo "REFUSING $label: port $PORT is held" >&2
         return 1
     fi
+    # ``ss`` is missing on some lab hosts, where the check above never fires,
+    # so also refuse a port on which anything already answers HTTP.
+    if curl -s -o /dev/null --max-time 2 "http://localhost:$PORT/health"; then
+        echo "REFUSING $label: something already answers on port $PORT" >&2
+        return 1
+    fi
     # ``exec`` so the recorded pid is the server itself: without it ``$!`` is
     # the subshell, and stopping that leaves the server holding the device.
     ( cd "$TT_METAL_HOME" && exec python "$PLUGIN_DIR/examples/server_example_tt.py" "$@" ) \
@@ -84,10 +90,12 @@ start_server() {
     LAUNCHER=$!
     for _ in $(seq 1 150); do
         sleep 2
+        # The launcher first: a server that failed to bind its port has
+        # exited, and a health answer then comes from someone else's server.
+        kill -0 "$LAUNCHER" 2>/dev/null || break
         if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
             return 0
         fi
-        kill -0 "$LAUNCHER" 2>/dev/null || break
     done
     echo "SERVER FAILED for $label, see $log" >&2
     tail -30 "$log" >&2
