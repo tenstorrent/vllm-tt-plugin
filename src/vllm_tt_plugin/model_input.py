@@ -188,6 +188,8 @@ class TTModelInput:
     # committed, in [1, 1+K] and never 0, which is what a model reads to select
     # the candidate state slot it continues from. Both are ``[total_B]`` int32
     # in the same row order as ``input_tokens``, including its padding rows.
+    # A verify sets both. An ordinary decode sets ``accepted_counts`` alone,
+    # and only when a live row's previous step committed more than one token.
     # ``None`` on a prefill build and on a non-speculating launch.
     num_valid_drafts: torch.Tensor | None = None
     accepted_counts: torch.Tensor | None = None

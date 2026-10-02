@@ -141,3 +141,21 @@ def fixed_target_ids(prompt: list[int], count: int) -> list[int]:
         position += 1
         ids.append(token)
     return ids
+
+
+# The distribution the fixed target returns as logits, which is what a sampled
+# request draws from: the rule's choice at probability 0.4 and these three
+# shared tokens at 0.3, 0.2 and 0.1, every other token at 0. Mirrors
+# FIXED_SHARED_ALTERNATIVES in tt-metal's
+# models/vllm_test_utils/spec_test/test_model.py.
+FIXED_TARGET_SHARED_TOKENS = (17, 4099, 65537)
+
+
+def fixed_target_support(token: int, position: int) -> set[int]:
+    """Every token the fixed target can emit after ``token`` at ``position``.
+
+    A sampled token outside this set was not drawn from the target's
+    distribution, so it was committed by something other than the sampler.
+    """
+    shared = {t % FIXED_TARGET_VOCAB for t in FIXED_TARGET_SHARED_TOKENS}
+    return {fixed_target_choice(token, position), *shared}

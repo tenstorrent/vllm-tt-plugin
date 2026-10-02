@@ -81,6 +81,9 @@ class FakeSpecModel:
     # How many of the K drafts the verify agrees with. The rest diverge, so a
     # test can predict the accepted count exactly. None accepts every draft.
     accept_depth: int | None = None
+    # Published in the plan, which is what per-request admission reads: a
+    # launch without it verifies every step and refuses a sampled request.
+    supports_narrow_decode: bool = False
 
     def __init__(self) -> None:
         self.propose_calls: list[dict] = []
@@ -126,7 +129,7 @@ class FakeSpecModel:
             extra_bytes_per_token=cls.extra_bytes_per_token,
             accept_modes=cls.accept_modes,
             drafter_state=cls.drafter_state,
-            supports_narrow_decode=False,
+            supports_narrow_decode=cls.supports_narrow_decode,
         )
 
     # ---- the primitives --------------------------------------------------
@@ -194,19 +197,24 @@ class FakeSpecModel:
         if spec_mode is None:
             # The ordinary decode call, which a model declaring
             # ``supports_narrow_decode`` also serves: a speculating launch
-            # sends it on a step with nothing to verify, and that step is what
-            # can overlap. The three speculative arguments come together or
-            # not at all, so their absence is what makes this the plain call.
-            if num_valid_drafts is not None or accepted_counts is not None:
+            # sends it on a step that verifies nothing, and that step is what
+            # can overlap. ``num_valid_drafts`` belongs to a verify, so its
+            # presence without ``spec_mode`` is the plain call made wrong.
+            if num_valid_drafts is not None:
                 # A ``TypeError``, which is what the signature raised when
                 # ``spec_mode`` had no default: a caller that sends the side
                 # tensors and forgets the mode called this wrong, and must not
                 # receive greedy ids for it.
                 raise TypeError(
-                    "FakeSpecModel was sent a speculative side tensor with no "
-                    "spec_mode; the runner builds all three together"
+                    "FakeSpecModel was sent num_valid_drafts with no "
+                    "spec_mode; the runner sends it only with a verify"
                 )
-            return self._plain_decode(tokens, positions)
+            if accepted_counts is not None:
+                # An unresolved multi-token commit, carried into an ordinary
+                # decode because a row that is not speculable shares the step.
+                # The upper bound is the verify's, which this call cannot see.
+                self._check_plain_accepted_counts(tokens, accepted_counts)
+            return self._plain_decode(tokens, positions, accepted_counts)
         if spec_mode not in self.accept_modes:
             raise ValueError(
                 f"FakeSpecModel serves {list(self.accept_modes)}, "
@@ -249,7 +257,21 @@ class FakeSpecModel:
 
     # ---- contract checks -------------------------------------------------
 
-    def _plain_decode(self, tokens, positions):
+    @staticmethod
+    def _check_plain_accepted_counts(tokens, accepted_counts) -> None:
+        rows = int(tokens.shape[0])
+        if accepted_counts.shape != (rows,) or accepted_counts.dtype != torch.int32:
+            raise ValueError(
+                f"ordinary decode accepted_counts must be [{rows}] int32, got "
+                f"{tuple(accepted_counts.shape)} {accepted_counts.dtype}"
+            )
+        if bool((accepted_counts < 1).any()):
+            raise ValueError(
+                "ordinary decode accepted_counts entries are counts and never "
+                f"0, got {accepted_counts.tolist()}"
+            )
+
+    def _plain_decode(self, tokens, positions, accepted_counts=None):
         """``[B, 1, V]`` logits whose argmax is this row's next token.
 
         The same rule the verify uses for the token that follows a row's last
@@ -257,7 +279,15 @@ class FakeSpecModel:
         would choose: the host sampling tail then commits ``last + 1``.
         """
         rows = int(tokens.shape[0])
-        self.plain_calls.append({"rows": rows, "width": int(tokens.shape[1])})
+        self.plain_calls.append(
+            {
+                "rows": rows,
+                "width": int(tokens.shape[1]),
+                "accepted_counts": (
+                    None if accepted_counts is None else accepted_counts.clone()
+                ),
+            }
+        )
         last = tokens.reshape(rows, -1)[:, 0].to(torch.int64)
         choice = (last + 1) % self.vocab_size
         logits = torch.zeros(rows, 1, self.vocab_size)

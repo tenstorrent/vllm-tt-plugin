@@ -25,6 +25,7 @@ declare the required [model capabilities](../../../docs/MODEL_CAPABILITIES.md).
 | `test_adaptive_policy.py` | the model drafter offers drafts for one live request, declines for a batch, and resumes after the batch returns to one row |
 | `test_async_transitions.py` | asynchronous scheduling remains enabled, ordinary decode overlaps, verify transitions serialize, and output follows the fixed target rule |
 | `test_async_correctness.py` | fixed-target async output equality, zero/partial acceptance, cancellation/reuse, preemption, reset, concurrent prefill, and K/length boundaries under the matching launch |
+| `test_mixed_sampling.py` | with narrow decode, a sampled request that joins a speculating greedy one is sampled from the fixed target's distribution, the join step drops the greedy request's drafts, and the greedy output stays the rule's sequence; without narrow decode, a sampled or penalized request is refused |
 
 The suite checks token IDs, counter deltas, or direct scheduler and runner log
 evidence for each tested behavior. The capacity tests skip rather than pass
@@ -185,7 +186,27 @@ TT_SPEC_DRAFT_POLICY=solo TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=-1 \
     --tt-spec-artifacts=/tmp/spec-run/async
 ```
 
-**7. The host n-gram drafter.** Replace the speculative config with
+**7. Sampled requests beside a speculating one.** The adaptive drafter gives the launch narrow decode, and the fixed target gives its logits a known distribution:
+
+```bash
+mkdir -p /tmp/spec-run/mixed
+TT_SPEC_DRAFT_POLICY=solo TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=-1 \
+"$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" $COMMON --no-async-scheduling \
+    --max_num_seqs 8 --max_model_len 2048 --port 8100 \
+    --speculative-config "$SPEC" >/tmp/spec-run/mixed/server.log 2>&1
+
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_mixed_sampling.py \
+    --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
+    --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
+    --tt-spec-target=fixed --tt-spec-drafter=model --tt-spec-draft-policy=solo \
+    --tt-spec-async-scheduling=false \
+    --tt-spec-server-log=/tmp/spec-run/mixed/server.log \
+    --tt-spec-artifacts=/tmp/spec-run/mixed
+```
+
+The asynchronous variant is the launch of recipe 6 with this selection and `--tt-spec-async-scheduling=true`. On an `always` launch, the same file checks that a sampled request is refused instead.
+
+**8. The host n-gram drafter.** Replace the speculative config with
 `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_min":2,"prompt_lookup_max":4}`
 and pass `--tt-spec-drafter=ngram`. The n-gram drafter only drafts where the request's own text repeats, and this model's output is an ascending run that repeats no n-gram, so the prompt has to be that same run; the suite's prompts already are.
 
@@ -198,7 +219,7 @@ tests/tt/spec/run_spec_regression.sh /tmp/spec-run                  # every conf
 tests/tt/spec/run_spec_regression.sh /tmp/spec-run capacity         # or one of them
 ```
 
-The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, and `async-k3`. The six `async-*` correctness configurations run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
+The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, `async-k3`, `mixed`, and `async-mixed`. The six `async-*` correctness configurations (all but `async-mixed`) run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `mixed` and `async-mixed` run `test_mixed_sampling.py`, and the three `accept-*` configurations run its refusal test. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
 
 ## The manifest
 

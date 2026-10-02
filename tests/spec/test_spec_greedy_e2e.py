@@ -160,7 +160,9 @@ def _runner(
     return runner
 
 
-def _add_request(runner: SimpleNamespace, req_id: str, first_token: int = 1) -> None:
+def _add_request(
+    runner: SimpleNamespace, req_id: str, first_token: int = 1, temperature: float = 0.0
+) -> None:
     """Add a decoding request. ``first_token`` shifts its whole prompt.
 
     Two requests in one step need different token histories, or a defect that
@@ -170,7 +172,7 @@ def _add_request(runner: SimpleNamespace, req_id: str, first_token: int = 1) -> 
         req_id=req_id,
         prompt_token_ids=list(range(first_token, first_token + PROMPT_LEN)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(temperature=temperature),
         generator=None,
         block_ids=([0],),
         # Fully prefilled, so the next step is a decode rather than prompt work.
@@ -375,53 +377,6 @@ def test_the_verify_is_asked_for_the_mode_the_runner_can_walk():
     assert model.verify_calls[0]["block_width"] == DRAFT_LEN + 1
 
 
-def test_a_roundtrip_hidden_drafter_keeps_every_step_a_verify():
-    """The gate on the plain path, and the reason for it.
-
-    A step with nothing to verify returns no ``VerifyOutput``, so it produces
-    no hidden handle. A drafter that is fed its target hidden state through the
-    runner would then be asked to draft from nothing, so a model declaring that
-    feed keeps every step a verify instead. Decided when the model is loaded,
-    because a launch-time decision is checkable and passing ``None`` to that
-    drafter at step time is not.
-    """
-    runner = TTModelRunner.__new__(TTModelRunner)
-    runner._spec_drafts_from_model = True
-
-    class RoundtripHidden:
-        model_capabilities = {
-            "supports_spec_decode": True,
-            "spec_requirements": ["device_propose", "hidden_feed"],
-            "spec_hidden_handoff": ["roundtrip"],
-        }
-
-    class OnDeviceHidden:
-        model_capabilities = {
-            "supports_spec_decode": True,
-            "spec_requirements": ["device_propose", "hidden_feed"],
-            "spec_hidden_handoff": ["on_device"],
-        }
-
-    class NoHiddenFeed:
-        model_capabilities = {
-            "supports_spec_decode": True,
-            "spec_requirements": ["device_propose"],
-        }
-
-    runner.model = RoundtripHidden()
-    assert runner._narrow_steps_serve_the_drafter() is False
-    runner.model = OnDeviceHidden()
-    assert runner._narrow_steps_serve_the_drafter() is True
-    runner.model = NoHiddenFeed()
-    assert runner._narrow_steps_serve_the_drafter() is True
-
-    # And a launch that speculates with a host proposer needs nothing from the
-    # model here at all: its drafter is never handed hidden state.
-    runner._spec_drafts_from_model = False
-    runner.model = RoundtripHidden()
-    assert runner._narrow_steps_serve_the_drafter() is True
-
-
 def test_a_draftless_step_commits_through_the_ordinary_decode_tail():
     """With nothing to verify, the step is an ordinary decode.
 
@@ -472,6 +427,32 @@ def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
     _step(runner, "r")
     assert len(model.verify_calls) == 1
     assert len(model.plain_calls) == 1
+
+
+def test_a_sampled_row_makes_a_drafted_step_an_ordinary_decode():
+    """The whole step, for a sampled request beside a drafted greedy one.
+
+    A verify would commit the target argmax for the sampled row. So the model
+    is sent its ordinary decode call instead, carrying the greedy row's
+    unresolved count and nothing else of the verify's. Every row commits one
+    token through the sampling tail, and the greedy row's drafts are dropped.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "greedy")
+    _add_request(runner, "sampled", first_token=40, temperature=1.0)
+    runner._req_accepted_counts["greedy"] = 3
+
+    output = _step(runner, "greedy", "sampled", drafts={"greedy": [5, 6, 7]})
+
+    assert model.verify_calls == []
+    assert len(model.plain_calls) == 1
+    assert model.plain_calls[0]["accepted_counts"].tolist() == [3, 1]
+    assert [len(ids) for ids in output.sampled_token_ids] == [1, 1]
+    # FakeSpecModel's ordinary decode puts the argmax one past the last token.
+    assert output.sampled_token_ids[0] == [PROMPT_LEN + 1]
+    assert "greedy" not in runner._req_accepted_counts
 
 
 # endregion The loop
