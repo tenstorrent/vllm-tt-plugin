@@ -7,6 +7,24 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Any
 
+_RECALL_EQUIVALENT_CHARACTERS = str.maketrans(
+    {
+        "\N{HYPHEN}": "-",
+        "\N{NON-BREAKING HYPHEN}": "-",
+    }
+)
+
+
+def recalled_passphrase(output: str | None, passphrase: str) -> bool:
+    """Case-insensitively find a passphrase after accepted character folding.
+
+    Add observed variants to ``_RECALL_EQUIVALENT_CHARACTERS``. Other characters
+    remain exact, and a missing output is treated as empty text.
+    """
+    expected = passphrase.translate(_RECALL_EQUIVALENT_CHARACTERS).lower()
+    actual = (output or "").translate(_RECALL_EQUIVALENT_CHARACTERS).lower()
+    return expected in actual
+
 
 @dataclass
 class RequestConfig:
