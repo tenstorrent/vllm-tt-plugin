@@ -163,9 +163,10 @@ engine. Admission is not device validation for a particular DP deployment.
 `spec_hidden_handoff` at configuration time. If a model-owned drafter declares
 `hidden_feed` and includes `roundtrip`, the resolved plan comes back without
 `supports_narrow_decode`, so every decode supplies a verify hidden handle. This
-applies even if the model also declares `on_device`. Per-request admission
-then refuses a request with a non-zero temperature or a penalty on that
-launch, because every decode step is a verify.
+applies even if the model also declares `on_device`. Every decode step of
+that launch is a verify, so unless the model also serves `logits`,
+per-request admission refuses a request with a non-zero temperature or a
+penalty.
 
 Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py), and
@@ -185,7 +186,7 @@ speculative admission does not guarantee that state exists yet.
 | `lanes_per_request` | Required | Model decode rows consumed by one speculative request, at least 1. This value does not mean lane-DP lanes. The plugin validates the lower bound but does not enforce a row budget. |
 | `extra_bytes_per_seq` | Required | Nonnegative fixed device bytes per speculative request. The plugin does not reserve or enforce this byte budget. |
 | `extra_bytes_per_token` | Required | Nonnegative device bytes per KV token beyond target KV storage. The plugin does not reserve or enforce this byte budget. |
-| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission currently requires `argmax_ids` among the offered modes because the runner implements greedy acceptance only. |
+| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission requires `argmax_ids` or `logits` among the offered modes; `fused_sample` has no runner path. With both offered, the runner asks for `logits` only on a step with a sampled or penalized row. |
 | `drafter_state` | Required | One of `internal`, `paged`, or `shared_with_target`. Admission rejects `paged` because the plugin has no scheduler-owned drafter-cache allocation. |
 | `drafter_target_cache_requires` | `()` | Sequence using `named_layer_caches` and `absolute_positions`. `SpecPlan` rejects strings, unknown names, duplicates, and a nonempty sequence unless `drafter_state="shared_with_target"`. The plugin does not verify that the target cache satisfies these requirements. |
 | `supports_narrow_decode` | `False` | Declares ordinary `[B, 1]` decode support alongside wide `[B, 1+K]` verification. The runner uses this permission for draftless steps when the drafter's hidden-state requirements allow narrow decode. This value is a `SpecPlan` field, not a `model_capabilities` key. |
