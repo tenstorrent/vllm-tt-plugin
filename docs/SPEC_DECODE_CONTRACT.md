@@ -65,14 +65,10 @@ serve speculative decoding within the following execution limits:
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative
 launch cannot apply. Each of those refusals raises with the offending values.
-There are two exceptions, and neither raises. On a model that does not serve
-`logits`, temperature and penalties suppress draft publication, and a sampled
-or penalized request inside an `argmax_ids` verify commits the target argmax;
-the runner logs that (section 4d). A model drafter that samples its proposals
-would make the `logits` walk lossy, because the walk treats every draft as a
-point mass; the runner offers a sampled request model drafts only when the
-model declares `spec_deterministic_drafts`, and a model whose drafter samples
-must not declare it (section 4h). Separately, `TTPlatform` can disable async
+The one exception does not raise: on a model that does not serve `logits`,
+temperature and penalties suppress draft publication, and a sampled or
+penalized request inside an `argmax_ids` verify commits the target argmax; the
+runner logs that (section 4d). Separately, `TTPlatform` can disable async
 scheduling when `supports_async_decode` is absent (section 4c). Structured
 output over drafts, `fused_sample`, use of `DraftOutput.draft_scores` and a
 scheduler-owned paged drafter cache each need their own execution path before
@@ -100,7 +96,6 @@ launches without `speculative_config`.
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
-| `spec_deterministic_drafts` | `False` | The model's drafter proposes a deterministic function of the committed context. Read only for `custom_class` on a plan offering `logits`: without it a sampled request is offered no model drafts (section 4h). |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -830,16 +825,17 @@ applies it at every position when a caller does, as the ordinary sampler does,
 where upstream's rejection sampler skips it at the drafted positions.
 
 **Proposals are point masses.** `draft_probs` is `None` on this path, so `q`
-is 1 at the drafted token and 0 elsewhere. That is exact only for a proposal
-that is a deterministic function of the committed context. The n-gram
-proposer's proposals are. A model's drafter's are by declaration:
-`TTModelRunner.load_model` reads `spec_deterministic_drafts`, and without it
-`TTModelRunner._request_is_speculable` offers a sampled or penalized request no
-model drafts, so it is verified with zero drafts, still losslessly, and does
-not speculate. A drafter that proposes its argmax may declare it; one that
-samples its proposals must not. `DraftOutput.draft_scores` is `[B, K, q]` top
-scores and is not the `[B, K, V]` distribution a sampling drafter's residual
-needs.
+is 1 at the drafted token and 0 elsewhere: the walk accepts draft `d` with
+probability `p(d)` and on rejection draws from `p` with `d` removed. The
+committed token is then distributed as `p` for every value of `d`, because `d`
+commits with probability `p(d)` and any other token `x` with
+`(1 - p(d)) * p(x) / (1 - p(d)) = p(x)`. So the walk is lossless for any
+drafter, deterministic or sampling, as long as its choice does not read the
+walk's own random draws, and both the n-gram proposer and a model drafter
+qualify. A drafter's real distribution `q` would raise the acceptance
+probability to `min(1, p(d) / q(d))`; it would not change what is committed.
+`DraftOutput.draft_scores` is `[B, K, q]` top scores, not that `[B, K, V]`
+distribution, and no walk reads it.
 
 **Randomness.** A seeded request draws from its own generator. The bonus is
 drawn first, then the accept uniforms for the row's own valid drafts, then the

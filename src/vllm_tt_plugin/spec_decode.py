@@ -299,14 +299,13 @@ class DraftOutput:
 
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
-    No accept walk reads them: rejection sampling needs the drafter's whole
-    ``[B, K, V]`` distribution, not its top scores.
+    No accept walk reads them.
 
-    A ``logits`` verify treats every draft as a point mass at its id, which is
-    exact only for a proposal that is a deterministic function of the
-    committed context. A drafter that samples its proposals makes sampled
-    output lossy, and nothing detects it, so such a model must not declare
-    ``logits`` for its own drafter.
+    A ``logits`` verify treats every draft as a point mass at its id. That is
+    lossless for any drafter, deterministic or sampling, whose choice does not
+    read the accept walk's own random draws: the committed token is
+    distributed as the target whatever was drafted. A drafter's real
+    ``[B, K, V]`` distribution would only raise the acceptance rate.
     """
 
     draft_token_ids: "torch.Tensor"

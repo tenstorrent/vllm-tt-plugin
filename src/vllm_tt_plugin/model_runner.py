@@ -349,14 +349,6 @@ class TTModelRunner:
             and SPEC_REQUIREMENT_DEVICE_PROPOSE
             in method_requirements(self._spec_method)
         )
-        # Whether a draft is a deterministic function of the committed context,
-        # which is what lets a logits walk treat it as a point mass. The n-gram
-        # proposer's are; a model's drafter's are only by declaration, which
-        # ``load_model`` reads.
-        self._spec_drafts_are_point_masses = bool(
-            self._spec_method and not self._spec_drafts_from_model
-        )
-
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
 
@@ -543,21 +535,6 @@ class TTModelRunner:
         )
         if self._spec_supports_narrow_decode:
             self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
-        if self._spec_drafts_from_model:
-            capabilities = getattr(type(self.model), "model_capabilities", None) or {}
-            self._spec_drafts_are_point_masses = bool(
-                capabilities.get("spec_deterministic_drafts", False)
-            )
-            if ACCEPT_MODE_LOGITS in self._spec_accept_modes and not (
-                self._spec_drafts_are_point_masses
-            ):
-                logger.info(
-                    "TT speculative decoding: %s serves logits but does not "
-                    "declare spec_deterministic_drafts, so sampled requests get "
-                    "no drafts from its drafter. Their verifies stay lossless; "
-                    "they do not speculate.",
-                    type(self.model).__name__,
-                )
 
     def _narrow_steps_serve_the_drafter(self) -> bool:
         """Whether a step that verifies nothing can still feed the drafter.
@@ -1502,13 +1479,10 @@ class TTModelRunner:
         A model that serves ``logits`` lets a verify walk acceptance against
         the target distribution under the request's own temperature, top-k,
         top-p, penalties and seed, which covers every control admission lets
-        through on a speculating launch. That walk treats each draft as a point
-        mass, so it certifies only drafts that are a deterministic function of
-        the committed context. Otherwise only the greedy walk certifies.
+        through on a speculating launch, whichever proposer drafted. Without
+        it only the greedy walk exists.
         """
-        if ACCEPT_MODE_LOGITS in getattr(self, "_spec_accept_modes", ()) and getattr(
-            self, "_spec_drafts_are_point_masses", False
-        ):
+        if ACCEPT_MODE_LOGITS in getattr(self, "_spec_accept_modes", ()):
             return True
         return self._request_is_argmax_certifiable(req_id)
 
