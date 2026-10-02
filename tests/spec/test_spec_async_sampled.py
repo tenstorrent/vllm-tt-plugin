@@ -75,7 +75,6 @@ def _runner(model: DeferredSampledTarget):
     # An ordinary decode on a narrow-capable model samples on the host.
     runner.host_sampler = Sampler()
     runner._spec_accept_modes = type(model).accept_modes
-    runner._spec_drafts_are_point_masses = True
     runner._num_unspeculable_verify_rows = 0
     # The real builder: the walk samples under these tensors.
     del runner._sampling_params_for_padded_decode

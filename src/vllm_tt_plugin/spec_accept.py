@@ -29,8 +29,11 @@ deliberately so a kernel or a test ported from upstream needs no adjustment:
 A drafter that reports no probabilities, such as an n-gram proposer, is handled
 as a point mass at the drafted id: ``q`` is 1, so the accept test reduces to
 ``p >= u``, and the residual is ``p`` with the drafted id removed. That is
-exact only for a proposal that is a deterministic function of the committed
-context; a drafter that samples its proposals needs its own distribution.
+lossless for any draft the walk's own random draws did not choose: the drafted
+id commits with probability ``p(d)`` and any other id ``x`` with
+``(1 - p(d)) * p(x) / (1 - p(d)) = p(x)``. So a drafter that samples its
+proposals stays correct without reporting probabilities; reporting them would
+only raise the acceptance probability from ``p(d)`` to ``min(1, p(d) / q(d))``.
 
 The target distribution is the one vLLM's ordinary sampler would use, built in
 the ordinary sampler's order: penalties on the raw logits, then temperature,
@@ -263,7 +266,9 @@ def accept_speculated_tokens(
         min_p: ``[B]`` or None. Applied to random rows after temperature and
             before top-k/top-p, the ordinary sampler's order. 0 disables it.
         draft_probs: ``[B, K, V]`` or None. The drafter's own distribution per
-            drafted position. None means a deterministic drafter.
+            drafted position. None treats each draft as a point mass at its
+            id, which is lossless for any drafter whose choice does not read
+            this walk's random draws.
         generators: row index to a seeded ``torch.Generator``. A row named here
             draws its randomness from that generator, so a seeded request is
             reproducible; the rest draw from the global stream.

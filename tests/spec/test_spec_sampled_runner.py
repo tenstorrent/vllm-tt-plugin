@@ -82,7 +82,6 @@ def _runner(model: SampledTarget, num_speculative_tokens: int = DRAFT_LEN):
         _is_adaptive_block_output=False,
         _num_speculative_tokens=num_speculative_tokens,
         _spec_accept_modes=plan.accept_modes if num_speculative_tokens else (),
-        _spec_drafts_are_point_masses=True,
         async_decode_scheduling=False,
         # The drafts come from each test through the scheduler output, so a
         # case can make them right or wrong exactly where it means to.
@@ -320,21 +319,14 @@ def test_an_argmax_only_model_keeps_its_greedy_verify_and_counts_the_row():
 
 
 def test_a_sampled_request_is_offered_drafts_only_when_logits_is_served():
-    """The proposal gate follows the walks the launch can drive.
-
-    The logits walk treats a draft as a point mass, so it certifies a sampled
-    request only when the drafts are deterministic; otherwise the request is
-    not drafted for, and its verifies stay lossless.
-    """
+    """The proposal gate follows the walks the launch can drive."""
     sampled = SamplingParams(temperature=0.8, presence_penalty=0.2, seed=1)
-    for modes, point_masses, speculable in (
-        ((ACCEPT_MODE_ARGMAX_IDS,), True, False),
-        ((ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS), True, True),
-        ((ACCEPT_MODE_LOGITS,), True, True),
-        ((ACCEPT_MODE_LOGITS,), False, False),
+    for modes, speculable in (
+        ((ACCEPT_MODE_ARGMAX_IDS,), False),
+        ((ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS), True),
+        ((ACCEPT_MODE_LOGITS,), True),
     ):
         runner = _runner(sampled_target(accept_modes=modes)())
-        runner._spec_drafts_are_point_masses = point_masses
         _add_request(runner, "s", sampled)
         assert runner._request_is_speculable("s") is speculable, modes
         _add_request(runner, "g", GREEDY, first_token=20)
@@ -669,15 +661,14 @@ def test_narrow_steps_and_logits_verifies_alternate_on_one_request():
 class _DraftingTarget(SampledTarget):
     """``SampledTarget`` with its own drafter: the rule's argmax chain.
 
-    Deterministic, so it declares so, and each verify hands out a fresh hidden
-    handle that the next proposal must receive back.
+    Each verify hands out a fresh hidden handle that the next proposal must
+    receive back.
     """
 
     model_capabilities = {
         "supports_spec_decode": True,
         "spec_requirements": ["device_propose", "hidden_feed"],
         "spec_hidden_handoff": ["roundtrip"],
-        "spec_deterministic_drafts": True,
     }
 
     def __init__(self) -> None:
@@ -725,7 +716,7 @@ def _drafting_runner(model):
     return runner
 
 
-def test_a_model_drafter_drafts_for_a_sampled_request_it_declares_deterministic():
+def test_a_model_drafter_drafts_for_a_sampled_request():
     """Proposals reach a sampled request, verified with the step's hidden handle."""
     model = _DraftingTarget()
     runner = _drafting_runner(model)
