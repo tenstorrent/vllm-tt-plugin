@@ -550,7 +550,9 @@ certifies greedy requests only. With `logits` the adapter returns
 full-vocabulary verify logits and the runner rejection-samples each row on the
 host (`spec_accept.accept_sampled_drafts`), so sampled and penalized requests
 speculate losslessly under temperature, top-k, top-p, presence, frequency and
-repetition penalties and seed. No production tt-metal adapter declares `logits`
+repetition penalties and seed, and under structured output, `allowed_token_ids`,
+`bad_words` and `min_tokens`, with logprobs returned for every committed token.
+No production tt-metal adapter declares `logits`
 yet; tt-metal's `DummySpecDecodeModel` validates the path.
 `docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`. `fused_sample`
 execution, scheduler-owned paged drafter caches and `TTLaneCoordinator`
@@ -652,9 +654,14 @@ An adapter that also declares `logits` does not have this limit: a step with a
 sampled or penalized row verifies in `logits` mode, and the runner samples
 every row from its own distribution (section 4h of the contract).
 
-`TTPlatform.validate_request` rejects logprobs, structured output,
-`logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
-speculative launch. Prompt logprobs remain unsupported for all TT models.
+On an adapter that serves `logits`, logprobs, structured output, `bad_words`,
+`allowed_token_ids` and `min_tokens` speculate too: the host accept walk
+applies each of them at every candidate column and returns each committed
+token's logprobs, as upstream's rejection sampler does. On an adapter that
+serves only `argmax_ids`, `TTPlatform.validate_request` rejects those five on
+a speculative launch. `logit_bias` is rejected on every speculative launch,
+and vLLM itself rejects it first. Prompt logprobs remain unsupported for all
+TT models.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
 acceptance, K+1 lookahead reservation and lifecycle hooks. See
