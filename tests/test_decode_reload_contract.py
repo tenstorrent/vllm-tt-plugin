@@ -189,6 +189,37 @@ def test_a_verify_always_reloads_its_inputs():
     assert not plan.reload_page_table
 
 
+def test_the_plain_decode_after_a_verify_reloads_its_inputs():
+    """A verify leaves the resident inputs where the last plain decode left them.
+
+    The device sampler feeds a plain decode's token back into the buffer the
+    next plain decode reads, but a verify feeds back nothing: how many of its
+    tokens commit is decided on the host after the forward. So once a batch
+    falls from speculation to plain decode, which happens when a peer joins a
+    request the drafter only serves alone, the resident token predates every
+    token the verifies committed. The first plain decode after a verify must
+    reload, and rebuild the sampling state whose seed counters the commit moved
+    past, even with the layout and the sampling route unchanged.
+    """
+    controller = _controller()
+    _commit(controller, _decode_input())
+    _commit(controller, _decode_input(spec_mode="argmax_ids"))
+    # Two verifies in a row: the first must not leave the second asking for a
+    # sampling reset it never needed.
+    second_verify = _commit(controller, _decode_input(spec_mode="argmax_ids"))
+
+    after_verify = _commit(controller, _decode_input())
+    steady = _commit(controller, _decode_input())
+
+    assert not second_verify.reset_sampling_state
+    assert after_verify.reload_inputs
+    assert after_verify.reload_sampling_params
+    assert after_verify.reset_sampling_state
+    assert not after_verify.overlap_safe
+    assert not steady.reload_inputs
+    assert steady.overlap_safe
+
+
 def test_submit_decode_delivers_page_table_only_refresh():
     calls = []
 

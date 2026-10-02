@@ -343,6 +343,7 @@ class TTAsyncDecodeController:
         # behind, so submitted-device history is the only safe reload authority.
         self._decode_chain_valid = False
         self._previous_device_sampling: bool | None = None
+        self._previous_submission_verified = False
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
         self._legacy_contract_warning_emitted = False
         # How many submissions found a step already outstanding, and how many
@@ -394,10 +395,19 @@ class TTAsyncDecodeController:
             self._previous_device_sampling is not None
             and self._previous_device_sampling != device_sampling
         )
+        # A verify commits a count the host decides after the forward and
+        # writes none of its tokens into the resident inputs, so those still
+        # hold what the last plain decode fed back. The plain decode after a
+        # verify therefore starts a new chain, and so do the sampler's seed
+        # counters, which the verify's commit moved past.
+        verify_to_plain = (
+            self._previous_submission_verified and model_input.spec_mode is None
+        )
         transition = (
             not self._decode_chain_valid
             or model_input.decode_layout_changed
             or sampling_mode_changed
+            or verify_to_plain
         )
         reload_inputs = (
             # A verify's candidate block is assembled from this step's drafts
@@ -429,6 +439,7 @@ class TTAsyncDecodeController:
         """Commit residency after the model accepts a decode submission."""
         self._decode_chain_valid = True
         self._previous_device_sampling = model_input.perform_device_sampling
+        self._previous_submission_verified = model_input.spec_mode is not None
         if (
             reload_plan.reload_inputs
             or reload_plan.reload_page_table
