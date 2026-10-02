@@ -1413,7 +1413,7 @@ class TTAsyncDecodeController:
             fail_deferred()
             raise
         self.device_grammar_sample_count += 1
-        logger.info(
+        logger.debug(
             "TT device grammar sampling active count=%d",
             self.device_grammar_sample_count,
         )
