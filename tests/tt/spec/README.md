@@ -26,6 +26,8 @@ declare the required [model capabilities](../../../docs/MODEL_CAPABILITIES.md).
 | `test_async_transitions.py` | asynchronous scheduling remains enabled, ordinary decode overlaps, verify transitions serialize, and output follows the fixed target rule |
 | `test_async_correctness.py` | fixed-target async output equality, zero/partial acceptance, cancellation/reuse, preemption, reset, concurrent prefill, and K/length boundaries under the matching launch |
 | `test_sampled_speculation.py` | on a launch declaring `logits`: sampled requests speculate, accept and reject, and commit the target distribution under temperature, top-k, top-p and penalties; a greedy penalized request emits its exact reference; a seeded request repeats alone and in company; greedy and sampled rows keep their own semantics in one verify; verifies ask for `logits` only when a row needs it |
+| `test_sampled_controls.py` | on a launch declaring `logits`: `allowed_token_ids`, a two-token `bad_words` entry and `min_tokens` hold at every committed token and the pooled counts match the filtered target; logprobs report the target's raw distribution for every committed token; two regular grammars in one batch each hold over their own requests; one request per control in one batch keeps its own |
+| `test_request_admission.py` | logprobs, structured output, `allowed_token_ids`, `bad_words` and `min_tokens` are admitted on a launch declaring `logits` and refused with HTTP 400 on one serving only `argmax_ids`; `logit_bias` is refused on both |
 
 The suite checks token IDs, counter deltas, or direct scheduler and runner log
 evidence for each tested behavior. The capacity tests skip rather than pass
@@ -89,9 +91,11 @@ and `supports_async_spec_decode`; `supports_async_decode` alone does not cover
 deferred verification. Use `--no-async-scheduling` for the synchronous
 configurations below. The `async` configuration omits that option, requests
 `sample_on_device_mode=decode_only`, and verifies the resolved mode in the
-server log. Every test outside `test_sampled_speculation.py` sends greedy
-requests to exercise the `argmax_ids` acceptance path; that file sends sampled
-ones and needs the launch of recipe 7.
+server log. Every test outside `test_sampled_speculation.py`,
+`test_sampled_controls.py` and `test_request_admission.py` sends greedy
+requests to exercise the `argmax_ids` acceptance path; the first two send
+sampled ones and requests with logprobs, grammars and token filters, and need
+the launch of recipe 7.
 
 **1. Acceptance accounting, full acceptance.**
 
@@ -196,7 +200,7 @@ python $PLUGIN/examples/server_example_tt.py $COMMON --no-async-scheduling \
     --max_num_seqs 8 --max_model_len 2048 --port 8100 \
     --speculative-config "$SPEC" >/tmp/spec-run/sampled/server.log 2>&1
 
-pytest tests/tt/spec/test_sampled_speculation.py \
+pytest tests/tt/spec/test_sampled_speculation.py tests/tt/spec/test_sampled_controls.py \
     --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
     --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
     --tt-spec-target=fixed --tt-spec-accept-modes=argmax_ids,logits \
@@ -206,6 +210,8 @@ pytest tests/tt/spec/test_sampled_speculation.py \
 ```
 
 The distribution tests are statistical, each against a chi-square tail of 1e-4. On a synchronous launch the seeded ones draw the same tokens on every run of a correct server, so a seeded failure repeats on a rerun and needs investigating; only the unseeded check draws afresh. Under asynchronous scheduling a prefill-only step drops the model proposal of every request it hides, so arrival timing changes the draft counts and the seeded checks draw afresh too. The deterministic checks beside them are exact: every committed token must be in its context's support, and a greedy penalized request must equal its reference.
+
+`test_sampled_controls.py` relies on how the Llama 3.1 tokenizer the recipes serve with spells the shared tokens: 17 is `"2"`, 4099 is `"pression"` and 65537 is `" Guang"`, and vLLM tokenizes the bad word `"2pression"` to `[[17, 4099]]`. Its grammars, `(2|pression)+` and `( Guang|2)+`, therefore leave the target two shared tokens to sample at every position. The model drafter proposes the rule's choice, which neither grammar admits, so structured requests accept drafts only under the n-gram drafter.
 
 **8. The host n-gram drafter.** Replace the speculative config with
 `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_min":2,"prompt_lookup_max":4}`
@@ -220,7 +226,7 @@ tests/tt/spec/run_spec_regression.sh /tmp/spec-run                  # every conf
 tests/tt/spec/run_spec_regression.sh /tmp/spec-run capacity         # or one of them
 ```
 
-The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, `async-k3`, `sampled`, `sampled-async`, `sampled-async-device`, `sampled-solo-async`, `sampled-accept-2`, `sampled-capacity`, `sampled-logits-only`, `sampled-ngram`, and `async-logits-only`. The `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, and `async-k3` configurations run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. The `sampled-*` configurations run `test_sampled_speculation.py` with both accept modes declared: synchronously, asynchronously on host sampling, asynchronously with decode-only device sampling (greedy steps sample on the device, sampled steps on the host), under the `solo` policy, with deliberately wrong drafts past depth 2, under a KV budget small enough to preempt, with `logits` alone, and with the n-gram drafter. `async-logits-only` runs both `test_async_correctness.py` and `test_sampled_speculation.py` asynchronously with `logits` as the only mode. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
+The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, `async-k3`, `sampled`, `sampled-async`, `sampled-async-device`, `sampled-solo-async`, `sampled-accept-2`, `sampled-capacity`, `sampled-logits-only`, `sampled-ngram`, and `async-logits-only`. The `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, and `async-k3` configurations run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. The `sampled-*` configurations run `test_sampled_speculation.py`, `test_sampled_controls.py` and `test_request_admission.py` with both accept modes declared: synchronously, asynchronously on host sampling, asynchronously with decode-only device sampling (greedy steps sample on the device, sampled steps on the host), under the `solo` policy, with deliberately wrong drafts past depth 2, under a KV budget small enough to preempt, with `logits` alone, and with the n-gram drafter. `async-logits-only` runs `test_async_correctness.py` and the sampled selection asynchronously with `logits` as the only mode. `accept-all`, `accept-2` and `accept-0` also run `test_request_admission.py`, on a launch serving only `argmax_ids`. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
 
 ## The manifest
 
