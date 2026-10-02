@@ -15,11 +15,14 @@ The model-side contract this admits against, which a tt-metal model class must
 implement, is documented in ``docs/SPEC_DECODE_CONTRACT.md``.
 """
 
+import dataclasses
 from typing import TYPE_CHECKING, get_args
 
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     DRAFTER_STATE_PAGED,
+    HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     SPEC_REQUIREMENT_HIDDEN_FEED,
@@ -32,6 +35,8 @@ from vllm_tt_plugin.spec_decode import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = init_tt_logger(__name__)
 
 # Accept modes the runner can drive today. A plan offering none of these is
 # refused; a plan offering more keeps its extra modes and is still admitted,
@@ -178,10 +183,11 @@ def resolve_speculative_plan(
 
     # Validated when the hidden state is fed at all, whether the method
     # demands it or the model volunteers it. A model declaring the feed and no
-    # handoff has not said how the state reaches its drafter, and the runner
-    # reads the handoff to decide whether a step that produces no hidden
-    # handle can still ask that drafter to propose. A typo in a declaration no
-    # launch uses stays unvalidated, so it cannot refuse an ngram launch.
+    # handoff has not said how the state reaches its drafter, and the handoff
+    # decides below whether a step that produces no hidden handle can still
+    # ask that drafter to propose. A typo in a declaration no launch uses
+    # stays unvalidated, so it cannot refuse an ngram launch.
+    handoff: tuple[str, ...] = ()
     if (
         SPEC_REQUIREMENT_HIDDEN_FEED in required
         or SPEC_REQUIREMENT_HIDDEN_FEED in declared
@@ -283,6 +289,31 @@ def resolve_speculative_plan(
             f"{list(outcome.accept_modes)}, none of which the runner can "
             f"drive; it drives {list(_RUNNABLE_ACCEPT_MODES)}"
         )
+
+    # An ordinary decode returns no VerifyOutput, so it produces no hidden
+    # handle, and a model-owned drafter fed its target hidden state through
+    # the runner would be asked to draft from nothing after one. Read from the
+    # model's declaration rather than the method's requirements, because what
+    # the drafter reads is the model's own statement. Revoked in the plan
+    # rather than in the runner because per-request admission
+    # (TTPlatform._reject_unsupported_speculative_request) runs in the
+    # front-end process, where no model is loaded, and has to know whether
+    # every decode step of the launch is a verify.
+    if (
+        outcome.supports_narrow_decode
+        and SPEC_REQUIREMENT_DEVICE_PROPOSE in required
+        and SPEC_REQUIREMENT_HIDDEN_FEED in declared
+        and HIDDEN_HANDOFF_ROUNDTRIP in handoff
+    ):
+        logger.info(
+            "TT speculative decoding: %s feeds its drafter the target hidden "
+            "state through the runner, so every decode step stays a verify "
+            "and none of them overlaps. A model that keeps its hidden state "
+            "on device, or a drafter that needs none, decodes a draftless "
+            "step as an ordinary overlapping decode.",
+            model_class.__name__,
+        )
+        outcome = dataclasses.replace(outcome, supports_narrow_decode=False)
 
     return outcome
 

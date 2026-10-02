@@ -260,13 +260,17 @@ def _validate(params):
     TTPlatform.validate_request({"prompt_token_ids": [1, 2, 3]}, params)
 
 
-def _speculating_platform(monkeypatch, vllm_config):
+def _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=True):
     """Run the hook so a spec plan is live, and return the platform."""
     from vllm_tt_plugin.platform import TTPlatform
 
-    model = make_fake_spec_model(max_supported_num_seqs=4)
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4, supports_narrow_decode=supports_narrow_decode
+    )
     _run_hook(monkeypatch, _speculative(vllm_config), model)
-    assert get_tt_spec_plan(vllm_config) is not None
+    plan = get_tt_spec_plan(vllm_config)
+    assert plan is not None
+    assert plan.supports_narrow_decode is supports_narrow_decode
     return TTPlatform
 
 
@@ -283,8 +287,9 @@ def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
         ("bad_words", ["no"]),
     ],
 )
+@pytest.mark.parametrize("narrow", [True, False], ids=["narrow", "verify-only"])
 def test_a_request_the_greedy_walk_cannot_serve_is_refused(
-    monkeypatch, vllm_config, field, value
+    monkeypatch, vllm_config, field, value, narrow
 ):
     """Answering greedily anyway would change what was asked for, silently.
 
@@ -298,24 +303,35 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     """
     from vllm.sampling_params import SamplingParams
 
-    _speculating_platform(monkeypatch, vllm_config)
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=narrow)
     params = SamplingParams(temperature=0.0, **{field: value})
     with pytest.raises(ValueError) as excinfo:
         _validate(params)
     message = str(excinfo.value)
     assert "cannot serve" in message
     assert field in message
+    # Only a launch with narrow decode serves sampled requests, so only its
+    # refusal may say so.
+    assert ("ARE served" in message) is narrow
 
 
-@pytest.mark.parametrize(
-    "field, value",
-    [
-        ("temperature", 0.7),
-        ("presence_penalty", 0.5),
-        ("frequency_penalty", 0.5),
-        ("repetition_penalty", 1.1),
-    ],
-)
+_SAMPLED = [
+    ("temperature", 0.7),
+    ("presence_penalty", 0.5),
+    ("frequency_penalty", 0.5),
+    ("repetition_penalty", 1.1),
+]
+
+
+def _sampled_params(field, value):
+    from vllm.sampling_params import SamplingParams
+
+    kwargs = {"temperature": 0.0} if field != "temperature" else {}
+    kwargs[field] = value
+    return SamplingParams(**kwargs)
+
+
+@pytest.mark.parametrize("field, value", _SAMPLED)
 def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
     monkeypatch, vllm_config, field, value
 ):
@@ -323,17 +339,106 @@ def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
 
     Refusing these made a speculating launch unusable for any sampled client:
     every prompt of r1_gpqa_diamond and mmlu_pro came back HTTP 400, because
-    both send temperature=1.0. The ordinary decode path applies the full
-    sampling the runner implements, so the request gets what it asked for at
-    baseline speed; only the drafts are withheld
-    (TTModelRunner._request_is_speculable).
+    both send temperature=1.0. On a model that serves its own ordinary decode,
+    every step such a request shares runs as that decode, which applies the
+    full sampling the runner implements, so the request gets what it asked
+    for at baseline speed (``_step_verifies``).
     """
+    _speculating_platform(monkeypatch, vllm_config)
+    _validate(_sampled_params(field, value))  # must not raise
+
+
+@pytest.mark.parametrize("field, value", _SAMPLED)
+def test_a_sampled_request_is_refused_where_every_step_verifies(
+    monkeypatch, vllm_config, field, value
+):
+    """Without narrow decode, a sampled request would be answered greedily.
+
+    Such a model sends every decode step as a verify, and a verify in
+    ``argmax_ids`` mode commits the target argmax on every row. The request
+    would come back as greedy text with a 200, so it is refused instead.
+    """
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    with pytest.raises(ValueError) as excinfo:
+        _validate(_sampled_params(field, value))
+    message = str(excinfo.value)
+    assert f"{field}={value!r}" in message
+    assert "supports_narrow_decode" in message
+
+
+def test_a_greedy_request_is_served_where_every_step_verifies(monkeypatch, vllm_config):
+    """min_p, top_p and top_k do not move a greedy request's argmax."""
     from vllm.sampling_params import SamplingParams
 
-    _speculating_platform(monkeypatch, vllm_config)
-    kwargs = {"temperature": 0.0} if field != "temperature" else {}
-    kwargs[field] = value
-    _validate(SamplingParams(**kwargs))  # must not raise
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    _validate(SamplingParams(temperature=0.0, top_p=0.5, top_k=4, min_p=0.1))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"temperature": 0.0},
+        {"temperature": 1e-6},
+        {"temperature": 1e-5},
+        {"temperature": 0.7, "seed": 3},
+        {"temperature": 0.0, "presence_penalty": -0.5},
+        {"temperature": 0.0, "frequency_penalty": 0.5},
+        {"temperature": 0.0, "repetition_penalty": 1.0},
+        {"temperature": 0.0, "repetition_penalty": 0.9},
+        {"temperature": 0.0, "top_p": 0.5, "top_k": 4, "min_p": 0.1},
+    ],
+)
+def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
+    monkeypatch, vllm_config, kwargs
+):
+    """Two predicates over one request, read on two sides of a process boundary.
+
+    Admission reads the request's ``SamplingParams`` in the front-end process.
+    The runner reads the sets vLLM's ``InputBatch.add_request`` files the same
+    request into, in the engine. Disagreement either way is a defect: a
+    request admitted that the runner then verifies by argmax, or a greedy
+    request refused for nothing. So the request goes through both, through a
+    real ``InputBatch``.
+    """
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+    from vllm_tt_plugin.input_batch import InputBatch
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    params = SamplingParams(**kwargs)
+    batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        vocab_size=64,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+    )
+    batch.add_request(
+        CachedRequestState(
+            req_id="r0",
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            sampling_params=params,
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=3,
+            output_token_ids=[],
+        )
+    )
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = batch
+    speculable = TTModelRunner._request_is_speculable(runner, "r0")
+
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    try:
+        _validate(params)
+        admitted = True
+    except ValueError:
+        admitted = False
+
+    assert admitted is speculable
 
 
 def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_config):
