@@ -2593,26 +2593,28 @@ class TTPlatform(Platform):
     def _reject_unsupported_speculative_request(cls, params) -> None:
         """Refuse a request this launch cannot serve faithfully at all.
 
-        A model serving ``logits`` speculates for a request with a non-zero
-        temperature, top-k, top-p or the penalties: the runner
-        rejection-samples against the target distribution under those
-        controls. A model serving only ``argmax_ids`` certifies plain greedy
-        decoding and nothing else. Where such a model declares
-        ``supports_narrow_decode``, ``TTModelRunner._publish_draft`` offers a
-        sampled or penalized request no drafts, and every step it shares runs
-        as the ordinary decode, which applies its full sampling
-        (``_step_verifies`` in the runner). Refusing these controls would fail
-        every ordinary sampled client with HTTP 400, so they are served. A
-        model serving only ``argmax_ids`` without ``supports_narrow_decode``
-        sends every decode step as a verify, which commits the target argmax
-        on every row, so there the request is refused. vLLM itself refuses
-        logit_bias, and a min_p above 1e-5, on a speculating launch before
-        this runs.
+        A model serving ``logits`` speculates for every request admission lets
+        through: the runner rejection-samples each verify row on the host
+        against the target distribution under the row's temperature, top-k,
+        top-p, penalties, logprobs, grammar, allowed_token_ids, bad_words and
+        min_tokens, which is what upstream's rejection sampler applies too. A
+        model serving only ``argmax_ids`` certifies plain greedy decoding and
+        nothing else. Where such a model declares ``supports_narrow_decode``,
+        ``TTModelRunner._publish_draft`` offers a sampled or penalized request
+        no drafts, and every step it shares runs as the ordinary decode, which
+        applies its full sampling (``_step_verifies`` in the runner). Refusing
+        these controls would fail every ordinary sampled client with HTTP 400,
+        so they are served. A model serving only ``argmax_ids`` without
+        ``supports_narrow_decode`` sends every decode step as a verify, which
+        commits the target argmax on every row, so there the request is
+        refused. vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
+        speculating launch before this runs.
 
-        Refused on every speculating launch: controls that need logits or a
-        token filter the model-owned sampler does not apply. A request asking
-        for those would be answered without them, silently -- a grammar or
-        token filter unapplied, requested logprobs arriving empty.
+        What remains here is what this launch does not serve. On an
+        ``argmax_ids``-only launch those are the controls that need logits or
+        a token filter: the greedy walk cannot apply them, so a verify would
+        answer such a request without them, silently -- a grammar or token
+        filter unapplied, requested logprobs arriving empty.
 
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
@@ -2628,30 +2630,31 @@ class TTPlatform(Platform):
         spec_plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
         if spec_plan is None:
             return
+        serves_logits = ACCEPT_MODE_LOGITS in spec_plan.accept_modes
 
         unsupported = []
+        if params.logit_bias:
+            unsupported.append("logit_bias")
         # temperature and the penalties are absent: those requests speculate
         # in logits mode, or decode without speculation. ``sampled`` below
         # covers a launch that has neither.
-        if params.logprobs is not None:
-            unsupported.append(f"logprobs={params.logprobs!r}")
-        if getattr(params, "structured_outputs", None) is not None:
-            unsupported.append("structured_outputs")
-        if params.logit_bias:
-            unsupported.append("logit_bias")
-        if params.bad_words:
-            unsupported.append("bad_words")
-        if params.allowed_token_ids:
-            unsupported.append("allowed_token_ids")
-        if params.min_tokens:
-            unsupported.append(f"min_tokens={params.min_tokens!r}")
+        if not serves_logits:
+            if params.logprobs is not None:
+                unsupported.append(f"logprobs={params.logprobs!r}")
+            if getattr(params, "structured_outputs", None) is not None:
+                unsupported.append("structured_outputs")
+            if params.bad_words:
+                unsupported.append("bad_words")
+            if params.allowed_token_ids:
+                unsupported.append("allowed_token_ids")
+            if params.min_tokens:
+                unsupported.append(f"min_tokens={params.min_tokens!r}")
 
         # The same four conditions under which vLLM's InputBatch.add_request
         # files the request into random_reqs or a penalty set, which is what
         # TTModelRunner._request_is_speculable reads. min_p, top_p and top_k
         # are absent because they do not move a greedy request's argmax.
         sampled = []
-        serves_logits = ACCEPT_MODE_LOGITS in spec_plan.accept_modes
         if not spec_plan.supports_narrow_decode and not serves_logits:
             if params.sampling_type != SamplingType.GREEDY:
                 sampled.append(f"temperature={params.temperature!r}")
@@ -2671,6 +2674,11 @@ class TTPlatform(Platform):
                 f"No path on this launch applies {unsupported}, so answering "
                 "without them would change what was asked for without saying "
                 "so."
+            )
+        if unsupported and not serves_logits:
+            reasons.append(
+                "Logprobs, grammars and token filters need a model that "
+                "serves the logits accept mode."
             )
         if sampled:
             reasons.append(
