@@ -59,6 +59,7 @@ BAD_WORD = "2pression"
 BAD_WORD_IDS = [TWO, PRESSION]
 # Two grammars over different pairs of shared tokens, so a bitmask row that
 # reached the wrong request lets through a token the other grammar forbids.
+ASCII_TEXT = r"[ -~\n]*"
 GRAMMARS = {
     "2-pression": (r"(2|pression)+", {TWO, PRESSION}),
     "guang-2": (r"( Guang|2)+", {GUANG, TWO}),
@@ -529,15 +530,21 @@ def test_structured_output_speculates_and_follows_each_request_s_grammar(
 def test_a_grammar_the_model_drafts_follow_accepts_its_drafts(
     spec_server, spec_config, ascending_prompt, record
 ):
-    """``(.|\\n)*`` admits all but the special tokens, so the drafts are valid.
+    """Printable ASCII admits most of the rule's choices, so drafts are valid.
 
-    The model drafter proposes the rule's choice, which this grammar admits,
-    so a structured request accepts drafts. Under asynchronous scheduling
-    that is the evidence the scheduler validated the drafts the runner
-    actually verified: they reach it only through ``take_draft_token_ids`` on
-    the engine's deferred-sampling path, and a structured row whose drafts did
-    not reach it walks with none, so it could accept nothing. Each committed
-    token must still be in its context's support.
+    The model drafter proposes the rule's choice, which this grammar admits
+    about three times in four, so a structured request accepts drafts. Under
+    asynchronous scheduling that is the evidence the scheduler validated the
+    drafts the runner actually verified: they reach it only through
+    ``take_draft_token_ids`` on the engine's deferred-sampling path, and a
+    structured row whose drafts did not reach it walks with none, so it could
+    accept nothing. Each committed token must still be in its context's
+    support.
+
+    The grammar is ASCII so that every token it admits is a whole character.
+    One admitting the first byte of a multi-byte character would then need a
+    continuation byte, which none of the dummy's four support tokens is, and a
+    context with nothing allowed has no distribution to sample.
     """
     if spec_config.drafter != "model":
         pytest.skip("only the model drafter proposes what this grammar admits")
@@ -550,7 +557,7 @@ def test_a_grammar_the_model_drafts_follow_accepts_its_drafts(
             "max_tokens": max_tokens,
             "temperature": 1.0,
             "seed": 7300 + i,
-            "structured_outputs": {"regex": r"(.|\n)*"},
+            "structured_outputs": {"regex": ASCII_TEXT},
         }
         for i in range(requests)
     ]
@@ -561,6 +568,7 @@ def test_a_grammar_the_model_drafts_follow_accepts_its_drafts(
 
     for prompt, result in zip(prompts, results):
         assert_full_length_completion(result, max_tokens)
+        assert _spells(spec_server, result, ASCII_TEXT), result.token_ids
         _counts(prompt, result.token_ids, lambda h: set(), {"temperature": 1.0})
     assert delta.accepted > 0, (
         "no draft of a structured request was accepted, so the scheduler never "
