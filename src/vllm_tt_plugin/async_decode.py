@@ -180,6 +180,8 @@ class CompletedSpecDecodeStep:
     context: SubmittedStepContext
     completion_time_ns: int
     runner_output: ModelRunnerOutput | None = None
+    # The published prefixes' logprobs, when the step's rows asked for them.
+    logprobs: LogprobsLists | None = None
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
@@ -320,16 +322,28 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         self._context = context
         self._init_deferred()
 
-    def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
-        """Refused: no accept walk applies a grammar to the drafted positions.
+    def set_grammar_bitmask(
+        self, bitmask: torch.Tensor, *, num_valid_drafts: torch.Tensor
+    ) -> None:
+        """Attach the per-column bitmask and the drafts it can constrain.
 
-        Reachable only through a launch admission should have refused, so it
-        raises rather than dropping the mask and serving ungrammatical text.
+        ``bitmask`` is ``[rows, 1+K, W]``. ``num_valid_drafts`` is the
+        submitted count with every structured row whose drafts the bitmask was
+        not computed from set to 0, which
+        ``TTModelRunner._grammar_validated_drafts`` decides; the walk reads
+        both off ``model_input``. Only an ``argmax_ids`` verify has no use for
+        a grammar, and no structured row reaches one.
         """
-        raise NotImplementedError(
-            "structured output and speculative decoding cannot be combined on "
-            "this path: neither accept walk applies a grammar bitmask to the "
-            "drafted positions"
+        if self._model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+            raise RuntimeError(
+                "a grammar bitmask reached an argmax_ids verify, whose ids "
+                "cannot be masked; a structured-output row makes its verify "
+                "ask for logits"
+            )
+        self._model_input = replace(
+            self._model_input,
+            grammar_bitmask=[bitmask],
+            num_valid_drafts=num_valid_drafts,
         )
 
     def _get_output_impl(self) -> ModelRunnerOutput:
@@ -339,7 +353,7 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
             context=self._context,
         )
         runner_output = self._controller.runner.build_spec_runner_output(
-            self._model_input.row_req_ids, completed.prefixes
+            self._model_input.row_req_ids, completed.prefixes, completed.logprobs
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
@@ -1013,19 +1027,19 @@ class TTAsyncDecodeController:
                 context=context,
                 completion_time_ns=time.perf_counter_ns(),
             )
-        committed, counts = self.runner.walk_spec_acceptance(
-            model_input, finalized.tt_out
+        walk = self.runner.walk_spec_acceptance(model_input, finalized.tt_out)
+        prefixes = self.runner.spec_committed_prefixes(
+            model_input, walk.committed, walk.counts
         )
         return CompletedSpecDecodeStep(
-            committed=committed,
-            counts=counts,
-            prefixes=self.runner.spec_committed_prefixes(
-                model_input, committed, counts
-            ),
+            committed=walk.committed,
+            counts=walk.counts,
+            prefixes=prefixes,
             model_input=model_input,
             spec_hidden=submission.spec_hidden,
             context=context,
             completion_time_ns=time.perf_counter_ns(),
+            logprobs=self.runner.spec_committed_logprobs(walk.logprobs, prefixes),
         )
 
     def build_runner_output_from_completed_step(

@@ -546,7 +546,7 @@ def test_padding_rows_never_reach_the_output():
         accepted_counts=model_input.accepted_counts,
     )
 
-    committed, counts = runner.walk_spec_acceptance(model_input, verify.logits)
+    committed, counts, _ = runner.walk_spec_acceptance(model_input, verify.logits)
 
     assert counts[1:].tolist() == [1] * (rows - 1)
     assert committed[1:, 0].tolist() == verify.logits[1:, 0].argmax(-1).tolist()
