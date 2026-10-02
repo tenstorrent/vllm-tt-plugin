@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
+    TTCompactedHostLogits,
     TTModelInput,
     TTSamplingParams,
     slice_tt_sampling_params,
@@ -725,8 +726,9 @@ class TTLaneInputBatch(InputBatch):
     sampling defaults so they cannot perturb batch-wide flags (``all_greedy`` /
     ``no_penalties``) or sample an invalid value.
 
-    Merged host sampling: because rows are the device slots and gaps carry
-    neutral defaults, the runner samples the whole ``max_num_reqs`` slot batch
+    Merged host sampling: requests without active slot-indexed logits processors
+    are compacted to scheduled rows. The path for active/custom processors
+    samples the whole ``max_num_reqs`` slot batch
     in one call against one :class:`SamplingMetadata` built here over every row
     (``build_merged_sampling_metadata``). The builtin/custom logits processors
     keep per-row state over this full slot batch (``refresh_logitsprocs`` passes
@@ -974,12 +976,25 @@ class TTLaneInputBatch(InputBatch):
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
 
+    def can_compact_host_sampling(self) -> bool:
+        """Whether sampling can operate independently of persistent slot rows."""
+        return not self.sampling.has_active_logitsprocs() and all(
+            type(proc)
+            in (MinPLogitsProcessor, LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
+            for proc in self.sampling.logitsprocs.all
+        )
+
     def build_merged_sampling_metadata(
         self,
         scheduled_rows: list[int] | None = None,
         non_sampling_rows: list[int] | None = None,
+        compact: bool = False,
     ) -> SamplingMetadata:
-        """Build one :class:`SamplingMetadata` over every slot row.
+        """Build sampling metadata over slot rows, or compact scheduled rows.
+
+        ``compact`` is used only when slot-indexed logits processors have no
+        work. It reindexes all per-request data, while keeping seeded generators
+        attached to their requests and cloning intermediate-prefill generators.
 
         Mirrors a normal single-engine vLLM ``SamplingMetadata`` build, but over
         the full ``max_num_reqs`` slot batch (live rows interleaved with neutral
@@ -1007,31 +1022,41 @@ class TTLaneInputBatch(InputBatch):
         token is discarded, so they are handed a generator clone and the
         request's real RNG state stays put.
         """
-        n = self.max_num_reqs
+        if compact and scheduled_rows is None:
+            raise ValueError("Compacted sampling requires scheduled_rows")
+        rows = list(scheduled_rows) if compact else list(range(self.max_num_reqs))
+        n = len(rows)
         sampling = self.sampling
-        temperature = sampling.temperature[:n]
+        temperature = sampling.temperature[rows]
         all_greedy = bool((temperature == 0.0).all())
         all_random = bool((temperature != 0.0).all())
-        presence = sampling.presence_penalty[:n]
-        frequency = sampling.frequency_penalty[:n]
-        repetition = sampling.repetition_penalty[:n]
+        presence = sampling.presence_penalty[rows]
+        frequency = sampling.frequency_penalty[rows]
+        repetition = sampling.repetition_penalty[rows]
         no_penalties = bool(
             (presence == 0.0).all()
             and (frequency == 0.0).all()
             and (repetition == 1.0).all()
         )
-        rows = list(range(n))
+        bad_words_token_ids = {
+            i: sampling.bad_words_token_ids[row]
+            for i, row in enumerate(rows)
+            if row in sampling.bad_words_token_ids
+        }
         if not no_penalties:
             prompt_token_ids = self.make_prompt_token_ids_tensor(rows).to(torch.int64)
             prompt_token_ids = prompt_token_ids.masked_fill(
                 prompt_token_ids == -1, self.vocab_size
             )
+        else:
+            prompt_token_ids = None
+        # Multi-token bad words need output history even with neutral penalties.
+        if not no_penalties or bad_words_token_ids:
             output_rows = self.make_output_token_ids_tensor(rows)
             output_token_ids = [
                 [tok for tok in row.tolist() if tok != -1] for row in output_rows
             ]
         else:
-            prompt_token_ids = None
             output_token_ids = [[] for _ in range(n)]
         # Only hand the sampler an allowlist mask when some live request
         # actually constrains its tokens. The mask tensor is allocated lazily
@@ -1044,7 +1069,7 @@ class TTLaneInputBatch(InputBatch):
         else:
             allowed_token_ids_mask = sampling.allowed_token_ids_mask
             if allowed_token_ids_mask is not None:
-                allowed_token_ids_mask = allowed_token_ids_mask[:n]
+                allowed_token_ids_mask = allowed_token_ids_mask[rows]
         if scheduled_rows is None:
             generators = dict(sampling.generators)
         else:
@@ -1055,13 +1080,24 @@ class TTLaneInputBatch(InputBatch):
                 for row, gen in sampling.generators.items()
                 if row in scheduled
             }
+        top_p = sampling.top_p[rows]
+        top_k = sampling.top_k[rows]
+        if compact:
+            # A supplied all-ones top_p still sorts the entire vocabulary in
+            # vLLM's native sampler. None expresses that there is no filter.
+            if bool((top_p == 1.0).all()):
+                top_p = None
+            if bool((top_k == self.vocab_size).all()):
+                top_k = None
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
             all_greedy=all_greedy,
             all_random=all_random,
-            top_p=sampling.top_p[:n],
-            top_k=sampling.top_k[:n],
-            generators=generators,
+            top_p=top_p,
+            top_k=top_k,
+            generators={
+                i: generators[row] for i, row in enumerate(rows) if row in generators
+            },
             max_num_logprobs=self.max_num_logprobs,
             no_penalties=no_penalties,
             prompt_token_ids=prompt_token_ids,
@@ -1070,8 +1106,8 @@ class TTLaneInputBatch(InputBatch):
             repetition_penalties=repetition,
             output_token_ids=output_token_ids,
             allowed_token_ids_mask=allowed_token_ids_mask,
-            bad_words_token_ids=dict(sampling.bad_words_token_ids),
-            logitsprocs=sampling.logitsprocs,
+            bad_words_token_ids=bad_words_token_ids,
+            logitsprocs=LogitsProcessors() if compact else sampling.logitsprocs,
         )
 
     # ------------------------------------------------------------------
@@ -1340,11 +1376,10 @@ class TTLaneInputBatch(InputBatch):
 
         Returns ``(sampled_token_ids[n, 1], logprobs)`` for the ``n``
         ``scheduled_rows`` in order. Device sampling reads the sampled tokens
-        directly from each slot; host sampling runs **one** sampler call over
-        the whole slot batch (so the builtin/custom logits processors stay
-        row-aligned, with no per-lane slicing) and then picks the scheduled
-        rows out of the result. Also called from ``TTAsyncDecodeController`` to
-        finalize an async lane-decode step.
+        directly from each slot. Host sampling uses scheduled rows when no
+        slot-indexed logits processors are active, otherwise the whole slot
+        batch so builtin/custom processor state remains row-aligned. Also called
+        from ``TTAsyncDecodeController`` to finalize an async lane-decode step.
         """
         n = len(scheduled_rows)
         rows_t = torch.as_tensor(scheduled_rows, dtype=torch.long)
@@ -1385,18 +1420,43 @@ class TTLaneInputBatch(InputBatch):
 
         # Host sampling over the full slot batch.
         total = self.max_num_reqs
-        logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
+        precompacted = isinstance(tt_out, TTCompactedHostLogits)
         bitmask = model_input.grammar_bitmask[0]
+        if precompacted:
+            if (
+                tt_out.rows != tuple(scheduled_rows)
+                or not self.can_compact_host_sampling()
+            ):
+                raise ValueError(
+                    f"Compact host logits do not match scheduled slots: "
+                    f"output={tt_out.rows}, scheduled={scheduled_rows}"
+                )
+            logits = tt_out.logits
+            logits = logits[:, -1, :] if logits.dim() == 3 else logits
+            if logits.shape[0] != n:
+                raise ValueError(f"Expected {n} compact rows, got {logits.shape}")
+            if bitmask is not None:
+                bitmask = bitmask[scheduled_rows]
+        else:
+            logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
         if bitmask is not None:
             runner.apply_grammar_bitmask(logits, bitmask)
+        # Stateful processors index persistent slot rows. Keep their existing
+        # full-slot path; compact only when the known builtins have no work.
+        compact = self.can_compact_host_sampling()
         sampling_metadata = self.build_merged_sampling_metadata(
-            scheduled_rows, non_sampling_rows=intermediate_rows
+            scheduled_rows, non_sampling_rows=intermediate_rows, compact=compact
         )
+        if compact and not precompacted:
+            logits = logits[rows_t]
         sampler_output = runner.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
-        sampled = sampler_output.sampled_token_ids.reshape(-1)[rows_t].reshape(n, 1)
-        logprobs = self._host_logprobs(sampler_output.logprobs_tensors, scheduled_rows)
+        output_rows = list(range(n)) if compact else scheduled_rows
+        sampled = sampler_output.sampled_token_ids.reshape(-1)[output_rows].reshape(
+            n, 1
+        )
+        logprobs = self._host_logprobs(sampler_output.logprobs_tensors, output_rows)
         return sampled.to(torch.int32), logprobs
 
     def _host_logits(

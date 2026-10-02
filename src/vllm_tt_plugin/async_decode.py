@@ -15,6 +15,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.model_input import TTCompactedHostLogits
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -90,13 +91,14 @@ class TTDecodeSubmission:
     # belongs to: the runner hands it straight back to ``propose_draft_tokens``
     # without interpreting its dtype, layout or tensor-parallel fracturing.
     spec_hidden: Any | None = None
+    readback_rows: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor
+    tt_out: torch.Tensor | TTCompactedHostLogits
     tt_log_probs: torch.Tensor | None
 
 
@@ -931,7 +933,7 @@ class TTAsyncDecodeController:
         batch is read back via ``TTLaneInputBatch.extract_output``. Otherwise it
         is a plain single-process step read back via ``_get_output_tokens``.
         """
-        finalized = self.finalize_decode(submission)
+        finalized = self.finalize_decode(submission, sampling_rows=scheduled_rows)
         if finalized is None:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
@@ -1126,7 +1128,10 @@ class TTAsyncDecodeController:
         overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(
-            model_input, read_from_device=False, async_read=True
+            model_input,
+            read_from_device=False,
+            async_read=True,
+            sampling_rows=scheduled_rows,
         )
         if submission.tt_out is None:
             completion_event.set()
@@ -1147,6 +1152,7 @@ class TTAsyncDecodeController:
         *,
         read_from_device: bool,
         async_read: bool = False,
+        sampling_rows: list[int] | None = None,
     ) -> TTDecodeSubmission:
         runner = self.runner
         batch_size_per_dp = model_input.unpadded_batch_size
@@ -1155,6 +1161,20 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        readback_rows = None
+        if (
+            sampling_rows is not None
+            and not perform_device_sampling
+            and getattr(runner.model, "model_capabilities", {}).get(
+                "supports_selective_host_readback", False
+            )
+            and runner.lane_batch.can_compact_host_sampling()
+        ):
+            readback_rows = tuple(sampling_rows)
+            # Select rows before the adapter initiates a full output read.
+            # Synchronous callers wait for these same events in finalize_decode.
+            read_from_device = False
+            async_read = True
         contract_version = self.decode_input_update_contract_version()
         self.count_decode_submission(model_input)
         if not any(bs > 0 for bs in batch_size_per_dp):
@@ -1302,7 +1322,15 @@ class TTAsyncDecodeController:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
-                    runner.model.read_decode_output(tt_out, async_read=True),
+                    runner.model.read_decode_output(
+                        tt_out,
+                        async_read=True,
+                        **(
+                            {"sample_rows": list(readback_rows)}
+                            if readback_rows is not None
+                            else {}
+                        ),
+                    ),
                 )
             else:
                 is_host_tensor = isinstance(tt_out, torch.Tensor)
@@ -1323,15 +1351,26 @@ class TTAsyncDecodeController:
             perform_device_sampling=perform_device_sampling,
             reload_plan=reload_plan,
             spec_hidden=spec_hidden,
+            readback_rows=readback_rows,
         )
 
     def finalize_decode(
         self,
         submission: TTDecodeSubmission,
+        *,
+        sampling_rows: list[int] | None = None,
     ) -> TTFinalizedDecode | None:
         runner = self.runner
         if submission.tt_out is None:
             return None
+
+        if submission.readback_rows is not None and (
+            sampling_rows is None or tuple(sampling_rows) != submission.readback_rows
+        ):
+            raise ValueError(
+                f"Sampling rows {sampling_rows} differ from submitted readback "
+                f"rows {submission.readback_rows}"
+            )
 
         if submission.read_events is not None:
             for read_event in submission.read_events:
@@ -1341,11 +1380,23 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
 
         is_host_output = _is_host_decode_output(tt_out)
+        compact_rows = None
         if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
-            tt_out = runner.model.process_decode_output_host(
-                tt_out,
-                is_tokens=submission.perform_device_sampling,
-            )
+            kwargs = {"is_tokens": submission.perform_device_sampling}
+            if (
+                sampling_rows is not None
+                and not submission.perform_device_sampling
+                and getattr(runner.model, "model_capabilities", {}).get(
+                    "supports_compact_host_logits", False
+                )
+                and (
+                    submission.readback_rows is not None
+                    or runner.lane_batch.can_compact_host_sampling()
+                )
+            ):
+                compact_rows = tuple(sampling_rows)
+                kwargs["sample_rows"] = list(compact_rows)
+            tt_out = runner.model.process_decode_output_host(tt_out, **kwargs)
         elif not is_host_output:
             raise AttributeError(
                 "TT model must implement process_decode_output_host() "
@@ -1363,4 +1414,6 @@ class TTAsyncDecodeController:
         elif isinstance(tt_out, tuple):
             tt_out, _ = tt_out
 
+        if compact_rows is not None:
+            tt_out = TTCompactedHostLogits(logits=tt_out, rows=compact_rows)
         return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=tt_log_probs)
