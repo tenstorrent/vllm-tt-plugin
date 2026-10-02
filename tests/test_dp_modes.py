@@ -28,7 +28,7 @@ class TestDPModes:
         return type(
             "DummyModel",
             (),
-            {"__module__": "models.tt_transformers.tt.generator_vllm"},
+            {"__module__": "models.ttt_compat.tt.generator_vllm"},
         )
 
     @staticmethod
