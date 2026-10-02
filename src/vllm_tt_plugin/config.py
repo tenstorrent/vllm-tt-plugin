@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from vllm_tt_plugin.logger import init_tt_logger
 
@@ -32,6 +32,18 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
         getattr(vllm_config, "additional_config", {}) or {}, "additional_config"
     )
     return dict(additional_config)
+
+
+def get_tt_seeded_sampling_policy(
+    vllm_config: "VllmConfig",
+) -> Literal["auto", "host"]:
+    """Resolve the operator's sampling policy for explicitly seeded requests."""
+    policy = get_tt_config(vllm_config).get("seeded_sampling_policy", "auto")
+    if policy not in ("auto", "host"):
+        raise ValueError(
+            f"seeded_sampling_policy must be 'auto' or 'host', got {policy!r}"
+        )
+    return policy
 
 
 # Internal keys recording resolved platform state. Stored at the top level of

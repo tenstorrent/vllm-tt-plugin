@@ -790,6 +790,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
     runner = SimpleNamespace(
         input_batch=batch,
         sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
         num_devices=4,
         tt_data_parallel_size=2,
         model=SimpleNamespace(model_capabilities={"max_device_top_k": 32}),
