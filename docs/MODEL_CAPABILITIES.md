@@ -163,6 +163,7 @@ speculative admission does not guarantee that state exists yet.
 | `drafter_state` | Required | One of `internal`, `paged`, or `shared_with_target`. Admission rejects `paged` because the plugin has no scheduler-owned drafter-cache allocation. |
 | `drafter_target_cache_requires` | `()` | Sequence using `named_layer_caches` and `absolute_positions`. `SpecPlan` rejects strings, unknown names, duplicates, and a nonempty sequence unless `drafter_state="shared_with_target"`. The plugin does not verify that the target cache satisfies these requirements. |
 | `supports_narrow_decode` | `False` | Declares ordinary `[B, 1]` decode support alongside wide `[B, 1+K]` verification. The runner uses this permission for draftless steps when the drafter's hidden-state requirements allow narrow decode. This value is a `SpecPlan` field, not a `model_capabilities` key. |
+| `k_by_rows` | `()` | Per-step draft cap by live rows, as `(max_rows, k)` pairs in strictly ascending `max_rows` order. A step with R live rows carries at most the `k` of the first pair whose `max_rows` is at least R; empty means `effective_k` at every batch size. `SpecPlan` rejects a malformed pair, a `k` outside `[1, effective_k]`, and a mapping whose largest `k` is not `effective_k`. Admission rejects a mapping whose last `max_rows` is below `max_num_seqs`. The verify block stays `1 + effective_k` wide; only `num_valid_drafts` shrinks. |
 
 `SpecPlan.block_width` is `1 + effective_k` for wide verification.
 `SpecPlan.accepted_counts_range` is the inclusive range

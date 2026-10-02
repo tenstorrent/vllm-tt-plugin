@@ -189,7 +189,10 @@ nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids`, the return format the current runner
 executes. A model may also declare `logits` or `fused_sample`, but neither
-additional declaration enables an execution path for that return format.
+additional declaration enables an execution path for that return format. A
+non-empty `k_by_rows` must reach `max_num_seqs`: its last `max_rows` must be at
+least `max_num_seqs`, so that every live batch size the launch admits has a
+draft cap.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -204,8 +207,22 @@ occupies, which is not a lane-DP lane; `extra_bytes_per_seq` and
 and per KV token respectively; `accept_modes` names what the verify call
 returns; `drafter_state` says where the drafter's own state lives;
 `drafter_target_cache_requires` carries what a drafter sharing the target's
-caches needs to stay true of them; and `supports_narrow_decode` is the
-second-call-shape promise of section 1a.
+caches needs to stay true of them; `supports_narrow_decode` is the
+second-call-shape promise of section 1a; and `k_by_rows` caps the drafts per
+row by the number of live rows.
+
+`k_by_rows` is optional. It is a tuple of `(max_rows, k)` entries in strictly
+ascending `max_rows` order. `SpecPlan.draft_cap(R)` returns the `k` of the
+first entry whose `max_rows` is at least `R`, and returns `effective_k` when
+`k_by_rows` is empty. Every `k` is in `[1, effective_k]`, and at least one entry
+has `k` equal to `effective_k`, because the platform publishes `effective_k` as
+`num_speculative_tokens` and the scheduler reserves lookahead for that many
+drafts. A model uses `k_by_rows` when its verify cost grows with rows times
+columns: for example, `((4, 7), (8, 3))` gives up to 7 drafts per row to 1 to 4
+live rows, and up to 3 drafts per row to 5 to 8 live rows. `k_by_rows` changes
+only how many columns of a row are real. It does not change the call shape, so
+it is not one of the static declarations of section 1a. Section 4 says how the
+runner applies it.
 
 `lanes_per_request`, `extra_bytes_per_seq` and `extra_bytes_per_token` are
 declared but not yet budgeted against. The byte fields need a bytes-per-KV-token
@@ -222,7 +239,7 @@ decode. `TTModelInput` carries the verification inputs as four values.
 | --- | --- | --- |
 | `input_tokens` | `[B, 1+K]` int32 | Column 0 is the row's last committed token; columns 1..K are its pending drafts |
 | `input_positions` | `[B, 1+K]` int32 | Column j is that row's position for column j's token |
-| `num_valid_drafts` | `[B]` int32 | How many of a row's K draft columns are real, in `[0, K]` |
+| `num_valid_drafts` | `[B]` int32 | How many of a row's K draft columns are real, in `[0, K]`, and never above `SpecPlan.draft_cap` for the step's live rows |
 | `accepted_counts` | `[B]` int32 | How many tokens that row's previous step committed, in `[1, 1+K]` |
 
 `B` is the padded decode batch, the same capacity a plain decode is padded to,
@@ -236,6 +253,16 @@ speculation. A padded column carries `PLACEHOLDER_TOKEN_ID` for the token and
 -1 for the position, which is the same no-position marker a padding row
 carries. A padded column must not be verified, and `num_valid_drafts` is what
 says where a row's real columns stop.
+
+A model that declares `SpecPlan.k_by_rows` also gets a cap that depends on the
+batch. `TTModelRunner._prepare_model_inputs` calls `SpecPlan.draft_cap` with
+the number of live rows in the step, without the padding rows, and
+`TTModelRunner._spec_row_state` keeps at most that many drafts on each row. The
+block stays `[B, 1+K]` wide, where K is `effective_k`, and the columns past the
+cap are padded as on any other short row. With `k_by_rows=((4, 7), (8, 3))`, a
+step with five live rows sends a `[B, 8]` block in which no row has a
+`num_valid_drafts` entry above 3. The runner does not send the cap as a
+separate argument: `num_valid_drafts` is the per-step signal.
 
 `accepted_counts` is a count and not an index. It is never 0, it is 1 after a
 prefill and after a non-speculating step, and a model selecting a per-candidate
@@ -644,12 +671,25 @@ list changes only by losing a suffix. `Scheduler.update_draft_token_ids`
 replaces it with the longest prefix the request's grammar accepts
 (`validate_tokens` returns an accepted prefix and stops at the first
 rejection), the scheduler budgets a prefix into
-`scheduled_spec_decode_tokens`, `TTModelRunner._spec_row_state` copies the
-scheduled ids into the block unchanged, and under asynchronous scheduling
+`scheduled_spec_decode_tokens`, under asynchronous scheduling
 `TTModelRunner._drafts_to_verify` trims the retained proposal to the reserved
-placeholder count. The verify block's draft columns are therefore always a
-prefix of what the model proposed, which is what makes a result computed at
-proposal time (section 4a) valid for the block as sent.
+placeholder count, and `TTModelRunner._spec_row_state` copies the first
+`SpecPlan.draft_cap` scheduled ids into the block unchanged. The verify block's
+draft columns are therefore always a prefix of what the model proposed, which
+is what makes a result computed at proposal time (section 4a) valid for the
+block as sent.
+
+**A batch that grows can shorten an outstanding proposal.** A proposal is made
+after a step with R live rows, and `SpecPlan.draft_cap` is applied to the next
+step's live rows. When four requests each hold seven drafts under
+`k_by_rows=((4, 7), (8, 3))` and a fifth request joins,
+`TTModelRunner._spec_row_state` keeps the first three drafts of each of the
+four proposals. The drafter is still asked for `effective_k` drafts on every
+step, because the next step's row count is not known when it proposes. vLLM's
+`Scheduler.update_from_output` counts each dropped draft as a rejected draft:
+it subtracts the drafts that did not commit from `num_computed_tokens`, so the
+KV accounting stays correct, and vLLM's speculative decoding metrics count the
+dropped drafts as proposed and rejected.
 
 **Returning to drafting is a model obligation.** The plugin keeps asking:
 `TTModelRunner.propose_after_plain_step` calls `propose_draft_tokens` after an

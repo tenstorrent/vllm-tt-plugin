@@ -89,6 +89,54 @@ def test_accepted_counts_range_is_one_based_and_never_zero(effective_k):
     assert plan.block_width == 1 + effective_k
 
 
+def test_without_k_by_rows_every_batch_size_gets_effective_k():
+    plan = _plan(effective_k=5)
+    assert [plan.draft_cap(rows) for rows in (1, 2, 32, 1024)] == [5, 5, 5, 5]
+
+
+def test_k_by_rows_selects_the_first_cap_covering_the_live_rows():
+    plan = _plan(effective_k=7, k_by_rows=((4, 7), (8, 3)))
+    assert [plan.draft_cap(rows) for rows in range(1, 9)] == [7] * 4 + [3] * 4
+    # The block width does not follow the cap: a model keeps one call shape.
+    assert plan.block_width == 8
+    with pytest.raises(ValueError, match="does not cover 9"):
+        plan.draft_cap(9)
+
+
+@pytest.mark.parametrize("live_rows", [0, -1, True, 2.0])
+def test_draft_cap_refuses_a_row_count_that_is_not_a_positive_integer(live_rows):
+    with pytest.raises(ValueError, match="live_rows"):
+        _plan().draft_cap(live_rows)
+
+
+def test_k_by_rows_normalizes_json_lists_to_tuples():
+    # The plan is stored in additional_config as JSON-encodable data, and JSON
+    # has lists and no tuples.
+    plan = _plan(effective_k=7, k_by_rows=[[4, 7], [8, 3]])
+    assert plan.k_by_rows == ((4, 7), (8, 3))
+
+
+@pytest.mark.parametrize(
+    "k_by_rows",
+    [
+        pytest.param(4, id="not-a-sequence"),
+        pytest.param(((4,),), id="not-a-pair"),
+        pytest.param(((4, 7, 1),), id="three-values"),
+        pytest.param(((0, 7),), id="zero-rows"),
+        pytest.param(((4, 7), (4, 3)), id="rows-not-ascending"),
+        pytest.param(((8, 3), (4, 7)), id="rows-descending"),
+        pytest.param(((4, 0),), id="zero-cap"),
+        pytest.param(((4, 7), (8, 8)), id="cap-above-effective-k"),
+        pytest.param(((4, 3), (8, 2)), id="never-reaches-effective-k"),
+        pytest.param(((True, 7),), id="bool-rows"),
+        pytest.param(((4, 7.0),), id="float-cap"),
+    ],
+)
+def test_k_by_rows_refuses_a_malformed_or_inconsistent_mapping(k_by_rows):
+    with pytest.raises(ValueError, match="k_by_rows"):
+        _plan(effective_k=7, k_by_rows=k_by_rows)
+
+
 # --- SpecPlan rejects what the runner cannot budget with ------------------
 
 

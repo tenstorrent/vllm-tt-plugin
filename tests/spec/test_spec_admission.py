@@ -8,6 +8,7 @@ drive the admission function against ``FakeSpecModel`` and against models with
 deliberately incomplete declarations.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -399,6 +400,39 @@ def test_a_plan_above_the_requested_draft_length_is_refused():
     assert "8" in str(excinfo.value)
 
 
+class _DraftCapByRowsModel(FakeSpecModel):
+    @classmethod
+    def spec_plan(cls, vllm_config, max_num_seqs, requested_k):
+        del vllm_config, max_num_seqs, requested_k
+        return SpecPlan(
+            effective_k=7,
+            lanes_per_request=8,
+            extra_bytes_per_seq=0,
+            extra_bytes_per_token=0,
+            accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+            drafter_state="internal",
+            k_by_rows=((4, 7), (8, 3)),
+        )
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 5, 8])
+def test_a_draft_cap_mapping_covering_the_concurrency_is_admitted(max_num_seqs):
+    plan = _admit(
+        _config(requested_k=7, max_num_seqs=max_num_seqs),
+        model_class=_DraftCapByRowsModel,
+    )
+    assert plan.k_by_rows == ((4, 7), (8, 3))
+
+
+def test_a_draft_cap_mapping_short_of_the_concurrency_is_refused():
+    """Nine live rows would otherwise raise inside the runner, mid-serving."""
+    with pytest.raises(ValueError, match="below max_num_seqs=9"):
+        _admit(
+            _config(requested_k=7, max_num_seqs=9),
+            model_class=_DraftCapByRowsModel,
+        )
+
+
 def test_a_plan_of_the_wrong_type_is_refused():
     class _WrongTypeModel(FakeSpecModel):
         @classmethod
@@ -436,6 +470,16 @@ def test_the_admitted_plan_round_trips_through_the_config():
     store_tt_spec_plan(config, plan)
     # Equal, not identical: the plan is stored as a dictionary so
     # additional_config stays JSON-encodable, and rebuilt on the way out.
+    assert get_tt_spec_plan(config) == plan
+
+
+def test_a_draft_cap_mapping_survives_a_json_round_trip_of_the_config():
+    # json.dumps writes a tuple as a list, and the rebuilt plan must still
+    # equal the admitted one.
+    config = _config(requested_k=7, max_num_seqs=8)
+    plan = _admit(config, model_class=_DraftCapByRowsModel)
+    store_tt_spec_plan(config, plan)
+    config.additional_config = json.loads(json.dumps(config.additional_config))
     assert get_tt_spec_plan(config) == plan
 
 

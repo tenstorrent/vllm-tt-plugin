@@ -248,6 +248,7 @@ class TTModelRunner:
         # a model that reduced it -- though the platform publishes the
         # reduction back, so the two agree.
         spec_plan = get_tt_spec_plan(vllm_config)
+        self._spec_plan = spec_plan
         self._num_speculative_tokens = spec_plan.effective_k if spec_plan else 0
         self._spec_method = (
             str(vllm_config.speculative_config.method) if spec_plan else None
@@ -1331,6 +1332,7 @@ class TTModelRunner:
         scheduled_drafts: dict[str, list[int]],
         row_req_ids: list[str],
         num_drafts: int,
+        draft_cap: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather ``(drafts, num_valid_drafts, accepted_counts)`` for these rows.
 
@@ -1351,7 +1353,18 @@ class TTModelRunner:
 
         A request absent from either mapping takes the post-prefill default: no
         drafts, and a count of 1.
+
+        ``draft_cap`` is ``SpecPlan.draft_cap`` for this step's live rows, and
+        ``None`` means ``num_drafts``. A proposal is made for the batch of the
+        step that proposed it, so when peers join before the verify, a row can
+        hold more drafts than the larger batch may verify. Only the suffix past
+        the cap is dropped, so the verified drafts stay a prefix of the
+        proposal; the block keeps its ``num_drafts`` width.
         """
+        if draft_cap is None:
+            draft_cap = num_drafts
+        if not 1 <= draft_cap <= num_drafts:
+            raise ValueError(f"draft_cap must be in [1, {num_drafts}], got {draft_cap}")
         drafts = torch.full(
             (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
         )
@@ -1371,6 +1384,8 @@ class TTModelRunner:
                     f"request {req_id} was scheduled {valid} draft tokens, "
                     f"above the block's {num_drafts}: {list(row_drafts)}"
                 )
+            row_drafts = row_drafts[:draft_cap]
+            valid = len(row_drafts)
             num_valid[row] = valid
             if valid:
                 drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
@@ -1950,11 +1965,17 @@ class TTModelRunner:
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
             if self._num_speculative_tokens:
+                spec_plan = getattr(self, "_spec_plan", None)
                 spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
                     self._req_accepted_counts,
                     self._drafts_to_verify(scheduler_output, row_req_ids),
                     row_req_ids,
                     self._num_speculative_tokens,
+                    (
+                        spec_plan.draft_cap(len(row_req_ids))
+                        if spec_plan is not None
+                        else None
+                    ),
                 )
                 if _step_verifies(
                     self._spec_supports_narrow_decode,
