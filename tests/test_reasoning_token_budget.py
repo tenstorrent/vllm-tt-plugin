@@ -104,7 +104,7 @@ def test_mixed_batch_forwards_budget_to_every_request(batch_size):
 
     client = NS(chat=NS(completions=NS(create=create)))
     server = NS(get_async_client=lambda: client)
-    structured.test_dp1_full_capacity_mixes_structured_and_plain_requests(
+    structured.test_dp1_full_capacity_mixes_structured_and_plain_requests_first_wave(
         server, "reference", batch_size, 512
     )
     assert len(requests) == min(batch_size, 32)
