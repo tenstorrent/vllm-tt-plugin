@@ -25,6 +25,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.sample.logits_processor import MinPLogitsProcessor, build_logitsprocs
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -738,3 +739,30 @@ def test_a_model_drafter_drafts_for_a_sampled_request():
 
 
 # endregion Transitions
+
+# region What vLLM lets through
+
+
+def test_a_speculating_launch_admits_a_small_min_p_and_applies_it_nowhere():
+    """A min_p up to 1e-5 reaches neither sampler on a speculating launch.
+
+    vLLM admits it with speculation and builds no min_p processor for the
+    launch, so the ordinary sampler ignores it, and the walk is given none. A
+    vLLM that builds one fails here: carry min_p into ``SpecSamplingInputs``
+    then, or the two paths sample different distributions.
+    """
+    speculative = object()
+    SamplingParams(min_p=1e-5)._validate_spec_decode(speculative)
+    with pytest.raises(ValueError):
+        SamplingParams(min_p=2e-5)._validate_spec_decode(speculative)
+
+    processors = build_logitsprocs(
+        vllm_config=SimpleNamespace(speculative_config=speculative),
+        device=torch.device("cpu"),
+        is_pin_memory=False,
+        is_pooling_model=False,
+    )
+    assert not any(isinstance(p, MinPLogitsProcessor) for p in processors.all)
+
+
+# endregion What vLLM lets through

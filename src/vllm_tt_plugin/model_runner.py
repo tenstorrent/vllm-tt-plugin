@@ -219,7 +219,9 @@ def _spec_sampling_inputs(
     out: they own no request, and sampling them would cost a vocabulary's work
     per row for tokens nothing reads.
 
-    min_p is not carried: vLLM refuses it on a speculating launch.
+    min_p is not carried: vLLM refuses a min_p above 1e-5 on a speculating
+    launch and builds no min_p processor there, so the ordinary sampler ignores
+    a smaller one too.
     """
     live = len(model_input.row_req_ids)
     params = model_input.tt_sampling_params
