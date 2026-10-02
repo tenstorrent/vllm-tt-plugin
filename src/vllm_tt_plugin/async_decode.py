@@ -966,15 +966,15 @@ class TTAsyncDecodeController:
                 "a sample-time grammar bitmask"
             )
 
-        sample_decode = getattr(self.runner.model, "sample_decode_on_device", None)
-        if not callable(sample_decode):
+        sample_deferred = getattr(self.runner.model, "sample_deferred_decode", None)
+        if not callable(sample_deferred):
             fail_deferred()
             raise AttributeError(
                 "TT model declares device grammar support but does not implement "
-                "sample_decode_on_device()"
+                "sample_deferred_decode()"
             )
         try:
-            sampled = sample_decode(
+            sampled = sample_deferred(
                 submission.tt_out,
                 sampling_params=submission.device_sampling_params,
                 grammar_bitmask=grammar_bitmask,

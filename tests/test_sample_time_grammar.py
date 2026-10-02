@@ -249,7 +249,7 @@ def test_model_load_downgrades_device_grammar_for_incompatible_runtime(
         def load_model(self, **_kwargs):
             return SimpleNamespace(
                 device_grammar_enabled=False,
-                sample_decode_on_device=lambda *_args, **_kwargs: None,
+                sample_deferred_decode=lambda *_args, **_kwargs: None,
             )
 
     monkeypatch.setattr(
@@ -278,7 +278,7 @@ def test_model_load_activates_device_grammar_runtime(monkeypatch):
             events.append("activate")
             self.device_grammar_enabled = True
 
-        def sample_decode_on_device(self, *_args, **_kwargs):
+        def sample_deferred_decode(self, *_args, **_kwargs):
             return None
 
     class Loader:
@@ -306,18 +306,11 @@ def test_model_load_activates_device_grammar_runtime(monkeypatch):
 
 
 def test_runner_poison_rejects_all_later_work():
-    model_poisoned = []
-    runner = SimpleNamespace(
-        model=SimpleNamespace(
-            poison_deferred_device_sampling=lambda: model_poisoned.append(True)
-        ),
-        _device_grammar_poisoned=False,
-    )
+    runner = SimpleNamespace(_device_grammar_poisoned=False)
 
     TTModelRunner._poison_device_grammar(runner)
 
     assert runner._device_grammar_poisoned is True
-    assert model_poisoned == [True]
     with pytest.raises(RuntimeError, match="reconstruct the model runner"):
         TTModelRunner._raise_if_device_grammar_poisoned(runner)
 
@@ -682,12 +675,12 @@ def test_deferred_device_sampling_transports_sample_time_grammar():
     raw_logits = object()
     sampled = torch.tensor([[17]], dtype=torch.int32)
 
-    def sample_decode_on_device(tt_out, *, sampling_params, grammar_bitmask):
+    def sample_deferred_decode(tt_out, *, sampling_params, grammar_bitmask):
         calls.append((tt_out, sampling_params, grammar_bitmask))
         return sampled
 
     runner = SimpleNamespace(
-        model=SimpleNamespace(sample_decode_on_device=sample_decode_on_device)
+        model=SimpleNamespace(sample_deferred_decode=sample_deferred_decode)
     )
     controller = TTAsyncDecodeController(runner)
     sampling_params = SimpleNamespace(enable_log_probs=torch.tensor([False]))
@@ -721,7 +714,7 @@ def test_deferred_device_sampling_rejects_missing_sample_time_grammar():
     poisoned = []
     runner = SimpleNamespace(
         model=SimpleNamespace(
-            sample_decode_on_device=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sample_deferred_decode=lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 AssertionError("device sampler must not run without grammar")
             )
         ),
@@ -758,7 +751,7 @@ def test_deferred_device_sampling_rejects_missing_sample_time_grammar():
 def test_deferred_device_sampling_no_output_invalidates_decode_chain():
     poisoned = []
     runner = SimpleNamespace(
-        model=SimpleNamespace(sample_decode_on_device=lambda *_args, **_kwargs: None),
+        model=SimpleNamespace(sample_deferred_decode=lambda *_args, **_kwargs: None),
         _poison_device_grammar=lambda: poisoned.append(True),
     )
     controller = TTAsyncDecodeController(runner)

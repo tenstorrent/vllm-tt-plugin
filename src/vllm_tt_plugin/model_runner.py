@@ -357,7 +357,7 @@ class TTModelRunner:
                 activate()
             runtime_support = bool(getattr(self.model, "device_grammar_enabled", False))
             has_sample_api = callable(
-                getattr(self.model, "sample_decode_on_device", None)
+                getattr(self.model, "sample_deferred_decode", None)
             )
             if not runtime_support or not has_sample_api:
                 logger.warning(
@@ -372,9 +372,6 @@ class TTModelRunner:
     def _poison_device_grammar(self) -> None:
         """Reject all later runner work after a deferred decode becomes unsafe."""
         self._device_grammar_poisoned = True
-        poison_model = getattr(self.model, "poison_deferred_device_sampling", None)
-        if callable(poison_model):
-            poison_model()
 
     def _raise_if_device_grammar_poisoned(self) -> None:
         if getattr(self, "_device_grammar_poisoned", False):
