@@ -526,6 +526,48 @@ def test_structured_output_speculates_and_follows_each_request_s_grammar(
         assert statistic < CHI_SQUARE_CRITICAL[1], (name, twos, others, statistic)
 
 
+def test_a_grammar_the_model_drafts_follow_accepts_its_drafts(
+    spec_server, spec_config, ascending_prompt, record
+):
+    """``(.|\\n)*`` admits all but the special tokens, so the drafts are valid.
+
+    The model drafter proposes the rule's choice, which this grammar admits,
+    so a structured request accepts drafts. Under asynchronous scheduling
+    that is the evidence the scheduler validated the drafts the runner
+    actually verified: they reach it only through ``take_draft_token_ids`` on
+    the engine's deferred-sampling path, and a structured row whose drafts did
+    not reach it walks with none, so it could accept nothing. Each committed
+    token must still be in its context's support.
+    """
+    if spec_config.drafter != "model":
+        pytest.skip("only the model drafter proposes what this grammar admits")
+    requests, max_tokens = 16, 32
+    prompts = [
+        _prompt(spec_config, ascending_prompt, 2300 + i) for i in range(requests)
+    ]
+    bodies = [
+        {
+            "max_tokens": max_tokens,
+            "temperature": 1.0,
+            "seed": 7300 + i,
+            "structured_outputs": {"regex": r"(.|\n)*"},
+        }
+        for i in range(requests)
+    ]
+    before = spec_server.metrics()
+    results = _complete_all(spec_server, prompts, bodies, _concurrency(spec_config))
+    delta = acceptance_delta(before, spec_server.metrics(), spec_config.k)
+    record(acceptance=delta.as_dict(), responses=[r.token_ids for r in results])
+
+    for prompt, result in zip(prompts, results):
+        assert_full_length_completion(result, max_tokens)
+        _counts(prompt, result.token_ids, lambda h: set(), {"temperature": 1.0})
+    assert delta.accepted > 0, (
+        "no draft of a structured request was accepted, so the scheduler never "
+        "validated the drafts the runner verified"
+    )
+
+
 # endregion Structured output
 
 # region Every control in one batch
