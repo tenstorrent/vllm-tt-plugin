@@ -704,3 +704,13 @@ Block-output models (`output_tokens_per_step > 1`) cannot declare this capabilit
 ## Request seeds
 
 Sampling batches preserve signed 64-bit request seeds, including through slot compaction. Host generators retain the original seed. A model whose device sampler requires a narrower seed remains responsible for conversion at its device boundary. Host and device samplers need not generate identical random streams.
+
+## Host sampling readback
+
+Models can declare `supports_compact_host_logits` to return only the scheduled
+host sampling rows. `supports_selective_host_readback` additionally permits
+selective device-to-host transfers and requires compact-logit support.
+Adapters must preserve row order, buffer ownership, and asynchronous read
+completion. Active or custom logits processors can require the full slot
+layout. See the [host sampling output contract](docs/DECODE_RELOAD_CONTRACT.md#host-sampling-output-and-selective-reads)
+for the `sample_rows` callbacks and fallback requirements.

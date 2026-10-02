@@ -1038,17 +1038,25 @@ class TTLaneInputBatch(InputBatch):
             and (frequency == 0.0).all()
             and (repetition == 1.0).all()
         )
+        bad_words_token_ids = {
+            i: sampling.bad_words_token_ids[row]
+            for i, row in enumerate(rows)
+            if row in sampling.bad_words_token_ids
+        }
         if not no_penalties:
             prompt_token_ids = self.make_prompt_token_ids_tensor(rows).to(torch.int64)
             prompt_token_ids = prompt_token_ids.masked_fill(
                 prompt_token_ids == -1, self.vocab_size
             )
+        else:
+            prompt_token_ids = None
+        # Multi-token bad words need output history even with neutral penalties.
+        if not no_penalties or bad_words_token_ids:
             output_rows = self.make_output_token_ids_tensor(rows)
             output_token_ids = [
                 [tok for tok in row.tolist() if tok != -1] for row in output_rows
             ]
         else:
-            prompt_token_ids = None
             output_token_ids = [[] for _ in range(n)]
         # Only hand the sampler an allowlist mask when some live request
         # actually constrains its tokens. The mask tensor is allocated lazily
@@ -1098,11 +1106,7 @@ class TTLaneInputBatch(InputBatch):
             repetition_penalties=repetition,
             output_token_ids=output_token_ids,
             allowed_token_ids_mask=allowed_token_ids_mask,
-            bad_words_token_ids={
-                i: sampling.bad_words_token_ids[row]
-                for i, row in enumerate(rows)
-                if row in sampling.bad_words_token_ids
-            },
+            bad_words_token_ids=bad_words_token_ids,
             logitsprocs=LogitsProcessors() if compact else sampling.logitsprocs,
         )
 
