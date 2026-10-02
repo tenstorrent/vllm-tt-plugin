@@ -15,7 +15,7 @@ For every `model_capabilities` key consumed by the plugin, see
 ## Status
 
 Plugin `main` includes configuration admission, candidate construction, greedy
-acceptance and model-owned proposals. A model implementing this contract can
+and sampled acceptance and model-owned proposals. A model implementing this contract can
 serve speculative decoding within the following execution limits:
 
 - two drafting methods: **`ngram`**, which runs on the host and needs no
@@ -972,7 +972,8 @@ admits an off-by-one that only shows up as wrong output text.
 configuration. `TTPlatform.validate_request` rejects unsupported sampling
 controls during request admission. `submit_decode` validates `VerifyOutput`
 at execution time and raises the corresponding type or mode error. These
-checks report the offending values. A non-zero temperature or a penalty is
-admitted without draft publication, with the verification-step sampling limit
-in section 4d. The ordinary async capability check separately permits
+checks report the offending values. On a model that does not serve `logits`,
+a non-zero temperature or a penalty is admitted without draft publication,
+with the verification-step sampling limit in section 4d; a model that serves
+`logits` speculates for it (section 4h). The ordinary async capability check separately permits
 synchronous fallback with a warning, as specified in section 4c.
