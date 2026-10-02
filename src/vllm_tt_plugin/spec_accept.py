@@ -28,15 +28,32 @@ deliberately so a kernel or a test ported from upstream needs no adjustment:
 
 A drafter that reports no probabilities, such as an n-gram proposer, is handled
 as a point mass at the drafted id: ``q`` is 1, so the accept test reduces to
-``p >= u``, and the residual is ``p`` with the drafted id removed.
+``p >= u``, and the residual is ``p`` with the drafted id removed. That is
+lossless for any draft the walk's own random draws did not choose: the drafted
+id commits with probability ``p(d)`` and any other id ``x`` with
+``(1 - p(d)) * p(x) / (1 - p(d)) = p(x)``. So a drafter that samples its
+proposals stays correct without reporting probabilities; reporting them would
+only raise the acceptance probability from ``p(d)`` to ``min(1, p(d) / q(d))``.
+
+The target distribution is the one vLLM's ordinary sampler would use, built in
+the ordinary sampler's order: penalties on the raw logits, then temperature,
+then min_p, then top-k/top-p. ``accept_sampled_drafts`` applies the penalties
+per candidate column against that column's own history and hands the rest to
+``accept_speculated_tokens``. Upstream's rejection sampler skips min_p at the
+drafted positions; this walk does not, because the ordinary sampler applies it
+at every position. vLLM 0.26 refuses a min_p above 1e-5 on a speculating
+launch and builds no min_p processor there, so the ordinary sampler ignores a
+smaller one and the runner never passes it; the parameter is there for when
+vLLM applies it.
 
 The accept walk uses host PyTorch and the plugin's placeholder constant.
-Top-k/top-p filtering lazily imports vLLM's PyTorch helper. This module reads
-no ``model_capabilities`` key and admits no configuration, so synthetic
-distributions are sufficient to exercise the acceptance arithmetic.
+Top-k/top-p filtering and the penalties lazily import vLLM's PyTorch helpers.
+This module reads no ``model_capabilities`` key and admits no configuration,
+so synthetic distributions are sufficient to exercise the acceptance
+arithmetic.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -96,6 +113,126 @@ class AcceptResult:
             )
 
 
+@dataclass(frozen=True)
+class SpecPenalties:
+    """The history-dependent controls of one verify, per row.
+
+    ``prompt_token_ids`` is ``[B, P]`` int64 padded with the vocabulary size,
+    which is the padding vLLM's penalty op ignores. ``output_token_ids`` holds
+    each row's committed output before this step's candidate block; a draft
+    joins the history only for the columns after it.
+    """
+
+    prompt_token_ids: torch.Tensor
+    output_token_ids: list[list[int]]
+    presence: torch.Tensor
+    frequency: torch.Tensor
+    repetition: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SpecSamplingInputs:
+    """One verify step's sampling controls, row-aligned with its block.
+
+    Captured when the step is built, because the asynchronous path walks
+    acceptance on whichever thread resolves the readback, after the persistent
+    batch may have moved on. ``generators`` maps a verify row to its request's
+    own generator, which the walk advances; a row without one draws from the
+    global stream.
+    """
+
+    vocab_size: int
+    temperature: torch.Tensor
+    top_k: torch.Tensor | None = None
+    top_p: torch.Tensor | None = None
+    min_p: torch.Tensor | None = None
+    generators: dict[int, torch.Generator] = field(default_factory=dict)
+    penalties: SpecPenalties | None = None
+
+
+def accept_sampled_drafts(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    sampling: SpecSamplingInputs,
+) -> AcceptResult:
+    """Walk acceptance under every control the ordinary sampler applies.
+
+    The penalties are applied here, per candidate column, because they read a
+    history and column ``j``'s history is the committed output plus the first
+    ``j`` drafts. The remaining controls are history-free and are applied by
+    ``accept_speculated_tokens``.
+    """
+    if target_logits.dim() != 3 or int(target_logits.shape[-1]) != sampling.vocab_size:
+        raise ValueError(
+            "accept_sampled_drafts target_logits must be [B, 1+K, "
+            f"{sampling.vocab_size}], the whole vocabulary at every candidate "
+            f"column, got {tuple(target_logits.shape)}"
+        )
+    # Before the penalties, which index by draft id and would fail on a bad
+    # one inside vLLM's op rather than here, by name.
+    _check_inputs(
+        target_logits, draft_token_ids, num_valid_drafts, sampling.temperature
+    )
+    _check_sampling(sampling, int(target_logits.shape[0]))
+    logits = target_logits.to(torch.float32)
+    if sampling.penalties is not None:
+        logits = apply_speculative_penalties(
+            logits, draft_token_ids, num_valid_drafts, sampling.penalties
+        )
+    return accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=draft_token_ids,
+        num_valid_drafts=num_valid_drafts,
+        temperature=sampling.temperature,
+        top_k=sampling.top_k,
+        top_p=sampling.top_p,
+        min_p=sampling.min_p,
+        generators=sampling.generators,
+    )
+
+
+def apply_speculative_penalties(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    penalties: SpecPenalties,
+) -> torch.Tensor:
+    """Presence, frequency and repetition penalties, column by column.
+
+    Column ``j`` is scored after the row's committed output and its first
+    ``min(j, num_valid_drafts)`` drafts, so the bonus column reads every valid
+    draft and a padding column reads no padding. vLLM's own penalty op does
+    the arithmetic, which keeps it identical to the ordinary sampler's.
+
+    Returns a new tensor; the caller's logits are not modified.
+    """
+    # Deferred for the same import cycle as the top-k/top-p helper below.
+    from vllm.v1.sample.ops.penalties import apply_all_penalties
+
+    rows, width, vocab = target_logits.shape
+    histories: list[list[int]] = []
+    for row in range(rows):
+        committed = list(penalties.output_token_ids[row])
+        valid = int(num_valid_drafts[row])
+        drafts = [int(token) for token in draft_token_ids[row, :valid].tolist()]
+        for column in range(width):
+            histories.append(committed + drafts[: min(column, valid)])
+
+    def per_column(per_row: torch.Tensor) -> torch.Tensor:
+        return per_row.repeat_interleave(width, dim=0)
+
+    flat = apply_all_penalties(
+        target_logits.reshape(rows * width, vocab).clone(),
+        per_column(penalties.prompt_token_ids),
+        per_column(penalties.presence),
+        per_column(penalties.frequency),
+        per_column(penalties.repetition),
+        histories,
+    )
+    return flat.reshape(rows, width, vocab)
+
+
 def accept_speculated_tokens(
     target_logits: torch.Tensor,
     draft_token_ids: torch.Tensor,
@@ -105,6 +242,7 @@ def accept_speculated_tokens(
     top_p: torch.Tensor | None = None,
     draft_probs: torch.Tensor | None = None,
     generators: dict[int, torch.Generator] | None = None,
+    min_p: torch.Tensor | None = None,
 ) -> AcceptResult:
     """Walk acceptance over one ``[B, 1+K]`` candidate block.
 
@@ -124,11 +262,15 @@ def accept_speculated_tokens(
             real. A row with 0 commits exactly its bonus token.
         temperature: ``[B]``. A value of 0 selects greedy acceptance for that
             row, matching what the HTTP sampling parameter means. Greedy rows
-            read the raw logits; only random rows are rescaled.
+            read ``target_logits`` as given; only random rows are rescaled.
         top_k: ``[B]`` or None. Applied to random rows before the softmax.
         top_p: ``[B]`` or None. Applied to random rows before the softmax.
+        min_p: ``[B]`` or None. Applied to random rows after temperature and
+            before top-k/top-p, the ordinary sampler's order. 0 disables it.
         draft_probs: ``[B, K, V]`` or None. The drafter's own distribution per
-            drafted position. None means a deterministic drafter.
+            drafted position. None treats each draft as a point mass at its
+            id, which is lossless for any drafter whose choice does not read
+            this walk's random draws.
         generators: row index to a seeded ``torch.Generator``. A row named here
             draws its randomness from that generator, so a seeded request is
             reproducible; the rest draw from the global stream.
@@ -137,7 +279,7 @@ def accept_speculated_tokens(
         An :class:`AcceptResult`.
     """
     rows, width, vocab = _check_inputs(
-        target_logits, draft_token_ids, num_valid_drafts, temperature
+        target_logits, draft_token_ids, num_valid_drafts, temperature, min_p
     )
     num_drafts = width - 1
     generators = generators or {}
@@ -165,6 +307,7 @@ def accept_speculated_tokens(
             temperature,
             top_k,
             top_p,
+            min_p,
             draft_probs,
             generators,
             rows,
@@ -206,6 +349,7 @@ def _random_walk(
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
     draft_probs: torch.Tensor | None,
     generators: dict[int, torch.Generator],
     rows: int,
@@ -213,7 +357,7 @@ def _random_walk(
     vocab: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
-    probs = _constrained_probs(target_logits, temperature, top_k, top_p)
+    probs = _constrained_probs(target_logits, temperature, top_k, top_p, min_p)
     # Replaced inside the vocabulary before any gather, because a draft column
     # past its row's count holds padding, the runner pads with
     # PLACEHOLDER_TOKEN_ID, and torch.gather refuses a negative index rather
@@ -284,8 +428,9 @@ def _constrained_probs(
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Target probabilities after temperature, top-k and top-p.
+    """Target probabilities after temperature, min_p, top-k and top-p.
 
     The distribution the accept walk must preserve is the one the operator
     asked for, so the constraints belong before the accept test rather than
@@ -301,6 +446,15 @@ def _constrained_probs(
         temperature <= 0.0, torch.ones_like(temperature), temperature
     )
     logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
+
+    if min_p is not None and bool((min_p > 0).any()):
+        # vLLM's MinPLogitsProcessor arithmetic, on the tempered logits. A row
+        # at 0 has a threshold of 0, which nothing falls below.
+        probs = logits.softmax(dim=-1)
+        threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(torch.float32).view(
+            rows, 1, 1
+        )
+        logits = logits.masked_fill(probs < threshold, float("-inf"))
 
     if top_k is not None or top_p is not None:
         # Deferred: vllm.v1.sample.ops resolves current_platform at import
@@ -334,12 +488,16 @@ def _sample_per_row(
     argmax of ``w_v / e_v`` is distributed as ``w`` normalised. One race per
     row rather than per position, matching upstream, so a seeded request draws
     the same number of values however many positions it carries.
+
+    Divided rather than multiplied by a reciprocal, because that is the
+    ordinary sampler's arithmetic: a seeded row with no drafts then draws
+    exactly the token the ordinary sampler draws from the same distribution.
     """
     race = torch.empty((rows, vocab), dtype=torch.float32)
     race.exponential_()
     for row, generator in generators.items():
         race[row].exponential_(generator=generator)
-    scored = weights * race.reciprocal().unsqueeze(1)
+    scored = weights / race.unsqueeze(1)
     return scored.argmax(dim=-1).to(torch.int32)
 
 
@@ -428,6 +586,7 @@ def _check_inputs(
     draft_token_ids: torch.Tensor,
     num_valid_drafts: torch.Tensor,
     temperature: torch.Tensor,
+    min_p: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if target_logits.dim() != 3:
         raise ValueError(
@@ -450,8 +609,9 @@ def _check_inputs(
     for name, tensor in (
         ("num_valid_drafts", num_valid_drafts),
         ("temperature", temperature),
+        ("min_p", min_p),
     ):
-        if tensor.shape != (rows,):
+        if tensor is not None and tensor.shape != (rows,):
             raise ValueError(
                 f"accept_speculated_tokens {name} must be [{rows}], got "
                 f"{tuple(tensor.shape)}"
@@ -499,6 +659,41 @@ def _check_draft_ids(
     )
 
 
+def _check_sampling(sampling: SpecSamplingInputs, rows: int) -> None:
+    """Every per-row control must have one entry per row of the block.
+
+    Checked because a short tensor is not always refused further down: vLLM's
+    penalty op scatters a one-row prompt into the first row only, and the other
+    rows silently lose their repetition penalty.
+    """
+    per_row = {"top_k": sampling.top_k, "top_p": sampling.top_p}
+    penalties = sampling.penalties
+    if penalties is not None:
+        per_row.update(
+            presence=penalties.presence,
+            frequency=penalties.frequency,
+            repetition=penalties.repetition,
+        )
+        if penalties.prompt_token_ids.dim() != 2 or (
+            int(penalties.prompt_token_ids.shape[0]) != rows
+        ):
+            raise ValueError(
+                f"accept_sampled_drafts penalties.prompt_token_ids must be "
+                f"[{rows}, P], got {tuple(penalties.prompt_token_ids.shape)}"
+            )
+        if len(penalties.output_token_ids) != rows:
+            raise ValueError(
+                f"accept_sampled_drafts penalties.output_token_ids must hold "
+                f"{rows} rows, got {len(penalties.output_token_ids)}"
+            )
+    for name, tensor in per_row.items():
+        if tensor is not None and tensor.shape != (rows,):
+            raise ValueError(
+                f"accept_sampled_drafts {name} must be [{rows}], got "
+                f"{tuple(tensor.shape)}"
+            )
+
+
 def _check_draft_probs(
     draft_probs: torch.Tensor, rows: int, num_drafts: int, vocab: int
 ) -> None:
@@ -509,4 +704,11 @@ def _check_draft_probs(
         )
 
 
-__all__ = ["AcceptResult", "accept_speculated_tokens"]
+__all__ = [
+    "AcceptResult",
+    "SpecPenalties",
+    "SpecSamplingInputs",
+    "accept_sampled_drafts",
+    "accept_speculated_tokens",
+    "apply_speculative_penalties",
+]

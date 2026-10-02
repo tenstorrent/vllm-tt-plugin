@@ -31,7 +31,7 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- config.py            # TT plugin config access
 |   +-- spec_admission.py    # Speculative configuration and model-plan validation
 |   +-- spec_decode.py       # Candidate/verification types and greedy acceptance
-|   +-- spec_accept.py       # CPU sampled-acceptance helper (not yet used by the runner)
+|   +-- spec_accept.py       # Host sampled acceptance for the logits accept mode
 |   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
@@ -530,10 +530,10 @@ family and are unrelated to the above.
 
 ## Speculative Decoding
 
-The plugin supports greedy speculative decoding through a runner-model
-contract. `TTModelRunner` builds candidate blocks, asks the selected tt-metal
-adapter to verify candidates, accepts matching draft tokens, and reports
-committed tokens to vLLM. The selected adapter must declare
+The plugin supports speculative decoding through a runner-model contract.
+`TTModelRunner` builds candidate blocks, asks the selected tt-metal adapter to
+verify candidates, accepts draft tokens, and reports committed tokens to
+vLLM. The selected adapter must declare
 `supports_spec_decode=True` and return an admissible `SpecPlan` from
 `spec_plan`. Architecture registration alone does not enable speculation.
 
@@ -544,12 +544,17 @@ Two drafting methods execute today:
 | `ngram` | vLLM's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
 | `custom_class` | The selected adapter's `propose_draft_tokens` | `spec_plan`, multi-position verification and `device_propose` in `spec_requirements` |
 
-Both methods currently use `argmax_ids` verification and host greedy
-acceptance. `docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`.
-The CPU sampled-acceptance helper exists in `spec_accept.py`, but
-`TTModelRunner` does not call it. `logits` and `fused_sample` execution,
-lossless sampled speculation, scheduler-owned paged drafter caches and
-`TTLaneCoordinator` execution are not implemented for this contract.
+Two accept modes execute, chosen per step from the adapter's `SpecPlan`. With
+`argmax_ids` the runner accepts drafts that equal the target argmax, which
+certifies greedy requests only. With `logits` the adapter returns
+full-vocabulary verify logits and the runner rejection-samples each row on the
+host (`spec_accept.accept_sampled_drafts`), so sampled and penalized requests
+speculate losslessly under temperature, top-k, top-p, presence, frequency and
+repetition penalties and seed. No production tt-metal adapter declares `logits`
+yet; tt-metal's `DummySpecDecodeModel` validates the path.
+`docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`. `fused_sample`
+execution, scheduler-owned paged drafter caches and `TTLaneCoordinator`
+execution are not implemented for this contract.
 
 ### Model selection and launch settings
 
@@ -629,19 +634,23 @@ Two model-side limits require attention in current dFlash recipes:
 
 ### Request controls and sampling limits
 
-Use `temperature=0` with no penalties to exercise greedy speculation.
+On an adapter that serves only `argmax_ids`, which is every production adapter
+today, use `temperature=0` with no penalties to exercise speculation.
 `TTModelRunner._publish_draft` withholds drafts for requests with non-zero
 temperature or penalties. When the model supports narrow decode and the whole
 step has no drafts or unresolved multi-token commit, `TTModelRunner` uses
 ordinary decode and the selected model's normal sampling path.
 
-**Sampled requests can still receive greedy tokens.** If any row requires
-verification, every row enters the `argmax_ids` call. A sampled row then
+**On such an adapter, sampled requests can still receive greedy tokens.** If
+any row requires verification, every row enters the `argmax_ids` call. A sampled row then
 commits the target argmax without applying that row's temperature or penalties.
 `TTModelRunner._note_unspeculable_verify_rows` warns once and counts affected
 rows; `TTModelRunner.shutdown` logs the total. A model without narrow decode
 uses verification on every decode step. Use a server without
 `speculative_config` when sampled-request semantics must hold on every step.
+An adapter that also declares `logits` does not have this limit: a step with a
+sampled or penalized row verifies in `logits` mode, and the runner samples
+every row from its own distribution (section 4h of the contract).
 
 `TTPlatform.validate_request` rejects logprobs, structured output,
 `logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
@@ -660,8 +669,9 @@ clear error before anything reaches the device:
 
 - Tensor parallel and pipeline parallel execution are provided by the models
   internal implementation, not exposed at the vLLM level.
-- Speculative decoding supports greedy `argmax_ids` verification with `ngram`
-  or the model-owned `custom_class` drafter on a compatible tt-metal adapter.
+- Speculative decoding supports `argmax_ids` verification for greedy requests
+  and `logits` verification for sampled ones, with `ngram` or the model-owned
+  `custom_class` drafter on a compatible tt-metal adapter.
   See [Speculative Decoding](#speculative-decoding) for launch settings,
   model selection and sampling limits.
 - LoRA is not currently supported.

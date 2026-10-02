@@ -638,19 +638,27 @@ def test_a_verify_output_from_an_unspeculated_step_is_refused():
 
 
 def test_a_verify_answering_in_another_mode_is_refused():
-    """A mode the runner cannot walk fails by name, not by misreading ids.
+    """A verify answers in the mode it was asked for, or fails by name.
 
-    ``logits`` is a legal accept mode and a model may offer it, but nothing
-    drives it yet. A model that ignores the requested mode and answers in its
-    own must not have its ``[B, 1+K, V]`` logits read as token ids: that would
-    commit vocabulary indices of float rows as output. A conformant stand-in
-    refuses the request instead, so the guard is exercised on its own.
+    A model that ignores the requested mode and answers in its own must not
+    have its ``[B, 1+K, V]`` logits read as token ids: that would commit
+    vocabulary indices of float rows as output. Nor may ``[B, 1+K]`` ids be
+    read as logits, which would sample over a vocabulary as wide as the block.
     """
     logits = torch.zeros(1, 4, FAKE_VOCAB_SIZE)
-    answer = VerifyOutput(spec_mode=ACCEPT_MODE_LOGITS, logits=logits)
+    as_logits = VerifyOutput(spec_mode=ACCEPT_MODE_LOGITS, logits=logits)
+    as_ids = VerifyOutput(
+        spec_mode=ACCEPT_MODE_ARGMAX_IDS,
+        argmax_ids=torch.zeros(1, 4, dtype=torch.int32),
+    )
 
-    with pytest.raises(NotImplementedError, match="no accept walk for that mode"):
-        _verify_output_tensor(answer, "FakeSpecModel", ACCEPT_MODE_ARGMAX_IDS)
+    with pytest.raises(NotImplementedError, match="answers in the mode it was asked"):
+        _verify_output_tensor(as_logits, "FakeSpecModel", ACCEPT_MODE_ARGMAX_IDS)
+    with pytest.raises(NotImplementedError, match="answers in the mode it was asked"):
+        _verify_output_tensor(as_ids, "FakeSpecModel", ACCEPT_MODE_LOGITS)
+    assert (
+        _verify_output_tensor(as_logits, "FakeSpecModel", ACCEPT_MODE_LOGITS) is logits
+    )
 
 
 def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():
