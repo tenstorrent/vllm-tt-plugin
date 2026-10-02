@@ -41,8 +41,10 @@ then min_p, then top-k/top-p. ``accept_sampled_drafts`` applies the penalties
 per candidate column against that column's own history and hands the rest to
 ``accept_speculated_tokens``. Upstream's rejection sampler skips min_p at the
 drafted positions; this walk does not, because the ordinary sampler applies it
-at every position. vLLM 0.26 refuses min_p on a speculating launch, so the
-runner never passes it; the parameter is there for when that refusal goes.
+at every position. vLLM 0.26 refuses a min_p above 1e-5 on a speculating
+launch and builds no min_p processor there, so the ordinary sampler ignores a
+smaller one and the runner never passes it; the parameter is there for when
+vLLM applies it.
 
 The accept walk uses host PyTorch and the plugin's placeholder constant.
 Top-k/top-p filtering and the penalties lazily import vLLM's PyTorch helpers.

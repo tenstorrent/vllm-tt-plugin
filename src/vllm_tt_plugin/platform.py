@@ -2606,7 +2606,8 @@ class TTPlatform(Platform):
         model serving only ``argmax_ids`` without ``supports_narrow_decode``
         sends every decode step as a verify, which commits the target argmax
         on every row, so there the request is refused. vLLM itself refuses
-        min_p and logit_bias on a speculating launch before this runs.
+        logit_bias, and a min_p above 1e-5, on a speculating launch before
+        this runs.
 
         Refused on every speculating launch: controls that need logits or a
         token filter the model-owned sampler does not apply. A request asking
