@@ -273,6 +273,12 @@ The capability is fail-closed. Without it, the plugin disables async scheduling
 for that model and requests a full forward-input reload on every version-1
 decode.
 
+This document defines the ordinary single-token decode contract only: a launch
+that also configures speculative decoding adds a wider verify call, a
+`supports_async_spec_decode` capability and the step-selection and KV
+reservation rules that go with them, all stated in
+[SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
+
 ## Negotiation and rollout
 
 Adapters opt in with `decode_input_update_contract = 1`. Missing or zero means

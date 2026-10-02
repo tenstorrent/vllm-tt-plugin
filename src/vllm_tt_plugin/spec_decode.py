@@ -6,9 +6,11 @@ The contract these types encode is specified in
 https://github.com/tenstorrent/vllm-tt-plugin/issues/110. This module holds the
 wire surface and the validation of the values that cross it, so a model class
 and the runner can agree on shapes and modes before either side implements a
-step of the loop. It reads no ``model_capabilities`` key and admits no
-configuration: ``normalize_declared_values`` validates a declaration a caller
-has already read, and lives here next to the constant sets it validates.
+step of the loop. It reads no ``model_capabilities`` key, admits no
+configuration and imports nothing from vLLM at run time:
+``normalize_declared_values`` validates a declaration a caller has already
+read, and lives here next to the constant sets it validates. The plugin's own
+admission policy lives in ``spec_admission``, which imports from here.
 
 Per the contract, one step is verify then propose: the runner calls
 ``decode_forward`` over the ``[B, 1+K]`` candidate block, walks acceptance, and
@@ -145,10 +147,10 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 class SpecPlan:
     """What one model can serve at one ``(max_num_seqs, requested_k)`` point.
 
-    Returned by a model class's ``spec_plan`` classmethod at config time. The
-    runner budgets with these numbers and never inspects the physical verify
-    layout: a model's lane arithmetic, L1 fit and state budget stay private,
-    and only their consequences cross.
+    Returned by a model class's ``spec_plan`` classmethod at config time.
+    Resource fields describe the model's requirements, but the plugin does not
+    yet enforce their row or byte budgets. The physical verify layout stays
+    private to the model.
 
     ``accept_modes`` is stored as a tuple because the instance is frozen and a
     list field would be shared mutable state on a value object.
@@ -157,8 +159,8 @@ class SpecPlan:
     effective_k: int
     # Decode rows one speculating request occupies while verifying its
     # [B, 1+K] block. Unrelated to a lane-DP lane: this counts rows of the
-    # model's decode batch, not TT lanes in an engine. The runner checks it
-    # against its own row budget and never asks how the rows are arranged.
+    # model's decode batch, not TT lanes in an engine. The plugin validates
+    # this declaration but does not yet check it against a row budget.
     lanes_per_request: int
     # Fixed device bytes per speculating request, independent of sequence
     # length: candidate state slots, a conv stash, retained hidden rows.
@@ -237,10 +239,13 @@ class SpecPlan:
 
     @property
     def block_width(self) -> int:
-        """Row width of every speculative decode call, ``1 + effective_k``.
+        """Row width of a **wide** speculative decode call, ``1 + effective_k``.
 
-        Uniform once speculation is on, including on a step where no request
-        carries drafts, so a model needs one verify shape and not two.
+        Every speculative step is this wide, including a step where no request
+        carries drafts, so a model needs one verify shape and not two. The one
+        exception is a model that sets ``supports_narrow_decode``: it also
+        receives the plain decode's own shapes on a draftless step, and this
+        property does not describe that call.
         """
         return 1 + self.effective_k
 
@@ -278,9 +283,18 @@ class SpecReject:
 class DraftOutput:
     """What a device drafter returns for one step.
 
-    ``draft_token_ids`` is ``[B, K]`` and padded. How many of row ``i``'s
-    drafts are real is the runner's own bookkeeping, carried into the verify
-    call as ``num_valid_drafts``, not encoded in this tensor.
+    ``draft_token_ids`` is ``[B, K]`` and padded.
+
+    ``num_valid`` is ``[B]`` int32, how many of each row's ``K`` drafts the
+    drafter is actually offering, and it is the only way to offer none: a row
+    at 0 is drafted for nowhere, and the step it would have been verified on
+    runs as an ordinary decode instead. ``None`` means every row offers all
+    ``K``, which is what a drafter that always drafts returns. A drafter that
+    has nothing for a row still returns ids in that row, because a device graph
+    has one shape; the ids are then not read. Do not encode an empty proposal
+    as a dummy token id: the runner cannot tell that apart from a real draft
+    and would verify it.
+
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
     An accept rule that needs the drafter distribution reads them; a runner
@@ -288,6 +302,7 @@ class DraftOutput:
     """
 
     draft_token_ids: "torch.Tensor"
+    num_valid: "torch.Tensor | None" = None
     draft_scores: "torch.Tensor | None" = None
 
 
@@ -343,6 +358,11 @@ def normalize_declared_values(
     """
     if values is None:
         return ()
+    if isinstance(values, str):
+        raise ValueError(
+            f"{label} must be a list of values, not the single string "
+            f"{values!r}; wrap it in a list"
+        )
     declared = tuple(values)
     unknown = [value for value in declared if value not in known]
     if unknown:
@@ -352,6 +372,144 @@ def normalize_declared_values(
     if len(set(declared)) != len(declared):
         raise ValueError(f"{label} repeats a value: {list(declared)}")
     return declared
+
+
+def check_spec_side_tensors(
+    num_valid_drafts: "torch.Tensor | None",
+    accepted_counts: "torch.Tensor | None",
+    rows: int,
+    num_drafts: int,
+    call: str = "verify",
+) -> None:
+    """Validate the two ``[B]`` tensors a verify receives beside its block.
+
+    Lives here, in the contract module both sides import, because every model
+    implementing the contract has to check the same domain and a model that
+    checks a weaker one is a poor witness for it. Two independent copies of
+    this drifted apart once already.
+
+    ``num_valid_drafts`` says how many of a row's draft columns are real, in
+    ``[0, num_drafts]``. ``accepted_counts`` says how many tokens that row's
+    previous step committed, in ``[1, 1 + num_drafts]``: a count and not an
+    index, so 0 is never valid and a model reading ``accepted_counts - 1`` to
+    select a candidate state never indexes -1.
+
+    Both are int32, because the runner builds them that way and a float or a
+    wider integer here means the caller built something else.
+    """
+    import torch
+
+    for name, tensor, low, high in (
+        ("num_valid_drafts", num_valid_drafts, 0, num_drafts),
+        ("accepted_counts", accepted_counts, 1, 1 + num_drafts),
+    ):
+        if tensor is None:
+            raise ValueError(
+                f"{call} {name} must be present; only accepted_counts may be "
+                "None, and only after a fused_sample step left an "
+                "authoritative count on the device"
+            )
+        if tensor.shape != (rows,):
+            raise ValueError(
+                f"{call} {name} must be [{rows}], got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{call} {name} must be int32, got {tensor.dtype}")
+        out_of_range = tensor[(tensor < low) | (tensor > high)]
+        if out_of_range.numel():
+            raise ValueError(
+                f"{call} {name} entries must lie in [{low}, {high}], got "
+                f"{out_of_range.tolist()}"
+            )
+
+
+def accept_greedy_drafts(
+    argmax_ids: "torch.Tensor",
+    draft_token_ids: "torch.Tensor",
+    num_valid_drafts: "torch.Tensor",
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Walk greedy acceptance over one verify's ``argmax_ids``.
+
+    The accept mode ``"argmax_ids"`` returns what the target model would have
+    chosen at each of the ``1+K`` candidate positions, and greedy acceptance
+    takes each draft that matches and stops at the first that does not. The
+    target's own choice at the position that rejected commits in the rejected
+    draft's place, so a row that rejects its very first draft still commits one
+    token and the count is never 0.
+
+    A row that accepts all of its drafts commits one more, the bonus, which is
+    the argmax at the column past its last draft. The uniform ``1+K`` width is
+    what makes that column already present.
+
+    Args:
+        argmax_ids: ``[B, 1+K]``.
+        draft_token_ids: ``[B, K]``. Entries past a row's count are padding and
+            are not read as candidates.
+        num_valid_drafts: ``[B]`` in ``[0, K]``.
+
+    Returns:
+        ``(committed_token_ids, accepted_counts)``. The ids are ``[B, 1+K]``
+        int32, each row holding its committed prefix followed by
+        ``PLACEHOLDER_TOKEN_ID``; the counts are ``[B]`` int32 in ``[1, 1+K]``.
+    """
+    import torch
+
+    if argmax_ids.dim() != 2:
+        raise ValueError(
+            f"accept_greedy_drafts argmax_ids must be 2-D [B, 1+K], got "
+            f"{tuple(argmax_ids.shape)}"
+        )
+    rows, width = argmax_ids.shape
+    num_drafts = width - 1
+    if draft_token_ids.shape != (rows, num_drafts):
+        raise ValueError(
+            f"accept_greedy_drafts draft_token_ids must be [{rows}, "
+            f"{num_drafts}] to match argmax_ids {tuple(argmax_ids.shape)}, got "
+            f"{tuple(draft_token_ids.shape)}"
+        )
+    if num_valid_drafts.shape != (rows,):
+        raise ValueError(
+            f"accept_greedy_drafts num_valid_drafts must be [{rows}], got "
+            f"{tuple(num_valid_drafts.shape)}"
+        )
+
+    ids = argmax_ids.to(torch.int32)
+    if num_drafts == 0:
+        # A narrow step: the model was handed one column because no row carried
+        # a draft, so every row commits that column and nothing else. Handled
+        # before the walk because an argmax over a zero-width reduction raises.
+        return ids, torch.ones(rows, dtype=torch.int32)
+    matched = ids[:, :num_drafts] == draft_token_ids.to(torch.int32)
+    # A column past a row's own count holds padding, not a candidate, so it can
+    # neither be accepted nor reject the row.
+    valid = torch.arange(num_drafts).unsqueeze(0) < num_valid_drafts.unsqueeze(1)
+    if bool((draft_token_ids.eq(PLACEHOLDER_TOKEN_ID) & valid).any()):
+        # The padding marker inside a row's own count is not a token the model
+        # can have chosen, so nothing downstream can catch it: the model is
+        # handed the same column, returns it unchanged, the comparison above
+        # matches, and the marker commits as an output token. The caller
+        # counted more drafts than it delivered.
+        raise ValueError(
+            "accept_greedy_drafts was given PLACEHOLDER_TOKEN_ID as a draft "
+            "inside a row's num_valid_drafts prefix: num_valid_drafts "
+            f"{num_valid_drafts.tolist()} against draft_token_ids "
+            f"{draft_token_ids.tolist()}"
+        )
+    rejected = valid & ~matched
+    # argmax over an all-False row returns 0, so the index is only meaningful
+    # once a rejection is known to exist.
+    first_rejection = rejected.to(torch.int8).argmax(dim=1)
+    counts = torch.where(
+        rejected.any(dim=1), first_rejection + 1, num_valid_drafts.to(torch.int64) + 1
+    ).to(torch.int32)
+
+    columns = torch.arange(width).unsqueeze(0).expand(rows, width)
+    committed = torch.where(
+        columns < counts.to(torch.int64).unsqueeze(1),
+        ids,
+        torch.full_like(ids, PLACEHOLDER_TOKEN_ID),
+    )
+    return committed, counts
 
 
 __all__ = [
@@ -381,5 +539,7 @@ __all__ = [
     "SpecPlan",
     "SpecReject",
     "VerifyOutput",
+    "accept_greedy_drafts",
+    "check_spec_side_tensors",
     "normalize_declared_values",
 ]
