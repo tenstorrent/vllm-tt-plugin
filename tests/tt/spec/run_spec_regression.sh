@@ -24,7 +24,7 @@ if [ ${#CONFIGS[@]} -eq 0 ]; then
     CONFIGS=(
         accept-all accept-2 accept-0 adaptive async capacity lossless
         async-accept-0 async-accept-2 async-capacity async-reset
-        async-k1 async-k3
+        async-k1 async-k3 mixed async-mixed
     )
 fi
 
@@ -255,7 +255,8 @@ run_lossless() {
     return "$status"
 }
 
-BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py tests/tt/spec/test_termination.py)
+BEHAVIOUR=(tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py tests/tt/spec/test_termination.py tests/tt/spec/test_mixed_sampling.py)
+MIXED=(tests/tt/spec/test_mixed_sampling.py)
 ASYNC_CORRECTNESS=(tests/tt/spec/test_async_correctness.py)
 OVERALL=0
 for config in "${CONFIGS[@]}"; do
@@ -301,6 +302,13 @@ for config in "${CONFIGS[@]}"; do
         # K=3 sits between that and the K=5 the other configurations run.
         async-k1)       run_config async-k1 -1 all 2048 8 - always true fixed 1 false "${ASYNC_CORRECTNESS[@]}" ;;
         async-k3)       run_config async-k3 -1 all 2048 8 - always true fixed 3 false "${ASYNC_CORRECTNESS[@]}" ;;
+        # Sampled requests beside a speculating greedy one. The adaptive
+        # drafter, because only a launch with narrow decode admits them, and
+        # the fixed target, because its logits are a known distribution the
+        # sampled tokens can be checked against. The asynchronous variant
+        # samples on device, so its greedy-only steps can overlap.
+        mixed)       run_config mixed -1 all 2048 8 - solo false fixed "$K" false "${MIXED[@]}" ;;
+        async-mixed) run_config async-mixed -1 all 2048 8 - solo true fixed "$K" false "${MIXED[@]}" ;;
         lossless)   run_lossless ;;
         *) echo "unknown configuration: $config" >&2; OVERALL=1; continue ;;
     esac

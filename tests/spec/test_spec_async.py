@@ -372,12 +372,14 @@ def _runner(model: DeferredVerifyTarget) -> SimpleNamespace:
     return runner
 
 
-def _new_request(req_id: str, first_token: int) -> NewRequestData:
+def _new_request(
+    req_id: str, first_token: int, temperature: float = 0.0
+) -> NewRequestData:
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=list(range(first_token, first_token + PROMPT_LEN)),
         mm_features=[],
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(temperature=temperature),
         pooling_params=None,
         block_ids=([0],),
         num_computed_tokens=PROMPT_LEN,
@@ -409,8 +411,8 @@ def _scheduler_output(
     drafts=None,
 ) -> SchedulerOutput:
     output = SchedulerOutput.make_empty()
-    output.scheduled_new_reqs = [_new_request(req_id, first) for req_id, first in new]
-    scheduled = [req_id for req_id, _ in new] + list(decoding)
+    output.scheduled_new_reqs = [_new_request(*spec) for spec in new]
+    scheduled = [spec[0] for spec in new] + list(decoding)
     output.scheduled_cached_reqs = CachedRequestData(
         req_ids=list(decoding),
         resumed_req_ids=set(resumed),
@@ -535,9 +537,9 @@ def _settle_layout(runner) -> None:
     runner._decode_layout_changed_since_last_decode = False
 
 
-def _submit_plain_step(runner, *req_ids):
-    """Run one asynchronous step that has nothing to verify."""
-    scheduler_output = _scheduler_output(runner, decoding=req_ids)
+def _submit_plain_step(runner, *req_ids, drafts=None):
+    """Run one asynchronous step that verifies nothing."""
+    scheduler_output = _scheduler_output(runner, decoding=req_ids, drafts=drafts)
     for req_id in req_ids:
         row = runner.input_batch.req_id_to_index[req_id]
         runner.input_batch.num_computed_tokens_cpu[row] = runner.input_batch.num_tokens[
@@ -1712,6 +1714,40 @@ def test_a_verify_is_not_submitted_over_an_outstanding_ordinary_step():
     model.release()
     outstanding.get_output()
     _drain(runner, "a")
+
+
+def test_a_sampled_row_keeps_the_overlap_whatever_the_greedy_row_proposed():
+    """The prediction follows the step-level fallback of ``_step_verifies``.
+
+    With a sampled row scheduled beside it, the greedy row's proposal does not
+    make the next step a verify: the step is built as an ordinary decode, so
+    there is no candidate block to start behind an outstanding step, and that
+    step need not drain. The build that follows confirms it.
+    """
+    model = DeferredVerifyTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11), ("s", 41, 1.0))
+    _settle_layout(runner)
+
+    outstanding = _submit_plain_step(runner, "a", "s")
+    runner._proposed_draft_token_ids["a"] = _accept_everything(runner, "a")
+    reservation = {req_id: [PLACEHOLDER_TOKEN_ID] * DRAFT_LEN for req_id in ("a", "s")}
+    scheduler_output = _scheduler_output(
+        runner, decoding=["a", "s"], drafts=reservation
+    )
+
+    assert not runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True, scheduler_output=scheduler_output
+    ), "a step the sampled row keeps ordinary was predicted to verify"
+
+    model.release()
+    outstanding.get_output()
+    _drain(runner, "a", "s")
+
+    following = _submit_plain_step(runner, "a", "s", drafts=reservation)
+    model.release()
+    following.get_output()
+    _drain(runner, "a", "s")
 
 
 def test_an_ordinary_step_still_overlaps_an_outstanding_ordinary_step():

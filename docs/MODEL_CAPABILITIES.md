@@ -135,11 +135,13 @@ block-output execution or lane-DP. Standard multi-process DP does not use the
 lane-DP rejection, but the selected model must admit the concurrency of each
 engine. Admission is not device validation for a particular DP deployment.
 
-`TTModelRunner._narrow_steps_serve_the_drafter` reads `spec_requirements` and
-`spec_hidden_handoff` after model loading. If a model-owned drafter declares
-`hidden_feed` and includes `roundtrip`, the runner disables narrow draftless
-decode so every decode supplies a verify hidden handle. This applies even if
-the model also declares `on_device`.
+`resolve_speculative_plan` reads `spec_requirements` and
+`spec_hidden_handoff` at configuration time. If a model-owned drafter declares
+`hidden_feed` and includes `roundtrip`, the resolved plan comes back without
+`supports_narrow_decode`, so every decode supplies a verify hidden handle. This
+applies even if the model also declares `on_device`. Per-request admission
+then refuses a request with a non-zero temperature or a penalty on that
+launch, because every decode step is a verify.
 
 Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py), and

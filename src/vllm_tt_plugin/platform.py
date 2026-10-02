@@ -2400,29 +2400,34 @@ class TTPlatform(Platform):
         and commits ids. That certifies plain greedy decoding exactly, and
         nothing else.
 
-        Controls the ORDINARY decode path can honour are no longer refused --
-        a non-zero temperature and the penalties are served by simply not
-        speculating for that request (``TTModelRunner._request_is_speculable``
-        offers no drafts, and the runner applies its full sampling). Refusing
-        them made a speculating launch unusable for any sampled client and, in
-        our case, failed every prompt of two standard evals with HTTP 400.
+        A non-zero temperature and the penalties are served without
+        speculation where the launch has an ordinary decode to serve them
+        with. On a model that declares ``supports_narrow_decode``,
+        ``TTModelRunner._publish_draft`` offers such a request no drafts, and
+        every step it shares runs as the ordinary decode, which applies its
+        full sampling (``_step_verifies`` in the runner). Refusing them would
+        make a speculating launch unusable for any sampled client. A model
+        without ``supports_narrow_decode`` sends every decode step as a verify,
+        which commits the target argmax on every row, so there the request is
+        refused.
 
-        What remains here is what no path on this launch serves: controls that
-        need logits or a token filter the model-owned sampler does not apply.
-        A request asking for those would be answered without them, silently --
-        a grammar or token filter unapplied, requested logprobs arriving empty.
+        Refused on every speculating launch: controls that need logits or a
+        token filter the model-owned sampler does not apply. A request asking
+        for those would be answered without them, silently -- a grammar or
+        token filter unapplied, requested logprobs arriving empty.
 
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
         """
+        from vllm.sampling_params import SamplingType
+
         vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+        spec_plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+        if spec_plan is None:
             return
 
         unsupported = []
-        # temperature / min_p / the penalties are intentionally absent: those
-        # requests are decoded without speculation instead of being refused.
         if params.logprobs is not None:
             unsupported.append(f"logprobs={params.logprobs!r}")
         if getattr(params, "structured_outputs", None) is not None:
@@ -2436,16 +2441,48 @@ class TTPlatform(Platform):
         if params.min_tokens:
             unsupported.append(f"min_tokens={params.min_tokens!r}")
 
+        # The same four conditions under which vLLM's InputBatch.add_request
+        # files the request into random_reqs or a penalty set, which is what
+        # TTModelRunner._request_is_speculable reads. min_p, top_p and top_k
+        # are absent because they do not move a greedy request's argmax.
+        sampled = []
+        if not spec_plan.supports_narrow_decode:
+            if params.sampling_type != SamplingType.GREEDY:
+                sampled.append(f"temperature={params.temperature!r}")
+            for name, neutral in (
+                ("presence_penalty", 0.0),
+                ("frequency_penalty", 0.0),
+                ("repetition_penalty", 1.0),
+            ):
+                if getattr(params, name) != neutral:
+                    sampled.append(f"{name}={getattr(params, name)!r}")
+
+        if not unsupported and not sampled:
+            return
+        reasons = []
         if unsupported:
-            raise ValueError(
-                f"Speculative decoding on {cls.device_name} cannot serve this "
-                f"request's {unsupported}. No path on this launch applies "
-                "those, so answering without them would change what was asked "
-                "for without saying so. Sampled requests (temperature, "
-                "min_p, the penalties) ARE served here -- they simply decode "
-                "without speculation. Drop the controls above, or drop the "
-                "speculative flags from the server"
+            reasons.append(
+                f"No path on this launch applies {unsupported}, so answering "
+                "without them would change what was asked for without saying "
+                "so."
             )
+        if sampled:
+            reasons.append(
+                "This launch's model sends every decode step as a verify (its "
+                "SpecPlan does not keep supports_narrow_decode), and a verify "
+                f"commits the target argmax on every row, so {sampled} would "
+                "not be applied. Send temperature 0 without penalties."
+            )
+        elif spec_plan.supports_narrow_decode:
+            reasons.append(
+                "Sampled requests (temperature, the penalties) ARE served "
+                "here -- they simply decode without speculation."
+            )
+        raise ValueError(
+            f"Speculative decoding on {cls.device_name} cannot serve this "
+            f"request's {unsupported + sampled}. {' '.join(reasons)} Drop the "
+            "controls above, or drop the speculative flags from the server"
+        )
 
     @classmethod
     def validate_request(

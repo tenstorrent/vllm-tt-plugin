@@ -902,6 +902,14 @@ class TTAsyncDecodeController:
         if not runner._pending_async_steps:
             return False
         scheduled = scheduler_output.num_scheduled_tokens
+        if runner._spec_supports_narrow_decode and not all(
+            runner._request_is_speculable(req_id) for req_id in scheduled
+        ):
+            # ``_step_verifies`` sends such a step as the ordinary decode,
+            # whatever its rows carry. A scheduled request that is not in the
+            # persistent batch yet reads as speculable here, which errs
+            # towards True below.
+            return False
         drafts = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduled:
             offered = drafts.get(req_id) or ()
@@ -1201,14 +1209,17 @@ class TTAsyncDecodeController:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         # Speculative side tensors, sent only on a speculating decode step so a
-        # model that never speculates keeps its present call shape. Both or
-        # neither: the runner builds them together and a model needs the count
-        # to know which candidate state to continue from, not only the draft
-        # count to know how much of the block is real.
+        # model that never speculates keeps its present call shape. A verify
+        # carries all three: a model needs the count to know which candidate
+        # state to continue from, not only the draft count to know how much of
+        # the block is real. An ordinary decode carries ``accepted_counts``
+        # alone, and only while a row's previous step committed more than one
+        # token, for the same reason.
         if model_input.num_valid_drafts is not None:
             kwargs["num_valid_drafts"] = model_input.num_valid_drafts
-            kwargs["accepted_counts"] = model_input.accepted_counts
             kwargs["spec_mode"] = model_input.spec_mode
+        if model_input.accepted_counts is not None:
+            kwargs["accepted_counts"] = model_input.accepted_counts
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (

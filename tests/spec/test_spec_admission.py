@@ -30,6 +30,7 @@ from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_FUSED_SAMPLE,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFF_ON_DEVICE,
+    HIDDEN_HANDOFF_ROUNDTRIP,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     SPEC_REQUIREMENT_HIDDEN_FEED,
     SpecPlan,
@@ -238,6 +239,76 @@ def test_the_model_owned_drafter_needs_a_declared_hidden_handoff():
         )
 
     assert "spec_hidden_handoff" in str(excinfo.value)
+
+
+_HIDDEN_FEED = [SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED]
+
+
+@pytest.mark.parametrize(
+    "method, capabilities, keeps_narrow_decode",
+    [
+        (
+            MODEL_OWNED_DRAFT_METHOD,
+            {
+                "spec_requirements": _HIDDEN_FEED,
+                "spec_hidden_handoff": [HIDDEN_HANDOFF_ROUNDTRIP],
+            },
+            False,
+        ),
+        (
+            MODEL_OWNED_DRAFT_METHOD,
+            {
+                "spec_requirements": _HIDDEN_FEED,
+                "spec_hidden_handoff": [HIDDEN_HANDOFF_ON_DEVICE],
+            },
+            True,
+        ),
+        (
+            MODEL_OWNED_DRAFT_METHOD,
+            {"spec_requirements": [SPEC_REQUIREMENT_DEVICE_PROPOSE]},
+            True,
+        ),
+        (
+            RUNNABLE_METHOD,
+            {
+                "spec_requirements": _HIDDEN_FEED,
+                "spec_hidden_handoff": [HIDDEN_HANDOFF_ROUNDTRIP],
+            },
+            True,
+        ),
+    ],
+    ids=["roundtrip", "on-device", "no-hidden-feed", "host-proposer"],
+)
+def test_narrow_decode_is_revoked_for_a_drafter_an_ordinary_decode_cannot_feed(
+    method, capabilities, keeps_narrow_decode
+):
+    """The plan carries the launch's effective narrow decode, decided once.
+
+    An ordinary decode returns no ``VerifyOutput``, so it produces no hidden
+    handle. A model-owned drafter fed its target hidden state through the
+    runner would then be asked to draft from nothing, so that plan comes back
+    without ``supports_narrow_decode`` and every step of the launch verifies.
+    A host proposer is handed no hidden state, so nothing constrains it.
+
+    Decided in the plan rather than when the model loads, because per-request
+    admission runs in the front-end process, where no model is loaded, and
+    refuses a sampled request exactly when every step verifies.
+    """
+    variant = make_fake_spec_model(supports_narrow_decode=True)
+    plan = _admit(
+        _config(
+            method=method,
+            model=(
+                MODEL_OWNED_DRAFT_SENTINEL
+                if method == MODEL_OWNED_DRAFT_METHOD
+                else None
+            ),
+        ),
+        model_class=variant,
+        capabilities={"supports_spec_decode": True, **capabilities},
+    )
+
+    assert plan.supports_narrow_decode is keeps_narrow_decode
 
 
 def test_a_model_that_cannot_draft_is_refused_the_model_owned_method():

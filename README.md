@@ -631,17 +631,16 @@ Two model-side limits require attention in current dFlash recipes:
 
 Use `temperature=0` with no penalties to exercise greedy speculation.
 `TTModelRunner._publish_draft` withholds drafts for requests with non-zero
-temperature or penalties. When the model supports narrow decode and the whole
-step has no drafts or unresolved multi-token commit, `TTModelRunner` uses
-ordinary decode and the selected model's normal sampling path.
+temperature or penalties.
 
-**Sampled requests can still receive greedy tokens.** If any row requires
-verification, every row enters the `argmax_ids` call. A sampled row then
-commits the target argmax without applying that row's temperature or penalties.
-`TTModelRunner._note_unspeculable_verify_rows` warns once and counts affected
-rows; `TTModelRunner.shutdown` logs the total. A model without narrow decode
-uses verification on every decode step. Use a server without
-`speculative_config` when sampled-request semantics must hold on every step.
+**A sampled request never enters a verify.** A verify in `argmax_ids` mode
+commits the target argmax on every row, so it cannot apply a row's temperature
+or penalties. When the model supports narrow decode, every step that includes
+a sampled or penalized request runs as the ordinary decode, with the selected
+model's normal sampling path; the other rows' drafts on that step are dropped,
+so no request speculates while a sampled one shares its batch. A model without
+narrow decode verifies every decode step, so `TTPlatform.validate_request`
+refuses a request with a non-zero temperature or a penalty on that launch.
 
 `TTPlatform.validate_request` rejects logprobs, structured output,
 `logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a

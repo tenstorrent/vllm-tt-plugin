@@ -71,15 +71,10 @@ from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
-    HIDDEN_HANDOFF_ROUNDTRIP,
-    HIDDEN_HANDOFFS,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
-    SPEC_REQUIREMENT_HIDDEN_FEED,
-    SPEC_REQUIREMENTS,
     DraftOutput,
     accept_greedy_drafts,
-    normalize_declared_values,
 )
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
@@ -136,8 +131,21 @@ class _SyncForward:
     spec_hidden: Any | None = None
 
 
+def _has_unresolved_commit(accepted_counts: torch.Tensor, num_rows: int) -> bool:
+    """Whether a live row's previous step committed more than one token.
+
+    ``accepted_counts`` is how the model finds which candidate state slot that
+    commit landed on, so the step after such a commit carries the count even
+    when it drafts nothing. Only the live rows are read: a padding row sits at
+    the post-prefill default of 1 and owns no request, so it says nothing about
+    state to resolve.
+    """
+    return any(int(accepted_counts[row]) > 1 for row in range(num_rows))
+
+
 def _step_verifies(
     supports_narrow_decode: bool,
+    every_row_speculable: bool,
     num_valid_drafts: torch.Tensor,
     accepted_counts: torch.Tensor,
     num_rows: int,
@@ -145,23 +153,30 @@ def _step_verifies(
     """Whether a speculating launch sends the model a verify on this step.
 
     Two things make a step speculative. A row carrying drafts is the obvious
-    one. The other is a row whose previous step committed more than one token:
-    ``accepted_counts`` is how the model finds which candidate state slot that
-    commit landed on, so the step after such a commit carries the count even
-    when it drafts nothing. One step resolves it, because that step commits a
-    single token and records a count of 1.
+    one. The other is an unresolved commit (``_has_unresolved_commit``). One
+    step resolves that, because the step commits a single token and records a
+    count of 1.
+
+    A row whose request is not speculable overrules both. The runner asks a
+    verify for ``argmax_ids``, which answers every row with the target argmax,
+    so that row would commit a greedy token for a request that asked to
+    sample. The step runs as the ordinary decode instead, which samples each
+    row with its own request's parameters. The other rows' drafts are dropped,
+    and an unresolved commit reaches that ordinary decode as
+    ``accepted_counts``.
 
     A model that does not declare ``supports_narrow_decode`` implements one
-    input shape, so every step it is sent is a verify.
+    input shape, so every step it is sent is a verify, and
+    ``TTPlatform._reject_unsupported_speculative_request`` keeps every request
+    that is not speculable off such a launch.
     """
     if not supports_narrow_decode:
         return True
+    if not every_row_speculable:
+        return False
     if bool(num_valid_drafts.any()):
         return True
-    # Only the live rows are read: a padding row sits at the post-prefill
-    # default of 1 and owns no request, so it says nothing about state to
-    # resolve.
-    return any(int(accepted_counts[row]) > 1 for row in range(num_rows))
+    return _has_unresolved_commit(accepted_counts, num_rows)
 
 
 def _coerce_output_block(
@@ -255,7 +270,8 @@ class TTModelRunner:
         # A model that also serves a narrow [B, 1] decode lets a step on which
         # no request carries drafts run as the ordinary decode it is, which is
         # what keeps batched baseline decoding overlapped inside a speculating
-        # server. ``load_model`` narrows this further, once the model exists.
+        # server. ``resolve_speculative_plan`` has already revoked it for a
+        # drafter that an ordinary decode cannot feed.
         self._spec_supports_narrow_decode = bool(
             spec_plan and spec_plan.supports_narrow_decode
         )
@@ -362,9 +378,6 @@ class TTModelRunner:
         # consumes them in _drafts_to_verify within the scheduled lookahead
         # reservation. Each consumer takes a proposal only once.
         self._proposed_draft_token_ids: dict[str, list[int]] = {}
-        # Rows a verify answered by argmax although their request is not
-        # speculable. See _note_unspeculable_verify_rows; reported at shutdown.
-        self._num_unspeculable_verify_rows = 0
         # Built on first use rather than here, because constructing it compiles
         # numba kernels and a launch that never speculates must not pay that.
         self._ngram_proposer: Any = None
@@ -400,14 +413,6 @@ class TTModelRunner:
         """
         if getattr(self, "_persistent_capture_released", False):
             return
-        unspeculable_rows = getattr(self, "_num_unspeculable_verify_rows", 0)
-        if unspeculable_rows:
-            logger.warning(
-                "Speculative verify steps committed a greedy token for %d "
-                "row(s) whose request is not speculable (non-zero temperature "
-                "or a penalty).",
-                unspeculable_rows,
-            )
         release = getattr(
             getattr(self, "model", None), "release_persistent_capture", None
         )
@@ -452,60 +457,6 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
-        if self._spec_supports_narrow_decode:
-            self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
-
-    def _narrow_steps_serve_the_drafter(self) -> bool:
-        """Whether a step that verifies nothing can still feed the drafter.
-
-        A step with nothing to verify returns no ``VerifyOutput``, so it
-        produces no hidden handle. A drafter whose target hidden state reaches
-        it through the runner would then be asked to draft from nothing, so for
-        that one pairing the step stays a verify and the launch keeps the
-        ordinary decode's overlap only where it can serve it. A drafter that
-        declares no hidden feed, or one that keeps its own state on device, is
-        unaffected.
-
-        Read from what the model declares rather than from what the method
-        requires, because this is a property of the drafter: the model-owned
-        method demands only that the model propose, and what its drafter reads
-        is the model's own statement.
-
-        Decided here rather than at step time: the alternative is handing that
-        drafter ``None`` and hoping, which is the silent degradation this
-        contract refuses everywhere else.
-        """
-        if not self._spec_drafts_from_model:
-            # A host proposer reads the request's own text and is handed no
-            # hidden state, so nothing here constrains it.
-            return True
-        declared_requirements = normalize_declared_values(
-            (getattr(type(self.model), "model_capabilities", None) or {}).get(
-                "spec_requirements"
-            ),
-            SPEC_REQUIREMENTS,
-            f"{type(self.model).__name__} model_capabilities['spec_requirements']",
-        )
-        if SPEC_REQUIREMENT_HIDDEN_FEED not in declared_requirements:
-            return True
-        declared = normalize_declared_values(
-            (getattr(type(self.model), "model_capabilities", None) or {}).get(
-                "spec_hidden_handoff"
-            ),
-            HIDDEN_HANDOFFS,
-            f"{type(self.model).__name__} model_capabilities['spec_hidden_handoff']",
-        )
-        if HIDDEN_HANDOFF_ROUNDTRIP not in declared:
-            return True
-        logger.info(
-            "TT speculative decoding: %s feeds its drafter the target hidden "
-            "state through the runner, so every decode step stays a verify "
-            "and none of them overlaps. A model that keeps its hidden state "
-            "on device, or a drafter that needs none, decodes a draftless "
-            "step as an ordinary overlapping decode.",
-            type(self.model).__name__,
-        )
-        return False
 
     def _uses_async_scheduler(self) -> bool:
         """Whether upstream publishes outputs through placeholder accounting.
@@ -1417,30 +1368,6 @@ class TTModelRunner:
                 return False
         return True
 
-    def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
-        """Count the live rows of a verify whose request is not speculable.
-
-        ``_publish_draft`` keeps drafts off such a request, but it cannot keep
-        the request out of a verify: another row's drafts, an unresolved
-        multi-token commit, or a model without ``supports_narrow_decode`` makes
-        the whole step one. A verify in ``argmax_ids`` mode answers every row
-        with the target's argmax, so the row commits that argmax, not a token
-        drawn with its request's temperature and penalties.
-        """
-        rows = sum(
-            1 for req_id in row_req_ids if not self._request_is_speculable(req_id)
-        )
-        if not rows:
-            return
-        self._num_unspeculable_verify_rows += rows
-        logger.warning_once(
-            "A speculative verify step included a request that is not "
-            "speculable (non-zero temperature or a penalty). A verify returns "
-            "the target argmax for every row, so on that step the request "
-            "committed the argmax and its temperature and penalties were not "
-            "applied. The total count is logged at shutdown."
-        )
-
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         """Hand the drafts proposed since the last call to the engine.
 
@@ -1958,23 +1885,23 @@ class TTModelRunner:
                 )
                 if _step_verifies(
                     self._spec_supports_narrow_decode,
+                    all(self._request_is_speculable(req_id) for req_id in row_req_ids),
                     num_valid_drafts,
                     accepted_counts,
                     len(row_req_ids),
                 ):
-                    self._note_unspeculable_verify_rows(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
                         spec_drafts, num_valid_drafts, input_tokens, input_positions
                     )
                 else:
-                    # No row carries a draft and no row has a multi-token
-                    # commit left to resolve, so this step has nothing to
-                    # verify. It runs as the ordinary decode it is: no
-                    # ``spec_mode``, no side tensors, the sampler's own tail,
-                    # and eligible for asynchronous overlap, which a verify
-                    # never is. That is what keeps batched baseline decoding
+                    # Either this step has nothing to verify, or a row that is
+                    # not speculable shares it (see ``_step_verifies``). It
+                    # runs as the ordinary decode: no ``spec_mode``, no
+                    # ``num_valid_drafts``, the sampler's own tail, and
+                    # eligible for asynchronous overlap, which a verify never
+                    # is. That is what keeps batched baseline decoding
                     # overlapped inside a server with speculation configured.
                     # Only a model that declares ``supports_narrow_decode``
                     # reaches this: for any other, the step stays a wide verify
@@ -1982,7 +1909,13 @@ class TTModelRunner:
                     # model implements one input shape.
                     spec_drafts = None
                     num_valid_drafts = None
-                    accepted_counts = None
+                    if not _has_unresolved_commit(accepted_counts, len(row_req_ids)):
+                        accepted_counts = None
+                    # Each row commits one token here, which is the count 1.
+                    # Reset at the build because the ordinary commit path
+                    # records no count.
+                    for req_id in row_req_ids:
+                        self._req_accepted_counts.pop(req_id, None)
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -2023,13 +1956,14 @@ class TTModelRunner:
                         ]
                     )
                 if num_valid_drafts is not None:
+                    num_valid_drafts = torch.cat(
+                        [num_valid_drafts, torch.zeros(batch_pad, dtype=torch.int32)]
+                    )
+                if accepted_counts is not None:
                     # A padding row carries no draft and stands on its own
                     # input token, which is the count 1: ``accepted_counts`` is
                     # a count in [1, 1+K] and is never 0, on a padding row as
                     # much as on a real one.
-                    num_valid_drafts = torch.cat(
-                        [num_valid_drafts, torch.zeros(batch_pad, dtype=torch.int32)]
-                    )
                     accepted_counts = torch.cat(
                         [accepted_counts, torch.ones(batch_pad, dtype=torch.int32)]
                     )
@@ -2722,8 +2656,8 @@ class TTModelRunner:
         sees one call shape whatever produced the tokens.
 
         ``hidden`` is ``None``: a step that returned no ``VerifyOutput``
-        produced no handle. ``load_model`` keeps a drafter that is fed its
-        hidden state through the runner off this path entirely.
+        produced no handle. ``resolve_speculative_plan`` keeps a drafter that
+        is fed its hidden state through the runner off this path entirely.
         """
         skipped = set(skip_req_ids or ())
         live = len(row_req_ids)

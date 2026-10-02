@@ -114,7 +114,6 @@ def _fake_runner(
         _spec_candidate_block=TTModelRunner._spec_candidate_block,
         _spec_row_state=TTModelRunner._spec_row_state,
         _proposed_draft_token_ids={},
-        _num_unspeculable_verify_rows=0,
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -131,9 +130,6 @@ def _fake_runner(
     # step verifies depends on whether this launch schedules asynchronously.
     runner._drafts_to_verify = TTModelRunner._drafts_to_verify.__get__(runner)
     runner._request_is_speculable = TTModelRunner._request_is_speculable.__get__(runner)
-    runner._note_unspeculable_verify_rows = (
-        TTModelRunner._note_unspeculable_verify_rows.__get__(runner)
-    )
     return runner
 
 
@@ -390,67 +386,84 @@ def test_narrow_decode_widens_when_any_row_carries_a_draft():
 # region A request that is not speculable
 
 
-def _record_warnings(monkeypatch, name: str) -> list[str]:
-    """Capture what the runner's module logger emits through ``name``."""
-    emitted: list[str] = []
-    monkeypatch.setattr(
-        f"vllm_tt_plugin.model_runner.logger.{name}",
-        lambda msg, *args: emitted.append(msg % args),
+def _mixed_batch(
+    supports_narrow_decode: bool = True, accepted_counts: dict[str, int] | None = None
+) -> SimpleNamespace:
+    """A greedy request and a sampled one decoding in the same batch."""
+    batch = _batch()
+    requests = {
+        "greedy": _add_decoding_request(batch, "greedy"),
+        "sampled": _add_decoding_request(batch, "sampled", temperature=1.0),
+    }
+    return _fake_runner(
+        batch,
+        requests,
+        supports_narrow_decode=supports_narrow_decode,
+        accepted_counts=accepted_counts,
     )
-    return emitted
 
 
-def test_a_verify_counts_a_sampled_row_it_answers_by_argmax(monkeypatch):
-    """Withholding drafts does not keep a sampled request out of a verify.
+def test_a_sampled_row_turns_a_drafted_step_into_an_ordinary_decode():
+    """Another row's drafts do not pull a sampled request into a verify.
 
-    The greedy row's drafts make the whole step a verify, and a verify in
-    ``argmax_ids`` mode commits the target's argmax on every row, so the
-    sampled row gets a greedy token on this step. The runner counts each such
-    row and warns.
+    The runner asks a verify for ``argmax_ids``, which answers every row with
+    the target argmax, so on a verify the sampled row would commit a greedy
+    token. With the sampled row present the step is the ordinary decode
+    instead: the plain shapes, no ``spec_mode``, no ``num_valid_drafts``, and
+    the greedy row's drafts are dropped.
     """
-    warnings = _record_warnings(monkeypatch, "warning_once")
-    batch = _batch()
-    requests = {
-        "greedy": _add_decoding_request(batch, "greedy"),
-        "sampled": _add_decoding_request(batch, "sampled", temperature=1.0),
-    }
-    runner = _fake_runner(batch, requests, supports_narrow_decode=True)
+    runner = _mixed_batch()
 
-    for _ in range(2):
-        model_input = _decode(
-            runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22])
-        )
-        assert model_input.spec_mode is not None
+    model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
 
-    assert runner._num_unspeculable_verify_rows == 2
-    assert len(warnings) == 2
+    assert model_input.spec_mode is None
+    assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1)
+    assert model_input.input_positions.shape == (MAX_NUM_REQS,)
+    assert model_input.num_valid_drafts is None
+    assert model_input.draft_token_ids is None
+    # Every live count is 1, so there is nothing for the model to resolve.
+    assert model_input.accepted_counts is None
 
 
-def test_an_ordinary_decode_does_not_count_a_sampled_row(monkeypatch):
-    """With nothing to verify, the step is not a verify and nothing is counted."""
-    warnings = _record_warnings(monkeypatch, "warning_once")
-    batch = _batch()
-    requests = {
-        "greedy": _add_decoding_request(batch, "greedy"),
-        "sampled": _add_decoding_request(batch, "sampled", temperature=1.0),
-    }
-    runner = _fake_runner(batch, requests, supports_narrow_decode=True)
+def test_an_unresolved_commit_reaches_the_ordinary_decode_a_sampled_row_forces():
+    """The count of a multi-token commit is not lost when the step is plain.
+
+    A verify would have resolved the greedy row's count of 3. The sampled row
+    makes the step an ordinary decode, so the count travels on that call
+    instead, padded with the rows, and the step then commits one token per
+    row: the runner forgets the 3, and the next step reads the default of 1.
+    """
+    runner = _mixed_batch(accepted_counts={"greedy": 3})
 
     model_input = _decode(runner, "greedy", "sampled")
 
     assert model_input.spec_mode is None
-    assert runner._num_unspeculable_verify_rows == 0
-    assert warnings == []
+    assert model_input.input_tokens.shape == (MAX_NUM_REQS, 1)
+    assert model_input.num_valid_drafts is None
+    assert model_input.accepted_counts.dtype == torch.int32
+    assert model_input.accepted_counts.tolist() == [3] + [1] * (MAX_NUM_REQS - 1)
+    assert runner._req_accepted_counts == {}
+
+    # The sampled request left. The greedy row has neither drafts nor a count
+    # left to resolve, so this is an ordinary decode with no count at all.
+    model_input = _decode(runner, "greedy")
+    assert model_input.spec_mode is None
+    assert model_input.accepted_counts is None
 
 
-def test_shutdown_reports_the_sampled_rows_a_verify_answered(monkeypatch):
-    warnings = _record_warnings(monkeypatch, "warning")
-    runner = SimpleNamespace(_num_unspeculable_verify_rows=3)
+def test_a_sampled_row_does_not_change_a_model_that_only_verifies():
+    """Without narrow decode there is no ordinary decode to fall back to.
 
-    TTModelRunner.shutdown(runner)
+    Such a model implements the verify shape only, so the step stays a verify.
+    Keeping sampled requests off that launch is admission's job
+    (``TTPlatform._reject_unsupported_speculative_request``).
+    """
+    runner = _mixed_batch(supports_narrow_decode=False)
 
-    assert len(warnings) == 1
-    assert "3 row(s)" in warnings[0]
+    model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
+
+    assert model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
+    assert model_input.input_tokens.shape == (MAX_NUM_REQS, 4)
 
 
 # endregion A request that is not speculable
@@ -734,6 +747,32 @@ def test_a_non_speculating_decode_sends_no_side_tensors():
 
     assert "num_valid_drafts" not in calls[0]
     assert "accepted_counts" not in calls[0]
+
+
+def test_an_ordinary_decode_carries_an_unresolved_count_alone():
+    """The count reaches ``decode_forward`` without the verify's arguments.
+
+    ``spec_mode`` and ``num_valid_drafts`` are what make a call a verify, so an
+    ordinary decode that carried either would be read as one.
+    """
+    calls = []
+
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {"supports_async_decode": False}
+
+        def decode_forward(self, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros((MAX_NUM_REQS, 1))
+
+    runner = _mixed_batch(accepted_counts={"greedy": 3})
+    model_input = _decode(runner, "greedy", "sampled")
+
+    _submit(runner, Model(), model_input)
+
+    assert "spec_mode" not in calls[0]
+    assert "num_valid_drafts" not in calls[0]
+    assert torch.equal(calls[0]["accepted_counts"], model_input.accepted_counts)
 
 
 # endregion Conformance
