@@ -18,6 +18,7 @@ from vllm_tt_plugin.config import (
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -265,6 +266,16 @@ class TTScheduler(AsyncScheduler):
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
         self._widest_decode_batch_size = 0
+        self._prefill_chunk_alignment = (
+            get_tt_prefill_chunk_alignment(self.vllm_config)
+            if self.scheduler_config.enable_chunked_prefill
+            else 0
+        )
+        if self._prefill_chunk_alignment > 1:
+            logger.info(
+                "TT scheduler: partial prefill chunks end on %d-token boundaries",
+                self._prefill_chunk_alignment,
+            )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
@@ -596,6 +607,64 @@ class TTScheduler(AsyncScheduler):
             deferred_queue.prepend_request(request)
         self.waiting.remove_requests(deferred)
         return deferred_queue
+
+    # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
+    # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
+    # hook so chunk ends can be aligned before any block is allocated.
+    @property
+    def need_mamba_block_aligned_split(self) -> bool:
+        return bool(getattr(self, "_base_need_mamba_split", False)) or (
+            getattr(self, "_prefill_chunk_alignment", 0) > 1
+        )
+
+    @need_mamba_block_aligned_split.setter
+    def need_mamba_block_aligned_split(self, value: bool) -> None:
+        self._base_need_mamba_split = bool(value)
+
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if getattr(self, "_base_need_mamba_split", False):
+            num_new_tokens = super()._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+
+    def _align_prefill_chunk_end(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Round a *partial* prefill chunk down so it ends on the alignment grid.
+
+        Chunks that finish the prompt, decode steps and multimodal prompts are
+        left alone. A new request whose aligned chunk would be empty waits for
+        the next step; a running request never gets an empty chunk.
+        """
+        align = getattr(self, "_prefill_chunk_alignment", 0)
+        if align <= 1 or num_new_tokens <= 0:
+            return num_new_tokens
+        end = start + num_new_tokens
+        if end >= request.num_prompt_tokens:
+            return num_new_tokens
+        if getattr(request, "mm_features", None) or getattr(
+            request, "has_encoder_inputs", False
+        ):
+            return num_new_tokens
+        aligned_end = end // align * align
+        if aligned_end <= start:
+            return 0 if start == 0 else num_new_tokens
+        return aligned_end - start
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()
