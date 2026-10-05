@@ -20,6 +20,14 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
 @dataclass(frozen=True)
+class TTCompactedHostLogits:
+    """Host logits in explicit scheduled-slot order, rather than full capacity."""
+
+    logits: torch.Tensor
+    rows: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class TTDecodeReloadPlan:
     """Explicit host-to-device updates for one decode submission.
 

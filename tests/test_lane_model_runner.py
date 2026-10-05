@@ -145,11 +145,11 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
     assert logprobs is None
 
 
-def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
+def test_extract_output_host_decode_samples_scheduled_rows():
     captured: dict = {}
     batch = _lane_batch()
     batch.build_merged_sampling_metadata = (
-        lambda rows, non_sampling_rows=None: None
+        lambda rows, non_sampling_rows=None, compact=False: None
     )  # sampler ignores it
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Full slot logits: row r's argmax is token r (vocab>=5).
@@ -162,7 +162,7 @@ def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
         runner, logits, None, model_input, scheduled_rows=[4, 1], is_decode=True
     )
 
-    assert captured["logits"].shape == (5, VOCAB)  # sampled the whole slot batch once
+    assert captured["logits"].shape == (2, VOCAB)  # only scheduled rows are sampled
     assert sampled.tolist() == [[4], [1]]  # rows 4 and 1, in scheduled order
     assert logprobs is None
 
@@ -170,7 +170,9 @@ def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
 def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     captured: dict = {}
     batch = _lane_batch()
-    batch.build_merged_sampling_metadata = lambda rows, non_sampling_rows=None: None
+    batch.build_merged_sampling_metadata = (
+        lambda rows, non_sampling_rows=None, compact=False: None
+    )
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Prefill logits: one row per scheduled request (front-packed, plan order).
     prefill_logits = torch.full((2, VOCAB), -10.0)
@@ -192,11 +194,8 @@ def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     )
 
     full = captured["logits"]
-    assert full.shape == (5, VOCAB)  # scattered onto the full slot grid before sampling
-    assert torch.equal(full[4], prefill_logits[0])  # request 0 -> stable row 4
-    assert torch.equal(full[1], prefill_logits[1])  # request 1 -> stable row 1
-    for gap in (0, 2, 3):
-        assert torch.all(full[gap] == 0)  # unscheduled rows left empty
+    assert full.shape == (2, VOCAB)
+    assert torch.equal(full, prefill_logits)  # scheduled order survives slot mapping
     assert sampled.tolist() == [[3], [6]]
 
 
@@ -436,10 +435,15 @@ def test_async_lane_decode_uses_batch_extraction():
 
     runner = SimpleNamespace(lane_batch=FakeLaneBatch())
     controller = TTAsyncDecodeController(runner)
-    controller.finalize_decode = lambda submission: TTFinalizedDecode(
-        tt_out=torch.tensor([[1, 2, 3]], dtype=torch.float32),
-        tt_log_probs=None,
-    )
+
+    def finalize(submission, *, sampling_rows=None):
+        assert sampling_rows == [4]
+        return TTFinalizedDecode(
+            tt_out=torch.tensor([[1, 2, 3]], dtype=torch.float32),
+            tt_log_probs=None,
+        )
+
+    controller.finalize_decode = finalize
     submission = TTDecodeSubmission(
         tt_out=object(),
         read_events=None,

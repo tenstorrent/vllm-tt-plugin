@@ -31,7 +31,6 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -52,6 +51,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
 )
+from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
     CachedRequestState,
@@ -411,7 +411,7 @@ class TTModelRunner:
 
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
-        self.host_sampler = Sampler()
+        self.host_sampler = create_host_sampler()
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
@@ -2464,12 +2464,15 @@ class TTModelRunner:
                 model_input,
                 read_from_device=not model_input.defer_device_sampling,
                 async_read=False,
+                sampling_rows=scheduled_rows,
             )
             if model_input.defer_device_sampling:
                 tt_out = submission.tt_out
                 tt_log_probs = None
             else:
-                finalized = self.async_decode.finalize_decode(submission)
+                finalized = self.async_decode.finalize_decode(
+                    submission, sampling_rows=scheduled_rows
+                )
                 assert finalized is not None
                 tt_out = finalized.tt_out
                 tt_log_probs = finalized.tt_log_probs

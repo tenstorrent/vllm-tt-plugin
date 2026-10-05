@@ -953,3 +953,182 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
     assert result.perform_device_sampling is (not is_decode and scheduled_top_k <= 32)
     if not is_decode:
         assert result.input_tokens.tolist() == [[1, 2, 3]]
+
+
+@pytest.mark.parametrize(
+    "is_decode,precompacted", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("features", ["unrestricted", "filters", "penalties"])
+def test_compact_host_sampling_matches_full_slots_and_preserves_rng(
+    is_decode, precompacted, features
+):
+    batch = _lane_batch(num_lanes=4, per_lane=4, with_custom=False)
+    params = dict(temperature=0.8, logprobs=3)
+    if features == "filters":
+        params.update(top_k=7, top_p=0.8)
+    elif features == "penalties":
+        params.update(
+            presence_penalty=0.3,
+            frequency_penalty=0.2,
+            repetition_penalty=1.1,
+            allowed_token_ids=list(range(2, 50)),
+        )
+    batch.add_request_to_row(_make_req("a", [2, 3], [4, 4], params, seed=42), 7)
+    batch.add_request_to_row(_make_req("b", [5, 6], [7], params, seed=55), 12)
+    batch.add_request_to_row(_make_req("idle", [8], [], params, seed=66), 0)
+    if features == "penalties":
+        batch.sampling.bad_words_token_ids[7] = [[9], [4, 10]]
+    batch.refresh_logitsprocs()
+    rows = [12, 7]
+    intermediate = [] if is_decode else [12]
+    sampler = Sampler()
+    torch.manual_seed(1729)
+    output = torch.randn(16 if is_decode else 2, VOCAB)
+    full_logits = batch._host_logits(output.clone(), rows, is_decode, 16)
+    before = {
+        i: gen.get_state().clone() for i, gen in batch.sampling.generators.items()
+    }
+    reference = sampler(
+        logits=full_logits.clone(),
+        sampling_metadata=batch.build_merged_sampling_metadata(rows, intermediate),
+    )
+    expected_rng = {
+        i: gen.get_state().clone() for i, gen in batch.sampling.generators.items()
+    }
+    expected_logprobs = batch._host_logprobs(reference.logprobs_tensors, rows)
+    for i, state in before.items():
+        batch.sampling.generators[i].set_state(state)
+    seen = []
+
+    def capture(*, logits, sampling_metadata):
+        seen.append(logits.shape[0])
+        return sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    model_input = SimpleNamespace(
+        perform_device_sampling=False,
+        grammar_bitmask=[None],
+        intermediate_prefill_mask=torch.tensor([True, False])
+        if not is_decode
+        else None,
+    )
+    from vllm_tt_plugin.model_input import TTCompactedHostLogits
+
+    decoded = (
+        TTCompactedHostLogits(output[rows].clone(), tuple(rows))
+        if precompacted
+        else output.clone()
+    )
+    sampled, logprobs = batch.extract_output(
+        SimpleNamespace(host_sampler=capture),
+        decoded,
+        None,
+        model_input,
+        rows,
+        is_decode,
+    )
+    assert seen == [2]
+    torch.testing.assert_close(
+        sampled.reshape(-1), reference.sampled_token_ids.reshape(-1)[rows]
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(logprobs.logprob_token_ids),
+        torch.as_tensor(expected_logprobs.logprob_token_ids),
+    )
+    torch.testing.assert_close(
+        torch.tensor(logprobs.logprobs), torch.tensor(expected_logprobs.logprobs)
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(logprobs.sampled_token_ranks),
+        torch.as_tensor(expected_logprobs.sampled_token_ranks),
+    )
+    for i, state in expected_rng.items():
+        assert torch.equal(batch.sampling.generators[i].get_state(), state)
+    assert torch.equal(before[0], expected_rng[0])
+    if not is_decode:
+        assert torch.equal(before[12], expected_rng[12])
+
+
+@pytest.mark.parametrize(
+    "custom,sp",
+    [
+        (True, {}),
+        (False, {"min_p": 0.1}),
+        (False, {"logit_bias": {3: 1.0}}),
+        (False, {"min_tokens": 3, "stop_token_ids": [4]}),
+    ],
+)
+def test_compact_host_sampling_keeps_stateful_processors_on_slot_rows(custom, sp):
+    batch = _lane_batch(num_lanes=2, per_lane=4, with_custom=custom)
+    batch.add_request_to_row(
+        _make_req("a", [1], [], dict(temperature=1.0, **sp), seed=42), 6
+    )
+    batch.refresh_logitsprocs()
+    seen = []
+    sampler = Sampler()
+
+    def capture(*, logits, sampling_metadata):
+        seen.append(logits.shape[0])
+        return sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    inp = SimpleNamespace(
+        perform_device_sampling=False,
+        grammar_bitmask=[None],
+        intermediate_prefill_mask=None,
+    )
+    batch.extract_output(
+        SimpleNamespace(host_sampler=capture),
+        torch.randn(8, VOCAB),
+        None,
+        inp,
+        [6],
+        True,
+    )
+    assert seen == [8]
+
+
+def test_compact_metadata_omits_only_noop_filters():
+    batch = _lane_batch(num_lanes=2, per_lane=4, with_custom=False)
+    batch.add_request_to_row(_make_req("a", [1], [], dict(temperature=1.0), seed=42), 6)
+    metadata = batch.build_merged_sampling_metadata([6], compact=True)
+    assert metadata.top_k is None and metadata.top_p is None
+    assert set(metadata.generators) == {0}
+    batch.sampling.top_p[6] = 0.9
+    batch.sampling.top_k[6] = 5
+    metadata = batch.build_merged_sampling_metadata([6], compact=True)
+    assert metadata.top_k.tolist() == [5]
+    torch.testing.assert_close(metadata.top_p, torch.tensor([0.9]))
+
+
+@pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
+def test_compact_mixed_greedy_random_preserves_logprobs(mode):
+    batch = _lane_batch(num_lanes=2, per_lane=4, with_custom=False)
+    batch.add_request_to_row(
+        _make_req("greedy", [1], [], dict(temperature=0.0, top_k=1, logprobs=3)), 6
+    )
+    batch.add_request_to_row(
+        _make_req("random", [2], [], dict(temperature=1.0, logprobs=3), seed=42), 1
+    )
+    batch.refresh_logitsprocs()
+    sampler = Sampler(logprobs_mode=mode)
+    logits = torch.randn(8, VOCAB)
+    rows = [6, 1]
+    state = batch.sampling.generators[1].get_state().clone()
+    reference = sampler(
+        logits=logits.clone(),
+        sampling_metadata=batch.build_merged_sampling_metadata(rows),
+    )
+    batch.sampling.generators[1].set_state(state)
+    compact = sampler(
+        logits=logits[rows].clone(),
+        sampling_metadata=batch.build_merged_sampling_metadata(rows, compact=True),
+    )
+    torch.testing.assert_close(
+        compact.sampled_token_ids, reference.sampled_token_ids[rows]
+    )
+    torch.testing.assert_close(
+        compact.logprobs_tensors.logprobs, reference.logprobs_tensors.logprobs[rows]
+    )
+    torch.testing.assert_close(
+        compact.logprobs_tensors.logprob_token_ids,
+        reference.logprobs_tensors.logprob_token_ids[rows],
+    )

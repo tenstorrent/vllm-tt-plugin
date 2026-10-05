@@ -169,6 +169,92 @@ forced reset reject its token before the runner adds it to local state.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
+## Host sampling output and selective reads
+
+Host sampling can reduce CPU work by processing only the scheduled rows.
+These output capabilities are independent of `decode_input_update_contract`:
+
+| Model capability | Default | Required adapter support |
+| --- | --- | --- |
+| `supports_compact_host_logits` | `False` | `process_decode_output_host` accepts `sample_rows` and returns logits in that order. |
+| `supports_selective_host_readback` | `False` | `read_decode_output` also accepts `sample_rows` and retains the data needed to complete the selected read. |
+
+An adapter that declares selective readback must also declare compact host
+logits support. Compact host logits alone permit a full device read followed
+by host compaction. These capabilities do not change device sampling or the
+rules for reloading forward inputs.
+
+### Row selection
+
+The current plugin supplies `sample_rows` for lane-DP host sampling when no
+active slot-indexed or custom logits processor requires the full slot layout.
+The indices belong to the merged lane batch for that submission. They are
+not tensor-parallel shard indices or global indices across independent runners.
+
+`sample_rows` is a nonempty list of unique, valid slot indices. The list can
+contain gaps and need not be sorted. Output row `i` must represent slot
+`sample_rows[i]`. An adapter may gather or slice device data internally, but
+must preserve this order in its final output. It must reject invalid indices.
+
+### Adapter callbacks
+
+For a selective read, the plugin calls:
+
+```python
+host_output, read_events = model.read_decode_output(
+    tt_output, async_read=True, sample_rows=sample_rows
+)
+```
+
+The plugin stores the selected rows as an immutable tuple in the submission.
+It rejects a different row list at finalization. The adapter must retain any
+temporary device slices and host transfer buffers until the read completes.
+Each returned event must cover the corresponding transfer. The plugin waits
+for these events before it processes the host output.
+
+For selective reads, `host_output` must be an adapter-owned handle that requires
+`process_decode_output_host`. A plain PyTorch tensor or a tuple of PyTorch
+tensors bypasses that callback. Such values use the existing full slot path
+and cannot carry compact rows through this interface.
+
+Host processing then uses the same row list:
+
+```python
+logits = model.process_decode_output_host(
+    host_output, is_tokens=False, sample_rows=sample_rows
+)
+```
+
+The callback returns a CPU logits tensor, or `(logits, None)` when its normal
+interface returns a pair. For `N` selected rows and vocabulary size `V`, the
+shape must be `[N, V]` or `[N, 1, V]`. The last dimension must contain the real
+vocabulary without padding. FP32 output avoids a later conversion for sampling.
+The returned tensor must own writable storage independent of any buffer that
+the adapter reuses or that another request can modify. The host sampler may
+modify logits in place.
+
+The plugin wraps this result in `TTCompactedHostLogits`, with the captured row
+tuple. Extraction verifies the row order and count before sampling. Sampling
+metadata, output history, token constraints, and grammar masks must use that
+same order. Host sampling computes its own logprobs on this path. An adapter
+must not discard model-provided logprobs to enter it.
+
+### Full slot fallback
+
+Adapters without these capabilities keep their existing callback signatures.
+The plugin omits `sample_rows` during device sampling and when active or custom
+logits processors require persistent slot indices. Such requests use the full
+slot layout, including gaps. Compact-logit support must therefore retain the
+adapter's existing behavior when `sample_rows` is absent.
+
+The plugin fixes selective transfer rows before starting the read. A later
+metadata change cannot change which rows the adapter transferred. Extraction
+rejects compact output if the processor state then requires the full layout.
+
+Model-interface tests must cover unsorted rows, gaps, asynchronous completion,
+and mismatched row lists. They must also cover adapters without either
+capability, device sampling, and active/custom processor fallback.
+
 ## Host input authority
 
 The `tokens` and `start_pos` arguments are authoritative only when
