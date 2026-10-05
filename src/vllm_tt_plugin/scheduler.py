@@ -194,7 +194,6 @@ class TTDecodeInterleavePolicy:
             self._decode_run = 0
 
 
-
 def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
     """Reject caps that can never let a new request reach the alignment grid.
 
@@ -213,10 +212,12 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         if 0 < cap < align:
             raise ValueError(
                 f"additional_config['tt']['prefill_chunk_alignment']={align} cannot be "
-                f"reached: scheduler {name}={cap} is a permanent per-step cap below the "
+                f"reached: scheduler {name}={cap} is a permanent per-step cap "
+                "below the "
                 "alignment. Raise the cap to at least the alignment or set "
                 "prefill_chunk_alignment to 0."
             )
+
 
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
@@ -696,7 +697,9 @@ class TTScheduler(AsyncScheduler):
             # A new request waits only when this step's leftover budget is what
             # stopped it. If a full step could not reach the grid either (a
             # permanent cap below the alignment), it must still make progress.
-            return 0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
+            return (
+                0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
+            )
         return aligned_end - start
 
     def _full_step_prefill_cap(self) -> int:

@@ -111,13 +111,18 @@ def test_init_rejects_caps_below_the_alignment():
     ok = SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=4096)
     _validate_prefill_chunk_alignment(128, ok)
     _validate_prefill_chunk_alignment(
-        128, SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=0)
+        128,
+        SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=0),
     )
     with pytest.raises(ValueError, match="long_prefill_token_threshold=64"):
         _validate_prefill_chunk_alignment(
-            128, SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=64)
+            128,
+            SimpleNamespace(
+                max_num_batched_tokens=4096, long_prefill_token_threshold=64
+            ),
         )
     with pytest.raises(ValueError, match="max_num_batched_tokens=64"):
         _validate_prefill_chunk_alignment(
-            128, SimpleNamespace(max_num_batched_tokens=64, long_prefill_token_threshold=0)
+            128,
+            SimpleNamespace(max_num_batched_tokens=64, long_prefill_token_threshold=0),
         )
