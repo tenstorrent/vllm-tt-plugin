@@ -698,9 +698,11 @@ class InputBatch:
             # keep earlier occupants' block ids (condense/move leave them), so a
             # consumer that writes padded rows would reach another request's
             # blocks. Zero them: 0 is the null block, never allocated.
+            # Index a tensor, not the NumPy array: NumPy turns a one-element tensor
+            # selector into scalar indexing and the mask below would lose its row axis.
             live = torch.as_tensor(
-                np.asarray(bt.num_blocks_per_row)[rows], dtype=torch.int64
-            )
+                np.asarray(bt.num_blocks_per_row), dtype=torch.int64
+            )[rows].reshape(-1)
             cols = torch.arange(bt_cpu.shape[1], dtype=torch.int64)
             bt_cpu[cols.unsqueeze(0) >= live.unsqueeze(1)] = 0
             if bt_cpu.shape[1] < width:

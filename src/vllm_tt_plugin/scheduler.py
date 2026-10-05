@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -193,6 +194,30 @@ class TTDecodeInterleavePolicy:
             self._decode_run = 0
 
 
+
+def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
+    """Reject caps that can never let a new request reach the alignment grid.
+
+    ``_align_prefill_chunk_end`` defers a new request whose chunk falls short
+    of the grid; that only converges if a later step can offer a larger chunk.
+    """
+    caps = {
+        "max_num_batched_tokens": int(
+            getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+        ),
+        "long_prefill_token_threshold": int(
+            getattr(scheduler_config, "long_prefill_token_threshold", 0) or 0
+        ),
+    }
+    for name, cap in caps.items():
+        if 0 < cap < align:
+            raise ValueError(
+                f"additional_config['tt']['prefill_chunk_alignment']={align} cannot be "
+                f"reached: scheduler {name}={cap} is a permanent per-step cap below the "
+                "alignment. Raise the cap to at least the alignment or set "
+                "prefill_chunk_alignment to 0."
+            )
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -272,6 +297,9 @@ class TTScheduler(AsyncScheduler):
             else 0
         )
         if self._prefill_chunk_alignment > 1:
+            _validate_prefill_chunk_alignment(
+                self._prefill_chunk_alignment, self.scheduler_config
+            )
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
@@ -663,8 +691,24 @@ class TTScheduler(AsyncScheduler):
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
-            return 0 if start == 0 else num_new_tokens
+            if start != 0:
+                return num_new_tokens
+            # A new request waits only when this step's leftover budget is what
+            # stopped it. If a full step could not reach the grid either (a
+            # permanent cap below the alignment), it must still make progress.
+            return 0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
         return aligned_end - start
+
+    def _full_step_prefill_cap(self) -> int:
+        """Most prompt tokens one scheduling step can give a single new request."""
+        cfg = getattr(self, "scheduler_config", None)
+        if cfg is None:
+            return sys.maxsize
+        cap = int(getattr(cfg, "max_num_batched_tokens", 0) or sys.maxsize)
+        threshold = int(getattr(cfg, "long_prefill_token_threshold", 0) or 0)
+        if threshold > 0:
+            cap = min(cap, threshold)
+        return cap
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()

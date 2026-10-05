@@ -14,7 +14,7 @@ import pytest
 import vllm  # noqa: F401  (resolve the platform plugin before importing ours)
 
 from vllm_tt_plugin.config import get_tt_prefill_chunk_alignment
-from vllm_tt_plugin.scheduler import TTScheduler
+from vllm_tt_plugin.scheduler import TTScheduler, _validate_prefill_chunk_alignment
 
 
 def _scheduler(alignment=128, *, base_mamba=False):
@@ -90,3 +90,34 @@ def test_config_accessor_defaults_and_validates():
     cfg = SimpleNamespace(additional_config={"tt": {"prefill_chunk_alignment": -8}})
     with pytest.raises(ValueError):
         get_tt_prefill_chunk_alignment(cfg)
+
+
+def test_a_permanent_cap_below_the_grid_still_makes_progress():
+    # long_prefill_token_threshold=64 caps every step at 64 tokens: deferring would
+    # never converge, so the new request keeps its 64-token chunk ...
+    s = _scheduler()
+    s.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=4096, long_prefill_token_threshold=64
+    )
+    assert s._mamba_block_aligned_split(_request(1024), 64) == 64
+    # ... while a chunk cut short by this step's leftover budget still waits.
+    s.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=4096, long_prefill_token_threshold=0
+    )
+    assert s._mamba_block_aligned_split(_request(1024), 100) == 0
+
+
+def test_init_rejects_caps_below_the_alignment():
+    ok = SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=4096)
+    _validate_prefill_chunk_alignment(128, ok)
+    _validate_prefill_chunk_alignment(
+        128, SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=0)
+    )
+    with pytest.raises(ValueError, match="long_prefill_token_threshold=64"):
+        _validate_prefill_chunk_alignment(
+            128, SimpleNamespace(max_num_batched_tokens=4096, long_prefill_token_threshold=64)
+        )
+    with pytest.raises(ValueError, match="max_num_batched_tokens=64"):
+        _validate_prefill_chunk_alignment(
+            128, SimpleNamespace(max_num_batched_tokens=64, long_prefill_token_threshold=0)
+        )

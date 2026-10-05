@@ -50,3 +50,10 @@ def test_row_selection_width_padding_and_truncation_still_hold():
     assert wide[0].tolist() == [[4, 0, 0, 0, 0], [1, 2, 3, 0, 0]]
     narrow = InputBatch.block_tables_for_rows(_batch(bt), [0], width=2)
     assert narrow[0].tolist() == [[1, 2]]
+
+
+def test_a_singleton_tensor_selector_keeps_its_row_dimension():
+    bt = _FakeBlockTable([[1, 2, 3], [4, 5, 6]], live=[3, 1])
+    out = InputBatch.block_tables_for_rows(_batch(bt), torch.tensor([1]), width=3)
+    assert out[0].shape == (1, 3)
+    assert out[0].tolist() == [[4, 0, 0]]
