@@ -110,31 +110,29 @@ async def _send_plain_request(
     return content
 
 
-def _run_mixed_request_wave(
+def _run_mixed_requests(
     tt_server,
     tt_model_name: str,
-    max_batch_size: int,
+    request_count: int,
     reasoning_token_budget: int,
-    wave: int,
 ) -> None:
     async def _run() -> None:
         async_client = tt_server.get_async_client()
-        request_count = min(max_batch_size, 32)
         senders = [
             _send_choice_request,
             _send_regex_request,
             _send_json_request,
             _send_plain_request,
         ]
-        request_ids = range(wave * request_count, (wave + 1) * request_count)
+
         tasks = [
-            senders[(request_id + wave) % len(senders)](
+            senders[request_id % len(senders)](
                 async_client,
                 tt_model_name,
                 request_id,
                 reasoning_token_budget,
             )
-            for request_id in request_ids
+            for request_id in range(request_count)
         ]
 
         results = await asyncio.gather(*tasks)
@@ -143,23 +141,24 @@ def _run_mixed_request_wave(
     asyncio.run(_run())
 
 
-def test_dp1_full_capacity_mixes_structured_and_plain_requests_first_wave(
+def test_dp1_full_capacity_mixes_structured_and_plain_requests(
     tt_server,
     tt_model_name,
     max_batch_size,
     reasoning_token_budget,
 ):
-    _run_mixed_request_wave(
-        tt_server, tt_model_name, max_batch_size, reasoning_token_budget, wave=0
+    _run_mixed_requests(
+        tt_server, tt_model_name, min(max_batch_size, 32), reasoning_token_budget
     )
 
 
-def test_dp1_full_capacity_reuses_slots_for_second_mixed_wave(
+def test_dp1_reuses_slots_with_mixed_requests(
     tt_server,
     tt_model_name,
     max_batch_size,
     reasoning_token_budget,
 ):
-    _run_mixed_request_wave(
-        tt_server, tt_model_name, max_batch_size, reasoning_token_budget, wave=1
+    """Twice the slots: queued requests take over slots freed mid-batch."""
+    _run_mixed_requests(
+        tt_server, tt_model_name, 2 * max_batch_size, reasoning_token_budget
     )
