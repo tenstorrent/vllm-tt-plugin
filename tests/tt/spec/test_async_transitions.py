@@ -77,6 +77,21 @@ def _overlap_counts(server_log):
     return last
 
 
+def _wait_for_acceptance(spec_server, since, k, future, timeout_s=30.0):
+    """Return once a draft has been accepted since the ``since`` scrape.
+
+    Fails if ``future``, the request expected to be speculating, ends first.
+    """
+    deadline = time.monotonic() + timeout_s
+    while acceptance_delta(since, spec_server.metrics(), k).accepted == 0:
+        if future.done():
+            pytest.fail(
+                "the long request finished before the counters showed an accepted draft"
+            )
+        if time.monotonic() > deadline:
+            pytest.fail(f"no draft was accepted within {timeout_s} s")
+
+
 def test_the_resolved_server_schedules_asynchronously(server_log, record):
     """The outcome, not the request.
 
@@ -180,11 +195,16 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
         long_future = pool.submit(
             spec_server.complete, long_prompt, max_tokens=long_tokens
         )
-        # Short, and it has to be: this model's forward is host arithmetic,
-        # so a step costs about a millisecond and a tenth of a second is a
-        # hundred steps. A longer pause and the long request finishes before
-        # its peer is even posted, leaving nothing to measure.
-        time.sleep(0.02)
+        # The peer is posted only after the long request has had a draft
+        # accepted, so the peer's prefill lands while the long request
+        # speculates. This launch accepts every draft, so the long request's
+        # last commit was more than one token, and a row with such a commit
+        # makes the next step a verify: its first decode beside the peer is
+        # still one. Once that resolves, the solo drafter offers nothing to two
+        # rows, and the next step is an ordinary decode on an unchanged layout,
+        # the case whose inputs must be reloaded. A fixed pause cannot promise
+        # that order, because a step on this model costs about a millisecond.
+        _wait_for_acceptance(spec_server, solo_after, spec_config.k, long_future)
         peer = pool.submit(spec_server.complete, peer_prompt, max_tokens=MAX_TOKENS)
         peer_result = peer.result()
         after_peer = spec_server.metrics()
