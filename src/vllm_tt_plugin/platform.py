@@ -7,6 +7,8 @@ import multiprocessing
 import os
 import sys
 import weakref
+from contextlib import asynccontextmanager
+from functools import wraps
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 import torch
@@ -633,6 +635,34 @@ def _tt_model_class_overrides() -> dict[str, str]:
             )
         overrides[arch] = target
     return overrides
+
+
+def _install_api_lifespan_gc_patch() -> None:
+    """Collect the frozen API startup graph after upstream lifespan cleanup."""
+    from vllm.entrypoints.serve.utils import server_utils
+
+    original = server_utils.lifespan
+    if getattr(original, "_tt_lifespan_gc_patch", False):
+        return
+
+    @asynccontextmanager
+    @wraps(original)
+    async def lifespan(app):
+        try:
+            async with original(app):
+                yield
+        finally:
+            gc.unfreeze()
+            gc.collect()
+
+    lifespan._tt_lifespan_gc_patch = True
+    server_utils.lifespan = lifespan
+    # The CLI can import the lifespan before the platform configuration hook.
+    # ``python -m ...api_server`` keeps that binding in __main__ instead.
+    for name in ("vllm.entrypoints.openai.api_server", "__main__"):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "lifespan", None) is original:
+            module.lifespan = lifespan
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:
@@ -1521,6 +1551,7 @@ class TTPlatform(Platform):
         # test models when the CLI override requests them).
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
+        _install_api_lifespan_gc_patch()
         _install_tt_harmony_truncation_patch()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
@@ -1601,6 +1632,7 @@ class TTPlatform(Platform):
         # Before any read of ``vllm_config.use_v2_model_runner``, which
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
+        _install_api_lifespan_gc_patch()
         _install_tt_harmony_truncation_patch()
         # Too late to change this config's asynchronous setting, which upstream
         # resolved before calling this hook. Installed anyway, for a process
