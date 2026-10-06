@@ -37,11 +37,12 @@ if TYPE_CHECKING:
 #
 #   "logits"       returns logits [B, 1+K, V]. The host rejection-samples
 #                  acceptance, which serves greedy and sampled rows under
-#                  temperature, top-k, top-p and the penalties. It is also the
-#                  only mode that could serve a request needing host
-#                  arbitration (structured output, token filters, logprobs),
-#                  but each of those needs an execution path of its own and is
-#                  refused today. It pays a [B, 1+K, V] readback.
+#                  temperature, top-k, top-p and the penalties, and applies
+#                  structured output, the token filters (allowed_token_ids,
+#                  bad_words, min_tokens) and logprobs at every candidate
+#                  column. It is the only mode that serves those controls, so
+#                  a greedy row carrying one also needs it; a launch without
+#                  it refuses them. It pays a [B, 1+K, V] readback.
 #   "argmax_ids"   returns the verify argmax ids [B, 1+K]. The host walks
 #                  acceptance greedily, comparing ids, so no logits cross. This
 #                  mode is greedy only.
