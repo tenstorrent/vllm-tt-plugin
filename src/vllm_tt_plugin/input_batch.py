@@ -688,11 +688,23 @@ class InputBatch:
 
         Constant ``width`` (``max_num_blocks_per_req``) is required for ttnn
         tracing: runtime block tables must match the traced width even when
-        their underlying group is narrower.
+        their underlying group is narrower. Columns past each row's live
+        block count are zero.
         """
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
             bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            # vLLM tracks only the live prefix of a row; the columns past it
+            # keep earlier occupants' block ids (condense/move leave them), so a
+            # consumer that writes padded rows would reach another request's
+            # blocks. Zero them: 0 is the null block, never allocated.
+            # Index a tensor, not the NumPy array: NumPy turns a one-element tensor
+            # selector into scalar indexing and the mask below would lose its row axis.
+            live = torch.as_tensor(
+                np.asarray(bt.num_blocks_per_row), dtype=torch.int64
+            )[rows].reshape(-1)
+            cols = torch.arange(bt_cpu.shape[1], dtype=torch.int64)
+            bt_cpu[cols.unsqueeze(0) >= live.unsqueeze(1)] = 0
             if bt_cpu.shape[1] < width:
                 pad = torch.zeros(
                     bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
