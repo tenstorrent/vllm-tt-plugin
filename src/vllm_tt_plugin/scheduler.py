@@ -12,6 +12,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_tt_plugin.config import (
+    get_tt_recurrent_prefix_capacity,
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
@@ -20,6 +21,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.recurrent_prefix import RecurrentPrefixCache
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -238,6 +240,7 @@ class TTScheduler(AsyncScheduler):
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
         self._spec_session_owner: str | None = None
+        self._recurrent_prefix = self._install_recurrent_prefix_filter()
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
@@ -906,6 +909,52 @@ class TTScheduler(AsyncScheduler):
             elif not solo or first_id != owner:
                 owner = None
         self._spec_session_owner = owner
+
+    def _install_recurrent_prefix_filter(self) -> RecurrentPrefixCache | None:
+        """Cap cache hits to prefixes whose recurrent state the model can put back.
+
+        Attention keeps a prefix in paged KV that the block manager may hand to any request, so
+        upstream reports a hit as soon as those pages are cached. A hybrid model's recurrent
+        layers summarise the tokens one request has seen instead, and that summary exists only
+        where a snapshot was taken. Admitting a request on the attention pages alone would run
+        those layers from unrelated state, and it cannot be caught later: the scheduler drops the
+        hit tokens from the request, so the model never sees them and has nothing to recompute
+        from.
+
+        Wrapping the manager rather than overriding ``schedule`` keeps this to the one decision
+        that is wrong for a hybrid model, and leaves every other scheduling path untouched.
+        """
+        capacity = get_tt_recurrent_prefix_capacity(self.vllm_config)
+        manager = getattr(self, "kv_cache_manager", None)
+        if not capacity or manager is None or not getattr(manager, "enable_caching", False):
+            return None
+        block_size = self.vllm_config.cache_config.block_size
+        cache = RecurrentPrefixCache(block_size=block_size, capacity=capacity)
+        inner = manager.get_computed_blocks
+
+        def get_computed_blocks(request):
+            blocks, tokens, boundary = inner(request)
+            if not tokens:
+                return blocks, tokens, boundary
+            servable = cache.servable_tokens(request.block_hashes, tokens)
+            if servable >= tokens:
+                return blocks, tokens, boundary
+            # Keep whole blocks only, so the trimmed hit stays block-aligned the way
+            # allocate_slots requires. The dropped blocks stay cached for whoever can use them;
+            # this request simply recomputes those tokens.
+            keep = servable // block_size
+            trimmed = type(blocks)(tuple(group[:keep] for group in blocks.blocks))
+            # The boundary pins a junction for cross-request reuse that this request is no
+            # longer taking, so leave nothing pinned on its behalf.
+            return trimmed, servable, 0
+
+        manager.get_computed_blocks = get_computed_blocks
+        logger.info(
+            "Recurrent prefix cache active: the model holds up to %d prefix snapshots, "
+            "so hits are capped to prefixes it can restore",
+            capacity,
+        )
+        return cache
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """Bind this step's block-step decisions before the base loop commits
