@@ -2188,7 +2188,13 @@ class TTModelRunner:
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
-        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
+        if (
+            intermediate_prefill_mask is not None
+            and intermediate_prefill_mask.any()
+            and not (getattr(self.model, "model_capabilities", None) or {}).get(
+                "supports_intermediate_prefill_output_mask", False
+            )
+        ):
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
@@ -3313,6 +3319,19 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        if capabilities.get("supports_intermediate_prefill_output_mask", False):
+            mask = model_input.intermediate_prefill_mask
+            kwargs["prefill_output_mask"] = None if mask is None else (~mask).tolist()
+        if capabilities.get("supports_prefill_sampling_origins", False):
+            kwargs["original_prompt_lens"] = [
+                int(
+                    self.input_batch.num_prompt_tokens[
+                        self.input_batch.req_id_to_index[req_id]
+                    ]
+                )
+                for req_id in model_input.row_req_ids
+            ]
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
