@@ -418,6 +418,20 @@ def assert_deterministic_allow_near_tie(
 # confidence can decide the result.
 
 
+def render_penalty_prompts(prompts, tokenizer):
+    """Use the checkpoint's declared format for qualitative penalty probes."""
+    if not getattr(tokenizer, "chat_template", None):
+        return list(prompts)
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for prompt in prompts
+    ]
+
+
 def count_prompts_changed_by(
     tt_server, tt_model_name, prompts, max_tokens=24, **penalty_kwargs
 ):
@@ -471,3 +485,29 @@ def count_prompts_changed_by(
         else:
             detail.append(f"  same    {prompt!r}\n    -> {base!r}")
     return changed, slot_noise, detail
+
+
+def assert_frequency_penalty_reduces_token_repeats(baseline, penalized):
+    """Measure repetition in the token-ID domain used by frequency penalties."""
+    for label, tokens in (("baseline", baseline), ("penalized", penalized)):
+        assert isinstance(tokens, (list, tuple)) and all(
+            isinstance(token, int) for token in tokens
+        ), f"{label} must contain exact token IDs, got {tokens!r}"
+    assert baseline and penalized, "Both requests must emit tokens"
+    baseline_counts = Counter(baseline)
+    penalized_counts = Counter(penalized)
+    dominant, baseline_count = baseline_counts.most_common(1)[0]
+    assert baseline_count > 1, f"Baseline did not exercise repetition: {baseline!r}"
+    assert penalized_counts[dominant] < baseline_count, (
+        f"Frequency penalty should reduce repeated token {dominant}: "
+        f"baseline={baseline_count}, penalized={penalized_counts[dominant]}; "
+        f"outputs={baseline!r}, {penalized!r}"
+    )
+    baseline_repeats = len(baseline) - len(baseline_counts)
+    penalized_repeats = len(penalized) - len(penalized_counts)
+    assert penalized_repeats < baseline_repeats, (
+        "Frequency penalty should reduce repeated token occurrences, "
+        "not merely replace one repeated token with another: "
+        f"baseline={baseline_repeats}, penalized={penalized_repeats}; "
+        f"outputs={baseline!r}, {penalized!r}"
+    )

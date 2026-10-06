@@ -76,6 +76,14 @@ def tt_model_name(request):
 
 
 @pytest.fixture(scope="session")
+def tt_tokenizer(tt_model_name):
+    """Load the served checkpoint's declared prompt format for text probes."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(tt_model_name)
+
+
+@pytest.fixture(scope="session")
 def max_batch_size(request):
     """Returns the max batch size for testing."""
     return request.config.getoption("--tt-max-num-seqs")
