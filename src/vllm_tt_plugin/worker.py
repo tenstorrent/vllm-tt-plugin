@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_uniform_page_size,
@@ -289,6 +290,11 @@ class TTWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        # TT models allocate their own KV, so no vLLM attention backend
+        # narrows the layout; upstream's default would look one up and fail.
+        return [layout.name for layout in get_supported_kv_cache_layouts(())]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """

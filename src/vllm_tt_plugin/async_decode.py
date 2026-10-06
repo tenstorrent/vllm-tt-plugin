@@ -474,7 +474,8 @@ class TTAsyncDecodeController:
         Ordinary preemption and resume deliberately do not appear here: their
         in-flight token is valid and AsyncScheduler must consume its output
         placeholder. Forced-reset frames also stay published so
-        ``async_tokens_to_discard`` consumes the stale frame itself.
+        ``drop_stale_output`` causes the scheduler to consume the stale frame
+        itself.
         """
         return set(scheduler_output.finished_req_ids)
 
@@ -751,7 +752,7 @@ class TTAsyncDecodeController:
         ``reset_prefix_cache(reset_running_requests=True)``. It preempts live
         requests and frees their KV blocks. vLLM resumes the requests from
         saved token history. It records the number of in-flight outputs in
-        ``async_tokens_to_discard``.
+        ``drop_stale_output`` / ``num_stale_output_tokens``.
 
         "Publish" means that the output stays visible to vLLM. "Apply" means
         that the runner adds the token to its request state. Use these rules:
@@ -1034,8 +1035,8 @@ class TTAsyncDecodeController:
         # finished before scheduler.update_from_output observes that cached
         # output. The result that finished the request was already accepted.
         # These results arrived after finish or raced with an abort.
-        # Forced-reset results stay intact because AsyncScheduler must
-        # see them to decrement ``async_tokens_to_discard``.
+        # Forced-reset results stay intact because the scheduler must see them
+        # to drain ``num_stale_output_tokens``.
         if completed.runner_output is not None:
             assert self.runner.scheduler_config.async_scheduling, (
                 "mutating a published runner output is only ordered correctly "
