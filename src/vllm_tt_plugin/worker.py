@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import copy
 import math
 import os
 import time
@@ -18,6 +19,8 @@ from vllm.utils.torch_utils import (
     set_torch_threads_for_runtime,
 )
 from vllm.v1.core.kv_cache_utils import (
+    _max_memory_usage_bytes_from_groups,
+    _pool_bytes_per_block,
     get_kv_cache_groups,
     get_uniform_page_size,
 )
@@ -564,6 +567,27 @@ class TTWorker(WorkerBase):
             super().__del__()  # type: ignore
 
 
+def _kv_cache_groups_for_sizing(vllm_config: VllmConfig, kv_cache_specs: dict):
+    """Group ``kv_cache_specs`` the way the engine will, for pool sizing.
+
+    vLLM 0.29+ packs heterogeneous groups by the KV cache layout, which the
+    engine core resolves only after ``init_device`` (``resolve_kv_cache_layout``),
+    so the real ``cache_config`` still has no layout here. TT advertises LBNHC
+    alone (``TTWorker.get_supported_kv_cache_layouts``), so that is what the
+    engine resolves; size against it on a shallow copy, leaving the shared
+    config for the engine to resolve itself.
+    """
+    cache_config = vllm_config.cache_config
+    if getattr(cache_config, "kv_cache_layout", None) is not None or not hasattr(
+        cache_config, "get_resolved_kv_cache_layout"
+    ):
+        return vllm_config, get_kv_cache_groups(vllm_config, kv_cache_specs)
+    sizing_config = copy.copy(vllm_config)
+    sizing_config.cache_config = copy.copy(cache_config)
+    sizing_config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
+    return sizing_config, get_kv_cache_groups(sizing_config, kv_cache_specs)
+
+
 def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we
@@ -667,6 +691,29 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+    spec_hook = getattr(model_class, "get_kv_cache_spec", None)
+    if (
+        hybrid_kv_cache_groups_enabled
+        and callable(spec_hook)
+        and getattr(model_config, "original_max_model_len", None) != -1
+    ):
+        # A window-only estimate can miss blocks retained by in-flight
+        # prefill batches, especially at small batch sizes. Use upstream's
+        # actual groups and admission bound, including group padding. Keep
+        # the model budget if larger and preserve the output reservation.
+        # Auto-fit (-1) must keep its fixed pool rather than grow to HF length.
+        sizing_config, groups = _kv_cache_groups_for_sizing(
+            vllm_config, dict(spec_hook(vllm_config))
+        )
+        if groups:
+            required_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
+            bytes_per_block = _pool_bytes_per_block(groups)
+            minimum_blocks = (required_bytes + bytes_per_block - 1) // bytes_per_block
+            reserved_blocks = (
+                math.ceil(per_user_output_reservation / cache_config.block_size)
+                * max_batch
+            )
+            num_tt_blocks = max(num_tt_blocks, minimum_blocks + reserved_blocks)
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
