@@ -50,6 +50,55 @@ def get_tt_forced_reset_discard_counts(
     return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
 
 
+def install_recurrent_prefix_filter(
+    manager, hash_block_size: int, alignment_tokens: int, capacity: int
+) -> RecurrentPrefixCache | None:
+    """Cap cache hits to prefixes whose recurrent state the model can put back.
+
+    Attention keeps a prefix in paged KV that the block manager may hand to any request, so
+    upstream reports a hit as soon as those pages are cached. A hybrid model's recurrent layers
+    summarise the tokens one request has seen instead, and that summary exists only where a
+    snapshot was taken. Admitting a request on the attention pages alone would run those layers
+    from unrelated state, and it cannot be caught later: the scheduler drops the hit tokens from
+    the request, so the model never sees them and has nothing to recompute from.
+
+    Wrapping the manager rather than overriding ``schedule`` keeps this to the one decision that
+    is wrong for a hybrid model, and leaves every other scheduling path untouched. Returns the
+    index the caller maintains, or None when the model declares no snapshots.
+    """
+    if not capacity or manager is None or not getattr(manager, "enable_caching", False):
+        return None
+    cache = RecurrentPrefixCache(block_size=hash_block_size, capacity=capacity)
+    group_block_sizes = [
+        group.kv_cache_spec.block_size for group in manager.kv_cache_config.kv_cache_groups
+    ]
+    inner = manager.get_computed_blocks
+
+    def get_computed_blocks(request):
+        blocks, tokens, boundary = inner(request)
+        if not tokens:
+            return blocks, tokens, boundary
+        servable = cache.servable_tokens(request.block_hashes, tokens)
+        # A hit is reported at the scheduler block size, so a prefix held at a finer hash
+        # granularity has to give back the remainder rather than round up past its snapshot.
+        servable -= servable % alignment_tokens
+        if servable >= tokens:
+            return blocks, tokens, boundary
+        # Each group counts the same tokens in its own block size. The dropped blocks stay
+        # cached for whoever can use them; this request simply recomputes those tokens.
+        trimmed = type(blocks)(
+            tuple(
+                group[: servable // size] for group, size in zip(blocks.blocks, group_block_sizes)
+            )
+        )
+        # The boundary pins a junction for cross-request reuse that this request is no longer
+        # taking, so leave nothing pinned on its behalf.
+        return trimmed, servable, 0
+
+    manager.get_computed_blocks = get_computed_blocks
+    return cache
+
+
 # Per-step block-output reconciliation decisions, keyed by request id. Attached
 # to the ``SchedulerOutput`` -- the ONLY object that re-associates a step's
 # output with the scheduling decision that produced it: under async scheduling
@@ -911,49 +960,21 @@ class TTScheduler(AsyncScheduler):
         self._spec_session_owner = owner
 
     def _install_recurrent_prefix_filter(self) -> RecurrentPrefixCache | None:
-        """Cap cache hits to prefixes whose recurrent state the model can put back.
-
-        Attention keeps a prefix in paged KV that the block manager may hand to any request, so
-        upstream reports a hit as soon as those pages are cached. A hybrid model's recurrent
-        layers summarise the tokens one request has seen instead, and that summary exists only
-        where a snapshot was taken. Admitting a request on the attention pages alone would run
-        those layers from unrelated state, and it cannot be caught later: the scheduler drops the
-        hit tokens from the request, so the model never sees them and has nothing to recompute
-        from.
-
-        Wrapping the manager rather than overriding ``schedule`` keeps this to the one decision
-        that is wrong for a hybrid model, and leaves every other scheduling path untouched.
-        """
         capacity = get_tt_recurrent_prefix_capacity(self.vllm_config)
-        manager = getattr(self, "kv_cache_manager", None)
-        if not capacity or manager is None or not getattr(manager, "enable_caching", False):
-            return None
-        block_size = self.vllm_config.cache_config.block_size
-        cache = RecurrentPrefixCache(block_size=block_size, capacity=capacity)
-        inner = manager.get_computed_blocks
-
-        def get_computed_blocks(request):
-            blocks, tokens, boundary = inner(request)
-            if not tokens:
-                return blocks, tokens, boundary
-            servable = cache.servable_tokens(request.block_hashes, tokens)
-            if servable >= tokens:
-                return blocks, tokens, boundary
-            # Keep whole blocks only, so the trimmed hit stays block-aligned the way
-            # allocate_slots requires. The dropped blocks stay cached for whoever can use them;
-            # this request simply recomputes those tokens.
-            keep = servable // block_size
-            trimmed = type(blocks)(tuple(group[:keep] for group in blocks.blocks))
-            # The boundary pins a junction for cross-request reuse that this request is no
-            # longer taking, so leave nothing pinned on its behalf.
-            return trimmed, servable, 0
-
-        manager.get_computed_blocks = get_computed_blocks
-        logger.info(
-            "Recurrent prefix cache active: the model holds up to %d prefix snapshots, "
-            "so hits are capped to prefixes it can restore",
-            capacity,
+        # Hashes are indexed at the hash granularity, which for a multi-group model is the gcd
+        # of the group block sizes, while a cache hit must land on the scheduler block size.
+        cache = install_recurrent_prefix_filter(
+            getattr(self, "kv_cache_manager", None),
+            hash_block_size=self.hash_block_size,
+            alignment_tokens=self.block_size,
+            capacity=capacity,
         )
+        if cache is not None:
+            logger.info(
+                "Recurrent prefix cache active: the model holds up to %d prefix snapshots, "
+                "so hits are capped to prefixes it can restore",
+                capacity,
+            )
         return cache
 
     def update_from_output(self, scheduler_output, model_runner_output):
