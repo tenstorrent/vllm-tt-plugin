@@ -73,7 +73,9 @@ logger = init_tt_logger(__name__)
 # line before its measured interval against the last one after, so the cadence
 # bounds the error on that diff; a step costs about a millisecond on a model
 # with no device work, so 128 is a fraction of a second.
-_SUBMISSION_LOG_INTERVAL = 128
+# 4096 keeps the line usable for an interval diff (bench_spec_overhead) while a
+# 40 tok/s single user no longer gets a line every three seconds.
+_SUBMISSION_LOG_INTERVAL = 4096
 
 
 @dataclass(frozen=True)
