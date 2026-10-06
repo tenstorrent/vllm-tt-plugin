@@ -241,6 +241,52 @@ def _apply_chunked_prefill_policy(
     )
 
 
+def _store_recurrent_prefix_capacity(
+    vllm_config: "VllmConfig", model_capabilities: dict | None
+) -> None:
+    """Carry a hybrid model's snapshot capacity to the scheduler, or refuse to cache at all.
+
+    A model declaring ``recurrent_prefix_snapshots`` is saying its recurrent layers hold state
+    that the attention pages do not, so a cache hit is only servable where a snapshot backs it.
+    The scheduler enforces that from this number alone. If it does not arrive, the scheduler
+    would serve hits on the pages by themselves and the model would answer from a summary of
+    unrelated tokens -- silently, and with no way to recover -- so a capacity that fails to
+    round-trip disables prefix caching rather than being assumed harmless.
+    """
+    from vllm_tt_plugin.config import (
+        get_tt_recurrent_prefix_capacity,
+        store_tt_recurrent_prefix_capacity,
+    )
+
+    declared = (model_capabilities or {}).get("recurrent_prefix_snapshots", 0)
+    try:
+        capacity = int(declared)
+    except (TypeError, ValueError):
+        capacity = -1
+    if capacity <= 0:
+        if capacity < 0 or declared:
+            raise ValueError(
+                "model_capabilities['recurrent_prefix_snapshots'] must be a positive "
+                f"integer when declared; got {declared!r}"
+            )
+        # The ordinary case: the model keeps its whole state in paged KV.
+        return
+    store_tt_recurrent_prefix_capacity(vllm_config, capacity)
+    if get_tt_recurrent_prefix_capacity(vllm_config) != capacity:
+        vllm_config.cache_config.enable_prefix_caching = False
+        logger.warning(
+            "Recurrent prefix snapshot capacity did not reach the scheduler; "
+            "disabling prefix caching rather than serving hits the model cannot restore"
+        )
+        _renormalize_mamba_cache_config(vllm_config)
+        return
+    logger.info(
+        "Model declares %d recurrent prefix snapshots; cache hits will be capped to "
+        "prefixes it can restore",
+        capacity,
+    )
+
+
 def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
     """Re-apply core's no-prefix-caching Mamba sizing after we turn it off.
 
@@ -1788,6 +1834,8 @@ class TTPlatform(Platform):
                     "models with sliding window, disabling it"
                 )
                 _renormalize_mamba_cache_config(vllm_config)
+            else:
+                _store_recurrent_prefix_capacity(vllm_config, model_capabilities)
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",

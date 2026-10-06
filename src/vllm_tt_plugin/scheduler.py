@@ -50,6 +50,42 @@ def get_tt_forced_reset_discard_counts(
     return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
 
 
+# Recurrent-state handles travelling in both directions between the scheduler, which owns the
+# index, and the model runner, which owns the bytes. Both objects are plain dataclasses pickled
+# across the executor boundary, so ad-hoc attributes survive it the way the step state above does.
+_TT_RECURRENT_RESTORE_ATTR = "_tt_recurrent_restore"
+_TT_RECURRENT_FREE_ATTR = "_tt_recurrent_free"
+_TT_RECURRENT_SAVED_ATTR = "_tt_recurrent_saved"
+
+
+def set_tt_recurrent_restore(scheduler_output: SchedulerOutput, handles: dict[str, int]) -> None:
+    if handles:
+        setattr(scheduler_output, _TT_RECURRENT_RESTORE_ATTR, dict(handles))
+
+
+def get_tt_recurrent_restore(scheduler_output: SchedulerOutput) -> dict[str, int]:
+    return dict(getattr(scheduler_output, _TT_RECURRENT_RESTORE_ATTR, {}))
+
+
+def set_tt_recurrent_free(scheduler_output: SchedulerOutput, handles: list[int]) -> None:
+    if handles:
+        setattr(scheduler_output, _TT_RECURRENT_FREE_ATTR, list(handles))
+
+
+def get_tt_recurrent_free(scheduler_output: SchedulerOutput) -> list[int]:
+    return list(getattr(scheduler_output, _TT_RECURRENT_FREE_ATTR, []))
+
+
+def set_tt_recurrent_saved(model_runner_output, saved: list[tuple[str, int, int]]) -> None:
+    """Report snapshots the runner took, as ``(req_id, tokens, handle)``."""
+    if saved:
+        setattr(model_runner_output, _TT_RECURRENT_SAVED_ATTR, list(saved))
+
+
+def get_tt_recurrent_saved(model_runner_output) -> list[tuple[str, int, int]]:
+    return list(getattr(model_runner_output, _TT_RECURRENT_SAVED_ATTR, []))
+
+
 def install_recurrent_prefix_filter(
     manager, hash_block_size: int, alignment_tokens: int, capacity: int
 ) -> RecurrentPrefixCache | None:
@@ -289,6 +325,7 @@ class TTScheduler(AsyncScheduler):
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
         self._spec_session_owner: str | None = None
+        self._pending_recurrent_frees: list[int] = []
         self._recurrent_prefix = self._install_recurrent_prefix_filter()
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
@@ -616,10 +653,68 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()
         try:
-            return self._schedule_without_pending_output_resumes(throttle_prefills)
+            out = self._schedule_without_pending_output_resumes(throttle_prefills)
+            self._annotate_recurrent_prefix(out)
+            return out
         finally:
             if deferred_resumes:
                 self.waiting.prepend_requests(deferred_resumes)
+
+    def _annotate_recurrent_prefix(self, out: SchedulerOutput) -> None:
+        """Name the snapshot each admitted cache hit must be restored from.
+
+        A new request with tokens already computed was admitted on a prefix the filter said is
+        servable, which means an index entry held a handle for exactly that length. The runner
+        cannot look it up -- the index lives here -- so the handle travels with the step.
+        """
+        if self._recurrent_prefix is None:
+            return
+        restore: dict[str, int] = {}
+        for new_req in out.scheduled_new_reqs:
+            computed = new_req.num_computed_tokens
+            if not computed:
+                continue
+            request = self.requests.get(new_req.req_id)
+            if request is None:
+                continue
+            handle = self._recurrent_prefix.handle_for(request.block_hashes, computed)
+            if handle is None:
+                # Unreachable while the filter is the only source of hits, and silence here
+                # would be a wrong answer rather than a slow one.
+                raise RuntimeError(
+                    f"request {new_req.req_id!r} was admitted with {computed} cached tokens "
+                    "but no recurrent snapshot holds that prefix"
+                )
+            restore[new_req.req_id] = handle
+        set_tt_recurrent_restore(out, restore)
+        set_tt_recurrent_free(out, self._take_recurrent_frees())
+
+    def _take_recurrent_frees(self) -> list[int]:
+        pending, self._pending_recurrent_frees = self._pending_recurrent_frees, []
+        return pending
+
+    def _record_recurrent_prefix_saves(self, model_runner_output) -> None:
+        """Index the snapshots the runner took, and queue whatever they displaced.
+
+        The handle the index gives back is state the model still holds but nothing can ask for
+        any more, so it has to reach the runner to be freed or the store fills with orphans.
+        """
+        if self._recurrent_prefix is None:
+            return
+        for req_id, tokens, handle in get_tt_recurrent_saved(model_runner_output):
+            request = self.requests.get(req_id)
+            if request is None:
+                self._pending_recurrent_frees.append(handle)
+                continue
+            index = tokens // self.hash_block_size - 1
+            if index < 0 or index >= len(request.block_hashes):
+                self._pending_recurrent_frees.append(handle)
+                continue
+            displaced = self._recurrent_prefix.remember(
+                request.block_hashes[index], handle, tokens
+            )
+            if displaced is not None:
+                self._pending_recurrent_frees.append(displaced)
 
     def _schedule_without_pending_output_resumes(
         self, throttle_prefills: bool = False
@@ -800,6 +895,12 @@ class TTScheduler(AsyncScheduler):
             if reset_running_requests
             else []
         )
+        # The attention pages this index's prefixes were admitted alongside are about to go, so
+        # every snapshot becomes unreachable. Queue the handles before clearing, or the model
+        # keeps holding state no index names.
+        if self._recurrent_prefix is not None:
+            self._pending_recurrent_frees.extend(self._recurrent_prefix.handles())
+            self._recurrent_prefix.clear()
         try:
             return super().reset_prefix_cache(reset_running_requests, reset_connector)
         finally:
@@ -985,6 +1086,9 @@ class TTScheduler(AsyncScheduler):
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
             )
+        # Before the base loop, which is free to finish a request and drop it from
+        # ``self.requests`` -- and the block hashes the snapshot is filed under with it.
+        self._record_recurrent_prefix_saves(model_runner_output)
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:

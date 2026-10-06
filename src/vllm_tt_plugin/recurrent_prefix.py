@@ -19,6 +19,21 @@ Deliberately free of vLLM imports: block hashes are opaque keys and handles are 
 from collections import OrderedDict
 
 
+def rows_worth_snapshotting(row_req_ids, slots, ends, totals, block_size):
+    """``(req_id, slot, tokens)`` for each row whose state now summarises a hashable prefix.
+
+    A snapshot is nameable only at a block boundary, because that is the granularity the content
+    hashes are computed at, and the state is only worth keeping once the whole prompt is in it.
+    Recurrent state is sequential, so a prefill that stops past a boundary cannot be wound back
+    to one: a row that ends unaligned yields nothing rather than something mislabelled.
+    """
+    chosen = []
+    for req_id, slot, end, total in zip(row_req_ids, slots, ends, totals):
+        if end and end == total and end % block_size == 0:
+            chosen.append((req_id, slot, end))
+    return chosen
+
+
 class RecurrentPrefixCache:
     """A bounded, least-recently-used index from prefix hash to snapshot handle."""
 
@@ -84,6 +99,10 @@ class RecurrentPrefixCache:
             if held == handle:
                 del self._entries[key]
                 return
+
+    def handles(self):
+        """Every handle currently indexed, for a caller that is about to drop the index."""
+        return [handle for handle, _ in self._entries.values()]
 
     def clear(self) -> None:
         self._entries.clear()

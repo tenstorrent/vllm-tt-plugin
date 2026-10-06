@@ -291,6 +291,8 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
         raise AssertionError("intermediate prefill must not emit a sampled token")
 
     runner = SimpleNamespace(
+        # Nothing was snapshotted, so the step reports no handles back to the scheduler.
+        _recurrent_saved=[],
         _apply_grammar_to_input=lambda model_input,
         grammar_output,
         *,
@@ -343,6 +345,9 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         request_specific_rope=False,
         model=FakeModel(),
         async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
+        # No model declaring recurrent snapshots, so neither hook has anything to do.
+        _restore_recurrent_prefixes=lambda *_: None,
+        _snapshot_recurrent_prefixes=lambda *_: None,
     )
     model_input = SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),

@@ -66,7 +66,13 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.recurrent_prefix import rows_worth_snapshotting
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    get_tt_recurrent_free,
+    get_tt_recurrent_restore,
+    set_tt_recurrent_saved,
+)
 from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
@@ -277,6 +283,10 @@ class TTModelRunner:
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
+        # Recurrent-prefix handles for the step being built: restores the scheduler asked for,
+        # and snapshots taken during it, reported back on this step's output.
+        self._recurrent_restore: dict[str, int] = {}
+        self._recurrent_saved: list[tuple[str, int, int]] = []
         self._pending_state_slot_settle: dict[str, int] | None = None
         # Slot-level ``old -> new`` for the same pending gather, forwarded to the
         # model once the decode is accepted so its recorded session owner follows
@@ -967,6 +977,20 @@ class TTModelRunner:
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
 
+    def _take_recurrent_prefix_step(self, scheduler_output: SchedulerOutput) -> None:
+        """Adopt this step's recurrent-prefix instructions and release what the index dropped.
+
+        Freeing first is deliberate: the store is bounded, and a handle the scheduler has
+        already stopped naming must not keep a slot's worth of snapshot out of circulation
+        while this step tries to take another.
+        """
+        self._recurrent_saved = []
+        self._recurrent_restore = get_tt_recurrent_restore(scheduler_output)
+        free = get_tt_recurrent_free(scheduler_output)
+        if free and hasattr(self.model, "free_recurrent_prefix"):
+            for handle in free:
+                self.model.free_recurrent_prefix(handle)
+
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
         off-batch requests own. Prefers its own row (where it decodes), so the
@@ -1518,6 +1542,7 @@ class TTModelRunner:
         # preemption or resume keeps a completed token valid for replay. Only a
         # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
+        self._take_recurrent_prefix_step(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
             and self._decode_layout_changed_since_last_decode
@@ -1951,6 +1976,8 @@ class TTModelRunner:
             prompt_logprobs_dict=dict.fromkeys(req_ids, None),
             pooler_output=[],
         )
+        set_tt_recurrent_saved(runner_output, self._recurrent_saved)
+        self._recurrent_saved = []
         if defer_state_apply and final_tokens is not None:
             self._enqueue_deferred_state_apply(
                 final_tokens, final_req_ids, runner_output
@@ -2109,16 +2136,56 @@ class TTModelRunner:
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
 
+        self._restore_recurrent_prefixes(model_input, empty_slots)
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
             self.async_decode.note_prefill_submitted()
+            self._snapshot_recurrent_prefixes(model_input, empty_slots)
             return tt_out
         tt_out = self.model.prefill_forward(**kwargs)
         self.async_decode.note_prefill_submitted()
+        self._snapshot_recurrent_prefixes(model_input, empty_slots)
         return tt_out
+
+    def _restore_recurrent_prefixes(self, model_input, empty_slots) -> None:
+        """Put each admitted hit's recurrent state back before the prefill continues it.
+
+        Without this the slot holds a summary of nothing while ``start_pos`` says the prefix is
+        already computed, which is the one shape the model's continuity gate refuses outright.
+        """
+        if not self._recurrent_restore or empty_slots is None:
+            return
+        for req_id, slot in zip(model_input.row_req_ids, empty_slots):
+            handle = self._recurrent_restore.get(req_id)
+            if handle is None:
+                continue
+            if not self.model.restore_recurrent_prefix(slot, handle):
+                raise RuntimeError(
+                    f"recurrent snapshot {handle} for request {req_id!r} is gone; its prefix "
+                    "tokens were dropped at admission and cannot be recomputed"
+                )
+
+    def _snapshot_recurrent_prefixes(self, model_input, empty_slots) -> None:
+        """Keep the state of any row that just finished a prompt on a block boundary."""
+        if empty_slots is None or not hasattr(self.model, "save_recurrent_prefix"):
+            return
+        totals = [
+            self.requests[req_id].num_prompt_tokens for req_id in model_input.row_req_ids
+        ]
+        ends = torch.as_tensor(model_input.prompt_lens).reshape(-1).tolist()
+        for req_id, slot, tokens in rows_worth_snapshotting(
+            model_input.row_req_ids,
+            list(empty_slots),
+            ends,
+            totals,
+            self.cache_config.block_size,
+        ):
+            handle = self.model.save_recurrent_prefix(slot)
+            if handle is not None:
+                self._recurrent_saved.append((req_id, tokens, handle))
 
     def _forward_with_model_input(
         self,

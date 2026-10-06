@@ -235,6 +235,7 @@ def _scheduler(*, running=(), waiting=0, mode=TTSchedulingMode.DEFAULT, **tt_key
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
     scheduler._forced_mode = mode
+    scheduler._recurrent_prefix = None
     scheduler._decode_interleave = _policy(**tt_keys)
     return scheduler
 

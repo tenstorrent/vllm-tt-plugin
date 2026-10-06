@@ -38,6 +38,8 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
     scheduler._forced_mode = mode
+    # No model declaring recurrent snapshots, so the prefix index stays out of the step.
+    scheduler._recurrent_prefix = None
     # Production defaults; the decode-interleave cadence itself is covered in
     # tests/test_decode_interleave.py.
     scheduler._decode_interleave = TTDecodeInterleavePolicy(
