@@ -145,6 +145,39 @@ def store_tt_adaptive_block_output(vllm_config: "VllmConfig", flag: bool) -> Non
 
 
 # Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY.
+_RECURRENT_PREFIX_CAPACITY_KEY = "_tt_recurrent_prefix_capacity"
+
+
+def get_tt_recurrent_prefix_capacity(vllm_config: "VllmConfig") -> int:
+    """How many prefix snapshots of recurrent state the model can hold at once.
+
+    Zero means the model keeps no such state, or keeps it but cannot hand a prefix back, and the
+    prefix cache must then report no hit for it. A hybrid model holding every attention page for
+    a prefix can still be unable to start from it, because its recurrent layers summarise the
+    tokens one request has seen rather than caching them per block.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    try:
+        capacity = int(additional.get(_RECURRENT_PREFIX_CAPACITY_KEY, 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(capacity, 0)
+
+
+def store_tt_recurrent_prefix_capacity(vllm_config: "VllmConfig", capacity: int) -> None:
+    """Record the model's snapshot capacity on the config.
+
+    Internal platform-to-runtime handoff, not user-facing: the value comes from the model's
+    ``recurrent_prefix_snapshots`` capability.
+    """
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_RECURRENT_PREFIX_CAPACITY_KEY] = max(int(capacity), 0)
+
+
+# Platform-derived; see _ADAPTIVE_BLOCK_OUTPUT_KEY.
 _ADAPTIVE_BLOCK_MAX_PROMPT_KEY = "_tt_adaptive_block_max_prompt_tokens"
 
 

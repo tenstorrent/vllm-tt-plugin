@@ -109,3 +109,52 @@ def test_a_nonsense_configuration_is_refused():
     for block, capacity in ((0, 4), (-1, 4), (BLOCK, -1)):
         with pytest.raises(ValueError):
             RecurrentPrefixCache(block_size=block, capacity=capacity)
+
+
+class TestCapacityPlumbing:
+    """The model's snapshot capacity reaches the scheduler through the config.
+
+    Platform-derived, like the other underscore-prefixed keys: it is written from what the model
+    declares, never read from operator input, so an --additional-config entry of the same name
+    cannot talk the scheduler into offering prefixes the model cannot serve.
+    """
+
+    @staticmethod
+    def _config():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(additional_config=None)
+
+    def test_a_model_that_declares_nothing_offers_no_prefixes(self):
+        from vllm_tt_plugin.config import get_tt_recurrent_prefix_capacity
+
+        assert get_tt_recurrent_prefix_capacity(self._config()) == 0
+
+    def test_a_declared_capacity_survives_the_handoff(self):
+        from vllm_tt_plugin.config import (
+            get_tt_recurrent_prefix_capacity,
+            store_tt_recurrent_prefix_capacity,
+        )
+
+        config = self._config()
+        store_tt_recurrent_prefix_capacity(config, 8)
+        assert get_tt_recurrent_prefix_capacity(config) == 8
+
+    def test_a_nonsense_capacity_reads_as_unsupported_rather_than_raising(self):
+        from vllm_tt_plugin.config import get_tt_recurrent_prefix_capacity
+
+        config = self._config()
+        config.additional_config = {"_tt_recurrent_prefix_capacity": "lots"}
+        # Reporting a hit the model cannot serve is unrecoverable, so an unreadable value has to
+        # fail closed rather than propagate.
+        assert get_tt_recurrent_prefix_capacity(config) == 0
+
+    def test_a_negative_capacity_reads_as_unsupported(self):
+        from vllm_tt_plugin.config import (
+            get_tt_recurrent_prefix_capacity,
+            store_tt_recurrent_prefix_capacity,
+        )
+
+        config = self._config()
+        store_tt_recurrent_prefix_capacity(config, -3)
+        assert get_tt_recurrent_prefix_capacity(config) == 0
