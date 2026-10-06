@@ -329,6 +329,37 @@ def test_a_bad_word_bans_its_last_token_after_the_column_s_own_history():
     assert bool((logits == 0).all()), "the caller's logits were modified"
 
 
+def test_a_bad_word_applies_to_logits_of_any_layout():
+    """The contract asks for ``[B, 1+K, V]``, not for contiguous storage.
+
+    A model may hand back its logits transposed from ``[1+K, B, V]``. The walk
+    must filter and commit them exactly as it does a contiguous copy: row 0
+    bans its argmax 1 and commits 4, and row 1, unrestricted, commits 2.
+    """
+    by_column = torch.tensor([[0.0, 10.0, 1.0, 2.0, 3.0], [0.0, 1.0, 10.0, 2.0, 3.0]])
+    transposed = by_column.repeat(3, 1, 1).transpose(0, 1)
+    assert not transposed.is_contiguous()
+    drafts = torch.tensor([[4, 4], [2, 2]], dtype=torch.int32)
+    num_valid = torch.tensor([2, 2], dtype=torch.int32)
+    filters = SpecTokenFilters(
+        bad_words_token_ids={0: [[1]]}, output_token_ids=[[], []]
+    )
+    sampling = SpecSamplingInputs(
+        vocab_size=5, temperature=torch.zeros(2), filters=filters
+    )
+
+    assert torch.equal(
+        apply_speculative_token_filters(transposed, drafts, num_valid, filters),
+        apply_speculative_token_filters(
+            transposed.contiguous(), drafts, num_valid, filters
+        ),
+    )
+    for logits in (transposed.contiguous(), transposed):
+        result = accept_sampled_drafts(logits, drafts, num_valid, sampling)
+        assert result.committed_token_ids.tolist() == [[4, 4, 4], [2, 2, 2]]
+        assert result.accepted_counts.tolist() == [3, 3]
+
+
 def test_min_tokens_masks_the_stop_tokens_only_while_the_output_is_short():
     """A column ``j`` masks the stop tokens while ``j < min_tokens - len(output)``.
 
