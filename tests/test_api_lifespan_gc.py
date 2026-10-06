@@ -4,6 +4,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -82,3 +83,47 @@ finally:
     gc.collect()
 """
     subprocess.run([sys.executable, "-c", code, failure], check=True, timeout=90)
+
+
+def test_example_installs_lifespan_patch_in_runpy_globals():
+    code = r"""
+import importlib.abc
+import importlib.util
+import runpy
+import sys
+from contextlib import asynccontextmanager
+
+from vllm.entrypoints.serve.utils import server_utils
+from vllm_tt_plugin.platform import _install_api_lifespan_gc_patch
+
+@asynccontextmanager
+async def original(app):
+    yield
+
+server_utils.lifespan = original
+name = "vllm.entrypoints.openai.api_server"
+sys.modules.pop(name, None)
+
+class API(importlib.abc.MetaPathFinder, importlib.abc.InspectLoader):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == name:
+            return importlib.util.spec_from_loader(fullname, self)
+
+    def get_source(self, fullname):
+        return (
+            'from vllm.entrypoints.serve.utils import server_utils\n'
+            'from vllm.entrypoints.serve.utils.server_utils import lifespan\n'
+            'from vllm_tt_plugin.platform import _install_api_lifespan_gc_patch\n'
+            '_install_api_lifespan_gc_patch()\n'
+            'assert lifespan is server_utils.lifespan\n'
+            'assert getattr(lifespan, "_tt_lifespan_gc_patch", False)\n'
+        )
+
+    def is_package(self, fullname):
+        return False
+
+sys.meta_path.insert(0, API())
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
+    example = Path(__file__).resolve().parents[1] / "examples/server_example_tt.py"
+    subprocess.run([sys.executable, "-c", code, str(example)], check=True, timeout=90)
