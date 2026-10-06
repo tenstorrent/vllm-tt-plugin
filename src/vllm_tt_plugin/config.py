@@ -438,6 +438,32 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+_PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
+# TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
+# that starts off that grid is realigned down by the model and the whole
+# chunk is then padded up to the next power of two (4096 + delta -> 8192).
+_PREFILL_CHUNK_ALIGNMENT_DEFAULT = 128
+
+
+def get_tt_prefill_chunk_alignment(vllm_config: "VllmConfig") -> int:
+    """Token alignment every partial prefill chunk must end on (0 disables).
+
+    A request admitted on leftover budget would otherwise start every later
+    chunk on an odd offset; aligning chunk ends keeps the model's chunk walk on
+    its native grid for every model served through this plugin.
+    """
+    tt_config = get_tt_config(vllm_config)
+    value = tt_config.get(
+        _PREFILL_CHUNK_ALIGNMENT_KEY, _PREFILL_CHUNK_ALIGNMENT_DEFAULT
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{_PREFILL_CHUNK_ALIGNMENT_KEY}'] must be an "
+            f"integer >= 0 (0 disables), got {value!r}"
+        )
+    return value
+
+
 def get_tt_decode_interleave_config(
     vllm_config: "VllmConfig",
 ) -> tuple[bool, int, int]:
