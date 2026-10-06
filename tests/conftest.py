@@ -21,6 +21,7 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.
+    import torch
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.input_processor as input_processor
@@ -28,6 +29,7 @@ def reset_tt_platform_class_state():
     from vllm_tt_plugin.platform import TTPlatform
 
     unset = object()
+    saved_empty_cache = torch.accelerator.empty_cache
     saved = {
         name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
     }
@@ -53,6 +55,7 @@ def reset_tt_platform_class_state():
 
     yield
 
+    torch.accelerator.empty_cache = saved_empty_cache
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
     engine_core.EngineCoreProc.pause_scheduler = saved_proc_pause_scheduler

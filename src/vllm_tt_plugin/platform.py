@@ -741,6 +741,32 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+def _install_tt_empty_cache_patch() -> None:
+    """Allow upstream cleanup on TT with a CPU-only PyTorch build.
+
+    vLLM calls ``torch.accelerator.empty_cache`` for every non-CPU platform,
+    including TT. PyTorch's CPU build raises before its allocator-initialized
+    guard because it has no registered accelerator. TT owns its cache cleanup;
+    skip only that absent allocator, preserving all other backends and errors.
+    """
+    original = torch.accelerator.empty_cache
+    if getattr(original, "_tt_empty_cache_patch", False):
+        return
+
+    def empty_cache_tt():
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.device_type == "tt"
+            and torch.accelerator.current_accelerator() is None
+        ):
+            return
+        return original()
+
+    empty_cache_tt._tt_empty_cache_patch = True
+    torch.accelerator.empty_cache = empty_cache_tt
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 
@@ -1522,6 +1548,7 @@ class TTPlatform(Platform):
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        _install_tt_empty_cache_patch()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
@@ -1602,6 +1629,7 @@ class TTPlatform(Platform):
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        _install_tt_empty_cache_patch()
         # Too late to change this config's asynchronous setting, which upstream
         # resolved before calling this hook. Installed anyway, for a process
         # that reaches configuration without the CLI path: a second engine, or
