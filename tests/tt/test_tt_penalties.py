@@ -4,9 +4,12 @@
 from tests.tt.utils import (
     RequestConfig,
     assert_deterministic_allow_near_tie,
+    assert_frequency_penalty_reduces_token_repeats,
     assert_varied,
     count_prompts_changed_by,
+    render_penalty_prompts,
     run_concurrent_batch,
+    run_concurrent_batch_tokens,
 )
 
 
@@ -119,7 +122,9 @@ class TestPresencePenalty:
         "a b c a b c a b c",
     ]
 
-    def test_presence_penalty_changes_output(self, tt_server, tt_model_name):
+    def test_presence_penalty_changes_output(
+        self, tt_server, tt_model_name, tt_tokenizer
+    ):
         """Presence must alter greedy output on most of a diverse prompt set.
 
         Threshold is a bare majority, well under the observed rate, so ordinary
@@ -139,7 +144,7 @@ class TestPresencePenalty:
         changed, slot_noise, detail = count_prompts_changed_by(
             tt_server,
             tt_model_name,
-            self.PRESENCE_PROMPTS,
+            render_penalty_prompts(self.PRESENCE_PROMPTS, tt_tokenizer),
             presence_penalty=2.0,
         )
         total = len(self.PRESENCE_PROMPTS)
@@ -315,20 +320,15 @@ class TestFrequencyPenalty:
                 )
             )
 
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results = run_concurrent_batch_tokens(tt_server, tt_model_name, configs)
 
         no_penalty = [results[i] for i in range(0, max_batch_size, 2)]
         with_penalty = [results[i] for i in range(1, max_batch_size, 2)]
 
-        # Count "a"s in each output
-        no_penalty_a_count = no_penalty[0].count("a")
-        with_penalty_a_count = with_penalty[0].count("a")
-
-        assert no_penalty_a_count > with_penalty_a_count, (
-            f"Frequency penalty should reduce 'a' repetitions: "
-            f"no_penalty={no_penalty_a_count},"
-            f"with_penalty={with_penalty_a_count}"
-        )
+        # A different token may encode several 'a' characters. Frequency
+        # penalties count token IDs, so character counts can increase even
+        # while both the dominant token and total repeated occurrences fall.
+        assert_frequency_penalty_reduces_token_repeats(no_penalty[0], with_penalty[0])
         assert_deterministic_allow_near_tie(
             no_penalty, "No penalty requests should be identical."
         )
