@@ -579,6 +579,22 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     )
 
 
+def _register_kolibri1_hf_config() -> None:
+    """Make ``model_type: kolibri1`` loadable by ``AutoConfig``.
+
+    Aleph-Alpha/Kolibri-1 ships only a vLLM plugin upstream; Transformers has
+    no config class for it. A plain ``PretrainedConfig`` is enough: every
+    field the TT adapter reads (layer_types, sliding_window, head counts,
+    max_position_embeddings) comes verbatim from the checkpoint's config.json.
+    """
+    from transformers import AutoConfig, PretrainedConfig
+
+    class Kolibri1Config(PretrainedConfig):
+        model_type = "kolibri1"
+
+    AutoConfig.register("kolibri1", Kolibri1Config, exist_ok=True)
+
+
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
     """Register `model_arch` only if not already registered.
 
@@ -1419,6 +1435,20 @@ def register_tt_models(register_test_models=False) -> None:
         "TTGemma4UnifiedForConditionalGeneration",
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
+
+    # Kolibri-1 (Aleph Alpha) model-local autoport, TP4 on Blackhole QB2.
+    # The checkpoint's ``model_type: kolibri1`` has no Transformers config
+    # class and no auto_map, so vLLM's config load fails before any
+    # architecture lookup unless the type is registered in every process
+    # (general plugins run in all of them). Upstream resolves the HF name
+    # before the TT platform prefixes it, so both spellings are registered.
+    _register_kolibri1_hf_config()
+    _kolibri1_target = (
+        "models.autoports.aleph_alpha_kolibri_1_bf16.tt.generator_vllm:"
+        "KolibriForCausalLM"
+    )
+    for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
+        _register_model_if_missing(ModelRegistry, arch, _kolibri1_target)
 
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare
