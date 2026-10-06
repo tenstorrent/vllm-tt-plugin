@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # `TTPlatform.check_and_update_config` records its results on the class rather
 # than on the config it is handed, so one test that calls it configures every
@@ -35,6 +36,7 @@ def reset_tt_platform_class_state():
         for name in ("vllm.entrypoints.openai.api_server", "__main__")
         if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
     }
+    saved_empty_cache = torch.accelerator.empty_cache
 
     unset = object()
     saved = {
@@ -70,6 +72,7 @@ def reset_tt_platform_class_state():
                 module.lifespan = saved_lifespan_aliases[name]
             elif getattr(module.lifespan, "_tt_lifespan_gc_patch", False):
                 module.lifespan = saved_lifespan
+    torch.accelerator.empty_cache = saved_empty_cache
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
