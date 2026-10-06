@@ -37,6 +37,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from vllm_tt_plugin import config as tt_config
 
@@ -334,3 +335,90 @@ def test_per_model_branch_with_sliding_window(cfg):
     # gemma-3-4b N300 branch: 65536 base + 64*32 padding + 1024*32*8 sliding
     # = 65536 + 2048 + 262144 = 329728 -> ceil/64 = 5152
     assert n == 5152
+
+
+@pytest.mark.parametrize(
+    ("batch", "in_flight", "expected"),
+    [(1, 1024, 32965), (32, 1024, 36904), (1, 512, 32901), (1, 4096, 33349)],
+)
+def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
+    """Real upstream grouping/planning must admit the unchanged full context."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    from vllm_tt_plugin.worker import (
+        _available_kv_cache_memory_bytes_for_num_blocks,
+        get_num_available_blocks_tt,
+    )
+
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="hybrid-test",
+            max_model_len=1048576,
+            original_max_model_len=1048576,
+            get_sliding_window=lambda: 513,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=batch, disable_hybrid_kv_cache_manager=False
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, decode_context_parallel_size=1
+        ),
+        cache_config=SimpleNamespace(block_size=32, num_gpu_blocks_override=None),
+        additional_config={},
+        speculative_config=None,
+        kv_transfer_config=None,
+        max_in_flight_tokens=in_flight,
+    )
+    common = dict(block_size=32, num_kv_heads=4, head_size=128, dtype=torch.bfloat16)
+    specs = {
+        f"layer.{i}": (
+            FullAttentionSpec(**common)
+            if i % 5 == 4
+            else SlidingWindowSpec(**common, sliding_window=513)
+        )
+        for i in range(50)
+    }
+
+    class HybridModel:
+        _HYBRID_KV_CACHE_GROUPS_ENABLED = True
+
+        @staticmethod
+        def get_max_tokens_all_users(**kwargs):
+            return kwargs["max_model_len"]
+
+        @staticmethod
+        def get_kv_cache_spec(config):
+            return specs
+
+    with patch(
+        "vllm_tt_plugin.worker.get_model_architecture",
+        return_value=(HybridModel, "hybrid-test"),
+    ):
+        blocks = get_num_available_blocks_tt(cfg)
+
+    assert blocks == expected
+    cfg.cache_config.num_gpu_blocks_override = blocks
+    available = _available_kv_cache_memory_bytes_for_num_blocks(cfg, specs, blocks)
+    [planned] = get_kv_cache_configs(cfg, [specs], [available])
+    assert planned.num_blocks == blocks
+    assert len(planned.kv_cache_groups) == 5
+    assert cfg.model_config.max_model_len == 1048576
+
+    if batch == 1 and in_flight == 1024:
+        # Reproduce the old B1 admission failure with the real upstream check.
+        cfg.cache_config.num_gpu_blocks_override = 32898
+        old_available = _available_kv_cache_memory_bytes_for_num_blocks(
+            cfg, specs, 32898
+        )
+        with pytest.raises(ValueError, match="larger than the available"):
+            get_kv_cache_configs(cfg, [specs], [old_available])
+
+        # Auto-fit retains the original fixed budget; it must not expand to
+        # the checkpoint's advertised context before upstream fits it.
+        cfg.model_config.original_max_model_len = -1
+        with patch(
+            "vllm_tt_plugin.worker.get_model_architecture",
+            return_value=(HybridModel, "hybrid-test"),
+        ):
+            assert get_num_available_blocks_tt(cfg) == 32898

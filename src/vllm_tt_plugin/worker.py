@@ -14,6 +14,8 @@ from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_utils import (
+    _max_memory_usage_bytes_from_groups,
+    _pool_bytes_per_block,
     get_kv_cache_groups,
     get_uniform_page_size,
 )
@@ -653,6 +655,27 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+    spec_hook = getattr(model_class, "get_kv_cache_spec", None)
+    if (
+        hybrid_kv_cache_groups_enabled
+        and callable(spec_hook)
+        and getattr(model_config, "original_max_model_len", None) != -1
+    ):
+        # A window-only estimate can miss blocks retained by in-flight
+        # prefill batches, especially at small batch sizes. Use upstream's
+        # actual groups and admission bound, including group padding. Keep
+        # the model budget if larger and preserve the output reservation.
+        # Auto-fit (-1) must keep its fixed pool rather than grow to HF length.
+        groups = get_kv_cache_groups(vllm_config, dict(spec_hook(vllm_config)))
+        if groups:
+            required_bytes = _max_memory_usage_bytes_from_groups(vllm_config, groups)
+            bytes_per_block = _pool_bytes_per_block(vllm_config, groups)
+            minimum_blocks = (required_bytes + bytes_per_block - 1) // bytes_per_block
+            reserved_blocks = (
+                math.ceil(per_user_output_reservation / cache_config.block_size)
+                * max_batch
+            )
+            num_tt_blocks = max(num_tt_blocks, minimum_blocks + reserved_blocks)
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
