@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -24,8 +25,16 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.input_processor as input_processor
+    from vllm.entrypoints.serve.utils import server_utils
 
     from vllm_tt_plugin.platform import TTPlatform
+
+    saved_lifespan = server_utils.lifespan
+    saved_lifespan_aliases = {
+        name: module.lifespan
+        for name in ("vllm.entrypoints.openai.api_server", "__main__")
+        if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
+    }
 
     unset = object()
     saved = {
@@ -52,6 +61,15 @@ def reset_tt_platform_class_state():
     )
 
     yield
+
+    server_utils.lifespan = saved_lifespan
+    for name in ("vllm.entrypoints.openai.api_server", "__main__"):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "lifespan"):
+            if name in saved_lifespan_aliases:
+                module.lifespan = saved_lifespan_aliases[name]
+            elif getattr(module.lifespan, "_tt_lifespan_gc_patch", False):
+                module.lifespan = saved_lifespan
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
