@@ -2137,17 +2137,18 @@ class TTModelRunner:
             kwargs["empty_slots"] = list(empty_slots)
 
         self._restore_recurrent_prefixes(model_input, empty_slots)
+        self._request_prefix_snapshots(model_input, empty_slots, kwargs)
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
             self.async_decode.note_prefill_submitted()
-            self._snapshot_recurrent_prefixes(model_input, empty_slots)
+            self._collect_prefix_snapshots(model_input)
             return tt_out
         tt_out = self.model.prefill_forward(**kwargs)
         self.async_decode.note_prefill_submitted()
-        self._snapshot_recurrent_prefixes(model_input, empty_slots)
+        self._collect_prefix_snapshots(model_input)
         return tt_out
 
     def _restore_recurrent_prefixes(self, model_input, empty_slots) -> None:
@@ -2168,24 +2169,31 @@ class TTModelRunner:
                     "tokens were dropped at admission and cannot be recomputed"
                 )
 
-    def _snapshot_recurrent_prefixes(self, model_input, empty_slots) -> None:
-        """Keep the state of any row that just finished a prompt on a block boundary."""
-        if empty_slots is None or not hasattr(self.model, "save_recurrent_prefix"):
+    def _request_prefix_snapshots(self, model_input, empty_slots, kwargs) -> None:
+        """Ask the model to stop the rows worth keeping on a block boundary.
+
+        Before the prefill rather than after, because recurrent state is sequential: once the
+        prefill has run to the end of the prompt there is no boundary left to snapshot at.
+        """
+        if empty_slots is None or not hasattr(self.model, "take_prefix_snapshots"):
             return
-        totals = [
-            self.requests[req_id].num_prompt_tokens for req_id in model_input.row_req_ids
-        ]
-        ends = torch.as_tensor(model_input.prompt_lens).reshape(-1).tolist()
-        for req_id, slot, tokens in rows_worth_snapshotting(
-            model_input.row_req_ids,
-            list(empty_slots),
-            ends,
-            totals,
-            self.cache_config.block_size,
-        ):
-            handle = self.model.save_recurrent_prefix(slot)
-            if handle is not None:
-                self._recurrent_saved.append((req_id, tokens, handle))
+        block = self.cache_config.block_size
+        rows = rows_worth_snapshotting(
+            torch.as_tensor(model_input.input_positions).reshape(-1).tolist(),
+            torch.as_tensor(model_input.prompt_lens).reshape(-1).tolist(),
+            [self.requests[r].num_prompt_tokens for r in model_input.row_req_ids],
+            block,
+        )
+        if rows:
+            kwargs["snapshot_rows"] = rows
+            kwargs["snapshot_block"] = block
+
+    def _collect_prefix_snapshots(self, model_input) -> None:
+        """Take the handles the prefill produced, keyed back to the requests that own them."""
+        if not hasattr(self.model, "take_prefix_snapshots"):
+            return
+        for row, (tokens, handle) in self.model.take_prefix_snapshots().items():
+            self._recurrent_saved.append((model_input.row_req_ids[row], tokens, handle))
 
     def _forward_with_model_input(
         self,

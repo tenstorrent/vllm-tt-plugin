@@ -347,7 +347,8 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
         # No model declaring recurrent snapshots, so neither hook has anything to do.
         _restore_recurrent_prefixes=lambda *_: None,
-        _snapshot_recurrent_prefixes=lambda *_: None,
+        _request_prefix_snapshots=lambda *_: None,
+        _collect_prefix_snapshots=lambda *_: None,
     )
     model_input = SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),

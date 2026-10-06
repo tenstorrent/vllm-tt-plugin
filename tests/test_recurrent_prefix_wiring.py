@@ -95,26 +95,39 @@ class TestTheChannel:
 
 
 class TestWhichRowsAreWorthKeeping:
-    def test_a_prompt_finishing_on_a_boundary_is_kept(self):
-        assert rows_worth_snapshotting(["a"], [3], [64], [64], BLOCK) == [("a", 3, 64)]
+    """Asked before the prefill, so the boundary can be a stopping point rather than a search.
 
-    def test_a_prompt_finishing_off_the_boundary_is_not(self):
-        # The state is sequential, so it cannot be wound back to 64; keeping it under the hash
-        # for 64 tokens would name a summary of 70.
-        assert rows_worth_snapshotting(["a"], [3], [70], [70], BLOCK) == []
+    ``block_size`` is 32 here; the boundary is the last multiple strictly below the prompt end,
+    which leaves the sampling pass tokens to run.
+    """
+
+    def test_an_unaligned_prompt_is_kept_at_the_boundary_below_it(self):
+        # The case the whole split exists for: prompt ends at 1000, state is kept at 992.
+        assert rows_worth_snapshotting([0], [1000], [1000], BLOCK) == [0]
+
+    def test_an_aligned_prompt_is_kept_one_block_back(self):
+        # 64 would leave the sampling pass nothing to run, so the boundary is 32.
+        assert rows_worth_snapshotting([0], [64], [64], BLOCK) == [0]
+
+    def test_a_prompt_inside_one_block_has_nothing_whole_to_keep(self):
+        for end in (1, BLOCK, BLOCK - 1):
+            assert rows_worth_snapshotting([0], [end], [end], BLOCK) == []
 
     def test_a_partial_prefill_is_not_kept(self):
-        # Block-aligned but the prompt continues, so a later chunk still has to run in this slot.
-        assert rows_worth_snapshotting(["a"], [3], [64], [128], BLOCK) == []
+        # A later chunk still has to run in this slot, so the prompt is not in the state yet.
+        assert rows_worth_snapshotting([0], [64], [128], BLOCK) == []
 
-    def test_an_empty_prefill_is_not_kept(self):
-        assert rows_worth_snapshotting(["a"], [0], [0], [0], BLOCK) == []
+    def test_a_continuation_that_adds_no_whole_block_is_not_kept(self):
+        # The slot already holds 992; the boundary below 1000 is the state it has.
+        assert rows_worth_snapshotting([992], [1000], [1000], BLOCK) == []
+
+    def test_a_continuation_that_adds_a_whole_block_is_kept(self):
+        assert rows_worth_snapshotting([992], [1100], [1100], BLOCK) == [0]
 
     def test_rows_are_judged_one_at_a_time(self):
-        kept = rows_worth_snapshotting(
-            ["a", "b", "c"], [0, 1, 2], [64, 70, 96], [64, 70, 96], BLOCK
-        )
-        assert kept == [("a", 0, 64), ("c", 2, 96)]
+        assert rows_worth_snapshotting(
+            [0, 0, 0], [1000, 64, 20], [1000, 128, 20], BLOCK
+        ) == [0]
 
 
 class TestSchedulerBookkeeping:

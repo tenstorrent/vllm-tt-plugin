@@ -19,19 +19,19 @@ Deliberately free of vLLM imports: block hashes are opaque keys and handles are 
 from collections import OrderedDict
 
 
-def rows_worth_snapshotting(row_req_ids, slots, ends, totals, block_size):
-    """``(req_id, slot, tokens)`` for each row whose state now summarises a hashable prefix.
+def rows_worth_snapshotting(starts, ends, totals, block_size):
+    """Row indices whose prefill should stop on a block boundary to be kept.
 
-    A snapshot is nameable only at a block boundary, because that is the granularity the content
-    hashes are computed at, and the state is only worth keeping once the whole prompt is in it.
-    Recurrent state is sequential, so a prefill that stops past a boundary cannot be wound back
-    to one: a row that ends unaligned yields nothing rather than something mislabelled.
+    Asked before the prefill runs, because recurrent state is sequential: a prefill that has run
+    past a boundary cannot be wound back to one, so the boundary has to be a stopping point. Only
+    a row finishing its prompt is worth the extra pass, and only where a whole block lies beyond
+    what the slot already holds -- below that there is nothing to keep that is not kept already.
     """
-    chosen = []
-    for req_id, slot, end, total in zip(row_req_ids, slots, ends, totals):
-        if end and end == total and end % block_size == 0:
-            chosen.append((req_id, slot, end))
-    return chosen
+    return [
+        row
+        for row, (start, end, total) in enumerate(zip(starts, ends, totals))
+        if end == total and (end - 1) // block_size * block_size > start
+    ]
 
 
 class RecurrentPrefixCache:
