@@ -283,7 +283,10 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-Requests that cannot use TT on-device sampling automatically fall back to vLLM’s host-side sampling path. This fallback is selected per batch and requires no user configuration.
+Before a forward is submitted, TT selects one sampling path for the whole
+submitted batch. If any request or batch feature cannot use on-device
+sampling, the batch uses vLLM's host-side path. Structured outputs have
+additional rules; see [Structured Output Sampling](#structured-output-sampling).
 
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
@@ -320,6 +323,51 @@ Common options:
 | `decode_interleave_decode_steps` | How many decode-only steps one insertion runs. Reaching this count stops the policy choosing decode; it never forces a prefill step. Does not loosen the latency bound; buys more decode progress per insertion, and more cheaply than a shorter prefill run does. Default: `1`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
+
+### Structured Output Sampling
+
+Structured-output decode can use TT device sampling on models that declare
+`supports_device_grammar`. It is off by default. To enable it, set a
+`sample_on_device_mode` and turn off async scheduling:
+
+```bash
+MESH_DEVICE=T3K \
+python examples/server_example_tt.py \
+  --no-async-scheduling \
+  --additional-config '{"tt": {"sample_on_device_mode": "decode_only"}}'
+```
+
+vLLM enables async scheduling by default, and the platform disables it only
+for models without `supports_async_decode`. On models that declare it,
+structured requests keep host sampling unless the server is started with
+`--no-async-scheduling`.
+
+| Step | Sampling path |
+| --- | --- |
+| Structured prefill | Host sampling |
+| Eligible structured decode | TT device sampling after the sample-time grammar mask arrives |
+| Structured decode with logprobs, another host-only sampling option, or no effective device-grammar support | Host sampling |
+
+Eligibility also requires a compatible runtime sampler (not row-sharded),
+model warmup when tracing, and no logprobs (including `logprobs=0`) or other
+host-only sampling option. The ordinary device-sampling limits,
+`max_device_top_k` and `supports_device_penalties`, also apply. Eligibility is
+batch-wide: one ineligible request moves the whole decode step to host
+sampling. Block-output models reject structured outputs rather than falling
+back.
+
+Fallback is selected before forward submission. Once an eligible decode is
+submitted with deferred device sampling, its sample-time grammar mask must be
+present and valid. A missing mask or a device-sampling failure is terminal for
+that runner and requires recovery/restart; it is not retried on host, because
+the device decode and sampler state may already have advanced.
+
+With `VLLM_LOGGING_LEVEL=DEBUG`, each device-grammar step logs
+`TT device grammar sampling active`. See
+[`docs/SCHEDULING.md`](docs/SCHEDULING.md#when-steady-async-decode-is-allowed)
+for the execution flow and
+[`docs/MODEL_CAPABILITIES.md`](docs/MODEL_CAPABILITIES.md#sampling-and-async-capabilities)
+for the capability contract.
 
 ### Model Fabric Configuration
 

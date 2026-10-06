@@ -32,6 +32,7 @@ async def _send_choice_request(
         ],
         max_completion_tokens=8 + reasoning_token_budget,
         temperature=0,
+        presence_penalty=0.5,
         extra_body={"structured_outputs": {"choice": CHOICES}},
     )
     content = response.choices[0].message.content
@@ -109,15 +110,14 @@ async def _send_plain_request(
     return content
 
 
-def test_dp1_full_capacity_mixes_structured_and_plain_requests(
+def _run_mixed_requests(
     tt_server,
-    tt_model_name,
-    max_batch_size,
-    reasoning_token_budget,
-):
+    tt_model_name: str,
+    request_count: int,
+    reasoning_token_budget: int,
+) -> None:
     async def _run() -> None:
         async_client = tt_server.get_async_client()
-        request_count = min(max_batch_size, 32)
         senders = [
             _send_choice_request,
             _send_regex_request,
@@ -139,3 +139,26 @@ def test_dp1_full_capacity_mixes_structured_and_plain_requests(
         assert len(results) == request_count
 
     asyncio.run(_run())
+
+
+def test_dp1_full_capacity_mixes_structured_and_plain_requests(
+    tt_server,
+    tt_model_name,
+    max_batch_size,
+    reasoning_token_budget,
+):
+    _run_mixed_requests(
+        tt_server, tt_model_name, min(max_batch_size, 32), reasoning_token_budget
+    )
+
+
+def test_dp1_reuses_slots_with_mixed_requests(
+    tt_server,
+    tt_model_name,
+    max_batch_size,
+    reasoning_token_budget,
+):
+    """Twice the slots: queued requests take over slots freed mid-batch."""
+    _run_mixed_requests(
+        tt_server, tt_model_name, 2 * max_batch_size, reasoning_token_budget
+    )

@@ -14,6 +14,7 @@ from vllm.sampling_params import (
 
 from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
+    get_tt_supports_device_grammar,
     store_tt_output_tokens_per_step,
 )
 from vllm_tt_plugin.platform import (
@@ -288,6 +289,21 @@ class ARModel:
     }
 
 
+class ARDeviceGrammarModel(ARModel):
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_device_grammar": True,
+    }
+
+
+class InvalidDeviceGrammarModel(ARModel):
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_sample_on_device": False,
+        "supports_device_grammar": True,
+    }
+
+
 class _WeakrefableConfig(SimpleNamespace):
     """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
 
@@ -333,6 +349,23 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.diffusion_config is None
     assert not hasattr(config.model_config.hf_config, "canvas_length")
     assert config.model_config.is_diffusion is False
+
+
+def test_startup_stores_device_grammar_capability(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, ARDeviceGrammarModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert get_tt_supports_device_grammar(config)
+
+
+def test_device_grammar_requires_device_sampling_capability(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, InvalidDeviceGrammarModel)
+
+    with pytest.raises(ValueError, match="supports_sample_on_device"):
+        TTPlatform.check_and_update_config(config)
 
 
 def _switch_resolution(monkeypatch, model_class):

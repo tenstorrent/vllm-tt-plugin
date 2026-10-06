@@ -80,6 +80,7 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `supports_sample_on_device` | `False` | Permits the requested `sample_on_device_mode`. The platform rejects any non-`None` sampling mode when this declaration is false. Runtime sampling requirements can still select host sampling. |
 | `max_device_top_k` | `None` | Bounds stochastic device sampling. `TTModelRunner.check_perform_device_sampling` selects host sampling when any selected sampling row has nonzero temperature and `top_k < 1` or `top_k > max_device_top_k`. Greedy rows do not trigger this restriction. The platform rejects any non-`None` value on a block-output model. The plugin does not otherwise validate the numeric type or range of `max_device_top_k`; model authors must supply the actual supported bound. |
 | `supports_device_penalties` | `True` | Permits device sampling with active penalties. When this declaration is false and `InputBatch.no_penalties` is false, `TTModelRunner.check_perform_device_sampling` selects host sampling. The default preserves the existing behavior of model implementations that predate this declaration. |
+| `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, with async scheduling, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. |
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
 | `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
 
@@ -91,7 +92,8 @@ scheduling to remain enabled when an upstream executor or launch restriction
 requires synchronous execution.
 
 Device sampling also falls back to the host for supported host-only sampling
-controls, structured output, and unsupported logprob requests. These runtime
+controls, structured output without an eligible `supports_device_grammar`
+decode, and unsupported logprob requests. These runtime
 restrictions remain in force when `supports_sample_on_device=True`. Generic
 speculative request restrictions remain separate from ordinary sampling:
 the current speculative acceptance path requires greedy requests. See
