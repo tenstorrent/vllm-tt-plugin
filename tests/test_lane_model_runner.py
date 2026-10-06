@@ -374,6 +374,92 @@ def _sampling_params(rows=2):
     )
 
 
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        {},
+        {
+            "supports_intermediate_prefill_output_mask": False,
+            "supports_prefill_sampling_origins": False,
+        },
+        {"supports_intermediate_prefill_output_mask": True},
+        {"supports_prefill_sampling_origins": True},
+        {
+            "supports_intermediate_prefill_output_mask": True,
+            "supports_prefill_sampling_origins": True,
+        },
+    ],
+)
+@pytest.mark.parametrize("row_req_ids", [("a", "b"), ("b", "a")])
+@pytest.mark.parametrize("intermediate_mask", [None, [True, False]])
+@pytest.mark.parametrize("perform_device_sampling", [False, True])
+def test_submit_prefill_capability_metadata_preserves_request_order(
+    capabilities, row_req_ids, intermediate_mask, perform_device_sampling
+):
+    captured = {}
+    result = object()
+
+    def prefill_forward(**kwargs):
+        captured.update(kwargs)
+        return result
+
+    model = SimpleNamespace(prefill_forward=prefill_forward)
+    if capabilities is not None:
+        model.model_capabilities = capabilities
+    submitted = []
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="all",
+        request_specific_rope=False,
+        model=model,
+        async_decode=SimpleNamespace(
+            note_prefill_submitted=lambda: submitted.append(True)
+        ),
+        input_batch=SimpleNamespace(
+            req_id_to_index={"a": 0, "b": 1}, num_prompt_tokens=[4, 7]
+        ),
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((2, 12), dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        prompt_lens=torch.tensor([12, 10]),
+        input_positions=torch.tensor([8, 6]),
+        block_tables_per_layer=None,
+        multi_modal_kwargs={},
+        perform_device_sampling=perform_device_sampling,
+        tt_sampling_params=_sampling_params(),
+        prefill_empty_slots=[4, 1],
+        row_req_ids=list(row_req_ids),
+        intermediate_prefill_mask=None
+        if intermediate_mask is None
+        else torch.tensor(intermediate_mask),
+    )
+
+    assert TTModelRunner.submit_prefill(runner, model_input, [2]) is result
+
+    capabilities = capabilities or {}
+    if capabilities.get("supports_intermediate_prefill_output_mask"):
+        assert captured["prefill_output_mask"] == (
+            None
+            if intermediate_mask is None
+            else [not value for value in intermediate_mask]
+        )
+    else:
+        assert "prefill_output_mask" not in captured
+    if capabilities.get("supports_prefill_sampling_origins"):
+        assert captured["original_prompt_lens"] == [
+            {"a": 4, "b": 7}[req_id] for req_id in row_req_ids
+        ]
+    else:
+        assert "original_prompt_lens" not in captured
+    assert captured["tokens"] is model_input.input_tokens
+    assert captured["prompt_lens"] is model_input.prompt_lens
+    assert captured["empty_slots"] == [4, 1]
+    assert ("sampling_params" in captured) is perform_device_sampling
+    assert submitted == [True]
+
+
 @pytest.mark.parametrize("perform_device_sampling", [True, False])
 def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
     """``slot_remap`` moves per-slot state (GDN recurrent/conv), so it is not a
