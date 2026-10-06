@@ -194,29 +194,52 @@ class TTDecodeInterleavePolicy:
             self._decode_run = 0
 
 
+def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
+    """The most tokens one scheduling step can hand a single new request, named.
+
+    Resolved exactly as vLLM's ``Scheduler.__init__`` resolves its per-step
+    token budget: ``max_num_scheduled_tokens`` when it is set, otherwise
+    ``max_num_batched_tokens``. A positive ``long_prefill_token_threshold``
+    then caps that limit. Returns ``(limit, name_of_the_binding_cap)``; the
+    limit is ``sys.maxsize`` when nothing is configured.
+    """
+    scheduled = getattr(scheduler_config, "max_num_scheduled_tokens", None)
+    if scheduled is not None:
+        limit, name = int(scheduled), "max_num_scheduled_tokens"
+    else:
+        batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+        limit, name = (
+            (batched, "max_num_batched_tokens")
+            if batched > 0
+            else (
+                sys.maxsize,
+                "max_num_batched_tokens",
+            )
+        )
+    threshold = int(getattr(scheduler_config, "long_prefill_token_threshold", 0) or 0)
+    if 0 < threshold < limit:
+        limit, name = threshold, "long_prefill_token_threshold"
+    return limit, name
+
+
 def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
     """Reject caps that can never let a new request reach the alignment grid.
 
     ``_align_prefill_chunk_end`` defers a new request whose chunk falls short
     of the grid; that only converges if a later step can offer a larger chunk.
+    The binding cap is the one vLLM schedules with (``max_num_scheduled_tokens``
+    when set, else ``max_num_batched_tokens``), further capped by a positive
+    ``long_prefill_token_threshold``.
     """
-    caps = {
-        "max_num_batched_tokens": int(
-            getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
-        ),
-        "long_prefill_token_threshold": int(
-            getattr(scheduler_config, "long_prefill_token_threshold", 0) or 0
-        ),
-    }
-    for name, cap in caps.items():
-        if 0 < cap < align:
-            raise ValueError(
-                f"additional_config['tt']['prefill_chunk_alignment']={align} cannot be "
-                f"reached: scheduler {name}={cap} is a permanent per-step cap "
-                "below the "
-                "alignment. Raise the cap to at least the alignment or set "
-                "prefill_chunk_alignment to 0."
-            )
+    limit, name = _effective_prefill_step_limit(scheduler_config)
+    if limit < align:
+        raise ValueError(
+            f"additional_config['tt']['prefill_chunk_alignment']={align} cannot be "
+            f"reached: scheduler {name}={limit} is a permanent per-step cap "
+            "below the "
+            "alignment. Raise the cap to at least the alignment or set "
+            "prefill_chunk_alignment to 0."
+        )
 
 
 class TTScheduler(AsyncScheduler):
@@ -707,11 +730,8 @@ class TTScheduler(AsyncScheduler):
         cfg = getattr(self, "scheduler_config", None)
         if cfg is None:
             return sys.maxsize
-        cap = int(getattr(cfg, "max_num_batched_tokens", 0) or sys.maxsize)
-        threshold = int(getattr(cfg, "long_prefill_token_threshold", 0) or 0)
-        if threshold > 0:
-            cap = min(cap, threshold)
-        return cap
+        limit, _ = _effective_prefill_step_limit(cfg)
+        return limit
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()

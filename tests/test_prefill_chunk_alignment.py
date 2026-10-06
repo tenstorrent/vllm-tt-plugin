@@ -14,7 +14,11 @@ import pytest
 import vllm  # noqa: F401  (resolve the platform plugin before importing ours)
 
 from vllm_tt_plugin.config import get_tt_prefill_chunk_alignment
-from vllm_tt_plugin.scheduler import TTScheduler, _validate_prefill_chunk_alignment
+from vllm_tt_plugin.scheduler import (
+    TTScheduler,
+    _effective_prefill_step_limit,
+    _validate_prefill_chunk_alignment,
+)
 
 
 def _scheduler(alignment=128, *, base_mamba=False):
@@ -126,3 +130,49 @@ def test_init_rejects_caps_below_the_alignment():
             128,
             SimpleNamespace(max_num_batched_tokens=64, long_prefill_token_threshold=0),
         )
+
+
+def test_max_num_scheduled_tokens_is_the_step_limit_when_set():
+    # vLLM schedules with max_num_scheduled_tokens when it is configured; the
+    # alignment cap and its validation must see the same limit (review on #169).
+    cfg = SimpleNamespace(
+        max_num_batched_tokens=4096,
+        max_num_scheduled_tokens=256,
+        long_prefill_token_threshold=0,
+    )
+    assert _effective_prefill_step_limit(cfg) == (256, "max_num_scheduled_tokens")
+    s = _scheduler()
+    s.scheduler_config = cfg
+    assert s._full_step_prefill_cap() == 256
+    # unset -> max_num_batched_tokens, as before
+    cfg.max_num_scheduled_tokens = None
+    assert _effective_prefill_step_limit(cfg) == (4096, "max_num_batched_tokens")
+    # a positive long_prefill_token_threshold caps the resolved limit
+    cfg.max_num_scheduled_tokens = 256
+    cfg.long_prefill_token_threshold = 100
+    assert _effective_prefill_step_limit(cfg) == (100, "long_prefill_token_threshold")
+    assert s._full_step_prefill_cap() == 100
+
+
+def test_init_rejects_a_scheduled_token_limit_below_the_alignment():
+    # The reviewer's trigger: batched 4096, scheduled 64, threshold 0, alignment
+    # 128, an uncached 1,024-token prompt. Every step starts with a 64-token
+    # budget, the aligned split returns 0 forever and the waiting queue stalls.
+    with pytest.raises(ValueError, match="max_num_scheduled_tokens=64"):
+        _validate_prefill_chunk_alignment(
+            128,
+            SimpleNamespace(
+                max_num_batched_tokens=4096,
+                max_num_scheduled_tokens=64,
+                long_prefill_token_threshold=0,
+            ),
+        )
+    # and the scheduler's own cap agrees, so a 64-token proposal is a full step
+    s = _scheduler()
+    s.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=4096,
+        max_num_scheduled_tokens=64,
+        long_prefill_token_threshold=0,
+    )
+    assert s._full_step_prefill_cap() == 64
+    assert s._mamba_block_aligned_split(_request(1024), 64) == 64
