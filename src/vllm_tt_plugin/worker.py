@@ -686,7 +686,18 @@ def set_fabric(tt_config, num_devices):
             fabric_config,
             reliability_mode,
         )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+        payload = (tt_config or {}).get("fabric_router_max_payload_size")
+        if payload is None:
+            ttnn.set_fabric_config(fabric_config, reliability_mode)
+            return
+        # A model whose collectives were sized for a fabric packet payload
+        # (tt-metal's conftest `fabric_router_config`) asks for it here.
+        router_config = ttnn._ttnn.fabric.FabricRouterConfig()
+        router_config.max_packet_payload_size_bytes = int(payload)
+        logger.info("Fabric router max packet payload: %d bytes", int(payload))
+        ttnn.set_fabric_config(
+            fabric_config, reliability_mode, router_config=router_config
+        )
 
 
 # From tt-metal/conftest.py:

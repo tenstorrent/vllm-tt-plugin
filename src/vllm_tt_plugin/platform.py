@@ -722,6 +722,19 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.deepseek_v3.tt.generator_vllm:DeepseekV3ForCausalLM",
     )
 
+    # DeepSeek-V4.1 (Flash): the pinned vLLM has neither the architecture nor the
+    # HF config type, so the plain name is registered too (as for Gemma4) and the
+    # config class is put in vLLM's registry ahead of AutoConfig.
+    from vllm_tt_plugin.deepseek_v41_config import register_deepseek_v41_config
+
+    register_deepseek_v41_config()
+    for arch in ("DeepseekV41ForCausalLM", "TTDeepseekV41ForCausalLM"):
+        _register_model_if_missing(
+            ModelRegistry,
+            arch,
+            "models.demos.deepseek_v3_d_p.tt.v41.generator_vllm:DeepseekV41ForCausalLM",
+        )
+
     # GPT-OSS
     _register_model_if_missing(
         ModelRegistry,
