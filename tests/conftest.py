@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # `TTPlatform.check_and_update_config` records its results on the class rather
 # than on the config it is handed, so one test that calls it configures every
@@ -26,6 +27,8 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.input_processor as input_processor
 
     from vllm_tt_plugin.platform import TTPlatform
+
+    saved_empty_cache = torch.accelerator.empty_cache
 
     unset = object()
     saved = {
@@ -52,6 +55,8 @@ def reset_tt_platform_class_state():
     )
 
     yield
+
+    torch.accelerator.empty_cache = saved_empty_cache
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler

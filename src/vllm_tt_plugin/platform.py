@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import sys
 import weakref
+from functools import wraps
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 import torch
@@ -633,6 +634,34 @@ def _tt_model_class_overrides() -> dict[str, str]:
             )
         overrides[arch] = target
     return overrides
+
+
+def _install_torch_accelerator_cleanup_patch() -> None:
+    """Make process-wide cache release safe with TT's CPU-only Torch runtime.
+
+    Upstream distributed teardown treats TT as a non-CPU platform and calls
+    this Torch API before host-cache cleanup. With no Torch accelerator that
+    call raises. Preserve available-accelerator behavior and leave upstream's
+    host/distributed cleanup untouched. TT hooks and general-plugin loading
+    install this only when TT is the active platform.
+    """
+    from vllm.platforms import current_platform
+
+    if not isinstance(current_platform, TTPlatform):
+        return
+
+    original = torch.accelerator.empty_cache
+    if getattr(original, "_tt_availability_guard", False):
+        return
+
+    @wraps(original)
+    def empty_cache():
+        if torch.accelerator.is_available():
+            return original()
+        return None
+
+    empty_cache._tt_availability_guard = True
+    torch.accelerator.empty_cache = empty_cache
 
 
 def _install_diffusion_gemma_architecture_patch() -> None:
@@ -1521,6 +1550,7 @@ class TTPlatform(Platform):
         # test models when the CLI override requests them).
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
+        _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
@@ -1601,6 +1631,7 @@ class TTPlatform(Platform):
         # Before any read of ``vllm_config.use_v2_model_runner``, which
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
+        _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
         # Too late to change this config's asynchronous setting, which upstream
         # resolved before calling this hook. Installed anyway, for a process
