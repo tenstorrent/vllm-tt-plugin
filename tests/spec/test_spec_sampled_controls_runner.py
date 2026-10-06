@@ -598,6 +598,38 @@ def test_an_ordinary_decode_on_a_speculating_launch_reads_each_request_s_row_0()
     assert bitmask[:2, 0].tolist() == [0, DRAFT_LEN + 1]
 
 
+def test_a_grammar_output_missing_a_structured_row_is_refused():
+    """A structured row the grammar output omits would walk unconstrained.
+
+    The step captured both structured requests when it was built, so a
+    synchronous sample that receives rows for one of them only is refused by
+    name. An asynchronous sample tolerates it, because a request finished by
+    the result before it may be absent and its token is discarded.
+    """
+    runner = _runner()
+    for req_id, first in (("a", 1), ("b", 9)):
+        sync_harness._add_request(
+            runner,
+            req_id,
+            SamplingParams(temperature=0.0, structured_outputs=_structured()),
+            first_token=first,
+        )
+    model_input = sync_harness._build(
+        runner, "a", "b", drafts={"a": [5] * DRAFT_LEN, "b": [6] * DRAFT_LEN}
+    )
+    assert model_input.structured_output_req_ids == {"a", "b"}
+    only_a = GrammarOutput(
+        ["a"], torch.zeros(DRAFT_LEN + 1, 1, dtype=torch.int32).numpy()
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing TT batch request IDs: \['b'\]"):
+        runner._reorder_grammar_bitmask(only_a, model_input, lane_total=None)
+    tolerated = runner._reorder_grammar_bitmask(
+        only_a, model_input, lane_total=None, require_complete=False
+    )
+    assert bool((tolerated[1] == -1).all())
+
+
 # endregion The scheduler's bitmask layout
 
 # region Asynchronous: the grammar handoff
