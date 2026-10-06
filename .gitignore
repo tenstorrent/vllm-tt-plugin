@@ -38,3 +38,6 @@ vllm_cache/
 *.tensorbin
 tracy/
 profiler/
+
+# Locally generated runtime/build artifacts (fabric, inspector, watcher, etc.)
+generated/

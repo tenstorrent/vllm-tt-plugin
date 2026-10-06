@@ -5,7 +5,7 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -29,6 +29,7 @@ def _batch_with_one_request(
     prompt_len: int,
     output_len: int,
     num_computed_tokens: int,
+    sampling_params: SamplingParams | None = None,
 ) -> tuple[InputBatch, CachedRequestState]:
     """Creates a batch with a single request, for testing purposes."""
     batch = InputBatch(
@@ -43,7 +44,11 @@ def _batch_with_one_request(
         req_id="r",
         prompt_token_ids=list(range(prompt_len)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=(
+            sampling_params
+            if sampling_params is not None
+            else SamplingParams(temperature=0.0)
+        ),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -55,10 +60,12 @@ def _batch_with_one_request(
 
 def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamespace:
     """Creates a fake runner with the given batch and request, for testing purposes."""
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         input_batch=batch,
         requests={"r": request},
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
+        _is_adaptive_block_output=False,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
@@ -71,6 +78,12 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+    # The output-commit methods resolve the step's committed width through
+    # _tt_committed_width (reads _is_adaptive_block_output + _output_tokens_per_step).
+    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
+        runner, toks
+    )
+    return runner
 
 
 def _prepare(runner, *rows):
@@ -125,7 +138,6 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens=[num_computed_tokens],
         num_output_tokens=[0],
     )
-
     model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
 
     assert model_input is not None
@@ -216,6 +228,33 @@ def test_completed_cached_request_builds_decode_input(output_len: int):
     )
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
     assert model_input.input_tokens[0, 0] == batch.token_ids_cpu[0, num_tokens - 1]
+
+
+def test_structured_decode_build_captures_expected_grammar_request_ids():
+    prompt_len = 8
+    output_len = 1
+    num_computed_tokens = prompt_len
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=output_len,
+        num_computed_tokens=num_computed_tokens,
+        sampling_params=SamplingParams(
+            temperature=0.0,
+            structured_outputs=StructuredOutputsParams(json_object=True),
+        ),
+    )
+    runner = _fake_runner(batch, request)
+    runner.check_perform_device_sampling = lambda **_: True
+
+    model_input = _prepare(
+        runner,
+        ("r", 1, num_computed_tokens, output_len),
+    )
+
+    assert model_input.prompt_lens is None
+    assert model_input.grammar_bitmask == [None]
+    assert model_input.structured_output_req_ids == frozenset({"r"})
+    assert model_input.defer_device_sampling is True
 
 
 def test_final_one_token_prompt_chunk_stays_prefill():
@@ -315,3 +354,26 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+
+@pytest.mark.parametrize("declared", [None, True, False])
+@pytest.mark.parametrize("has_penalties", [False, True])
+def test_device_penalties_follow_model_capability(declared, has_penalties):
+    capabilities = {} if declared is None else {"supports_device_penalties": declared}
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        model=SimpleNamespace(model_capabilities=capabilities),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_penalties=not has_penalties,
+            no_allowed_token_ids=True,
+            max_num_logprobs=None,
+            sampling=SimpleNamespace(
+                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            ),
+        ),
+    )
+    expected = not (has_penalties and declared is False)
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected

@@ -3,6 +3,7 @@
 
 from vllm_tt_plugin.platform import (
     _install_diffusion_gemma_architecture_patch,
+    _install_tt_async_spec_method_patch,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
     register_tt_test_models,
@@ -34,3 +35,10 @@ def register_tt_models_from_plugin() -> None:
     # general plugins, and without the rewrite upstream's DiffusionGemma
     # MODELS_CONFIG_MAP hook fires there before any platform hook runs.
     _install_diffusion_gemma_architecture_patch()
+    # The engine core runs VllmConfig.__post_init__ again when its startup
+    # handshake completes, with asynchronous scheduling already on. Under data
+    # parallelism the mp executor runs the TT worker, and with it
+    # check_and_update_config, in another process, so no TT hook has patched
+    # the gate in the engine core by then. Without this, a model-owned drafter
+    # launch fails upstream's async gate there after KV cache allocation.
+    _install_tt_async_spec_method_patch()

@@ -145,11 +145,11 @@ def test_extract_output_device_prefill_returns_front_packed_tokens():
     assert logprobs is None
 
 
-def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
+def test_extract_output_host_decode_samples_scheduled_rows():
     captured: dict = {}
     batch = _lane_batch()
     batch.build_merged_sampling_metadata = (
-        lambda rows, non_sampling_rows=None: None
+        lambda rows, non_sampling_rows=None, compact=False: None
     )  # sampler ignores it
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Full slot logits: row r's argmax is token r (vocab>=5).
@@ -162,7 +162,7 @@ def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
         runner, logits, None, model_input, scheduled_rows=[4, 1], is_decode=True
     )
 
-    assert captured["logits"].shape == (5, VOCAB)  # sampled the whole slot batch once
+    assert captured["logits"].shape == (2, VOCAB)  # only scheduled rows are sampled
     assert sampled.tolist() == [[4], [1]]  # rows 4 and 1, in scheduled order
     assert logprobs is None
 
@@ -170,7 +170,9 @@ def test_extract_output_host_decode_samples_full_slot_then_picks_rows():
 def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     captured: dict = {}
     batch = _lane_batch()
-    batch.build_merged_sampling_metadata = lambda rows, non_sampling_rows=None: None
+    batch.build_merged_sampling_metadata = (
+        lambda rows, non_sampling_rows=None, compact=False: None
+    )
     runner = SimpleNamespace(host_sampler=_capturing_host_sampler(captured))
     # Prefill logits: one row per scheduled request (front-packed, plan order).
     prefill_logits = torch.full((2, VOCAB), -10.0)
@@ -192,11 +194,8 @@ def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     )
 
     full = captured["logits"]
-    assert full.shape == (5, VOCAB)  # scattered onto the full slot grid before sampling
-    assert torch.equal(full[4], prefill_logits[0])  # request 0 -> stable row 4
-    assert torch.equal(full[1], prefill_logits[1])  # request 1 -> stable row 1
-    for gap in (0, 2, 3):
-        assert torch.all(full[gap] == 0)  # unscheduled rows left empty
+    assert full.shape == (2, VOCAB)
+    assert torch.equal(full, prefill_logits)  # scheduled order survives slot mapping
     assert sampled.tolist() == [[3], [6]]
 
 
@@ -238,10 +237,6 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     class FakeInputBatch:
         sampling = SimpleNamespace(generators={0: intermediate, 1: final})
 
-        def advance_generators(self, rows):
-            for row in rows:
-                torch.rand(1, generator=self.sampling.generators[row])
-
     generators = TTModelRunner._build_host_generators(
         FakeInputBatch(), [0, 1], torch.tensor([True, False])
     )
@@ -250,13 +245,14 @@ def test_build_host_generators_preserves_intermediate_request_rng():
     assert torch.equal(generators[0].get_state(), intermediate_before)
     assert generators[1] is final
     assert torch.equal(intermediate.get_state(), intermediate_before)
-    assert not torch.equal(final.get_state(), final_before)
+    assert torch.equal(final.get_state(), final_before)
 
 
 def test_get_output_tokens_skips_all_intermediate_prefill_rows():
     runner = SimpleNamespace(
         host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run"),
         _is_block_output_model=False,
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
     )
     model_input = SimpleNamespace(intermediate_prefill_mask=torch.tensor([True]))
@@ -301,6 +297,7 @@ def test_finish_lane_sync_suppresses_intermediate_prefill_output():
             num_tokens=[8],
         ),
         apply_and_build_runner_output=unexpected_final_output,
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
     )
 
@@ -342,6 +339,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         trace_mode="none",
         request_specific_rope=False,
         model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
     )
     model_input = SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
@@ -393,6 +391,8 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         trace_mode="none",
         request_specific_rope=False,
         model=FakeModel(),
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: None,
     )
     remap = torch.tensor([1, 0], dtype=torch.int32)
     model_input = SimpleNamespace(
@@ -405,7 +405,12 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         perform_device_sampling=perform_device_sampling,
         prompt_tokens=None,
         output_tokens=None,
-        reset_batch=False,
+        decode_layout_changed=False,
+        num_valid_drafts=None,
+        # Not a verify: the submission counters read this to tell an ordinary
+        # decode from one.
+        spec_mode=None,
+        accepted_counts=None,
         slot_remap=remap,
     )
 
@@ -430,10 +435,15 @@ def test_async_lane_decode_uses_batch_extraction():
 
     runner = SimpleNamespace(lane_batch=FakeLaneBatch())
     controller = TTAsyncDecodeController(runner)
-    controller.finalize_decode = lambda submission: TTFinalizedDecode(
-        tt_out=torch.tensor([[1, 2, 3]], dtype=torch.float32),
-        tt_log_probs=None,
-    )
+
+    def finalize(submission, *, sampling_rows=None):
+        assert sampling_rows == [4]
+        return TTFinalizedDecode(
+            tt_out=torch.tensor([[1, 2, 3]], dtype=torch.float32),
+            tt_log_probs=None,
+        )
+
+    controller.finalize_decode = finalize
     submission = TTDecodeSubmission(
         tt_out=object(),
         read_events=None,
@@ -444,7 +454,6 @@ def test_async_lane_decode_uses_batch_extraction():
     context = SubmittedStepContext(
         req_ids=["req-4"],
         req_id_to_index={"req-4": 0},
-        request_states=(),
         submit_time_ns=123,
     )
     model_input = object()

@@ -14,6 +14,7 @@ from vllm.sampling_params import (
 
 from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
+    get_tt_supports_device_grammar,
     store_tt_output_tokens_per_step,
 )
 from vllm_tt_plugin.platform import (
@@ -288,6 +289,21 @@ class ARModel:
     }
 
 
+class ARDeviceGrammarModel(ARModel):
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_device_grammar": True,
+    }
+
+
+class InvalidDeviceGrammarModel(ARModel):
+    model_capabilities = {
+        **ARModel.model_capabilities,
+        "supports_sample_on_device": False,
+        "supports_device_grammar": True,
+    }
+
+
 class _WeakrefableConfig(SimpleNamespace):
     """SimpleNamespace itself cannot be weak-referenced; VllmConfig can."""
 
@@ -333,6 +349,23 @@ def test_startup_stores_block_capability_and_enforces_contract(monkeypatch):
     assert config.diffusion_config is None
     assert not hasattr(config.model_config.hf_config, "canvas_length")
     assert config.model_config.is_diffusion is False
+
+
+def test_startup_stores_device_grammar_capability(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, ARDeviceGrammarModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert get_tt_supports_device_grammar(config)
+
+
+def test_device_grammar_requires_device_sampling_capability(monkeypatch):
+    config = _ar_config()
+    _patch_model_resolution(monkeypatch, InvalidDeviceGrammarModel)
+
+    with pytest.raises(ValueError, match="supports_sample_on_device"):
+        TTPlatform.check_and_update_config(config)
 
 
 def _switch_resolution(monkeypatch, model_class):
@@ -445,6 +478,68 @@ def test_startup_requires_block_model_lifecycle_hooks(monkeypatch):
         TTPlatform.check_and_update_config(config)
 
 
+def test_startup_requires_the_slot_move_hook_for_adaptive_block_models(monkeypatch):
+    """An adaptive block-output model admits several live requests, so the runner
+    can gather its per-slot state between steps and then releases a request by
+    its CURRENT slot. A model that keys a session on the slot must therefore
+    track the move, or a release identifies the wrong request and tears down a
+    live session (vllm-tt-plugin#118 review, finding 1).
+
+    Plain block-output is pinned to max_num_seqs=1 and cannot be gathered, so it
+    is deliberately NOT required there -- see the sibling test above, whose model
+    lacks the hook and is rejected only for the two older ones.
+    """
+
+    class AdaptiveBlockModelWithoutMoveHook:
+        model_capabilities = {
+            **BlockModel.model_capabilities,
+            "tt_adaptive_block_output": True,
+        }
+
+        @staticmethod
+        def release_request(_slot):
+            pass
+
+        @staticmethod
+        def release_persistent_capture():
+            pass
+
+    config = _config()
+    config.scheduler_config.max_num_seqs = 2
+    _patch_model_resolution(monkeypatch, AdaptiveBlockModelWithoutMoveHook)
+
+    with pytest.raises(ValueError, match=r"note_state_slots_moved"):
+        TTPlatform.check_and_update_config(config)
+
+
+def test_adaptive_block_model_with_the_move_hook_starts(monkeypatch):
+    """The same model, with the hook, is admitted at max_num_seqs > 1."""
+
+    class AdaptiveBlockModel:
+        model_capabilities = {
+            **BlockModel.model_capabilities,
+            "tt_adaptive_block_output": True,
+        }
+
+        @staticmethod
+        def release_request(_slot):
+            pass
+
+        @staticmethod
+        def release_persistent_capture():
+            pass
+
+        @staticmethod
+        def note_state_slots_moved(_moves):
+            pass
+
+    config = _config()
+    config.scheduler_config.max_num_seqs = 2
+    _patch_model_resolution(monkeypatch, AdaptiveBlockModel)
+
+    TTPlatform.check_and_update_config(config)
+
+
 @pytest.mark.parametrize(
     ("model_class", "expected_max_tokens", "expected_wrapped"),
     [
@@ -513,7 +608,7 @@ def test_startup_requires_device_sampling_for_block_models(monkeypatch, tt_confi
     config.additional_config = {"tt": tt_config}
     _patch_model_resolution(monkeypatch)
 
-    with pytest.raises(ValueError, match='sample_on_device_mode="all"'):
+    with pytest.raises(ValueError, match=r"sample_on_device_mode in \('all',\)"):
         TTPlatform.check_and_update_config(config)
 
 
@@ -725,6 +820,33 @@ def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
         TTPlatform.check_and_update_config(config)
 
 
+@pytest.mark.parametrize("sliding_window", [None, 128])
+@pytest.mark.parametrize("prefix_support", [None, False, True])
+@pytest.mark.parametrize("requested", [False, True])
+def test_prefix_cache_uses_adapter_capability(
+    monkeypatch, sliding_window, prefix_support, requested
+):
+    class PrefixModel(ARModel):
+        model_capabilities = dict(ARModel.model_capabilities)
+
+    if prefix_support is None:
+        PrefixModel.model_capabilities.pop("supports_prefix_caching", None)
+    else:
+        PrefixModel.model_capabilities["supports_prefix_caching"] = prefix_support
+    config = _config()
+    config.model_config.hf_config.model_type = "future_model"
+    config.model_config.hf_config.canvas_length = None
+    config.model_config.get_sliding_window = lambda: sliding_window
+    config.cache_config.enable_prefix_caching = requested
+    _patch_model_resolution(monkeypatch, PrefixModel)
+
+    TTPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching is (
+        requested and prefix_support is True
+    )
+
+
 @pytest.mark.parametrize(
     ("prompt_lens", "expected"),
     [
@@ -879,3 +1001,12 @@ def test_default_max_tokens_without_canvas_room_is_rejected_at_validation():
         _validate(params, prompt_len=1000)
 
     assert params.max_tokens is None
+
+
+def test_startup_rejects_top_k_host_fallback_for_block_output(monkeypatch):
+    class BoundedBlockModel(BlockModel):
+        model_capabilities = {**BlockModel.model_capabilities, "max_device_top_k": 32}
+
+    _patch_model_resolution(monkeypatch, BoundedBlockModel)
+    with pytest.raises(ValueError, match="max_device_top_k.*block-output"):
+        TTPlatform.check_and_update_config(_config())

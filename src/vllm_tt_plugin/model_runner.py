@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, fields, replace
 from functools import partial
@@ -23,27 +24,34 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
+    SubmittedStepContext,
     TTAsyncDecodeController,
+    TTDecodeSubmission,
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_spec_plan,
+    get_tt_supports_device_grammar,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
+    is_tt_device_grammar_preload_eligible,
 )
+from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
     CachedRequestState,
@@ -63,9 +71,24 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.spec_admission import method_requirements
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    HIDDEN_HANDOFF_ROUNDTRIP,
+    HIDDEN_HANDOFFS,
+    PLACEHOLDER_TOKEN_ID,
+    SPEC_REQUIREMENT_DEVICE_PROPOSE,
+    SPEC_REQUIREMENT_HIDDEN_FEED,
+    SPEC_REQUIREMENTS,
+    DraftOutput,
+    accept_greedy_drafts,
+    normalize_declared_values,
+)
 from vllm_tt_plugin.structured_output import (
+    capture_structured_decode_request_ids,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
+    scheduled_structured_output_request_ids,
 )
 
 if TYPE_CHECKING:
@@ -102,7 +125,7 @@ def _parse_layer_index(layer_name: str) -> int:
 
 @dataclass(frozen=True)
 class _SyncForward:
-    """Materialized non-DP forward result awaiting host/device sampling.
+    """Materialized front-packed forward result awaiting sampling.
 
     Carries everything ``_get_output_tokens`` needs so the sampling tail can
     run in a later ``sample_tokens`` call rather than inside ``execute_model``.
@@ -115,6 +138,37 @@ class _SyncForward:
     batch_size_per_dp: list[int]
     perform_device_sampling: bool
     is_decode: bool
+    decode_submission: TTDecodeSubmission | None = None
+    # The verify's hidden handle, for a model whose drafter consumes it.
+    spec_hidden: Any | None = None
+
+
+def _step_verifies(
+    supports_narrow_decode: bool,
+    num_valid_drafts: torch.Tensor,
+    accepted_counts: torch.Tensor,
+    num_rows: int,
+) -> bool:
+    """Whether a speculating launch sends the model a verify on this step.
+
+    Two things make a step speculative. A row carrying drafts is the obvious
+    one. The other is a row whose previous step committed more than one token:
+    ``accepted_counts`` is how the model finds which candidate state slot that
+    commit landed on, so the step after such a commit carries the count even
+    when it drafts nothing. One step resolves it, because that step commits a
+    single token and records a count of 1.
+
+    A model that does not declare ``supports_narrow_decode`` implements one
+    input shape, so every step it is sent is a verify.
+    """
+    if not supports_narrow_decode:
+        return True
+    if bool(num_valid_drafts.any()):
+        return True
+    # Only the live rows are read: a padding row sits at the post-prefill
+    # default of 1 and owns no request, so it says nothing about state to
+    # resolve.
+    return any(int(accepted_counts[row]) > 1 for row in range(num_rows))
 
 
 def _coerce_output_block(
@@ -140,6 +194,37 @@ def _coerce_output_block(
     return sampled_token_ids
 
 
+def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
+    """Tell the model that its per-slot state moved ``old -> new``.
+
+    The model keys B=1 session ownership on the slot it was handed at prefill
+    (``empty_slots``), and the decode gather permutes every slot. Two things have
+    to stay true for a release to identify the right request:
+
+    * the model's recorded owner slot must follow the gather -- otherwise a
+      request prefilled at slot 1 and gathered to row 0 is released as 0 while
+      the model still holds 1, and its session outlives the request;
+    * the release must then use the request's CURRENT slot.
+
+    Keying on the prefill slot instead (the first attempt at this) is not enough,
+    because slots are REUSED: a cancelled request frees its slot, a survivor is
+    gathered into it, and a new request is then prefilled into the survivor's old
+    slot and arms a session there. Releasing the survivor by its prefill slot
+    matches the newcomer's owner slot and clears a live session
+    (vllm-tt-plugin#118 review, finding 1).
+
+    The hook is optional -- models that hold no per-slot session do not define it.
+    Reached through ``runner.__dict__``/``getattr`` so it also works on a
+    partially initialised runner and on the ``SimpleNamespace`` stand-ins the
+    state-slot tests pass as ``self`` when calling these methods unbound.
+    """
+    if not moves:
+        return
+    note = getattr(getattr(runner, "model", None), "note_state_slots_moved", None)
+    if callable(note):
+        note(dict(moves))
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -162,6 +247,34 @@ class TTModelRunner:
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
         self._shutdown_complete = False
+        self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
+        self._device_grammar_poisoned = False
+
+        # Resolved and validated by the platform's config-time admission;
+        # ``None`` means the launch asked for no speculation. The draft length
+        # is the plan's, not ``speculative_config.num_speculative_tokens``, for
+        # a model that reduced it -- though the platform publishes the
+        # reduction back, so the two agree.
+        spec_plan = get_tt_spec_plan(vllm_config)
+        self._num_speculative_tokens = spec_plan.effective_k if spec_plan else 0
+        self._spec_method = (
+            str(vllm_config.speculative_config.method) if spec_plan else None
+        )
+        # A model that also serves a narrow [B, 1] decode lets a step on which
+        # no request carries drafts run as the ordinary decode it is, which is
+        # what keeps batched baseline decoding overlapped inside a speculating
+        # server. ``load_model`` narrows this further, once the model exists.
+        self._spec_supports_narrow_decode = bool(
+            spec_plan and spec_plan.supports_narrow_decode
+        )
+        # Who proposes: the model's own drafter on device, or a host drafter.
+        # Read from the one requirements table rather than from a second list of
+        # method names, and once, because that table is rebuilt per call.
+        self._spec_drafts_from_model = bool(
+            self._spec_method
+            and SPEC_REQUIREMENT_DEVICE_PROPOSE
+            in method_requirements(self._spec_method)
+        )
 
         if self.model_config.is_encoder_decoder:
             raise ValueError("Encoder-decoder models aren't yet supported for TT")
@@ -175,11 +288,39 @@ class TTModelRunner:
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
+        self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
+            vllm_config,
+            trace_mode=self.trace_mode,
+            enable_model_warmup=self.enable_model_warmup,
+        )
+        if (
+            not self.supports_device_grammar
+            and get_tt_supports_device_grammar(vllm_config)
+            and self.trace_mode != "none"
+            and not self.enable_model_warmup
+        ):
+            logger.warning(
+                "TT device grammar sampling requires model warmup before "
+                "traced execution; retaining host grammar sampling because "
+                "enable_model_warmup is false"
+            )
+            self.supports_device_grammar = False
         # Runtime-discovered physical device count, supplied by the worker.
         self.num_devices = num_devices
         # Whether to sample on device
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
+        if self.supports_device_grammar and (
+            self.sample_on_device_mode is None or self.scheduler_config.async_scheduling
+        ):
+            logger.info(
+                "TT device grammar runtime activation is disabled "
+                "(sample_on_device_mode=%s, async_scheduling=%s); retaining "
+                "host grammar sampling",
+                self.sample_on_device_mode,
+                self.scheduler_config.async_scheduling,
+            )
+            self.supports_device_grammar = False
         # Whether the model supports top-K logprobs on device.
         # Detected from model_type (available to all DP ranks without
         # requiring the model to be loaded). Models like gpt-oss-120b
@@ -225,12 +366,10 @@ class TTModelRunner:
         # correct even with one forward in flight.
         self._pending_samples: deque[Any] = deque()
 
-        # Non-DP async scheduling: overlap CPU scheduling with device execution.
-        # Only supported for DP=1 (DP>1 uses a different execution path).
-        self.non_dp_async_scheduling = (
-            self.scheduler_config.async_scheduling
-            and self.parallel_config.data_parallel_size == 1
-        )
+        # The platform has already disabled upstream async scheduling when the
+        # registered model lacks async-decode capability. Contract negotiation
+        # selects reload semantics, not async eligibility.
+        self.async_decode_scheduling = self.scheduler_config.async_scheduling
         self._steady_decode_lock = threading.Lock()
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
@@ -245,9 +384,35 @@ class TTModelRunner:
         # request's ROW, not its state.
         self._req_state_slot: dict[str, int] = {}
 
+        # req_id -> how many tokens its last step committed, for the same
+        # reason: a running request the scheduler skips for one step is removed
+        # from the persistent batch and added back later, and only an explicit
+        # preemption releases the model's candidate state, so the count that
+        # selects among those candidates has to survive the row going away.
+        # Draft IDs are resolved separately by _drafts_to_verify according to
+        # scheduling mode. An absent accepted-count entry defaults to 1.
+        self._req_accepted_counts: dict[str, int] = {}
+
+        # Pending proposal IDs. Synchronous execution hands them to the
+        # scheduler through take_draft_token_ids. Asynchronous execution
+        # consumes them in _drafts_to_verify within the scheduled lookahead
+        # reservation. Each consumer takes a proposal only once.
+        self._proposed_draft_token_ids: dict[str, list[int]] = {}
+        # Rows a verify answered by argmax although their request is not
+        # speculable. See _note_unspeculable_verify_rows; reported at shutdown.
+        self._num_unspeculable_verify_rows = 0
+        # Built on first use rather than here, because constructing it compiles
+        # numba kernels and a launch that never speculates must not pay that.
+        self._ngram_proposer: Any = None
+        self._pending_state_slot_settle: dict[str, int] | None = None
+        # Slot-level ``old -> new`` for the same pending gather, forwarded to the
+        # model once the decode is accepted so its recorded session owner follows
+        # the move (see ``_notify_model_slot_moves``).
+        self._pending_state_slot_moves: dict[int, int] | None = None
+
         # Every standard-DP rank owns its own mesh and therefore its own host
         # sampler state. Single-process modes also instantiate exactly one.
-        self.host_sampler = Sampler()
+        self.host_sampler = create_host_sampler()
 
         # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
         # custom logits processors). Used by the host sampler when device
@@ -290,6 +455,14 @@ class TTModelRunner:
         # property; releasing the model below is.
 
         # While the model is still alive, and before the mesh closes.
+        unspeculable_rows = getattr(self, "_num_unspeculable_verify_rows", 0)
+        if unspeculable_rows:
+            logger.warning(
+                "Speculative verify steps committed a greedy token for %d "
+                "row(s) whose request is not speculable (non-zero temperature "
+                "or a penalty).",
+                unspeculable_rows,
+            )
         release = getattr(
             getattr(self, "model", None), "release_persistent_capture", None
         )
@@ -327,8 +500,8 @@ class TTModelRunner:
         ``tt_data_parallel_size`` in-process DP replicas. In this mode the
         persistent batch is a ``TTLaneInputBatch`` that owns the lane layout
         (stable per-lane device slots, merged sampling) and the runner only
-        orchestrates; standard multi-process DP and non-DP keep the plain
-        ``InputBatch``, one per engine.
+        orchestrates; single-process execution and standard multi-process DP
+        ranks keep the plain ``InputBatch``, one per engine.
 
         Derived (rather than cached in ``__init__``) so it depends only on
         already-set runner state -- this mirrors ``uses_tt_lane_coordinator``:
@@ -344,6 +517,98 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        if self.supports_device_grammar:
+            activate = getattr(self.model, "enable_device_grammar", None)
+            if callable(activate):
+                activate()
+            runtime_support = bool(getattr(self.model, "device_grammar_enabled", False))
+            has_sample_api = callable(
+                getattr(self.model, "sample_deferred_decode", None)
+            )
+            if not runtime_support or not has_sample_api:
+                logger.warning(
+                    "TT model declares device grammar support but this runtime "
+                    "layout has no compatible sampler; retaining host grammar "
+                    "sampling (runtime_support=%s, sample_api=%s)",
+                    runtime_support,
+                    has_sample_api,
+                )
+                self.supports_device_grammar = False
+        if self._spec_supports_narrow_decode:
+            self._spec_supports_narrow_decode = self._narrow_steps_serve_the_drafter()
+
+    def _poison_device_grammar(self) -> None:
+        """Reject all later runner work after a deferred decode becomes unsafe."""
+        self._device_grammar_poisoned = True
+
+    def _raise_if_device_grammar_poisoned(self) -> None:
+        if getattr(self, "_device_grammar_poisoned", False):
+            raise RuntimeError(
+                "TT device grammar sampling previously failed after decode "
+                "submission; reconstruct the model runner before continuing"
+            )
+
+    def _narrow_steps_serve_the_drafter(self) -> bool:
+        """Whether a step that verifies nothing can still feed the drafter.
+
+        A step with nothing to verify returns no ``VerifyOutput``, so it
+        produces no hidden handle. A drafter whose target hidden state reaches
+        it through the runner would then be asked to draft from nothing, so for
+        that one pairing the step stays a verify and the launch keeps the
+        ordinary decode's overlap only where it can serve it. A drafter that
+        declares no hidden feed, or one that keeps its own state on device, is
+        unaffected.
+
+        Read from what the model declares rather than from what the method
+        requires, because this is a property of the drafter: the model-owned
+        method demands only that the model propose, and what its drafter reads
+        is the model's own statement.
+
+        Decided here rather than at step time: the alternative is handing that
+        drafter ``None`` and hoping, which is the silent degradation this
+        contract refuses everywhere else.
+        """
+        if not self._spec_drafts_from_model:
+            # A host proposer reads the request's own text and is handed no
+            # hidden state, so nothing here constrains it.
+            return True
+        declared_requirements = normalize_declared_values(
+            (getattr(type(self.model), "model_capabilities", None) or {}).get(
+                "spec_requirements"
+            ),
+            SPEC_REQUIREMENTS,
+            f"{type(self.model).__name__} model_capabilities['spec_requirements']",
+        )
+        if SPEC_REQUIREMENT_HIDDEN_FEED not in declared_requirements:
+            return True
+        declared = normalize_declared_values(
+            (getattr(type(self.model), "model_capabilities", None) or {}).get(
+                "spec_hidden_handoff"
+            ),
+            HIDDEN_HANDOFFS,
+            f"{type(self.model).__name__} model_capabilities['spec_hidden_handoff']",
+        )
+        if HIDDEN_HANDOFF_ROUNDTRIP not in declared:
+            return True
+        logger.info(
+            "TT speculative decoding: %s feeds its drafter the target hidden "
+            "state through the runner, so every decode step stays a verify "
+            "and none of them overlaps. A model that keeps its hidden state "
+            "on device, or a drafter that needs none, decodes a draftless "
+            "step as an ordinary overlapping decode.",
+            type(self.model).__name__,
+        )
+        return False
+
+    def _uses_async_scheduler(self) -> bool:
+        """Whether upstream publishes outputs through placeholder accounting.
+
+        Synchronously produced outputs such as final prefills still require
+        lifecycle-deferred host state when the engine uses ``AsyncScheduler``.
+        """
+        return bool(
+            getattr(getattr(self, "scheduler_config", None), "async_scheduling", False)
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
@@ -680,9 +945,16 @@ class TTModelRunner:
     def _release_model_request(self, req_id: str) -> None:
         """Release model-owned state while the slot mapping is still valid.
 
-        State follows the request's ``_req_state_slot`` slot, not its batch
-        row: prefill can park a request at a slot other than its row when the
-        preferred row is held (``_alloc_prefill_state_slots``).
+        Released by the request's CURRENT slot, which is the identity the model
+        holds: it was handed the slot at prefill (``empty_slots``) and is told
+        about every subsequent gather through ``note_state_slots_moved``, so the
+        two agree at all times.
+
+        Releasing by the PREFILL slot instead does not work, even though it
+        survives the gather: slots are reused, so one request's prefill slot can
+        be another live request's current owner slot, and the release then clears
+        the newcomer's session (vllm-tt-plugin#118 review, finding 1). See
+        ``_notify_model_slot_moves``.
         """
         slot = self._req_state_slot.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
@@ -703,11 +975,10 @@ class TTModelRunner:
             self.requests.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
+        # Upstream input processing gives resubmissions fresh internal IDs, but
+        # keep the update order robust for an internal caller that bypasses it:
+        # a finished and newly scheduled duplicate is treated as two requests,
+        # clearing the old cached state before adding the new one.
         removed_req_indices: list[int] = []
         for req_id in scheduler_output.finished_req_ids:
             self._release_model_request(req_id)
@@ -989,8 +1260,8 @@ class TTModelRunner:
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
-        means identity, so skip it. Commits the move to ``self._req_state_slot`` for
-        every request the permutation touches, off-batch holders included."""
+        means identity, so skip it. The resulting ownership map remains pending
+        until ``decode_forward`` accepts the submission."""
         n_slots = self.tt_per_lane_max_num_seqs
         # More decode rows than slots means the batch cannot be described at all, so
         # truncating would just drop a request's state silently.
@@ -1030,10 +1301,39 @@ class TTModelRunner:
         for row, slot in enumerate(remap):
             for req_id in by_slot.get(slot, ()):
                 moved[req_id] = row
-        self._req_state_slot = moved
+        self._pending_state_slot_settle = moved
+        # Slot-level view of the SAME permutation, for the model's own per-slot
+        # state: row ``i`` reads slot ``remap[i]``, so slot ``remap[i]`` becomes
+        # slot ``i``. Handed over whole, not applied one pair at a time -- a
+        # sequential walk over a permutation can move the same state twice.
+        self._pending_state_slot_moves = {
+            remap[i]: i for i in range(n_slots) if remap[i] != i
+        }
         if all(remap[i] == i for i in range(n_slots)):
+            self._pending_state_slot_settle = None
+            self._pending_state_slot_moves = None
             return None
         return torch.tensor(remap, dtype=torch.int32)
+
+    def note_decode_state_slots_settled(self) -> None:
+        """Commit a remap only after the model accepted the decode.
+
+        The model is told about the move here, for the same reason the commit
+        happens here: a gather that the model refused never took effect on the
+        device, so telling it earlier would leave its owner slot describing a
+        permutation that did not happen.
+        """
+        if self._pending_state_slot_settle is not None:
+            self._req_state_slot = self._pending_state_slot_settle
+            self._pending_state_slot_settle = None
+        moves = self.__dict__.get("_pending_state_slot_moves")
+        if moves:
+            _notify_model_slot_moves(self, moves)
+        self._pending_state_slot_moves = None
+
+    def note_decode_layout_consumed(self) -> None:
+        """Retire the sticky layout transition after an accepted decode."""
+        self._decode_layout_changed_since_last_decode = False
 
     @staticmethod
     def _build_host_generators(
@@ -1043,10 +1343,8 @@ class TTModelRunner:
     ) -> dict[int, torch.Generator]:
         """Re-key generators (batch row -> Generator) to this build's rows.
 
-        The host sampler draws once per generator it is handed, so each request
-        must appear exactly once per step: this build's generators are advanced
-        here, and lane builds pass only their own ``req_indices`` so a generator
-        advances once per step rather than once per lane.
+        The sampler advances the request's live generator. Preparing inputs
+        must not consume random values before an output is sampled.
 
         An intermediate-prefill row's token is discarded, so it gets a clone
         and its request's real RNG state is left untouched.
@@ -1057,7 +1355,6 @@ class TTModelRunner:
             else set()
         )
         generators: dict[int, torch.Generator] = {}
-        rows_to_advance: list[int] = []
         for local_row, batch_row in enumerate(req_indices):
             generator = input_batch.sampling.generators.get(batch_row)
             if generator is None:
@@ -1066,11 +1363,497 @@ class TTModelRunner:
                 generators[local_row] = clone_torch_generator(generator)
             else:
                 generators[local_row] = generator
-                rows_to_advance.append(batch_row)
-        # Technically this advances the generator before it is copied, but it's
-        # ok because this happens consistently.
-        input_batch.advance_generators(rows_to_advance)
         return generators
+
+    def _drafts_to_verify(
+        self,
+        scheduler_output: SchedulerOutput,
+        row_req_ids: list[str],
+    ) -> dict[str, list[int]]:
+        """The drafts this step verifies, by request.
+
+        Synchronously, the scheduler's own list, and that is the whole story:
+        a proposer reports through ``take_draft_token_ids``, upstream stores
+        the ids on the request, budgets and grammar-checks them, and delivers
+        what survived.
+
+        Asynchronously, nothing arrives that way. ``EngineCore.post_step``
+        skips ``take_draft_token_ids`` entirely when asynchronous scheduling is
+        on, because a step's drafts are not known before it runs, and upstream
+        substitutes its own ids inside the worker instead.
+        ``AsyncScheduler`` still schedules the lookahead: it leaves each
+        scheduled request holding ``[-1] * num_spec_tokens_to_schedule``, which
+        is a reservation of that many positions rather than a proposal. So the
+        placeholders are read as the reservation they are, and the proposal the
+        runner published for that request is what gets verified, trimmed to
+        what the scheduler reserved.
+
+        The runner's entry is consumed here, keeping the rule the synchronous
+        path gets from ``take_draft_token_ids``: a proposal is handed over
+        once, so a row that proposed nothing this step verifies nothing next
+        step rather than replaying a spent proposal.
+        """
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        if not self.async_decode_scheduling:
+            return scheduled
+        drafts: dict[str, list[int]] = {}
+        for req_id in row_req_ids:
+            offered = list(scheduled.get(req_id) or ())
+            placeholders = sum(1 for token in offered if token == PLACEHOLDER_TOKEN_ID)
+            if placeholders and placeholders != len(offered):
+                raise RuntimeError(
+                    f"request {req_id} was scheduled a mix of placeholder and "
+                    f"real draft tokens: {offered}. A scheduled list is either "
+                    "the asynchronous lookahead reservation or a proposal, and "
+                    "the runner cannot tell which half to verify"
+                )
+            if not placeholders:
+                # Real ids, or nothing scheduled at all. Either way this is
+                # what the scheduler means to verify.
+                if offered:
+                    drafts[req_id] = offered
+                self._proposed_draft_token_ids.pop(req_id, None)
+                continue
+            proposed = self._proposed_draft_token_ids.pop(req_id, None)
+            if proposed:
+                drafts[req_id] = list(proposed[:placeholders])
+        return drafts
+
+    @staticmethod
+    def _spec_row_state(
+        accepted_counts_by_req: dict[str, int],
+        scheduled_drafts: dict[str, list[int]],
+        row_req_ids: list[str],
+        num_drafts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather ``(drafts, num_valid_drafts, accepted_counts)`` for these rows.
+
+        The two halves come from different owners, deliberately.
+
+        ``scheduled_drafts`` contains actual IDs resolved by
+        ``_drafts_to_verify``. Synchronous execution receives scheduler-owned
+        IDs after the proposal handoff. Asynchronous execution substitutes
+        retained runner proposals within the scheduler's placeholder
+        reservation. Both paths obey the scheduled per-request draft budget;
+        structured speculative requests are not admitted.
+
+        The **accepted count** is the runner's, because nothing upstream models
+        it. It is keyed by request id rather than by row because a running
+        request that one step does not schedule leaves the persistent batch and
+        comes back, and only an explicit preemption releases the candidate
+        state the count selects.
+
+        A request absent from either mapping takes the post-prefill default: no
+        drafts, and a count of 1.
+        """
+        drafts = torch.full(
+            (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+        )
+        num_valid = torch.zeros(len(row_req_ids), dtype=torch.int32)
+        counts = torch.ones(len(row_req_ids), dtype=torch.int32)
+        for row, req_id in enumerate(row_req_ids):
+            counts[row] = accepted_counts_by_req.get(req_id, 1)
+            row_drafts = scheduled_drafts.get(req_id) or ()
+            valid = len(row_drafts)
+            if valid > num_drafts:
+                # The scheduler truncates to the lookahead it budgeted, which
+                # the platform publishes as num_speculative_tokens, so a longer
+                # list means the two disagree about the draft length. Raised
+                # rather than truncated, because silently dropping the tail
+                # would verify a prefix at positions the block was built for.
+                raise RuntimeError(
+                    f"request {req_id} was scheduled {valid} draft tokens, "
+                    f"above the block's {num_drafts}: {list(row_drafts)}"
+                )
+            num_valid[row] = valid
+            if valid:
+                drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
+        return drafts, num_valid, counts
+
+    def _publish_draft(self, req_id: str, tokens) -> None:
+        """Record this step's proposal for ``req_id``, or erase the last one.
+
+        Every proposer publishes through here so the speculability gate cannot
+        be bypassed by adding one: there is a single accept walk behind all of
+        them, and it certifies by id equality only.
+
+        Erasing on an empty offer is not optional. This map is what the
+        scheduler is told to verify next, so an entry nothing rewrote would be
+        verified against a token the request has already moved past.
+        """
+        if tokens and self._request_is_speculable(req_id):
+            self._proposed_draft_token_ids[req_id] = list(tokens)
+        else:
+            self._proposed_draft_token_ids.pop(req_id, None)
+
+    def _request_is_speculable(self, req_id: str) -> bool:
+        """False when this request's sampling cannot be certified by id equality.
+
+        ``accept_greedy_drafts`` compares token ids, so it can only certify a
+        greedy continuation. Anything that makes the target distribution differ
+        from argmax -- a non-zero temperature, or a penalty that reshapes the
+        logits -- has to be decoded ordinarily. top_p/top_k need no entry: they
+        only narrow a distribution that temperature 0 has already collapsed to a
+        point, so a greedy request carrying them is still greedy.
+        """
+        batch = self.input_batch
+        # getattr rather than attribute access: the gate has to stay total for
+        # any batch the runner is handed. A batch that tracks none of these
+        # sets has no sampled request to withhold drafts from, so the answer is
+        # the same as an empty set -- speculable.
+        for attr in (
+            "random_reqs",
+            "presence_penalties_reqs",
+            "frequency_penalties_reqs",
+            "repetition_penalties_reqs",
+        ):
+            if req_id in getattr(batch, attr, ()):
+                return False
+        return True
+
+    def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
+        """Count the live rows of a verify whose request is not speculable.
+
+        ``_publish_draft`` keeps drafts off such a request, but it cannot keep
+        the request out of a verify: another row's drafts, an unresolved
+        multi-token commit, or a model without ``supports_narrow_decode`` makes
+        the whole step one. A verify in ``argmax_ids`` mode answers every row
+        with the target's argmax, so the row commits that argmax, not a token
+        drawn with its request's temperature and penalties.
+        """
+        rows = sum(
+            1 for req_id in row_req_ids if not self._request_is_speculable(req_id)
+        )
+        if not rows:
+            return
+        self._num_unspeculable_verify_rows += rows
+        logger.warning_once(
+            "A speculative verify step included a request that is not "
+            "speculable (non-zero temperature or a penalty). A verify returns "
+            "the target argmax for every row, so on that step the request "
+            "committed the argmax and its temperature and penalties were not "
+            "applied. The total count is logged at shutdown."
+        )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """Hand the drafts proposed since the last call to the engine.
+
+        On the synchronous path, ``EngineCore`` collects proposals and passes
+        them to ``Scheduler.update_draft_token_ids``. The supported async path
+        instead consumes retained proposals in ``_drafts_to_verify`` within
+        the scheduled lookahead reservation. Returning ``None`` reports that
+        no pending proposal is available for handoff.
+        """
+        if not self._proposed_draft_token_ids:
+            return None
+        # Only requests the runner still holds. A request can finish in the
+        # step that proposed for it, and the runner drops it from
+        # ``self.requests`` before the engine collects; the scheduler tolerates
+        # a draft for a request it has finished, but the runner has no business
+        # reporting one for a request it has forgotten.
+        proposed = self._proposed_draft_token_ids
+        self._proposed_draft_token_ids = {}
+        req_ids = [req_id for req_id in proposed if req_id in self.requests]
+        if not req_ids:
+            return None
+        drafts = [proposed[req_id] for req_id in req_ids]
+        return DraftTokenIds(req_ids, drafts)
+
+    def _propose_ngram_drafts(self, committed: dict[str, list[int]]) -> None:
+        """Propose the next step's drafts from the tokens just committed.
+
+        The n-gram proposer searches the request's own text for a repeat of its
+        most recent tokens and drafts what followed last time, so it reads the
+        committed history and needs no model and no device. It runs after the
+        commit for that reason: ``token_ids_cpu`` and ``num_tokens`` have to
+        already hold this step's tokens.
+
+        Rows are the persistent batch's, because that is what the proposer
+        indexes; the result is re-keyed by request id, because that is what the
+        scheduler indexes.
+        """
+        if self._spec_method != "ngram" or not committed:
+            return
+        if self._ngram_proposer is None:
+            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+            self._ngram_proposer = NgramProposer(self.vllm_config)
+
+        num_reqs = self.input_batch.num_reqs
+        row_req_ids = list(self.input_batch.req_ids[:num_reqs])
+        # An empty list tells the proposer to skip that row, which is what a
+        # request that committed nothing this step needs.
+        sampled = [committed.get(req_id, []) for req_id in row_req_ids]
+        drafts = self._ngram_proposer.propose(
+            self._num_speculative_tokens,
+            sampled,
+            self.input_batch.num_tokens[:num_reqs],
+            self.input_batch.token_ids_cpu,
+        )
+        for req_id, row_drafts in zip(row_req_ids, drafts):
+            # A row the proposer found no repeat for drafts nothing this step,
+            # and a request whose sampling the accept walk cannot certify is
+            # not drafted for at all; _publish_draft handles both by erasing.
+            self._publish_draft(req_id, row_drafts)
+
+    def _propose_model_drafts(
+        self,
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+        model_input: TTModelInput,
+        hidden: Any,
+        row_req_ids: list[str],
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> None:
+        """Ask the model's own drafter for the next step's drafts.
+
+        The drafter continues each row from the token that row just committed,
+        so it is handed the committed block and each row's count rather than a
+        single token: which entry of the block is that row's last is
+        ``counts - 1``, the same arithmetic the verify uses to pick a candidate
+        state slot. Rows are the verify's rows, padding included, because the
+        drafter's state is indexed by row and a device graph has one shape.
+
+        ``hidden`` is the verify's own handle, passed straight back. The runner
+        does not interpret it, and a drafter that needs none is handed whatever
+        its verify returned, which for a model that returns nothing is
+        ``None``.
+        """
+        num_drafts = self._num_speculative_tokens
+        width = num_drafts + 1
+        rows = int(committed.shape[0])
+        if int(committed.shape[1]) < width:
+            # A narrow verify answers one column wide, because the model
+            # declared it serves the plain decode's shapes on a step where no
+            # row carries a draft. The drafter is a separate call with one
+            # shape of its own, so the block is padded to the uniform 1+K,
+            # which is what a row that committed less than the full width
+            # already looks like after a wide step.
+            committed = torch.cat(
+                [
+                    committed,
+                    torch.full(
+                        (rows, width - int(committed.shape[1])),
+                        PLACEHOLDER_TOKEN_ID,
+                        dtype=committed.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+        if model_input.spec_mode is None:
+            positions = self._committed_positions_from_state(
+                row_req_ids,
+                counts,
+                submitted_positions=model_input.input_positions,
+                width=width,
+            )
+        else:
+            # A verify has authoritative submitted positions. Its physical
+            # acceptance count can exceed the prefix retained at max_model_len.
+            positions = self._committed_positions(model_input.input_positions, width)
+        drafted = self.model.propose_draft_tokens(
+            num_drafts,
+            committed,
+            positions,
+            counts,
+            hidden=hidden,
+        )
+        if not isinstance(drafted, DraftOutput):
+            raise TypeError(
+                f"TT model {type(self.model).__name__} declares "
+                f"{SPEC_REQUIREMENT_DEVICE_PROPOSE!r} and its "
+                "propose_draft_tokens returned "
+                f"{type(drafted).__name__}; a drafter returns a DraftOutput "
+                "from vllm_tt_plugin.spec_decode"
+            )
+        draft_token_ids = drafted.draft_token_ids
+        if draft_token_ids.dtype != torch.int32:
+            # Checked before the range test below, which a fractional value
+            # passes: the ids are read out with ``int()``, so a float tensor
+            # would have every draft silently truncated and the scheduler would
+            # verify a token the drafter never proposed.
+            raise ValueError(
+                f"TT model {type(self.model).__name__} proposed drafts of "
+                f"dtype {draft_token_ids.dtype}; propose_draft_tokens returns "
+                "int32 token ids, as the candidate block and both side "
+                "tensors do"
+            )
+        if tuple(draft_token_ids.shape) != (rows, num_drafts):
+            raise ValueError(
+                f"TT model {type(self.model).__name__} proposed drafts of "
+                f"shape {tuple(draft_token_ids.shape)}; the contract is "
+                f"[{rows}, {num_drafts}], one row per verified row"
+            )
+        offered = drafted.num_valid
+        if offered is not None:
+            if offered.dtype != torch.int32:
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} returned "
+                    f"num_valid of dtype {offered.dtype}; propose_draft_tokens "
+                    "returns int32 counts, as both verify side tensors do"
+                )
+            if tuple(offered.shape) != (rows,):
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} returned "
+                    f"num_valid of shape {tuple(offered.shape)}; the contract "
+                    f"is [{rows}], one count per verified row"
+                )
+            if bool(((offered < 0) | (offered > num_drafts)).any()):
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} returned a "
+                    f"num_valid outside [0, {num_drafts}]: "
+                    f"{offered.tolist()}; a row offers at most the draft "
+                    "length the plan resolved, and 0 to offer nothing"
+                )
+        # Range-checked before the ids reach the scheduler, because a draft it
+        # stores is verified next step and committed if the model agrees with
+        # it, and an id outside the vocabulary is not something any verify can
+        # have chosen. Only the offered entries are checked: a row's unoffered
+        # tail is never read, so a drafter may pad it with the placeholder or
+        # with anything else.
+        vocab = int(self.input_batch.vocab_size)
+        if offered is None:
+            out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
+        else:
+            columns = torch.arange(num_drafts).unsqueeze(0)
+            is_offered = columns < offered.to(torch.int64).unsqueeze(1)
+            out_of_range = (
+                (draft_token_ids < 0) | (draft_token_ids >= vocab)
+            ) & is_offered
+        if bool(out_of_range.any()):
+            raise ValueError(
+                f"TT model {type(self.model).__name__} proposed a draft token "
+                f"id outside [0, {vocab}); a drafter offering nothing for a "
+                "row says so with num_valid, and the ids in that row are then "
+                "not read"
+            )
+        max_model_len = int(self.model_config.max_model_len)
+        skipped = set(skip_req_ids or ())
+        for row, req_id in enumerate(row_req_ids):
+            # A row whose committed prefix was not applied has nothing to
+            # continue: a forced prefix-cache reset discards those tokens, and
+            # a draft of what followed them would be verified against the
+            # history vLLM replays instead.
+            if req_id in skipped:
+                continue
+            # A row that committed nothing this step proposes nothing: there is
+            # no continuation to draft from.
+            if int(counts[row]) < 1:
+                continue
+            # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
+            # indexed by the step's rows, which is the order the model answered
+            # in; the persistent batch is indexed by where the request sits
+            # now, and a completion between this step's submission and its
+            # commit makes ``condense`` slide a request into another row. A
+            # request with no row has no current length for max-model-length
+            # trimming, so this step records its retained accepted count but
+            # does not publish a proposal.
+            batch_row = self.input_batch.req_id_to_index.get(req_id)
+            if batch_row is None:
+                continue
+            # A request whose sampling the accept walk cannot arbitrate is
+            # served WITHOUT speculation rather than refused. The walk compares
+            # token ids and never sees logits, so it can only certify a greedy
+            # continuation; proposing for a sampled request and accepting on id
+            # equality would silently return greedy text for a request that
+            # asked to sample. Offering nothing instead routes the request down
+            # the ordinary decode path, where the runner applies the full
+            # sampling it already implements (temperature, top_p/top_k, the
+            # penalties, seeds), so the caller gets what it asked for at
+            # baseline speed. Lossless speculation for these requests needs the
+            # target probabilities (rejection sampling), not this walk.
+
+            # Trimmed to what the request can still hold, the way the host
+            # proposer trims itself. Drafts past ``max_model_len`` would be
+            # verified and then dropped at the commit.
+            room = max_model_len - int(self.input_batch.num_tokens[batch_row])
+            row_offered = num_drafts if offered is None else int(offered[row])
+            usable = max(0, min(row_offered, room))
+            self._publish_draft(
+                req_id, [int(token) for token in draft_token_ids[row, :usable]]
+            )
+
+    @staticmethod
+    def _committed_positions(input_positions: torch.Tensor, width: int) -> torch.Tensor:
+        """Absolute positions of one step's committed block.
+
+        The verify's input column 0 holds each row's last committed token at
+        its own position, and the verify's return column ``j`` is the model's
+        choice at candidate position ``j``, which follows that input. So the
+        committed block starts one position past the input's first column and
+        runs consecutively, whatever each row accepted.
+
+        Padding rows carry an input position of -1 and come out negative here,
+        which is what marks them as rows no request owns.
+        """
+        first = (
+            input_positions if input_positions.dim() == 1 else input_positions[:, 0]
+        ).to(torch.int32)
+        offsets = torch.arange(1, width + 1, dtype=torch.int32)
+        positions = first.unsqueeze(1) + offsets.unsqueeze(0)
+        # A padding row's input position is -1, and the offsets would turn that
+        # into 0, 1, 2 and so on, which is exactly where a request starting
+        # from nothing would sit. The drafter is handed no live-row mask, so the
+        # position is the only thing that marks a row as owned by no request.
+        return positions.masked_fill((first < 0).unsqueeze(1), -1)
+
+    def _committed_positions_from_state(
+        self,
+        row_req_ids: list[str],
+        counts: torch.Tensor,
+        *,
+        submitted_positions: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        """Build committed positions from history after each applied result."""
+        positions = self._committed_positions(submitted_positions, width)
+        offsets = torch.arange(width, dtype=torch.int32)
+        requests = getattr(self, "requests", {})
+        for row, req_id in enumerate(row_req_ids):
+            req_state = requests.get(req_id)
+            count = int(counts[row])
+            if req_state is None or count < 1:
+                continue
+            first = req_state.num_tokens - count
+            positions[row] = first + offsets
+        return positions
+
+    @staticmethod
+    def _spec_candidate_block(
+        drafts: torch.Tensor,
+        num_valid: torch.Tensor,
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Widen a ``[B, 1]`` decode into the uniform ``[B, 1+K]`` block.
+
+        Column 0 is the row's last committed token at its own position, which
+        is the token a plain decode would have sent; columns 1..K are that
+        row's pending drafts at the K positions that follow. A row with fewer
+        than K valid drafts pads its tail columns, and a token there is
+        ``PLACEHOLDER_TOKEN_ID`` while a position there is -1, which is the
+        same no-position marker the unused rows of a padded decode carry. A
+        padded column must therefore never be mistaken for a real candidate,
+        which is what ``num_valid_drafts`` tells the model.
+        """
+        num_drafts = drafts.shape[1]
+        columns = torch.arange(num_drafts, dtype=torch.int32)
+        # True where a column lies past that row's valid draft count.
+        padded_draft = columns.unsqueeze(0) >= num_valid.unsqueeze(1)
+        # Column 0 is committed, so it is never padded.
+        padded = torch.cat(
+            [torch.zeros(drafts.shape[0], 1, dtype=torch.bool), padded_draft], dim=1
+        )
+
+        tokens = torch.cat([input_tokens, drafts], dim=1)
+        tokens = torch.where(
+            padded, torch.full_like(tokens, PLACEHOLDER_TOKEN_ID), tokens
+        )
+        offsets = torch.arange(1 + num_drafts, dtype=input_positions.dtype)
+        positions = input_positions.unsqueeze(1) + offsets.unsqueeze(0)
+        positions = torch.where(padded, torch.full_like(positions, -1), positions)
+        return tokens, positions
 
     def _prepare_model_inputs(
         self,
@@ -1081,8 +1864,9 @@ class TTModelRunner:
 
         Reads the current persistent ``self.input_batch`` and assembles the
         padded, fixed-shape tensors a TT model needs (constant shapes are
-        required for ttnn tracing). This is the input builder for the non-DP and
-        standard multi-process DP paths; each operates on its whole local
+        required for ttnn tracing). This is the front-packed input builder for
+        single-process execution and standard multi-process DP; each rank
+        operates on its whole local
         ``input_batch``. Single-process lane mode does not use this builder --
         it builds its merged device input directly from ``TTLaneInputBatch``.
 
@@ -1107,10 +1891,42 @@ class TTModelRunner:
         # The whole local batch.
         req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
+        row_req_ids = [input_batch.req_ids[i] for i in req_indices]
+        if self._num_speculative_tokens:
+            # Pruned here rather than where requests finish, because every
+            # other way a request leaves the persistent batch is temporary and
+            # has to keep its state. ``self.requests`` is what says a request
+            # is gone for good: ``_update_states`` drops it there only on
+            # finish. A preempted request keeps its entry and loses it below,
+            # where the prefill it resumes with resets the count.
+            for req_id in self._req_accepted_counts.keys() - self.requests.keys():
+                self._req_accepted_counts.pop(req_id, None)
 
         # Pad decode to the per-rank wire capacity, which outside lane mode is
         # the whole engine capacity.
         decode_pad_to = self.tt_per_lane_max_num_seqs
+
+        # Models that declare ``tt_supported_decode_batch_sizes`` (e.g. Gemma4)
+        # may pad only to the nearest supported size >= num_reqs, so B=1 is not
+        # forced through a B=max graph.
+        #
+        # A model must declare only the buckets it has actually captured a decode
+        # trace for on this instance: padding to a bucket with no captured trace
+        # leaves the device in an undefined state. There is deliberately no
+        # separate "warmed" list to fall back from -- a bucket that is not warmed
+        # is not supported.
+        decode_buckets = getattr(
+            getattr(self, "model", None), "tt_supported_decode_batch_sizes", None
+        )
+        if decode_buckets:
+            decode_pad_to = next(
+                (
+                    int(b)
+                    for b in sorted(int(x) for x in decode_buckets)
+                    if int(b) >= num_reqs and int(b) <= self.tt_per_lane_max_num_seqs
+                ),
+                self.tt_per_lane_max_num_seqs,
+            )
 
         # Second dim of each block table is (ceil(max_model_len / block_size)).
         # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
@@ -1176,6 +1992,9 @@ class TTModelRunner:
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        num_valid_drafts: torch.Tensor | None = None
+        accepted_counts: torch.Tensor | None = None
+        spec_drafts: torch.Tensor | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -1201,7 +2020,17 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
-            reset_batch = False
+            decode_layout_changed = False
+            if self._num_speculative_tokens:
+                # A prefill commits one token, so its accepted count is 1,
+                # and a request resumed from preemption has no candidate state
+                # left to select anyway. Dropping the entry restores that
+                # default, so the first speculative step after a prefill needs
+                # no special case. The drafts a prefilling row may still carry
+                # are the scheduler's to drop, and it does: update_draft_token_ids
+                # clears spec_token_ids for a request in a prefill chunk.
+                for req_id in row_req_ids:
+                    self._req_accepted_counts.pop(req_id, None)
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -1209,22 +2038,95 @@ class TTModelRunner:
                 req_indices, positions_np
             ].view(-1, 1)
             prompt_lens = None
-            # For on-device decode sampling, tell the backend if the padded
-            # decode batch layout changed since the previous step.
-            reset_batch = self._decode_layout_changed_since_last_decode
-            self._decode_layout_changed_since_last_decode = False
+            # Record whether the padded decode layout changed since the previous
+            # decode. The controller translates this lifecycle fact into either
+            # explicit contract commands or the legacy ``reset_batch`` keyword.
+            decode_layout_changed = self._decode_layout_changed_since_last_decode
+
+            if self._num_speculative_tokens:
+                spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
+                    self._req_accepted_counts,
+                    self._drafts_to_verify(scheduler_output, row_req_ids),
+                    row_req_ids,
+                    self._num_speculative_tokens,
+                )
+                if _step_verifies(
+                    self._spec_supports_narrow_decode,
+                    num_valid_drafts,
+                    accepted_counts,
+                    len(row_req_ids),
+                ):
+                    self._note_unspeculable_verify_rows(row_req_ids)
+                    # Uniformly 1+K wide, so a model needs one verify shape
+                    # rather than two.
+                    input_tokens, input_positions = self._spec_candidate_block(
+                        spec_drafts, num_valid_drafts, input_tokens, input_positions
+                    )
+                else:
+                    # No row carries a draft and no row has a multi-token
+                    # commit left to resolve, so this step has nothing to
+                    # verify. It runs as the ordinary decode it is: no
+                    # ``spec_mode``, no side tensors, the sampler's own tail,
+                    # and eligible for asynchronous overlap, which a verify
+                    # never is. That is what keeps batched baseline decoding
+                    # overlapped inside a server with speculation configured.
+                    # Only a model that declares ``supports_narrow_decode``
+                    # reaches this: for any other, the step stays a wide verify
+                    # whose rows all carry zero valid drafts, because that
+                    # model implements one input shape.
+                    spec_drafts = None
+                    num_valid_drafts = None
+                    accepted_counts = None
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
             if input_tokens.shape[0] < decode_pad_to:
                 batch_pad = decode_pad_to - input_tokens.shape[0]
+                # Width comes from the built block: 1 for a plain decode, 1+K
+                # for a speculative one.
                 input_tokens = torch.cat(
-                    [input_tokens, torch.zeros(batch_pad, 1, dtype=torch.int32)]
+                    [
+                        input_tokens,
+                        torch.zeros(
+                            batch_pad, input_tokens.shape[1], dtype=torch.int32
+                        ),
+                    ]
                 )
                 # Pad positions with -1 to indicate no position
                 input_positions = torch.cat(
-                    [input_positions, torch.ones(batch_pad, dtype=torch.int32) * -1]
+                    [
+                        input_positions,
+                        torch.full(
+                            (batch_pad, *input_positions.shape[1:]),
+                            -1,
+                            dtype=input_positions.dtype,
+                        ),
+                    ]
                 )
+                if spec_drafts is not None:
+                    # The accept walk reads the drafts against the verify's
+                    # own row count, so they pad with the rows.
+                    spec_drafts = torch.cat(
+                        [
+                            spec_drafts,
+                            torch.full(
+                                (batch_pad, spec_drafts.shape[1]),
+                                PLACEHOLDER_TOKEN_ID,
+                                dtype=torch.int32,
+                            ),
+                        ]
+                    )
+                if num_valid_drafts is not None:
+                    # A padding row carries no draft and stands on its own
+                    # input token, which is the count 1: ``accepted_counts`` is
+                    # a count in [1, 1+K] and is never 0, on a padding row as
+                    # much as on a real one.
+                    num_valid_drafts = torch.cat(
+                        [num_valid_drafts, torch.zeros(batch_pad, dtype=torch.int32)]
+                    )
+                    accepted_counts = torch.cat(
+                        [accepted_counts, torch.ones(batch_pad, dtype=torch.int32)]
+                    )
                 # Pad each per-group block table to the same wire capacity so
                 # the device sees a fixed shape regardless of how many users
                 # are active. Keep ``block_tables`` aliased to the (now padded)
@@ -1267,6 +2169,26 @@ class TTModelRunner:
         has_structured = has_structured_outputs(
             self.requests, scheduler_output, bitmask
         )
+        scheduled_structured_req_ids = scheduled_structured_output_request_ids(
+            self.requests,
+            scheduler_output,
+        )
+        has_scheduled_structured = bool(scheduled_structured_req_ids)
+        if is_prompt:
+            structured_output_req_ids = frozenset(
+                req_id
+                for row, req_id in enumerate(row_req_ids)
+                if req_id in scheduled_structured_req_ids
+                and (
+                    intermediate_prefill_mask is None
+                    or not bool(intermediate_prefill_mask[row])
+                )
+            )
+        else:
+            structured_output_req_ids = capture_structured_decode_request_ids(
+                scheduled_structured_req_ids,
+                row_req_ids,
+            )
         if bitmask is not None:
             # Using torch tensor instead of numpy array for consistency
             # because we need it as tensor for gather.
@@ -1287,17 +2209,24 @@ class TTModelRunner:
                 structured_output_request_ids=structured_output_request_ids,
                 row_req_ids=row_req_ids,
                 batch_length=batch_length,
+                expected_structured_output_request_ids=structured_output_req_ids,
             )
 
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
+            sampling_rows=req_indices,
         )
+        if has_structured and not has_scheduled_structured:
+            perform_device_sampling = False
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
             perform_device_sampling = False
+        defer_device_sampling = (
+            perform_device_sampling and has_scheduled_structured and not is_prompt
+        )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
         # (decode only).
@@ -1407,7 +2336,7 @@ class TTModelRunner:
             grammar_bitmask=[bitmask],  # wrap to match DP case
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
-            reset_batch=reset_batch,
+            decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
@@ -1420,6 +2349,17 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            defer_device_sampling=defer_device_sampling,
+            structured_output_req_ids=structured_output_req_ids,
+            grammar_row_req_ids=tuple(row_req_ids)
+            + (None,) * (input_tokens.shape[0] - len(row_req_ids)),
+            # Already in post-remap row order: ``req_indices`` reads the
+            # persistent batch after ``condense`` moved every surviving
+            # request's speculative state down with it.
+            num_valid_drafts=num_valid_drafts,
+            accepted_counts=accepted_counts,
+            draft_token_ids=spec_drafts,
+            spec_mode=ACCEPT_MODE_ARGMAX_IDS if spec_drafts is not None else None,
         )
 
     def build_model_input(
@@ -1435,23 +2375,22 @@ class TTModelRunner:
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """
-        # Update cached state
+        # Update scheduler-owned state before accepting any older async result.
+        # Reject late results for request IDs already reported finished. The
+        # result that finished the request was accepted earlier. Ordinary
+        # preemption or resume keeps a completed token valid for replay. Only a
+        # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
+        if (
+            self.async_decode.decode_input_update_contract_version() < 1
+            and self._decode_layout_changed_since_last_decode
+        ):
+            # Preserve the legacy path's drain point: version-0 adapters still
+            # own reload policy and receive reset_batch after batch mutation.
+            self.async_decode.wait_for_all_pending_async_steps()
+        self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             return None
-
-        # ``_update_states`` may have just discovered a layout change that the
-        # scheduler-output prediction could not see: it predicts the resets caused by
-        # new or resumed requests, but removals, unscheduled requests and batch
-        # condensation only surface here, after the drain decision was already made.
-        # ``_decode_layout_changed_since_last_decode = True`` implies
-        # ``reset_batch=True``: ``_prepare_model_inputs`` below reloads inputs from host
-        # state, which a pending async decode step has not been applied to yet. This
-        # step is therefore not steady-decode eligible, so drain pending decodes to
-        # ensure updated host inputs. No-op when the flag was already set before the
-        # step (the caller's drain decision covered it) or when nothing is pending.
-        if self._decode_layout_changed_since_last_decode:
-            self.async_decode.wait_for_all_pending_async_steps()
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
@@ -1489,25 +2428,29 @@ class TTModelRunner:
             )
 
         lane_batch = self.lane_batch
-        self.async_decode.apply_ready_completed_decode_steps()
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_lane_decode_from_scheduler(
-                scheduler_output
+                scheduler_output,
+                decode_layout_changed=plan.decode_layout_changed,
             )
         )
-        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+        if self.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate, scheduler_output
+        ):
             self.async_decode.wait_for_all_pending_async_steps()
 
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
         )
+        assert layout_changed == plan.decode_layout_changed, (
+            "lane scheduler and runner disagreed about decode layout change: "
+            f"plan={plan.decode_layout_changed}, applied={layout_changed}"
+        )
         if layout_changed:
             self._decode_layout_changed_since_last_decode = True
-            # ``_decode_layout_changed_since_last_decode = True`` implies
-            # ``reset_batch=True``: the model will reload inputs. This step is not
-            # steady-decode eligible, so drain pending decodes to ensure updated
-            # host inputs.
-            self.async_decode.wait_for_all_pending_async_steps()
+            if self.async_decode.decode_input_update_contract_version() < 1:
+                self.async_decode.wait_for_all_pending_async_steps()
+        self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -1524,8 +2467,17 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if self.non_dp_async_scheduling:
-                req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+            if model_input.defer_device_sampling:
+                self.async_decode.wait_for_all_pending_async_steps()
+            if self.async_decode_scheduling and not model_input.defer_device_sampling:
+                req_ids = [
+                    model_input.grammar_row_req_ids[row] for row in scheduled_rows
+                ]
+                if any(req_id is None for req_id in req_ids):
+                    raise RuntimeError(
+                        "submitted lane row identity is missing scheduled request IDs: "
+                        f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+                    )
                 context = self.async_decode.capture_submitted_step_context(req_ids)
                 wrapper = self.async_decode.submit_async_lane_decode(
                     model_input, context, scheduled_rows
@@ -1540,14 +2492,24 @@ class TTModelRunner:
                 )
                 return None
             submission = self.async_decode.submit_decode(
-                model_input, read_from_device=True, async_read=False
+                model_input,
+                read_from_device=not model_input.defer_device_sampling,
+                async_read=False,
+                sampling_rows=scheduled_rows,
             )
-            finalized = self.async_decode.finalize_decode(submission)
-            assert finalized is not None
-            tt_out = finalized.tt_out
-            tt_log_probs = finalized.tt_log_probs
+            if model_input.defer_device_sampling:
+                tt_out = submission.tt_out
+                tt_log_probs = None
+            else:
+                finalized = self.async_decode.finalize_decode(
+                    submission, sampling_rows=scheduled_rows
+                )
+                assert finalized is not None
+                tt_out = finalized.tt_out
+                tt_log_probs = finalized.tt_log_probs
             is_decode = True
         else:
+            submission = None
             # Prefill reorders against the per-lane request capacity.
             lane_total = lane_batch.max_num_reqs
             tt_out = self.submit_prefill(model_input, model_input.unpadded_batch_size)
@@ -1577,6 +2539,7 @@ class TTModelRunner:
                 scheduled_rows=scheduled_rows,
                 is_decode=is_decode,
                 lane_total=lane_total,
+                decode_submission=submission,
             )
         )
         return None
@@ -1591,17 +2554,83 @@ class TTModelRunner:
         scheduled_rows: list[int],
         is_decode: bool,
         lane_total: int,
+        decode_submission: TTDecodeSubmission | None = None,
+    ) -> ModelRunnerOutput:
+        deferred = bool(getattr(model_input, "defer_device_sampling", False))
+        try:
+            return TTModelRunner._finish_lane_sync_impl(
+                self,
+                grammar_output,
+                tt_out=tt_out,
+                tt_log_probs=tt_log_probs,
+                model_input=model_input,
+                scheduled_rows=scheduled_rows,
+                is_decode=is_decode,
+                lane_total=lane_total,
+                decode_submission=decode_submission,
+            )
+        except Exception:
+            if deferred:
+                self._poison_device_grammar()
+            raise
+
+    def _finish_lane_sync_impl(
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        tt_out: Any,
+        tt_log_probs: Any,
+        model_input: TTModelInput,
+        scheduled_rows: list[int],
+        is_decode: bool,
+        lane_total: int,
+        decode_submission: TTDecodeSubmission | None = None,
     ) -> ModelRunnerOutput:
         """Sample and build the runner output for a deferred lane forward."""
         model_input = self._apply_grammar_to_input(
             model_input, grammar_output, lane_total=lane_total
         )
+        if getattr(model_input, "defer_device_sampling", False):
+            if decode_submission is None:
+                raise RuntimeError(
+                    "deferred lane decode is missing its device submission"
+                )
+            finalized = self.async_decode.complete_deferred_device_sampling(
+                decode_submission,
+                model_input,
+            )
+            tt_out = finalized.tt_out
+            tt_log_probs = finalized.tt_log_probs
+            model_input = replace(
+                model_input,
+                grammar_bitmask=[None],
+                defer_device_sampling=False,
+            )
         sampled, logprobs = self.lane_batch.extract_output(
             self, tt_out, tt_log_probs, model_input, scheduled_rows, is_decode=is_decode
         )
         # ``scheduled_rows`` are persistent slots; their req_ids in row order are
         # the canonical merged output order.
-        req_ids = [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        submitted_row_ids = getattr(model_input, "grammar_row_req_ids", ())
+        snapshot_covers_rows = bool(submitted_row_ids) and (
+            not scheduled_rows or max(scheduled_rows) < len(submitted_row_ids)
+        )
+        if isinstance(model_input, TTModelInput) and not snapshot_covers_rows:
+            raise RuntimeError(
+                "submitted lane row identity does not cover scheduled rows: "
+                f"scheduled_rows={scheduled_rows}, "
+                f"row_identity_size={len(submitted_row_ids)}"
+            )
+        req_ids = (
+            [submitted_row_ids[row] for row in scheduled_rows]
+            if snapshot_covers_rows
+            else [self.lane_batch.req_ids[row] for row in scheduled_rows]
+        )
+        if any(req_id is None for req_id in req_ids):
+            raise RuntimeError(
+                "submitted lane row identity is missing scheduled request IDs: "
+                f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+            )
 
         if not is_decode and model_input.prompt_lens is not None:
             lane_batch = self.lane_batch
@@ -1617,8 +2646,13 @@ class TTModelRunner:
                     sampled_token_ids=sampled,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask,
+                    defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
+        if TTModelRunner._uses_async_scheduler(self):
+            return self.defer_state_apply_and_build_runner_output(
+                sampled, logprobs, req_ids=req_ids
+            )
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
@@ -1626,7 +2660,7 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
-        """Run the device forward for one non-DP or lane-DP step.
+        """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None`` after enqueuing a pending sampler; the engine computes
         the grammar bitmask while the forward runs and then calls
@@ -1634,6 +2668,8 @@ class TTModelRunner:
         nothing was scheduled (no sampler is enqueued). Standard multi-process
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
+        TTModelRunner._raise_if_device_grammar_poisoned(self)
+
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
         # the scheduler output. When present, the step runs over the merged lane
         # batch (``TTLaneInputBatch`` owns all the lane-specific input/output
@@ -1641,15 +2677,16 @@ class TTModelRunner:
         if get_tt_step_plan(scheduler_output) is not None:
             return self._execute_lane_step(scheduler_output)
 
-        # Apply any decode steps that have already completed on the async
-        # thread. In steady decode mode we intentionally allow one step of
-        # lag between host application and device submission, but we never let
-        # completed work pile up unbounded.
-        self.async_decode.apply_ready_completed_decode_steps()
+        # Decide whether the next build can remain one step host-stale before
+        # mutating the persistent batch. On a transition, finalize pending work
+        # now but defer applying it until ``build_model_input`` has processed
+        # lifecycle events and the forced-reset discard boundary.
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
-        if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
+        if self.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate, scheduler_output
+        ):
             self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
@@ -1658,11 +2695,17 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if self.non_dp_async_scheduling and is_decode:
+        if model_input.defer_device_sampling:
+            self.async_decode.wait_for_all_pending_async_steps()
+        if (
+            self.async_decode_scheduling
+            and is_decode
+            and not model_input.defer_device_sampling
+        ):
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
-            wrapper = self.async_decode.submit_async_non_dp_decode(
+            wrapper = self.async_decode.submit_async_decode(
                 model_input,
                 steady_decode_fast_path=steady_decode_fast_path,
             )
@@ -1679,7 +2722,7 @@ class TTModelRunner:
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
         fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_nondp_sync, fwd=fwd))
+        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
         return None
 
     def _reorder_grammar_bitmask(
@@ -1688,22 +2731,31 @@ class TTModelRunner:
         model_input: TTModelInput,
         *,
         lane_total: int | None,
+        require_complete: bool = True,
     ) -> torch.Tensor | None:
         """Reorder a scheduler grammar bitmask into TT batch layout, or ``None``."""
         if grammar_output is None or grammar_output.grammar_bitmask is None:
+            if require_complete and model_input.structured_output_req_ids:
+                raise RuntimeError(
+                    "sample-time grammar output is absent for TT batch request IDs: "
+                    f"{sorted(model_input.structured_output_req_ids)}"
+                )
             return None
 
-        if lane_total is not None:
-            return self.lane_batch.slot_grammar_bitmask(grammar_output, lane_total)
-
-        assert model_input.row_req_ids is not None
-
         bitmask = torch.from_numpy(grammar_output.grammar_bitmask)
+        row_req_ids = model_input.grammar_row_req_ids
+        if not row_req_ids:
+            raise RuntimeError(
+                "sample-time grammar remapping is missing the submitted TT row identity"
+            )
         return reorder_grammar_bitmask_for_tt_batch(
             bitmask=bitmask,
             structured_output_request_ids=grammar_output.structured_output_request_ids,
-            row_req_ids=model_input.row_req_ids,
-            batch_length=model_input.input_tokens.shape[0],
+            row_req_ids=row_req_ids,
+            batch_length=len(row_req_ids),
+            expected_structured_output_request_ids=(
+                model_input.structured_output_req_ids if require_complete else None
+            ),
         )
 
     def _apply_grammar_to_input(
@@ -1732,19 +2784,309 @@ class TTModelRunner:
         """Attach the sample-time grammar bitmask to a deferred async decode.
 
         The reorder happens here on the engine thread (layout still matches the
-        forward); the wrapper applies the bitmask when its read completes.
+        forward); the wrapper applies the bitmask when its read completes. A
+        row finished by the preceding queued result may be absent from the new
+        grammar output; it stays unrestricted here and late-output suppression
+        discards its sampled token.
         """
         bitmask = self._reorder_grammar_bitmask(
-            grammar_output, model_input, lane_total=lane_total
+            grammar_output,
+            model_input,
+            lane_total=lane_total,
+            require_complete=False,
         )
         if bitmask is not None:
             wrapper.set_grammar_bitmask(bitmask)
         return wrapper
 
-    def _finish_nondp_sync(
+    def _finish_spec_decode(self, fwd: _SyncForward) -> ModelRunnerOutput:
+        """Accept, commit and re-propose for one speculative decode step.
+
+        The synchronous tail, where the forward has already completed: walk,
+        commit and publish in one go. The asynchronous path splits the same
+        three at the readback boundary, which is why the walk and the commit
+        are separate methods rather than one.
+        """
+        committed, counts = self.walk_spec_acceptance(fwd.model_input, fwd.tt_out)
+        prefixes = self.spec_committed_prefixes(fwd.model_input, committed, counts)
+        self.commit_spec_acceptance(fwd.model_input, committed, counts, fwd.spec_hidden)
+        return self.build_spec_runner_output(fwd.model_input.row_req_ids, prefixes)
+
+    def walk_spec_acceptance(
+        self, model_input: TTModelInput, argmax_ids: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy acceptance over one verify's return. Touches no host state.
+
+        Separate from the commit because the asynchronous path runs this on
+        whichever thread resolves the readback, where the runner's own state is
+        one step behind and must not be read or written. Everything this needs
+        is the step's own: the block it submitted and what came back.
+        """
+        row_req_ids = model_input.row_req_ids
+        missing = [
+            name
+            for name in ("row_req_ids", "draft_token_ids", "num_valid_drafts")
+            if getattr(model_input, name) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"a speculative step in mode {model_input.spec_mode!r} reached "
+                f"the accept walk without {missing}; the builder sets all three "
+                "together whenever it sets spec_mode"
+            )
+        del row_req_ids
+
+        if not isinstance(argmax_ids, torch.Tensor):
+            raise TypeError(
+                "a verify in argmax_ids mode must return a token id tensor, got "
+                f"{type(argmax_ids).__name__}"
+            )
+        # The draft block is built at the full width K even on a narrow step,
+        # where the model was handed one column because no row carried a draft.
+        # The walk compares the two, so the drafts are trimmed to the width the
+        # verify actually answered at.
+        verified_drafts = int(argmax_ids.shape[1]) - 1
+        # Walked over every row the verify answered for, padding rows included,
+        # because a model-owned drafter is asked for the same rows the verify
+        # ran on: its per-row state is indexed by row, and a device graph has
+        # one shape. A padding row carries no draft, so the walk commits its
+        # column 0 and counts 1, and only the live rows reach a request.
+        return accept_greedy_drafts(
+            argmax_ids,
+            model_input.draft_token_ids[:, :verified_drafts],
+            model_input.num_valid_drafts,
+        )
+
+    def spec_committed_prefixes(
+        self,
+        model_input: TTModelInput,
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> list[list[int]]:
+        """Each live row's accepted prefix, as the step's published output.
+
+        Read off the step's own tensors and the immutable model config, never
+        off runner state, so this is safe on a readback thread.
+
+        The length cap is applied here rather than left to the commit, so both
+        paths publish the same thing. It can be: the block's own first column
+        sits at the position the row had reached when the block was built, and
+        a speculative step is drained before the next one is built, so that is
+        still the row's length when the commit runs. Publishing more than fits
+        would report tokens the commit then refuses to write, and the request's
+        own history and the engine's would disagree about its text.
+        """
+        rows = len(model_input.row_req_ids)
+        max_model_len = int(self.model_config.max_model_len)
+        positions = model_input.input_positions
+        first = positions if positions.dim() == 1 else positions[:, 0]
+        block = committed[:rows].tolist()
+        prefixes: list[list[int]] = []
+        for row, count in enumerate(counts[:rows].tolist()):
+            # One past the row's last committed token is where this step writes.
+            start = int(first[row]) + 1
+            room = max(0, max_model_len - start)
+            keep = min(int(count), room)
+            prefixes.append([int(token) for token in block[row][:keep]])
+        return prefixes
+
+    def commit_spec_acceptance(
+        self,
+        model_input: TTModelInput,
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+        spec_hidden: Any,
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> dict[str, list[int]]:
+        """Apply the accepted prefixes and publish the next proposal.
+
+        Mutates runner state, so it runs on the engine thread only: on the
+        synchronous path inside the sampling tail, and on the asynchronous path
+        when the next step drains this one. ``skip_req_ids`` is how a forced
+        prefix-cache reset drops a frame it has already accounted for.
+        """
+        row_req_ids = model_input.row_req_ids
+        rows = len(row_req_ids)
+        committed_by_req = self._apply_committed_spec_tokens_to_state(
+            row_req_ids,
+            committed[:rows],
+            counts[:rows],
+            skip_req_ids=skip_req_ids,
+        )
+        if self._spec_drafts_from_model:
+            self._propose_model_drafts(
+                committed,
+                counts,
+                model_input,
+                spec_hidden,
+                row_req_ids,
+                skip_req_ids=skip_req_ids,
+            )
+        else:
+            self._propose_ngram_drafts(committed_by_req)
+        return committed_by_req
+
+    def propose_after_plain_step(
+        self,
+        model_input: TTModelInput,
+        sampled_token_ids: torch.Tensor,
+        row_req_ids: list[str],
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> None:
+        """Publish the next proposal after a step that verified nothing.
+
+        A speculating launch runs a step with nothing to verify as the ordinary
+        decode it is, which is what lets it overlap. The proposal still has to
+        happen: the drafts for the next step come from a proposer that is asked
+        once per step, so a launch that skipped it on a draftless step would
+        never draft again and would stay in plain decoding for the rest of the
+        server's life, however the batch changed.
+
+        The block is one column wide, that column being the token this step
+        committed, and every count is 1. ``_propose_model_drafts`` pads the
+        block to the uniform ``1+K`` a drafter is called with, so a drafter
+        sees one call shape whatever produced the tokens.
+
+        ``hidden`` is ``None``: a step that returned no ``VerifyOutput``
+        produced no handle. ``load_model`` keeps a drafter that is fed its
+        hidden state through the runner off this path entirely.
+        """
+        skipped = set(skip_req_ids or ())
+        live = len(row_req_ids)
+        sampled = _coerce_output_block(sampled_token_ids, live, 1).to(torch.int32)
+        # The drafter's rows are the step's rows, padding included, because its
+        # state is indexed by row and a device graph has one shape. A padding
+        # row's token is never read: what marks it as owned by no request is
+        # its position, which ``_committed_positions`` leaves negative.
+        rows = int(model_input.input_positions.shape[0])
+        committed = torch.zeros((rows, 1), dtype=torch.int32)
+        committed[:live] = sampled
+        counts = torch.ones(rows, dtype=torch.int32)
+        if self._spec_drafts_from_model:
+            self._propose_model_drafts(
+                committed,
+                counts,
+                model_input,
+                None,
+                row_req_ids,
+                skip_req_ids=skipped,
+            )
+            return
+        sampled_np = sampled.numpy()
+        self._propose_ngram_drafts(
+            {
+                req_id: [int(sampled_np[row, 0])]
+                for row, req_id in enumerate(row_req_ids)
+                if req_id not in skipped
+            }
+        )
+
+    def build_spec_runner_output(
+        self, row_req_ids: list[str], prefixes: list[list[int]]
+    ) -> ModelRunnerOutput:
+        """One speculative step's output, with its per-row committed prefixes.
+
+        Not routed through ``_build_runner_output``: that coerces the sampled
+        ids to one fixed width for every row, and a speculative step commits a
+        width that differs per row.
+        """
+        return ModelRunnerOutput(
+            req_ids=list(row_req_ids),
+            req_id_to_index={req: idx for idx, req in enumerate(row_req_ids)},
+            sampled_token_ids=[list(prefix) for prefix in prefixes],
+            logprobs=None,
+            prompt_logprobs_dict=dict.fromkeys(row_req_ids, None),
+            pooler_output=[],
+        )
+
+    def _apply_committed_spec_tokens_to_state(
+        self,
+        row_req_ids: list[str],
+        committed: torch.Tensor,
+        counts: torch.Tensor,
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> dict[str, list[int]]:
+        """Commit each row's accepted prefix and record its count.
+
+        Separate from ``_apply_sampled_tokens_to_state`` rather than widening
+        it. That function commits one fixed width for every row of every step
+        of every model, twice over in two code paths, and a speculative step
+        commits a length that differs per row. Sharing it would put a variable
+        width through the one path that every non-speculating model depends on.
+
+        Returns the committed ids per request, which the proposer needs and
+        which become the step's output.
+        """
+        max_model_len = self.model_config.max_model_len
+        committed_np = committed.numpy()
+        skipped = set(skip_req_ids or ())
+        committed_by_req: dict[str, list[int]] = {}
+        for row, req_id in enumerate(row_req_ids):
+            if req_id in skipped:
+                # A forced prefix-cache reset already accounted for this frame.
+                # Writing it would replay tokens the scheduler has discarded,
+                # and proposing from it would draft a continuation of them.
+                continue
+            count = int(counts[row])
+            block = [int(token) for token in committed_np[row, :count]]
+            batch_row = self.input_batch.req_id_to_index.get(req_id)
+            if batch_row is not None:
+                start = int(self.input_batch.num_tokens[batch_row])
+                end = min(start + len(block), max_model_len)
+                block = block[: end - start]
+                self.input_batch.token_ids_cpu[batch_row, start:end] = block
+                self.input_batch.num_tokens[batch_row] = end
+            # Exactly one extend: ``InputBatch.add_request`` stores the
+            # request's own output list in ``req_output_token_ids``, so the two
+            # are the same object while the request holds a row and extending
+            # both would commit every token twice.
+            req_state = self.requests.get(req_id)
+            if batch_row is not None:
+                output_token_ids = self.input_batch.req_output_token_ids[batch_row]
+                if output_token_ids is None:
+                    raise RuntimeError(
+                        f"request {req_id} holds row {batch_row} of the "
+                        "persistent batch but that row has no output token "
+                        f"list, so its {len(block)} committed token(s) have "
+                        "nowhere to go"
+                    )
+                output_token_ids.extend(block)
+            elif req_state is not None:
+                req_state.output_token_ids.extend(block)
+            if batch_row is None and req_id not in self._req_state_slot:
+                # Explicit preemption releases the request's model state slot.
+                # The tokens remain valid for replay, but the accepted count
+                # would select candidate state the model no longer holds.
+                continue
+            # The count the next verify reads, which is what selects the
+            # candidate state this step left the model holding. Length-capped
+            # rows record what they actually committed, never the full count.
+            self._req_accepted_counts[req_id] = max(len(block), 1)
+            committed_by_req[req_id] = block
+        return committed_by_req
+
+    def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
     ) -> ModelRunnerOutput:
-        """Sample and build the runner output for a deferred non-DP forward."""
+        deferred = bool(fwd is not None and fwd.model_input.defer_device_sampling)
+        try:
+            return TTModelRunner._finish_front_packed_sync_impl(
+                self,
+                grammar_output,
+                fwd=fwd,
+            )
+        except Exception:
+            if deferred:
+                self._poison_device_grammar()
+            raise
+
+    def _finish_front_packed_sync_impl(
+        self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
+    ) -> ModelRunnerOutput:
+        """Sample and build output for a deferred front-packed forward."""
         if fwd is None:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
@@ -1755,6 +3097,9 @@ class TTModelRunner:
                 fwd.model_input, grammar_output, lane_total=None
             ),
         )
+        if fwd.model_input.spec_mode is not None:
+            return self._finish_spec_decode(fwd)
+
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
@@ -1770,22 +3115,37 @@ class TTModelRunner:
             intermediate_mask = fwd.model_input.intermediate_prefill_mask
 
             assert intermediate_mask is not None
-
             if intermediate_mask.any():
                 return self._build_chunked_prefill_output(
                     req_ids=row_req_ids,
                     sampled_token_ids=sampled_token_ids,
                     logprobs=logprobs,
                     intermediate_mask=intermediate_mask.numpy(),
+                    defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
-        return self.apply_and_build_runner_output(
+        if TTModelRunner._uses_async_scheduler(self):
+            return self.defer_state_apply_and_build_runner_output(
+                sampled_token_ids,
+                logprobs,
+                req_ids=(
+                    row_req_ids
+                    if is_prefill
+                    else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+                ),
+            )
+        output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
             # Only a prefill build can filter rows. Decode rows are the front-packed
             # batch rows, so it keeps the vectorized state write.
             req_ids=row_req_ids if is_prefill else None,
         )
+        if not is_prefill and self._num_speculative_tokens:
+            self.propose_after_plain_step(
+                fwd.model_input, sampled_token_ids, row_req_ids
+            )
+        return output
 
     def _build_chunked_prefill_output(
         self,
@@ -1794,34 +3154,42 @@ class TTModelRunner:
         logprobs: LogprobsLists | None,
         intermediate_mask: np.ndarray,
         req_id_to_index: dict[str, int] | None = None,
+        defer_state_apply: bool = False,
     ) -> ModelRunnerOutput:
-        """Build a prefill output that emits no token for intermediate chunks.
+        """Build a prefill output with intermediate rows suppressed.
 
         A request mid-prompt gets ``[]`` so the engine advances its computed
-        tokens without appending output; only rows whose chunk ended the prompt
-        emit a token and are applied to runner state.
+        tokens without appending output. Only final rows emit a token and reach
+        runner state.
         """
         assert self._output_tokens_per_step == 1, (
             "Chunked-prefill output suppression assumes one sampled token per "
             "request; block-output models must disable chunked prefill"
         )
-        final_idx_np = np.where(~intermediate_mask)[0]
+        emit_mask = np.asarray(
+            [not bool(intermediate_mask[i]) for i in range(len(req_ids))],
+            dtype=bool,
+        )
+        final_idx_np = np.where(emit_mask)[0]
+        final_tokens = None
+        final_req_ids: list[str] = []
         if final_idx_np.shape[0] > 0:
             final_idx_tensor = torch.from_numpy(final_idx_np.astype(np.int64))
             final_tokens = sampled_token_ids[final_idx_tensor]
             final_req_ids = [req_ids[int(i)] for i in final_idx_np]
-            self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
+            if not defer_state_apply:
+                self._apply_sampled_tokens_to_state(final_tokens, req_ids=final_req_ids)
 
         num_reqs = len(req_ids)
         sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
         sampled_token_id_lists = [
-            [] if intermediate_mask[i] else [int(sampled_token_ids_np[i])]
+            [int(sampled_token_ids_np[i])] if emit_mask[i] else []
             for i in range(num_reqs)
         ]
 
-        return ModelRunnerOutput(
+        runner_output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=(
                 dict(req_id_to_index)
@@ -1833,6 +3201,11 @@ class TTModelRunner:
             prompt_logprobs_dict=dict.fromkeys(req_ids, None),
             pooler_output=[],
         )
+        if defer_state_apply and final_tokens is not None:
+            self._enqueue_deferred_state_apply(
+                final_tokens, final_req_ids, runner_output
+            )
+        return runner_output
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -1852,13 +3225,18 @@ class TTModelRunner:
         ``EngineCore``'s ``if model_output is None`` path), so the true cause
         surfaces instead of being masked by the empty-popleft error.
         """
+        TTModelRunner._raise_if_device_grammar_poisoned(self)
         if not self._pending_samples:
             return None
         finish = self._pending_samples.popleft()
         return finish(grammar_output)
 
     def check_perform_device_sampling(
-        self, is_decode: bool, has_structured_outputs: bool
+        self,
+        is_decode: bool,
+        has_structured_outputs: bool,
+        *,
+        sampling_rows: list[int] | None = None,
     ) -> bool:
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -1872,6 +3250,28 @@ class TTModelRunner:
         # Always host-only sampling params: min_p, bad_words, logit_bias,
         # allowed_token_ids, min_tokens require host sampling.
         input_batch = self.input_batch
+        max_top_k = self.model.model_capabilities.get("max_device_top_k")
+        if max_top_k is not None:
+            sampling = input_batch.sampling
+            # Prefill can submit only a subset of the resident lane requests.
+            # An unscheduled decode request must not change its sampling route.
+            # Steady decode omits the selection because it submits all occupants.
+            rows = (
+                list(input_batch.req_id_to_index.values())
+                if sampling_rows is None
+                else sampling_rows
+            )
+            temperature = sampling.temperature[rows]
+            top_k = sampling.top_k[rows]
+            needs_unbounded_or_larger_k = (temperature != 0) & (
+                (top_k < 1) | (top_k > max_top_k)
+            )
+            if needs_unbounded_or_larger_k.any():
+                return False
+        if not input_batch.no_penalties and not self.model.model_capabilities.get(
+            "supports_device_penalties", True
+        ):
+            return False
         has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set
@@ -1882,9 +3282,17 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # Structured outputs are not supported on device yet
-        # https://github.com/tenstorrent/vllm/issues/277
-        if has_structured_outputs:
+        # The initial model contract covers decode only. Prefill keeps the
+        # established host path so its first token remains grammar-safe.
+        # Upstream async scheduling can queue another forward before the
+        # current sample-time grammar arrives; the traced TT logits buffer is
+        # single-owner, so structured decode stays on host until that overlap
+        # has a dedicated multi-buffer contract.
+        if has_structured_outputs and (
+            not is_decode
+            or not self.supports_device_grammar
+            or self.scheduler_config.async_scheduling
+        ):
             return False
 
         # Logprobs on device require multi-device setups (num_devices in {8,32}).
@@ -1897,6 +3305,11 @@ class TTModelRunner:
         # return the sampled token's logprob, so max_lp > 0 falls back to
         # host sampling to compute full top-N from logits.
         max_lp = input_batch.max_num_logprobs
+        if has_structured_outputs and max_lp is not None:
+            # Grammar-aware device logprob parity is not part of the initial
+            # contract. Keep vLLM's host path rather than publish incomplete
+            # or force-argmax placeholder metadata.
+            return False
         if max_lp is not None:
             if num_devices not in (8, 32):
                 return False
@@ -1965,8 +3378,11 @@ class TTModelRunner:
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
+            self.async_decode.note_prefill_submitted()
             return tt_out
-        return self.model.prefill_forward(**kwargs)
+        tt_out = self.model.prefill_forward(**kwargs)
+        self.async_decode.note_prefill_submitted()
+        return tt_out
 
     def _forward_with_model_input(
         self,
@@ -1989,8 +3405,10 @@ class TTModelRunner:
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
         tt_log_probs = None
+        decode_submission = None
 
         # Execute model
+        spec_hidden = None
         if not is_decode:
             tt_out = self.submit_prefill(model_input, batch_size_per_dp)
             # Prefill returns the raw model output: an optional
@@ -2005,17 +3423,21 @@ class TTModelRunner:
             elif isinstance(tt_out, tuple):
                 tt_out, _ = tt_out
         else:
-            submission = self.async_decode.submit_decode(
+            decode_submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
-            finalized = self.async_decode.finalize_decode(submission)
-            assert finalized is not None
-            # ``finalize_decode`` already unpacked ``(tt_out, tt_log_probs)``.
-            tt_out = finalized.tt_out
-            tt_log_probs = finalized.tt_log_probs
-            batch_size_per_dp = submission.batch_size_per_dp
-            sampling_params = submission.sampling_params
-            perform_device_sampling = submission.perform_device_sampling
+            if model_input.defer_device_sampling:
+                tt_out = decode_submission.tt_out
+            else:
+                finalized = self.async_decode.finalize_decode(decode_submission)
+                assert finalized is not None
+                # ``finalize_decode`` already unpacked ``(tt_out, tt_log_probs)``.
+                tt_out = finalized.tt_out
+                tt_log_probs = finalized.tt_log_probs
+            batch_size_per_dp = decode_submission.batch_size_per_dp
+            sampling_params = decode_submission.sampling_params
+            perform_device_sampling = decode_submission.perform_device_sampling
+            spec_hidden = decode_submission.spec_hidden
 
         return _SyncForward(
             tt_out=tt_out,
@@ -2025,12 +3447,31 @@ class TTModelRunner:
             batch_size_per_dp=batch_size_per_dp,
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
+            decode_submission=decode_submission,
+            spec_hidden=spec_hidden,
         )
 
     def _sample_sync_forward(
         self, fwd: _SyncForward
     ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
         """Sample a forward produced by ``_forward_with_model_input``."""
+        if getattr(fwd.model_input, "defer_device_sampling", False):
+            if fwd.decode_submission is None:
+                raise RuntimeError("deferred decode is missing its device submission")
+            finalized = self.async_decode.complete_deferred_device_sampling(
+                fwd.decode_submission,
+                fwd.model_input,
+            )
+            fwd = replace(
+                fwd,
+                tt_out=finalized.tt_out,
+                tt_log_probs=finalized.tt_log_probs,
+                model_input=replace(
+                    fwd.model_input,
+                    grammar_bitmask=[None],
+                    defer_device_sampling=False,
+                ),
+            )
         return self._get_output_tokens(
             tt_out=fwd.tt_out,
             tt_log_probs=fwd.tt_log_probs,
@@ -2089,7 +3530,14 @@ class TTModelRunner:
             def _take(tensor: torch.Tensor, _rows: torch.Tensor = rows) -> torch.Tensor:
                 return tensor[_rows]
 
-            if not perform_device_sampling and self._is_block_output_model:
+            # An adaptive block model's PREFILL emits one plain host-sampled
+            # anchor token (its blocks come only from solo decode steps); any
+            # other host-sampled block step cannot construct the canvas.
+            if (
+                not perform_device_sampling
+                and self._is_block_output_model
+                and not (self._is_adaptive_block_output and not is_decode)
+            ):
                 raise ValueError(
                     "Block-output step fell back to host sampling; "
                     "host sampling cannot construct a multi-token canvas"
@@ -2237,11 +3685,15 @@ class TTModelRunner:
                 )
 
                 next_token_ids = _take(tt_out).reshape(sz, -1)
-                if next_token_ids.shape[1] != self._output_tokens_per_step:
+                allowed_widths = (
+                    (1, self._output_tokens_per_step)
+                    if self._is_adaptive_block_output
+                    else (self._output_tokens_per_step,)
+                )
+                if next_token_ids.shape[1] not in allowed_widths:
                     raise ValueError(
                         "Model output width violates output_tokens_per_step: "
-                        f"{next_token_ids.shape[1]} != "
-                        f"{self._output_tokens_per_step}"
+                        f"{next_token_ids.shape[1]} not in {allowed_widths}"
                     )
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
@@ -2327,7 +3779,7 @@ class TTModelRunner:
             else {req_id: idx for idx, req_id in enumerate(output_req_ids)}
         )
         sampled_token_ids = _coerce_output_block(
-            sampled_token_ids, num_reqs, self._output_tokens_per_step
+            sampled_token_ids, num_reqs, self._tt_committed_width(sampled_token_ids)
         )
 
         sampled_token_ids_np = sampled_token_ids.numpy()
@@ -2354,20 +3806,20 @@ class TTModelRunner:
         self,
         sampled_token_ids: torch.Tensor,
         req_ids: list[str] | None = None,
-        request_states: tuple[CachedRequestState, ...] | None = None,
+        skip_req_ids: set[str] | None = None,
     ) -> None:
         # When applying a deferred async step, the write row is resolved live
         # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime
-        # and the ``request_states`` identity check guards slot reuse, so the
-        # live row equals the captured one. ``req_id_to_index`` is therefore the
-        # single source of truth for the target row.
+        # time: lane mode pins each request to a stable slot for its lifetime,
+        # while the scheduler lifecycle skip set rejects stale results before a
+        # live row is resolved. ``req_id_to_index`` is therefore the source of
+        # truth for the target row.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
+        num_out_tokens = self._tt_committed_width(sampled_token_ids)
         sampled_token_ids = _coerce_output_block(
-            sampled_token_ids, num_reqs, self._output_tokens_per_step
+            sampled_token_ids, num_reqs, num_out_tokens
         )
-        num_out_tokens = self._output_tokens_per_step
 
         sampled_token_ids_np = sampled_token_ids.numpy()
         if sampled_token_ids_np.dtype != np.int32:
@@ -2423,14 +3875,13 @@ class TTModelRunner:
             # raise never leaves a partially applied batch. Block canvases
             # are clipped below instead of raising.
             for req_idx, req_id in enumerate(captured_req_ids):
+                if skip_req_ids is not None and req_id in skip_req_ids:
+                    continue
                 req_state = self.requests.get(req_id)
-                if req_state is None:
-                    continue
-                if (
-                    request_states is not None
-                    and req_state is not request_states[req_idx]
-                ):
-                    continue
+                assert req_state is not None, (
+                    "captured request missing from runner state while applying "
+                    f"sampled tokens: req_id={req_id!r}"
+                )
                 current_row = self.input_batch.req_id_to_index.get(req_id)
                 if current_row is not None:
                     end_idx = (
@@ -2444,15 +3895,13 @@ class TTModelRunner:
                         )
 
         for req_idx, req_id in enumerate(captured_req_ids):
-            req_state = self.requests.get(req_id)
-            # A deferred decode step can be applied after the engine finished
-            # and dropped its request, so a missing state is ordinary. Same for
-            # readmission under a reused id: the token has no live owner.
-            if req_state is None or (
-                request_states is not None and req_state is not request_states[req_idx]
-            ):
+            if skip_req_ids is not None and req_id in skip_req_ids:
                 continue
-
+            req_state = self.requests.get(req_id)
+            assert req_state is not None, (
+                "captured request missing from runner state while applying sampled "
+                f"tokens: req_id={req_id!r}"
+            )
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
@@ -2472,6 +3921,23 @@ class TTModelRunner:
                 block = sampled_token_ids_np[req_idx]
 
             req_state.output_token_ids.extend(int(token_id) for token_id in block)
+
+    def _tt_committed_width(self, sampled_token_ids: torch.Tensor) -> int:
+        """Resolve one step's committed output width.
+
+        Fixed at ``output_tokens_per_step``, except an ADAPTIVE block model's
+        non-block steps (batched decodes and prefill anchors) emit exactly one
+        valid token per request -- the scheduler reserved exactly one
+        placeholder for those steps, so the emitted row length IS the step's
+        contract. Any other width still fails _coerce_output_block.
+        """
+        if (
+            self._is_adaptive_block_output
+            and sampled_token_ids.dim() == 2
+            and sampled_token_ids.shape[1] == 1
+        ):
+            return 1
+        return self._output_tokens_per_step
 
     def apply_and_build_runner_output(
         self,
@@ -2496,13 +3962,59 @@ class TTModelRunner:
             req_id_to_index=req_id_to_index,
         )
 
+    def _enqueue_deferred_state_apply(
+        self,
+        sampled_token_ids: torch.Tensor,
+        req_ids: list[str],
+        runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Queue sampled host state until scheduler lifecycle is known.
+
+        Final prefills are sampled synchronously, but under AsyncScheduler their
+        published output is still protected by a placeholder. Queue them beside
+        completed async decodes so a forced prefix reset can leave the published
+        row intact for discard accounting without first appending its stale
+        token to runner state.
+        """
+        now = time.perf_counter_ns()
+        self.async_decode.enqueue_completed_decode_step(
+            CompletedDecodeStep(
+                sampled_token_ids=sampled_token_ids,
+                logprobs=None,
+                context=SubmittedStepContext(
+                    req_ids=list(req_ids),
+                    req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+                    submit_time_ns=now,
+                ),
+                completion_time_ns=now,
+                runner_output=runner_output,
+            )
+        )
+
+    def defer_state_apply_and_build_runner_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        logprobs: LogprobsLists | None = None,
+        req_ids: list[str] | None = None,
+        req_id_to_index: dict[str, int] | None = None,
+    ) -> ModelRunnerOutput:
+        assert req_ids is not None, "deferred synchronous output needs request IDs"
+        runner_output = self._build_runner_output(
+            sampled_token_ids=sampled_token_ids,
+            logprobs=logprobs,
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+        )
+        self._enqueue_deferred_state_apply(sampled_token_ids, req_ids, runner_output)
+        return runner_output
+
     def warmup_model(self) -> None:
-        # Two-phase warmup: compile first, then capture traces.
+        # Two-phase warmup: eager preparation, then trace-enabled warmup.
         #
-        # Phase 1 compiles all op variants (prefill + decode) into the
-        # program cache WITHOUT capturing any traces.  Phase 2 then
-        # captures traces with every op already compiled, so no new
-        # kernel-cache allocations occur that could corrupt trace memory.
+        # Phase 1 warms the eager prefill/decode paths without capturing
+        # traces. Generators own preparation of the programs and persistent
+        # buffers their traces need. Keep prefill first in Phase 2 because
+        # some custom adapters defer its preparation to that call.
         #
         # Assumptions / limitations:
         #   1. Traced and non-traced code paths must use the same ops.
@@ -2530,8 +4042,12 @@ class TTModelRunner:
             num_blocks=self.max_num_blocks_per_req,
             can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
         )
+        if self.supports_device_grammar:
+            decode_kwargs["can_sample_device_grammar"] = True
 
-        # Phase 1: compile all code paths (no trace capture)
+        # Phase 1: eager warmup (no trace capture). tt-metal #55343 also
+        # stages generic decode trace inputs here, using the profiled
+        # num_blocks above, so Phase 2 can reuse their device allocations.
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
         self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
 
@@ -2539,7 +4055,12 @@ class TTModelRunner:
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture traces (all ops already compiled)
+        # Phase 2: capture prefill before decode. Custom adapters such as
+        # Qwen can defer persistent prefill allocations / compilation until
+        # this trace-enabled warmup; they must not run behind decode traces.
+        # Generic decode inputs are already staged by tt-metal #55343, so
+        # restoring this order does not require allocating them after prefill
+        # capture. Older tt-metal revisions lack that protection (see #122).
         if trace_prefill_mode:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
         if trace_decode_mode:

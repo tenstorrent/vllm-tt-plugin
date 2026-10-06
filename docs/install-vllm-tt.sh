@@ -13,15 +13,31 @@
 # not stay behind in the image layer.
 VLLM_COMMON_REQUIREMENTS=$(mktemp)
 curl -fsSL \
-    https://raw.githubusercontent.com/vllm-project/vllm/v0.25.1/requirements/common.txt \
+    https://raw.githubusercontent.com/vllm-project/vllm/v0.26.0/requirements/common.txt \
     -o "$VLLM_COMMON_REQUIREMENTS" ||
     # `return`, not `exit`: this script is sourced into the caller's shell.
     { echo "install-vllm-tt: cannot fetch vLLM common.txt"; return 1; }
 uv pip install --override docs/vllm-overrides.txt \
     -r "$VLLM_COMMON_REQUIREMENTS"   # see that file for why. Must read when bumping vllm version!
 rm -f "$VLLM_COMMON_REQUIREMENTS"
+# torchvision is absent from common.txt (requirements/cuda.txt carries it for
+# the CUDA target), yet several vLLM model and processor modules import it
+# unconditionally. Registry inspection imports the module for the resolved
+# architecture, so without torchvision a serve command dies before any TT code
+# runs; transformers' Gemma4 processor reaches it for google/gemma-4-*.
+# --no-deps and the CPU index leave torch alone: this is the torchvision half
+# of the torch pair the tt-metal env fixes, and the default PyPI wheel is the
+# CUDA build.
+uv pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
+    torchvision==0.26.0   # keep in sync with tt-metal requirements-dev.txt
+# numba is absent from common.txt for the same reason as torchvision: vLLM
+# carries it in requirements/cuda.txt, labelled "Required for N-gram
+# speculative decoding". It is platform independent, and vllm.v1.spec_decode.
+# ngram_proposer imports it at module scope, so without it the ngram drafter
+# cannot be constructed and ngram speculation cannot run on TT at all.
+uv pip install numba==0.61.2   # matches vLLM's own requirements/cuda.txt pin
 # --no-binary vllm: the published wheel is the CUDA build, kernels included, so
 # vLLM has to come from source. vLLM ends up declaring no torch dependency, which
 # is intended; torch belongs to the tt-metal env this plugin runs inside.
-VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.25.1
+VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.26.0
 uv pip install -e .

@@ -7,7 +7,7 @@ import multiprocessing
 import os
 import sys
 import weakref
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 import torch
 from vllm.platforms.interface import Platform, PlatformEnum
@@ -16,15 +16,28 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_decode_interleave_config,
+    get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
+    get_tt_spec_plan,
+    is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    store_tt_adaptive_block_max_prompt_tokens,
+    store_tt_adaptive_block_output,
+    store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_spec_plan,
+    store_tt_supports_device_grammar,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.spec_admission import (
+    MODEL_OWNED_DRAFT_METHOD,
+    resolve_speculative_plan,
+)
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -60,6 +73,11 @@ TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # (_aligned_prefill_len and _round_down_to_tile), so admission and the adapter
 # must agree on this hardware-fixed value.
 _TT_TOKEN_TILE_SIZE = 32
+# The comparison ``_install_tt_async_spec_method_patch`` acts through, and how
+# many times ``VllmConfig.__post_init__`` makes it: once for an explicitly
+# requested asynchronous scheduling, once for the automatic selection.
+_ASYNC_SPEC_GATE_COMPARISON = "not in get_args(EagleModelTypes)"
+_ASYNC_SPEC_GATE_COMPARISONS = 2
 _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
     "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
     "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
@@ -139,10 +157,6 @@ _GALAXY_GENERATOR_VERSIONS = {
     "TT_QWEN3_TEXT_VER": "qwen3_32b_galaxy",
 }
 
-# HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
-# prefill, i.e. the ones token-chunked prefill has been validated against.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
-
 
 def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     """Disable split prefills and restore a full-prompt scheduler budget."""
@@ -176,20 +190,68 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     scheduler_config.long_prefill_token_threshold = 0
 
 
-def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:
-    """Restrict token-chunked prefill to the model types that support it."""
-    scheduler_config = vllm_config.scheduler_config
-    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
+    """Fail here rather than at the first scheduler step in a worker subprocess."""
+    enabled, prefill_steps, decode_steps = get_tt_decode_interleave_config(vllm_config)
+    if not enabled:
+        logger.info(
+            "Decode interleave disabled: a run of prefill steps stalls every "
+            "running decode for its whole duration."
+        )
+        return
+    logger.info(
+        "Decode interleave enabled: at most %d consecutive prefill step(s) "
+        "before %d decode-only step(s).",
+        prefill_steps,
+        decode_steps,
+    )
 
-    if model_type in _CHUNKED_PREFILL_MODEL_TYPES:
-        # A chunk boundary inside a multimodal item would split its embeddings
-        # from their positions. Only meaningful while prefill can be split, and
-        # vLLM rejects the flag outright when one item exceeds the token budget,
-        # so it stays off for every model type below.
-        scheduler_config.disable_chunked_mm_input = True
+
+def _apply_chunked_prefill_policy(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Restrict token-chunked prefill to the models that declare support for it."""
+    scheduler_config = vllm_config.scheduler_config
+    model_desc = f"TT model {model_class.__name__} ({model_class.__module__})"
+
+    supports_chunked_prefill = (
+        model_capabilities.get("supports_chunked_prefill", False)
+        if model_capabilities
+        else False
+    )
+    output_tokens_per_step = (
+        model_capabilities.get("output_tokens_per_step", 1) if model_capabilities else 1
+    )
+    if (
+        not supports_chunked_prefill
+        or not scheduler_config.enable_chunked_prefill
+        or output_tokens_per_step > 1
+    ):
+        reason = model_desc
+        if supports_chunked_prefill and output_tokens_per_step > 1:
+            reason = f"{model_desc} (block-output)"
+        _disable_chunked_prefill(vllm_config, reason)
         return
 
-    _disable_chunked_prefill(vllm_config, f"`model_type={model_type}`")
+    # A chunk boundary inside a multimodal item would split its embeddings from
+    # their positions. Only meaningful while prefill can be split, and vLLM
+    # rejects the flag outright when one item exceeds the token budget, so it
+    # stays off for every model that does not reach here.
+    scheduler_config.disable_chunked_mm_input = True
+
+    # The only signal from outside the process that chunked prefill is active and
+    # at what budget: the scheduler config is absent from /metrics and an
+    # intermediate chunk emits no token, so it raises no iteration stats either.
+    # CI gates its device tests on this line, so it is logged unconditionally.
+    logger.info(
+        "Chunked prefill enabled for %s: max_num_batched_tokens=%d, "
+        "long_prefill_token_threshold=%d.",
+        model_desc,
+        scheduler_config.max_num_batched_tokens,
+        scheduler_config.long_prefill_token_threshold,
+    )
 
 
 def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
@@ -527,6 +589,52 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
         ModelRegistry.register_model(model_arch, model_path)
 
 
+def _tt_model_class_overrides() -> dict[str, str]:
+    """Parse ``TT_MODEL_CLASS_OVERRIDES`` into an {architecture: target} map.
+
+    Format: comma-separated ``Arch=module.path:Class`` entries, e.g.::
+
+        TT_MODEL_CLASS_OVERRIDES = \
+            "TTGemma4ForCausalLM=models.demos.gemma4.tt:Gemma4MTPForCausalLM"
+
+    Generic serving-class selection for ANY architecture. Architecture names are
+    normalised to the ``TT``-prefixed form, which is the name vLLM actually
+    resolves: ``check_and_update_config`` rewrites every checkpoint architecture
+    in place with a ``TT`` prefix before registry lookup, so an override keyed on
+    the bare name would never be consulted. Either form may be written here.
+
+    Two caveats an operator needs. The override must name the architecture the
+    CHECKPOINT resolves to: several aliases can share one target (the built-in
+    map registers six names for Gemma4 alone), and overriding one alias leaves
+    the others on the default class. And the override is registered
+    UNCONDITIONALLY, ahead of bundles and built-ins, so it is authoritative for
+    the process -- registering it if-missing silently discarded every override
+    naming an architecture upstream vLLM already ships, which is most of them
+    (vllm-tt-plugin#118.3).
+
+    Model-specific selection envs are deliberately not added per model type --
+    behaviour keyed on model identity is against this repo's gating contract.
+    """
+    raw = os.getenv("TT_MODEL_CLASS_OVERRIDES", "").strip()
+    if not raw:
+        return {}
+    overrides: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        arch, sep, target = entry.partition("=")
+        arch = arch.strip()
+        target = target.strip()
+        if not sep or not arch or ":" not in target:
+            raise ValueError(
+                f"TT_MODEL_CLASS_OVERRIDES entry {entry!r} is not of the form "
+                "'Architecture=module.path:ClassName'"
+            )
+        overrides[arch] = target
+    return overrides
+
+
 def _install_diffusion_gemma_architecture_patch() -> None:
     """Resolve DiffusionGemma through its TT architecture before config hooks.
 
@@ -631,6 +739,117 @@ def _install_tt_harmony_truncation_patch() -> None:
     renderer_registry = sys.modules.get("vllm.renderers.registry")
     if renderer_registry is not None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
+
+
+def _install_tt_async_spec_method_patch() -> None:
+    """Let the TT model-owned drafter through upstream's async-scheduling gate.
+
+    ``VllmConfig.__post_init__`` decides asynchronous scheduling against the
+    speculative method name, and it decides before ``check_and_update_config``
+    runs: an explicit ``--async-scheduling`` raises for any method outside
+    EAGLE/MTP/draft_model/NGram GPU/DSpark, and the default path rewrites the
+    setting to False for the same set. TT uses the ``custom_class`` extension
+    category for its model-owned drafter. The ordinary platform validation
+    hook runs too late to admit that category through the upstream check.
+
+    Both predicates read one module-level name, ``EagleModelTypes``, which
+    ``vllm.config.vllm`` imports and uses nowhere else. Rebinding that name to
+    a widened ``Literal`` changes exactly those two conditions, in that module,
+    and leaves every other consumer of the type alone: each imports it into its
+    own namespace. Everything else upstream checks stays in force, including
+    the executor's support, ``disable_padded_drafter_batch``, and the
+    configuration that follows from the resolved setting, and
+    ``--no-async-scheduling`` still disables.
+
+    Installed only in a process that can serve TT models: from the TT platform
+    hooks, and from the general-plugin entry point once ttnn imports. Whether a
+    given model may serve the pairing is still the plugin's own admission
+    decision.
+
+    TODO: remove this once vLLM admits a proposer-owning platform through a
+    hook of its own.
+    """
+    import vllm.config.vllm as vllm_config_module
+
+    if hasattr(vllm_config_module, "_tt_original_eagle_model_types"):
+        return
+    if hasattr(vllm_config_module, "_tt_async_spec_gate_problem"):
+        return
+
+    problem = _async_spec_gate_shape_problem(vllm_config_module)
+    if problem is not None:
+        # This runs in every TT process, including launches that never
+        # speculate, so an unrecognized gate must not fail them. Unpatched,
+        # upstream refuses an explicit --async-scheduling for the model-owned
+        # drafter and otherwise serves it synchronously;
+        # _warn_unpatched_async_spec_gate tells that launch why.
+        vllm_config_module._tt_async_spec_gate_problem = problem
+        return
+    original = vllm_config_module.EagleModelTypes
+    vllm_config_module._tt_original_eagle_model_types = original
+    vllm_config_module.EagleModelTypes = Literal[
+        tuple(get_args(original)) + (MODEL_OWNED_DRAFT_METHOD,)
+    ]
+
+
+def _async_spec_gate_shape_problem(vllm_config_module: Any) -> str | None:
+    """Why the gate no longer looks like the one documented, or None.
+
+    The rebind has no effect when upstream inlines the method list, renames it,
+    or routes the decision through a helper: the name still exists and still
+    holds ``custom_class`` while asynchronous scheduling stays disabled for the
+    model-owned drafter. The source is checked for the two comparisons the
+    patch acts through, so that case is reported instead of passing as patched.
+    """
+    import inspect
+
+    try:
+        source = inspect.getsource(vllm_config_module.VllmConfig.__post_init__)
+    except (OSError, TypeError) as error:  # pragma: no cover - source ships
+        return (
+            "TT cannot verify vLLM's asynchronous-scheduling gate because "
+            f"VllmConfig.__post_init__ has no readable source: {error}. The TT "
+            "patch admitting the model-owned drafter is not applied, so it "
+            "serves without asynchronous scheduling"
+        )
+    comparisons = source.count(_ASYNC_SPEC_GATE_COMPARISON)
+    if comparisons != _ASYNC_SPEC_GATE_COMPARISONS:
+        return (
+            "TT expects vLLM's asynchronous-scheduling gate to test the "
+            "speculative method with "
+            f"{_ASYNC_SPEC_GATE_COMPARISON!r} exactly "
+            f"{_ASYNC_SPEC_GATE_COMPARISONS} times in "
+            f"VllmConfig.__post_init__, and found {comparisons}. This vLLM has "
+            "restructured that decision, so the TT patch admitting the "
+            "model-owned drafter is not applied and it serves without "
+            "asynchronous scheduling. Pin the supported vLLM version, or "
+            "update _install_tt_async_spec_method_patch to the new structure"
+        )
+    return None
+
+
+def _warn_unpatched_async_spec_gate(vllm_config: Any) -> None:
+    """Tell a model-owned drafter launch why it runs without async scheduling."""
+    import vllm.config.vllm as vllm_config_module
+
+    problem = getattr(vllm_config_module, "_tt_async_spec_gate_problem", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    method = getattr(speculative_config, "method", None)
+    if problem is not None and method == MODEL_OWNED_DRAFT_METHOD:
+        logger.warning_once(problem)
+
+
+def _uninstall_tt_async_spec_method_patch() -> None:
+    """Restore the upstream gate, for tests that assert the unpatched one."""
+    import vllm.config.vllm as vllm_config_module
+
+    if hasattr(vllm_config_module, "_tt_async_spec_gate_problem"):
+        del vllm_config_module._tt_async_spec_gate_problem
+    original = getattr(vllm_config_module, "_tt_original_eagle_model_types", None)
+    if original is None:
+        return
+    vllm_config_module.EagleModelTypes = original
+    del vllm_config_module._tt_original_eagle_model_types
 
 
 def _pin_v1_model_runner() -> None:
@@ -994,8 +1213,23 @@ def _builtin_models_enabled() -> bool:
 def register_tt_models(register_test_models=False) -> None:
     from vllm.model_executor.models.registry import ModelRegistry
 
+    # Operator overrides register FIRST: an explicit per-launch
+    # TT_MODEL_CLASS_OVERRIDES entry is the most specific intent and wins over
+    # bundles and built-ins via the if-missing precedence below.
+    for _arch, _target in _tt_model_class_overrides().items():
+        # UNCONDITIONAL: ModelRegistry already holds every architecture upstream
+        # vLLM ships (362 in vLLM 0.26.0), so if-missing would discard the
+        # override with no diagnostic. Upstream permits re-registration. The
+        # TT-prefixed form is the one vLLM resolves (see the parser docstring);
+        # register the bare form too so nothing depends on which one ran first.
+        _tt_arch = _arch if _arch.startswith("TT") else "TT" + _arch
+        for _name in dict.fromkeys((_tt_arch, _arch)):
+            ModelRegistry.register_model(_name, _target)
+        logger.info("Applied TT_MODEL_CLASS_OVERRIDES: %s -> %s", _tt_arch, _target)
+
     # Dynamic hook: register any bundles dropped under EXTRA_MODELS_DIR. Runs
-    # first so a distributed bundle can supply a model without touching this file.
+    # before the built-ins so a distributed bundle can supply a model without
+    # touching this file.
     _register_models_from_extra_dir(ModelRegistry)
 
     # DiffusionGemma aliases register regardless of the builtin-map switch:
@@ -1031,10 +1265,15 @@ def register_tt_models(register_test_models=False) -> None:
         path_llama_text = (
             "models.demos.t3000.llama2_70b.tt.generator_vllm:TtLlamaForCausalLM"
         )
+    elif llama_text_version == "llama31_8b_qb2":
+        path_llama_text = (
+            "models.demos.llama31_8b_qb2.tt.generator_vllm:LlamaForCausalLM"
+        )
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [tt_transformers, llama3_70b_galaxy, llama2_70b]"
+            "pick one of [tt_transformers, llama3_70b_galaxy, "
+            "llama2_70b, llama31_8b_qb2]"
         )
 
     # Llama3.1/3.2 - Text
@@ -1200,6 +1439,16 @@ def register_tt_test_models():
         "models.vllm_test_utils.no_op_test.test_model:DummyNoOpModel",
     )
 
+    # The same, implementing the speculative-decoding contract: the only way to
+    # exercise the plugin's speculative path against a real engine, scheduler
+    # and worker, and the instrument for measuring what a speculative step
+    # costs on the host with no device work under it.
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTDummySpecDecodeModel",
+        "models.vllm_test_utils.spec_test.test_model:DummySpecDecodeModel",
+    )
+
     # Fake model for testing multi-host inference on dual Galaxy
     _register_model_if_missing(
         ModelRegistry,
@@ -1273,6 +1522,10 @@ class TTPlatform(Platform):
         super().pre_register_and_update(parser)
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
+        # which is where upstream decides asynchronous scheduling against the
+        # speculative method name. This hook is that call's first statement.
+        _install_tt_async_spec_method_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
@@ -1349,6 +1602,12 @@ class TTPlatform(Platform):
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v1_model_runner()
         _install_tt_harmony_truncation_patch()
+        # Too late to change this config's asynchronous setting, which upstream
+        # resolved before calling this hook. Installed anyway, for a process
+        # that reaches configuration without the CLI path: a second engine, or
+        # a direct VllmConfig construction, then finds the gate patched.
+        _install_tt_async_spec_method_patch()
+        _warn_unpatched_async_spec_gate(vllm_config)
         # The class carries process-level admission state, so a live
         # block-output engine cannot share the process with a second engine:
         # the reset below (and every class write after it) would corrupt the
@@ -1443,11 +1702,6 @@ class TTPlatform(Platform):
 
     @classmethod
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        _apply_chunked_prefill_policy(vllm_config)
-
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -1567,9 +1821,110 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        # Rewrites scheduler_config; nothing between here and the closing
+        # ``verify_max_model_len`` reads the fields it touches.
+        _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
+        _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
+        if (
+            output_tokens_per_step > 1
+            and model_capabilities is not None
+            and model_capabilities.get("max_device_top_k") is not None
+        ):
+            raise ValueError(
+                "max_device_top_k requires host sampling fallback and cannot be "
+                "used by block-output models (output_tokens_per_step > 1)."
+            )
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
+        # Adaptive block-output: the model emits its block ONLY when it decodes
+        # alone (batch==1) and falls back to plain batched baseline otherwise,
+        # so the max_num_seqs=1 and data-parallel gates below are relaxed for
+        # it -- the scheduler reserves the block placeholder only on solo
+        # decode steps.
+        adaptive_block_output = bool(
+            (model_capabilities or {}).get("tt_adaptive_block_output", False)
+        )
+        if adaptive_block_output and output_tokens_per_step <= 1:
+            raise ValueError(
+                "tt_adaptive_block_output requires output_tokens_per_step > 1"
+            )
+        store_tt_adaptive_block_output(vllm_config, adaptive_block_output)
+        # Optional prompt-length frontier for the adaptive block path: prompts
+        # above it are served as plain baseline by the model, so the scheduler
+        # must reserve width-1 for them (see TTScheduler). 0 = no limit.
+        adaptive_block_max_prompt = int(
+            (model_capabilities or {}).get("tt_adaptive_block_max_prompt_tokens", 0)
+        )
+        if adaptive_block_max_prompt < 0:
+            raise ValueError(
+                "tt_adaptive_block_max_prompt_tokens must be >= 0; got "
+                f"{adaptive_block_max_prompt}"
+            )
+        if adaptive_block_max_prompt and not adaptive_block_output:
+            raise ValueError(
+                "tt_adaptive_block_max_prompt_tokens requires tt_adaptive_block_output"
+            )
+        store_tt_adaptive_block_max_prompt_tokens(
+            vllm_config, adaptive_block_max_prompt
+        )
+        # Total KV positions ONE block-output step may touch. The emitted width
+        # does not bound this: a step's verification rows and carried tokens run
+        # past the tokens it commits, and a model may be configured with a
+        # verification width LARGER than its output block (dFlash at
+        # SERVE_BLOCK=2, VERIFY=7 emits 2 and writes 8 rows), in which case a
+        # multiple of the output width under-allocates and the step writes
+        # positions with no request block (vllm-tt-plugin#118 review, finding 2).
+        block_kv_extent = int(
+            (model_capabilities or {}).get("tt_block_kv_extent_tokens", 0)
+        )
+        if block_kv_extent < 0:
+            raise ValueError(
+                f"tt_block_kv_extent_tokens must be >= 0; got {block_kv_extent}"
+            )
+        if block_kv_extent and block_kv_extent < output_tokens_per_step:
+            # It must cover the committed block itself, or the declaration is
+            # describing something other than the step's whole KV extent.
+            raise ValueError(
+                "tt_block_kv_extent_tokens must cover the emitted block: "
+                f"{block_kv_extent} < output_tokens_per_step "
+                f"{output_tokens_per_step}"
+            )
+        store_tt_block_kv_extent_tokens(vllm_config, block_kv_extent)
         is_block_output_model = is_tt_block_output_model(vllm_config)
+        supports_device_grammar = (
+            model_capabilities.get("supports_device_grammar", False)
+            if model_capabilities
+            else False
+        )
+        if not isinstance(supports_device_grammar, bool):
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "must declare model_capabilities['supports_device_grammar'] "
+                f"as a boolean, got {supports_device_grammar!r}"
+            )
+        supports_sample_on_device = (
+            model_capabilities.get("supports_sample_on_device", False)
+            if model_capabilities
+            else False
+        )
+        if supports_device_grammar and not supports_sample_on_device:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['supports_device_grammar']=True "
+                "without model_capabilities['supports_sample_on_device']=True"
+            )
+        if is_block_output_model and supports_device_grammar:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['supports_device_grammar']=True, "
+                "but block-output models own a multi-token sampler and do not "
+                "support vLLM grammar masks"
+            )
+        store_tt_supports_device_grammar(
+            vllm_config,
+            supports_device_grammar,
+        )
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
                 "DiffusionGemma must declare output_tokens_per_step > 1 "
@@ -1584,6 +1939,17 @@ class TTPlatform(Platform):
             if model_capabilities
             else False
         )
+        if is_block_output_model and vllm_config.speculative_config:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['output_tokens_per_step'] > 1, "
+                "which selects the block-output rail, and a speculative "
+                "config was also requested. Both define the committed output "
+                "width per step, and the block-output rail neutralizes the "
+                "HTTP sampling controls and disables the logprobs that "
+                "speculation honours. The model capability cannot be changed "
+                "from the command line, so drop the speculative flags"
+            )
         if is_block_output_model and supports_prefix_caching:
             raise ValueError(
                 f"Model {model_class.__module__}.{model_class.__name__} "
@@ -1591,22 +1957,16 @@ class TTPlatform(Platform):
                 "but block-output models (output_tokens_per_step > 1) bypass "
                 "the vLLM prefix cache; fix the model's capability declaration"
             )
-        if vllm_config.cache_config.enable_prefix_caching:
-            if not supports_prefix_caching:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported in TT backend for %s, "
-                    "disabling it",
-                    model_class.__module__,
-                )
-                _renormalize_mamba_cache_config(vllm_config)
-            elif model_config.get_sliding_window() is not None:
-                vllm_config.cache_config.enable_prefix_caching = False
-                logger.warning(
-                    "Prefix caching is not supported in TT backend for "
-                    "models with sliding window, disabling it"
-                )
-                _renormalize_mamba_cache_config(vllm_config)
+        if (
+            vllm_config.cache_config.enable_prefix_caching
+            and not supports_prefix_caching
+        ):
+            vllm_config.cache_config.enable_prefix_caching = False
+            logger.warning(
+                "Prefix caching is not supported in TT backend for %s, disabling it",
+                model_class.__module__,
+            )
+            _renormalize_mamba_cache_config(vllm_config)
         logger.info(
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
@@ -1617,6 +1977,23 @@ class TTPlatform(Platform):
                 "release_request",
                 "release_persistent_capture",
             )
+            # The runner permutes per-slot state between decode steps and then
+            # releases a request by its CURRENT slot. A model that keys per-slot
+            # state (a B=1 session, a per-row session dict) on the slot it was
+            # handed at prefill must therefore be told about the move, or a
+            # release stops matching its own request and tears down a live one
+            # (vllm-tt-plugin#118 review, finding 1).
+            #
+            # Only required where a gather can actually happen: a plain
+            # block-output model is pinned to max_num_seqs=1 below, so its
+            # permutation is always the identity and the current slot never
+            # diverges from the prefill slot. The ADAPTIVE variant is the one
+            # that admits several live requests, so it is the one that must
+            # track moves.
+            if adaptive_block_output and (
+                int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1) or 1) > 1
+            ):
+                required_lifecycle_hooks += ("note_state_slots_moved",)
             missing_hooks = [
                 hook
                 for hook in required_lifecycle_hooks
@@ -1629,9 +2006,9 @@ class TTPlatform(Platform):
                     + ", ".join(missing_hooks)
                 )
 
-            # Gemma4 autoregressive models support token-chunked prefill, but
-            # block-output models cannot resume a split prompt. Capability wins
-            # over the model-type policy once the output width is known.
+            # Block-output models cannot resume a split prompt. The policy
+            # already disables this from output_tokens_per_step; keep the
+            # same guard after the width is stored on the config.
             _disable_chunked_prefill(vllm_config, "block-output models")
 
             # Independently of the MODELS_CONFIG_MAP hook prevented during
@@ -1676,18 +2053,29 @@ class TTPlatform(Platform):
                     "tile, so max_model_len must be at least "
                     f"{min_max_model_len}"
                 )
-            if vllm_config.scheduler_config.max_num_seqs != 1:
+            adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
+            if (
+                not adaptive_block_output
+                and vllm_config.scheduler_config.max_num_seqs != 1
+            ):
                 raise ValueError(
                     "Block-output models currently own one model-side request "
-                    "state and require --max-num-seqs 1"
+                    "state and require --max-num-seqs 1 (or declare "
+                    "tt_adaptive_block_output to batch >1 as plain baseline)"
                 )
-            if (
+            if not adaptive_block_output and (
                 parallel_config.data_parallel_size != 1
                 or get_tt_data_parallel_size(vllm_config) != 1
             ):
+                # Adaptive block-output IS data-parallel-safe: each DP engine owns
+                # its own scheduler + model state and runs the solo-decode block
+                # gate independently, so N engines each serve solo requests at
+                # block width and batched requests as plain baseline. A plain
+                # (non-adaptive) block-output model owns one shared state -> DP 1.
                 raise ValueError(
                     "Block-output models do not yet support data parallelism; "
-                    "use --data-parallel-size 1"
+                    "use --data-parallel-size 1 (or declare "
+                    "tt_adaptive_block_output for per-engine adaptive DP)"
                 )
             # After the DP check: upstream auto-selects "mp" whenever
             # --data-parallel-size > 1, and the DP message is the actionable
@@ -1695,7 +2083,13 @@ class TTPlatform(Platform):
             distributed_executor_backend = getattr(
                 parallel_config, "distributed_executor_backend", None
             )
-            if distributed_executor_backend not in (None, "uni"):
+            allowed_backends = (None, "uni")
+            if adaptive_block_output:
+                # Adaptive DP runs one engine process per DP rank (the mp
+                # executor upstream auto-selects for data_parallel_size > 1),
+                # each with its own single-rank scheduler and model state.
+                allowed_backends = (None, "uni", "mp")
+            if distributed_executor_backend not in allowed_backends:
                 raise ValueError(
                     "Block-output models require the uniproc executor; "
                     f"got distributed_executor_backend="
@@ -1716,10 +2110,24 @@ class TTPlatform(Platform):
                     "Block-output models do not support --logits-processors "
                     "because output is sampled inside the model"
                 )
-            if vllm_config.scheduler_config.async_scheduling:
+            if (
+                vllm_config.scheduler_config.async_scheduling
+                and not adaptive_block_output
+            ):
+                # A PLAIN block-output model reserves its whole canvas on every
+                # step and cannot survive the async schedule/commit lag (the
+                # next step's schedule overwrites the Request state before the
+                # prior output commits). An ADAPTIVE block-output model may
+                # serve async: TTScheduler carries each step's block decision on
+                # its SchedulerOutput (which the engine pairs with that step's
+                # output), so a solo block commit and a batched width-1 commit
+                # each reconcile against their own step regardless of the lag.
+                # The batched baseline fallback wants the async decode overlap;
+                # the solo block step has no read to overlap and stays correct.
                 raise ValueError(
                     "Block-output models currently support synchronous serving "
-                    "only; launch with --no-async-scheduling"
+                    "only; launch with --no-async-scheduling (adaptive "
+                    "block-output models may serve async)"
                 )
             # Worker knobs the launch gates cannot hard-require: eager serving
             # without upfront capture is legitimate. But a capture-based model
@@ -1753,11 +2161,6 @@ class TTPlatform(Platform):
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
         # `supports_sample_on_device` in their `model_capabilities` dict.
-        supports_sample_on_device = (
-            model_capabilities.get("supports_sample_on_device", False)
-            if model_capabilities
-            else False
-        )
         if sample_on_device_mode is not None and not supports_sample_on_device:
             raise ValueError(
                 f"sample_on_device_mode={sample_on_device_mode!r} was requested, "
@@ -1765,12 +2168,22 @@ class TTPlatform(Platform):
                 f"({model_class.__module__}) does not support on-device sampling. "
                 "Unset sample_on_device_mode or use a model that supports it."
             )
-        if is_block_output_model and sample_on_device_mode != "all":
-            raise ValueError(
-                "Block-output models emit complete multi-token outputs from "
-                "their model-owned sampler and require "
-                f'sample_on_device_mode="all"; got {sample_on_device_mode!r}'
+        if is_block_output_model:
+            # An adaptive block model's prefill and batched-decode steps are
+            # plain one-token steps, so its prefill anchor may be host-sampled:
+            # decode_only is valid for it. Blocks themselves always come from
+            # the model-owned sampler on solo decode steps.
+            allowed_sampling = (
+                ("all", "decode_only")
+                if is_tt_adaptive_block_output_model(vllm_config)
+                else ("all",)
             )
+            if sample_on_device_mode not in allowed_sampling:
+                raise ValueError(
+                    "Block-output models emit complete multi-token outputs from "
+                    "their model-owned sampler and require sample_on_device_mode "
+                    f"in {allowed_sampling}; got {sample_on_device_mode!r}"
+                )
 
         # Model-gated async scheduling. Async overlap requires generators that
         # support split decode submission via `decode_forward(...,
@@ -1798,6 +2211,81 @@ class TTPlatform(Platform):
         # Must run before the validation/routing below so the lane path is
         # selected. model_class carries the single-execute decision for GPT-OSS.
         _convert_dp_to_lanes(vllm_config, model_class)
+
+        if (
+            vllm_config.speculative_config
+            and vllm_config.scheduler_config.async_scheduling
+        ):
+            # The runner has a deferred speculative path: acceptance is walked
+            # where the readback completes, and the commit and the next
+            # proposal wait for the engine thread. That path places two demands
+            # on a model that supports_async_decode does not cover, because the
+            # decode reload contract was written for a decode committing one
+            # token per forward: read_decode_output is handed a [B, 1+K] verify
+            # whose committed length the host decides after the forward, and
+            # the verify's hidden handle must stay valid across the readback
+            # and until the next step's propose call. Declared separately
+            # rather than derived, so a model already declaring async decode
+            # does not silently acquire obligations it was never written to.
+            supports_async_spec_decode = bool(
+                (model_capabilities or {}).get("supports_async_spec_decode", False)
+            )
+            if not supports_async_spec_decode:
+                raise ValueError(
+                    "TT asynchronous scheduling and speculative decoding "
+                    f"cannot be combined for {model_class.__name__}, which "
+                    "does not declare "
+                    "model_capabilities['supports_async_spec_decode']. The "
+                    "deferred speculative path hands read_decode_output a "
+                    "[B, 1+K] verify whose committed length is decided after "
+                    "the forward, and holds the verify's hidden handle across "
+                    "the readback until the next step's propose call; "
+                    "supports_async_decode covers neither. Launch with "
+                    "--no-async-scheduling, or drop the speculative flags"
+                )
+            # The TT bootstrap patch admits custom_class through upstream's
+            # method check. These capability checks determine whether the
+            # selected model can serve the combined async speculative path.
+
+        if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
+            raise ValueError(
+                "TT lane mode and speculative decoding cannot be combined. "
+                "Lane mode builds its device input from TTLaneInputBatch, "
+                "which has no candidate-block builder, so a speculating lane "
+                "launch would send plain single-token decodes and silently "
+                "serve no speculation. Drop the speculative flags, or set "
+                "--data-parallel-size 1 to leave lane mode"
+            )
+
+        # After the lane fold: _convert_dp_to_lanes rewrites
+        # scheduler_config.max_num_seqs and stores the lane count, and a plan is
+        # dimensioned against the concurrency it was resolved for. Admitting
+        # earlier would resolve a plan for the per-lane batch and then have the
+        # engine-core re-run resolve it for the global one.
+        spec_plan = resolve_speculative_plan(
+            vllm_config,
+            model_class,
+            model_capabilities,
+            get_tt_max_batch_size(vllm_config),
+        )
+        if spec_plan is not None:
+            requested_k = vllm_config.speculative_config.num_speculative_tokens
+            if spec_plan.effective_k != requested_k:
+                # Published back, because vLLM's own scheduler budgets its
+                # lookahead slots off num_speculative_tokens. Leaving the
+                # request there would have the scheduler reserve for a draft
+                # length the model will not verify.
+                logger.info(
+                    "TT speculative decoding: %s reduced the draft length from "
+                    "%d to %d",
+                    model_class.__name__,
+                    requested_k,
+                    spec_plan.effective_k,
+                )
+                vllm_config.speculative_config.num_speculative_tokens = (
+                    spec_plan.effective_k
+                )
+        store_tt_spec_plan(vllm_config, spec_plan)
 
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
@@ -1933,6 +2421,62 @@ class TTPlatform(Platform):
         )
 
     @classmethod
+    def _reject_unsupported_speculative_request(cls, params) -> None:
+        """Refuse a request this launch cannot serve faithfully at all.
+
+        Speculation runs in the ``argmax_ids`` mode, where no logits cross the
+        boundary: the runner compares drafted ids against the target's argmax
+        and commits ids. That certifies plain greedy decoding exactly, and
+        nothing else.
+
+        Controls the ORDINARY decode path can honour are no longer refused --
+        a non-zero temperature and the penalties are served by simply not
+        speculating for that request (``TTModelRunner._request_is_speculable``
+        offers no drafts, and the runner applies its full sampling). Refusing
+        them made a speculating launch unusable for any sampled client and, in
+        our case, failed every prompt of two standard evals with HTTP 400.
+
+        What remains here is what no path on this launch serves: controls that
+        need logits or a token filter the model-owned sampler does not apply.
+        A request asking for those would be answered without them, silently --
+        a grammar or token filter unapplied, requested logprobs arriving empty.
+
+        Refused per request rather than at config time because these are
+        per-request controls, and a launch may legitimately mix requests that
+        speculate with requests that cannot.
+        """
+        vllm_config = cls._resolve_tt_admission_handle()
+        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+            return
+
+        unsupported = []
+        # temperature / min_p / the penalties are intentionally absent: those
+        # requests are decoded without speculation instead of being refused.
+        if params.logprobs is not None:
+            unsupported.append(f"logprobs={params.logprobs!r}")
+        if getattr(params, "structured_outputs", None) is not None:
+            unsupported.append("structured_outputs")
+        if params.logit_bias:
+            unsupported.append("logit_bias")
+        if params.bad_words:
+            unsupported.append("bad_words")
+        if params.allowed_token_ids:
+            unsupported.append("allowed_token_ids")
+        if params.min_tokens:
+            unsupported.append(f"min_tokens={params.min_tokens!r}")
+
+        if unsupported:
+            raise ValueError(
+                f"Speculative decoding on {cls.device_name} cannot serve this "
+                f"request's {unsupported}. No path on this launch applies "
+                "those, so answering without them would change what was asked "
+                "for without saying so. Sampled requests (temperature, "
+                "min_p, the penalties) ARE served here -- they simply decode "
+                "without speculation. Drop the controls above, or drop the "
+                "speculative flags from the server"
+            )
+
+    @classmethod
     def validate_request(
         cls,
         processed_inputs: "EngineInput",
@@ -1948,6 +2492,9 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
             raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+
+        if isinstance(params, SamplingParams):
+            cls._reject_unsupported_speculative_request(params)
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
