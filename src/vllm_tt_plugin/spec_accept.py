@@ -290,7 +290,10 @@ def apply_speculative_token_filters(
     Returns a new tensor; the caller's logits are not modified.
     """
     rows, width, vocab = target_logits.shape
-    logits = target_logits.clone()
+    # Contiguous whatever the caller's strides: the contract does not require
+    # contiguous logits, and apply_bad_words writes in place through a flat
+    # view below, which a transposed layout cannot give.
+    logits = target_logits.clone(memory_format=torch.contiguous_format)
     if filters.allowed_token_ids_mask is not None:
         logits.masked_fill_(filters.allowed_token_ids_mask.unsqueeze(1), float("-inf"))
 
