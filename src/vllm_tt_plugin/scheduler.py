@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -18,6 +19,7 @@ from vllm_tt_plugin.config import (
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -192,6 +194,54 @@ class TTDecodeInterleavePolicy:
             self._decode_run = 0
 
 
+def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
+    """The most tokens one scheduling step can hand a single new request, named.
+
+    Resolved exactly as vLLM's ``Scheduler.__init__`` resolves its per-step
+    token budget: ``max_num_scheduled_tokens`` when it is set, otherwise
+    ``max_num_batched_tokens``. A positive ``long_prefill_token_threshold``
+    then caps that limit. Returns ``(limit, name_of_the_binding_cap)``; the
+    limit is ``sys.maxsize`` when nothing is configured.
+    """
+    scheduled = getattr(scheduler_config, "max_num_scheduled_tokens", None)
+    if scheduled is not None:
+        limit, name = int(scheduled), "max_num_scheduled_tokens"
+    else:
+        batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+        limit, name = (
+            (batched, "max_num_batched_tokens")
+            if batched > 0
+            else (
+                sys.maxsize,
+                "max_num_batched_tokens",
+            )
+        )
+    threshold = int(getattr(scheduler_config, "long_prefill_token_threshold", 0) or 0)
+    if 0 < threshold < limit:
+        limit, name = threshold, "long_prefill_token_threshold"
+    return limit, name
+
+
+def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
+    """Reject caps that can never let a new request reach the alignment grid.
+
+    ``_align_prefill_chunk_end`` defers a new request whose chunk falls short
+    of the grid; that only converges if a later step can offer a larger chunk.
+    The binding cap is the one vLLM schedules with (``max_num_scheduled_tokens``
+    when set, else ``max_num_batched_tokens``), further capped by a positive
+    ``long_prefill_token_threshold``.
+    """
+    limit, name = _effective_prefill_step_limit(scheduler_config)
+    if limit < align:
+        raise ValueError(
+            f"additional_config['tt']['prefill_chunk_alignment']={align} cannot be "
+            f"reached: scheduler {name}={limit} is a permanent per-step cap "
+            "below the "
+            "alignment. Raise the cap to at least the alignment or set "
+            "prefill_chunk_alignment to 0."
+        )
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -265,6 +315,19 @@ class TTScheduler(AsyncScheduler):
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
         self._widest_decode_batch_size = 0
+        self._prefill_chunk_alignment = (
+            get_tt_prefill_chunk_alignment(self.vllm_config)
+            if self.scheduler_config.enable_chunked_prefill
+            else 0
+        )
+        if self._prefill_chunk_alignment > 1:
+            _validate_prefill_chunk_alignment(
+                self._prefill_chunk_alignment, self.scheduler_config
+            )
+            logger.info(
+                "TT scheduler: partial prefill chunks end on %d-token boundaries",
+                self._prefill_chunk_alignment,
+            )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
@@ -596,6 +659,79 @@ class TTScheduler(AsyncScheduler):
             deferred_queue.prepend_request(request)
         self.waiting.remove_requests(deferred)
         return deferred_queue
+
+    # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
+    # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
+    # hook so chunk ends can be aligned before any block is allocated.
+    @property
+    def need_mamba_block_aligned_split(self) -> bool:
+        return bool(getattr(self, "_base_need_mamba_split", False)) or (
+            getattr(self, "_prefill_chunk_alignment", 0) > 1
+        )
+
+    @need_mamba_block_aligned_split.setter
+    def need_mamba_block_aligned_split(self, value: bool) -> None:
+        self._base_need_mamba_split = bool(value)
+
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if getattr(self, "_base_need_mamba_split", False):
+            num_new_tokens = super()._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+
+    def _align_prefill_chunk_end(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Round a *partial* prefill chunk down so it ends on the alignment grid.
+
+        Chunks that finish the prompt, decode steps and multimodal prompts are
+        left alone. A new request whose aligned chunk would be empty waits for
+        the next step; a running request never gets an empty chunk.
+        """
+        align = getattr(self, "_prefill_chunk_alignment", 0)
+        if align <= 1 or num_new_tokens <= 0:
+            return num_new_tokens
+        end = start + num_new_tokens
+        if end >= request.num_prompt_tokens:
+            return num_new_tokens
+        if getattr(request, "mm_features", None) or getattr(
+            request, "has_encoder_inputs", False
+        ):
+            return num_new_tokens
+        aligned_end = end // align * align
+        if aligned_end <= start:
+            if start != 0:
+                return num_new_tokens
+            # A new request waits only when this step's leftover budget is what
+            # stopped it. If a full step could not reach the grid either (a
+            # permanent cap below the alignment), it must still make progress.
+            return (
+                0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
+            )
+        return aligned_end - start
+
+    def _full_step_prefill_cap(self) -> int:
+        """Most prompt tokens one scheduling step can give a single new request."""
+        cfg = getattr(self, "scheduler_config", None)
+        if cfg is None:
+            return sys.maxsize
+        limit, _ = _effective_prefill_step_limit(cfg)
+        return limit
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         deferred_resumes = self._take_preempted_requests_with_pending_outputs()
