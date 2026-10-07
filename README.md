@@ -796,6 +796,38 @@ A reference that hits its discovery ceiling or runtime limit has not established
 a usable limit. Keep its failure
 visible and investigate it before treating a larger test budget as a fix.
 
+For GPT-OSS, run the chunked-prefill recall gate through its supported Harmony
+chat rendering. The recall-only options preserve the original user prompts,
+three rounds of four concurrent requests, and complete-identifier matching:
+
+Configure the GPT-OSS server with
+`--structured-outputs-config '{"reasoning_parser":"openai_gptoss"}'` so that
+analysis is separated from the final content returned by chat completions.
+
+```bash
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
+  --tt-server-url=http://localhost:8000 \
+  --tt-model-name=openai/gpt-oss-120b \
+  --tt-chunked-prefill-budget=8192 \
+  --tt-recall-reasoning-effort=low \
+  --tt-recall-reasoning-token-budget=1000
+```
+
+The recall cap is the original 24 plus the explicit 1,000-token allowance, totaling
+1024 for both reasoning and answer tokens. This finite diagnostic ceiling was
+used for all 14 original GPT-OSS 120B inputs; it is not inferred from a shorter
+observed answer. The gate requires normal stop and nonempty final content;
+analysis, tool handoffs and length-truncated answers cannot pass. The chosen
+effort is sent to chat completions without rewriting the user's text.
+
+Without `--tt-recall-reasoning-effort`, recall uses the existing legacy requests
+and 24-token cap, even if a recall allowance is supplied. The recall-only options
+do not change the bad-word/structured allowance or any other test's request cap.
+No model name is used to select this behavior. Check the server's effective
+chunked-prefill settings before running; a recall pass alone cannot prove that
+the scheduler split the prompt. Supported-input diagnostic evidence does not
+replace earlier raw-input scores or qualify an untested runtime revision.
+
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
