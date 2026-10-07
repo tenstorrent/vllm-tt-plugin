@@ -2466,7 +2466,6 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)
-
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
             return
