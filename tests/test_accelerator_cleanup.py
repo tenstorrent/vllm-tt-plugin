@@ -108,9 +108,9 @@ def test_original_distributed_cleanup_preserves_host_behavior(
     namespace = dict(original.__globals__)
     namespace.update(
         torch=SimpleNamespace(
-            accelerator=torch.accelerator,
-            _C=SimpleNamespace(
-                **({} if host == "missing" else {"_host_emptyCache": host_cache})
+            accelerator=SimpleNamespace(
+                empty_cache=torch.accelerator.empty_cache,
+                **({} if host == "missing" else {"empty_host_cache": host_cache}),
             ),
         ),
         envs=SimpleNamespace(disable_envs_cache=lambda: events.append("envs")),

@@ -26,14 +26,14 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.input_processor as input_processor
-    from vllm.entrypoints.serve.utils import server_utils
+    from vllm.entrypoints.launchers.utils import server_utils
 
     from vllm_tt_plugin.platform import TTPlatform
 
     saved_lifespan = server_utils.lifespan
     saved_lifespan_aliases = {
         name: module.lifespan
-        for name in ("vllm.entrypoints.openai.api_server", "__main__")
+        for name in ("vllm.entrypoints.launchers.app",)
         if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
     }
     saved_empty_cache = torch.accelerator.empty_cache
@@ -65,7 +65,7 @@ def reset_tt_platform_class_state():
     yield
 
     server_utils.lifespan = saved_lifespan
-    for name in ("vllm.entrypoints.openai.api_server", "__main__"):
+    for name in ("vllm.entrypoints.launchers.app",):
         module = sys.modules.get(name)
         if module is not None and hasattr(module, "lifespan"):
             if name in saved_lifespan_aliases:
