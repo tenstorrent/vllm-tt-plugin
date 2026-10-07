@@ -867,9 +867,9 @@ class TTModelRunner:
                 )
             return per_layer  # type: ignore[return-value]
 
-        # Multi-group: each KVCacheTensor describes one backing buffer and its
-        # ``layers`` list replaces the removed ``shared_by`` field. Shape/dtype
-        # come from each layer's own group spec.
+        # Multi-group: every group's KVCacheTensor starts at byte 0, so layers
+        # whose regions start at the same byte share one buffer -- the i-th
+        # layer of each group, as ``shared_by`` listed before vLLM 0.29.
         spec_by_layer_name: dict[str, AttentionSpec] = {}
         for group in kv_cache_groups:
             assert isinstance(group.kv_cache_spec, AttentionSpec)
@@ -879,8 +879,13 @@ class TTModelRunner:
         per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
             None
         ] * num_layers
-        for tensor_idx, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
-            for layer_name in kv_cache_tensor.layers:
+        tensor_idx_by_start: dict[int, int] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for position, layer_name in enumerate(kv_cache_tensor.layers):
+                start = kv_cache_tensor.offset + position * kv_cache_tensor.layer_stride
+                tensor_idx = tensor_idx_by_start.setdefault(
+                    start, len(tensor_idx_by_start)
+                )
                 spec = spec_by_layer_name.get(layer_name)
                 if spec is None:
                     raise ValueError(

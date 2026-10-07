@@ -133,7 +133,8 @@ def test_hybrid_kv_cache_uses_v029_tensor_layers():
 
     per_layer = TTModelRunner._build_per_layer_specs(runner, config, 3)
 
-    assert [entry[2] for entry in per_layer] == [0, 0, 1]
+    # Groups alias from byte 0: the i-th layer of each group shares buffer i.
+    assert [entry[2] for entry in per_layer] == [0, 1, 0]
 
 
 def _prepare(runner, *rows):
