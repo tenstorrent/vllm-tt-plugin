@@ -12,7 +12,11 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import (
+    OMP_NUM_THREADS_SET_BY_VLLM,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    set_torch_threads_for_runtime,
+)
 from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
@@ -466,11 +470,15 @@ class TTWorker(WorkerBase):
         # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return CompilationTimes(language_model=0.0, encoder=0.0)
+            elapsed = 0.0
+        else:
+            start = time.perf_counter()
+            self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
 
-        start = time.perf_counter()
-        self.model_runner.warmup_model()
-        elapsed = time.perf_counter() - start
+        # vLLM sizes multiproc workers' torch threads for startup only.
+        if os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) == "1":
+            set_torch_threads_for_runtime()
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 
