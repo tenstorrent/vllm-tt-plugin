@@ -40,6 +40,7 @@ from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
 )
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -2287,8 +2288,9 @@ class TTPlatform(Platform):
             # proposal wait for the engine thread. That path places two demands
             # on a model that supports_async_decode does not cover, because the
             # decode reload contract was written for a decode committing one
-            # token per forward: read_decode_output is handed a [B, 1+K] verify
-            # whose committed length the host decides after the forward, and
+            # token per forward: read_decode_output is handed a verify's return
+            # in its mode, [B, 1+K] ids or [B, 1+K, V] logits, whose committed
+            # length the host decides after the forward, and
             # the verify's hidden handle must stay valid across the readback
             # and until the next step's propose call. Declared separately
             # rather than derived, so a model already declaring async decode
@@ -2303,8 +2305,9 @@ class TTPlatform(Platform):
                     "does not declare "
                     "model_capabilities['supports_async_spec_decode']. The "
                     "deferred speculative path hands read_decode_output a "
-                    "[B, 1+K] verify whose committed length is decided after "
-                    "the forward, and holds the verify's hidden handle across "
+                    "verify's [B, 1+K] ids or [B, 1+K, V] logits, whose "
+                    "committed length is decided after the forward, and holds "
+                    "the verify's hidden handle across "
                     "the readback until the next step's propose call; "
                     "supports_async_decode covers neither. Launch with "
                     "--no-async-scheduling, or drop the speculative flags"
@@ -2490,56 +2493,63 @@ class TTPlatform(Platform):
     def _reject_unsupported_speculative_request(cls, params) -> None:
         """Refuse a request this launch cannot serve faithfully at all.
 
-        Speculation runs in the ``argmax_ids`` mode, where no logits cross the
-        boundary: the runner compares drafted ids against the target's argmax
-        and commits ids. That certifies plain greedy decoding exactly, and
-        nothing else.
+        A model serving ``logits`` speculates for every request admission lets
+        through: the runner rejection-samples each verify row on the host
+        against the target distribution under the row's temperature, top-k,
+        top-p, penalties, logprobs, grammar, allowed_token_ids, bad_words and
+        min_tokens, which is what upstream's rejection sampler applies too. A
+        model serving only ``argmax_ids`` certifies plain greedy decoding and
+        nothing else. On it a sampled or penalized request is served by not
+        speculating for it (``TTModelRunner._request_is_speculable`` offers no
+        drafts, and the runner applies its full sampling), because refusing
+        those would fail every ordinary sampled client with HTTP 400. vLLM
+        itself refuses logit_bias, and a min_p above 1e-5, on a speculating
+        launch before this runs.
 
-        Controls the ORDINARY decode path can honour are no longer refused --
-        a non-zero temperature and the penalties are served by simply not
-        speculating for that request (``TTModelRunner._request_is_speculable``
-        offers no drafts, and the runner applies its full sampling). Refusing
-        them made a speculating launch unusable for any sampled client and, in
-        our case, failed every prompt of two standard evals with HTTP 400.
-
-        What remains here is what no path on this launch serves: controls that
-        need logits or a token filter the model-owned sampler does not apply.
-        A request asking for those would be answered without them, silently --
-        a grammar or token filter unapplied, requested logprobs arriving empty.
+        What remains here is what no path on this launch serves. On an
+        ``argmax_ids``-only launch those are the controls that need logits or
+        a token filter: a request asking for them can share a verify with a
+        row that has drafts, where it commits the target argmax, so it would be
+        answered without them, silently -- a grammar or token filter
+        unapplied, requested logprobs arriving empty.
 
         Refused per request rather than at config time because these are
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
         """
         vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or get_tt_spec_plan(vllm_config) is None:
+        plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
+        if plan is None:
             return
 
         unsupported = []
-        # temperature / min_p / the penalties are intentionally absent: those
-        # requests are decoded without speculation instead of being refused.
-        if params.logprobs is not None:
-            unsupported.append(f"logprobs={params.logprobs!r}")
-        if getattr(params, "structured_outputs", None) is not None:
-            unsupported.append("structured_outputs")
         if params.logit_bias:
             unsupported.append("logit_bias")
-        if params.bad_words:
-            unsupported.append("bad_words")
-        if params.allowed_token_ids:
-            unsupported.append("allowed_token_ids")
-        if params.min_tokens:
-            unsupported.append(f"min_tokens={params.min_tokens!r}")
+        # temperature and the penalties are intentionally absent: those
+        # requests speculate in logits mode, or decode without speculation.
+        if ACCEPT_MODE_LOGITS not in plan.accept_modes:
+            if params.logprobs is not None:
+                unsupported.append(f"logprobs={params.logprobs!r}")
+            if getattr(params, "structured_outputs", None) is not None:
+                unsupported.append("structured_outputs")
+            if params.bad_words:
+                unsupported.append("bad_words")
+            if params.allowed_token_ids:
+                unsupported.append("allowed_token_ids")
+            if params.min_tokens:
+                unsupported.append(f"min_tokens={params.min_tokens!r}")
 
         if unsupported:
             raise ValueError(
                 f"Speculative decoding on {cls.device_name} cannot serve this "
                 f"request's {unsupported}. No path on this launch applies "
                 "those, so answering without them would change what was asked "
-                "for without saying so. Sampled requests (temperature, "
-                "min_p, the penalties) ARE served here -- they simply decode "
-                "without speculation. Drop the controls above, or drop the "
-                "speculative flags from the server"
+                "for without saying so. Sampled requests (temperature, top-k, "
+                "top-p, the penalties) ARE served here -- they speculate when "
+                "the model serves logits and otherwise decode without "
+                "speculation; logprobs, grammars and token filters need a "
+                "model that serves the logits accept mode. Drop the controls "
+                "above, or drop the speculative flags from the server"
             )
 
     @classmethod

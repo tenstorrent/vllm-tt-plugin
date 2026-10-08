@@ -35,11 +35,14 @@ if TYPE_CHECKING:
 # device argmax followed by a host walk, which is what both existing tt-metal
 # implementations do.
 #
-#   "logits"       returns logits [B, 1+K, V]. The host walks acceptance, so
-#                  this is the only mode that can serve a request needing host
-#                  arbitration: structured output, host logits processors,
-#                  min_p, logit_bias, bad_words, allowed_token_ids, min_tokens
-#                  or logprobs. It pays a [B, 1+K, V] readback.
+#   "logits"       returns logits [B, 1+K, V]. The host rejection-samples
+#                  acceptance, which serves greedy and sampled rows under
+#                  temperature, top-k, top-p and the penalties, and applies
+#                  structured output, the token filters (allowed_token_ids,
+#                  bad_words, min_tokens) and logprobs at every candidate
+#                  column. It is the only mode that serves those controls, so
+#                  a greedy row carrying one also needs it; a launch without
+#                  it refuses them. It pays a [B, 1+K, V] readback.
 #   "argmax_ids"   returns the verify argmax ids [B, 1+K]. The host walks
 #                  acceptance greedily, comparing ids, so no logits cross. This
 #                  mode is greedy only.
@@ -297,8 +300,13 @@ class DraftOutput:
 
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
-    An accept rule that needs the drafter distribution reads them; a runner
-    that does not must not require them.
+    No accept walk reads them.
+
+    A ``logits`` verify treats every draft as a point mass at its id. That is
+    lossless for any drafter, deterministic or sampling, whose choice does not
+    read the accept walk's own random draws: the committed token is
+    distributed as the target whatever was drafted. A drafter's real
+    ``[B, K, V]`` distribution would only raise the acceptance rate.
     """
 
     draft_token_ids: "torch.Tensor"

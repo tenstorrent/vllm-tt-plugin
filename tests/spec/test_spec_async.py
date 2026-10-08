@@ -41,6 +41,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.outputs import DraftTokenIds
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin import async_decode as async_decode_module
@@ -533,6 +534,19 @@ def _settle_layout(runner) -> None:
     that wants the steady state says so here.
     """
     runner._decode_layout_changed_since_last_decode = False
+
+
+def _take_proposals(runner) -> DraftTokenIds | None:
+    """What the drafter offered since the last look, taken once.
+
+    Read off the runner rather than through ``take_draft_token_ids``, which an
+    asynchronous launch reserves for the deferred grammar handoff.
+    """
+    proposed = runner._proposed_draft_token_ids
+    runner._proposed_draft_token_ids = {}
+    if not proposed:
+        return None
+    return DraftTokenIds(list(proposed), [list(d) for d in proposed.values()])
 
 
 def _submit_plain_step(runner, *req_ids):
@@ -1418,7 +1432,7 @@ def test_solo_speculation_yields_to_a_peer_and_resumes_when_it_leaves():
     model.release()
     plain.get_output()
     _drain(runner, "solo")
-    drafts = runner.take_draft_token_ids()
+    drafts = _take_proposals(runner)
     assert drafts is not None and drafts.draft_token_ids[0], (
         "a solo request was offered no drafts"
     )
@@ -1462,7 +1476,7 @@ def test_solo_speculation_yields_to_a_peer_and_resumes_when_it_leaves():
     assert len(model.verify_calls) == verifies_before, (
         "a batched baseline step ran a verify"
     )
-    assert runner.take_draft_token_ids() is None, (
+    assert _take_proposals(runner) is None, (
         "the drafter offered drafts for a batch it declined"
     )
     # One token from the resolving verify plus one from each ordinary step.
@@ -1475,7 +1489,7 @@ def test_solo_speculation_yields_to_a_peer_and_resumes_when_it_leaves():
     model.release()
     step.get_output()
     _drain(runner, "solo")
-    drafts = runner.take_draft_token_ids()
+    drafts = _take_proposals(runner)
     assert drafts is not None and drafts.draft_token_ids[0], (
         "speculation never resumed after the batch went solo again"
     )
@@ -1527,7 +1541,7 @@ def test_a_peer_cancelled_mid_transition_leaves_the_solo_request_intact():
     # ordinary step later the batch is solo and it offers again: a transition
     # costs one step before speculation resumes, which is inherent to deciding
     # at the commit of the step that produced the token.
-    assert runner.take_draft_token_ids() is None
+    assert _take_proposals(runner) is None
 
     _settle_layout(runner)
     step = _submit_plain_step(runner, "solo")
@@ -1535,7 +1549,7 @@ def test_a_peer_cancelled_mid_transition_leaves_the_solo_request_intact():
     step.get_output()
     _drain(runner, "solo")
 
-    drafts = runner.take_draft_token_ids()
+    drafts = _take_proposals(runner)
     assert drafts is not None
     assert drafts.req_ids == ["solo"]
 

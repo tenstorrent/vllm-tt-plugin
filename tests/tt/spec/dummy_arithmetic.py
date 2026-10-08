@@ -27,6 +27,9 @@ counts up by one inside each accepted prefix and by two across each rejection.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
+
 
 def depth_target_blocks(k: int, depth: int | None, steps: int) -> list[list[int]]:
     """The tokens each step commits, starting with the prefill's own.
@@ -138,6 +141,116 @@ def fixed_target_ids(prompt: list[int], count: int) -> list[int]:
     token, position = prompt[-1], len(prompt) - 1
     while len(ids) < count:
         token = fixed_target_choice(token, position)
+        position += 1
+        ids.append(token)
+    return ids
+
+
+# The ``fixed`` target's distribution, which a launch declaring the ``logits``
+# accept mode samples from. Its argmax is ``fixed_target_choice``, so a greedy
+# request emits the rule's sequence. The support is the rule's choice and three
+# tokens shared by every context, and nothing else: a committed token outside
+# the support is a wrong commit, not sampling noise.
+#
+# Mirrors FIXED_SHARED_ALTERNATIVES and FIXED_PROBABILITIES in tt-metal's
+# models/vllm_test_utils/spec_test/test_model.py, which places the shared
+# tokens modulo the vocabulary; the dummy's 128256 needs no wrap.
+
+FIXED_SHARED_ALTERNATIVES = (17, 4099, 65537)
+FIXED_PROBABILITIES = (0.4, 0.3, 0.2, 0.1)
+
+
+def fixed_target_support(token: int, position: int) -> list[int]:
+    """The tokens that can follow ``token`` at ``position``, rule's choice first."""
+    return [fixed_target_choice(token, position), *FIXED_SHARED_ALTERNATIVES]
+
+
+def fixed_target_distribution(
+    token: int,
+    position: int,
+    *,
+    history: list[int] = (),
+    prompt: list[int] = (),
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    repetition_penalty: float = 1.0,
+    excluded: Iterable[int] = (),
+) -> dict[int, float]:
+    """What vLLM's ordinary sampler draws from after ``token`` at ``position``.
+
+    Computed here, in plain Python, rather than through the plugin or vLLM, so
+    a test compares the server against an independent statement of the
+    sampling semantics: repetition over prompt and output first, then
+    frequency and presence over the output, then temperature, top-k and top-p.
+    ``temperature`` 0 returns the greedy point mass. Tokens outside the
+    support stay at probability 0 under every control.
+
+    ``excluded`` is what a grammar, an allowlist, a bad word or a pending
+    ``min_tokens`` rules out at this position. The sampler sets those logits
+    to ``-inf`` before the temperature, so they are dropped here before it too,
+    which is what keeps top-k and top-p reading only what remains.
+    """
+    weights: dict[int, float] = {}
+    for candidate, probability in zip(
+        fixed_target_support(token, position), FIXED_PROBABILITIES
+    ):
+        weights[candidate] = weights.get(candidate, 0.0) + probability
+    logits = {}
+    for candidate, probability in weights.items():
+        value = math.log(probability)
+        if candidate in history or candidate in prompt:
+            value = (
+                value / repetition_penalty if value > 0 else value * repetition_penalty
+            )
+        count = list(history).count(candidate)
+        value -= frequency_penalty * count
+        value -= presence_penalty * (1.0 if count else 0.0)
+        logits[candidate] = value
+    for candidate in excluded:
+        logits.pop(candidate, None)
+    if not logits:
+        raise ValueError(
+            f"every support member after {token} at position {position} is "
+            f"excluded by {sorted(set(excluded))}; the test has no distribution"
+        )
+    if temperature == 0:
+        best = max(logits, key=lambda candidate: logits[candidate])
+        return {best: 1.0}
+    logits = {candidate: value / temperature for candidate, value in logits.items()}
+    if top_k and top_k < len(logits):
+        kth = sorted(logits.values(), reverse=True)[top_k - 1]
+        logits = {c: v for c, v in logits.items() if v >= kth}
+    probs = _softmax(logits)
+    if top_p < 1.0:
+        cumulative = 0.0
+        ascending = sorted(probs, key=lambda candidate: probs[candidate])
+        for candidate in ascending[:-1]:
+            cumulative += probs[candidate]
+            if cumulative <= 1.0 - top_p:
+                logits.pop(candidate)
+        probs = _softmax(logits)
+    return probs
+
+
+def _softmax(logits: dict[int, float]) -> dict[int, float]:
+    top = max(logits.values())
+    weights = {c: math.exp(v - top) for c, v in logits.items()}
+    total = sum(weights.values())
+    return {c: w / total for c, w in weights.items()}
+
+
+def fixed_target_greedy_ids(prompt: list[int], count: int, **controls) -> list[int]:
+    """A greedy request's whole output under ``controls``, penalties included."""
+    ids: list[int] = []
+    token, position = prompt[-1], len(prompt) - 1
+    while len(ids) < count:
+        distribution = fixed_target_distribution(
+            token, position, history=ids, prompt=prompt, temperature=0, **controls
+        )
+        token = next(iter(distribution))
         position += 1
         ids.append(token)
     return ids

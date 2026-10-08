@@ -19,6 +19,7 @@ from vllm_tt_plugin.model_input import TTCompactedHostLogits
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_LOGITS,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
     VerifyOutput,
@@ -38,10 +39,12 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
     token per row, so the run commits one token per step for its whole life
     and reports nothing. Refused by type here, where the answer arrives.
 
-    Only ``argmax_ids`` is driven today, so a model that answers in another
-    mode is refused by name rather than having its tensor read as ids.
-    ``VerifyOutput`` has already checked that the field its mode declares is
-    present.
+    The answer must be in the mode that was asked for. A model that answers in
+    another one is refused by name rather than having its tensor read as the
+    requested mode's: ``[B, 1+K, V]`` logits read as ids would commit
+    vocabulary indices of float rows, and ``[B, 1+K]`` ids read as logits
+    would be sampled over a block-width vocabulary. ``VerifyOutput`` has
+    already checked that the field its mode declares is present.
     """
     if not isinstance(tt_out, VerifyOutput):
         raise TypeError(
@@ -51,14 +54,20 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
             "vllm_tt_plugin.spec_decode, so a model whose decode_forward "
             "serves no verify must not declare supports_spec_decode"
         )
-    if tt_out.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+    if tt_out.spec_mode != spec_mode:
         raise NotImplementedError(
-            f"TT decode asked for spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} and the "
-            f"model answered in {tt_out.spec_mode!r}, which carries "
-            f"{list(MODE_REQUIRED_FIELDS[tt_out.spec_mode])}; the runner drives "
-            "no accept walk for that mode yet"
+            f"TT decode asked for spec_mode {spec_mode!r} and the model "
+            f"answered in {tt_out.spec_mode!r}, which carries "
+            f"{list(MODE_REQUIRED_FIELDS[tt_out.spec_mode])}; a verify answers "
+            "in the mode it was asked for"
         )
-    return tt_out.argmax_ids
+    if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+        return tt_out.argmax_ids
+    if spec_mode == ACCEPT_MODE_LOGITS:
+        return tt_out.logits
+    raise NotImplementedError(
+        f"the runner drives no accept walk for spec_mode {spec_mode!r}"
+    )
 
 
 if TYPE_CHECKING:
@@ -171,6 +180,8 @@ class CompletedSpecDecodeStep:
     context: SubmittedStepContext
     completion_time_ns: int
     runner_output: ModelRunnerOutput | None = None
+    # The published prefixes' logprobs, when the step's rows asked for them.
+    logprobs: LogprobsLists | None = None
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
@@ -311,16 +322,28 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         self._context = context
         self._init_deferred()
 
-    def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
-        """Refused: a grammar needs the logits a verify in this mode never returns.
+    def set_grammar_bitmask(
+        self, bitmask: torch.Tensor, *, num_valid_drafts: torch.Tensor
+    ) -> None:
+        """Attach the per-column bitmask and the drafts it can constrain.
 
-        Reachable only through a launch admission should have refused, so it
-        raises rather than dropping the mask and serving ungrammatical text.
+        ``bitmask`` is ``[rows, 1+K, W]``. ``num_valid_drafts`` is the
+        submitted count with every structured row whose drafts the bitmask was
+        not computed from set to 0, which
+        ``TTModelRunner._grammar_validated_drafts`` decides; the walk reads
+        both off ``model_input``. Only an ``argmax_ids`` verify has no use for
+        a grammar, and no structured row reaches one.
         """
-        raise NotImplementedError(
-            "structured output and speculative decoding cannot be combined on "
-            "this path: acceptance compares token ids and never sees the "
-            "logits a grammar bitmask applies to"
+        if self._model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+            raise RuntimeError(
+                "a grammar bitmask reached an argmax_ids verify, whose ids "
+                "cannot be masked; a structured-output row makes its verify "
+                "ask for logits"
+            )
+        self._model_input = replace(
+            self._model_input,
+            grammar_bitmask=[bitmask],
+            num_valid_drafts=num_valid_drafts,
         )
 
     def _get_output_impl(self) -> ModelRunnerOutput:
@@ -330,7 +353,7 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
             context=self._context,
         )
         runner_output = self._controller.runner.build_spec_runner_output(
-            self._model_input.row_req_ids, completed.prefixes
+            self._model_input.row_req_ids, completed.prefixes, completed.logprobs
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
@@ -361,6 +384,9 @@ class TTAsyncDecodeController:
         # count the scheduler's lookahead reservation rather than a verify.
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
+        # The verifies among those that asked for logits, which is the one
+        # observable that says a launch serving both modes chose per step.
+        self._logits_verify_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -689,14 +715,19 @@ class TTAsyncDecodeController:
             self._ordinary_decode_submissions += 1
         else:
             self._verify_submissions += 1
+            if model_input.spec_mode == ACCEPT_MODE_LOGITS:
+                self._logits_verify_submissions += 1
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
+            # Parsed by tests/tt/spec/bench_spec_overhead.py and
+            # tests/tt/spec/test_sampled_speculation.py; keep them in step.
             logger.info(
                 "TT submissions: %d ordinary decode, %d verify, "
-                "%d overlapped an outstanding step",
+                "%d overlapped an outstanding step, %d verify in logits mode",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
+                self._logits_verify_submissions,
             )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
@@ -978,8 +1009,10 @@ class TTAsyncDecodeController:
         """Finalize a speculative read and walk acceptance over what came back.
 
         Runs on whichever thread resolved the deferred output, so it reads the
-        step's own tensors and the immutable model config and nothing else. The
-        commit and the next proposal are left for the engine thread.
+        step's own tensors and the immutable model config and nothing else. A
+        ``logits`` walk also advances the step's request generators, which is
+        why ``DeferredDecodeOutput`` resolves a step once. The commit and the
+        next proposal are left for the engine thread.
         """
         finalized = self.finalize_decode(submission)
         if finalized is None:
@@ -993,19 +1026,19 @@ class TTAsyncDecodeController:
                 context=context,
                 completion_time_ns=time.perf_counter_ns(),
             )
-        committed, counts = self.runner.walk_spec_acceptance(
-            model_input, finalized.tt_out
+        walk = self.runner.walk_spec_acceptance(model_input, finalized.tt_out)
+        prefixes = self.runner.spec_committed_prefixes(
+            model_input, walk.committed, walk.counts
         )
         return CompletedSpecDecodeStep(
-            committed=committed,
-            counts=counts,
-            prefixes=self.runner.spec_committed_prefixes(
-                model_input, committed, counts
-            ),
+            committed=walk.committed,
+            counts=walk.counts,
+            prefixes=prefixes,
             model_input=model_input,
             spec_hidden=submission.spec_hidden,
             context=context,
             completion_time_ns=time.perf_counter_ns(),
+            logprobs=self.runner.spec_committed_logprobs(walk.logprobs, prefixes),
         )
 
     def build_runner_output_from_completed_step(
