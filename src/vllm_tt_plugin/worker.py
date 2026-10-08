@@ -17,7 +17,6 @@ from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     set_torch_threads_for_runtime,
 )
-from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_uniform_page_size,
@@ -29,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -296,9 +296,9 @@ class TTWorker(WorkerBase):
         return self.model_runner.get_supported_tasks()
 
     def get_supported_kv_cache_layouts(self) -> list[str]:
-        # TT models allocate their own KV, so no vLLM attention backend
-        # narrows the layout; upstream's default would look one up and fail.
-        return [layout.name for layout in get_supported_kv_cache_layouts(())]
+        # TT cache setup handles only LBNHC's per-group packing; it is also
+        # block-compact, so models with mixed KV shapes still resolve to it.
+        return [KVCacheLayout.LBNHC.name]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
