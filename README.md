@@ -165,13 +165,43 @@ login()
 ## Preparing TT-Metal Models
 
 For the target model, follow any setup instructions in the corresponding
-tt-metal demo. For Llama 3.1, Llama 3.2, and Qwen 2.5 models, follow the
-[tt-transformers demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
-for weights and environment variables.
+tt-metal demo.
+
+### Text models served by tt-transformers
+
+The `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
+`MistralForCausalLM` and `Phi3ForCausalLM` architectures are served by the
+standalone [tt-transformers](https://github.com/tenstorrent/tt-transformers)
+package, which must be installed in the serving environment. The plugin
+registers one class per architecture from `tt_transformers.vllm_registry`;
+when the model loads, that class selects the generator for the exact
+checkpoint id passed as `--model` (or a Hugging Face cache snapshot of it):
+
+| Architecture | Checkpoints |
+|---|---|
+| `LlamaForCausalLM` | `meta-llama/Llama-3.2-1B-Instruct`, `meta-llama/Llama-3.2-3B-Instruct`, `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.3-70B-Instruct` |
+| `Qwen2ForCausalLM` | `Qwen/Qwen2-7B-Instruct`, `Qwen/Qwen2.5-7B-Instruct`, `Qwen/Qwen2.5-Coder-32B-Instruct`, `Qwen/Qwen2.5-72B-Instruct`, `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` |
+| `Qwen3ForCausalLM` | `Qwen/Qwen3-32B` |
+| `MistralForCausalLM` | `mistralai/Mistral-7B-Instruct-v0.3` |
+| `Phi3ForCausalLM` | `microsoft/phi-4` |
+
+Any other checkpoint on these architectures is rejected at model load with
+the supported list; the authoritative list and the supported device meshes
+are in the tt-transformers repository. Registration itself imports nothing,
+so an environment without tt-transformers still starts and serves other
+architectures. Select a single generator explicitly with
+`TT_MODEL_CLASS_OVERRIDES` (see
+[Selecting a serving class](#selecting-a-serving-class-tt_model_class_overrides)).
+
+Pass `trace_region_size` in `--additional-config '{"tt": {...}}'` for these
+models; the 50 MB default is too small with on-device sampling at longer
+context lengths. On multi-device meshes also pass the `fabric_config` the
+model needs (for example `FABRIC_1D_RING` for the T3K rows of the 70B and
+32B models).
 
 ## Running The Offline Inference Example
 
-Run offline generation with the default Llama 3.1 70B model:
+Run offline generation with the default Llama 3.3 70B Instruct model:
 
 ```bash
 MESH_DEVICE=T3K python examples/offline_inference_tt.py
@@ -187,12 +217,14 @@ python examples/offline_inference_tt.py --measure_perf
 To run a different text model, set `MESH_DEVICE` to `N150`, `N300`, `T3K`, `TG`,
 `BH-Galaxy`, or a mesh shape such as `"(4,8)"`, then pass `--model`:
 
-- Llama 3.1 8B: `--model "meta-llama/Llama-3.1-8B"`
-- Llama 3.2 1B: `--model "meta-llama/Llama-3.2-1B"`
-- Llama 3.2 3B: `--model "meta-llama/Llama-3.2-3B"`
-- Qwen 2.5 7B: `--model "Qwen/Qwen2.5-7B"`
-- Qwen 2.5 72B: `--model "Qwen/Qwen2.5-72B"`
-- DeepSeek R1 Distill Llama 70B: `--model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"`
+- Llama 3.1 8B: `--model "meta-llama/Llama-3.1-8B-Instruct"`
+- Llama 3.2 1B: `--model "meta-llama/Llama-3.2-1B-Instruct"`
+- Llama 3.2 3B: `--model "meta-llama/Llama-3.2-3B-Instruct"`
+- Qwen 2.5 7B: `--model "Qwen/Qwen2.5-7B-Instruct"`
+- Qwen 2.5 72B: `--model "Qwen/Qwen2.5-72B-Instruct"`
+- Qwen 3 32B: `--model "Qwen/Qwen3-32B"`
+- Mistral 7B: `--model "mistralai/Mistral-7B-Instruct-v0.3"`
+- Phi-4: `--model "microsoft/phi-4"`
 - GPT-OSS 20B: `--model "openai/gpt-oss-20b"`
 - GPT-OSS 120B: `--model "openai/gpt-oss-120b"`
 
@@ -495,15 +527,18 @@ At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families
 
-The plugin registers TT-prefixed model architectures backed by tt-metal model
-implementations. Current families:
+The plugin registers TT-prefixed model architectures backed by tt-metal and
+tt-transformers model implementations. Current families:
 
-- Llama 3.1 / 3.2 / 3.3 text models (`TTLlamaForCausalLM`)
+- Llama 3.1 / 3.2 / 3.3 text models (`TTLlamaForCausalLM`), Qwen 2 / 2.5 and
+  Qwen 3 text models (`TTQwen2ForCausalLM`, `TTQwen3ForCausalLM`), Mistral
+  text models (`TTMistralForCausalLM`) and Phi-4 (`TTPhi3ForCausalLM`), from
+  tt-transformers; see
+  [Text models served by tt-transformers](#text-models-served-by-tt-transformers)
 - Llama 3.2 vision models (`TTMllamaForConditionalGeneration`)
-- Qwen 2.5 and Qwen 3 text models (`TTQwen2ForCausalLM`, `TTQwen3ForCausalLM`)
 - Qwen 3.5 text models on Blackhole (`TTQwen3_5ForConditionalGeneration`)
 - Qwen 2.5-VL and Qwen 3-VL vision-language models
-- Mistral and Mistral 3 multimodal models
+- Mistral 3 multimodal models
 - Gemma 3 multimodal models
 - Gemma 4 text-only models (`TTGemma4ForCausalLM`,
   `TTGemma4ForConditionalGeneration`,
@@ -574,7 +609,9 @@ The registration environment variables, in the order they are consulted:
 `TT_MODEL_CLASS_OVERRIDES`, `EXTRA_MODELS_DIR`, then the built-in map
 (`TT_VLLM_BUILTIN_MODELS=0` disables it). `TT_LLAMA_TEXT_VER`,
 `TT_QWEN3_TEXT_VER` and `TT_QWEN35_TEXT_VER` select a version WITHIN a built-in
-family and are unrelated to the above.
+family and are unrelated to the above. For Llama and Qwen3 text, unset and
+`tt_transformers` both select the tt-transformers package; the other values
+select tt-metal demo generators.
 
 ## Speculative Decoding
 

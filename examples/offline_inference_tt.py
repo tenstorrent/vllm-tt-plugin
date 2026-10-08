@@ -612,7 +612,10 @@ async def generate_tokens_async(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model", type=str, default="meta-llama/Llama-3.1-70B", help="Model name"
+        "--model",
+        type=str,
+        default="meta-llama/Llama-3.3-70B-Instruct",
+        help="Model name",
     )
     parser.add_argument(
         "--prompts_json",

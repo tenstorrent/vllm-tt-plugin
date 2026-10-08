@@ -270,12 +270,16 @@ classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRAC
 `supports_narrow_decode` belongs to `SpecPlan`, not `model_capabilities`.
 `SpecPlan` resource declarations do not yet enforce row or byte budgets.
 
-The model classes and their capability declarations live in **tt-metal**, under
-`models.tt_transformers.tt.generator_vllm` and the per-demo generators such as
-`models.demos.llama3_70b_galaxy.tt.generator_vllm`.
+The model classes and their capability declarations live outside this
+repository: in **tt-metal**, under `models.tt_transformers.tt.generator_vllm`
+and the per-demo generators such as
+`models.demos.llama3_70b_galaxy.tt.generator_vllm`, and in **tt-transformers**
+for the Llama, Qwen2, Qwen3, Mistral and Phi-3 text architectures
+(`tt_transformers.vllm_registry`, which hands back each model package's
+`vllm_generator.py` instance).
 
 Consequence: a plugin change that consumes a new capability needs a matching
-tt-metal change that declares it. Those two land as a pair. Say so in both pull
+tt-metal or tt-transformers change that declares it. Those two land as a pair. Say so in both pull
 request bodies and cross-link them. A plugin pull request that reads a
 capability no tt-metal model declares is incomplete.
 

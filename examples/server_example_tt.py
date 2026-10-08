@@ -11,7 +11,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="meta-llama/Llama-3.1-70B-Instruct",
+        default="meta-llama/Llama-3.3-70B-Instruct",
         help="Model name",
     )
     parser.add_argument(

@@ -1252,6 +1252,20 @@ def _register_models_from_extra_dir(ModelRegistry) -> int:
     return count
 
 
+# Text architectures served by the standalone ``tt_transformers`` package. Each
+# target is one class per architecture that picks the package's generator by
+# the checkpoint's exact Hugging Face id when the model loads, so registering
+# the string imports nothing: an image without ``tt_transformers`` still starts
+# and fails only when a row on one of these architectures loads its model.
+_TT_TRANSFORMERS_TEXT_TARGETS = {
+    "TTLlamaForCausalLM": "tt_transformers.vllm_registry:LlamaForCausalLM",
+    "TTQwen2ForCausalLM": "tt_transformers.vllm_registry:Qwen2ForCausalLM",
+    "TTQwen3ForCausalLM": "tt_transformers.vllm_registry:Qwen3ForCausalLM",
+    "TTMistralForCausalLM": "tt_transformers.vllm_registry:MistralForCausalLM",
+    "TTPhi3ForCausalLM": "tt_transformers.vllm_registry:Phi3ForCausalLM",
+}
+
+
 def _builtin_models_enabled() -> bool:
     """Whether to register the built-in (hard-coded) TT model map.
 
@@ -1312,7 +1326,7 @@ def register_tt_models(register_test_models=False) -> None:
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "tt_transformers")
     if llama_text_version == "tt_transformers":
-        path_llama_text = "models.tt_transformers.tt.generator_vllm:LlamaForCausalLM"
+        path_llama_text = _TT_TRANSFORMERS_TEXT_TARGETS["TTLlamaForCausalLM"]
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:LlamaForCausalLM"
@@ -1342,14 +1356,17 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:MllamaForConditionalGeneration",
     )
 
-    # Qwen2.5 - Text
-    path_qwen_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
-    _register_model_if_missing(ModelRegistry, "TTQwen2ForCausalLM", path_qwen_text)
+    # Qwen2 / Qwen2.5 - Text
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen2ForCausalLM",
+        _TT_TRANSFORMERS_TEXT_TARGETS["TTQwen2ForCausalLM"],
+    )
 
     # Qwen3 - Text
     qwen3_text_version = os.getenv("TT_QWEN3_TEXT_VER", "tt_transformers")
     if qwen3_text_version == "tt_transformers":
-        path_qwen3_text = "models.tt_transformers.tt.generator_vllm:QwenForCausalLM"
+        path_qwen3_text = _TT_TRANSFORMERS_TEXT_TARGETS["TTQwen3ForCausalLM"]
     elif qwen3_text_version == "qwen3_32b_galaxy":
         path_qwen3_text = (
             "models.demos.llama3_70b_galaxy.tt.generator_vllm:QwenForCausalLM"
@@ -1396,7 +1413,14 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(
         ModelRegistry,
         "TTMistralForCausalLM",
-        "models.tt_transformers.tt.generator_vllm:MistralForCausalLM",
+        _TT_TRANSFORMERS_TEXT_TARGETS["TTMistralForCausalLM"],
+    )
+
+    # Phi-3 architecture (Phi-4) - Text
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTPhi3ForCausalLM",
+        _TT_TRANSFORMERS_TEXT_TARGETS["TTPhi3ForCausalLM"],
     )
 
     # Mistral 3 - Multimodal (Vision + Text)
