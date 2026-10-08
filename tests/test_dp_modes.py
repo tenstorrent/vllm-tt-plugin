@@ -60,6 +60,23 @@ class TestDPModes:
 
             TTPlatform.check_and_update_config(vllm_config)
 
+    def test_image_normalization_stays_in_the_cpu_processor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        # vLLM >= 0.28 enables this for upstream Qwen2/2.5-VL.
+        vllm_config.model_config.multimodal_config = SimpleNamespace(
+            mm_device_do_normalize=True
+        )
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert (
+            vllm_config.model_config.multimodal_config.mm_device_do_normalize is False
+        )
+
     @pytest.mark.parametrize("original_max_model_len", [8192, -1, None])
     def test_check_and_update_config_never_rewrites_max_model_len(
         self,

@@ -140,6 +140,7 @@ def vllm_config() -> SimpleNamespace:
             max_model_len=4,
             original_max_model_len=None,
             is_moe=False,
+            multimodal_config=None,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(

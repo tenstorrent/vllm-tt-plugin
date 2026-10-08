@@ -1781,6 +1781,12 @@ class TTPlatform(Platform):
             )
             model_config.max_logprobs = MAX_TOP_K
 
+        # vLLM resolved this from the upstream class; TT vision towers take
+        # rescaled, normalized pixels, so keep that step in the CPU processor.
+        mm_config = model_config.multimodal_config
+        if mm_config is not None and mm_config.mm_device_do_normalize:
+            mm_config.mm_device_do_normalize = False
+
         # Force the grammar backends to emit compact JSON. xgrammar and guidance
         # allow arbitrary inter-field whitespace by default; under greedy decoding
         # the model can pick a whitespace token as the argmax indefinitely,

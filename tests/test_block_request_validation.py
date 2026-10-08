@@ -235,6 +235,7 @@ def _config(
             original_max_model_len=None,
             max_logprobs=20,
             is_moe=False,
+            multimodal_config=None,
             generation_config="auto",
             logits_processors=None,
             get_sliding_window=lambda: None,
