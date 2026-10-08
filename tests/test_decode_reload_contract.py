@@ -19,6 +19,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.spec_decode import VerifyOutput
 
 
 def _bind_committed_width(runner: SimpleNamespace) -> SimpleNamespace:
@@ -77,8 +78,13 @@ def _sampling_params(rows=1):
     )
 
 
-def _submission_input(*, device_sampling=True, layout_changed=True, page=0):
+def _submission_input(
+    *, device_sampling=True, layout_changed=True, page=0, spec_mode=None
+):
     page_table = torch.tensor([[page]], dtype=torch.int32)
+    # submit_decode sends spec_mode only together with the two side tensors,
+    # so a verify carries them and a plain decode carries neither.
+    side_tensor = None if spec_mode is None else torch.tensor([1], dtype=torch.int32)
     return SimpleNamespace(
         input_tokens=torch.zeros((1, 1), dtype=torch.int32),
         input_positions=torch.zeros((1,), dtype=torch.int32),
@@ -91,11 +97,9 @@ def _submission_input(*, device_sampling=True, layout_changed=True, page=0):
         prompt_tokens=None,
         output_tokens=None,
         decode_layout_changed=layout_changed,
-        num_valid_drafts=None,
-        accepted_counts=None,
-        # Not a verify. The reload plan forces a full input upload for one,
-        # because a candidate block is assembled fresh every step.
-        spec_mode=None,
+        num_valid_drafts=side_tensor,
+        accepted_counts=side_tensor,
+        spec_mode=spec_mode,
         slot_remap=torch.tensor([0], dtype=torch.int32),
     )
 
@@ -104,6 +108,54 @@ def _accepted_decode_hooks(runner):
     runner.note_decode_layout_consumed = lambda: None
     runner.note_decode_state_slots_settled = lambda: None
     return runner
+
+
+class _VerifyingModel:
+    """A version-1 adapter that serves both plain decodes and verifies.
+
+    It records the commands of every call it accepts. Setting ``fail`` to
+    ``"verify"`` or ``"plain"`` makes calls of that kind raise instead, which
+    is a submission the model did not accept.
+    """
+
+    decode_input_update_contract = 1
+    model_capabilities = {"supports_async_decode": True}
+
+    def __init__(self):
+        self.calls = []
+        self.fail = None
+
+    def decode_forward(self, **kwargs):
+        kind = "plain" if kwargs.get("spec_mode") is None else "verify"
+        if kind == self.fail:
+            raise RuntimeError("submission failed")
+        self.calls.append(kwargs)
+        if kind == "plain":
+            return torch.zeros((1, 1))
+        return VerifyOutput(
+            spec_mode="argmax_ids",
+            argmax_ids=torch.zeros((1, 2), dtype=torch.int32),
+        )
+
+
+def _verifying_controller():
+    model = _VerifyingModel()
+    runner = _accepted_decode_hooks(
+        SimpleNamespace(
+            model=model,
+            trace_mode="decode_only",
+            kv_caches=object(),
+            request_specific_rope=False,
+        )
+    )
+    return TTAsyncDecodeController(runner), model
+
+
+def _submit(controller, *, spec_mode=None, layout_changed=False):
+    controller.submit_decode(
+        _submission_input(layout_changed=layout_changed, spec_mode=spec_mode),
+        read_from_device=True,
+    )
 
 
 def _cached_reqs(req_ids, *, context_phase=(), resumed=()):
@@ -187,6 +239,102 @@ def test_a_verify_always_reloads_its_inputs():
 
     assert plan.reload_inputs
     assert not plan.reload_page_table
+
+
+def test_the_plain_decode_after_a_verify_reloads_its_inputs():
+    """A verify leaves the resident inputs where the last plain decode left them.
+
+    The device sampler feeds a plain decode's token back into the buffer the
+    next plain decode reads, but a verify feeds back nothing: how many of its
+    tokens commit is decided on the host after the forward. So once a batch
+    falls from speculation to plain decode, which happens when a peer joins a
+    request the drafter only serves alone, the resident token predates every
+    token the verifies committed. The first plain decode after a verify must
+    reload, and rebuild the sampling state whose seed counters the commit moved
+    past, even with the layout and the sampling route unchanged.
+    """
+    controller = _controller()
+    _commit(controller, _decode_input())
+    _commit(controller, _decode_input(spec_mode="argmax_ids"))
+    # Two verifies in a row: the first must not leave the second asking for a
+    # sampling reset it never needed.
+    second_verify = _commit(controller, _decode_input(spec_mode="argmax_ids"))
+
+    after_verify = _commit(controller, _decode_input())
+    steady = _commit(controller, _decode_input())
+
+    assert not second_verify.reload_sampling_params
+    assert not second_verify.reset_sampling_state
+    assert after_verify.reload_inputs
+    assert after_verify.reload_sampling_params
+    assert after_verify.reset_sampling_state
+    assert not after_verify.overlap_safe
+    assert not steady.reload_inputs
+    assert steady.overlap_safe
+
+
+@pytest.mark.parametrize(
+    "sampling_after_verify, resets_sampling",
+    [
+        # Host sampling uploads its inputs on every step and has no device
+        # sampler to rebuild.
+        ((False,), False),
+        # The host-sampled decode ends the chain the verify left, and the
+        # return to device sampling is a sampling-mode transition of its own.
+        ((False, True), True),
+    ],
+    ids=["verify-host", "verify-host-device"],
+)
+def test_host_sampled_decodes_after_a_verify(sampling_after_verify, resets_sampling):
+    controller = _controller()
+    _commit(controller, _decode_input())
+    _commit(controller, _decode_input(spec_mode="argmax_ids"))
+
+    for device_sampling in sampling_after_verify:
+        plan = _commit(controller, _decode_input(device_sampling=device_sampling))
+
+    assert plan.reload_inputs
+    assert plan.reload_sampling_params == resets_sampling
+    assert plan.reset_sampling_state == resets_sampling
+
+
+def test_submit_decode_reloads_the_plain_decode_after_a_verify():
+    controller, model = _verifying_controller()
+
+    _submit(controller, layout_changed=True)
+    _submit(controller)
+    _submit(controller, spec_mode="argmax_ids")
+    _submit(controller)
+
+    steady, after_verify = model.calls[1], model.calls[3]
+    assert steady["reload_inputs"] is False
+    assert after_verify["reload_inputs"] is True
+    assert after_verify["reload_sampling_params"] is True
+    assert after_verify["reset_sampling_state"] is True
+
+
+def test_previous_submission_verified_commits_only_after_accepted_decode():
+    controller, model = _verifying_controller()
+    _submit(controller, layout_changed=True)
+
+    model.fail = "verify"
+    with pytest.raises(RuntimeError, match="submission failed"):
+        _submit(controller, spec_mode="argmax_ids")
+    model.fail = None
+    _submit(controller)
+    # The refused verify fed nothing back, so the resident inputs still hold
+    # what the first plain decode left there.
+    assert model.calls[-1]["reload_inputs"] is False
+
+    _submit(controller, spec_mode="argmax_ids")
+    model.fail = "plain"
+    with pytest.raises(RuntimeError, match="submission failed"):
+        _submit(controller)
+    model.fail = None
+    _submit(controller)
+    # The refused plain decode did not consume the verify's transition.
+    assert model.calls[-1]["reload_inputs"] is True
+    assert model.calls[-1]["reset_sampling_state"] is True
 
 
 def test_submit_decode_delivers_page_table_only_refresh():

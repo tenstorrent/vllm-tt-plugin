@@ -100,10 +100,11 @@ transition are still represented by `slot_remap`.
 - **Device sampling:** tt-metal selects the token. A supporting adapter writes
   the selected token into the persistent token buffer for the next decode and
   advances its persistent position in the forward trace.
-- **Transition decode:** the first decode; the first decode after prefill; a
-  request-layout, sampling-mode, or resume transition. Pending work is drained
-  and applied first, then host-authoritative inputs and required sampling state
-  are reloaded.
+- **Transition decode:** the first decode; the first decode after prefill; the
+  first ordinary decode after a speculative verification; a request-layout,
+  sampling-mode, or resume transition. Pending work is drained and applied
+  first, then host-authoritative inputs and required sampling state are
+  reloaded.
 - **Chunked-prefill continuation:** a later prompt chunk for a request already
   present in the persistent batch. Membership can remain unchanged, so the
   plugin classifies it using the scheduler's context-phase marker rather than
@@ -123,6 +124,7 @@ transition are still represented by `slot_remap`.
 | First decode or prefill → decode | reload | no | reload on device | reset on device |
 | Request add/remove/reuse/condense, preemption, or resume | reload | no | reload on device | reset on device |
 | Chunked-prefill continuation | reload | no | reload on device | reset on device |
+| Speculative verification → ordinary decode | reload | no | reload on device | reset on device |
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if allocation changed | keep | keep |
@@ -384,7 +386,10 @@ deferred verification output as ineligible for overlap. Deferred readback
 therefore does not imply concurrent verification steps. A speculative launch
 can also issue ordinary width-1 decode steps when the admitted model supports
 that transition; those ordinary steps follow the reload rules in this
-document. See [Generic speculative decoding](SCHEDULING.md#generic-speculative-decoding)
+document. The first of them after a verification is a transition decode: the
+verification commits a number of tokens the host decides after the forward and
+writes none of them into the resident token and position buffers, which still
+hold what the last ordinary decode fed back. See [Generic speculative decoding](SCHEDULING.md#generic-speculative-decoding)
 for step selection and [Model capabilities](MODEL_CAPABILITIES.md) for the
 separate ordinary and speculative async declarations.
 
