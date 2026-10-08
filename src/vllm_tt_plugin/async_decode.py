@@ -751,8 +751,8 @@ class TTAsyncDecodeController:
         A forced prefix-cache reset calls
         ``reset_prefix_cache(reset_running_requests=True)``. It preempts live
         requests and frees their KV blocks. vLLM resumes the requests from
-        saved token history. It records the number of in-flight outputs in
-        ``drop_stale_output`` / ``num_stale_output_tokens``.
+        saved token history and drops their in-flight outputs
+        (``drop_stale_output``).
 
         "Publish" means that the output stays visible to vLLM. "Apply" means
         that the runner adds the token to its request state. Use these rules:
@@ -767,9 +767,7 @@ class TTAsyncDecodeController:
         result B. vLLM accepted result A before the reset, but the runner has
         not applied its token. Result B was in flight at the reset, so
         ``forced_reset_discard_counts[R]`` is 1. Apply the token from result A.
-        Publish result B, but do not apply its token. This lets vLLM discard
-        result B and reduce its discard count. If result B is not published,
-        vLLM discards the next valid result instead.
+        Publish result B, but do not apply its token; vLLM drops it.
 
         A late result can occur when an earlier result ends the request. It can
         also occur when a result is in flight during an abort. The result that
