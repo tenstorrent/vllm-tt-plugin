@@ -188,7 +188,8 @@ def _discover_standard_dp_visible_device_groups(
     [("0,1,2,3,4,5,6,7", (1, 8)), ...]
     """
     import ttnn
-    from models.tt_transformers.tt.generator import create_submeshes
+
+    from vllm_tt_plugin.utils.dp_submeshes import create_dp_submeshes
 
     mesh_device = None
     submeshes = []
@@ -197,10 +198,10 @@ def _discover_standard_dp_visible_device_groups(
         num_devices_available = ttnn.get_num_devices()
         mesh_grid = _resolve_parent_mesh_grid(mesh_device_env, num_devices_available)
         mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*mesh_grid))
-        submeshes = create_submeshes(mesh_device, data_parallel_size)
+        submeshes = create_dp_submeshes(mesh_device, data_parallel_size)
         if len(submeshes) != data_parallel_size:
             raise RuntimeError(
-                "TT create_submeshes returned "
+                "TT create_dp_submeshes returned "
                 f"{len(submeshes)} groups for data_parallel_size={data_parallel_size}"
             )
 
