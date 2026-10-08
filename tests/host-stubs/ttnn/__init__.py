@@ -58,8 +58,13 @@ class DispatchCoreConfig:
 
 
 class MeshShape:
+    """Iterable like native ttnn's, whose ``dims`` is a method, not the dimensions."""
+
     def __init__(self, *dims):
-        self.dims = dims
+        self._dims = dims
+
+    def __iter__(self):
+        return iter(self._dims)
 
 
 class MeshDevice:
