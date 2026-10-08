@@ -5,13 +5,22 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.worker import TTWorker
 
 # region Constants
 VOCAB_SIZE = 64
@@ -84,6 +93,72 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         runner, toks
     )
     return runner
+
+
+def test_hybrid_kv_cache_uses_v029_tensor_layers():
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=1024,
+                layers=["model.layers.0.self_attn", "model.layers.1.self_attn"],
+                layer_stride=512,
+                block_stride=256,
+            ),
+            KVCacheTensor(
+                size=1024,
+                layers=["model.layers.2.self_attn"],
+                layer_stride=512,
+                block_stride=256,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn", "model.layers.1.self_attn"], spec
+            ),
+            KVCacheGroupSpec(["model.layers.2.self_attn"], spec),
+        ],
+    )
+    runner = SimpleNamespace(
+        num_devices=1,
+        tt_data_parallel_size=1,
+    )
+    runner._kv_cache_shape = lambda spec, num_blocks: TTModelRunner._kv_cache_shape(
+        runner, spec, num_blocks
+    )
+
+    per_layer = TTModelRunner._build_per_layer_specs(runner, config, 3)
+
+    # Groups alias from byte 0: the i-th layer of each group shares buffer i.
+    assert [entry[2] for entry in per_layer] == [0, 1, 0]
+
+
+def test_kv_cache_layout_resolves_to_lbnhc_for_mixed_specs():
+    specs = [
+        FullAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=num_kv_heads,
+            head_size=8,
+            dtype=torch.float32,
+        )
+        for num_kv_heads in (1, 4)
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_layout=None),
+        kv_transfer_config=None,
+    )
+    supported = TTWorker.get_supported_kv_cache_layouts(TTWorker.__new__(TTWorker))
+
+    layout = resolve_kv_cache_layout(vllm_config, [supported], specs)
+
+    assert supported == ["LBNHC"]
+    assert layout.name == "LBNHC"
 
 
 def _prepare(runner, *rows):

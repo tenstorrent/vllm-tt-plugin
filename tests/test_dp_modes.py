@@ -11,7 +11,9 @@ the DP-to-lanes conversion in ``test_galaxy_dp_conversion.py``.
 from types import SimpleNamespace
 
 import pytest
+import torch
 import ttnn
+from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 from vllm.v1.core.sched import interface as sched_interface
 
 from vllm_tt_plugin import worker
@@ -57,6 +59,23 @@ class TestDPModes:
             )
 
             TTPlatform.check_and_update_config(vllm_config)
+
+    def test_image_normalization_stays_in_the_cpu_processor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        # vLLM >= 0.28 enables this for upstream Qwen2/2.5-VL.
+        vllm_config.model_config.multimodal_config = SimpleNamespace(
+            mm_device_do_normalize=True
+        )
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert (
+            vllm_config.model_config.multimodal_config.mm_device_do_normalize is False
+        )
 
     @pytest.mark.parametrize("original_max_model_len", [8192, -1, None])
     def test_check_and_update_config_never_rewrites_max_model_len(
@@ -141,6 +160,29 @@ class TestDPModes:
 
         assert warmup_calls == ["warmup"]
         assert timings.language_model >= 0.0
+
+    @pytest.mark.parametrize("set_by_vllm", [True, False])
+    def test_warmup_drops_vllm_sized_worker_threads(
+        self, monkeypatch: pytest.MonkeyPatch, set_by_vllm: bool
+    ) -> None:
+        worker = TTWorker.__new__(TTWorker)
+        worker.enable_model_warmup = False
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        if set_by_vllm:
+            monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
+        else:
+            monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
+        threads = [4]
+
+        def set_num_threads(n: int) -> None:
+            threads[0] = n
+
+        monkeypatch.setattr(torch, "get_num_threads", lambda: threads[0])
+        monkeypatch.setattr(torch, "set_num_threads", set_num_threads)
+
+        TTWorker.compile_or_warm_up_model(worker)
+
+        assert threads == [1 if set_by_vllm else 4]
 
     def test_single_host_standard_dp_leaves_the_launcher_to_upstream(
         self,

@@ -58,6 +58,7 @@ from vllm_tt_plugin.scheduler import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -281,8 +282,9 @@ class TTLaneCoordinator(SchedulerInterface):
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
-        # No KV connector on TT; surfaced for engine-core attribute access.
+        # No KV or encoder-cache connector on TT; EngineCore reads both.
         self.connector: KVConnectorBase_V1 | None = None
+        self.ec_connector: ECConnectorBase | None = None
         # One policy for the whole step, not one per lane. Every lane executes
         # the single negotiated mode, so per-lane instances would each see only
         # their own lane's work and disagree about when to interleave.

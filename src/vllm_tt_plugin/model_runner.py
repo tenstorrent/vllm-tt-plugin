@@ -867,9 +867,9 @@ class TTModelRunner:
                 )
             return per_layer  # type: ignore[return-value]
 
-        # Multi-group: walk ``kv_cache_tensors`` (one entry per unique DRAM
-        # buffer) and assign every layer in ``shared_by`` the same
-        # ``tensor_idx``. Shape/dtype come from the layer's own group spec.
+        # Multi-group: every group's KVCacheTensor starts at byte 0, so layers
+        # whose regions start at the same byte share one buffer -- the i-th
+        # layer of each group, as ``shared_by`` listed before vLLM 0.29.
         spec_by_layer_name: dict[str, AttentionSpec] = {}
         for group in kv_cache_groups:
             assert isinstance(group.kv_cache_spec, AttentionSpec)
@@ -879,12 +879,17 @@ class TTModelRunner:
         per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
             None
         ] * num_layers
-        for tensor_idx, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
-            for layer_name in kv_cache_tensor.shared_by:
+        tensor_idx_by_start: dict[int, int] = {}
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for position, layer_name in enumerate(kv_cache_tensor.layers):
+                start = kv_cache_tensor.offset + position * kv_cache_tensor.layer_stride
+                tensor_idx = tensor_idx_by_start.setdefault(
+                    start, len(tensor_idx_by_start)
+                )
                 spec = spec_by_layer_name.get(layer_name)
                 if spec is None:
                     raise ValueError(
-                        f"KVCacheTensor.shared_by names layer '{layer_name}' "
+                        f"KVCacheTensor.layers names layer '{layer_name}' "
                         "but it doesn't appear in any kv_cache_group"
                     )
                 idx = _parse_layer_index(layer_name)
@@ -896,8 +901,8 @@ class TTModelRunner:
                 if per_layer[idx] is not None:
                     raise ValueError(
                         f"Layer index {idx} (from '{layer_name}') is named "
-                        "by more than one KVCacheTensor.shared_by; each "
-                        "layer must map to exactly one DRAM buffer"
+                        "by more than one KVCacheTensor; each layer must "
+                        "map to exactly one DRAM buffer"
                     )
                 shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
                 per_layer[idx] = (shape, spec.dtype, tensor_idx)
@@ -907,7 +912,7 @@ class TTModelRunner:
             raise ValueError(
                 f"No KVCacheTensor covers layer indices {missing}; "
                 "every attention layer must appear in some "
-                "kv_cache_tensors[i].shared_by"
+                "kv_cache_tensors[i].layers"
             )
         return per_layer  # type: ignore[return-value]
 

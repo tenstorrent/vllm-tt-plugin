@@ -639,7 +639,7 @@ def _tt_model_class_overrides() -> dict[str, str]:
 
 def _install_api_lifespan_gc_patch() -> None:
     """Collect the frozen API startup graph after upstream lifespan cleanup."""
-    from vllm.entrypoints.serve.utils import server_utils
+    from vllm.entrypoints.launchers.utils import server_utils
 
     original = server_utils.lifespan
     if getattr(original, "_tt_lifespan_gc_patch", False):
@@ -657,12 +657,10 @@ def _install_api_lifespan_gc_patch() -> None:
 
     lifespan._tt_lifespan_gc_patch = True
     server_utils.lifespan = lifespan
-    # The CLI can import the lifespan before the platform configuration hook.
-    # ``python -m ...api_server`` keeps that binding in __main__ instead.
-    for name in ("vllm.entrypoints.openai.api_server", "__main__"):
-        module = sys.modules.get(name)
-        if module is not None and getattr(module, "lifespan", None) is original:
-            module.lifespan = lifespan
+    # launchers.app imports ``lifespan`` by name, possibly before this hook runs.
+    app_module = sys.modules.get("vllm.entrypoints.launchers.app")
+    if app_module is not None and getattr(app_module, "lifespan", None) is original:
+        app_module.lifespan = lifespan
 
 
 def _install_torch_accelerator_cleanup_patch() -> None:
@@ -1782,6 +1780,12 @@ class TTPlatform(Platform):
                 MAX_TOP_K,
             )
             model_config.max_logprobs = MAX_TOP_K
+
+        # vLLM resolved this from the upstream class; TT vision towers take
+        # rescaled, normalized pixels, so keep that step in the CPU processor.
+        mm_config = model_config.multimodal_config
+        if mm_config is not None and mm_config.mm_device_do_normalize:
+            mm_config.mm_device_do_normalize = False
 
         # Force the grammar backends to emit compact JSON. xgrammar and guidance
         # allow arbitrary inter-field whitespace by default; under greedy decoding

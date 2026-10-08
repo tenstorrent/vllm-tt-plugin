@@ -145,23 +145,33 @@ the runner adds its token to local request state. The plugin uses these rules:
   it. The result that ended the request was already accepted.
 
 An ordinary preemption does not invalidate an in-flight decode. Its forward
-completed before the KV blocks were reused, so its token is valid. If its
-result is still in flight, the scheduler does not resume the request. After
-vLLM accepts the result, resumed prefill includes the token and gets a new
-output placeholder. This prevents two physical results from using one
-placeholder. It also prevents an extra sample from advancing seeded RNG state.
+completed before the KV blocks were reused, so its token is valid. vLLM marks
+that output stale: it sets `Request.num_stale_output_tokens` to the request's
+in-flight scheduled tokens and resets `num_output_placeholders` to zero. The
+stale output is still delivered and accepted, because `drop_stale_output` stays
+false. The scheduler does not resume the request until that deliverable stale
+output has drained (`num_stale_output_tokens` is zero). Resumed prefill
+therefore includes the token and gets a new output placeholder. This prevents
+two physical results from using one placeholder. It also prevents an extra
+sample from advancing seeded RNG state.
 
 A forced prefix-cache reset calls
 `reset_prefix_cache(reset_running_requests=True)`. It preempts live requests so
-all KV blocks can be freed. vLLM resumes each request from committed token
-history and records the number of in-flight results in its upstream
-`Request.async_tokens_to_discard` field. The plugin keeps those results visible
-to vLLM, but does not add their tokens to local request state. If the plugin
-removes one of these results, vLLM cannot reduce the discard count and discards
-the next valid result instead. This control path is used by an explicit
-live-request reset or by pause/sleep with cache clearing. Normal completion,
-ordinary scheduler preemption, and cache eviction do not use it. An ordinary
-`reset_prefix_cache()` only succeeds when no running request holds KV blocks.
+all KV blocks can be freed, with `drop_stale_output` set. vLLM resumes each
+request from committed token history in the same step and drops its stale
+output instead of delivering it. The two sides count different units:
+
+- vLLM's `num_stale_output_tokens` counts scheduled tokens. Each step's output
+  reduces it by the number of tokens scheduled in that step.
+- The plugin's forced-reset discard counts count output frames. One TT output
+  frame can carry several tokens, for example 1+K with speculative decoding.
+
+The plugin keeps forced-reset results visible to vLLM, which drops them, but
+does not add their tokens to local request state. This control path is used by
+an explicit live-request reset or by pause/sleep with cache clearing. Normal
+completion, ordinary scheduler preemption, and cache eviction do not use it. An
+ordinary `reset_prefix_cache()` only succeeds when no running request holds KV
+blocks.
 
 Under upstream async scheduling, a synchronously sampled final-prefill result
 uses the same deferred state-apply queue as an async decode result. This lets a
@@ -300,14 +310,15 @@ when it is set, the caller must keep active and resubmitted IDs unique.
 When `SchedulerOutput` reports that a request is finished, the plugin removes
 any later result that vLLM has not consumed and does not add its token to runner
 state. The result that finished the request was already accepted. Ordinary
-preemption does not suppress its in-flight result. A preempted request cannot
-resume while it owns an output placeholder. Resumed prefill therefore includes
-the accepted token and owns a new placeholder for its next result.
+preemption does not suppress its in-flight result. vLLM delivers that stale
+output and does not resume the request until it has drained. Resumed prefill
+therefore includes the accepted token and owns a new placeholder for its next
+result.
 
 Forced-reset discard counts are scheduler-owned sidecar metadata on
-`SchedulerOutput`. They prevent runner-state updates for only the newest
-counted results. The results stay visible to vLLM so it can reduce its upstream
-discard count.
+`SchedulerOutput`. They count output frames, not tokens, and prevent
+runner-state updates for only the newest counted results. The results stay
+visible to vLLM, which drops them itself.
 
 ## Requirements for `decode_input_update_contract = 1`
 
