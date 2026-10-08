@@ -397,6 +397,61 @@ def test_another_request_being_sampled_does_not_block_this_one():
     assert _speculable(random=["other"]) is True
 
 
+def _sampled_runner(capabilities, device_sampling=True, structured=False):
+    from types import SimpleNamespace
+
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch(random=["r0"])
+    runner.model = SimpleNamespace(model_capabilities=capabilities)
+    runner.requests = {
+        "r0": SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                structured_outputs=object() if structured else None
+            )
+        )
+    }
+    runner.check_perform_device_sampling = lambda **_: device_sampling
+    return runner
+
+
+def test_sampled_request_unchanged_without_the_capability():
+    """No ``supports_sampled_verify``: a sampled request is never speculable."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    for caps in ({}, {"supports_sampled_verify": False}, {"max_device_top_k": 1}):
+        runner = _sampled_runner(caps)
+        assert TTModelRunner._request_is_speculable(runner, "r0") is False
+
+
+def test_sampled_request_speculable_with_the_capability():
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = _sampled_runner({"supports_sampled_verify": True})
+    assert TTModelRunner._request_is_speculable(runner, "r0") is True
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"device_sampling": False}, {"structured": True}],
+    ids=["host_sampling", "structured_output"],
+)
+def test_sampled_verify_needs_sampling_params_to_reach_the_model(kwargs):
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = _sampled_runner({"supports_sampled_verify": True}, **kwargs)
+    assert TTModelRunner._request_is_speculable(runner, "r0") is False
+
+
+def test_penalties_stay_unspeculable_even_with_the_capability():
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = _sampled_runner({"supports_sampled_verify": True})
+    runner.input_batch = _FakeBatch(random=["r0"], presence=["r0"])
+    assert TTModelRunner._request_is_speculable(runner, "r0") is False
+
+
 def _publish(tokens, **batch_kwargs):
     """Drive the single publish choke point every proposer goes through."""
     from vllm_tt_plugin.model_runner import TTModelRunner

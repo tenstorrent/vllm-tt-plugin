@@ -1408,14 +1408,42 @@ class TTModelRunner:
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
         for attr in (
-            "random_reqs",
             "presence_penalties_reqs",
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
             if req_id in getattr(batch, attr, ()):
                 return False
+        if req_id in getattr(batch, "random_reqs", ()):
+            # A model that declares ``supports_sampled_verify`` certifies the
+            # draft against the request's own sampling distribution (it is
+            # handed the sampling params on a verify and returns ids the greedy
+            # walk accepts or rejects losslessly). Every other model keeps the
+            # rule above.
+            return TTModelRunner._sampled_verify_is_servable(self, req_id)
         return True
+
+    def _sampled_verify_is_servable(self, req_id: str) -> bool:
+        """True when a sampled request may be verified by the model itself.
+
+        Needs the capability, and needs the sampling params to reach the model:
+        they are only sent when the step samples on device, so a request that
+        forces host sampling (structured output, host-only logits processors,
+        a top_k the device cannot serve) is not eligible.
+        """
+        model = getattr(self, "model", None)
+        caps = getattr(model, "model_capabilities", None) or {}
+        if not caps.get("supports_sampled_verify", False):
+            return False
+        request = getattr(self, "requests", {}).get(req_id)
+        params = getattr(request, "sampling_params", None)
+        if params is not None and getattr(params, "structured_outputs", None):
+            return False
+        return bool(
+            self.check_perform_device_sampling(
+                is_decode=True, has_structured_outputs=False
+            )
+        )
 
     def _note_unspeculable_verify_rows(self, row_req_ids: list[str]) -> None:
         """Count the live rows of a verify whose request is not speculable.
