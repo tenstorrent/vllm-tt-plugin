@@ -271,7 +271,7 @@ classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRAC
 `SpecPlan` resource declarations do not yet enforce row or byte budgets.
 
 The model classes and their capability declarations live in **tt-metal**, under
-`models.tt_transformers.tt.generator_vllm` and the per-demo generators such as
+`models.ttt_compat.tt.generator_vllm` and the per-demo generators such as
 `models.demos.llama3_70b_galaxy.tt.generator_vllm`.
 
 Consequence: a plugin change that consumes a new capability needs a matching
