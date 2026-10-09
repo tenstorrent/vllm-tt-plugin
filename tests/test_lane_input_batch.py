@@ -32,6 +32,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -281,7 +282,7 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert b.occupied_rows() == []
 
 
-def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
@@ -314,8 +315,16 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
         requests={"request": request},
     )
 
+    logged: list[str] = []
+    monkeypatch.setattr(
+        input_batch_module,
+        "logger",
+        SimpleNamespace(info=lambda msg, *args: logged.append(msg % args)),
+    )
+
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
 
+    assert logged == ["Prefill chunk for request request: tokens [2, 3) of 8."]
     assert model_input.input_positions.tolist() == [2]
     assert model_input.prompt_lens.tolist() == [3]
     assert model_input.input_tokens.tolist() == [[0, 1, 2]]
