@@ -21,9 +21,10 @@ from vllm_tt_plugin.scheduler import (
 )
 
 
-def _scheduler(alignment=128, *, base_mamba=False):
+def _scheduler(alignment=128, *, base_mamba=False, block_size=64):
     scheduler = TTScheduler.__new__(TTScheduler)
     scheduler._prefill_chunk_alignment = alignment
+    scheduler.block_size = block_size
     scheduler.need_mamba_block_aligned_split = base_mamba
     return scheduler
 
@@ -49,21 +50,38 @@ def test_a_new_request_that_cannot_reach_the_grid_waits_a_step():
     assert s._mamba_block_aligned_split(_request(32612), 100) == 0
 
 
-def test_a_running_request_never_gets_an_empty_chunk():
+def test_a_running_request_short_of_the_grid_still_ends_on_a_kv_block():
+    """The next chunk resumes where this one ends, and the model rejects a resume
+    offset off the KV block grid ("cached prefill start ... must be block
+    aligned"), so a short chunk must not be kept whole."""
     s = _scheduler()
-    # Started unaligned (e.g. before the feature, or a cached prefix): the first
-    # aligned end is 4224, so a 4096 chunk from 157 shrinks to 4067 ...
+    # Started unaligned (e.g. before the feature): the first aligned end is
+    # 4224, so a 4096 chunk from 157 shrinks to 4067 ...
     assert (
         s._mamba_block_aligned_split(_request(32612, computed=157), 4096) == 4096 - 29
     )
-    # ... but a chunk too short to reach the next boundary is kept whole.
-    assert s._mamba_block_aligned_split(_request(32612, computed=157), 50) == 50
+    # ... a chunk too short to reach 256 ends on the 192 block instead ...
+    assert s._mamba_block_aligned_split(_request(32612, computed=157), 50) == 35
+    # ... and from a block boundary a chunk shorter than one block waits a step.
+    assert s._mamba_block_aligned_split(_request(32612, computed=192), 50) == 0
+    assert s._mamba_block_aligned_split(_request(32612, computed=192), 64) == 64
 
 
 def test_the_chunk_that_finishes_the_prompt_is_left_alone():
     s = _scheduler()
     assert s._mamba_block_aligned_split(_request(32612, computed=28672), 3940) == 3940
     assert s._mamba_block_aligned_split(_request(300), 300) == 300
+
+
+def test_a_resumed_replay_past_the_prompt_stays_on_the_grid():
+    """A preempted request replays prompt and output tokens; a replay chunk that
+    passes the prompt's end but not the sequence's still resumes later."""
+    s = _scheduler()
+    resumed = SimpleNamespace(
+        num_prompt_tokens=128, num_tokens=300, num_computed_tokens=128, mm_features=[]
+    )
+    assert s._mamba_block_aligned_split(resumed, 100) == 64
+    assert s._mamba_block_aligned_split(resumed, 172) == 172
 
 
 def test_decode_and_multimodal_requests_are_untouched():
