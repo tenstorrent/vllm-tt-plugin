@@ -1,0 +1,168 @@
+name: Lint and host tests
+
+# Host tests are the suite outside tests/tt, which drives a live server on a
+# Tenstorrent device and runs from tt-metal's vllm-model-tests instead.
+
+on:
+  pull_request:
+    branches: [main, "release/*"]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      tt-metal-tag:
+        description: "tt-metal release tag for host-tests-ttnn (blank: latest stable and latest release)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: pre-commit/action@v3.0.1
+
+  resolve-tt-metal:
+    # Both test jobs need this one, so a draft skips them too.
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    outputs:
+      stable: ${{ steps.resolve.outputs.stable }}
+      tags: ${{ steps.resolve.outputs.tags }}
+      torch-pins: ${{ steps.resolve.outputs.torch-pins }}
+    steps:
+      - name: Resolve release tags and their torch pins
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tt-metal-tag }}
+        run: |
+          set -euo pipefail
+          newest() {
+            gh release list --repo tenstorrent/tt-metal --exclude-drafts --limit 1 \
+              --json tagName --jq '.[0].tagName' "$@"
+          }
+          stable=$(newest --exclude-pre-releases)
+          if [ -n "$REQUESTED" ]; then
+            tags=$(jq -cn --arg t "$REQUESTED" '[$t]')
+          else
+            tags=$(jq -cn --arg s "$stable" --arg l "$(newest)" '[$s, $l] | unique')
+          fi
+          # The ttnn wheel declares no torch; each tt-metal tag pins it here.
+          pins='{}'
+          for tag in $(jq -r --arg s "$stable" '. + [$s] | unique | .[]' <<<"$tags"); do
+            pin=$(curl -fsSL "https://raw.githubusercontent.com/tenstorrent/tt-metal/$tag/tt_metal/python_env/requirements-dev.txt" \
+              | sed -nE "s/^(torch==[^ ;]+) *;.*x86_64.*/\1/p")
+            [ -n "$pin" ] || { echo "no x86_64 torch pin in tt-metal $tag requirements-dev.txt" >&2; exit 1; }
+            pins=$(jq -c --arg t "$tag" --arg p "$pin" '. + {($t): $p}' <<<"$pins")
+          done
+          {
+            echo "stable=$stable"
+            echo "tags=$tags"
+            echo "torch-pins=$pins"
+          } >> "$GITHUB_OUTPUT"
+          echo "stable=$stable tags=$tags torch-pins=$pins"
+
+  host-tests-stubbed:
+    # tests/host-stubs answers `import ttnn`, so this needs no tt-metal at all.
+    needs: resolve-tt-metal
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The interpreters of tt-metal's Ubuntu 22.04 and 24.04 environments.
+        python-version: ["3.10", "3.12"]
+    env:
+      VIRTUAL_ENV: ${{ github.workspace }}/.venv
+      # Keeps vLLM's transitive torch ecosystem on CPU wheels, as in tt-metal.
+      UV_TORCH_BACKEND: cpu
+      TORCH_PIN: ${{ fromJSON(needs.resolve-tt-metal.outputs.torch-pins)[needs.resolve-tt-metal.outputs.stable] }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Create the environment
+        run: uv venv --python ${{ matrix.python-version }} "$VIRTUAL_ENV"
+
+      - name: Install torch at tt-metal's stable pin
+        run: uv pip install "$TORCH_PIN"
+
+      - name: Install vLLM and the plugin
+        # The operator install path, so this job also fails when it rots.
+        run: source docs/install-vllm-tt.sh
+
+      - name: Install dev tools
+        run: uv pip install -e ".[dev]"
+
+      - name: Run host tests
+        run: "$VIRTUAL_ENV/bin/python -m pytest tests/ --ignore=tests/tt"
+        env:
+          PYTHONPATH: tests/host-stubs
+
+  host-tests-ttnn:
+    # Release images are the only public ttnn for every tag: the release .debs
+    # carry no Python package, and PyPI gets tagged releases only.
+    name: host-tests-ttnn (${{ matrix.tt-metal-tag }}, ubuntu-${{ matrix.ubuntu }})
+    needs: resolve-tt-metal
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tt-metal-tag: ${{ fromJSON(needs.resolve-tt-metal.outputs.tags) }}
+        # The images ship Python 3.10 and 3.12 respectively, in /opt/venv.
+        ubuntu: ["22.04", "24.04"]
+    container:
+      image: ghcr.io/tenstorrent/tt-metal/tt-metalium-ubuntu-${{ matrix.ubuntu }}-release-amd64:${{ matrix.tt-metal-tag }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_TORCH_BACKEND: cpu
+      TORCH_PIN: ${{ fromJSON(needs.resolve-tt-metal.outputs.torch-pins)[matrix.tt-metal-tag] }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install torch at this tag's pin
+        run: uv pip install "$TORCH_PIN"
+
+      - name: Install vLLM and the plugin
+        run: source docs/install-vllm-tt.sh
+
+      - name: Install dev tools
+        run: uv pip install -e ".[dev]"
+
+      - name: Run host tests
+        run: "$VIRTUAL_ENV/bin/python -m pytest tests/ --ignore=tests/tt"
+
+  required-checks:
+    # The only check the branch ruleset should require; host-tests-ttnn only warns.
+    if: ${{ always() && !github.event.pull_request.draft }}
+    needs: [pre-commit, host-tests-stubbed, host-tests-ttnn]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on pre-commit and stubbed host tests
+        env:
+          PRE_COMMIT: ${{ needs.pre-commit.result }}
+          STUBBED: ${{ needs.host-tests-stubbed.result }}
+          TTNN: ${{ needs.host-tests-ttnn.result }}
+        run: |
+          if [ "$TTNN" != success ]; then
+            echo "::warning::host-tests-ttnn is '$TTNN'; real-ttnn failures do not block merging"
+          fi
+          if [ "$PRE_COMMIT" != success ] || [ "$STUBBED" != success ]; then
+            echo "::error::pre-commit is '$PRE_COMMIT', host-tests-stubbed is '$STUBBED'"
+            exit 1
+          fi

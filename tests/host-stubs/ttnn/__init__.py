@@ -15,7 +15,7 @@ loudly here instead of silently passing against a fake device.
 
 Put this directory's parent on ``PYTHONPATH`` to use it:
 
-    PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
+    PYTHONPATH=tests/host-stubs pytest tests/ --ignore=tests/tt
 """
 
 from enum import Enum
