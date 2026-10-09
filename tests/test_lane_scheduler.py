@@ -8,10 +8,13 @@ on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
 length, forced-mode scheduling, and ``update_from_output``).
 """
 
+import collections
 from types import SimpleNamespace
 
+import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.request import RequestStatus
 
 from vllm_tt_plugin.lane_scheduler import (
     TTLaneCoordinator,
@@ -19,7 +22,12 @@ from vllm_tt_plugin.lane_scheduler import (
     get_tt_step_plan,
     merge_lane_scheduler_outputs,
 )
-from vllm_tt_plugin.scheduler import TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTDecodeInterleavePolicy,
+    TTSchedulingMode,
+    get_tt_forced_reset_discard_counts,
+    set_tt_forced_reset_discard_counts,
+)
 
 
 class FakeLane:
@@ -39,6 +47,7 @@ class FakeLane:
         skipped_waiting=0,
         partial_prefills=0,
         pending_finished=(),
+        owns=(),
     ):
         self.waiting = [object()] * waiting
         self.skipped_waiting = [object()] * skipped_waiting
@@ -46,10 +55,13 @@ class FakeLane:
             SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
         ] + [SimpleNamespace(is_prefill_chunk=True) for _ in range(partial_prefills)]
         self._pending_finished = set(pending_finished)
+        self.requests: dict[str, SimpleNamespace] = {}
         self._mode = TTSchedulingMode.DEFAULT
         self.scheduled_modes: list[TTSchedulingMode] = []
         self.update_calls: list[SchedulerOutput] = []
         self._eco: dict[int, EngineCoreOutputs] = {}
+        self._owned = {r.request_id: r for r in owns}
+        self.finish_calls: list[tuple] = []
 
     def set_forced_mode(self, mode):
         self._mode = mode
@@ -70,10 +82,30 @@ class FakeLane:
         self.update_calls.append(scheduler_output)
         return self._eco
 
+    def finish_requests(self, request_ids, finished_status):
+        self.finish_calls.append((request_ids, finished_status))
+        if request_ids is None:
+            ids = list(self._owned)
+        elif isinstance(request_ids, str):
+            ids = [request_ids]
+        else:
+            ids = list(request_ids)
+        return [self._owned.pop(rid) for rid in ids if rid in self._owned]
 
-def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False):
+
+def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False, **interleave_keys):
     coordinator = TTLaneCoordinator.__new__(TTLaneCoordinator)
     coordinator.lanes = lanes
+    # The coordinator owns a single decode-interleave policy for the whole
+    # step. Disabled unless a test passes bounds, so the mode negotiation
+    # under test is the plain prefill-wins rule.
+    coordinator._decode_interleave = TTDecodeInterleavePolicy(
+        SimpleNamespace(
+            additional_config={
+                "tt": interleave_keys or {"decode_interleave_enabled": False}
+            }
+        )
+    )
     coordinator.num_lanes = len(lanes)
     coordinator._per_lane_max = per_lane_max
     coordinator.log_stats = log_stats
@@ -127,6 +159,66 @@ def test_negotiate_prefill_for_running_continuation_at_lane_capacity():
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
+def test_decode_interleave_overrides_a_prefill_intent_once_the_bound_is_hit():
+    # One lane holds a multi-chunk prefill it cannot finish in one step; the
+    # other lane is decoding. Without the interleave every step is prefill and
+    # the decoding lane stalls for the whole prompt.
+    lanes = [FakeLane(partial_prefills=1), FakeLane(running=2)]
+    coordinator = _make_coordinator(
+        lanes,
+        decode_interleave_prefill_steps=2,
+        decode_interleave_decode_steps=1,
+    )
+
+    # schedule() advances the counters in production; negotiation alone does
+    # not, so drive them the way the step loop does.
+    modes = []
+    for _ in range(9):
+        mode = coordinator._negotiate_forced_mode()
+        coordinator._decode_interleave.record_step(
+            is_decode=mode == TTSchedulingMode.DECODE_ONLY, prefill_pending=True
+        )
+        modes.append(mode)
+
+    P, D = TTSchedulingMode.PREFILL_ONLY, TTSchedulingMode.DECODE_ONLY
+    assert modes == [P, P, D, P, P, D, P, P, D]
+
+
+def test_decode_interleave_needs_a_lane_with_a_genuine_running_decode():
+    # Every running request across both lanes is a partial-prefill
+    # continuation. A decode step samples nothing for those, so the interleave
+    # would only produce empty steps.
+    lanes = [FakeLane(partial_prefills=1), FakeLane(partial_prefills=1)]
+    coordinator = _make_coordinator(lanes, decode_interleave_prefill_steps=1)
+
+    for _ in range(4):
+        mode = coordinator._negotiate_forced_mode()
+        coordinator._decode_interleave.record_step(
+            is_decode=mode == TTSchedulingMode.DECODE_ONLY, prefill_pending=True
+        )
+        assert mode == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_schedule_records_the_step_phase_for_the_interleave_policy():
+    # The counters must follow the mode the step actually ran, which schedule()
+    # settles only after the zero-token prefill fallback has had its say.
+    # FakeLane always schedules zero prefill tokens, so this step falls back to
+    # decode and must be recorded as a decode step.
+    lanes = [FakeLane(waiting=1, running=1)]
+    coordinator = _make_coordinator(lanes, decode_interleave_prefill_steps=1)
+
+    coordinator.schedule()
+
+    assert lanes[0].scheduled_modes == [
+        TTSchedulingMode.PREFILL_ONLY,
+        TTSchedulingMode.DECODE_ONLY,
+    ]
+    # The fallback decode consumed the allowance, so the next step prefills.
+    assert not coordinator._decode_interleave.wants_decode_step(
+        has_pending_prefill=True, has_running_decode=True
+    )
+
+
 def test_idle_step_propagates_finished_req_ids():
     # No lane has work, but one lane still has a finished request to report.
     lanes = [FakeLane(pending_finished={"done-0"}), FakeLane()]
@@ -141,6 +233,24 @@ def test_idle_step_propagates_finished_req_ids():
     # Every lane is scheduled (so each drains its own finished set).
     assert lanes[0].scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
     assert lanes[1].scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
+
+
+def test_step_plan_reports_exact_lane_layout_changes():
+    lane = FakeLane(running=1)
+    coordinator = _make_coordinator([lane], per_lane_max=2)
+
+    first_decode = coordinator.schedule()
+    assert get_tt_step_plan(first_decode).decode_layout_changed
+
+    # The same request keeps the same stable lane row.
+    second_decode = coordinator.schedule()
+    assert not get_tt_step_plan(second_decode).decode_layout_changed
+
+    # A live request omitted from a prefill step still owns its row; unlike a
+    # front-packed batch, unscheduled membership is not a layout transition.
+    empty = SchedulerOutput.make_empty()
+    prefill_plan = coordinator._build_step_plan([empty], empty, is_decode=False)
+    assert not prefill_plan.decode_layout_changed
 
 
 def test_decode_fallback_when_forced_prefill_schedules_nothing():
@@ -163,6 +273,25 @@ def test_decode_fallback_when_forced_prefill_schedules_nothing():
         TTSchedulingMode.PREFILL_ONLY,
         TTSchedulingMode.DECODE_ONLY,
     ]
+
+
+def test_decode_fallback_carries_forced_reset_discard_counts():
+    lane0 = FakeLane(running=1)
+    lane1 = FakeLane(waiting=1)
+    coordinator = _make_coordinator([lane0, lane1])
+    lane_schedule = lane0.schedule
+
+    def _schedule():
+        output = lane_schedule()
+        if lane0.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY:
+            set_tt_forced_reset_discard_counts(output, {"stale": 2})
+        return output
+
+    lane0.schedule = _schedule
+
+    output = coordinator.schedule()
+
+    assert get_tt_forced_reset_discard_counts(output) == {"stale": 2}
 
 
 def test_no_fallback_when_no_running_requests():
@@ -224,6 +353,58 @@ def test_preemption_in_a_discarded_prefill_pass_is_carried_to_the_decode_step():
     assert "p" not in get_tt_step_plan(output).req_id_to_row
 
 
+def _structured_request(*, is_prefill_chunk):
+    return SimpleNamespace(
+        use_structured_output=True, is_prefill_chunk=is_prefill_chunk
+    )
+
+
+def _recording_structured_output_manager(recorded):
+    def grammar_bitmask(requests, req_ids, spec_decode_tokens):
+        recorded.append(list(req_ids))
+        return "bitmask"
+
+    return SimpleNamespace(grammar_bitmask=grammar_bitmask)
+
+
+def test_grammar_bitmask_skips_intermediate_prefill_chunks():
+    # An intermediate chunk samples no token, so giving it a bitmask row would
+    # offset every later row against the batch the runner remaps onto.
+    lane = FakeLane()
+    lane.requests = {
+        "chunk": _structured_request(is_prefill_chunk=True),
+        "decode": _structured_request(is_prefill_chunk=False),
+    }
+    coordinator = _make_coordinator([lane])
+    recorded: list[list[str]] = []
+    coordinator.structured_output_manager = _recording_structured_output_manager(
+        recorded
+    )
+
+    scheduler_output = _scheduled_output(["chunk", "decode"])
+    # The base scheduler raises the flag for "decode": a structured request that
+    # is past its prefill chunks.
+    scheduler_output.has_structured_output_requests = True
+
+    grammar_output = coordinator.get_grammar_bitmask(scheduler_output)
+
+    assert recorded == [["decode"]]
+    assert grammar_output.structured_output_request_ids == ["decode"]
+
+
+def test_grammar_bitmask_is_none_when_only_prefill_chunks_are_scheduled():
+    lane = FakeLane()
+    lane.requests = {"chunk": _structured_request(is_prefill_chunk=True)}
+    coordinator = _make_coordinator([lane])
+    recorded: list[list[str]] = []
+    coordinator.structured_output_manager = _recording_structured_output_manager(
+        recorded
+    )
+
+    assert coordinator.get_grammar_bitmask(_scheduled_output(["chunk"])) is None
+    assert recorded == []
+
+
 def test_update_from_output_routes_and_merges_per_lane():
     lane0 = FakeLane()
     lane1 = FakeLane()
@@ -276,6 +457,7 @@ def test_merge_combines_nonempty_lane_outputs():
     lane0.free_encoder_mm_hashes = ["h0"]
     lane0.preempted_req_ids = {"pre-0"}
     lane0.num_invalid_spec_tokens = {"a": 3}
+    set_tt_forced_reset_discard_counts(lane0, {"a": 1})
 
     lane1 = SchedulerOutput.make_empty()
     lane1.scheduled_new_reqs = ["new-b", "new-c"]
@@ -294,6 +476,7 @@ def test_merge_combines_nonempty_lane_outputs():
     lane1.finished_req_ids = {"fin-1"}
     lane1.free_encoder_mm_hashes = ["h1"]
     # lane1 reports no preemption and no invalid spec tokens.
+    set_tt_forced_reset_discard_counts(lane1, {"b": 2})
 
     merged = merge_lane_scheduler_outputs([lane0, lane1])
 
@@ -319,6 +502,7 @@ def test_merge_combines_nonempty_lane_outputs():
     # Optional fields reported by exactly one lane survive the merge.
     assert merged.preempted_req_ids == {"pre-0"}
     assert merged.num_invalid_spec_tokens == {"a": 3}
+    assert get_tt_forced_reset_discard_counts(merged) == {"a": 1, "b": 2}
 
 
 def test_merge_preserves_none_for_absent_optional_fields():
@@ -466,3 +650,44 @@ def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():
     # model sizing is left untouched (copied, not aliased/mutated).
     assert global_config.scheduler_config.max_num_seqs == 32
     assert per_lane_config.scheduler_config is not global_config.scheduler_config
+
+
+def _req(rid, client_index=0):
+    return SimpleNamespace(request_id=rid, client_index=client_index)
+
+
+@pytest.mark.parametrize(
+    "request_ids, expected_ids",
+    [
+        (None, ["a0", "a1", "b0"]),  # None -> every held request
+        (["a1", "b0", "gone"], ["a1", "b0"]),  # spans lanes; unheld id no-ops
+        ("a0", ["a0"]),  # single str id
+    ],
+)
+def test_finish_requests_returns_only_owned_no_duplicates(request_ids, expected_ids):
+    # Each lane returns only the requests it holds (a request lives in exactly one
+    # lane), so the coordinator's concatenation is the aborted set with no
+    # duplicates.
+    a0, a1, b0 = _req("a0", 0), _req("a1", 1), _req("b0", 0)
+    owned = {"a0": a0, "a1": a1, "b0": b0}
+    coordinator = _make_coordinator([FakeLane(owns=[a0, a1]), FakeLane(owns=[b0])])
+
+    aborted = coordinator.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+
+    assert aborted == [owned[i] for i in expected_ids]  # exact objects, in lane order
+    assert len({id(r) for r in aborted}) == len(aborted)  # no request returned twice
+
+
+def test_finish_requests_result_is_routable_per_client():
+    # The returned Requests must carry client_index so engine-core's
+    # _send_abort_outputs can notify each client. True end-to-end notification is
+    # covered device-side in tests/tt.
+    lanes = [FakeLane(owns=[_req("a", 0), _req("b", 1)]), FakeLane(owns=[_req("c", 0)])]
+    coordinator = _make_coordinator(lanes)
+
+    aborted = coordinator.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+
+    by_client = collections.defaultdict(set)
+    for r in aborted:
+        by_client[r.client_index].add(r.request_id)
+    assert by_client == {0: {"a", "c"}, 1: {"b"}}

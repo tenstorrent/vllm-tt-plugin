@@ -1,0 +1,99 @@
+name: Bug report
+description: Report a reproducible defect in the vLLM TT plugin.
+title: "[bug] "
+labels:
+  - "type:bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem.
+        Please take the time to fill in all required fields. Complete reports
+        help us reproduce and resolve issues faster.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: TL;DR
+      description: Summarize the problem and its impact in one or two sentences.
+      placeholder: The server fails to start with ... on ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Select the primary area affected by this issue.
+      options:
+        - Installation or plugin discovery
+        - Platform detection or configuration
+        - Performance
+        - Scheduling, batching, or async decode
+        - Multi-lane or data-parallel execution
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Explain the conditions that trigger the issue and any relevant context.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest command, request, or Python snippet that reproduces the problem.
+      placeholder: |
+        MESH_DEVICE=T3K python examples/server_example_tt.py --model <model>
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Current behavior
+      description: Include the observed response, output, traceback, or performance result.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: Describe the desired result or include a known-good output snippet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Fill in the versions and runtime configuration used for the reproduction.
+      value: |
+        Plugin version or commit:
+        vLLM version and build target:
+        TT-Metal commit:
+        OS and Python version:
+        Hardware and MESH_DEVICE:
+        Model and revision:
+        TT_VISIBLE_DEVICES, lane/DP settings, and relevant VLLM_* variables:
+        --additional-config:
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste the relevant logs or traceback.
+      render: shell
+    validations:
+      required: true

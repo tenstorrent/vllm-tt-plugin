@@ -48,10 +48,17 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    TTDecodeInterleavePolicy,
+    TTScheduler,
+    TTSchedulingMode,
+    get_tt_forced_reset_discard_counts,
+    set_tt_forced_reset_discard_counts,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorBase
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -73,6 +80,9 @@ class TTStepPlan:
     req_id_to_row: dict[str, int]
     batch_size_per_dp: tuple[int, ...]
     prefill_empty_slots: tuple[int, ...] | None
+    # Exact scheduler-owned layout transition for this step. Merely leaving a
+    # live request unscheduled does not count: lane rows stay stable.
+    decode_layout_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +155,7 @@ def merge_lane_scheduler_outputs(
     has_structured_output_requests = False
     pending_structured_output_tokens = False
     num_invalid_spec_tokens: dict[str, int] | None = None
+    forced_reset_discard_counts: dict[str, int] = {}
 
     for out in lane_outputs:
         scheduled_new_reqs.extend(out.scheduled_new_reqs)
@@ -204,9 +215,13 @@ def merge_lane_scheduler_outputs(
             if num_invalid_spec_tokens is None:
                 num_invalid_spec_tokens = {}
             num_invalid_spec_tokens.update(out.num_invalid_spec_tokens)
+        for req_id, count in get_tt_forced_reset_discard_counts(out).items():
+            forced_reset_discard_counts[req_id] = (
+                forced_reset_discard_counts.get(req_id, 0) + count
+            )
 
     total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-    return SchedulerOutput(
+    merged = SchedulerOutput(
         scheduled_new_reqs=scheduled_new_reqs,
         scheduled_cached_reqs=cached,
         num_scheduled_tokens=num_scheduled_tokens,
@@ -221,6 +236,8 @@ def merge_lane_scheduler_outputs(
         pending_structured_output_tokens=pending_structured_output_tokens,
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
+    set_tt_forced_reset_discard_counts(merged, forced_reset_discard_counts)
+    return merged
 
 
 class TTLaneCoordinator(SchedulerInterface):
@@ -265,8 +282,13 @@ class TTLaneCoordinator(SchedulerInterface):
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
-        # No KV connector on TT; surfaced for engine-core attribute access.
+        # No KV or encoder-cache connector on TT; EngineCore reads both.
         self.connector: KVConnectorBase_V1 | None = None
+        self.ec_connector: ECConnectorBase | None = None
+        # One policy for the whole step, not one per lane. Every lane executes
+        # the single negotiated mode, so per-lane instances would each see only
+        # their own lane's work and disagree about when to interleave.
+        self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -373,6 +395,16 @@ class TTLaneCoordinator(SchedulerInterface):
             has_partial_prefill or (has_waiting and ((not has_running) or has_capacity))
         )
 
+    def _has_running_decode(self) -> bool:
+        """Whether any lane holds a request a decode step can advance.
+
+        A partial-prefill continuation occupies ``running`` but samples no
+        token, so it does not qualify.
+        """
+        return any(
+            any(not r.is_prefill_chunk for r in sched.running) for sched in self.lanes
+        )
+
     def _negotiate_forced_mode(self) -> TTSchedulingMode:
         """Pick the single mode (prefill- or decode-only) all lanes will run.
 
@@ -380,8 +412,17 @@ class TTLaneCoordinator(SchedulerInterface):
         decode, so the lanes must agree. If *any* lane wants to prefill, the
         whole step is prefill-only; otherwise it is decode-only. Lanes without
         work for the chosen mode simply contribute an empty batch.
+
+        Decode interleaving is decided jointly for all lanes: the policy
+        overrides a prefill intent once a run of prefill steps reaches its
+        bound and some lane holds a decode that a decode step can advance.
         """
         intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
+        if intent == 1 and self._decode_interleave.wants_decode_step(
+            has_pending_prefill=True,
+            has_running_decode=self._has_running_decode(),
+        ):
+            return TTSchedulingMode.DECODE_ONLY
         return TTSchedulingMode.from_prefill_intent(intent)
 
     def _schedule_all_lanes(
@@ -456,8 +497,10 @@ class TTLaneCoordinator(SchedulerInterface):
         merged: SchedulerOutput,
         is_decode: bool,
     ) -> TTStepPlan:
+        decode_layout_changed = False
         lane_of_req = self._lane_of_scheduled_reqs(lane_outputs)
         for req_id in merged.finished_req_ids:
+            decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
 
@@ -473,10 +516,12 @@ class TTLaneCoordinator(SchedulerInterface):
         # step, so the row is free on both sides before anything is placed there.
         # ``preempted_req_ids`` is typed optional, hence the ``or ()``.
         for req_id in merged.preempted_req_ids or ():
+            decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
 
         resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
         for req_id in resumed_req_ids:
+            decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
 
         for req_id in merged.num_scheduled_tokens:
@@ -484,6 +529,7 @@ class TTLaneCoordinator(SchedulerInterface):
             if lane is None:
                 raise KeyError(f"no TT lane recorded for scheduled request {req_id!r}")
             self._req_to_lane[req_id] = lane
+            decode_layout_changed |= req_id not in self._req_to_row
             self._assign_slot(req_id, lane)
 
         scheduled_pairs = [
@@ -514,9 +560,11 @@ class TTLaneCoordinator(SchedulerInterface):
             req_id_to_row=dict(self._req_to_row),
             batch_size_per_dp=batch_size_per_dp,
             prefill_empty_slots=prefill_empty_slots,
+            decode_layout_changed=decode_layout_changed,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        prefill_intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
         forced_mode = self._negotiate_forced_mode()
         lane_outputs = self._schedule_all_lanes(forced_mode)
         merged = merge_lane_scheduler_outputs(lane_outputs)
@@ -545,6 +593,7 @@ class TTLaneCoordinator(SchedulerInterface):
             carried_finished = merged.finished_req_ids
             carried_free_encoder = merged.free_encoder_mm_hashes
             carried_preempted = merged.preempted_req_ids
+            carried_reset_discards = get_tt_forced_reset_discard_counts(merged)
             forced_mode = TTSchedulingMode.DECODE_ONLY
             lane_outputs = self._schedule_all_lanes(forced_mode)
             merged = merge_lane_scheduler_outputs(lane_outputs)
@@ -556,8 +605,18 @@ class TTLaneCoordinator(SchedulerInterface):
                 merged.preempted_req_ids = (
                     merged.preempted_req_ids or set()
                 ) | carried_preempted
+            if carried_reset_discards:
+                current_reset_discards = get_tt_forced_reset_discard_counts(merged)
+                for req_id, count in carried_reset_discards.items():
+                    current_reset_discards[req_id] = (
+                        current_reset_discards.get(req_id, 0) + count
+                    )
+                set_tt_forced_reset_discard_counts(merged, current_reset_discards)
 
         is_decode = forced_mode == TTSchedulingMode.DECODE_ONLY
+        self._decode_interleave.record_step(
+            is_decode=is_decode, prefill_pending=bool(prefill_intent)
+        )
         plan = self._build_step_plan(lane_outputs, merged, is_decode)
         _set_tt_step_state(merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan))
         return merged
@@ -569,13 +628,23 @@ class TTLaneCoordinator(SchedulerInterface):
         # requests (request IDs are globally unique). Row order within the
         # bitmask is irrelevant: the runner remaps rows back to batch positions
         # by request ID via reorder_grammar_bitmask_for_tt_batch.
+        #
+        # The merged flag is the union over the lanes, so a false value means no
+        # lane scheduled a constrained request and the per-step union below is
+        # pure waste.
+        if not scheduler_output.has_structured_output_requests:
+            return None
         requests: dict[str, Request] = {}
         for sched in self.lanes:
             requests.update(sched.requests)
+        # An intermediate chunked-prefill row samples no token, so it must not
+        # consume a bitmask row.
         structured_output_request_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
-            if (req := requests.get(req_id)) and req.use_structured_output
+            if (req := requests.get(req_id))
+            and req.use_structured_output
+            and not req.is_prefill_chunk
         ]
         if not structured_output_request_ids:
             return None
@@ -676,13 +745,15 @@ class TTLaneCoordinator(SchedulerInterface):
 
     def finish_requests(
         self,
-        request_ids: str | Iterable[str],
+        request_ids: str | Iterable[str] | None,
         finished_status: RequestStatus,
-    ) -> None:
+    ) -> list[Request]:
         # Broadcast to every lane; a lane no-ops for IDs it does not hold, so no
         # request->lane map is needed.
+        aborted: list[Request] = []
         for sched in self.lanes:
-            sched.finish_requests(request_ids, finished_status)
+            aborted.extend(sched.finish_requests(request_ids, finished_status))
+        return aborted
 
     # ------------------------------------------------------------------
     # SchedulerInterface: queries / lifecycle

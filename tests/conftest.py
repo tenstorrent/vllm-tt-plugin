@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # `TTPlatform.check_and_update_config` records its results on the class rather
 # than on the config it is handed, so one test that calls it configures every
@@ -13,6 +15,7 @@ _TT_PLATFORM_CONFIG_ATTRS = (
     "_standard_dp_mesh_grids",
     "sample_on_device_mode",
     "always_compat_sampling",
+    "_tt_vllm_config",
 )
 
 
@@ -20,14 +23,82 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.
+    import vllm.v1.engine.async_llm as async_llm
+    import vllm.v1.engine.core as engine_core
+    import vllm.v1.engine.input_processor as input_processor
+    from vllm.entrypoints.launchers.utils import server_utils
+
     from vllm_tt_plugin.platform import TTPlatform
+
+    saved_lifespan = server_utils.lifespan
+    saved_lifespan_aliases = {
+        name: module.lifespan
+        for name in ("vllm.entrypoints.launchers.app",)
+        if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
+    }
+    saved_empty_cache = torch.accelerator.empty_cache
 
     unset = object()
     saved = {
         name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
     }
+    saved_process_inputs = input_processor.InputProcessor.process_inputs
+    saved_original_process_inputs = input_processor.__dict__.get(
+        "_tt_original_process_inputs", unset
+    )
+    saved_add_streaming_input_request = async_llm.AsyncLLM._add_streaming_input_request
+    saved_original_add_streaming_input_request = async_llm.__dict__.get(
+        "_tt_original_add_streaming_input_request", unset
+    )
+    # The engine-core patches read the strict width accessor, so a wrapper
+    # leaked across tests raises for any config lacking the TT setup key.
+    saved_reset_prefix_cache = engine_core.EngineCore.reset_prefix_cache
+    saved_pause_scheduler = engine_core.EngineCore.pause_scheduler
+    saved_proc_pause_scheduler = engine_core.EngineCoreProc.pause_scheduler
+    saved_original_reset_prefix_cache = engine_core.__dict__.get(
+        "_tt_original_reset_prefix_cache", unset
+    )
+    saved_original_pause_scheduler = engine_core.__dict__.get(
+        "_tt_original_pause_scheduler", unset
+    )
 
     yield
+
+    server_utils.lifespan = saved_lifespan
+    for name in ("vllm.entrypoints.launchers.app",):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "lifespan"):
+            if name in saved_lifespan_aliases:
+                module.lifespan = saved_lifespan_aliases[name]
+            elif getattr(module.lifespan, "_tt_lifespan_gc_patch", False):
+                module.lifespan = saved_lifespan
+    torch.accelerator.empty_cache = saved_empty_cache
+
+    engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
+    engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
+    engine_core.EngineCoreProc.pause_scheduler = saved_proc_pause_scheduler
+    if saved_original_reset_prefix_cache is unset:
+        engine_core.__dict__.pop("_tt_original_reset_prefix_cache", None)
+    else:
+        engine_core._tt_original_reset_prefix_cache = saved_original_reset_prefix_cache
+    if saved_original_pause_scheduler is unset:
+        engine_core.__dict__.pop("_tt_original_pause_scheduler", None)
+    else:
+        engine_core._tt_original_pause_scheduler = saved_original_pause_scheduler
+
+    async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
+    if saved_original_add_streaming_input_request is unset:
+        async_llm.__dict__.pop("_tt_original_add_streaming_input_request", None)
+    else:
+        async_llm._tt_original_add_streaming_input_request = (
+            saved_original_add_streaming_input_request
+        )
+
+    input_processor.InputProcessor.process_inputs = saved_process_inputs
+    if saved_original_process_inputs is unset:
+        input_processor.__dict__.pop("_tt_original_process_inputs", None)
+    else:
+        input_processor._tt_original_process_inputs = saved_original_process_inputs
 
     for name, value in saved.items():
         if value is unset:
@@ -69,6 +140,7 @@ def vllm_config() -> SimpleNamespace:
             max_model_len=4,
             original_max_model_len=None,
             is_moe=False,
+            multimodal_config=None,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(

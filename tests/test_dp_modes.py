@@ -11,7 +11,9 @@ the DP-to-lanes conversion in ``test_galaxy_dp_conversion.py``.
 from types import SimpleNamespace
 
 import pytest
+import torch
 import ttnn
+from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 from vllm.v1.core.sched import interface as sched_interface
 
 from vllm_tt_plugin import worker
@@ -58,6 +60,23 @@ class TestDPModes:
 
             TTPlatform.check_and_update_config(vllm_config)
 
+    def test_image_normalization_stays_in_the_cpu_processor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        # vLLM >= 0.28 enables this for upstream Qwen2/2.5-VL.
+        vllm_config.model_config.multimodal_config = SimpleNamespace(
+            mm_device_do_normalize=True
+        )
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert (
+            vllm_config.model_config.multimodal_config.mm_device_do_normalize is False
+        )
+
     @pytest.mark.parametrize("original_max_model_len", [8192, -1, None])
     def test_check_and_update_config_never_rewrites_max_model_len(
         self,
@@ -87,22 +106,20 @@ class TestDPModes:
 
         assert worker_instance.model_config.max_model_len == 131_072
 
-    def test_upstream_dp_engine_core_is_default(
+    def test_engine_core_classes_are_left_to_upstream(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
+        # ``ParallelConfig`` accepts arbitrary attribute writes, so naming an
+        # engine-core class upstream does not define reads as configuration but
+        # does nothing. The plugin selects a worker and a scheduler; engine-core
+        # selection is upstream's.
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
-        assert (
-            vllm_config.parallel_config.engine_core_cls
-            == "vllm.v1.engine.core.EngineCore"
-        )
-        assert (
-            vllm_config.parallel_config.engine_core_proc_cls
-            == "vllm.v1.engine.core.EngineCoreProc"
-        )
+        assert not hasattr(vllm_config.parallel_config, "engine_core_cls")
+        assert not hasattr(vllm_config.parallel_config, "engine_core_proc_cls")
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
@@ -119,14 +136,8 @@ class TestDPModes:
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
-        assert (
-            vllm_config.parallel_config.engine_core_cls
-            == "vllm.v1.engine.core.EngineCore"
-        )
-        assert (
-            vllm_config.parallel_config.engine_core_proc_cls
-            == "vllm.v1.engine.core.EngineCoreProc"
-        )
+        assert not hasattr(vllm_config.parallel_config, "engine_core_cls")
+        assert not hasattr(vllm_config.parallel_config, "engine_core_proc_cls")
         assert (
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
@@ -150,7 +161,30 @@ class TestDPModes:
         assert warmup_calls == ["warmup"]
         assert timings.language_model >= 0.0
 
-    def test_single_host_standard_dp_uses_upstream_launcher(
+    @pytest.mark.parametrize("set_by_vllm", [True, False])
+    def test_warmup_drops_vllm_sized_worker_threads(
+        self, monkeypatch: pytest.MonkeyPatch, set_by_vllm: bool
+    ) -> None:
+        worker = TTWorker.__new__(TTWorker)
+        worker.enable_model_warmup = False
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        if set_by_vllm:
+            monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
+        else:
+            monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
+        threads = [4]
+
+        def set_num_threads(n: int) -> None:
+            threads[0] = n
+
+        monkeypatch.setattr(torch, "get_num_threads", lambda: threads[0])
+        monkeypatch.setattr(torch, "set_num_threads", set_num_threads)
+
+        TTWorker.compile_or_warm_up_model(worker)
+
+        assert threads == [1 if set_by_vllm else 4]
+
+    def test_single_host_standard_dp_leaves_the_launcher_to_upstream(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
@@ -165,10 +199,7 @@ class TestDPModes:
             visible_device_groups=["24,25", "26,27", "3,2", "1,0"],
         )
 
-        assert (
-            vllm_config.parallel_config.engine_core_launcher_cls
-            == "vllm.v1.engine.utils.CoreEngineLauncher"
-        )
+        assert not hasattr(vllm_config.parallel_config, "engine_core_launcher_cls")
         assert TTPlatform._standard_dp_visible_device_groups == [
             "24,25",
             "26,27",
@@ -176,13 +207,43 @@ class TestDPModes:
             "1,0",
         ]
 
-    def test_rank_binding_keeps_tt_launcher(
+    @pytest.mark.parametrize(
+        ("tt_config", "parallel_overrides"),
+        [
+            ({"rank_binding": "/tmp/rank_binding.yaml"}, {}),
+            ({"mpi_args": "--host hostA"}, {}),
+            ({}, {"nnodes": 2}),
+            ({}, {"node_rank": 1}),
+        ],
+    )
+    def test_explicit_tt_launch_is_rejected_without_the_launcher_hook(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+        tt_config: dict,
+        parallel_overrides: dict,
+    ) -> None:
+        # Upstream vLLM defines no ``engine_core_launcher_cls``, and writing one
+        # anyway is silently ignored, which would quietly single-host a run the
+        # user asked to spread over several nodes. Every explicit-MPI trigger
+        # (rank_binding, mpi_args, nnodes > 1, node_rank > 0) must fail fast.
+        vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.additional_config = {"tt": tt_config}
+        for key, value in parallel_overrides.items():
+            setattr(vllm_config.parallel_config, key, value)
+
+        with pytest.raises(NotImplementedError, match="engine-core launcher hook"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+    def test_rank_binding_selects_the_tt_launcher_when_the_hook_exists(
         self,
         monkeypatch: pytest.MonkeyPatch,
         vllm_config: SimpleNamespace,
         dummy_model_class: type,
     ) -> None:
         vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.parallel_config.engine_core_launcher_cls = "auto"
         vllm_config.additional_config = {
             "tt": {"rank_binding": "/tmp/rank_binding.yaml"}
         }
@@ -215,9 +276,11 @@ class TestDPModes:
 
         assert assigned_devices == [mesh_device]
 
+    @pytest.mark.parametrize("declares_fabric", [False, True])
     def test_init_device_tracks_mesh_as_worker_device(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        declares_fabric: bool,
     ) -> None:
         mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
         model_runner = SimpleNamespace()
@@ -236,17 +299,50 @@ class TestDPModes:
         # WorkerBase aliases the field; keep the test's view identical.
         worker_instance.parallel_config = parallel_config
         worker_instance.device_config = SimpleNamespace(device=None)
+        worker_instance.model_config = SimpleNamespace()
         worker_instance.trace_mode = "all"
         worker_instance.enable_model_warmup = True
 
         monkeypatch.setattr(TTPlatform, "check_and_update_config", lambda _cfg: None)
         monkeypatch.setattr(worker, "get_tt_config", lambda _cfg: {})
-        monkeypatch.setattr(
-            worker,
-            "open_mesh_device",
-            lambda _tt_config, _trace_mode, _local_dp_rank: mesh_device,
+        fabric_config = (
+            {"config": worker.ttnn.FabricConfig.FABRIC_1D_RING}
+            if declares_fabric
+            else None
         )
-        monkeypatch.setattr(worker, "TTModelRunner", lambda **_kwargs: model_runner)
+        model_class = SimpleNamespace()
+        if declares_fabric:
+            model_class.model_capabilities = {"fabric_config": fabric_config}
+        monkeypatch.setattr(
+            worker, "get_model_architecture", lambda _cfg: (model_class, "model")
+        )
+
+        def open_mesh(_tt_config, _trace_mode, _local_dp_rank, *, model_fabric_config):
+            assert model_fabric_config is fabric_config
+            return mesh_device
+
+        monkeypatch.setattr(worker, "open_mesh_device", open_mesh)
+
+        # The KV pool is sized and --max-model-len settled during init_device so
+        # the model sees the fitted length when load_model runs next.
+        steps: list[str] = []
+
+        def size_pool(_cfg, _num_devices):
+            steps.append("size")
+            return 7
+
+        def fit_max_model_len(_cfg, _num_tt_blocks):
+            steps.append("fit")
+
+        def build_runner(**_kwargs):
+            steps.append("runner")
+            return model_runner
+
+        monkeypatch.setattr(worker, "get_num_available_blocks_tt", size_pool)
+        monkeypatch.setattr(
+            worker, "_fit_block_output_max_model_len", fit_max_model_len
+        )
+        monkeypatch.setattr(worker, "TTModelRunner", build_runner)
 
         try:
             TTWorker.init_device(worker_instance)
@@ -255,6 +351,8 @@ class TestDPModes:
             assert worker_instance.device is mesh_device
             assert worker_instance.device_config.device is mesh_device
             assert worker_instance.model_runner is model_runner
+            assert steps == ["size", "fit", "runner"]
+            assert worker_instance._num_tt_blocks == 7
         finally:
             # The test double cannot be passed to TT device cleanup.
             worker_instance.mesh_device = None

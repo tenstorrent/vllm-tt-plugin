@@ -12,7 +12,11 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import (
+    OMP_NUM_THREADS_SET_BY_VLLM,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    set_torch_threads_for_runtime,
+)
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_uniform_page_size,
@@ -24,34 +28,25 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.worker.worker_base import WorkerBase
-
-from vllm_tt_plugin.logger import init_tt_logger
-
-try:
-    # Newer vLLM has compile_or_warm_up_model return per-worker timings, which
-    # the executor reduces into compilation_config. Older vLLM lacks the type;
-    # fall back to a local definition so the return value is still well-formed.
-    from vllm.v1.worker.worker_base import CompilationTimes
-except ImportError:  # pragma: no cover - older vLLM without the timing contract
-    from typing import NamedTuple
-
-    class CompilationTimes(NamedTuple):
-        language_model: float
-        encoder: float
-
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
+    get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    is_tt_block_output_model,
 )
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
+    _TT_TOKEN_TILE_SIZE,
     TTPlatform,
     _load_standard_dp_visible_groups,
+    _min_block_output_max_model_len,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
@@ -62,6 +57,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.outputs import DraftTokenIds
 
 logger = init_tt_logger(__name__)
 
@@ -75,11 +71,10 @@ register_tt_models(register_test_models=_should_pre_register_tt_test_models_from
 def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
     """Bind ``TT_VISIBLE_DEVICES`` to this rank's device group.
 
-    As of vLLM v0.24, the engine-core launcher writes
-    ``parallel_config.assigned_physical_gpu_ids`` instead of exporting a
-    per-rank env var. tt-metal reads only the env var, so the worker
-    materializes it here; otherwise every rank keeps the launcher's value and
-    they share chips.
+    The engine-core launcher writes ``parallel_config.assigned_physical_gpu_ids``
+    rather than exporting a per-rank env var. tt-metal reads only the env var, so
+    the worker materializes it here; otherwise every rank keeps the launcher's
+    value and they share chips.
 
     Standard-DP discovery owns the rank-to-submesh topology. A nonempty
     assignment must agree with the discovered group for the local rank. MPI
@@ -206,6 +201,7 @@ class TTWorker(WorkerBase):
 
         # Initialized by init_device
         self.mesh_device = None
+        self._num_tt_blocks: int | None = None
 
         # Whether to use ttnn tracing for model execution
         tt_config = get_tt_config(self.vllm_config)
@@ -248,13 +244,33 @@ class TTWorker(WorkerBase):
             os.environ.get(TTPlatform.device_control_env_var),
             os.environ.get("MESH_DEVICE"),
         )
+        model_class, _ = get_model_architecture(self.model_config)
+        model_capabilities = getattr(model_class, "model_capabilities", None) or {}
         self.mesh_device = open_mesh_device(
-            get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+            get_tt_config(self.vllm_config),
+            self.trace_mode,
+            local_dp_rank,
+            model_fabric_config=model_capabilities.get("fabric_config"),
         )
         self.device = self.mesh_device
         self.device_config.device = self.mesh_device
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
+
+        # Size the KV pool and settle --max-model-len here, not in
+        # determine_available_memory: upstream runs the whole executor init
+        # (init_device, then load_model) before it asks for available memory
+        # (EngineCore.__init__ -> _initialize_kv_caches), so a model that sizes
+        # its own KV state at load time would otherwise see the unfitted
+        # length -- for --max-model-len -1 that is the full HF context.
+        # The count is cached rather than recomputed later because
+        # get_max_tokens_all_users derives the budget from max_model_len,
+        # which the fit below may have shrunk.
+        self._num_tt_blocks = get_num_available_blocks_tt(
+            self.vllm_config, self.num_devices
+        )
+        _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
+
         # Init ModelRunner here, so that we have access to self.mesh_device.
         self.model_runner: TTModelRunner = TTModelRunner(
             vllm_config=self.vllm_config,
@@ -267,8 +283,22 @@ class TTWorker(WorkerBase):
     def load_model(self):
         self.model_runner.load_model()
 
+    def take_draft_token_ids(self) -> "DraftTokenIds | None":
+        """Hand the runner's proposed drafts to the engine.
+
+        ``EngineCore`` calls this on every step of a speculative run and there
+        is no base implementation, so without it a launch that passes
+        admission raises ``AttributeError`` on its first step.
+        """
+        return self.model_runner.take_draft_token_ids()
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        # TT cache setup handles only LBNHC's per-group packing; it is also
+        # block-compact, so models with mixed KV shapes still resolve to it.
+        return [KVCacheLayout.LBNHC.name]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -395,12 +425,17 @@ class TTWorker(WorkerBase):
         in conjunction with the output of get_kv_cache_spec to determine
         the number of kv cache blocks (total memory / page_size / num layers).
 
-        NOTE: TT does not profile device memory yet. Instead, it computes the target
-              TT KV block count, then returns a synthetic byte budget that makes the
-              upstream KV planner reconstruct that same block count in the engine
-              process.
+        NOTE: TT does not profile device memory yet. ``init_device`` computed the
+              target TT KV block count before the model loaded; this returns a
+              synthetic byte budget that makes the upstream KV planner
+              reconstruct that same block count in the engine process.
         """
-        num_tt_blocks = get_num_available_blocks_tt(self.vllm_config, self.num_devices)
+        if self._num_tt_blocks is None:
+            raise RuntimeError(
+                "The TT KV pool has not been sized; determine_available_memory "
+                "ran before init_device"
+            )
+        num_tt_blocks = self._num_tt_blocks
         kv_cache_spec = self.get_kv_cache_spec()
         self.cache_config.num_gpu_blocks_override = num_tt_blocks
         return _available_kv_cache_memory_bytes_for_num_blocks(
@@ -417,11 +452,6 @@ class TTWorker(WorkerBase):
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        # Cache is already initialized in initialize_from_config.
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
         # auto-fit reduces max_model_len to the KV cache capacity.
@@ -434,18 +464,21 @@ class TTWorker(WorkerBase):
         self.model_config.max_model_len = max_model_len
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        # Newer vLLM reduces per-worker timings returned here into
-        # compilation_config.compilation_time; older vLLM ignores the return.
-        # TT does device warmup rather than graph compilation, so report the
-        # warmup wall time as the language-model figure and zero for the
-        # (absent) encoder phase.
+        # The executor reduces per-worker timings returned here into
+        # compilation_config.compilation_time. TT does device warmup rather than
+        # graph compilation, so report the warmup wall time as the language-model
+        # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return CompilationTimes(language_model=0.0, encoder=0.0)
+            elapsed = 0.0
+        else:
+            start = time.perf_counter()
+            self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
 
-        start = time.perf_counter()
-        self.model_runner.warmup_model()
-        elapsed = time.perf_counter() - start
+        # vLLM sizes multiproc workers' torch threads for startup only.
+        if os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) == "1":
+            set_torch_threads_for_runtime()
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 
@@ -453,7 +486,7 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Run the device forward for a non-DP or lane-DP step.
+        """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None``: the forward leaves a pending sampler that the engine
         finalizes via ``sample_tokens``. The runner dispatches plain
@@ -481,14 +514,48 @@ class TTWorker(WorkerBase):
         # Worker will always be healthy as long as it's running.
         return
 
+    def shutdown(self) -> None:
+        """Release model-owned captures and close the mesh before exit.
+
+        This is the hook upstream guarantees on every orderly shutdown path:
+        EngineCore's SIGTERM/SIGINT handler ends run_busy_loop and the
+        surrounding ``finally`` reaches ``executor.shutdown()`` even on fatal
+        errors. ``__del__`` alone is not guaranteed at interpreter exit, and a
+        mesh left open wedges the board's ethernet cores for the *next*
+        process ("Timed out while waiting for active ethernet core ... Try
+        resetting the board").
+        """
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            runner.shutdown()
+        mesh_device = getattr(self, "mesh_device", None)
+        if mesh_device is not None:
+            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            # Idempotence: __del__ (and a second shutdown call) must not
+            # close the mesh again.
+            self.mesh_device = None
+        # Release the process-level admission handle when it points at this
+        # engine's config, so an in-process successor engine is admitted
+        # without waiting for garbage collection to clear the weakref.
+        vllm_config = getattr(self, "vllm_config", None)
+        if (
+            vllm_config is not None
+            and TTPlatform._resolve_tt_admission_handle() is vllm_config
+        ):
+            TTPlatform._tt_vllm_config = None
+
     # ---- Destructor (used to close devices) ----
 
     def __del__(self):
-        # Delete model runner first in case there are model artifacts
+        # Delete model runner first in case there are model artifacts.
+        # Separate suppress blocks: init_device raises between opening the
+        # mesh and assigning model_runner (sizing validation), and a missing
+        # model_runner must not short-circuit closing the open mesh.
         with suppress(AttributeError):
             # attributes may be already torn down when destructor is called
             del self.model_runner
 
+        with suppress(AttributeError):
             if self.mesh_device:
                 close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
                 del self.mesh_device
@@ -501,6 +568,12 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     """
     Used to set the number of available blocks for the TT KV cache as we
     currently do not run profiling to determine available memory.
+
+    Pure sizing query: validates the budget (raising when a block-output pool
+    cannot hold an explicitly configured ``max_model_len`` plus one canvas) but
+    never mutates the config; the ``--max-model-len -1`` fit, and the
+    servability check on the length it writes, live in
+    ``_fit_block_output_max_model_len``.
 
     ``num_devices`` is the runtime-discovered physical device count.
     """
@@ -545,9 +618,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # endregion
 
     # To fit a max batch with (max_tokens_all_users / max batch) per user,
-    # allocate an extra block_size per user since vLLM uses a worst-case
-    # heuristic and assumes each touched block will require a new
-    # allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.
+    # allocate one worst-case output reservation per user. AR models need one
+    # extra cache block; block-output models commit their entire output canvas
+    # atomically and therefore need at least one full canvas of headroom.
     #
     # ``num_blocks`` is applied to each submesh KV cache un-divided, so the
     # padding must use the *per-lane/per-rank* batch -- the number of requests
@@ -557,7 +630,9 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # Both reduce to the same per-submesh value, keeping the KV shape identical
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
-    max_tokens_all_users += cache_config.block_size * max_batch
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    per_user_output_reservation = max(cache_config.block_size, output_tokens_per_step)
+    max_tokens_all_users += per_user_output_reservation * max_batch
 
     # Hybrid attention models (Gemma3/4, GPT-OSS, ...) normally split layers
     # into multiple kv_cache_groups: a full-attention group plus several
@@ -592,8 +667,73 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+    if is_tt_block_output_model(vllm_config):
+        resolved_kv_tokens = num_tt_blocks * cache_config.block_size
+        required_kv_tokens = model_config.max_model_len + output_tokens_per_step
+        # ``--max-model-len -1`` asked for whatever the pool allows, so a pool
+        # this length does not fit is not an error yet: the fit that follows
+        # shrinks the length and validates what it writes.
+        if (
+            resolved_kv_tokens < required_kv_tokens
+            and getattr(model_config, "original_max_model_len", None) != -1
+        ):
+            raise ValueError(
+                "Block-output KV budget is too small: resolved "
+                f"{resolved_kv_tokens} tokens, but max_model_len="
+                f"{model_config.max_model_len} plus output_tokens_per_step="
+                f"{output_tokens_per_step} requires at least "
+                f"{required_kv_tokens}. Fix the model's "
+                "get_max_tokens_all_users budget."
+            )
 
     return num_tt_blocks
+
+
+def _fit_block_output_max_model_len(
+    vllm_config: VllmConfig, num_tt_blocks: int
+) -> None:
+    """Fit ``--max-model-len -1`` to the block-output KV pool.
+
+    Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
+    (vllm/v1/core/kv_cache_utils.py:2092): the TT pool is a fixed budget
+    rather than profiled memory, and the upstream fit would hand the whole
+    pool to ``max_model_len``, while a block-output request also needs one
+    full output canvas of headroom. The engine snapshots ``max_model_len``
+    only after ``determine_available_memory`` returns
+    (``EngineCore._initialize_kv_caches``), so upstream's fit sees the
+    fitted value as its baseline and, since it only ever shrinks, keeps it.
+
+    Also owns the servability check for the fitted length: the sizing query
+    deliberately lets an oversized ``-1`` request through, so this is where a
+    pool too small to hold a prompt tile plus a canvas is rejected.
+    """
+    model_config = vllm_config.model_config
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    auto_fit_requested = getattr(model_config, "original_max_model_len", None) == -1
+    if not auto_fit_requested or not is_tt_block_output_model(vllm_config):
+        return
+    resolved_kv_tokens = num_tt_blocks * vllm_config.cache_config.block_size
+    fitted_max_model_len = resolved_kv_tokens - output_tokens_per_step
+    if fitted_max_model_len >= model_config.max_model_len:
+        return
+    min_max_model_len = _min_block_output_max_model_len(output_tokens_per_step)
+    if fitted_max_model_len < min_max_model_len:
+        raise ValueError(
+            "Block-output KV budget is too small to auto-fit --max-model-len: "
+            f"the pool holds {resolved_kv_tokens} tokens, leaving "
+            f"max_model_len={fitted_max_model_len} after reserving one "
+            f"{output_tokens_per_step}-token output canvas, but serving a "
+            f"request also needs a {_TT_TOKEN_TILE_SIZE}-token prompt tile, so "
+            f"max_model_len must be at least {min_max_model_len}. Raise the "
+            "model's get_max_tokens_all_users budget."
+        )
+    logger.info(
+        "Auto-fitting block-output max_model_len from %d to %d so "
+        "the KV budget covers one full output canvas.",
+        model_config.max_model_len,
+        fitted_max_model_len,
+    )
+    model_config.max_model_len = fitted_max_model_len
 
 
 # TT-NN utilities
@@ -621,26 +761,25 @@ def get_fabric_config(tt_config, num_devices):
         # Ignore any explicit fabric request for single-device meshes.
         return None
 
-    # Set the most common value as default
-    is_6u = ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
-    fabric_config = (
-        ttnn.FabricConfig.FABRIC_1D_RING if is_6u else ttnn.FabricConfig.FABRIC_1D
-    )
+    # Wormhole Galaxy (6U) uses a 1D ring. Blackhole Galaxy needs a 2D torus:
+    # column-axis collectives have no wraparound path on 1D fabrics.
+    cluster_type = ttnn.cluster.get_cluster_type()
+    if cluster_type == ttnn.cluster.ClusterType.BLACKHOLE_GALAXY:
+        fabric_config = ttnn.FabricConfig.FABRIC_2D_TORUS_XY
+    elif cluster_type == ttnn.cluster.ClusterType.GALAXY:
+        fabric_config = ttnn.FabricConfig.FABRIC_1D_RING
+    else:
+        fabric_config = ttnn.FabricConfig.FABRIC_1D
 
-    # Override fabric_config if specified in TT plugin config.
+    # Override fabric_config if specified in TT plugin config. Resolve the name
+    # from ttnn.FabricConfig so newly added fabrics (e.g. FABRIC_2D_TORUS_XY)
+    # work without a plugin allow-list update.
     if tt_config is not None and "fabric_config" in tt_config:
         fabric_config_str = tt_config["fabric_config"]
-        fabric_config_map = {
-            "DISABLED": ttnn.FabricConfig.DISABLED,
-            "FABRIC_1D": ttnn.FabricConfig.FABRIC_1D,
-            "FABRIC_1D_RING": ttnn.FabricConfig.FABRIC_1D_RING,
-            "FABRIC_2D": ttnn.FabricConfig.FABRIC_2D,
-            "CUSTOM": ttnn.FabricConfig.CUSTOM,
-        }
-        fabric_config = fabric_config_map.get(fabric_config_str)
+        fabric_config = ttnn.FabricConfig.__members__.get(fabric_config_str)
         assert fabric_config is not None, (
             f"Invalid fabric_config: {fabric_config_str}. "
-            f"Expected one of {list(fabric_config_map.keys())}."
+            f"Expected one of {list(ttnn.FabricConfig.__members__)}."
         )
     return fabric_config
 
@@ -662,20 +801,24 @@ def get_reliability_mode(tt_config):
     return reliability_mode
 
 
-# From tt-metal/conftest.py:
-# Set fabric config to passed in value
-# Do nothing if not set
-# Must be called before creating the mesh device
-def set_fabric(tt_config, num_devices):
-    fabric_config = get_fabric_config(tt_config, num_devices)
-    if fabric_config:
-        reliability_mode = get_reliability_mode(tt_config)
-        logger.info(
-            "Setting fabric config: %s, reliability mode: %s",
-            fabric_config,
-            reliability_mode,
-        )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+def set_fabric(tt_config, num_devices, model_fabric_config=None):
+    """Apply hardware defaults, model defaults, then explicit launch overrides."""
+    if num_devices == 1:
+        return
+
+    fabric_kwargs = {
+        "config": get_fabric_config(None, num_devices),
+        "reliability_mode": get_reliability_mode(None),
+    }
+    if model_fabric_config is not None:
+        fabric_kwargs = {**fabric_kwargs, **model_fabric_config}
+    if tt_config and "fabric_config" in tt_config:
+        fabric_kwargs["config"] = get_fabric_config(tt_config, num_devices)
+    if tt_config and "fabric_reliability_mode" in tt_config:
+        fabric_kwargs["reliability_mode"] = get_reliability_mode(tt_config)
+
+    logger.info("Setting fabric config: %s", fabric_kwargs)
+    ttnn.set_fabric_config(**fabric_kwargs)
 
 
 # From tt-metal/conftest.py:
@@ -734,7 +877,9 @@ def get_mesh_grid(*args: Any, **kwargs: Any):
     return mesh_grid
 
 
-def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
+def open_mesh_device(
+    tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
+):
     mesh_grid = get_mesh_grid()
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
@@ -742,7 +887,7 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
     # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested)
+    set_fabric(tt_config, num_devices_requested, model_fabric_config)
 
     mesh_device = ttnn.open_mesh_device(
         ttnn.MeshShape(*mesh_grid),
