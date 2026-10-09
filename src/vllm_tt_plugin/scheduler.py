@@ -767,13 +767,16 @@ class TTScheduler(AsyncScheduler):
 
         Chunks that finish the prompt, decode steps and multimodal prompts are
         left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request never gets an empty chunk.
+        the next step; a running request that cannot reach the grid ends its
+        chunk on a KV block instead, and waits a step if that is empty too.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if align <= 1 or num_new_tokens <= 0:
             return num_new_tokens
         end = start + num_new_tokens
-        if end >= request.num_prompt_tokens:
+        # A request resumed from preemption replays its output tokens too, so
+        # only a chunk that reaches the end of the sequence is the last one.
+        if end >= request.num_tokens:
             return num_new_tokens
         if getattr(request, "mm_features", None) or getattr(
             request, "has_encoder_inputs", False
@@ -782,7 +785,12 @@ class TTScheduler(AsyncScheduler):
         aligned_end = end // align * align
         if aligned_end <= start:
             if start != 0:
-                return num_new_tokens
+                # The next chunk resumes where this one ends, and the model
+                # takes a resume offset only on a KV block boundary. A running
+                # request whose chunk cannot reach the grid still ends on a
+                # block, or waits for the next step's budget.
+                block = self.block_size
+                return max(end // block * block - start, 0)
             # A new request waits only when this step's leftover budget is what
             # stopped it. If a full step could not reach the grid either (a
             # permanent cap below the alignment), it must still make progress.
