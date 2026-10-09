@@ -3296,6 +3296,10 @@ class TTModelRunner:
         if max_lp is not None:
             if num_devices not in (8, 32):
                 return False
+            # A model whose warmup does not build the logprobs program variants
+            # declines them; its logprobs requests then sample on host.
+            if not self.model.model_capabilities.get("supports_device_logprobs", True):
+                return False
             if max_lp > 0 and not self.supports_topk_logprobs:
                 return False
 

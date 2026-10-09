@@ -536,3 +536,27 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     )
     expected = not (has_penalties and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+@pytest.mark.parametrize("declared", [None, True, False])
+@pytest.mark.parametrize("max_num_logprobs", [None, 0])
+def test_device_logprobs_follow_model_capability(declared, max_num_logprobs):
+    capabilities = {} if declared is None else {"supports_device_logprobs": declared}
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=8,
+        tt_data_parallel_size=1,
+        supports_topk_logprobs=False,
+        model=SimpleNamespace(model_capabilities=capabilities),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            max_num_logprobs=max_num_logprobs,
+            sampling=SimpleNamespace(
+                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            ),
+        ),
+    )
+    expected = not (max_num_logprobs is not None and declared is False)
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
