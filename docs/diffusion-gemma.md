@@ -22,7 +22,7 @@ separate from [generic speculative decoding](SPEC_DECODE_CONTRACT.md):
 
 Follow [Environment Setup in the main README](../README.md#environment-setup):
 activate the tt-metal environment, then run `source docs/install-vllm-tt.sh`
-to install the pinned vLLM 0.31.0 build and this plugin.
+to install the pinned vLLM 0.30.0 build and this plugin.
 
 ## Launch
 
@@ -54,7 +54,7 @@ python -m vllm.entrypoints.openai.api_server \
 ```
 
 DiffusionGemma uses the `gemma4` reasoning and tool parsers shipped by vLLM
-0.31.0. The plugin does not override or alias upstream parser names. For tool
+0.30.0. The plugin does not override or alias upstream parser names. For tool
 calling add `--enable-auto-tool-choice --tool-call-parser gemma4`.
 
 `--max-num-batched-tokens` concerns scheduler prompt admission. It does not
