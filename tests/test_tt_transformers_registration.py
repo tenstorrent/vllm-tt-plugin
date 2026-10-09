@@ -223,8 +223,8 @@ def test_class_capabilities_drive_the_config_hook(
     arch: str, monkeypatch: pytest.MonkeyPatch, vllm_config
 ):
     """The registered class is read before the model exists: it must keep
-    prefix caching, async decode and on-device sampling, and turn chunked
-    prefill off, for every architecture it serves."""
+    prefix caching, async decode and on-device sampling, and chunked prefill
+    exactly as the class declares it, for every architecture it serves."""
     pytest.importorskip("tt_transformers.vllm_registry")
     from vllm_tt_plugin.platform import TTPlatform
 
@@ -243,13 +243,15 @@ def test_class_capabilities_drive_the_config_hook(
     )
     vllm_config.model_config.hf_config.architectures = [arch.removeprefix("TT")]
     vllm_config.scheduler_config.enable_chunked_prefill = True
+    vllm_config.scheduler_config.long_prefill_token_threshold = 0
     vllm_config.scheduler_config.async_scheduling = True
     vllm_config.cache_config.enable_prefix_caching = True
     vllm_config.additional_config = {"tt": {"sample_on_device_mode": "all"}}
 
     TTPlatform.check_and_update_config(vllm_config)
 
-    assert vllm_config.scheduler_config.enable_chunked_prefill is False
+    declared = model_class.model_capabilities.get("supports_chunked_prefill", False)
+    assert vllm_config.scheduler_config.enable_chunked_prefill is declared
     assert vllm_config.cache_config.enable_prefix_caching is True
     assert vllm_config.scheduler_config.async_scheduling is True
     assert TTPlatform.sample_on_device_mode == "all"
