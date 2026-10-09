@@ -32,6 +32,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -291,7 +292,7 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert b.occupied_rows() == []
 
 
-def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
@@ -320,12 +321,21 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
         _block_tables_per_layer=lambda _: None,
         check_perform_device_sampling=lambda **_: True,
+        _output_tokens_per_step=1,
         model_config=SimpleNamespace(is_multimodal_model=False),
         requests={"request": request},
     )
 
+    logged: list[str] = []
+    monkeypatch.setattr(
+        input_batch_module,
+        "logger",
+        SimpleNamespace(info=lambda msg, *args: logged.append(msg % args)),
+    )
+
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
 
+    assert logged == ["Prefill chunk for request request: tokens [2, 3) of 8."]
     assert model_input.input_positions.tolist() == [2]
     assert model_input.prompt_lens.tolist() == [3]
     assert model_input.input_tokens.tolist() == [[0, 1, 2]]
@@ -952,6 +962,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         model_config=SimpleNamespace(is_multimodal_model=False, logits_processors=[]),
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
         _decode_layout_changed_since_last_decode=False,
+        _output_tokens_per_step=1,
         _block_tables_per_layer=lambda _: None,
         requests={"prompt": prompt, "waiting": waiting},
     )

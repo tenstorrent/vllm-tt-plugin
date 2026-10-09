@@ -24,6 +24,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTCompactedHostLogits,
@@ -44,6 +45,8 @@ if TYPE_CHECKING:
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
     from vllm_tt_plugin.model_runner import TTModelRunner
 
+logger = init_tt_logger(__name__)
+
 # Sentinel value for None seed. vLLM treats -1 as equivalent to None
 # (see SamplingParams.__post_init__), so we use -1 as the sentinel.
 SEED_NONE_SENTINEL = -1
@@ -53,6 +56,53 @@ SEED_NONE_SENTINEL = -1
 # Can't use -1 because SamplingParams.logprobs=-1 means "all vocab logprobs".
 # although -1 gets remapped before writing to SamplingInputBatch.num_logprobs
 LOGPROBS_NONE_SENTINEL = -2
+
+
+def log_prefill_chunks(
+    input_batch,
+    req_indices,
+    input_positions: np.ndarray,
+    prompt_lens: np.ndarray,
+    intermediate_prefill_mask: torch.Tensor,
+    cached_reqs,
+    output_tokens_per_step: int,
+) -> None:
+    """Log one line per scheduled chunk of a prefill that runs in parts.
+
+    Neither vLLM's /metrics nor its iteration stats show that a prompt was
+    split: an intermediate chunk emits no token. This line is the per-request
+    evidence that chunked prefill ran. A row is a chunk of a split prefill when
+    it stops short of the sequence end (an intermediate chunk), or when it is
+    a running request that resumes prefill work mid-way (a continuation,
+    including the final chunk). Prefill work is what
+    ``TTModelRunner._prepare_model_inputs`` counts: an uncomputed prompt token,
+    or, in a replay after preemption, more than one step's output uncomputed.
+    A decode row has exactly one step's output left. A prefix-cache hit on a
+    new request starts mid-prompt too, but is not a continuation and is not
+    logged.
+    """
+    continuing = set(cached_reqs.req_ids) - set(cached_reqs.resumed_req_ids)
+    for i, row in enumerate(req_indices):
+        req_id = input_batch.req_ids[row]
+        start = int(input_positions[i])
+        intermediate = bool(intermediate_prefill_mask[i])
+        continuation = (
+            req_id in continuing
+            and start > 0
+            and (
+                start < input_batch.num_prompt_tokens[row]
+                or start + output_tokens_per_step < input_batch.num_tokens[row]
+            )
+        )
+        if intermediate or continuation:
+            logger.info(
+                "Prefill chunk for request %s: tokens [%d, %d) of %d%s.",
+                req_id,
+                start,
+                int(prompt_lens[i]),
+                int(input_batch.num_tokens[row]),
+                "" if intermediate else ", final",
+            )
 
 
 @dataclass
@@ -1364,6 +1414,15 @@ class TTLaneInputBatch(InputBatch):
         prompt_lens = input_positions_np + chunk_lens
         intermediate_prefill_mask = torch.from_numpy(
             prompt_lens < lane_batch.num_tokens[rows_np]
+        )
+        log_prefill_chunks(
+            lane_batch,
+            rows,
+            input_positions_np,
+            prompt_lens,
+            intermediate_prefill_mask,
+            scheduler_output.scheduled_cached_reqs,
+            runner._output_tokens_per_step,
         )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]

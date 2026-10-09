@@ -63,6 +63,7 @@ from vllm_tt_plugin.input_batch import (
     apply_cached_req_state_update,
     build_cached_request_state,
     clone_torch_generator,
+    log_prefill_chunks,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -2120,6 +2121,15 @@ class TTModelRunner:
             prompt_lens = input_positions + chunk_lens
             intermediate_prefill_mask = torch.from_numpy(
                 prompt_lens < input_batch.num_tokens[req_indices]
+            )
+            log_prefill_chunks(
+                input_batch,
+                req_indices,
+                input_positions,
+                prompt_lens,
+                intermediate_prefill_mask,
+                cached_reqs,
+                self._output_tokens_per_step,
             )
             max_prefill_tokens = int(prompt_lens.max())
             input_tokens = input_batch.token_ids_cpu_tensor[

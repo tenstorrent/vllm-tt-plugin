@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -19,6 +20,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
@@ -265,6 +267,112 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
 
 
 # endregion Prefill classification
+
+
+class _RecordingLogger:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def info(self, msg: str, *args) -> None:
+        self.lines.append(msg % args)
+
+
+@pytest.fixture
+def chunk_log(monkeypatch) -> list[str]:
+    """Lines the runner logs while building inputs."""
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(input_batch_module, "logger", recorder)
+    return recorder.lines
+
+
+@pytest.mark.parametrize(
+    "num_computed_tokens, num_scheduled_tokens, expected",
+    [
+        (0, 2, ["Prefill chunk for request r: tokens [0, 2) of 8."]),
+        (2, 4, ["Prefill chunk for request r: tokens [2, 6) of 8."]),
+        (6, 2, ["Prefill chunk for request r: tokens [6, 8) of 8, final."]),
+        (0, 8, []),
+    ],
+)
+def test_each_chunk_of_a_split_prompt_is_logged(
+    chunk_log, num_computed_tokens, num_scheduled_tokens, expected
+):
+    """Every chunk of a split prompt leaves one line; an unsplit prompt none.
+
+    An intermediate chunk emits no token, so this line is the only per-request
+    evidence outside the process that the prompt was split.
+    """
+    batch, request = _batch_with_one_request(8, 0, num_computed_tokens)
+
+    _prepare(
+        _fake_runner(batch, request),
+        ("r", num_scheduled_tokens, num_computed_tokens, 0),
+    )
+
+    assert chunk_log == expected
+
+
+@pytest.mark.parametrize(
+    "num_computed_tokens, num_scheduled_tokens, expected",
+    [
+        (0, 16, ["Prefill chunk for request r: tokens [0, 16) of 20."]),
+        (16, 4, ["Prefill chunk for request r: tokens [16, 20) of 20, final."]),
+    ],
+)
+def test_each_chunk_of_a_replay_past_the_prompt_is_logged(
+    chunk_log, num_computed_tokens, num_scheduled_tokens, expected
+):
+    """After preemption vLLM replays the 8 prompt tokens and the 12 generated
+    ones to rebuild the KV cache. The final replay chunk starts past the prompt
+    but is still prefill work, so it is logged like a prompt's final chunk."""
+    batch, request = _batch_with_one_request(8, 12, num_computed_tokens)
+
+    _prepare(
+        _fake_runner(batch, request),
+        ("r", num_scheduled_tokens, num_computed_tokens, 12),
+    )
+
+    assert chunk_log == expected
+
+
+def test_decode_row_beside_a_chunk_is_not_logged(chunk_log):
+    batch, chunking = _batch_with_one_request(8, 0, num_computed_tokens=2)
+    batch.add_request(
+        CachedRequestState(
+            req_id="r2",
+            prompt_token_ids=list(range(8)),
+            mm_features=None,
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            block_ids=([1],),
+            num_computed_tokens=8,
+            output_token_ids=[100],
+        )
+    )
+
+    _prepare(_fake_runner(batch, chunking), ("r", 2, 2, 0), ("r2", 1, 8, 1))
+
+    assert chunk_log == ["Prefill chunk for request r: tokens [2, 4) of 8."]
+
+
+def test_prefix_cache_hit_on_a_new_request_is_not_a_chunk(chunk_log):
+    """A new request that starts at a cached offset and finishes its prompt
+    in one step was not split."""
+    batch, _ = _batch_with_one_request(8, 0, num_computed_tokens=4)
+    no_running = CachedRequestData.make_empty()
+
+    input_batch_module.log_prefill_chunks(
+        batch,
+        [0],
+        np.array([4]),
+        np.array([8]),
+        torch.tensor([False]),
+        no_running,
+        output_tokens_per_step=1,
+    )
+
+    assert chunk_log == []
+
 
 # region Decode input construction
 
