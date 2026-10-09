@@ -117,6 +117,8 @@ def test_discovery_needs_no_model_package(monkeypatch: pytest.MonkeyPatch):
         return opened[-1]
 
     monkeypatch.setattr(ttnn, "get_num_devices", lambda: 8, raising=False)
+    # Every chip on its own PCIe link, so the submesh split applies.
+    monkeypatch.setattr(ttnn, "GetPCIeDeviceID", lambda chip: chip, raising=False)
     monkeypatch.setattr(ttnn, "open_mesh_device", open_mesh_device, raising=False)
     monkeypatch.setattr(ttnn, "close_mesh_device", lambda mesh: None, raising=False)
     monkeypatch.setattr(
@@ -132,6 +134,47 @@ def test_discovery_needs_no_model_package(monkeypatch: pytest.MonkeyPatch):
         ("6,7", (1, 2)),
     ]
     assert opened[0].calls == [("create_submeshes", (1, 2))]
+
+
+def _n300_cluster(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Four N300 cards: chips 0-3 on PCIe, chips 4-7 reached through card 7 - chip."""
+    opened = []
+    monkeypatch.setattr(ttnn, "get_num_devices", lambda: 8, raising=False)
+    monkeypatch.setattr(
+        ttnn,
+        "GetPCIeDeviceID",
+        lambda chip: chip if chip < 4 else 7 - chip,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ttnn, "open_mesh_device", lambda shape: opened.append(shape), raising=False
+    )
+    monkeypatch.setattr(ttnn, "close_mesh_device", lambda mesh: None, raising=False)
+    return opened
+
+
+def test_n300_cluster_binds_one_whole_card_per_rank(monkeypatch: pytest.MonkeyPatch):
+    """TT_VISIBLE_DEVICES names PCIe cards, and opening one opens its remote chip
+    too, so on a T3K each rank gets one card as a 1x2 mesh. No parent mesh is
+    opened: its submeshes pair chips of different cards, which no rank can open.
+    """
+    opened = _n300_cluster(monkeypatch)
+
+    groups = dp_discovery._discover_standard_dp_visible_device_groups("T3K", 4)
+
+    assert groups == [("0", (1, 2)), ("1", (1, 2)), ("2", (1, 2)), ("3", (1, 2))]
+    assert opened == []
+
+
+@pytest.mark.parametrize("dp", [2, 8])
+def test_n300_cluster_rejects_a_split_that_is_not_one_card_per_rank(
+    monkeypatch: pytest.MonkeyPatch, dp: int
+):
+    opened = _n300_cluster(monkeypatch)
+
+    with pytest.raises(ValueError, match=r"need data_parallel_size=4, got " + str(dp)):
+        dp_discovery._discover_standard_dp_visible_device_groups("T3K", dp)
+    assert opened == []
 
 
 @pytest.mark.parametrize(("mesh_shape", "dp", "parent", "submesh"), PLACEMENTS)
