@@ -5,7 +5,6 @@
 # loading, which re-enters this module before it has finished executing.
 import functools
 import logging
-import os
 from dataclasses import dataclass, field
 from types import MethodType
 
@@ -78,10 +77,6 @@ def init_tt_logger(name: str) -> logging.Logger:
           disables every logger created before vLLM applies it, so calling this
           ahead of ``import vllm`` silences TT records entirely.
     """
-    root_tt_logger = logging.getLogger(_TT_LOGGER_ROOT)
-    if root_tt_logger.level == logging.NOTSET:
-        root_tt_logger.setLevel(os.environ.get("VLLM_LOGGING_LEVEL", "INFO").upper())
-
     logger = logging.getLogger(
         f"{_TT_LOGGER_ROOT}.{name.removeprefix(_PACKAGE_PREFIX)}"
     )
