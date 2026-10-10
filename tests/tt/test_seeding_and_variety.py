@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -13,6 +14,29 @@ from tests.tt.utils import (
     run_concurrent_batch,
     run_concurrent_batch_tokens,
 )
+
+
+def _run_exact_token_batch(tt_server, tt_model_name, configs):
+    """Use actual tokens for tests that distinguish prefill from later decode."""
+    # Response IDs require no logprobs, which would change device-sampling
+    # eligibility and defeat the original coverage of these tests.
+    token_configs = [replace(config, return_token_ids=True) for config in configs]
+    results = run_concurrent_batch(
+        tt_server, tt_model_name, token_configs, return_full_response=True
+    )
+    assert len(results) == len(configs)
+    sequences = []
+    for i, response in enumerate(results):
+        token_ids = getattr(response.choices[0], "token_ids", None)
+        # Distinct tokens may begin with the same space or byte fragment.
+        # Missing IDs cannot establish token variety; never fall back to text.
+        assert (
+            isinstance(token_ids, list)
+            and token_ids
+            and all(isinstance(token, int) for token in token_ids)
+        ), f"request {i} must return nonempty exact integer token IDs: {token_ids!r}"
+        sequences.append(tuple(token_ids))
+    return sequences
 
 
 class TestSeedingAndVariety:
@@ -44,8 +68,8 @@ class TestSeedingAndVariety:
                     )
                 )
 
-        results1 = run_concurrent_batch(tt_server, tt_model_name, configs)
-        results2 = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results1 = _run_exact_token_batch(tt_server, tt_model_name, configs)
+        results2 = _run_exact_token_batch(tt_server, tt_model_name, configs)
 
         # This tests both prefill and decode
         all_greedy = results1[:greedy_count] + results2[:greedy_count]
@@ -271,7 +295,7 @@ class TestSeedingAndVariety:
         ]
 
         # Overall
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results = _run_exact_token_batch(tt_server, tt_model_name, configs)
         assert_varied(results, 2, "With temperature=2.0, outputs should vary in batch.")
 
         # First token (prefill)
@@ -291,7 +315,7 @@ class TestSeedingAndVariety:
 
         # Overall
         results = [
-            run_concurrent_batch(tt_server, tt_model_name, configs)[0]
+            _run_exact_token_batch(tt_server, tt_model_name, configs)[0]
             for _ in range(tries)
         ]
         assert_varied(
@@ -321,8 +345,8 @@ class TestSeedingAndVariety:
         ]
         joint_configs = greedy_config + topk_configs
 
-        results_1 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
-        results_2 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
+        results_1 = _run_exact_token_batch(tt_server, tt_model_name, joint_configs)
+        results_2 = _run_exact_token_batch(tt_server, tt_model_name, joint_configs)
 
         # Within each batch:
         for results in [results_1, results_2]:

@@ -5,8 +5,9 @@ Tests for sampling parameters which require host ("compat") sampling.
 """
 
 import string
+from dataclasses import replace
 
-from tests.tt.utils import RequestConfig, run_concurrent_batch
+from tests.tt.utils import RequestConfig, extract_token_ids, run_concurrent_batch
 
 
 class TestHostOnlyParameters:
@@ -79,7 +80,7 @@ class TestHostOnlyParameters:
         assert results[0] is not None, "should produce output with logit_bias"
 
     def test_allowed_token_ids(self, tt_server, tt_model_name, max_batch_size):
-        """Test allowed_token_ids parameter (smoke test)."""
+        """Every emitted token must belong to its request's allowed set."""
         configs = [
             RequestConfig(
                 prompt="Allowed: ", max_tokens=10, allowed_token_ids=[1, 2, 3]
@@ -97,12 +98,40 @@ class TestHostOnlyParameters:
                 prompt="Allowed: ", max_tokens=10, allowed_token_ids=[13, 14, 15]
             ),
         ]
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        configs = [
+            replace(config, return_tokens_as_token_ids=True, logprobs=0)
+            for config in configs
+        ]
+        results = run_concurrent_batch(
+            tt_server, tt_model_name, configs, return_full_response=True
+        )
         assert len(results) == len(configs)
-        # With only 3 allowed tokens, output should be limited
-        for i, result in enumerate(results):
-            assert result is not None, f"should produce output for request {i}"
-            assert len(result) > 0, f"should produce non-empty output for request {i}"
+        # Byte-fallback IDs and special tokens can produce no incremental
+        # text. Token IDs test the actual constraint without requiring those
+        # arbitrary vocabulary entries to be printable characters.
+        for i, (config, response) in enumerate(zip(configs, results)):
+            token_ids = extract_token_ids(response)
+            assert isinstance(token_ids, list) and all(
+                isinstance(token, int) for token in token_ids
+            ), f"request {i} must return exact integer token IDs: {token_ids!r}"
+            assert 0 < len(token_ids) <= config.max_tokens, (
+                f"request {i} emitted {len(token_ids)} tokens with cap "
+                f"{config.max_tokens}"
+            )
+            assert response.usage is not None, f"request {i} must report token usage"
+            assert len(token_ids) == response.usage.completion_tokens, (
+                f"request {i} token count differs from usage: "
+                f"{len(token_ids)} != {response.usage.completion_tokens}"
+            )
+            if response.choices[0].finish_reason == "length":
+                assert len(token_ids) == config.max_tokens, (
+                    f"request {i} stopped at length before its token cap: "
+                    f"{len(token_ids)} != {config.max_tokens}"
+                )
+            assert set(token_ids) <= set(config.allowed_token_ids), (
+                f"request {i} emitted IDs outside its allowed set: "
+                f"{token_ids} not within {config.allowed_token_ids}"
+            )
 
     def test_min_tokens(self, tt_server, tt_model_name, max_batch_size):
         """Test min_tokens parameter ensures minimum output length."""

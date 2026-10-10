@@ -49,6 +49,7 @@ class RequestConfig:
     allowed_token_ids: list[int] | None = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
+    return_token_ids: bool = False
     reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
@@ -73,6 +74,8 @@ async def send_request(
         extra_body["allowed_token_ids"] = config.allowed_token_ids
     if config.return_tokens_as_token_ids:
         extra_body["return_tokens_as_token_ids"] = True
+    if config.return_token_ids:
+        extra_body["return_token_ids"] = True
     if config.bad_words is not None:
         raise ValueError("bad_words is not supported in legacy completions API")
 
