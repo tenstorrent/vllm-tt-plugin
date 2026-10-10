@@ -3231,6 +3231,20 @@ class TTModelRunner:
             "supports_device_penalties", True
         ):
             return False
+        # A model whose prefill sampler draws from a fixed per-slot seed (no
+        # per-request RNG state) declines stochastic prefill: every unseeded
+        # request in the same slot would get the same first token, and an
+        # explicit seed would be ignored. Greedy prefill stays on device.
+        if not is_decode and not self.model.model_capabilities.get(
+            "supports_stochastic_device_prefill", True
+        ):
+            rows = (
+                list(input_batch.req_id_to_index.values())
+                if sampling_rows is None
+                else sampling_rows
+            )
+            if (input_batch.sampling.temperature[rows] != 0).any():
+                return False
         has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set

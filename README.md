@@ -396,7 +396,7 @@ structured requests keep host sampling unless the server is started with
 Eligibility also requires a compatible runtime sampler (not row-sharded),
 model warmup when tracing, and no logprobs (including `logprobs=0`) or other
 host-only sampling option. The ordinary device-sampling limits,
-`max_device_top_k`, `supports_device_penalties` and `supports_device_logprobs`, also apply. Eligibility is
+`max_device_top_k`, `supports_device_penalties`, `supports_device_logprobs` and `supports_stochastic_device_prefill`, also apply. Eligibility is
 batch-wide: one ineligible request moves the whole decode step to host
 sampling. Block-output models reject structured outputs rather than falling
 back.
