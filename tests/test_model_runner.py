@@ -560,3 +560,45 @@ def test_device_logprobs_follow_model_capability(declared, max_num_logprobs):
     )
     expected = not (max_num_logprobs is not None and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+@pytest.mark.parametrize("declared", [None, True, False])
+@pytest.mark.parametrize("is_decode", [False, True])
+@pytest.mark.parametrize(
+    ("temperatures", "sampling_rows"),
+    [([0.0, 0.0], None), ([0.0, 0.8], None), ([0.0, 0.8], [0])],
+    ids=["greedy", "stochastic", "stochastic-row-not-selected"],
+)
+def test_stochastic_prefill_follows_model_capability(
+    declared, is_decode, temperatures, sampling_rows
+):
+    capabilities = (
+        {} if declared is None else {"supports_stochastic_device_prefill": declared}
+    )
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        model=SimpleNamespace(model_capabilities=capabilities),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            max_num_logprobs=None,
+            req_id_to_index={"a": 0, "b": 1},
+            sampling=SimpleNamespace(
+                temperature=torch.tensor(temperatures),
+                bad_words_token_ids={},
+                has_active_logitsprocs=lambda: False,
+            ),
+        ),
+    )
+    selected = [0, 1] if sampling_rows is None else sampling_rows
+    stochastic = any(temperatures[row] != 0 for row in selected)
+    expected = not (not is_decode and declared is False and stochastic)
+    assert (
+        TTModelRunner.check_perform_device_sampling(
+            runner, is_decode, False, sampling_rows=sampling_rows
+        )
+        is expected
+    )
