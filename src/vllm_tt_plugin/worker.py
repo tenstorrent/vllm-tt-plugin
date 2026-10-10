@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import copy
+import fcntl
 import math
 import os
+import tempfile
 import time
 import warnings
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -1049,6 +1051,29 @@ def get_mesh_grid(*args: Any, **kwargs: Any):
     return mesh_grid
 
 
+def _device_open_lock_path() -> str:
+    return os.path.join(
+        tempfile.gettempdir(), f"vllm_tt_open_mesh_device.{os.getuid()}.lock"
+    )
+
+
+@contextmanager
+def _device_open_lock():
+    """Serialize device bring-up between TT worker processes on one host.
+
+    Standard-DP ranks open their cards at the same moment. On a T3K, concurrent
+    firmware and fabric bring-up made ranks time out on the ethernet remote-IO
+    flush to their remote chip, so ranks open one at a time; once open, they
+    load and serve in parallel.
+    """
+    with open(_device_open_lock_path(), "a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def open_mesh_device(
     tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
 ):
@@ -1057,15 +1082,16 @@ def open_mesh_device(
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
 
-    # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested, model_fabric_config)
+    with _device_open_lock():
+        # Set fabric before opening the device
+        set_fabric(tt_config, num_devices_requested, model_fabric_config)
 
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(*mesh_grid),
-        dispatch_core_config=get_dispatch_core_config(tt_config),
-        **device_params,
-    )
+        mesh_device = ttnn.open_mesh_device(
+            ttnn.MeshShape(*mesh_grid),
+            dispatch_core_config=get_dispatch_core_config(tt_config),
+            **device_params,
+        )
     logger.info(
         "multidevice with %d devices and grid %s is created",
         mesh_device.get_num_devices(),
