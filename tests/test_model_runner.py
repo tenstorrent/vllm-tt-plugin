@@ -161,6 +161,44 @@ def test_kv_cache_layout_resolves_to_lbnhc_for_mixed_specs():
     assert layout.name == "LBNHC"
 
 
+def test_hybrid_tables_pad_once_per_native_group():
+    runner = SimpleNamespace(
+        _layer_to_group_idx=[1, 0, 1, 0],
+        tt_max_batch_size=4,
+        max_num_blocks_per_req=8,
+    )
+    source = [torch.tensor([[2, 3]]), torch.tensor([[7, 9]])]
+    tables = TTModelRunner._block_tables_per_layer(runner, source)
+    assert tables[0] is tables[2]
+    assert tables[1] is tables[3]
+    assert tables[0] is not tables[1]
+    assert tables[0].shape == (4, 8)
+    assert tables[0][0].tolist() == [7, 9, 0, 0, 0, 0, 0, 0]
+    assert tables[1][0].tolist() == [2, 3, 0, 0, 0, 0, 0, 0]
+    source[1][0, 1] = 11
+    changed = TTModelRunner._block_tables_per_layer(runner, source)
+    assert changed[0][0, 1] == 11
+    assert tables[0][0, 1] == 9
+
+
+@pytest.mark.parametrize("groups", [None, [1, 0, 1]])
+def test_adapter_group_configuration_precedes_cache_allocation(groups):
+    calls = []
+    model = SimpleNamespace(
+        configure_kv_cache_groups=lambda mapping: calls.append(("groups", mapping)),
+        allocate_kv_cache_per_layer=lambda specs: calls.append(("allocate", specs)),
+    )
+    runner = SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(get_num_layers_by_block_type=lambda *args: 3),
+        parallel_config=None,
+        _layer_to_group_idx=groups,
+        _build_per_layer_specs=lambda *args: "specs",
+    )
+    TTModelRunner._allocate_kv_caches(runner, None)
+    assert calls == [("groups", tuple(groups or [0, 0, 0])), ("allocate", "specs")]
+
+
 def _prepare(runner, *rows):
     """Run _prepare_model_inputs for cached rows of
     (req_id, num_scheduled, num_computed, num_output)."""

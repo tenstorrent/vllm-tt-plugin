@@ -754,6 +754,12 @@ class TTModelRunner:
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
 
         if hasattr(self.model, "allocate_kv_cache_per_layer"):
+            configure_groups = getattr(self.model, "configure_kv_cache_groups", None)
+            if configure_groups is not None:
+                # Native groups, not shared backing tensor indices, own page
+                # mappings. Let an adapter bind one persistent table per group
+                # before allocating inputs or capturing any traces.
+                configure_groups(tuple(self._layer_to_group_idx or [0] * num_layers))
             return self.model.allocate_kv_cache_per_layer(per_layer_specs)
 
         # Legacy ``allocate_kv_cache(shape, dtype, num_layers)`` API: every
@@ -785,7 +791,6 @@ class TTModelRunner:
         """
         if self._layer_to_group_idx is None:
             return None
-        result = [block_tables_per_group[g] for g in self._layer_to_group_idx]
         # Pad to the warmup shape ``[max_batch, max_num_blocks_per_req]``.
         # The model side (``Transformer._page_tables_to_ttnn``) allocates
         # *persistent* ttnn device tensors at this shape during warmup so
@@ -798,7 +803,7 @@ class TTModelRunner:
         max_batch = self.tt_max_batch_size
         target_shape = (max_batch, self.max_num_blocks_per_req)
         padded = []
-        for bt in result:
+        for bt in block_tables_per_group:
             if bt is None:
                 padded.append(None)
                 continue
@@ -810,7 +815,7 @@ class TTModelRunner:
             cols = min(bt.shape[1], target_shape[1])
             full[:rows, :cols] = bt[:rows, :cols]
             padded.append(full)
-        return padded
+        return [padded[g] for g in self._layer_to_group_idx]
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int

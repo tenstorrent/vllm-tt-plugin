@@ -201,6 +201,14 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 ## Hooks that are not capability keys
 
 `get_kv_cache_spec` opts a model into hybrid KV-cache layouts.
+
+An adapter implementing `allocate_kv_cache_per_layer` may also implement
+`configure_kv_cache_groups(layer_to_group)`. The runner calls it once before
+cache allocation, with native group indices in model layer order (all zero for
+a uniform group). This permits persistent page-table inputs to be shared within
+a group before trace capture. Group indices describe page mappings; they are
+independent of shared KV backing tensor indices. The adapter must retain these
+bindings for the model lifetime and validate incoming per-layer mappings.
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
