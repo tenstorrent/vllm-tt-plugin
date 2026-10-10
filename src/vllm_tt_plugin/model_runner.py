@@ -1113,7 +1113,12 @@ class TTModelRunner:
                     pv_array.append(None)
                     image_grid_thw_array.append(None)
                     continue
-                pv_array.append(item["pixel_values"].data)
+                # With prefix caching, an image whose tokens are fully inside the
+                # cached prefix arrives with its tensor payload stripped; M-RoPE
+                # models keep the CPU-side grid so positions can still be built.
+                pv_array.append(
+                    item["pixel_values"].data if "pixel_values" in item else None
+                )
                 image_grid_thw_array.append(
                     item["image_grid_thw"].data if "image_grid_thw" in item else None
                 )
