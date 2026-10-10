@@ -281,7 +281,8 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert b.occupied_rows() == []
 
 
-def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
+@pytest.mark.parametrize("capability", [None, False, True])
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(capability):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
@@ -312,6 +313,13 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
         check_perform_device_sampling=lambda **_: True,
         model_config=SimpleNamespace(is_multimodal_model=False),
         requests={"request": request},
+        model=SimpleNamespace(
+            model_capabilities=(
+                {}
+                if capability is None
+                else {"supports_partial_prefill_device_sampling": capability}
+            )
+        ),
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -320,8 +328,8 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
     assert model_input.prompt_lens.tolist() == [3]
     assert model_input.input_tokens.tolist() == [[0, 1, 2]]
     assert model_input.intermediate_prefill_mask.tolist() == [True]
-    # An intermediate chunk must not advance device RNG state.
-    assert model_input.perform_device_sampling is False
+    # Only opted-in models promise to preserve intermediate-row RNG state.
+    assert model_input.perform_device_sampling is (capability is True)
 
 
 def test_lane_structured_decode_captures_expected_grammar_request_ids():

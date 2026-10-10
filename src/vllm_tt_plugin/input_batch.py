@@ -1360,10 +1360,12 @@ class TTLaneInputBatch(InputBatch):
             has_structured_outputs=has_structured,
             sampling_rows=rows,
         )
-        if intermediate_prefill_mask.any():
-            # Device sampling advances device RNG state for every row it reads,
-            # which an intermediate chunk must not do. Host sampling can hand
-            # those rows a generator clone instead.
+        if intermediate_prefill_mask.any() and not getattr(
+            getattr(runner, "model", None), "model_capabilities", {}
+        ).get("supports_partial_prefill_device_sampling", False):
+            # Opted-in models receive the mask at prefill submission and leave
+            # intermediate rows' token/RNG state untouched. Legacy samplers
+            # require the host path with cloned intermediate-row generators.
             perform_device_sampling = False
 
         # Device-side penalties only; host sampling rebuilds these in

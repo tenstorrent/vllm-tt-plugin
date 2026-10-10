@@ -367,6 +367,245 @@ def test_mixed_prefill_batch_keeps_scheduled_decode_row():
     assert sorted(model_input.prompt_lens.tolist()) == [4, 9]
 
 
+@pytest.mark.parametrize("capability", [None, False, True])
+@pytest.mark.parametrize("otherwise_eligible", [False, True])
+def test_partial_prefill_device_sampling_requires_opt_in(
+    capability, otherwise_eligible
+):
+    batch, intermediate = _batch_with_one_request(8, 0, num_computed_tokens=2)
+    final = CachedRequestState(
+        req_id="final",
+        prompt_token_ids=list(range(8)),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([1],),
+        num_computed_tokens=6,
+        output_token_ids=[],
+    )
+    batch.add_request(final)
+    runner = _fake_runner(batch, intermediate)
+    runner.requests["final"] = final
+    runner.model = SimpleNamespace(
+        model_capabilities=(
+            {}
+            if capability is None
+            else {"supports_partial_prefill_device_sampling": capability}
+        )
+    )
+    runner.check_perform_device_sampling = lambda **_: otherwise_eligible
+
+    model_input = _prepare(runner, ("r", 2, 2, 0), ("final", 2, 6, 0))
+
+    assert model_input.intermediate_prefill_mask.tolist() == [True, False]
+    assert model_input.perform_device_sampling is (
+        otherwise_eligible and capability is True
+    )
+
+
+@pytest.mark.parametrize("capability", [None, False, True])
+@pytest.mark.parametrize("otherwise_eligible", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_partial_prefill_mask_forwarding_and_output_suppression(
+    capability, otherwise_eligible, mixed
+):
+    batch, request = _batch_with_one_request(8, 0, num_computed_tokens=2)
+    runner = _fake_runner(batch, request)
+    rows = [("r", 2, 2, 0)]
+    if mixed:
+        final = CachedRequestState(
+            req_id="final",
+            prompt_token_ids=list(range(8)),
+            mm_features=None,
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            block_ids=([1],),
+            num_computed_tokens=6,
+            output_token_ids=[],
+        )
+        batch.add_request(final)
+        runner.requests["final"] = final
+        rows.append(("final", 2, 6, 0))
+    submitted = []
+    noted = []
+    applied = []
+    placeholder = torch.full((len(rows), 1), 42, dtype=torch.int32)
+
+    def prefill_forward(**kwargs):
+        submitted.append(kwargs)
+        return placeholder
+
+    runner.model = SimpleNamespace(
+        model_capabilities=(
+            {}
+            if capability is None
+            else {"supports_partial_prefill_device_sampling": capability}
+        ),
+        prefill_forward=prefill_forward,
+    )
+    runner.check_perform_device_sampling = lambda **_: otherwise_eligible
+    runner.kv_caches = object()
+    runner.trace_mode = "all"
+    runner.request_specific_rope = False
+    runner.async_decode = SimpleNamespace(
+        note_prefill_submitted=lambda: noted.append(True)
+    )
+    runner._apply_sampled_tokens_to_state = lambda *a, **kw: applied.append((a, kw))
+    model_input = _prepare(runner, *rows)
+
+    tt_out = TTModelRunner.submit_prefill(runner, model_input, [len(rows)])
+    output = TTModelRunner._build_chunked_prefill_output(
+        runner,
+        req_ids=[row[0] for row in rows],
+        sampled_token_ids=tt_out,
+        logprobs=None,
+        intermediate_mask=model_input.intermediate_prefill_mask.numpy(),
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["kv_cache"] is runner.kv_caches
+    if capability is True:
+        assert (
+            submitted[0]["intermediate_prefill_mask"]
+            is model_input.intermediate_prefill_mask
+        )
+    else:
+        assert "intermediate_prefill_mask" not in submitted[0]
+    assert ("sampling_params" in submitted[0]) is (
+        otherwise_eligible and capability is True
+    )
+    assert noted == [True]
+    assert output.sampled_token_ids == ([[], [42]] if mixed else [[]])
+    if mixed:
+        assert len(applied) == 1
+        assert applied[0][0][0].tolist() == [[42]]
+        assert applied[0][1] == {"req_ids": ["final"]}
+    else:
+        assert applied == []
+
+
+def test_prefill_schedule_hook_reports_exact_mixed_work_before_forward():
+    batch, intermediate = _batch_with_one_request(8, 0, num_computed_tokens=2)
+    runner = _fake_runner(batch, intermediate)
+    rows = [("r", 2, 2, 0)]
+    for name, computed, outputs, scheduled in (
+        ("decode", 8, [10], 1),
+        ("replay", 8, [10, 11, 12], 2),
+        ("final", 7, [], 1),
+    ):
+        request = CachedRequestState(
+            req_id=name,
+            prompt_token_ids=list(range(8)),
+            mm_features=None,
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            block_ids=([len(rows)],),
+            num_computed_tokens=computed,
+            output_token_ids=outputs,
+        )
+        batch.add_request(request)
+        runner.requests[name] = request
+        rows.append((name, scheduled, computed, len(outputs)))
+    model_input = _prepare(runner, *rows)
+    calls = []
+
+    def record_schedule(actual_input, active_decode_req_ids):
+        assert actual_input is model_input
+        assert actual_input.row_req_ids == ["r", "decode", "replay", "final"]
+        assert actual_input.input_positions.tolist() == [2, 8, 8, 7]
+        assert actual_input.prompt_lens.tolist() == [4, 9, 10, 8]
+        assert active_decode_req_ids == ["decode"]
+        calls.append("schedule")
+
+    runner.model = SimpleNamespace(
+        record_vllm_prefill_schedule=record_schedule,
+        prefill_forward=lambda **kwargs: calls.append("forward"),
+    )
+    runner.kv_caches = object()
+    runner.trace_mode = "all"
+    runner.request_specific_rope = False
+    runner.async_decode = SimpleNamespace(
+        note_prefill_submitted=lambda: calls.append("submitted")
+    )
+
+    TTModelRunner.submit_prefill(runner, model_input, [4])
+
+    assert calls == ["schedule", "forward", "submitted"]
+
+
+def test_prefill_schedule_hook_retains_decode_hidden_by_prefill_only_batch():
+    batch, anchor = _batch_with_one_request(8, 0, num_computed_tokens=0)
+    runner = _fake_runner(batch, anchor)
+    seen = []
+    runner.model = SimpleNamespace(
+        record_vllm_prefill_schedule=lambda inputs, active: seen.append(active),
+        prefill_forward=lambda **kwargs: None,
+    )
+    runner.kv_caches = object()
+    runner.trace_mode = "all"
+    runner.request_specific_rope = False
+    runner.async_decode = SimpleNamespace(note_prefill_submitted=lambda: None)
+    runner.encoder_cache = {}
+    runner._req_state_slot = {"r": 0}
+    runner._release_dead_state_slots = lambda output: (
+        TTModelRunner._release_dead_state_slots(runner, output)
+    )
+
+    # Readiness comes from this real successful final-prefill transition.
+    initial = _prepare(runner, ("r", 8, 0, 0))
+    TTModelRunner.submit_prefill(runner, initial, [1])
+    assert seen == [[]]
+    assert runner._diagnostic_decode_ready_req_ids == {"r"}
+
+    # Cached computed is a pre-step cursor. Async output publication can leave
+    # it more than one token behind, without turning a decode into prefill.
+    anchor.num_computed_tokens = 9
+    anchor.output_token_ids.extend([10, 11, 12])
+    assert anchor.num_computed_tokens + 1 < anchor.num_tokens
+    newcomer = CachedRequestState(
+        req_id="new",
+        prompt_token_ids=list(range(16)),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([1],),
+        num_computed_tokens=2,
+        output_token_ids=[],
+    )
+    runner.requests["new"] = newcomer
+    runner._req_state_slot["new"] = 1
+    step = SchedulerOutput.make_empty()
+    step.num_scheduled_tokens = {"new": 2}
+    step.total_num_scheduled_tokens = 2
+    step.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["new"],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[2],
+        num_output_tokens=[0],
+    )
+
+    # Exercise the actual operation that hid the resident decode in serving.
+    TTModelRunner._update_states(runner, step)
+    assert "r" not in batch.req_id_to_index
+    assert "r" in runner.requests and "r" in runner._req_state_slot
+    inputs = TTModelRunner._prepare_model_inputs(runner, step, None)
+    TTModelRunner.submit_prefill(runner, inputs, [1])
+    assert seen[-1] == ["r"]
+    assert runner._diagnostic_decode_ready_req_ids == {"r"}
+
+    # Residency loss must invalidate the diagnostic readiness before a later
+    # resume can reuse its slot for an intermediate history-replay chunk.
+    preemption = SchedulerOutput.make_empty()
+    preemption.preempted_req_ids = {"r"}
+    TTModelRunner._release_dead_state_slots(runner, preemption)
+    assert not runner._diagnostic_decode_ready_req_ids
+    TTModelRunner.submit_prefill(runner, inputs, [1])
+    assert seen[-1] == []
+
+
 def test_steady_block_step_builds_decode_input():
     """One whole canvas outstanding is the block steady state; dispatching it
     as prompt work re-encodes the entire session per canvas."""

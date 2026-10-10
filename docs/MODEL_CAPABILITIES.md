@@ -78,10 +78,12 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
 | `supports_sample_on_device` | `False` | Permits the requested `sample_on_device_mode`. The platform rejects any non-`None` sampling mode when this declaration is false. Runtime sampling requirements can still select host sampling. |
+| `supports_partial_prefill_device_sampling` | `False` | Keeps otherwise eligible device sampling enabled when a prefill batch contains intermediate chunks. `prefill_forward` receives `intermediate_prefill_mask` in both device and host sampling modes. The model must sample only final rows, preserve token/RNG state for intermediate and other live rows, and return placeholder output rows for intermediate chunks; the runner suppresses those rows before publishing tokens. An all-intermediate batch needs no sampling or logits readback. Other host-only sampling restrictions still apply. |
 | `max_device_top_k` | `None` | Bounds stochastic device sampling. `TTModelRunner.check_perform_device_sampling` selects host sampling when any selected sampling row has nonzero temperature and `top_k < 1` or `top_k > max_device_top_k`. Greedy rows do not trigger this restriction. The platform rejects any non-`None` value on a block-output model. The plugin does not otherwise validate the numeric type or range of `max_device_top_k`; model authors must supply the actual supported bound. |
 | `supports_device_penalties` | `True` | Permits device sampling with active penalties. When this declaration is false and `InputBatch.no_penalties` is false, `TTModelRunner.check_perform_device_sampling` selects host sampling. The default preserves the existing behavior of model implementations that predate this declaration. |
 | `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, with async scheduling, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. |
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
+| `requires_explicit_decode_read` | `False` | Declares that `process_decode_output_host` only formats a host-resident payload. For a synchronous device output, the controller first calls `read_decode_output(output, async_read=False)` and then formats it. An already submitted async read or an already materialized host output is not read again. The async read contract remains `(host_payload, events)`; synchronous reads return the host payload directly. |
 | `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
 
 The async capability combination has a specific order: the platform first
@@ -204,6 +206,19 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
 implements model-owned proposal. Adding a similarly named dictionary key
 does not implement any of these hooks.
+
+The optional `record_vllm_prefill_schedule(model_input, active_decode_req_ids)`
+hook receives the exact submitted prefill input before model execution. The
+second argument identifies resident requests whose final prefill was accepted,
+including decodes temporarily absent from this step's input batch. Readiness is
+tracked from successful final/intermediate prefill transitions and filtered by
+live request/slot ownership; finished and preempted requests lose it. A cached
+pre-step cursor is not compared with later asynchronous output counts to infer
+the phase of an off-batch request. Decode rows inside a mixed prefill build are
+also included; unfinished prompts and replaying histories are excluded. This
+records concurrently live work, not simultaneous hardware execution. Models can use the input's
+request IDs, positions, and prompt ends to record actual chunk scheduling.
+The plugin builds this diagnostic payload only when the hook is callable.
 
 Model authors should add new feature gates through explicit capability
 declarations and matching plugin consumers, with linked changes when tt-metal

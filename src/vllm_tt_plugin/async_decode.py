@@ -94,6 +94,9 @@ class TTDecodeSubmission:
     # without interpreting its dtype, layout or tensor-parallel fracturing.
     spec_hidden: Any | None = None
     readback_rows: tuple[int, ...] | None = None
+    # Async readers may complete without events. Track submission separately
+    # so a model with a pure read/process split is never read a second time.
+    readback_submitted: bool = False
 
 
 @dataclass(frozen=True)
@@ -1390,6 +1393,7 @@ class TTAsyncDecodeController:
             reload_plan=reload_plan,
             spec_hidden=spec_hidden,
             readback_rows=readback_rows,
+            readback_submitted=read_from_device or async_read,
         )
 
     def complete_deferred_device_sampling(
@@ -1444,6 +1448,7 @@ class TTAsyncDecodeController:
                 tt_out=sampled,
                 read_events=None,
                 deferred_device_sampling=False,
+                readback_submitted=False,
             )
             finalized = self.finalize_decode(completed_submission)
             if finalized is None:
@@ -1488,6 +1493,19 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
 
         is_host_output = _is_host_decode_output(tt_out)
+        if (
+            not is_host_output
+            and submission.read_events is None
+            and not submission.readback_submitted
+            and getattr(runner.model, "model_capabilities", {}).get(
+                "requires_explicit_decode_read", False
+            )
+        ):
+            # Legacy adapters read inside process_decode_output_host. Models
+            # opting into the pure split require this same explicit read in
+            # the synchronous path that submit_decode performs for async.
+            tt_out = runner.model.read_decode_output(tt_out, async_read=False)
+            is_host_output = _is_host_decode_output(tt_out)
         compact_rows = None
         if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             kwargs = {"is_tokens": submission.perform_device_sampling}

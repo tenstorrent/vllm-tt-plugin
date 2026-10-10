@@ -14,6 +14,132 @@ from vllm_tt_plugin.async_decode import TTAsyncDecodeController, TTDecodeSubmiss
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
 
 
+@pytest.mark.parametrize("capability", [None, False, True])
+@pytest.mark.parametrize("readback_submitted", [False, True])
+def test_explicit_sync_decode_read_is_opt_in_and_never_repeats(
+    capability, readback_submitted
+):
+    calls = []
+    device_payload, host_payload = object(), object()
+
+    def read(value, *, async_read):
+        assert value is device_payload
+        assert async_read is False
+        calls.append("read")
+        return host_payload
+
+    def process(value, *, is_tokens):
+        expected_host = readback_submitted or capability is True
+        assert value is (host_payload if expected_host else device_payload)
+        assert is_tokens is True
+        calls.append("process")
+        return torch.tensor([[42]])
+
+    runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model_capabilities=(
+                {}
+                if capability is None
+                else {"requires_explicit_decode_read": capability}
+            ),
+            read_decode_output=read,
+            process_decode_output_host=process,
+        )
+    )
+    controller = TTAsyncDecodeController.__new__(TTAsyncDecodeController)
+    controller.runner = runner
+    submission = TTDecodeSubmission(
+        host_payload if readback_submitted else device_payload,
+        None,
+        [1],
+        SimpleNamespace(enable_log_probs=torch.tensor([False])),
+        True,
+        readback_submitted=readback_submitted,
+    )
+
+    output = controller.finalize_decode(submission)
+
+    assert calls == (
+        ["read", "process"]
+        if capability is True and not readback_submitted
+        else ["process"]
+    )
+    assert output.tt_out.tolist() == [[42]]
+
+
+def test_explicit_sync_decode_read_skips_materialized_host_output():
+    def unexpected(*args, **kwargs):
+        pytest.fail("materialized torch output must not be read or formatted again")
+
+    controller = TTAsyncDecodeController.__new__(TTAsyncDecodeController)
+    controller.runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model_capabilities={"requires_explicit_decode_read": True},
+            read_decode_output=unexpected,
+            process_decode_output_host=unexpected,
+        )
+    )
+    submission = TTDecodeSubmission(
+        torch.tensor([[42]]),
+        None,
+        [1],
+        SimpleNamespace(enable_log_probs=torch.tensor([False])),
+        True,
+    )
+    assert controller.finalize_decode(submission).tt_out.tolist() == [[42]]
+
+
+@pytest.mark.parametrize("async_read", [False, True])
+def test_explicit_decode_read_submission_preserves_pure_read_process_split(async_read):
+    calls = []
+    device_payload, host_payload = object(), object()
+
+    class Model:
+        decode_input_update_contract = 1
+        model_capabilities = {
+            "supports_async_decode": True,
+            "requires_explicit_decode_read": True,
+        }
+
+        def decode_forward(self, **kwargs):
+            assert kwargs["read_from_device"] is False
+            calls.append("forward")
+            return device_payload
+
+        def read_decode_output(self, value, **kwargs):
+            assert value is device_payload
+            assert kwargs["async_read"] is async_read
+            calls.append("read")
+            # No events are necessary for an already completed async read.
+            return (host_payload, None) if async_read else host_payload
+
+        def process_decode_output_host(self, value, **kwargs):
+            assert value is host_payload
+            calls.append("process")
+            return torch.tensor([[42]])
+
+    runner = _accepted_decode_hooks(
+        SimpleNamespace(
+            model=Model(),
+            trace_mode="decode_only",
+            kv_caches=object(),
+            request_specific_rope=False,
+        )
+    )
+    controller = TTAsyncDecodeController(runner)
+    submission = controller.submit_decode(
+        _submission_input(device_sampling=True),
+        read_from_device=False,
+        async_read=async_read,
+    )
+
+    result = controller.finalize_decode(submission)
+
+    assert submission.readback_submitted is async_read
+    assert calls == ["forward", "read", "process"]
+    assert result.tt_out.tolist() == [[42]]
+
+
 @pytest.mark.parametrize("capability", [False, True])
 @pytest.mark.parametrize("independent", [False, True])
 @pytest.mark.parametrize("rows", [None, [6, 1]])

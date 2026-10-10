@@ -1187,6 +1187,10 @@ class TTModelRunner:
             self._req_state_slot.pop(req_id, None)
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
+        ready = getattr(self, "_diagnostic_decode_ready_req_ids", None)
+        if ready is not None:
+            ready.difference_update(scheduler_output.finished_req_ids)
+            ready.difference_update(scheduler_output.preempted_req_ids or ())
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
@@ -2193,10 +2197,17 @@ class TTModelRunner:
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
-        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
-            # Device sampling advances device RNG state for every row it reads,
-            # which an intermediate chunk must not do. Host sampling can hand
-            # those rows a generator clone instead.
+        if (
+            intermediate_prefill_mask is not None
+            and intermediate_prefill_mask.any()
+            and not getattr(getattr(self, "model", None), "model_capabilities", {}).get(
+                "supports_partial_prefill_device_sampling", False
+            )
+        ):
+            # Legacy device samplers advance every row's RNG state. Opted-in
+            # models receive the mask and sample only final rows, preserving
+            # intermediate/live-row token and RNG state. Host sampling instead
+            # gives intermediate rows a generator clone.
             perform_device_sampling = False
         defer_device_sampling = (
             perform_device_sampling and has_scheduled_structured and not is_prompt
@@ -3310,6 +3321,12 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        if getattr(getattr(self, "model", None), "model_capabilities", {}).get(
+            "supports_partial_prefill_device_sampling", False
+        ):
+            # Also forward in host compatibility mode: an all-intermediate
+            # step has no output to read or sample, only KV state to update.
+            kwargs["intermediate_prefill_mask"] = model_input.intermediate_prefill_mask
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has
@@ -3347,14 +3364,50 @@ class TTModelRunner:
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
 
+        record_schedule = getattr(self.model, "record_vllm_prefill_schedule", None)
+        if callable(record_schedule):
+            # The front-packed input batch contains only this step's rows:
+            # _update_states removes temporarily unscheduled decodes while
+            # requests and _req_state_slot retain their live device state.
+            # Remember accepted final-prefill transitions, not cached cursor
+            # arithmetic: a decode cursor is a PRE-step snapshot, while async
+            # readback may already have appended later output tokens.
+            batch = self.input_batch
+            resident = set(getattr(self, "_req_state_slot", {})) | set(
+                batch.req_id_to_index
+            )
+            ready = set(getattr(self, "_diagnostic_decode_ready_req_ids", ()))
+            ready.intersection_update(self.requests.keys() & resident)
+            scheduled_decode_req_ids = {
+                req_id
+                for req_id, row in batch.req_id_to_index.items()
+                if req_id in model_input.row_req_ids
+                and batch.num_computed_tokens_cpu[row] >= batch.num_prompt_tokens[row]
+                and batch.num_computed_tokens_cpu[row] + self._output_tokens_per_step
+                >= batch.num_tokens[row]
+            }
+            # A resumed history can already have output tokens but is still
+            # replaying. Its current prefill input overrides prior readiness.
+            ready.difference_update(
+                set(model_input.row_req_ids) - scheduled_decode_req_ids
+            )
+            ready.update(scheduled_decode_req_ids)
+            record_schedule(model_input, sorted(ready))
+
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
             # Store rope_deltas for each prefilled request
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
-            self.async_decode.note_prefill_submitted()
-            return tt_out
-        tt_out = self.model.prefill_forward(**kwargs)
+        else:
+            tt_out = self.model.prefill_forward(**kwargs)
+        if callable(record_schedule):
+            for req_id, intermediate in zip(
+                model_input.row_req_ids, model_input.intermediate_prefill_mask
+            ):
+                if not intermediate:
+                    ready.add(req_id)
+            self._diagnostic_decode_ready_req_ids = ready
         self.async_decode.note_prefill_submitted()
         return tt_out
 
