@@ -2604,15 +2604,16 @@ class TTPlatform(Platform):
         params: "SamplingParams | PoolingParams",
     ) -> None:
         """Raises if this request is unsupported on this platform"""
+        from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingParams
 
         dev = cls.device_name
 
         if processed_inputs.get("prompt_embeds") is not None:
-            raise ValueError(f"prompt_embeds are not supported on {dev}")
+            raise VLLMValidationError(f"prompt_embeds are not supported on {dev}")
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
-            raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+            raise VLLMValidationError(f"Not yet supporting prompt_logprobs on {dev}")
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)

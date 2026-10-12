@@ -6,6 +6,7 @@ from functools import cached_property
 from types import SimpleNamespace
 
 import pytest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import (
     RepetitionDetectionParams,
     SamplingParams,
@@ -928,10 +929,21 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
 def test_prompt_embeds_are_rejected_for_every_tt_model(monkeypatch, output_size):
     _set_platform_contract(monkeypatch, output_size=output_size)
 
-    with pytest.raises(ValueError, match=r"prompt_embeds are not supported"):
+    with pytest.raises(VLLMValidationError, match=r"prompt_embeds are not supported"):
         TTPlatform.validate_request(
             {"prompt_token_ids": None, "prompt_embeds": [0] * 513},
             SamplingParams(max_tokens=257),
+        )
+
+
+@pytest.mark.parametrize("output_size", [1, 256], ids=["ar", "block"])
+def test_prompt_logprobs_are_rejected_for_every_tt_model(monkeypatch, output_size):
+    _set_platform_contract(monkeypatch, output_size=output_size)
+
+    with pytest.raises(VLLMValidationError, match=r"prompt_logprobs"):
+        TTPlatform.validate_request(
+            {"prompt_token_ids": [1, 2, 3], "prompt_embeds": None},
+            SamplingParams(max_tokens=1, prompt_logprobs=1),
         )
 
 
