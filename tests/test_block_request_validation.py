@@ -20,8 +20,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _fit_block_output_max_tokens,
-    _install_block_output_input_processor_patch,
     _install_block_output_streaming_input_patch,
+    _install_tt_input_processor_patch,
 )
 
 
@@ -82,7 +82,7 @@ def _patch_upstream_boundary(monkeypatch):
 def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     """Install the vLLM 0.25.1 validate -> clone -> default boundary."""
     input_processor = _patch_upstream_boundary(monkeypatch)
-    _install_block_output_input_processor_patch()
+    _install_tt_input_processor_patch()
 
     config = _set_platform_contract(
         monkeypatch,
@@ -542,14 +542,14 @@ def test_adaptive_block_model_with_the_move_hook_starts(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("model_class", "expected_max_tokens", "expected_wrapped"),
+    ("model_class", "expected_max_tokens"),
     [
-        (BlockModel, 768, True),
-        (ARModel, 824, False),
+        (BlockModel, 768),
+        (ARModel, 824),
     ],
 )
-def test_startup_installs_input_processor_patch_only_for_block_models(
-    monkeypatch, model_class, expected_max_tokens, expected_wrapped
+def test_startup_installs_input_processor_patch_with_model_specific_defaults(
+    monkeypatch, model_class, expected_max_tokens
 ):
     input_processor = _patch_upstream_boundary(monkeypatch)
     config = _config()
@@ -557,10 +557,8 @@ def test_startup_installs_input_processor_patch_only_for_block_models(
 
     TTPlatform.check_and_update_config(config)
 
-    assert (
-        input_processor.InputProcessor.process_inputs is not _upstream_process_inputs
-    ) is expected_wrapped
-    assert hasattr(input_processor, "_tt_original_process_inputs") is expected_wrapped
+    assert input_processor.InputProcessor.process_inputs is not _upstream_process_inputs
+    assert hasattr(input_processor, "_tt_original_process_inputs")
 
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None

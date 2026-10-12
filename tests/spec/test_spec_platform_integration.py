@@ -8,6 +8,9 @@ call site, storing the result under the wrong key, or resolving the plan before
 the lane fold rewrites the concurrency all fail here.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -450,6 +453,128 @@ def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_con
     _run_hook(monkeypatch, vllm_config, make_fake_spec_model())
     assert get_tt_spec_plan(vllm_config) is None
     _validate(SamplingParams(temperature=0.9, presence_penalty=0.3))
+
+
+class _ReachedModelInputValidation(Exception):
+    """Stop the real input processor after platform admission."""
+
+
+def _input_processor_for_launch(monkeypatch, vllm_config, launch):
+    import vllm.v1.engine.input_processor as input_processor
+
+    from vllm_tt_plugin.platform import TTPlatform
+
+    vllm_config.diffusion_config = None
+    vllm_config.parallel_config.distributed_executor_backend = None
+    vllm_config.parallel_config.local_engines_only = False
+    if launch != "ordinary":
+        _speculative(vllm_config)
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4, supports_narrow_decode=launch == "narrow"
+    )
+    _run_hook(monkeypatch, vllm_config, model)
+    monkeypatch.setattr(input_processor, "current_platform", TTPlatform)
+    processor = object.__new__(input_processor.InputProcessor)
+    processor.vllm_config = vllm_config
+    processor._validate_params = lambda *_: None
+    processor._validate_lora = lambda *_: None
+
+    def reached_model_input_validation(*_):
+        raise _ReachedModelInputValidation
+
+    processor._validate_model_inputs = reached_model_input_validation
+    return processor
+
+
+def _process_until_admission(processor, params):
+    try:
+        processor.process_inputs(
+            request_id="r0",
+            prompt={"type": "token", "prompt_token_ids": [1, 2, 3]},
+            params=params,
+            supported_tasks=("generate",),
+        )
+    except _ReachedModelInputValidation:
+        return
+    raise AssertionError("InputProcessor did not reach model input validation")
+
+
+@pytest.mark.parametrize(
+    "launches",
+    [
+        ("narrow", "verify-only"),
+        ("verify-only", "narrow"),
+        ("ordinary", "verify-only"),
+        ("verify-only", "ordinary"),
+    ],
+)
+@pytest.mark.parametrize(
+    "field,value", [*_SAMPLED, ("temperature", 0.0), ("logprobs", 1)]
+)
+def test_each_live_engine_uses_its_own_speculative_admission(
+    monkeypatch, vllm_config, launches, field, value
+):
+    """A second engine must not change the first engine's request policy."""
+    processors = [
+        _input_processor_for_launch(monkeypatch, deepcopy(vllm_config), launch)
+        for launch in launches
+    ]
+    for launch, processor in zip(launches, processors):
+        params = _sampled_params(field, value)
+        rejected = (
+            launch == "verify-only" and (field, value) != ("temperature", 0.0)
+        ) or (launch == "narrow" and field == "logprobs")
+        if rejected:
+            with pytest.raises(ValueError, match=field):
+                _process_until_admission(processor, params)
+        else:
+            _process_until_admission(processor, params)
+
+    # Each processor above raises after admission or at rejection. Direct
+    # platform calls must still read the last engine after either exception.
+    params = _sampled_params("temperature", 0.7)
+    if launches[-1] == "verify-only":
+        with pytest.raises(ValueError, match="temperature"):
+            _validate(params)
+    else:
+        _validate(params)
+
+
+def test_concurrent_engine_requests_keep_separate_admission(monkeypatch, vllm_config):
+    processors = [
+        _input_processor_for_launch(monkeypatch, deepcopy(vllm_config), launch)
+        for launch in ("narrow", "verify-only")
+    ]
+    barrier = Barrier(2, timeout=5)
+    for processor in processors:
+        processor._validate_lora = lambda *_: barrier.wait()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        accepted, rejected = [
+            pool.submit(
+                _process_until_admission, processor, _sampled_params("temperature", 0.7)
+            )
+            for processor in processors
+        ]
+        accepted.result(timeout=10)
+        with pytest.raises(ValueError, match="temperature"):
+            rejected.result(timeout=10)
+
+
+def test_nested_engine_request_restores_outer_admission(monkeypatch, vllm_config):
+    outer = _input_processor_for_launch(monkeypatch, deepcopy(vllm_config), "narrow")
+    inner = _input_processor_for_launch(
+        monkeypatch, deepcopy(vllm_config), "verify-only"
+    )
+
+    def validate_nested_request(*_):
+        with pytest.raises(ValueError, match="temperature"):
+            _process_until_admission(inner, _sampled_params("temperature", 0.7))
+
+    outer._validate_lora = validate_nested_request
+    _process_until_admission(outer, _sampled_params("temperature", 0.7))
+    with pytest.raises(ValueError, match="temperature"):
+        _validate(_sampled_params("temperature", 0.7))
 
 
 # endregion Per-request semantics

@@ -8,6 +8,7 @@ import os
 import sys
 import weakref
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from functools import wraps
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
@@ -59,6 +60,10 @@ else:
     FlexibleArgumentParser = object
 
 logger = init_tt_logger(__name__)
+
+_tt_request_vllm_config: ContextVar["VllmConfig | None"] = ContextVar(
+    "tt_request_vllm_config", default=None
+)
 
 _STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
 _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
@@ -975,8 +980,13 @@ def _neutralize_model_owned_sampling(params) -> list[str]:
     return ignored
 
 
-def _install_block_output_input_processor_patch() -> None:
-    """Reject unsupported resumable requests and own block-output defaults.
+def _install_tt_input_processor_patch() -> None:
+    """Scope request admission to its engine and own block-output defaults.
+
+    Platform.validate_request receives no VllmConfig. Bind the requesting
+    InputProcessor's VllmConfig for that call so another live engine cannot
+    replace its speculative admission policy. ContextVar keeps concurrent
+    calls separate and restores the outer engine after a nested request.
 
     vLLM 0.25.1 validates caller-owned SamplingParams before cloning them, then
     resolves max_tokens=None on the clone. Patch that narrow boundary so TT can
@@ -1009,7 +1019,11 @@ def _install_block_output_input_processor_patch() -> None:
         unresolved_max_tokens = (
             isinstance(params, SamplingParams) and params.max_tokens is None
         )
-        request = original(self, request_id, prompt, params, *args, **kwargs)
+        token = _tt_request_vllm_config.set(self.vllm_config)
+        try:
+            request = original(self, request_id, prompt, params, *args, **kwargs)
+        finally:
+            _tt_request_vllm_config.reset(token)
 
         cloned_params = request.sampling_params
         if not is_block_output_model or cloned_params is None:
@@ -2218,8 +2232,8 @@ class TTPlatform(Platform):
                 )
                 model_config.generation_config = "vllm"
 
+        _install_tt_input_processor_patch()
         if is_block_output_model:
-            _install_block_output_input_processor_patch()
             _install_block_output_streaming_input_patch()
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()
@@ -2517,7 +2531,10 @@ class TTPlatform(Platform):
         """
         from vllm.sampling_params import SamplingType
 
-        vllm_config = cls._resolve_tt_admission_handle()
+        vllm_config = _tt_request_vllm_config.get()
+        if vllm_config is None:
+            # Direct platform callers have no InputProcessor request context.
+            vllm_config = cls._resolve_tt_admission_handle()
         spec_plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
         if spec_plan is None:
             return
@@ -2617,7 +2634,7 @@ class TTPlatform(Platform):
 
         # Reject unsupported response-contract controls. Model-owned sampling
         # controls (temperature etc.) are instead accepted and neutralized on
-        # the per-request clone in _install_block_output_input_processor_patch.
+        # the per-request clone in _install_tt_input_processor_patch.
         unsupported = []
         if params.n != 1:
             unsupported.append(f"n={params.n!r} (accepted: 1)")

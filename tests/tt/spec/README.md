@@ -88,9 +88,11 @@ and `supports_async_spec_decode`; `supports_async_decode` alone does not cover
 deferred verification. Use `--no-async-scheduling` for the synchronous
 configurations below. The `async` configuration omits that option, requests
 `sample_on_device_mode=decode_only`, and verifies the resolved mode in the
-server log. Every test here sends greedy requests to exercise the current
-`argmax_ids` acceptance path. The suite does not validate preservation of
-sampling controls for sampled requests in shared verification steps.
+server log. The acceptance tests send greedy requests to exercise the current
+`argmax_ids` acceptance path. `test_mixed_sampling.py` checks sampled requests
+beside greedy requests: ordinary decode preserves sampling when narrow decode
+is available, and admission refuses sampled requests when every step verifies.
+The suite does not establish sampled acceptance within `argmax_ids` verification.
 
 **1. Acceptance accounting, full acceptance.**
 

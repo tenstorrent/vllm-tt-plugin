@@ -560,6 +560,13 @@ stochastic acceptance (accept a draft with probability
 `min(1, p_target / p_draft)`, and on rejection sample from the normalized
 residual), which needs the target distribution, not `argmax_ids`.
 
+`_install_tt_input_processor_patch` binds the requesting
+`InputProcessor.vllm_config` while `InputProcessor.process_inputs` runs, so
+`TTPlatform.validate_request` uses that engine's `SpecPlan` even when several
+engines share a Python process. Concurrent and nested calls keep separate
+request contexts. A direct `TTPlatform.validate_request` call outside
+`InputProcessor.process_inputs` uses the process-level admission handle.
+
 **Overlap follows from that choice, and only an ordinary decode is eligible.**
 `TTAsyncDecodeController.submit_async_decode` reads `TTModelInput.spec_mode`:
 a step carrying one is registered through
