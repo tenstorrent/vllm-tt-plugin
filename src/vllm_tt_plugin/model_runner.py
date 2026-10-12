@@ -3152,6 +3152,11 @@ class TTModelRunner:
         if not want_device_sampling:
             return False
 
+        # The loaded model can narrow the class capability when its mesh has
+        # no device sampler, even if platform setup admitted this mode.
+        if not self.model.model_capabilities.get("supports_sample_on_device", True):
+            return False
+
         # Calculate number of devices per DP rank
         num_devices = self.num_devices // self.tt_data_parallel_size
 
