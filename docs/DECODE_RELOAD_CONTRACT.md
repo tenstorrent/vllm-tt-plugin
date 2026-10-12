@@ -4,7 +4,10 @@ Async device sampling deliberately allows the plugin's host token state to
 trail the TT device by one decode step. Only the plugin runner knows whether
 the host tensors are authoritative. A contract-aware tt-metal adapter declares
 `decode_input_update_contract = 1` and receives four independent boolean
-commands on every decode:
+commands on every decode.
+
+For model construction, forward-call arguments, output conversion, and state
+ownership, see the [model-plugin interface](MODEL_INTERFACE.md).
 
 ## Commands
 

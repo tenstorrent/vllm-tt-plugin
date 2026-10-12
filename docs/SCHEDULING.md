@@ -18,6 +18,8 @@ The [model capability reference](MODEL_CAPABILITIES.md) lists the declarations
 that enable each execution path. Generic speculative decoding follows the
 [speculative decoding contract](SPEC_DECODE_CONTRACT.md) and can combine
 ordinary single-token decoding with multi-token verification in one launch.
+The [model-plugin interface](MODEL_INTERFACE.md) defines the adapter calls,
+input and output formats, and lifecycle responsibilities used by this flow.
 
 ## Short Version
 
