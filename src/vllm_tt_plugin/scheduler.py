@@ -712,12 +712,53 @@ class TTScheduler(AsyncScheduler):
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        held_back = self._hold_back_partial_prefills(partial_prefills)
         try:
             result = super().schedule()
         finally:
+            for request in held_back:
+                self.waiting.add_request(request)
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
+
+    def _hold_back_partial_prefills(self, partial_prefills: list[Request]) -> list[Request]:
+        """Keep a new prompt out of a prefill step that cannot hold all of it.
+
+        The base scheduler gives each waiting prompt as much of the token budget
+        as is left after the earlier ones, so a prompt that does not fit is
+        prefilled in pieces over several steps. A model whose prefill state
+        lives in a slot another prompt can take over between the pieces (the
+        DeepSeek-V4.1 adapter: one prefill slot per mesh row) restarts such a
+        prompt from position 0 at every piece, which costs quadratic work in the
+        prompt length (measured: 16 prompts of 131072 tokens, 33 minutes to the
+        first token). When the budget holds a whole prompt (``max_num_batched_tokens
+        >= max_model_len``) no prompt ever needs to be split, so the waiting
+        queue is cut to the longest FIFO prefix whose remaining prompt tokens fit
+        the budget after the running partial prefills (always at least its first
+        request); the rest wait for the next prefill step. -> the held back
+        requests, in order (the caller puts them back behind what is left of the
+        admitted prefix)."""
+        if not self.waiting or self.max_num_scheduled_tokens < int(
+            self.vllm_config.model_config.max_model_len
+        ):
+            return []
+        budget = self.max_num_scheduled_tokens - sum(
+            r.num_tokens - r.num_computed_tokens for r in partial_prefills
+        )
+        admitted = create_request_queue(self.policy)
+        held: list[Request] = []
+        used = 0
+        while self.waiting:
+            request = self.waiting.pop_request()
+            need = request.num_tokens - request.num_computed_tokens
+            if held or (admitted and used + need > budget):
+                held.append(request)
+                continue
+            admitted.add_request(request)
+            used += need
+        self.waiting = admitted
+        return held
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
