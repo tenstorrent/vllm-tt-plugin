@@ -6,7 +6,8 @@ name: Lint and host tests
 on:
   pull_request:
     branches: [main, "release/*"]
-    types: [opened, synchronize, reopened, ready_for_review]
+    # converted_to_draft starts an all-skipped run that cancels the in-flight one.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
     inputs:
       tt-metal-tag:
@@ -118,6 +119,7 @@ jobs:
     name: host-tests-ttnn (${{ matrix.tt-metal-tag }}, ubuntu-${{ matrix.ubuntu }})
     needs: resolve-tt-metal
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -148,20 +150,17 @@ jobs:
         run: "$VIRTUAL_ENV/bin/python -m pytest tests/ --ignore=tests/tt"
 
   required-checks:
-    # The only check the branch ruleset should require; host-tests-ttnn only warns.
+    # The only check the branch ruleset should require. host-tests-ttnn is left
+    # out so a slow or failed real-ttnn leg can never hold up a merge.
     if: ${{ always() && !github.event.pull_request.draft }}
-    needs: [pre-commit, host-tests-stubbed, host-tests-ttnn]
+    needs: [pre-commit, host-tests-stubbed]
     runs-on: ubuntu-latest
     steps:
       - name: Gate on pre-commit and stubbed host tests
         env:
           PRE_COMMIT: ${{ needs.pre-commit.result }}
           STUBBED: ${{ needs.host-tests-stubbed.result }}
-          TTNN: ${{ needs.host-tests-ttnn.result }}
         run: |
-          if [ "$TTNN" != success ]; then
-            echo "::warning::host-tests-ttnn is '$TTNN'; real-ttnn failures do not block merging"
-          fi
           if [ "$PRE_COMMIT" != success ] || [ "$STUBBED" != success ]; then
             echo "::error::pre-commit is '$PRE_COMMIT', host-tests-stubbed is '$STUBBED'"
             exit 1

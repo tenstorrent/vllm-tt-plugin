@@ -214,7 +214,8 @@ this repository does not carry SPDX headers.
 
 `.github/workflows/lint-and-host-tests.yaml` runs on pull requests into `main`
 and `release/*` that are not drafts: when opened, reopened, pushed to, or
-marked ready for review. Draft pull requests run nothing. Its jobs:
+marked ready for review. Draft pull requests run nothing, and converting a
+pull request to draft cancels its run in progress. Its jobs:
 
 - `pre-commit` on `ubuntu-latest`
 - `host-tests-stubbed` on Python 3.10 and 3.12 with `tests/host-stubs`, which
@@ -222,7 +223,8 @@ marked ready for review. Draft pull requests run nothing. Its jobs:
   when the documented install path rots, which is intentional.
 - `host-tests-ttnn` with real `ttnn`, inside tt-metal's Ubuntu 22.04 and 24.04
   release images for the latest stable tag and the latest release tag (dev or
-  rc). Its failures warn but do not block merging. A `workflow_dispatch` run
+  rc). Its failures show on the pull request but do not block merging, and
+  `required-checks` does not wait for it. A `workflow_dispatch` run
   can name one tt-metal tag instead.
 - `required-checks`, which fails unless `pre-commit` and every
   `host-tests-stubbed` leg pass. It is the check to require in the branch
