@@ -2529,6 +2529,7 @@ class TTPlatform(Platform):
         per-request controls, and a launch may legitimately mix requests that
         speculate with requests that cannot.
         """
+        from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingType
 
         vllm_config = _tt_request_vllm_config.get()
@@ -2590,7 +2591,7 @@ class TTPlatform(Platform):
                 "Sampled requests (temperature, the penalties) ARE served "
                 "here -- they simply decode without speculation."
             )
-        raise ValueError(
+        raise VLLMValidationError(
             f"Speculative decoding on {cls.device_name} cannot serve this "
             f"request's {unsupported + sampled}. {' '.join(reasons)} Drop the "
             "controls above, or drop the speculative flags from the server"

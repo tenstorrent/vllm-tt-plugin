@@ -19,6 +19,7 @@ import pytest
 # modules. Letting a plugin import trigger that bootstrap deadlocks the cycle
 # on a half-built module, so let vLLM finish importing itself first.
 import vllm  # noqa: F401
+from vllm.exceptions import VLLMValidationError
 
 from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import (
@@ -308,7 +309,7 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
 
     _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=narrow)
     params = SamplingParams(temperature=0.0, **{field: value})
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(VLLMValidationError) as excinfo:
         _validate(params)
     message = str(excinfo.value)
     assert "cannot serve" in message
@@ -362,7 +363,7 @@ def test_a_sampled_request_is_refused_where_every_step_verifies(
     would come back as greedy text with a 200, so it is refused instead.
     """
     _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(VLLMValidationError) as excinfo:
         _validate(_sampled_params(field, value))
     message = str(excinfo.value)
     assert f"{field}={value!r}" in message
@@ -438,7 +439,7 @@ def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
     try:
         _validate(params)
         admitted = True
-    except ValueError:
+    except VLLMValidationError:
         admitted = False
 
     assert admitted is speculable
@@ -525,7 +526,7 @@ def test_each_live_engine_uses_its_own_speculative_admission(
             launch == "verify-only" and (field, value) != ("temperature", 0.0)
         ) or (launch == "narrow" and field == "logprobs")
         if rejected:
-            with pytest.raises(ValueError, match=field):
+            with pytest.raises(VLLMValidationError, match=field):
                 _process_until_admission(processor, params)
         else:
             _process_until_admission(processor, params)
@@ -534,7 +535,7 @@ def test_each_live_engine_uses_its_own_speculative_admission(
     # platform calls must still read the last engine after either exception.
     params = _sampled_params("temperature", 0.7)
     if launches[-1] == "verify-only":
-        with pytest.raises(ValueError, match="temperature"):
+        with pytest.raises(VLLMValidationError, match="temperature"):
             _validate(params)
     else:
         _validate(params)
@@ -557,7 +558,7 @@ def test_concurrent_engine_requests_keep_separate_admission(monkeypatch, vllm_co
             for processor in processors
         ]
         accepted.result(timeout=10)
-        with pytest.raises(ValueError, match="temperature"):
+        with pytest.raises(VLLMValidationError, match="temperature"):
             rejected.result(timeout=10)
 
 
@@ -568,12 +569,12 @@ def test_nested_engine_request_restores_outer_admission(monkeypatch, vllm_config
     )
 
     def validate_nested_request(*_):
-        with pytest.raises(ValueError, match="temperature"):
+        with pytest.raises(VLLMValidationError, match="temperature"):
             _process_until_admission(inner, _sampled_params("temperature", 0.7))
 
     outer._validate_lora = validate_nested_request
     _process_until_admission(outer, _sampled_params("temperature", 0.7))
-    with pytest.raises(ValueError, match="temperature"):
+    with pytest.raises(VLLMValidationError, match="temperature"):
         _validate(_sampled_params("temperature", 0.7))
 
 
