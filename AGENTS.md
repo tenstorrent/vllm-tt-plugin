@@ -230,10 +230,13 @@ pull request to draft cancels its run in progress. Its jobs:
   `host-tests-stubbed` leg pass. It is the check to require in the branch
   ruleset, so matrix changes never touch the ruleset.
 
-Torch comes from tt-metal's `tt_metal/python_env/requirements-dev.txt`:
-`host-tests-ttnn` installs the pin of the tag each leg tests, and
-`host-tests-stubbed`, which tests no tag, installs the latest stable tag's pin.
-Both install pytest through the `dev` extra.
+Torch comes from tt-metal's `tt_metal/python_env/requirements-dev.txt`, read by
+`.github/scripts/tt-metal-torch-pin.sh`: `host-tests-ttnn` installs the pin of
+the tag each leg tests, and `host-tests-stubbed`, which tests no tag, installs
+the latest stable tag's pin. The two lookups are separate jobs:
+`resolve-stable` feeds the required path, and `resolve-tt-metal` feeds only
+`host-tests-ttnn`, so a newer or requested tag that cannot be resolved fails
+only the advisory job. Both test jobs install pytest through the `dev` extra.
 
 **There is no hardware CI in this repository.** Plugin pull requests do not
 dispatch tt-metal `vllm-model-tests`. That workflow is workflow_dispatch, and

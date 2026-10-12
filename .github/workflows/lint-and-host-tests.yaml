@@ -33,50 +33,75 @@ jobs:
           python-version: "3.10"
       - uses: pre-commit/action@v3.0.1
 
-  resolve-tt-metal:
-    # Both test jobs need this one, so a draft skips them too.
+  resolve-stable:
+    # Every test job depends on this one, so a draft skips them too.
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     outputs:
-      stable: ${{ steps.resolve.outputs.stable }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      torch-pin: ${{ steps.resolve.outputs.torch-pin }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Resolve the latest stable release and its torch pin
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo tenstorrent/tt-metal --exclude-drafts --exclude-pre-releases \
+            --limit 1 --json tagName --jq '.[0].tagName')
+          pin=$(bash .github/scripts/tt-metal-torch-pin.sh "$tag")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "torch-pin=$pin" >> "$GITHUB_OUTPUT"
+          echo "stable=$tag torch-pin=$pin"
+
+  resolve-tt-metal:
+    # Advisory: a bad newer or requested tag fails only host-tests-ttnn.
+    needs: resolve-stable
+    runs-on: ubuntu-latest
+    outputs:
       tags: ${{ steps.resolve.outputs.tags }}
       torch-pins: ${{ steps.resolve.outputs.torch-pins }}
     steps:
-      - name: Resolve release tags and their torch pins
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Resolve the tags to test and their torch pins
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.tt-metal-tag }}
+          STABLE: ${{ needs.resolve-stable.outputs.tag }}
+          STABLE_PIN: ${{ needs.resolve-stable.outputs.torch-pin }}
         run: |
           set -euo pipefail
-          newest() {
-            gh release list --repo tenstorrent/tt-metal --exclude-drafts --limit 1 \
-              --json tagName --jq '.[0].tagName' "$@"
-          }
-          stable=$(newest --exclude-pre-releases)
           if [ -n "$REQUESTED" ]; then
             tags=$(jq -cn --arg t "$REQUESTED" '[$t]')
           else
-            tags=$(jq -cn --arg s "$stable" --arg l "$(newest)" '[$s, $l] | unique')
+            latest=$(gh release list --repo tenstorrent/tt-metal --exclude-drafts --limit 1 \
+              --json tagName --jq '.[0].tagName')
+            tags=$(jq -cn --arg s "$STABLE" --arg l "$latest" '[$s, $l] | unique')
           fi
-          # The ttnn wheel declares no torch; each tt-metal tag pins it here.
           pins='{}'
-          for tag in $(jq -r --arg s "$stable" '. + [$s] | unique | .[]' <<<"$tags"); do
-            pin=$(curl -fsSL "https://raw.githubusercontent.com/tenstorrent/tt-metal/$tag/tt_metal/python_env/requirements-dev.txt" \
-              | sed -nE "s/^(torch==[^ ;]+) *;.*x86_64.*/\1/p")
-            [ -n "$pin" ] || { echo "no x86_64 torch pin in tt-metal $tag requirements-dev.txt" >&2; exit 1; }
+          for tag in $(jq -r '.[]' <<<"$tags"); do
+            if [ "$tag" = "$STABLE" ]; then
+              pin=$STABLE_PIN
+            else
+              pin=$(bash .github/scripts/tt-metal-torch-pin.sh "$tag")
+            fi
             pins=$(jq -c --arg t "$tag" --arg p "$pin" '. + {($t): $p}' <<<"$pins")
           done
-          {
-            echo "stable=$stable"
-            echo "tags=$tags"
-            echo "torch-pins=$pins"
-          } >> "$GITHUB_OUTPUT"
-          echo "stable=$stable tags=$tags torch-pins=$pins"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "torch-pins=$pins" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags torch-pins=$pins"
 
   host-tests-stubbed:
     # tests/host-stubs answers `import ttnn`, so this needs no tt-metal at all.
-    needs: resolve-tt-metal
+    needs: resolve-stable
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -87,7 +112,7 @@ jobs:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
       # Keeps vLLM's transitive torch ecosystem on CPU wheels, as in tt-metal.
       UV_TORCH_BACKEND: cpu
-      TORCH_PIN: ${{ fromJSON(needs.resolve-tt-metal.outputs.torch-pins)[needs.resolve-tt-metal.outputs.stable] }}
+      TORCH_PIN: ${{ needs.resolve-stable.outputs.torch-pin }}
     steps:
       - uses: actions/checkout@v4
 
