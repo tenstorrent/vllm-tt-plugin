@@ -18,8 +18,9 @@ models, where CPU sampling used to dominate each step. It is smaller with
 greedy decoding, few concurrent requests, or larger models and long contexts,
 where the model's own compute dominates. Models on the shared tt_transformers
 code opt in with one flag; others implement a small "run the forward now,
-sample later" interface. It is opt-in and decode-only, and anything
-unsupported falls back to the CPU path automatically.
+sample later" interface. It is opt-in and decode-only. Ineligible steps fall
+back to the CPU path before forward submission; unsupported launch combinations
+may instead be rejected, and failures after deferred submission are terminal.
 
 ## Status
 
