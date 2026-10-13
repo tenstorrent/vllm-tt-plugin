@@ -71,7 +71,10 @@ in **Gotchas** at the end.
   under `vllm/v1/engine/`, worker calls under `vllm/v1/executor/` and `vllm/v1/worker/`) and
   confirm the TT class provides it with TT-correct behavior — a base default TT doesn't
   override now runs on TT. Also list dataclass fields the plugin only reads: a rename or
-  semantic change there fails no import.
+  semantic change there fails no import and may show only on models that exercise it.
+- Overridden methods — for each method TT overrides, also diff the upstream implementations
+  it replaces (the base plus the GPU `Worker`/`GPUModelRunner` counterpart); duties added
+  there are silently skipped on TT.
 
 Known surface (verify against current source):
 - **Subclassed bases** — `TTPlatform(Platform)`, `TTModelLoader(BaseModelLoader)`,
@@ -92,6 +95,8 @@ Known surface (verify against current source):
   the base default fails on TT), `EngineCore` reading `scheduler.ec_connector` (set to
   `None` on `TTLaneCoordinator`), and the read-only `KVCacheTensor.layers` (formerly
   `shared_by`).
+- **Upstream duties TT carries** — `TTWorker.compile_or_warm_up_model` calls
+  `set_torch_threads_for_runtime()`; `TTPlatform` forces `mm_device_do_normalize = False`.
 
 The snapshot above is the surface *as last observed* — a concrete instance of a general
 pattern, not a current guarantee. Follow the general pattern regardless: re-derive the five
@@ -111,8 +116,10 @@ diverge.
   change to its release, which the tracking issue's per-version diffs need.
 - Environment and startup preconditions: from the `envs.py` diff, note new or renamed
   variables and changed defaults; scan the engine/executor/worker startup diffs for new
-  `raise`/`assert`/resource checks (0.27 added a `/dev/shm` check — 160 MiB per DP engine —
-  that failed in CI containers).
+  `raise`/`assert`/resource checks.
+- Config derived from the upstream model class: TT runs its own model, so a flag that hands
+  work from the processor to the upstream model skips that work on TT — force such flags
+  off in `TTPlatform`.
 - When subagents are available, parallelize by subsystem — worker/platform,
   scheduler/lane, runner/outputs/sampling, config/loader/kv-cache,
   entrypoints/monkeypatch/utils — handing each the exact symbols + plugin `file:line` anchors.
@@ -137,8 +144,7 @@ For every coupled symbol: **CHANGE** (what differs) → **PLUGIN IMPACT** (`file
 - `BREAKING-ENV` — a new env var, changed default, or startup check the TT deployment or CI
   doesn't satisfy.
 - `BEHAVIORAL` — still runs, but semantics changed.
-- `REDUNDANT` — upstream now does what a plugin workaround does (e.g. 0.29 holds a preempted
-  request's resume until its stale output drains); the workaround can go.
+- `REDUNDANT` — upstream now does what a plugin workaround does; the workaround can go.
 - `NONE`.
 
 Prioritize: new required `__init__` params or abstract methods on subclassed bases;
@@ -161,13 +167,16 @@ workarounds (`platform.py` patches, scheduler/lane overrides) for `REDUNDANT` on
   `source docs/install-vllm-tt.sh` — rebuilds vLLM's `empty` target and reinstalls the
   plugin. Re-verify the import origin and `vllm.__version__`. The rebuild replaces BASELINE
   for everything else using that venv — ask first, and offer the Phase 2 shadow run instead.
-- Host-only tests: `python -m pytest tests/ --ignore=tests/tt`. Add device/server tests
-  (`tests/tt`, needs a running server) only when the change touches device behavior.
+- Host-only tests: `python -m pytest tests/ --ignore=tests/tt`. They miss device-only
+  regressions; validate on device before merging, covering DP, multimodal, and
+  multi-KV-group (hybrid) models.
 
 ## Phase 6 — Record & ship
 - Findings → the tracking issue: a concise summary + concise per-version diffs, **no
   proposed solutions**.
-- Change → a PR per `.github/pull_request_template.md`, title prefixed `[deps]`.
+- Change → a PR per `.github/pull_request_template.md`, title prefixed `[deps]`. Keep its
+  validation section to the final full device run plus one confirmation run per device fix;
+  drop superseded runs.
 - Version model: `main` follows the latest supported vLLM; there are no release branches.
   Before merging, tag the last `main` commit that targets BASELINE as an annotated
   `compat/vllm-<BASELINE>` and push it — the README points older-version users at these
