@@ -2349,6 +2349,16 @@ class TTPlatform(Platform):
             get_tt_max_batch_size(vllm_config),
         )
         if spec_plan is not None:
+            # The Rust frontend handles HTTP outside Python, so nothing runs
+            # TTPlatform.validate_request: a sampled request on a launch whose
+            # every decode step verifies would commit the target argmax, and
+            # logprobs, grammars and token filters would go unapplied.
+            if bool(int(os.environ.get("VLLM_USE_RUST_FRONTEND", "0"))):
+                raise ValueError(
+                    "Speculative decoding requires the Python frontend: the "
+                    "Rust frontend bypasses the TT request validation; unset "
+                    "VLLM_USE_RUST_FRONTEND or drop the speculative flags"
+                )
             requested_k = vllm_config.speculative_config.num_speculative_tokens
             if spec_plan.effective_k != requested_k:
                 # Published back, because vLLM's own scheduler budgets its

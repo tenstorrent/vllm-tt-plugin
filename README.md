@@ -723,6 +723,8 @@ refuses a request with a non-zero temperature or a penalty on that launch.
 `TTPlatform.validate_request` rejects logprobs, structured output,
 `logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
 speculative launch. Prompt logprobs remain unsupported for all TT models.
+Only vLLM's Python frontend runs these checks, so a speculative launch with
+`VLLM_USE_RUST_FRONTEND=1` is refused at startup.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
 acceptance, K+1 lookahead reservation and lifecycle hooks. See

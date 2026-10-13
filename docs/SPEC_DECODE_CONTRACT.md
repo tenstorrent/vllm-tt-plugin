@@ -56,10 +56,12 @@ serve speculative decoding within the following execution limits:
 
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative
-launch cannot apply. On a launch with narrow decode, temperature and penalties
-instead suppress draft publication and keep every step they are part of an
-ordinary decode, which uses the selected model's normal sampling path (section
-4d). Separately, `TTPlatform` can disable async scheduling when
+launch cannot apply. Only vLLM's Python frontend calls it, so
+`TTPlatform.check_and_update_config` refuses a speculative launch with
+`VLLM_USE_RUST_FRONTEND=1`. On a launch with narrow decode, temperature and
+penalties instead suppress draft publication and keep every step they are part
+of an ordinary decode, which uses the selected model's normal sampling path
+(section 4d). Separately, `TTPlatform` can disable async scheduling when
 `supports_async_decode` is absent (section 4c).
 
 The CPU acceptance helper `spec_accept.accept_speculated_tokens` is implemented,
