@@ -324,16 +324,45 @@ Common options:
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
 
+### Default top-k for device sampling
+
+The TT device sampler draws only from the 32 most probable tokens. A model class declares this limit as `max_device_top_k` (see [Sampling limits](#sampling-limits)). When a request has a temperature above 0 and a `top_k` that is unset or above the limit, the plugin samples the whole batch on host for that step. Host sampling reads back the full-vocabulary logits on every decode step, so decode is much slower than with device sampling.
+
+Most requests do not set `top_k`: the OpenAI Python client has no `top_k` argument, and `vllm bench serve` sends no sampling parameters. vLLM then uses the default from the model's `generation_config.json`. Llama 3.1, Llama 3.3 and GPT-OSS define no `top_k` default, which means all tokens. Gemma 3 and Gemma 4 define `top_k: 64`. So with these models, every request that does not set `top_k` samples on host.
+
+To keep these requests on the device, start the server with a default `top_k` equal to the device limit:
+
+```bash
+--override-generation-config '{"top_k": 32}'
+```
+
+vLLM merges this value into the model's default sampling parameters. It applies only to requests that do not set `top_k`. A request that sets its own `top_k` keeps it, and a value above 32 still samples on host.
+
+Use this setting when all of these are true:
+
+- `sample_on_device_mode` is set, and the model supports device sampling on the mesh.
+- The model's default temperature is above 0. Greedy requests do not use `top_k`.
+- The model's default `top_k` is unset or above 32.
+
+Do not use it when the model's default `top_k` is 32 or less, for example Qwen3 (`top_k: 20`). The override replaces the model default, so it would widen it. Do not use it when the server samples on host, because it then only changes the distribution and does not make decode faster.
+
+The setting is an approximation: "all tokens", or 64 for Gemma, becomes the 32 most probable tokens. A client that needs the model's full distribution sets `top_k` in the request (for example `extra_body={"top_k": 0}` with the OpenAI client) and accepts host sampling for that request.
+
+Some model classes do not declare `max_device_top_k`, for example the tt-metal `models/demos/gemma4` and `models/demos/llama31_8b_qb2` classes ([tenstorrent/tt-metal#60365](https://github.com/tenstorrent/tt-metal/issues/60365)). For them, the plugin does not route by `top_k`, and the device sampler changes any `top_k` above 32 to 32 without a message. The setting is still recommended for these models: the request then asks for what the device does.
+
 ### Structured Output Sampling
 
 Structured-output decode can use TT device sampling on models that declare
 `supports_device_grammar`. It is off by default. To enable it, set a
-`sample_on_device_mode` and turn off async scheduling:
+`sample_on_device_mode` and turn off async scheduling. The example also sets
+the [default top-k](#default-top-k-for-device-sampling), because requests
+without `top_k` to the default Llama model would otherwise sample on host:
 
 ```bash
 MESH_DEVICE=T3K \
 python examples/server_example_tt.py \
   --no-async-scheduling \
+  --override-generation-config '{"top_k": 32}' \
   --additional-config '{"tt": {"sample_on_device_mode": "decode_only"}}'
 ```
 
@@ -484,6 +513,7 @@ python examples/server_example_tt.py \
   --data_parallel_size 4 \
   --max_num_seqs 8 \
   --async-scheduling \
+  --override-generation-config '{"top_k": 32}' \
   --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
@@ -911,7 +941,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## Sampling limits
 
-Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing.
+Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing. To keep requests that do not set `top_k` on the device, see [Default top-k for device sampling](#default-top-k-for-device-sampling).
 
 Block-output models (`output_tokens_per_step > 1`) cannot declare this capability: their model-owned sampler produces a complete canvas, which the host sampler cannot replace. The combination is rejected at startup.
 
