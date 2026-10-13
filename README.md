@@ -396,7 +396,8 @@ With `VLLM_LOGGING_LEVEL=DEBUG`, each device-grammar step logs
 [`docs/SCHEDULING.md`](docs/SCHEDULING.md#when-steady-async-decode-is-allowed)
 for the execution flow and
 [`docs/MODEL_CAPABILITIES.md`](docs/MODEL_CAPABILITIES.md#sampling-and-async-capabilities)
-for the capability contract.
+for the capability contract. Model authors implement the
+[device grammar contract](docs/DEVICE_GRAMMAR_CONTRACT.md).
 
 ### Model Fabric Configuration
 
