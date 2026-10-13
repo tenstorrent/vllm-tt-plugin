@@ -10,13 +10,11 @@ agent: agent
 ## Usage
 
 Point an agent at this file with the target version — only TARGET is needed
-(BASELINE = the currently installed vLLM):
+(BASELINE = the currently installed vLLM), e.g.:
 
 ```
 Follow .github/prompts/vllm-upgrade-assessment.prompt.md; assess this plugin against vLLM v0.28.0.
 ```
-
-In Copilot for VS Code this file is also slash-invocable as `/vllm-upgrade-assessment`.
 
 Determine, and if asked apply, the plugin changes required to target a new upstream
 vLLM version. The plugin binds vLLM's **internal v1 APIs**, so every minor bump can
@@ -31,6 +29,10 @@ If tt-buddy skills are available, use `tt:learn`/`tt:note` and subagents as acce
 otherwise the phases below stand alone.
 
 ## Phase 0 — Pin the environment
+- Check for an in-flight bump first: search PRs (all states) and remote branches for TARGET
+  or any intermediate version (e.g., `gh pr list --state all --search "vllm in:title"`,
+  `git ls-remote --heads origin '*compat*'`). If exists, ask before working on the existing
+  PR/branch or starting a parallel one.
 - Activate the tt-metal venv, then resolve the installed checkout (the only authority):
   `python -c "import importlib.util as u; print(u.find_spec('vllm_tt_plugin').origin)"`.
   Confirm it is the tree you intend to assess.
@@ -62,6 +64,14 @@ in **Gotchas** at the end.
 - Monkeypatch / override sites: read `platform.py` (patches live here), `entrypoints.py`,
   `scheduler.py`, `lane_scheduler.py`, `worker.py`, `model_runner.py`, `input_batch.py`,
   `launcher.py`.
+- Run the greps over `tests/` too: fakes and stubs mimic upstream internals (e.g., a fake
+  engine's `_finish_pause`) and silently stop matching when those change.
+- Reverse coupling — upstream calling into or reading plugin objects. For each subclassed
+  base, grep TARGET for what upstream calls or reads on that object (e.g., `self.scheduler.`
+  under `vllm/v1/engine/`, worker calls under `vllm/v1/executor/` and `vllm/v1/worker/`) and
+  confirm the TT class provides it with TT-correct behavior — a base default TT doesn't
+  override now runs on TT. Also list dataclass fields the plugin only reads: a rename or
+  semantic change there fails no import.
 
 Known surface (verify against current source):
 - **Subclassed bases** — `TTPlatform(Platform)`, `TTModelLoader(BaseModelLoader)`,
@@ -78,45 +88,70 @@ Known surface (verify against current source):
   `EngineCore.reset_prefix_cache`, `EngineCore`/`EngineCoreProc.pause_scheduler`.
 - **Helpers** — `vllm.utils.{torch_utils,system_utils,network_utils,math_utils,import_utils,argparse_utils}`
   and `vllm.utils.length_from_prompt_token_ids_or_embeds`.
+- **Reverse coupling** — `WorkerBase.get_supported_kv_cache_layouts()` (TT returns `LBNHC`;
+  the base default fails on TT), `EngineCore` reading `scheduler.ec_connector` (set to
+  `None` on `TTLaneCoordinator`), and the read-only `KVCacheTensor.layers` (formerly
+  `shared_by`).
 
 The snapshot above is the surface *as last observed* — a concrete instance of a general
-pattern, not a current guarantee. Follow the general pattern regardless: re-derive the four
+pattern, not a current guarantee. Follow the general pattern regardless: re-derive the five
 categories (subclassed bases, constructed dataclasses, monkeypatch targets, imported
-helpers) from source and treat that as authoritative. If a coupling was added or removed,
-the greps catch it and this list will not — update the snapshot when they diverge.
+helpers, reverse coupling) from source and treat that as authoritative. If a coupling was
+added or removed, the greps catch it and this list will not — update the snapshot when they
+diverge.
 
-## Phase 2 — Diff the coupled files (BASELINE vs TARGET)
-- BASELINE side = the pinned baseline source (per the Phase 0 gate). When installed == pin,
-  read the exact local tree `.../site-packages/vllm/<path>` — fastest and byte-exact.
-  Otherwise read the pinned tag `refs/tags/v<pin>` the same way as TARGET below; never diff
-  against a drifted installed version.
-- TARGET side = upstream at the tag: fetch `vllm/<path>` at `refs/tags/<TARGET>` via your
-  GitHub file tool, or `https://raw.githubusercontent.com/vllm-project/vllm/<TARGET>/<path>`.
-  No shell `curl`/`gh`/`git` clone needed.
-- Also diff `requirements/common.txt` (BASELINE tag vs TARGET tag) for dependency changes
-  and any impact on `docs/vllm-overrides.txt`.
+## Phase 2 — Diff upstream release by release, then shadow-run the tests
+- Fetch source tarballs for BASELINE (the pin, per the Phase 0 gate), every intermediate
+  minor (`vX.Y.0`), and TARGET:
+  `mkdir -p /tmp/vllm-assess/<tag> && curl -sL https://github.com/vllm-project/vllm/archive/refs/tags/<tag>.tar.gz | tar xz --strip-components=1 -C /tmp/vllm-assess/<tag>`.
+- Diff each consecutive pair over whole directories, not only the coupled files — moved
+  symbols show up only there: `diff -ru /tmp/vllm-assess/{<A>,<B>}/vllm/v1`, likewise
+  `vllm/config/`, `vllm/distributed/`, `vllm/envs.py`, and `requirements/common.txt`
+  (dependency changes; check `docs/vllm-overrides.txt`). Consecutive pairs attribute each
+  change to its release, which the tracking issue's per-version diffs need.
+- Environment and startup preconditions: from the `envs.py` diff, note new or renamed
+  variables and changed defaults; scan the engine/executor/worker startup diffs for new
+  `raise`/`assert`/resource checks (0.27 added a `/dev/shm` check — 160 MiB per DP engine —
+  that failed in CI containers).
 - When subagents are available, parallelize by subsystem — worker/platform,
   scheduler/lane, runner/outputs/sampling, config/loader/kv-cache,
   entrypoints/monkeypatch/utils — handing each the exact symbols + plugin `file:line` anchors.
+- Shadow-run the host tests on TARGET before editing anything — the fastest breakage list,
+  and the venv stays untouched:
+  - The tarball lacks the generated `vllm/_version.py`; add a stub with
+    `__version__ = version = "X.Y.Z"`, `__version_tuple__ = version_tuple = (X, Y, Z)`,
+    `__commit_id__ = commit_id = None`.
+  - Confirm the shadow wins:
+    `PYTHONPATH=/tmp/vllm-assess/<TARGET> python -c "import vllm; print(vllm.__file__, vllm.__version__)"`.
+  - Run `python -m pytest tests/ --ignore=tests/tt -q` plain (BASELINE) and with that
+    `PYTHONPATH` (TARGET); failures new on TARGET seed Phase 3. Third-party deps stay at
+    BASELINE versions, so cross-check failures against the `requirements/common.txt` diff.
 
 ## Phase 3 — Classify each delta
 For every coupled symbol: **CHANGE** (what differs) → **PLUGIN IMPACT** (`file:line`) → **SEVERITY**:
 - `BREAKING-IMPORT` — symbol moved / renamed / removed.
 - `BREAKING-CONSTRUCT` — dataclass gained a required field, or a field was removed/reordered.
-- `BREAKING-OVERRIDE` — a subclassed base's method signature changed, or a new abstract method appeared.
+- `BREAKING-OVERRIDE` — a subclassed base's method signature changed, a new abstract method
+  appeared, or upstream now calls/reads something on a plugin object that TT lacks or gets wrong.
 - `BREAKING-PATCH (silent)` — a monkeypatch target moved / renamed / changed signature.
+- `BREAKING-ENV` — a new env var, changed default, or startup check the TT deployment or CI
+  doesn't satisfy.
 - `BEHAVIORAL` — still runs, but semantics changed.
+- `REDUNDANT` — upstream now does what a plugin workaround does (e.g. 0.29 holds a preempted
+  request's resume until its stale output drains); the workaround can go.
 - `NONE`.
 
 Prioritize: new required `__init__` params or abstract methods on subclassed bases;
 dataclass field changes; moved/renamed/removed imported symbols; monkeypatch target
 existence and signature. `MultiGroupBlockTable.__init__` and the scheduler's stale-token
-handling have churned across bumps — check them every time.
+handling have churned across bumps — check them every time. Also walk the plugin's
+workarounds (`platform.py` patches, scheduler/lane overrides) for `REDUNDANT` ones.
 
 ## Phase 4 — Synthesize the change plan
 - Required code edits (each with `file:line` + the concrete change).
 - Version-pin bumps: `docs/install-vllm-tt.sh` (the `requirements/common.txt` URL and the
   `vllm==<ver>` pin), `README.md`, `docs/diffusion-gemma.md`.
+- Deployment / CI changes (`BREAKING-ENV`) and removable workarounds (`REDUNDANT`).
 - Low / conditional watch items (behavioral deltas, new optional fields, new default methods).
 
 ## Phase 5 — Validate (only when applying)
@@ -124,7 +159,8 @@ handling have churned across bumps — check them every time.
   on changed files (the commit/CI pre-commit job runs these plus the other hooks).
 - Build TARGET: bump `docs/install-vllm-tt.sh`, then (tt-metal venv active)
   `source docs/install-vllm-tt.sh` — rebuilds vLLM's `empty` target and reinstalls the
-  plugin. Re-verify the import origin and `vllm.__version__`.
+  plugin. Re-verify the import origin and `vllm.__version__`. The rebuild replaces BASELINE
+  for everything else using that venv — ask first, and offer the Phase 2 shadow run instead.
 - Host-only tests: `python -m pytest tests/ --ignore=tests/tt`. Add device/server tests
   (`tests/tt`, needs a running server) only when the change touches device behavior.
 
@@ -132,9 +168,10 @@ handling have churned across bumps — check them every time.
 - Findings → the tracking issue: a concise summary + concise per-version diffs, **no
   proposed solutions**.
 - Change → a PR per `.github/pull_request_template.md`, title prefixed `[deps]`.
-- Branch / version model: `main` follows the latest supported vLLM; each still-supported
-  line lives on `release/vX.Y`; cherry-pick version-agnostic TT fixes across lines; tag
-  releases (e.g. `vX.Y.Z-tt.N`).
+- Version model: `main` follows the latest supported vLLM; there are no release branches.
+  Before merging, tag the last `main` commit that targets BASELINE as an annotated
+  `compat/vllm-<BASELINE>` and push it — the README points older-version users at these
+  tags, and nothing is maintained on top of them.
 
 ## Gotchas (learned)
 - Release-notes highlights are GPU/model/kernel noise; only v1 internal API churn matters here.
