@@ -8,6 +8,9 @@ call site, storing the result under the wrong key, or resolving the plan before
 the lane fold rewrites the concurrency all fail here.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +19,7 @@ import pytest
 # modules. Letting a plugin import trigger that bootstrap deadlocks the cycle
 # on a half-built module, so let vLLM finish importing itself first.
 import vllm  # noqa: F401
+from vllm.exceptions import VLLMValidationError
 
 from tests.spec.fake_spec_model import FakeSpecModel, make_fake_spec_model
 from vllm_tt_plugin.config import (
@@ -245,6 +249,25 @@ def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
     assert "TTLaneInputBatch" in message
 
 
+def test_the_rust_frontend_cannot_speculate(monkeypatch, vllm_config):
+    # The Rust frontend serves HTTP outside Python, so per-request admission
+    # in TTPlatform.validate_request never sees its requests.
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    model = make_fake_spec_model(max_supported_num_seqs=4)
+    with pytest.raises(ValueError, match="Rust frontend"):
+        _run_hook(monkeypatch, _speculative(vllm_config), model)
+
+
+def test_the_rust_frontend_is_left_alone_when_nothing_speculates(
+    monkeypatch, vllm_config
+):
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    vllm_config.diffusion_config = None
+    vllm_config.parallel_config.distributed_executor_backend = None
+    _run_hook(monkeypatch, vllm_config, make_fake_spec_model())
+    assert require_tt_spec_plan(vllm_config) is None
+
+
 # region Per-request semantics
 
 
@@ -260,13 +283,17 @@ def _validate(params):
     TTPlatform.validate_request({"prompt_token_ids": [1, 2, 3]}, params)
 
 
-def _speculating_platform(monkeypatch, vllm_config):
+def _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=True):
     """Run the hook so a spec plan is live, and return the platform."""
     from vllm_tt_plugin.platform import TTPlatform
 
-    model = make_fake_spec_model(max_supported_num_seqs=4)
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4, supports_narrow_decode=supports_narrow_decode
+    )
     _run_hook(monkeypatch, _speculative(vllm_config), model)
-    assert get_tt_spec_plan(vllm_config) is not None
+    plan = get_tt_spec_plan(vllm_config)
+    assert plan is not None
+    assert plan.supports_narrow_decode is supports_narrow_decode
     return TTPlatform
 
 
@@ -279,15 +306,13 @@ def test_a_greedy_request_is_served_while_speculating(monkeypatch, vllm_config):
     "field, value",
     [
         ("logprobs", 1),
-        ("presence_penalty", 0.5),
-        ("frequency_penalty", 0.5),
-        ("repetition_penalty", 1.1),
         ("min_tokens", 4),
         ("bad_words", ["no"]),
     ],
 )
+@pytest.mark.parametrize("narrow", [True, False], ids=["narrow", "verify-only"])
 def test_a_request_the_greedy_walk_cannot_serve_is_refused(
-    monkeypatch, vllm_config, field, value
+    monkeypatch, vllm_config, field, value, narrow
 ):
     """Answering greedily anyway would change what was asked for, silently.
 
@@ -301,23 +326,142 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     """
     from vllm.sampling_params import SamplingParams
 
-    _speculating_platform(monkeypatch, vllm_config)
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=narrow)
     params = SamplingParams(temperature=0.0, **{field: value})
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(VLLMValidationError) as excinfo:
         _validate(params)
     message = str(excinfo.value)
-    assert "greedy requests only" in message
+    assert "cannot serve" in message
     assert field in message
+    # Only a launch with narrow decode serves sampled requests, so only its
+    # refusal may say so.
+    assert ("ARE served" in message) is narrow
 
 
-def test_a_sampled_request_is_refused_while_speculating(monkeypatch, vllm_config):
-    """A temperature is the case that would silently come back deterministic."""
+_SAMPLED = [
+    ("temperature", 0.7),
+    ("presence_penalty", 0.5),
+    ("frequency_penalty", 0.5),
+    ("repetition_penalty", 1.1),
+]
+
+
+def _sampled_params(field, value):
     from vllm.sampling_params import SamplingParams
 
+    kwargs = {"temperature": 0.0} if field != "temperature" else {}
+    kwargs[field] = value
+    return SamplingParams(**kwargs)
+
+
+@pytest.mark.parametrize("field, value", _SAMPLED)
+def test_a_sampled_request_is_admitted_and_decoded_unspeculated(
+    monkeypatch, vllm_config, field, value
+):
+    """Sampling the walk cannot certify is served WITHOUT speculation.
+
+    Refusing these made a speculating launch unusable for any sampled client:
+    every prompt of r1_gpqa_diamond and mmlu_pro came back HTTP 400, because
+    both send temperature=1.0. On a model that serves its own ordinary decode,
+    every step such a request shares runs as that decode, which applies the
+    full sampling the runner implements, so the request gets what it asked
+    for at baseline speed (``_step_verifies``).
+    """
     _speculating_platform(monkeypatch, vllm_config)
-    with pytest.raises(ValueError) as excinfo:
-        _validate(SamplingParams(temperature=0.7))
-    assert "temperature=0.7" in str(excinfo.value)
+    _validate(_sampled_params(field, value))  # must not raise
+
+
+@pytest.mark.parametrize("field, value", _SAMPLED)
+def test_a_sampled_request_is_refused_where_every_step_verifies(
+    monkeypatch, vllm_config, field, value
+):
+    """Without narrow decode, a sampled request would be answered greedily.
+
+    Such a model sends every decode step as a verify, and a verify in
+    ``argmax_ids`` mode commits the target argmax on every row. The request
+    would come back as greedy text with a 200, so it is refused instead.
+    """
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    with pytest.raises(VLLMValidationError) as excinfo:
+        _validate(_sampled_params(field, value))
+    message = str(excinfo.value)
+    assert f"{field}={value!r}" in message
+    assert "supports_narrow_decode" in message
+
+
+def test_a_greedy_request_is_served_where_every_step_verifies(monkeypatch, vllm_config):
+    """min_p, top_p and top_k do not move a greedy request's argmax."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    _validate(SamplingParams(temperature=0.0, top_p=0.5, top_k=4, min_p=0.1))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"temperature": 0.0},
+        {"temperature": 1e-6},
+        {"temperature": 1e-5},
+        {"temperature": 0.7, "seed": 3},
+        {"temperature": 0.0, "presence_penalty": -0.5},
+        {"temperature": 0.0, "frequency_penalty": 0.5},
+        {"temperature": 0.0, "repetition_penalty": 1.0},
+        {"temperature": 0.0, "repetition_penalty": 0.9},
+        {"temperature": 0.0, "top_p": 0.5, "top_k": 4, "min_p": 0.1},
+    ],
+)
+def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
+    monkeypatch, vllm_config, kwargs
+):
+    """Two predicates over one request, read on two sides of a process boundary.
+
+    Admission reads the request's ``SamplingParams`` in the front-end process.
+    The runner reads the sets vLLM's ``InputBatch.add_request`` files the same
+    request into, in the engine. Disagreement either way is a defect: a
+    request admitted that the runner then verifies by argmax, or a greedy
+    request refused for nothing. So the request goes through both, through a
+    real ``InputBatch``.
+    """
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+    from vllm_tt_plugin.input_batch import InputBatch
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    params = SamplingParams(**kwargs)
+    batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        vocab_size=64,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+    )
+    batch.add_request(
+        CachedRequestState(
+            req_id="r0",
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            sampling_params=params,
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=3,
+            output_token_ids=[],
+        )
+    )
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = batch
+    speculable = TTModelRunner._request_is_speculable(runner, "r0")
+
+    _speculating_platform(monkeypatch, vllm_config, supports_narrow_decode=False)
+    try:
+        _validate(params)
+        admitted = True
+    except VLLMValidationError:
+        admitted = False
+
+    assert admitted is speculable
 
 
 def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_config):
@@ -331,4 +475,202 @@ def test_a_request_is_unrestricted_when_nothing_speculates(monkeypatch, vllm_con
     _validate(SamplingParams(temperature=0.9, presence_penalty=0.3))
 
 
+class _ReachedModelInputValidation(Exception):
+    """Stop the real input processor after platform admission."""
+
+
+def _input_processor_for_launch(monkeypatch, vllm_config, launch):
+    import vllm.v1.engine.input_processor as input_processor
+
+    from vllm_tt_plugin.platform import TTPlatform
+
+    vllm_config.diffusion_config = None
+    vllm_config.parallel_config.distributed_executor_backend = None
+    vllm_config.parallel_config.local_engines_only = False
+    if launch != "ordinary":
+        _speculative(vllm_config)
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4, supports_narrow_decode=launch == "narrow"
+    )
+    _run_hook(monkeypatch, vllm_config, model)
+    monkeypatch.setattr(input_processor, "current_platform", TTPlatform)
+    processor = object.__new__(input_processor.InputProcessor)
+    processor.vllm_config = vllm_config
+    processor._validate_params = lambda *_: None
+    processor._validate_lora = lambda *_: None
+
+    def reached_model_input_validation(*_):
+        raise _ReachedModelInputValidation
+
+    processor._validate_model_inputs = reached_model_input_validation
+    return processor
+
+
+def _process_until_admission(processor, params):
+    try:
+        processor.process_inputs(
+            request_id="r0",
+            prompt={"type": "token", "prompt_token_ids": [1, 2, 3]},
+            params=params,
+            supported_tasks=("generate",),
+        )
+    except _ReachedModelInputValidation:
+        return
+    raise AssertionError("InputProcessor did not reach model input validation")
+
+
+@pytest.mark.parametrize(
+    "launches",
+    [
+        ("narrow", "verify-only"),
+        ("verify-only", "narrow"),
+        ("ordinary", "verify-only"),
+        ("verify-only", "ordinary"),
+    ],
+)
+@pytest.mark.parametrize(
+    "field,value", [*_SAMPLED, ("temperature", 0.0), ("logprobs", 1)]
+)
+def test_each_live_engine_uses_its_own_speculative_admission(
+    monkeypatch, vllm_config, launches, field, value
+):
+    """A second engine must not change the first engine's request policy."""
+    processors = [
+        _input_processor_for_launch(monkeypatch, deepcopy(vllm_config), launch)
+        for launch in launches
+    ]
+    for launch, processor in zip(launches, processors):
+        params = _sampled_params(field, value)
+        rejected = (
+            launch == "verify-only" and (field, value) != ("temperature", 0.0)
+        ) or (launch == "narrow" and field == "logprobs")
+        if rejected:
+            with pytest.raises(VLLMValidationError, match=field):
+                _process_until_admission(processor, params)
+        else:
+            _process_until_admission(processor, params)
+
+    # Each processor above raises after admission or at rejection. Direct
+    # platform calls must still read the last engine after either exception.
+    params = _sampled_params("temperature", 0.7)
+    if launches[-1] == "verify-only":
+        with pytest.raises(VLLMValidationError, match="temperature"):
+            _validate(params)
+    else:
+        _validate(params)
+
+
+def test_concurrent_engine_requests_keep_separate_admission(monkeypatch, vllm_config):
+    processors = [
+        _input_processor_for_launch(monkeypatch, deepcopy(vllm_config), launch)
+        for launch in ("narrow", "verify-only")
+    ]
+    barrier = Barrier(2, timeout=5)
+    for processor in processors:
+        processor._validate_lora = lambda *_: barrier.wait()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        accepted, rejected = [
+            pool.submit(
+                _process_until_admission, processor, _sampled_params("temperature", 0.7)
+            )
+            for processor in processors
+        ]
+        accepted.result(timeout=10)
+        with pytest.raises(VLLMValidationError, match="temperature"):
+            rejected.result(timeout=10)
+
+
+def test_nested_engine_request_restores_outer_admission(monkeypatch, vllm_config):
+    outer = _input_processor_for_launch(monkeypatch, deepcopy(vllm_config), "narrow")
+    inner = _input_processor_for_launch(
+        monkeypatch, deepcopy(vllm_config), "verify-only"
+    )
+
+    def validate_nested_request(*_):
+        with pytest.raises(VLLMValidationError, match="temperature"):
+            _process_until_admission(inner, _sampled_params("temperature", 0.7))
+
+    outer._validate_lora = validate_nested_request
+    _process_until_admission(outer, _sampled_params("temperature", 0.7))
+    with pytest.raises(VLLMValidationError, match="temperature"):
+        _validate(_sampled_params("temperature", 0.7))
+
+
 # endregion Per-request semantics
+
+
+class _FakeBatch:
+    def __init__(self, random=(), presence=(), frequency=(), repetition=()):
+        self.random_reqs = set(random)
+        self.presence_penalties_reqs = set(presence)
+        self.frequency_penalties_reqs = set(frequency)
+        self.repetition_penalties_reqs = set(repetition)
+
+
+def _speculable(**batch_kwargs):
+    """Call the runner's gate without building a runner."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch(**batch_kwargs)
+    return TTModelRunner._request_is_speculable(runner, "r0")
+
+
+def test_a_greedy_request_is_speculable():
+    assert _speculable() is True
+
+
+@pytest.mark.parametrize(
+    "batch_kwargs",
+    [
+        {"random": ["r0"]},
+        {"presence": ["r0"]},
+        {"frequency": ["r0"]},
+        {"repetition": ["r0"]},
+    ],
+    ids=["temperature", "presence", "frequency", "repetition"],
+)
+def test_sampling_the_walk_cannot_certify_is_not_speculable(batch_kwargs):
+    """accept_greedy_drafts compares ids, so it can only certify argmax.
+
+    Proposing for these and accepting on id equality would return greedy text
+    for a request that asked to sample -- the silent failure the refusal was
+    protecting against. Withholding the drafts keeps that protection without
+    refusing the request.
+    """
+    assert _speculable(**batch_kwargs) is False
+
+
+def test_another_request_being_sampled_does_not_block_this_one():
+    """The gate is per request: a mixed batch still speculates where it can."""
+    assert _speculable(random=["other"]) is True
+
+
+def _publish(tokens, **batch_kwargs):
+    """Drive the single publish choke point every proposer goes through."""
+    from vllm_tt_plugin.model_runner import TTModelRunner
+
+    runner = object.__new__(TTModelRunner)
+    runner.input_batch = _FakeBatch(**batch_kwargs)
+    runner._proposed_draft_token_ids = {"r0": [9, 9]}  # a stale earlier offer
+    TTModelRunner._publish_draft(runner, "r0", tokens)
+    return runner._proposed_draft_token_ids
+
+
+def test_a_greedy_request_publishes_its_drafts():
+    assert _publish([1, 2, 3]) == {"r0": [1, 2, 3]}
+
+
+def test_a_sampled_request_publishes_nothing_and_erases_the_stale_offer():
+    """Both proposers route through here, so neither can bypass the gate.
+
+    The erase matters as much as the withholding: this map is what the
+    scheduler verifies next, so a stale entry would be verified against a
+    token the request has already moved past.
+    """
+    assert _publish([1, 2, 3], random=["r0"]) == {}
+
+
+def test_an_empty_offer_erases_the_stale_offer():
+    assert _publish([]) == {}

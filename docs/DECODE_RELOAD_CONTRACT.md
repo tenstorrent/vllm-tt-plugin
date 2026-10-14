@@ -100,10 +100,11 @@ transition are still represented by `slot_remap`.
 - **Device sampling:** tt-metal selects the token. A supporting adapter writes
   the selected token into the persistent token buffer for the next decode and
   advances its persistent position in the forward trace.
-- **Transition decode:** the first decode; the first decode after prefill; a
-  request-layout, sampling-mode, or resume transition. Pending work is drained
-  and applied first, then host-authoritative inputs and required sampling state
-  are reloaded.
+- **Transition decode:** the first decode; the first decode after prefill; the
+  first ordinary decode after a speculative verification; a request-layout,
+  sampling-mode, or resume transition. Pending work is drained and applied
+  first, then host-authoritative inputs and required sampling state are
+  reloaded.
 - **Chunked-prefill continuation:** a later prompt chunk for a request already
   present in the persistent batch. Membership can remain unchanged, so the
   plugin classifies it using the scheduler's context-phase marker rather than
@@ -123,6 +124,7 @@ transition are still represented by `slot_remap`.
 | First decode or prefill → decode | reload | no | reload on device | reset on device |
 | Request add/remove/reuse/condense, preemption, or resume | reload | no | reload on device | reset on device |
 | Chunked-prefill continuation | reload | no | reload on device | reset on device |
+| Speculative verification → ordinary decode | reload | no | reload on device | reset on device |
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if allocation changed | keep | keep |
@@ -145,23 +147,33 @@ the runner adds its token to local request state. The plugin uses these rules:
   it. The result that ended the request was already accepted.
 
 An ordinary preemption does not invalidate an in-flight decode. Its forward
-completed before the KV blocks were reused, so its token is valid. If its
-result is still in flight, the scheduler does not resume the request. After
-vLLM accepts the result, resumed prefill includes the token and gets a new
-output placeholder. This prevents two physical results from using one
-placeholder. It also prevents an extra sample from advancing seeded RNG state.
+completed before the KV blocks were reused, so its token is valid. vLLM marks
+that output stale: it sets `Request.num_stale_output_tokens` to the request's
+in-flight scheduled tokens and resets `num_output_placeholders` to zero. The
+stale output is still delivered and accepted, because `drop_stale_output` stays
+false. The scheduler does not resume the request until that deliverable stale
+output has drained (`num_stale_output_tokens` is zero). Resumed prefill
+therefore includes the token and gets a new output placeholder. This prevents
+two physical results from using one placeholder. It also prevents an extra
+sample from advancing seeded RNG state.
 
 A forced prefix-cache reset calls
 `reset_prefix_cache(reset_running_requests=True)`. It preempts live requests so
-all KV blocks can be freed. vLLM resumes each request from committed token
-history and records the number of in-flight results in its upstream
-`Request.async_tokens_to_discard` field. The plugin keeps those results visible
-to vLLM, but does not add their tokens to local request state. If the plugin
-removes one of these results, vLLM cannot reduce the discard count and discards
-the next valid result instead. This control path is used by an explicit
-live-request reset or by pause/sleep with cache clearing. Normal completion,
-ordinary scheduler preemption, and cache eviction do not use it. An ordinary
-`reset_prefix_cache()` only succeeds when no running request holds KV blocks.
+all KV blocks can be freed, with `drop_stale_output` set. vLLM resumes each
+request from committed token history in the same step and drops its stale
+output instead of delivering it. The two sides count different units:
+
+- vLLM's `num_stale_output_tokens` counts scheduled tokens. Each step's output
+  reduces it by the number of tokens scheduled in that step.
+- The plugin's forced-reset discard counts count output frames. One TT output
+  frame can carry several tokens, for example 1+K with speculative decoding.
+
+The plugin keeps forced-reset results visible to vLLM, which drops them, but
+does not add their tokens to local request state. This control path is used by
+an explicit live-request reset or by pause/sleep with cache clearing. Normal
+completion, ordinary scheduler preemption, and cache eviction do not use it. An
+ordinary `reset_prefix_cache()` only succeeds when no running request holds KV
+blocks.
 
 Under upstream async scheduling, a synchronously sampled final-prefill result
 uses the same deferred state-apply queue as an async decode result. This lets a
@@ -169,12 +181,98 @@ forced reset reject its token before the runner adds it to local state.
 Page-table-only refresh remains overlap-safe because page tables come from the
 current scheduler allocation even when token and position tensors are stale.
 
+## Host sampling output and selective reads
+
+Host sampling can reduce CPU work by processing only the scheduled rows.
+These output capabilities are independent of `decode_input_update_contract`:
+
+| Model capability | Default | Required adapter support |
+| --- | --- | --- |
+| `supports_compact_host_logits` | `False` | `process_decode_output_host` accepts `sample_rows` and returns logits in that order. |
+| `supports_selective_host_readback` | `False` | `read_decode_output` also accepts `sample_rows` and retains the data needed to complete the selected read. |
+
+An adapter that declares selective readback must also declare compact host
+logits support. Compact host logits alone permit a full device read followed
+by host compaction. These capabilities do not change device sampling or the
+rules for reloading forward inputs.
+
+### Row selection
+
+The current plugin supplies `sample_rows` for lane-DP host sampling when no
+active slot-indexed or custom logits processor requires the full slot layout.
+The indices belong to the merged lane batch for that submission. They are
+not tensor-parallel shard indices or global indices across independent runners.
+
+`sample_rows` is a nonempty list of unique, valid slot indices. The list can
+contain gaps and need not be sorted. Output row `i` must represent slot
+`sample_rows[i]`. An adapter may gather or slice device data internally, but
+must preserve this order in its final output. It must reject invalid indices.
+
+### Adapter callbacks
+
+For a selective read, the plugin calls:
+
+```python
+host_output, read_events = model.read_decode_output(
+    tt_output, async_read=True, sample_rows=sample_rows
+)
+```
+
+The plugin stores the selected rows as an immutable tuple in the submission.
+It rejects a different row list at finalization. The adapter must retain any
+temporary device slices and host transfer buffers until the read completes.
+Each returned event must cover the corresponding transfer. The plugin waits
+for these events before it processes the host output.
+
+For selective reads, `host_output` must be an adapter-owned handle that requires
+`process_decode_output_host`. A plain PyTorch tensor or a tuple of PyTorch
+tensors bypasses that callback. Such values use the existing full slot path
+and cannot carry compact rows through this interface.
+
+Host processing then uses the same row list:
+
+```python
+logits = model.process_decode_output_host(
+    host_output, is_tokens=False, sample_rows=sample_rows
+)
+```
+
+The callback returns a CPU logits tensor, or `(logits, None)` when its normal
+interface returns a pair. For `N` selected rows and vocabulary size `V`, the
+shape must be `[N, V]` or `[N, 1, V]`. The last dimension must contain the real
+vocabulary without padding. FP32 output avoids a later conversion for sampling.
+The returned tensor must own writable storage independent of any buffer that
+the adapter reuses or that another request can modify. The host sampler may
+modify logits in place.
+
+The plugin wraps this result in `TTCompactedHostLogits`, with the captured row
+tuple. Extraction verifies the row order and count before sampling. Sampling
+metadata, output history, token constraints, and grammar masks must use that
+same order. Host sampling computes its own logprobs on this path. An adapter
+must not discard model-provided logprobs to enter it.
+
+### Full slot fallback
+
+Adapters without these capabilities keep their existing callback signatures.
+The plugin omits `sample_rows` during device sampling and when active or custom
+logits processors require persistent slot indices. Such requests use the full
+slot layout, including gaps. Compact-logit support must therefore retain the
+adapter's existing behavior when `sample_rows` is absent.
+
+The plugin fixes selective transfer rows before starting the read. A later
+metadata change cannot change which rows the adapter transferred. Extraction
+rejects compact output if the processor state then requires the full layout.
+
+Model-interface tests must cover unsorted rows, gaps, asynchronous completion,
+and mismatched row lists. They must also cover adapters without either
+capability, device sampling, and active/custom processor fallback.
+
 ## Host input authority
 
 The `tokens` and `start_pos` arguments are authoritative only when
 `reload_inputs` is true. When it is false they are deliberately one step
-behind. An adapter must derive nothing from them—not forward inputs, sampling
-state, or RNG counters.
+behind. An adapter must derive no forward inputs, sampling state, or RNG
+counters from `tokens` or `start_pos` when `reload_inputs=False`.
 
 For example, an adapter that ties seeded sampling to the absolute decode
 position must align its counter from `start_pos` on a reloading step and then
@@ -191,7 +289,7 @@ must be consumed by step `k+1`.
 The base case is a full reload. Before issuing it, the runner finalizes the
 older step, suppresses late results for request IDs already reported finished,
 excludes explicitly marked forced-reset results from runner state, and applies
-every accepted token—including an ordinary preemption's in-flight token—to
+every accepted token, including an ordinary preemption's in-flight token, to
 host request state. It then copies the authoritative token, position, layout,
 and requested sampling state.
 
@@ -214,14 +312,15 @@ when it is set, the caller must keep active and resubmitted IDs unique.
 When `SchedulerOutput` reports that a request is finished, the plugin removes
 any later result that vLLM has not consumed and does not add its token to runner
 state. The result that finished the request was already accepted. Ordinary
-preemption does not suppress its in-flight result. A preempted request cannot
-resume while it owns an output placeholder. Resumed prefill therefore includes
-the accepted token and owns a new placeholder for its next result.
+preemption does not suppress its in-flight result. vLLM delivers that stale
+output and does not resume the request until it has drained. Resumed prefill
+therefore includes the accepted token and owns a new placeholder for its next
+result.
 
 Forced-reset discard counts are scheduler-owned sidecar metadata on
-`SchedulerOutput`. They prevent runner-state updates for only the newest
-counted results. The results stay visible to vLLM so it can reduce its upstream
-discard count.
+`SchedulerOutput`. They count output frames, not tokens, and prevent
+runner-state updates for only the newest counted results. The results stay
+visible to vLLM, which drops them itself.
 
 ## Requirements for `decode_input_update_contract = 1`
 
@@ -278,6 +377,21 @@ that also configures speculative decoding adds a wider verify call, a
 `supports_async_spec_decode` capability and the step-selection and KV
 reservation rules that go with them, all stated in
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
+
+For a speculative verification step, `TTAsyncDecodeController.plan_decode_reload`
+always sets `reload_inputs=True`: `TTModelRunner` builds the candidate block
+from the current drafts and each request's last committed token.
+`TTAsyncDecodeController` drains pending work before verification and marks
+deferred verification output as ineligible for overlap. Deferred readback
+therefore does not imply concurrent verification steps. A speculative launch
+can also issue ordinary width-1 decode steps when the admitted model supports
+that transition; those ordinary steps follow the reload rules in this
+document. The first of them after a verification is a transition decode: the
+verification commits a number of tokens the host decides after the forward and
+writes none of them into the resident token and position buffers, which still
+hold what the last ordinary decode fed back. See [Generic speculative decoding](SCHEDULING.md#generic-speculative-decoding)
+for step selection and [Model capabilities](MODEL_CAPABILITIES.md) for the
+separate ordinary and speculative async declarations.
 
 ## Negotiation and rollout
 

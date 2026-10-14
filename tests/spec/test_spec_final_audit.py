@@ -37,10 +37,10 @@ def test_forced_reset_counts_the_final_prefill_frame():
     scheduler.reset_prefix_cache(reset_running_requests=True)
     resumed = scheduler.schedule()
 
-    assert request.async_tokens_to_discard == 1
+    assert request.drop_stale_output is True
     assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
     scheduler.update_from_output(final, _runner_output(final, [7]))
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
 
 
 def test_intermediate_prefill_does_not_consume_a_later_output_frame():

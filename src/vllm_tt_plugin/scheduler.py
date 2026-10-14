@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -18,6 +19,7 @@ from vllm_tt_plugin.config import (
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
+    get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -192,6 +194,54 @@ class TTDecodeInterleavePolicy:
             self._decode_run = 0
 
 
+def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
+    """The most tokens one scheduling step can hand a single new request, named.
+
+    Resolved exactly as vLLM's ``Scheduler.__init__`` resolves its per-step
+    token budget: ``max_num_scheduled_tokens`` when it is set, otherwise
+    ``max_num_batched_tokens``. A positive ``long_prefill_token_threshold``
+    then caps that limit. Returns ``(limit, name_of_the_binding_cap)``; the
+    limit is ``sys.maxsize`` when nothing is configured.
+    """
+    scheduled = getattr(scheduler_config, "max_num_scheduled_tokens", None)
+    if scheduled is not None:
+        limit, name = int(scheduled), "max_num_scheduled_tokens"
+    else:
+        batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+        limit, name = (
+            (batched, "max_num_batched_tokens")
+            if batched > 0
+            else (
+                sys.maxsize,
+                "max_num_batched_tokens",
+            )
+        )
+    threshold = int(getattr(scheduler_config, "long_prefill_token_threshold", 0) or 0)
+    if 0 < threshold < limit:
+        limit, name = threshold, "long_prefill_token_threshold"
+    return limit, name
+
+
+def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
+    """Reject caps that can never let a new request reach the alignment grid.
+
+    ``_align_prefill_chunk_end`` defers a new request whose chunk falls short
+    of the grid; that only converges if a later step can offer a larger chunk.
+    The binding cap is the one vLLM schedules with (``max_num_scheduled_tokens``
+    when set, else ``max_num_batched_tokens``), further capped by a positive
+    ``long_prefill_token_threshold``.
+    """
+    limit, name = _effective_prefill_step_limit(scheduler_config)
+    if limit < align:
+        raise ValueError(
+            f"additional_config['tt']['prefill_chunk_alignment']={align} cannot be "
+            f"reached: scheduler {name}={limit} is a permanent per-step cap "
+            "below the "
+            "alignment. Raise the cap to at least the alignment or set "
+            "prefill_chunk_alignment to 0."
+        )
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -223,15 +273,13 @@ class TTScheduler(AsyncScheduler):
       completion before the preempt freed any block, device submits form a
       strict queue, and every async op is forced to complete before the next
       prefill, so no later write can reach the KV they were computed against.
-      The base class appends them on arrival and the resumed prefill replays
-      them. ``Request.async_tokens_to_discard`` serves the wholesale
-      ``reset_prefix_cache`` teardown only; wiring ordinary preemption into it
+      The base class marks them stale, appends them on arrival without
+      touching the placeholder count, and keeps the request waiting until
+      they drain, so the resumed prefill replays them instead of sampling
+      against the old token history. Only the wholesale
+      ``reset_prefix_cache`` teardown drops stale output
+      (``Request.drop_stale_output``); wiring ordinary preemption into it
       drops valid tokens and silently truncates the response.
-      A preempted request with an outstanding output placeholder stays in the
-      waiting queue until that valid frame is accounted for. Resuming earlier
-      would replay and sample against the old token history, producing a second
-      physical frame for the same single placeholder and advancing seeded RNG
-      state for a token that must be discarded.
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
@@ -265,6 +313,19 @@ class TTScheduler(AsyncScheduler):
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
         self._widest_decode_batch_size = 0
+        self._prefill_chunk_alignment = (
+            get_tt_prefill_chunk_alignment(self.vllm_config)
+            if self.scheduler_config.enable_chunked_prefill
+            else 0
+        )
+        if self._prefill_chunk_alignment > 1:
+            _validate_prefill_chunk_alignment(
+                self._prefill_chunk_alignment, self.scheduler_config
+            )
+            logger.info(
+                "TT scheduler: partial prefill chunks end on %d-token boundaries",
+                self._prefill_chunk_alignment,
+            )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
@@ -569,45 +630,80 @@ class TTScheduler(AsyncScheduler):
             or any(request.is_prefill_chunk for request in self.running)
         )
 
-    def _take_preempted_requests_with_pending_outputs(self) -> RequestQueue | None:
-        """Temporarily remove resumes that still own an in-flight output.
+    # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
+    # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
+    # hook so chunk ends can be aligned before any block is allocated.
+    @property
+    def need_mamba_block_aligned_split(self) -> bool:
+        return bool(getattr(self, "_base_need_mamba_split", False)) or (
+            getattr(self, "_prefill_chunk_alignment", 0) > 1
+        )
 
-        Ordinary preemption preserves already-submitted frames. Waiting for the
-        corresponding placeholder to be consumed makes the accepted token part
-        of request history before resumed prefill is built, so replay samples
-        the next logical token and receives a fresh placeholder.
+    @need_mamba_block_aligned_split.setter
+    def need_mamba_block_aligned_split(self, value: bool) -> None:
+        self._base_need_mamba_split = bool(value)
 
-        The temporary queue follows upstream's skipped-waiting convention:
-        ``prepend_request`` while collecting and ``prepend_requests`` while
-        restoring preserve FCFS order, while priority queues reorder by their
-        normal priority key.
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if getattr(self, "_base_need_mamba_split", False):
+            num_new_tokens = super()._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+
+    def _align_prefill_chunk_end(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Round a *partial* prefill chunk down so it ends on the alignment grid.
+
+        Chunks that finish the prompt, decode steps and multimodal prompts are
+        left alone. A new request whose aligned chunk would be empty waits for
+        the next step; a running request never gets an empty chunk.
         """
-        deferred = [
-            request
-            for request in self.waiting
-            if request.status == RequestStatus.PREEMPTED
-            and request.num_output_placeholders > 0
-        ]
-        if not deferred:
-            return None
+        align = getattr(self, "_prefill_chunk_alignment", 0)
+        if align <= 1 or num_new_tokens <= 0:
+            return num_new_tokens
+        end = start + num_new_tokens
+        if end >= request.num_prompt_tokens:
+            return num_new_tokens
+        if getattr(request, "mm_features", None) or getattr(
+            request, "has_encoder_inputs", False
+        ):
+            return num_new_tokens
+        aligned_end = end // align * align
+        if aligned_end <= start:
+            if start != 0:
+                return num_new_tokens
+            # A new request waits only when this step's leftover budget is what
+            # stopped it. If a full step could not reach the grid either (a
+            # permanent cap below the alignment), it must still make progress.
+            return (
+                0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
+            )
+        return aligned_end - start
 
-        deferred_queue = create_request_queue(self.policy)
-        for request in deferred:
-            deferred_queue.prepend_request(request)
-        self.waiting.remove_requests(deferred)
-        return deferred_queue
+    def _full_step_prefill_cap(self) -> int:
+        """Most prompt tokens one scheduling step can give a single new request."""
+        cfg = getattr(self, "scheduler_config", None)
+        if cfg is None:
+            return sys.maxsize
+        limit, _ = _effective_prefill_step_limit(cfg)
+        return limit
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        deferred_resumes = self._take_preempted_requests_with_pending_outputs()
-        try:
-            return self._schedule_without_pending_output_resumes(throttle_prefills)
-        finally:
-            if deferred_resumes:
-                self.waiting.prepend_requests(deferred_resumes)
-
-    def _schedule_without_pending_output_resumes(
-        self, throttle_prefills: bool = False
-    ) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
         has_pending_prefill = self._has_pending_prefill()
@@ -778,11 +874,11 @@ class TTScheduler(AsyncScheduler):
                 logger.error("%s", message)
                 return False
             raise RuntimeError(message)
-        # Upstream copies token reservations into ``async_tokens_to_discard``.
-        # TT receives one output frame for a speculative reservation of 1+K
-        # tokens, so publish frame counts to both the scheduler and runner. The
-        # stale frames remain visible to the scheduler but do not enter runner
-        # request state before resumed-prefill inputs are built.
+        # Upstream preempts these requests in drop mode and discards their stale
+        # output itself. TT receives one output frame for a speculative
+        # reservation of 1+K tokens, so publish frame counts to the runner,
+        # which must keep those frames out of request state before
+        # resumed-prefill inputs are built.
         reset_candidates = (
             [
                 (
@@ -799,8 +895,6 @@ class TTScheduler(AsyncScheduler):
             return super().reset_prefix_cache(reset_running_requests, reset_connector)
         finally:
             for request, frame_count in reset_candidates:
-                if request.status == RequestStatus.PREEMPTED:
-                    request.async_tokens_to_discard = frame_count
                 if request.status == RequestStatus.PREEMPTED and frame_count > 0:
                     pending = self._pending_forced_reset_discard_counts
                     pending[request.request_id] = (
@@ -1016,11 +1110,13 @@ class TTScheduler(AsyncScheduler):
                     pending[req_id] = count - 1
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int]
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
-            return super()._update_request_with_output(request, new_token_ids)
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
         # Adaptive: a request that decoded batched (or over-frontier) this step
         # committed a single baseline token (no block was reserved) -> plain
         # reconciliation. The decision is read from THIS step's SchedulerOutput
@@ -1052,14 +1148,16 @@ class TTScheduler(AsyncScheduler):
                         "baseline token -- the scheduler and model block gates "
                         "disagree"
                     )
-                return super()._update_request_with_output(request, new_token_ids)
-        if request.async_tokens_to_discard:
-            # A block step reserved K placeholders; the AsyncScheduler discard
-            # path drains only one per stale frame, so it cannot balance a
-            # dropped block. Block requests are never reset-preempted
-            # (reset_prefix_cache raises while one runs) and solo spec steps are
-            # not KV-preempted, so this must not happen -- fail loudly rather
-            # than silently leak placeholders.
+                return super()._update_request_with_output(
+                    request, new_token_ids, is_stale=is_stale
+                )
+        if is_stale:
+            # The request was preempted after this block was submitted, and
+            # preemption zeroed the K placeholders the block would reconcile.
+            # Block requests are never reset-preempted (reset_prefix_cache
+            # raises while one runs) and solo spec steps are not KV-preempted,
+            # so this must not happen -- fail loudly rather than commit a block
+            # against a reservation that no longer exists.
             raise RuntimeError(
                 "A stale async output reached block serving for a block step; "
                 "block-output frames cannot be discarded (reset/preempt of a "

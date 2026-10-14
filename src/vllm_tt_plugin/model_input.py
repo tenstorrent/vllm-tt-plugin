@@ -20,6 +20,14 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
 @dataclass(frozen=True)
+class TTCompactedHostLogits:
+    """Host logits in explicit scheduled-slot order, rather than full capacity."""
+
+    logits: torch.Tensor
+    rows: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class TTDecodeReloadPlan:
     """Explicit host-to-device updates for one decode submission.
 
@@ -180,6 +188,8 @@ class TTModelInput:
     # committed, in [1, 1+K] and never 0, which is what a model reads to select
     # the candidate state slot it continues from. Both are ``[total_B]`` int32
     # in the same row order as ``input_tokens``, including its padding rows.
+    # A verify sets both. An ordinary decode sets ``accepted_counts`` alone,
+    # and only when a live row's previous step committed more than one token.
     # ``None`` on a prefill build and on a non-speculating launch.
     num_valid_drafts: torch.Tensor | None = None
     accepted_counts: torch.Tensor | None = None
@@ -194,3 +204,16 @@ class TTModelInput:
     # must resolve rows through this. ``None`` for lane builds, whose rows are
     # the persistent slots.
     row_req_ids: list[str] | None = None
+
+    # Decode-only: retain device logits until sample_tokens supplies the grammar,
+    # then invoke the model's device sampler. Structured prefills stay on host.
+    defer_device_sampling: bool = False
+
+    # Requests in this forward that must receive a sample-time grammar row.
+    # Captured with the forward so a partial GrammarOutput cannot silently leave
+    # a structured row all-allowed after the persistent batch changes.
+    structured_output_req_ids: frozenset[str] = frozenset()
+
+    # Immutable row identity used for sample-time grammar remapping. Includes
+    # padding/gap rows as None and is never reconstructed from a mutable batch.
+    grammar_row_req_ids: tuple[str | None, ...] = ()

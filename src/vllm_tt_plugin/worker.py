@@ -12,7 +12,11 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import (
+    OMP_NUM_THREADS_SET_BY_VLLM,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    set_torch_threads_for_runtime,
+)
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_uniform_page_size,
@@ -24,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -290,6 +295,11 @@ class TTWorker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        # TT cache setup handles only LBNHC's per-group packing; it is also
+        # block-compact, so models with mixed KV shapes still resolve to it.
+        return [KVCacheLayout.LBNHC.name]
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
         For the GPU/TPU backends, this method generates the KVCacheSpec by
@@ -460,11 +470,15 @@ class TTWorker(WorkerBase):
         # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return CompilationTimes(language_model=0.0, encoder=0.0)
+            elapsed = 0.0
+        else:
+            start = time.perf_counter()
+            self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
 
-        start = time.perf_counter()
-        self.model_runner.warmup_model()
-        elapsed = time.perf_counter() - start
+        # vLLM sizes multiproc workers' torch threads for startup only.
+        if os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) == "1":
+            set_torch_threads_for_runtime()
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 

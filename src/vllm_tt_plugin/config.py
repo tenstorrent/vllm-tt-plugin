@@ -56,6 +56,7 @@ def get_tt_seeded_sampling_policy(
 # get_tt_output_tokens_per_step and get_tt_spec_plan.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
+_SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
 
 
@@ -267,6 +268,43 @@ def store_tt_output_tokens_per_step(
     additional[_OUTPUT_TOKENS_PER_STEP_KEY] = output_tokens_per_step
 
 
+def get_tt_supports_device_grammar(vllm_config: "VllmConfig") -> bool:
+    """Return the resolved model-side device grammar capability."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_DEVICE_GRAMMAR_KEY, False))
+
+
+def is_tt_device_grammar_preload_eligible(
+    vllm_config: "VllmConfig",
+    *,
+    trace_mode: str,
+    enable_model_warmup: bool,
+) -> bool:
+    """Whether config-time state permits loading device grammar support.
+
+    Grammar-on sampling traces must be compiled before traced execution starts.
+    The loaded runner separately checks sampler/API and mesh-layout support.
+    """
+    return get_tt_supports_device_grammar(vllm_config) and (
+        trace_mode == "none" or enable_model_warmup
+    )
+
+
+def store_tt_supports_device_grammar(
+    vllm_config: "VllmConfig", supported: bool
+) -> None:
+    """Store device grammar support on the serializable vLLM config."""
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"resolved TT supports_device_grammar must be a boolean, got {supported!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_DEVICE_GRAMMAR_KEY] = supported
+
+
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
     """Return the admitted speculative plan, or ``None``.
 
@@ -408,6 +446,32 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(
             f"additional_config['tt']['{key}'] must be an integer >= 1, got {value!r}"
+        )
+    return value
+
+
+_PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
+# TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
+# that starts off that grid is realigned down by the model and the whole
+# chunk is then padded up to the next power of two (4096 + delta -> 8192).
+_PREFILL_CHUNK_ALIGNMENT_DEFAULT = 128
+
+
+def get_tt_prefill_chunk_alignment(vllm_config: "VllmConfig") -> int:
+    """Token alignment every partial prefill chunk must end on (0 disables).
+
+    A request admitted on leftover budget would otherwise start every later
+    chunk on an odd offset; aligning chunk ends keeps the model's chunk walk on
+    its native grid for every model served through this plugin.
+    """
+    tt_config = get_tt_config(vllm_config)
+    value = tt_config.get(
+        _PREFILL_CHUNK_ALIGNMENT_KEY, _PREFILL_CHUNK_ALIGNMENT_DEFAULT
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{_PREFILL_CHUNK_ALIGNMENT_KEY}'] must be an "
+            f"integer >= 0 (0 disables), got {value!r}"
         )
     return value
 

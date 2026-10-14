@@ -143,6 +143,11 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _is_int(value: object) -> bool:
+    # bool is an int subclass, and True would read as a count of 1.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 @dataclass(frozen=True)
 class SpecPlan:
     """What one model can serve at one ``(max_num_seqs, requested_k)`` point.
@@ -182,6 +187,14 @@ class SpecPlan:
     # shape rather than two; a model that sets this offers a second, narrower
     # shape and the runner prefers it on those steps.
     supports_narrow_decode: bool = False
+    # Per-step draft cap by live decode rows, as ``(max_rows, k)`` entries in
+    # strictly ascending ``max_rows`` order. A verify with R live rows carries
+    # at most the k of the first entry whose ``max_rows`` is at least R, so a
+    # model whose verify cost grows with rows times columns can serve a long
+    # draft to a small batch and a short one to a large batch. The call shape
+    # stays ``1 + effective_k`` wide either way. Empty means ``effective_k`` at
+    # every batch size.
+    k_by_rows: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
@@ -225,6 +238,43 @@ class SpecPlan:
                 f"{list(requires)}"
             )
 
+        try:
+            k_by_rows = tuple(tuple(entry) for entry in self.k_by_rows)
+        except TypeError as exc:
+            raise ValueError(
+                "SpecPlan.k_by_rows must be a sequence of (max_rows, k) pairs, "
+                f"got {self.k_by_rows!r}"
+            ) from exc
+        previous_max_rows = 0
+        for entry in k_by_rows:
+            if len(entry) != 2:
+                raise ValueError(
+                    "SpecPlan.k_by_rows entries must be (max_rows, k) pairs, "
+                    f"got {entry!r}"
+                )
+            max_rows, k = entry
+            if not _is_int(max_rows) or max_rows <= previous_max_rows:
+                raise ValueError(
+                    "SpecPlan.k_by_rows max_rows must be positive integers in "
+                    f"strictly ascending order, got {k_by_rows!r}"
+                )
+            if not _is_int(k) or not 1 <= k <= self.effective_k:
+                raise ValueError(
+                    "SpecPlan.k_by_rows draft caps must be integers in "
+                    f"[1, effective_k={self.effective_k}], got {entry!r}"
+                )
+            previous_max_rows = max_rows
+        # effective_k is what the platform publishes as num_speculative_tokens
+        # and what the scheduler reserves lookahead for, so a mapping that
+        # never reaches it reserves for drafts no step can carry. Such a plan
+        # declares its largest cap as effective_k instead.
+        if k_by_rows and max(k for _, k in k_by_rows) != self.effective_k:
+            raise ValueError(
+                f"SpecPlan.k_by_rows never reaches effective_k={self.effective_k}: "
+                f"{k_by_rows!r}"
+            )
+        object.__setattr__(self, "k_by_rows", k_by_rows)
+
     @property
     def accepted_counts_range(self) -> tuple[int, int]:
         """Inclusive range a valid ``accepted_counts`` entry lies in.
@@ -248,6 +298,26 @@ class SpecPlan:
         property does not describe that call.
         """
         return 1 + self.effective_k
+
+    def draft_cap(self, live_rows: int) -> int:
+        """The most drafts one row may verify on a step with ``live_rows`` rows.
+
+        ``live_rows`` counts the step's requests, not its padding rows.
+        Admission refuses a ``k_by_rows`` that does not reach the launch's
+        ``max_num_seqs``, so an admitted launch never asks for a row count the
+        mapping lacks.
+        """
+        if not _is_int(live_rows) or live_rows < 1:
+            raise ValueError(f"live_rows must be a positive integer, got {live_rows!r}")
+        if not self.k_by_rows:
+            return self.effective_k
+        for max_rows, k in self.k_by_rows:
+            if live_rows <= max_rows:
+                return k
+        raise ValueError(
+            f"SpecPlan.k_by_rows {self.k_by_rows!r} does not cover "
+            f"{live_rows} live rows"
+        )
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -132,3 +133,47 @@ def test_required_output_tokens_per_step_rejects_missing_setup_state():
 def test_output_tokens_per_step_rejects_invalid_values(invalid):
     with pytest.raises(ValueError, match="integer >= 1"):
         tt_config.store_tt_output_tokens_per_step(_vllm_config(), invalid)
+
+
+def test_supports_device_grammar_defaults_false_and_round_trips():
+    config = _vllm_config()
+
+    assert not tt_config.get_tt_supports_device_grammar(config)
+
+    tt_config.store_tt_supports_device_grammar(config, True)
+
+    assert tt_config.get_tt_supports_device_grammar(config)
+    assert config.additional_config[tt_config._SUPPORTS_DEVICE_GRAMMAR_KEY] is True
+    assert tt_config.get_tt_supports_device_grammar(pickle.loads(pickle.dumps(config)))
+
+
+@pytest.mark.parametrize(
+    ("trace_mode", "enable_model_warmup", "expected"),
+    [
+        ("all", True, True),
+        ("decode_only", False, False),
+        ("none", False, True),
+    ],
+)
+def test_device_grammar_runtime_requires_warmup_only_for_tracing(
+    trace_mode,
+    enable_model_warmup,
+    expected,
+):
+    config = _vllm_config()
+    tt_config.store_tt_supports_device_grammar(config, True)
+
+    assert (
+        tt_config.is_tt_device_grammar_preload_eligible(
+            config,
+            trace_mode=trace_mode,
+            enable_model_warmup=enable_model_warmup,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("invalid", [1, "true", None])
+def test_supports_device_grammar_rejects_non_boolean(invalid):
+    with pytest.raises(ValueError, match="must be a boolean"):
+        tt_config.store_tt_supports_device_grammar(_vllm_config(), invalid)

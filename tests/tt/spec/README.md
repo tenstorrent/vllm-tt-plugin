@@ -5,6 +5,14 @@ These tests drive a running vLLM server that serves tt-metal's
 
 A reserved Tenstorrent device is therefore required, and one Wormhole chip is enough. `tests/tt` is excluded from the plugin's continuous integration, so this is a manual job; registering it as a device job is a separate step.
 
+The suite validates the plugin's engine, scheduler, worker, and request
+lifecycle against a controlled target. `DummySpecDecodeModel` does not execute
+a production target or drafter on the device, so passing this suite does not
+establish production-model numerical correctness, device KV contents, DMA
+completion, or performance. Production adapters must also satisfy the
+[speculative decoding contract](../../../docs/SPEC_DECODE_CONTRACT.md) and
+declare the required [model capabilities](../../../docs/MODEL_CAPABILITIES.md).
+
 ## What each test establishes
 
 | File | Establishes |
@@ -17,8 +25,12 @@ A reserved Tenstorrent device is therefore required, and one Wormhole chip is en
 | `test_adaptive_policy.py` | the model drafter offers drafts for one live request, declines for a batch, and resumes after the batch returns to one row |
 | `test_async_transitions.py` | asynchronous scheduling remains enabled, ordinary decode overlaps, verify transitions serialize, and output follows the fixed target rule |
 | `test_async_correctness.py` | fixed-target async output equality, zero/partial acceptance, cancellation/reuse, preemption, reset, concurrent prefill, and K/length boundaries under the matching launch |
+| `test_mixed_sampling.py` | with narrow decode, a sampled request that joins a speculating greedy one is sampled from the fixed target's distribution, the join step drops the greedy request's drafts, and the greedy output stays the rule's sequence; without narrow decode, a sampled or penalized request is refused |
 
-No test treats a completed response as proof of anything. Each one reads vLLM's own counters across the work, and the capacity tests skip rather than pass when `vllm:num_preemptions_total` did not move.
+The suite checks token IDs, counter deltas, or direct scheduler and runner log
+evidence for each tested behavior. The capacity tests skip rather than pass
+when `vllm:num_preemptions_total` did not move. A completed HTTP response alone
+does not establish that drafting, overlap, or preemption occurred.
 
 ## How the tests know what the server is
 
@@ -70,17 +82,27 @@ Put the plugin checkout first on `PYTHONPATH`, because tt-metal has a top-level 
 export PYTHONPATH="$PLUGIN:$PYTHONPATH"
 ```
 
-The model capability contract decides whether speculation can use asynchronous scheduling. Use `--no-async-scheduling` for the synchronous configurations below. The `async` configuration omits that option, requests `sample_on_device_mode=decode_only`, and verifies the resolved mode in the server log. Requests must be greedy, which every test here sends.
+The model capability contract decides whether speculation can use asynchronous
+scheduling. Async speculative launches require both `supports_async_decode`
+and `supports_async_spec_decode`; `supports_async_decode` alone does not cover
+deferred verification. Use `--no-async-scheduling` for the synchronous
+configurations below. The `async` configuration omits that option, requests
+`sample_on_device_mode=decode_only`, and verifies the resolved mode in the
+server log. The acceptance tests send greedy requests to exercise the current
+`argmax_ids` acceptance path. `test_mixed_sampling.py` checks sampled requests
+beside greedy requests: ordinary decode preserves sampling when narrow decode
+is available, and admission refuses sampled requests when every step verifies.
+The suite does not establish sampled acceptance within `argmax_ids` verification.
 
 **1. Acceptance accounting, full acceptance.**
 
 ```bash
 mkdir -p /tmp/spec-run/accept-all
-TT_SPEC_ACCEPT_DEPTH=-1 python $PLUGIN/examples/server_example_tt.py $COMMON \
+TT_SPEC_ACCEPT_DEPTH=-1 "$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" $COMMON \
     --no-async-scheduling --max_num_seqs 8 --max_model_len 2048 --port 8100 \
     --speculative-config "$SPEC" >/tmp/spec-run/accept-all/server.log 2>&1
 
-pytest tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.py \
     tests/tt/spec/test_termination.py \
     --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
     --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
@@ -94,14 +116,14 @@ pytest tests/tt/spec/test_acceptance_metrics.py tests/tt/spec/test_concurrency.p
 **3. Losslessness.** Two servers, one speculating and one not, both with the fixed target:
 
 ```bash
-TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=2 python $PLUGIN/examples/server_example_tt.py \
+TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=2 "$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" \
     $COMMON --no-async-scheduling --max_num_seqs 8 --max_model_len 2048 \
     --port 8100 --speculative-config "$SPEC"
-TT_SPEC_TARGET=fixed python $PLUGIN/examples/server_example_tt.py \
+TT_SPEC_TARGET=fixed "$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" \
     $COMMON --no-async-scheduling --max_num_seqs 8 --max_model_len 2048 \
     --port 8101     # no --speculative-config
 
-pytest tests/tt/spec/test_lossless_device.py \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_lossless_device.py \
     --tt-server-url=http://localhost:8100 --tt-reference-url=http://localhost:8101 \
     --tt-model-name=models/vllm_test_utils/spec_test --tt-max-num-seqs=8 \
     --tt-spec-k=5 --tt-spec-accept-depth=2 --tt-spec-target=fixed \
@@ -114,11 +136,11 @@ The two servers need two chips: give each one its own through `TT_VISIBLE_DEVICE
 
 ```bash
 TT_SPEC_MAX_TOKENS_ALL_USERS=1024 TT_SPEC_ACCEPT_DEPTH=-1 \
-python $PLUGIN/examples/server_example_tt.py $COMMON \
+"$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" $COMMON \
     --no-async-scheduling --max_num_seqs 8 --max_model_len 512 --port 8100 \
     --speculative-config "$SPEC"
 
-pytest tests/tt/spec/test_capacity.py \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_capacity.py \
     --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
     --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
     --tt-spec-artifacts=/tmp/spec-run/capacity
@@ -131,11 +153,11 @@ If the capacity tests skip, the run did not reach preemption. Tune `TT_SPEC_MAX_
 ```bash
 mkdir -p /tmp/spec-run/adaptive
 TT_SPEC_DRAFT_POLICY=solo TT_SPEC_ACCEPT_DEPTH=-1 \
-python $PLUGIN/examples/server_example_tt.py $COMMON --no-async-scheduling \
+"$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" $COMMON --no-async-scheduling \
     --max_num_seqs 8 --max_model_len 2048 --port 8100 \
     --speculative-config "$SPEC" >/tmp/spec-run/adaptive/server.log 2>&1
 
-pytest tests/tt/spec/test_adaptive_policy.py \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_adaptive_policy.py \
     --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
     --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
     --tt-spec-target=depth --tt-spec-drafter=model --tt-spec-draft-policy=solo \
@@ -150,14 +172,14 @@ pytest tests/tt/spec/test_adaptive_policy.py \
 mkdir -p /tmp/spec-run/async
 ASYNC_CONFIG='{"tt":{"register_test_models":true,"sample_on_device_mode":"decode_only"}}'
 TT_SPEC_DRAFT_POLICY=solo TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=-1 \
-python $PLUGIN/examples/server_example_tt.py \
+"$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" \
     --model models/vllm_test_utils/spec_test \
     --tokenizer meta-llama/Llama-3.1-8B-Instruct \
     --additional-config "$ASYNC_CONFIG" --max_num_seqs 8 --max_model_len 2048 \
     --port 8100 --speculative-config "$SPEC" \
     >/tmp/spec-run/async/server.log 2>&1
 
-pytest tests/tt/spec/test_async_transitions.py tests/tt/spec/test_adaptive_policy.py \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_async_transitions.py tests/tt/spec/test_adaptive_policy.py \
     --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
     --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
     --tt-spec-target=fixed --tt-spec-drafter=model --tt-spec-draft-policy=solo \
@@ -166,7 +188,27 @@ pytest tests/tt/spec/test_async_transitions.py tests/tt/spec/test_adaptive_polic
     --tt-spec-artifacts=/tmp/spec-run/async
 ```
 
-**7. The host n-gram drafter.** Replace the speculative config with
+**7. Sampled requests beside a speculating one.** The adaptive drafter gives the launch narrow decode, and the fixed target gives its logits a known distribution:
+
+```bash
+mkdir -p /tmp/spec-run/mixed
+TT_SPEC_DRAFT_POLICY=solo TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=-1 \
+"$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" $COMMON --no-async-scheduling \
+    --max_num_seqs 8 --max_model_len 2048 --port 8100 \
+    --speculative-config "$SPEC" >/tmp/spec-run/mixed/server.log 2>&1
+
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_mixed_sampling.py \
+    --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
+    --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
+    --tt-spec-target=fixed --tt-spec-drafter=model --tt-spec-draft-policy=solo \
+    --tt-spec-async-scheduling=false \
+    --tt-spec-server-log=/tmp/spec-run/mixed/server.log \
+    --tt-spec-artifacts=/tmp/spec-run/mixed
+```
+
+The asynchronous variant is the launch of recipe 6 with this selection and `--tt-spec-async-scheduling=true`. On an `always` launch, the same file checks that a sampled request is refused instead.
+
+**8. The host n-gram drafter.** Replace the speculative config with
 `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_min":2,"prompt_lookup_max":4}`
 and pass `--tt-spec-drafter=ngram`. The n-gram drafter only drafts where the request's own text repeats, and this model's output is an ascending run that repeats no n-gram, so the prompt has to be that same run; the suite's prompts already are.
 
@@ -179,7 +221,7 @@ tests/tt/spec/run_spec_regression.sh /tmp/spec-run                  # every conf
 tests/tt/spec/run_spec_regression.sh /tmp/spec-run capacity         # or one of them
 ```
 
-The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, and `async-k3`. The six `async-*` correctness configurations run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
+The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, `async-k3`, `mixed`, and `async-mixed`. The six `async-*` correctness configurations (all but `async-mixed`) run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `mixed` and `async-mixed` run `test_mixed_sampling.py`, and the three `accept-*` configurations run its refusal test. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
 
 ## The manifest
 

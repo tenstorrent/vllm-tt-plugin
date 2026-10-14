@@ -77,6 +77,21 @@ def _overlap_counts(server_log):
     return last
 
 
+def _wait_for_acceptance(spec_server, since, k, future, timeout_s=30.0):
+    """Return once a draft has been accepted since the ``since`` scrape.
+
+    Fails if ``future``, the request expected to be speculating, ends first.
+    """
+    deadline = time.monotonic() + timeout_s
+    while acceptance_delta(since, spec_server.metrics(), k).accepted == 0:
+        if future.done():
+            pytest.fail(
+                "the long request finished before the counters showed an accepted draft"
+            )
+        if time.monotonic() > deadline:
+            pytest.fail(f"no draft was accepted within {timeout_s} s")
+
+
 def test_the_resolved_server_schedules_asynchronously(server_log, record):
     """The outcome, not the request.
 
@@ -158,12 +173,15 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
     Upstream stops routing drafts through the scheduler when asynchronous
     scheduling is on, so a launch that got this wrong would serve correctly and
     never speculate. A lone request has to be drafted for, and has to be
-    drafted for again after a peer comes and goes.
+    drafted for again after a peer comes and goes. Under the ``fixed`` target
+    every response also has to be the rule's sequence across those
+    transitions.
     """
     if max_batch_size < 2:
         pytest.skip("this server serves one row at a time")
     solo_before = spec_server.metrics()
-    solo = spec_server.complete(ascending_prompt(64), max_tokens=MAX_TOKENS)
+    solo_prompt = ascending_prompt(64)
+    solo = spec_server.complete(solo_prompt, max_tokens=MAX_TOKENS)
     solo_after = spec_server.metrics()
     solo_delta = acceptance_delta(solo_before, solo_after, spec_config.k)
 
@@ -171,20 +189,23 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
     # the faster of the two per step: it commits up to 1+K where the peer
     # commits one.
     long_tokens = MAX_TOKENS * 16
+    long_prompt = ascending_prompt(64, start=300)
+    peer_prompt = ascending_prompt(64, start=900)
     with ThreadPoolExecutor(max_workers=2) as pool:
         long_future = pool.submit(
-            spec_server.complete,
-            ascending_prompt(64, start=300),
-            max_tokens=long_tokens,
+            spec_server.complete, long_prompt, max_tokens=long_tokens
         )
-        # Short, and it has to be: this model's forward is host arithmetic,
-        # so a step costs about a millisecond and a tenth of a second is a
-        # hundred steps. A longer pause and the long request finishes before
-        # its peer is even posted, leaving nothing to measure.
-        time.sleep(0.02)
-        peer = pool.submit(
-            spec_server.complete, ascending_prompt(64, start=900), max_tokens=MAX_TOKENS
-        )
+        # The peer is posted only after the long request has had a draft
+        # accepted, so the peer's prefill lands while the long request
+        # speculates. This launch accepts every draft, so the long request's
+        # last commit was more than one token, and a row with such a commit
+        # makes the next step a verify: its first decode beside the peer is
+        # still one. Once that resolves, the solo drafter offers nothing to two
+        # rows, and the next step is an ordinary decode on an unchanged layout,
+        # the case whose inputs must be reloaded. A fixed pause cannot promise
+        # that order, because a step on this model costs about a millisecond.
+        _wait_for_acceptance(spec_server, solo_after, spec_config.k, long_future)
+        peer = pool.submit(spec_server.complete, peer_prompt, max_tokens=MAX_TOKENS)
         peer_result = peer.result()
         after_peer = spec_server.metrics()
         long_result = long_future.result()
@@ -206,6 +227,20 @@ def test_speculation_happens_and_resumes_on_the_asynchronous_launch(
     assert solo_delta.mean_acceptance_length > 1.0
     assert resumed.steps > 0, "the long request finished before its peer"
     assert resumed.accepted > 0, "speculation never resumed after the peer left"
+
+    if spec_config.target != "fixed":
+        return
+    # The peer's arrival moves the long request from verifies to plain decodes
+    # and its departure moves it back. A plain decode that continues from
+    # resident inputs the verifies never updated passes every counter above
+    # and emits the wrong tokens, which only the rule's own sequence shows.
+    for result, prompt, count in (
+        (solo, solo_prompt, MAX_TOKENS),
+        (long_result, long_prompt, long_tokens),
+        (peer_result, peer_prompt, MAX_TOKENS),
+    ):
+        assert_full_length_completion(result, count)
+        assert result.token_ids == fixed_target_ids(prompt, count)
 
 
 def test_the_asynchronous_output_is_the_rule_s_own_sequence(

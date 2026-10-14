@@ -21,10 +21,11 @@ offset scored 10/20 here against 20/20 with chunked prefill off.
 """
 
 import random
+from dataclasses import replace
 
 import pytest
 
-from tests.tt.utils import RequestConfig, run_concurrent_batch
+from tests.tt.utils import RequestConfig, recalled_passphrase, run_concurrent_batch
 
 # The passphrase sits this far into the filler. A prompt of about one budget
 # plants it in the first chunk, so the resumed tail must attend back to the
@@ -84,10 +85,6 @@ def _needle_prompt(num_words: int, passphrase: str, seed: int, nonce: str) -> st
     )
 
 
-def _recalled(output: str | None, passphrase: str) -> bool:
-    return passphrase.lower() in (output or "").lower()
-
-
 @pytest.fixture(scope="module")
 def budget(chunked_prefill_budget):
     """The served ``max_num_batched_tokens``.
@@ -112,7 +109,46 @@ def budget(chunked_prefill_budget):
     return chunked_prefill_budget
 
 
-def test_a_solo_split_prefill_recalls_its_needle(tt_server, tt_model_name, budget):
+def _run_recall_batch(
+    tt_server, tt_model_name, configs, reasoning_effort, reasoning_token_budget
+):
+    if reasoning_effort is None:
+        return run_concurrent_batch(tt_server, tt_model_name, configs)
+
+    configs = [
+        replace(
+            config,
+            max_tokens=config.max_tokens + reasoning_token_budget,
+            reasoning_effort=reasoning_effort,
+        )
+        for config in configs
+    ]
+    responses = run_concurrent_batch(
+        tt_server, tt_model_name, configs, use_chat=True, return_full_response=True
+    )
+    assert len(responses) == len(configs)
+    outputs = []
+    for response in responses:
+        assert len(response.choices) == 1
+        choice = response.choices[0]
+        assert choice.finish_reason == "stop", (
+            "chat recall did not reach a completed final answer: "
+            f"finish_reason={choice.finish_reason!r}"
+        )
+        assert isinstance(choice.message.content, str) and choice.message.content, (
+            "chat recall returned no final content; reasoning is not an answer"
+        )
+        outputs.append(choice.message.content)
+    return outputs
+
+
+def test_a_solo_split_prefill_recalls_its_needle(
+    tt_server,
+    tt_model_name,
+    budget,
+    recall_reasoning_effort,
+    recall_reasoning_token_budget,
+):
     """One prompt, several engine steps, nothing else in flight.
 
     Every boundary is a multiple of the whole budget here, so this is the
@@ -122,19 +158,27 @@ def test_a_solo_split_prefill_recalls_its_needle(tt_server, tt_model_name, budge
     passphrase = "cobalt-heron-42"
     prompt = _needle_prompt(budget, passphrase, seed=0xC401, nonce="Solo.\n")
 
-    (output,) = run_concurrent_batch(
+    (output,) = _run_recall_batch(
         tt_server,
         tt_model_name,
         [RequestConfig(prompt=prompt, max_tokens=24, temperature=0)],
+        recall_reasoning_effort,
+        recall_reasoning_token_budget,
     )
 
-    assert _recalled(output, passphrase), (
+    assert recalled_passphrase(output, passphrase), (
         f"a solo split prefill lost the passphrase planted {NEEDLE_POSITION:.0%} "
         f"into its prompt: want {passphrase!r}, got {output!r}"
     )
 
 
-def test_a_long_split_prefill_recalls_its_needle(tt_server, tt_model_name, budget):
+def test_a_long_split_prefill_recalls_its_needle(
+    tt_server,
+    tt_model_name,
+    budget,
+    recall_reasoning_effort,
+    recall_reasoning_token_budget,
+):
     """Prompt long enough that a resumed span pins q_chunk_size=256.
 
     tt_transformers uses q_chunk_size 64 when the padded remaining span is
@@ -145,20 +189,26 @@ def test_a_long_split_prefill_recalls_its_needle(tt_server, tt_model_name, budge
     passphrase = "cobalt-heron-256"
     prompt = _needle_prompt(3 * budget, passphrase, seed=0xC402, nonce="Long.\n")
 
-    (output,) = run_concurrent_batch(
+    (output,) = _run_recall_batch(
         tt_server,
         tt_model_name,
         [RequestConfig(prompt=prompt, max_tokens=24, temperature=0)],
+        recall_reasoning_effort,
+        recall_reasoning_token_budget,
     )
 
-    assert _recalled(output, passphrase), (
+    assert recalled_passphrase(output, passphrase), (
         f"a long split prefill lost the passphrase planted {NEEDLE_POSITION:.0%} "
         f"into its prompt: want {passphrase!r}, got {output!r}"
     )
 
 
 def test_prefills_sharing_a_step_each_recall_their_own_needle(
-    tt_server, tt_model_name, budget
+    tt_server,
+    tt_model_name,
+    budget,
+    recall_reasoning_effort,
+    recall_reasoning_token_budget,
 ):
     """Several prompts that together overflow one step's token budget.
 
@@ -184,16 +234,21 @@ def test_prefills_sharing_a_step_each_recall_their_own_needle(
             for i, passphrase in enumerate(passphrases)
         ]
 
-        outputs = run_concurrent_batch(tt_server, tt_model_name, configs)
+        outputs = _run_recall_batch(
+            tt_server,
+            tt_model_name,
+            configs,
+            recall_reasoning_effort,
+            recall_reasoning_token_budget,
+        )
         total += len(outputs)
         for i, (passphrase, output) in enumerate(zip(passphrases, outputs)):
-            if not _recalled(output, passphrase):
+            if not recalled_passphrase(output, passphrase):
                 misses.append(
                     f"round {rnd} request {i}: want {passphrase!r}, got {output!r}"
                 )
 
     assert not misses, (
-        f"{len(misses)} of {total} concurrent split prefills answered with a "
-        "passphrase that is not the one planted in their own prompt, so they "
-        "attended the wrong prefix:\n  " + "\n  ".join(misses)
+        f"{len(misses)} of {total} concurrent split prefills did not return the "
+        "passphrase planted in their own prompt:\n  " + "\n  ".join(misses)
     )

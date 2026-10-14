@@ -40,7 +40,9 @@ from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
+    DRAFTER_STATE_INTERNAL,
     PLACEHOLDER_TOKEN_ID,
+    SpecPlan,
     VerifyOutput,
 )
 
@@ -123,6 +125,7 @@ def _runner(
         vllm_config=_vllm_config(num_speculative_tokens),
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
         tt_data_parallel_size=1,
+        vocab_size=FAKE_VOCAB_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         model_config=SimpleNamespace(
             is_multimodal_model=False, max_model_len=MAX_MODEL_LEN
@@ -160,7 +163,9 @@ def _runner(
     return runner
 
 
-def _add_request(runner: SimpleNamespace, req_id: str, first_token: int = 1) -> None:
+def _add_request(
+    runner: SimpleNamespace, req_id: str, first_token: int = 1, temperature: float = 0.0
+) -> None:
     """Add a decoding request. ``first_token`` shifts its whole prompt.
 
     Two requests in one step need different token histories, or a defect that
@@ -170,7 +175,7 @@ def _add_request(runner: SimpleNamespace, req_id: str, first_token: int = 1) -> 
         req_id=req_id,
         prompt_token_ids=list(range(first_token, first_token + PROMPT_LEN)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=SamplingParams(temperature=temperature),
         generator=None,
         block_ids=([0],),
         # Fully prefilled, so the next step is a decode rather than prompt work.
@@ -325,6 +330,69 @@ def test_one_row_s_rejection_does_not_shorten_another():
     assert len(by_req["b"]) == 1
 
 
+def test_the_draft_cap_drops_only_the_suffix_of_a_proposal():
+    drafts, num_valid, counts = TTModelRunner._spec_row_state(
+        {"a": 4}, {"a": [10, 11, 12], "b": [20]}, ["a", "b", "c"], 3, 2
+    )
+
+    assert drafts.tolist() == [[10, 11, -1], [20, -1, -1], [-1, -1, -1]]
+    assert num_valid.tolist() == [2, 1, 0]
+    assert counts.tolist() == [4, 1, 1]
+
+
+@pytest.mark.parametrize("draft_cap", [0, 4])
+def test_a_draft_cap_outside_the_block_width_is_refused(draft_cap):
+    with pytest.raises(ValueError, match="draft_cap"):
+        TTModelRunner._spec_row_state({}, {}, ["a"], 3, draft_cap)
+
+
+@pytest.mark.parametrize(
+    "req_ids, committed_per_row",
+    [
+        pytest.param(("a",), DRAFT_LEN + 1, id="one-row-full-k"),
+        pytest.param(("a", "b"), 2, id="two-rows-capped-to-one"),
+    ],
+)
+def test_the_plan_s_draft_cap_follows_the_live_rows(req_ids, committed_per_row):
+    """A proposal made for one row is truncated when a second row joins.
+
+    Every draft offered here is one the model agrees with, so the committed
+    length shows how many drafts the verify was allowed to carry.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_plan = SpecPlan(
+        effective_k=DRAFT_LEN,
+        lanes_per_request=DRAFT_LEN + 1,
+        extra_bytes_per_seq=0,
+        extra_bytes_per_token=0,
+        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        drafter_state=DRAFTER_STATE_INTERNAL,
+        k_by_rows=((1, DRAFT_LEN), (MAX_NUM_REQS, 1)),
+    )
+    drafts = {}
+    for i, req_id in enumerate(req_ids):
+        # Distinct histories, so a row reading another row's drafts fails.
+        _add_request(runner, req_id, first_token=1 + 20 * i)
+        last = int(runner.input_batch.token_ids_cpu[i, PROMPT_LEN - 1])
+        drafts[req_id] = [(last + 1 + j) % FAKE_VOCAB_SIZE for j in range(DRAFT_LEN)]
+
+    output = _step(runner, *req_ids, drafts=drafts)
+
+    call = model.verify_calls[0]
+    # The call shape stays 1+K wide; only the per-row count shrinks.
+    assert call["block_width"] == 1 + DRAFT_LEN
+    assert call["num_valid_drafts"][: len(req_ids)].tolist() == [
+        committed_per_row - 1
+    ] * len(req_ids)
+    by_req = dict(zip(output.req_ids, output.sampled_token_ids))
+    for req_id in req_ids:
+        assert by_req[req_id] == drafts[req_id][: committed_per_row - 1] + [
+            (drafts[req_id][committed_per_row - 2] + 1) % FAKE_VOCAB_SIZE
+        ]
+        assert runner._req_accepted_counts[req_id] == committed_per_row
+
+
 def test_the_committed_tokens_reach_the_persistent_batch_and_the_request():
     """A committed prefix lands in both places the runner tracks tokens."""
     model = FakeSpecModel()
@@ -373,53 +441,6 @@ def test_the_verify_is_asked_for_the_mode_the_runner_can_walk():
 
     assert model.verify_calls[0]["spec_mode"] == ACCEPT_MODE_ARGMAX_IDS
     assert model.verify_calls[0]["block_width"] == DRAFT_LEN + 1
-
-
-def test_a_roundtrip_hidden_drafter_keeps_every_step_a_verify():
-    """The gate on the plain path, and the reason for it.
-
-    A step with nothing to verify returns no ``VerifyOutput``, so it produces
-    no hidden handle. A drafter that is fed its target hidden state through the
-    runner would then be asked to draft from nothing, so a model declaring that
-    feed keeps every step a verify instead. Decided when the model is loaded,
-    because a launch-time decision is checkable and passing ``None`` to that
-    drafter at step time is not.
-    """
-    runner = TTModelRunner.__new__(TTModelRunner)
-    runner._spec_drafts_from_model = True
-
-    class RoundtripHidden:
-        model_capabilities = {
-            "supports_spec_decode": True,
-            "spec_requirements": ["device_propose", "hidden_feed"],
-            "spec_hidden_handoff": ["roundtrip"],
-        }
-
-    class OnDeviceHidden:
-        model_capabilities = {
-            "supports_spec_decode": True,
-            "spec_requirements": ["device_propose", "hidden_feed"],
-            "spec_hidden_handoff": ["on_device"],
-        }
-
-    class NoHiddenFeed:
-        model_capabilities = {
-            "supports_spec_decode": True,
-            "spec_requirements": ["device_propose"],
-        }
-
-    runner.model = RoundtripHidden()
-    assert runner._narrow_steps_serve_the_drafter() is False
-    runner.model = OnDeviceHidden()
-    assert runner._narrow_steps_serve_the_drafter() is True
-    runner.model = NoHiddenFeed()
-    assert runner._narrow_steps_serve_the_drafter() is True
-
-    # And a launch that speculates with a host proposer needs nothing from the
-    # model here at all: its drafter is never handed hidden state.
-    runner._spec_drafts_from_model = False
-    runner.model = RoundtripHidden()
-    assert runner._narrow_steps_serve_the_drafter() is True
 
 
 def test_a_draftless_step_commits_through_the_ordinary_decode_tail():
@@ -472,6 +493,32 @@ def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
     _step(runner, "r")
     assert len(model.verify_calls) == 1
     assert len(model.plain_calls) == 1
+
+
+def test_a_sampled_row_makes_a_drafted_step_an_ordinary_decode():
+    """The whole step, for a sampled request beside a drafted greedy one.
+
+    A verify would commit the target argmax for the sampled row. So the model
+    is sent its ordinary decode call instead, carrying the greedy row's
+    unresolved count and nothing else of the verify's. Every row commits one
+    token through the sampling tail, and the greedy row's drafts are dropped.
+    """
+    model = FakeSpecModel()
+    runner = _runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "greedy")
+    _add_request(runner, "sampled", first_token=40, temperature=1.0)
+    runner._req_accepted_counts["greedy"] = 3
+
+    output = _step(runner, "greedy", "sampled", drafts={"greedy": [5, 6, 7]})
+
+    assert model.verify_calls == []
+    assert len(model.plain_calls) == 1
+    assert model.plain_calls[0]["accepted_counts"].tolist() == [3, 1]
+    assert [len(ids) for ids in output.sampled_token_ids] == [1, 1]
+    # FakeSpecModel's ordinary decode puts the argmax one past the last token.
+    assert output.sampled_token_ids[0] == [PROMPT_LEN + 1]
+    assert "greedy" not in runner._req_accepted_counts
 
 
 # endregion The loop

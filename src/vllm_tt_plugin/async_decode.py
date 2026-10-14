@@ -15,6 +15,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.model_input import TTCompactedHostLogits
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -84,19 +85,22 @@ class TTDecodeSubmission:
     batch_size_per_dp: list[int]
     sampling_params: Any
     perform_device_sampling: bool
+    device_sampling_params: Any | None = None
+    deferred_device_sampling: bool = False
     reload_plan: TTDecodeReloadPlan | None = None
     # The verify's opaque hidden handle, for a model whose drafter consumes it.
     # Carried rather than stored on the runner so it cannot outlive the step it
     # belongs to: the runner hands it straight back to ``propose_draft_tokens``
     # without interpreting its dtype, layout or tensor-parallel fracturing.
     spec_hidden: Any | None = None
+    readback_rows: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor
+    tt_out: torch.Tensor | TTCompactedHostLogits
     tt_log_probs: torch.Tensor | None
 
 
@@ -343,8 +347,10 @@ class TTAsyncDecodeController:
         # behind, so submitted-device history is the only safe reload authority.
         self._decode_chain_valid = False
         self._previous_device_sampling: bool | None = None
+        self._previous_submission_verified = False
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
         self._legacy_contract_warning_emitted = False
+        self.device_grammar_sample_count = 0
         # How many submissions found a step already outstanding, and how many
         # of those were not overlap-safe. The second is the serialization
         # claim: a verify must never be submitted over an outstanding step, so
@@ -394,10 +400,19 @@ class TTAsyncDecodeController:
             self._previous_device_sampling is not None
             and self._previous_device_sampling != device_sampling
         )
+        # A verify commits a count the host decides after the forward and
+        # writes none of its tokens into the resident inputs, so those still
+        # hold what the last plain decode fed back. The plain decode after a
+        # verify therefore starts a new chain, and so do the sampler's seed
+        # counters, which the verify's commit moved past.
+        verify_to_plain = (
+            self._previous_submission_verified and model_input.spec_mode is None
+        )
         transition = (
             not self._decode_chain_valid
             or model_input.decode_layout_changed
             or sampling_mode_changed
+            or verify_to_plain
         )
         reload_inputs = (
             # A verify's candidate block is assembled from this step's drafts
@@ -429,6 +444,7 @@ class TTAsyncDecodeController:
         """Commit residency after the model accepts a decode submission."""
         self._decode_chain_valid = True
         self._previous_device_sampling = model_input.perform_device_sampling
+        self._previous_submission_verified = model_input.spec_mode is not None
         if (
             reload_plan.reload_inputs
             or reload_plan.reload_page_table
@@ -469,7 +485,8 @@ class TTAsyncDecodeController:
         Ordinary preemption and resume deliberately do not appear here: their
         in-flight token is valid and AsyncScheduler must consume its output
         placeholder. Forced-reset frames also stay published so
-        ``async_tokens_to_discard`` consumes the stale frame itself.
+        ``drop_stale_output`` causes the scheduler to consume the stale frame
+        itself.
         """
         return set(scheduler_output.finished_req_ids)
 
@@ -602,7 +619,7 @@ class TTAsyncDecodeController:
             return False
         if model_input.decode_layout_changed:
             return False
-        if model_input.grammar_bitmask[0] is not None:
+        if getattr(model_input, "defer_device_sampling", False):
             return False
         if (
             model_input.prompt_tokens is not None
@@ -745,8 +762,8 @@ class TTAsyncDecodeController:
         A forced prefix-cache reset calls
         ``reset_prefix_cache(reset_running_requests=True)``. It preempts live
         requests and frees their KV blocks. vLLM resumes the requests from
-        saved token history. It records the number of in-flight outputs in
-        ``async_tokens_to_discard``.
+        saved token history and drops their in-flight outputs
+        (``drop_stale_output``).
 
         "Publish" means that the output stays visible to vLLM. "Apply" means
         that the runner adds the token to its request state. Use these rules:
@@ -761,9 +778,7 @@ class TTAsyncDecodeController:
         result B. vLLM accepted result A before the reset, but the runner has
         not applied its token. Result B was in flight at the reset, so
         ``forced_reset_discard_counts[R]`` is 1. Apply the token from result A.
-        Publish result B, but do not apply its token. This lets vLLM discard
-        result B and reduce its discard count. If result B is not published,
-        vLLM discards the next valid result instead.
+        Publish result B, but do not apply its token; vLLM drops it.
 
         A late result can occur when an earlier result ends the request. It can
         also occur when a result is in flight during an abort. The result that
@@ -900,6 +915,14 @@ class TTAsyncDecodeController:
         if not runner._pending_async_steps:
             return False
         scheduled = scheduler_output.num_scheduled_tokens
+        if runner._spec_supports_narrow_decode and not all(
+            runner._request_is_speculable(req_id) for req_id in scheduled
+        ):
+            # ``_step_verifies`` sends such a step as the ordinary decode,
+            # whatever its rows carry. A scheduled request that is not in the
+            # persistent batch yet reads as speculable here, which errs
+            # towards True below.
+            return False
         drafts = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduled:
             offered = drafts.get(req_id) or ()
@@ -931,7 +954,7 @@ class TTAsyncDecodeController:
         batch is read back via ``TTLaneInputBatch.extract_output``. Otherwise it
         is a plain single-process step read back via ``_get_output_tokens``.
         """
-        finalized = self.finalize_decode(submission)
+        finalized = self.finalize_decode(submission, sampling_rows=scheduled_rows)
         if finalized is None:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
             logprobs = None
@@ -1029,8 +1052,8 @@ class TTAsyncDecodeController:
         # finished before scheduler.update_from_output observes that cached
         # output. The result that finished the request was already accepted.
         # These results arrived after finish or raced with an abort.
-        # Forced-reset results stay intact because AsyncScheduler must
-        # see them to decrement ``async_tokens_to_discard``.
+        # Forced-reset results stay intact because the scheduler must see them
+        # to drain ``num_stale_output_tokens``.
         if completed.runner_output is not None:
             assert self.runner.scheduler_config.async_scheduling, (
                 "mutating a published runner output is only ordered correctly "
@@ -1126,7 +1149,10 @@ class TTAsyncDecodeController:
         overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(
-            model_input, read_from_device=False, async_read=True
+            model_input,
+            read_from_device=False,
+            async_read=True,
+            sampling_rows=scheduled_rows,
         )
         if submission.tt_out is None:
             completion_event.set()
@@ -1147,6 +1173,7 @@ class TTAsyncDecodeController:
         *,
         read_from_device: bool,
         async_read: bool = False,
+        sampling_rows: list[int] | None = None,
     ) -> TTDecodeSubmission:
         runner = self.runner
         batch_size_per_dp = model_input.unpadded_batch_size
@@ -1155,7 +1182,38 @@ class TTAsyncDecodeController:
 
         sampling_params = model_input.tt_sampling_params
         perform_device_sampling = model_input.perform_device_sampling
+        deferred_device_sampling = bool(
+            getattr(model_input, "defer_device_sampling", False)
+        )
+        readback_rows = None
+        if (
+            sampling_rows is not None
+            and not perform_device_sampling
+            and getattr(runner.model, "model_capabilities", {}).get(
+                "supports_selective_host_readback", False
+            )
+            and runner.lane_batch.can_compact_host_sampling()
+        ):
+            readback_rows = tuple(sampling_rows)
+            # Select rows before the adapter initiates a full output read.
+            # Synchronous callers wait for these same events in finalize_decode.
+            read_from_device = False
+            async_read = True
         contract_version = self.decode_input_update_contract_version()
+        if deferred_device_sampling and (
+            not perform_device_sampling or model_input.prompt_lens is not None
+        ):
+            raise ValueError(
+                "defer_device_sampling requires a device-sampled decode step; "
+                f"perform_device_sampling={perform_device_sampling}, "
+                f"is_decode={model_input.prompt_lens is None}"
+            )
+        if deferred_device_sampling and (read_from_device or async_read):
+            raise ValueError(
+                "deferred device sampling must retain device logits and cannot "
+                f"read them during submission; read_from_device={read_from_device}, "
+                f"async_read={async_read}"
+            )
         self.count_decode_submission(model_input)
         if not any(bs > 0 for bs in batch_size_per_dp):
             return TTDecodeSubmission(
@@ -1164,6 +1222,7 @@ class TTAsyncDecodeController:
                 batch_size_per_dp=batch_size_per_dp,
                 sampling_params=sampling_params,
                 perform_device_sampling=perform_device_sampling,
+                deferred_device_sampling=deferred_device_sampling,
                 reload_plan=None,
             )
 
@@ -1180,15 +1239,19 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        device_sampling_params = None
         # Speculative side tensors, sent only on a speculating decode step so a
-        # model that never speculates keeps its present call shape. Both or
-        # neither: the runner builds them together and a model needs the count
-        # to know which candidate state to continue from, not only the draft
-        # count to know how much of the block is real.
+        # model that never speculates keeps its present call shape. A verify
+        # carries all three: a model needs the count to know which candidate
+        # state to continue from, not only the draft count to know how much of
+        # the block is real. An ordinary decode carries ``accepted_counts``
+        # alone, and only while a row's previous step committed more than one
+        # token, for the same reason.
         if model_input.num_valid_drafts is not None:
             kwargs["num_valid_drafts"] = model_input.num_valid_drafts
-            kwargs["accepted_counts"] = model_input.accepted_counts
             kwargs["spec_mode"] = model_input.spec_mode
+        if model_input.accepted_counts is not None:
+            kwargs["accepted_counts"] = model_input.accepted_counts
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -1202,7 +1265,11 @@ class TTAsyncDecodeController:
                 None if s == SEED_NONE_SENTINEL else s
                 for s in sampling_param_dict["seed"]
             ]
-            kwargs["sampling_params"] = type(sampling_params)(**sampling_param_dict)
+            device_sampling_params = type(sampling_params)(**sampling_param_dict)
+            if deferred_device_sampling:
+                kwargs["defer_device_sampling"] = True
+            else:
+                kwargs["sampling_params"] = device_sampling_params
             if model_input.prompt_tokens is not None:
                 assert model_input.output_tokens is not None
                 kwargs["prompt_tokens"] = model_input.prompt_tokens
@@ -1302,7 +1369,15 @@ class TTAsyncDecodeController:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
-                    runner.model.read_decode_output(tt_out, async_read=True),
+                    runner.model.read_decode_output(
+                        tt_out,
+                        async_read=True,
+                        **(
+                            {"sample_rows": list(readback_rows)}
+                            if readback_rows is not None
+                            else {}
+                        ),
+                    ),
                 )
             else:
                 is_host_tensor = isinstance(tt_out, torch.Tensor)
@@ -1321,17 +1396,100 @@ class TTAsyncDecodeController:
             batch_size_per_dp=batch_size_per_dp,
             sampling_params=sampling_params,
             perform_device_sampling=perform_device_sampling,
+            device_sampling_params=device_sampling_params,
+            deferred_device_sampling=deferred_device_sampling,
             reload_plan=reload_plan,
             spec_hidden=spec_hidden,
+            readback_rows=readback_rows,
         )
+
+    def complete_deferred_device_sampling(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+    ) -> TTFinalizedDecode:
+        """Apply sample-time grammar on device, then finalize sampled tokens."""
+
+        def fail_deferred() -> None:
+            self._decode_chain_valid = False
+            self._submitted_page_tables = None
+            self.runner._poison_device_grammar()
+
+        if not submission.deferred_device_sampling:
+            raise ValueError(
+                "decode submission is not awaiting deferred device sampling"
+            )
+        if submission.tt_out is None or submission.device_sampling_params is None:
+            raise RuntimeError(
+                "deferred device sampling is missing device logits or "
+                "sampling parameters"
+            )
+        if len(model_input.grammar_bitmask) != 1:
+            raise ValueError(
+                "deferred device grammar expects one merged mask payload, got "
+                f"{len(model_input.grammar_bitmask)}"
+            )
+        grammar_bitmask = model_input.grammar_bitmask[0]
+        if grammar_bitmask is None:
+            fail_deferred()
+            raise RuntimeError(
+                "structured decode reached deferred device sampling without "
+                "a sample-time grammar bitmask"
+            )
+
+        sample_deferred = getattr(self.runner.model, "sample_deferred_decode", None)
+        if not callable(sample_deferred):
+            fail_deferred()
+            raise AttributeError(
+                "TT model declares device grammar support but does not implement "
+                "sample_deferred_decode()"
+            )
+        try:
+            sampled = sample_deferred(
+                submission.tt_out,
+                sampling_params=submission.device_sampling_params,
+                grammar_bitmask=grammar_bitmask,
+            )
+            completed_submission = replace(
+                submission,
+                tt_out=sampled,
+                read_events=None,
+                deferred_device_sampling=False,
+            )
+            finalized = self.finalize_decode(completed_submission)
+            if finalized is None:
+                raise RuntimeError("deferred device sampling produced no output")
+        except Exception:
+            fail_deferred()
+            raise
+        self.device_grammar_sample_count += 1
+        logger.debug(
+            "TT device grammar sampling active count=%d",
+            self.device_grammar_sample_count,
+        )
+        return finalized
 
     def finalize_decode(
         self,
         submission: TTDecodeSubmission,
+        *,
+        sampling_rows: list[int] | None = None,
     ) -> TTFinalizedDecode | None:
         runner = self.runner
         if submission.tt_out is None:
             return None
+        if submission.deferred_device_sampling:
+            raise RuntimeError(
+                "cannot finalize decode logits before deferred device sampling"
+            )
+
+        if submission.readback_rows is not None and (
+            sampling_rows is None or tuple(sampling_rows) != submission.readback_rows
+        ):
+            raise ValueError(
+                f"Sampling rows {sampling_rows} differ from submitted readback "
+                f"rows {submission.readback_rows}"
+            )
 
         if submission.read_events is not None:
             for read_event in submission.read_events:
@@ -1341,11 +1499,23 @@ class TTAsyncDecodeController:
             tt_out = submission.tt_out
 
         is_host_output = _is_host_decode_output(tt_out)
+        compact_rows = None
         if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
-            tt_out = runner.model.process_decode_output_host(
-                tt_out,
-                is_tokens=submission.perform_device_sampling,
-            )
+            kwargs = {"is_tokens": submission.perform_device_sampling}
+            if (
+                sampling_rows is not None
+                and not submission.perform_device_sampling
+                and getattr(runner.model, "model_capabilities", {}).get(
+                    "supports_compact_host_logits", False
+                )
+                and (
+                    submission.readback_rows is not None
+                    or runner.lane_batch.can_compact_host_sampling()
+                )
+            ):
+                compact_rows = tuple(sampling_rows)
+                kwargs["sample_rows"] = list(compact_rows)
+            tt_out = runner.model.process_decode_output_host(tt_out, **kwargs)
         elif not is_host_output:
             raise AttributeError(
                 "TT model must implement process_decode_output_host() "
@@ -1363,4 +1533,6 @@ class TTAsyncDecodeController:
         elif isinstance(tt_out, tuple):
             tt_out, _ = tt_out
 
+        if compact_rows is not None:
+            tt_out = TTCompactedHostLogits(logits=tt_out, rows=compact_rows)
         return TTFinalizedDecode(tt_out=tt_out, tt_log_probs=tt_log_probs)

@@ -100,6 +100,20 @@ def test_explicit_host_policy_includes_seeded_greedy_requests(temperature, top_k
 
 
 @pytest.mark.parametrize("policy", ["auto", "host"])
+@pytest.mark.parametrize("rows", [[0], [3], [0, 3]])
+def test_seeded_policy_respects_device_grammar_routing(policy, rows):
+    runner = _runner(policy)
+    runner.supports_device_grammar = True
+    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+    runner.input_batch.sampling.seed[0] = 42
+    # A supported grammar route remains available to auto and unseeded rows;
+    # an explicit host policy keeps the entire seeded forward on the host.
+    assert TTModelRunner.check_perform_device_sampling(
+        runner, True, True, sampling_rows=rows
+    ) is (policy == "auto" or 0 not in rows)
+
+
+@pytest.mark.parametrize("policy", ["auto", "host"])
 def test_policy_survives_config_pickle(policy):
     config = SimpleNamespace(
         additional_config={"tt": {"seeded_sampling_policy": policy}}

@@ -5,7 +5,28 @@ import re
 import warnings
 from collections import Counter
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
+
+_RECALL_EQUIVALENT_CHARACTERS = str.maketrans(
+    {
+        "\N{HYPHEN}": "-",
+        "\N{NON-BREAKING HYPHEN}": "-",
+    }
+)
+
+
+def recalled_passphrase(output: str | None, passphrase: str) -> bool:
+    """Find a complete passphrase after case and accepted character folding.
+
+    Add observed variants to ``_RECALL_EQUIVALENT_CHARACTERS``. Other characters
+    remain exact, and a missing output is treated as empty text.
+    """
+    expected = passphrase.translate(_RECALL_EQUIVALENT_CHARACTERS).lower()
+    actual = (output or "").translate(_RECALL_EQUIVALENT_CHARACTERS).lower()
+    return (
+        re.search(r"(?<![\w-])" + re.escape(expected) + r"(?![\w-])", actual)
+        is not None
+    )
 
 
 @dataclass
@@ -28,12 +49,15 @@ class RequestConfig:
     allowed_token_ids: list[int] | None = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
 async def send_request(
     async_client, model: str, config: RequestConfig, return_full_response: bool = False
 ):
     """Send a single async legacy completion request (old API)."""
+    if config.reasoning_effort is not None:
+        raise ValueError("reasoning_effort requires the chat completions API")
     extra_body: dict[str, Any] = {}
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
@@ -74,6 +98,8 @@ async def send_chat_request(
 ):
     """Send a single async chat completion request (new API)."""
     extra_body: dict[str, Any] = {}
+    if config.reasoning_effort is not None:
+        extra_body["reasoning_effort"] = config.reasoning_effort
     if config.top_k is not None:
         extra_body["top_k"] = config.top_k
     if config.repetition_penalty != 1.0:
