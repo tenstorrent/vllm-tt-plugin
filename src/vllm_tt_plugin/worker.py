@@ -187,6 +187,10 @@ def _available_kv_cache_memory_bytes_for_num_blocks(
 
 
 class TTWorker(WorkerBase):
+    # Built by _create_model_runner; a subclass swaps the runner without
+    # copying the device and KV-pool steps of init_device.
+    model_runner_cls: type[TTModelRunner] = TTModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -224,6 +228,11 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        self._init_tt_device()
+        self._init_kv_pool()
+        self.model_runner: TTModelRunner = self._create_model_runner()
+
+    def _init_tt_device(self) -> None:
         # tt-metal latches the visible set at first cluster construction and never
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
@@ -257,6 +266,7 @@ class TTWorker(WorkerBase):
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
 
+    def _init_kv_pool(self) -> None:
         # Size the KV pool and settle --max-model-len here, not in
         # determine_available_memory: upstream runs the whole executor init
         # (init_device, then load_model) before it asks for available memory
@@ -271,8 +281,9 @@ class TTWorker(WorkerBase):
         )
         _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
 
-        # Init ModelRunner here, so that we have access to self.mesh_device.
-        self.model_runner: TTModelRunner = TTModelRunner(
+    def _create_model_runner(self) -> TTModelRunner:
+        # Needs the mesh that _init_tt_device opened.
+        return self.model_runner_cls(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
