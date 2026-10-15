@@ -840,8 +840,9 @@ class TTScheduler(AsyncScheduler):
             return super().reset_prefix_cache(reset_running_requests, reset_connector)
         finally:
             for request, frame_count in reset_candidates:
-                if request.status == RequestStatus.PREEMPTED:
-                    request.async_tokens_to_discard = frame_count
+                # vLLM >= 0.31 marks the in-flight output stale itself
+                # (``num_stale_output_tokens`` / ``drop_stale_output`` set by
+                # ``_preempt_request``); only the runner-side counts remain.
                 if request.status == RequestStatus.PREEMPTED and frame_count > 0:
                     pending = self._pending_forced_reset_discard_counts
                     pending[request.request_id] = (
@@ -1057,11 +1058,13 @@ class TTScheduler(AsyncScheduler):
                     pending[req_id] = count - 1
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int]
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
-            return super()._update_request_with_output(request, new_token_ids)
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
         # Adaptive: a request that decoded batched (or over-frontier) this step
         # committed a single baseline token (no block was reserved) -> plain
         # reconciliation. The decision is read from THIS step's SchedulerOutput
@@ -1093,8 +1096,10 @@ class TTScheduler(AsyncScheduler):
                         "baseline token -- the scheduler and model block gates "
                         "disagree"
                     )
-                return super()._update_request_with_output(request, new_token_ids)
-        if request.async_tokens_to_discard:
+                return super()._update_request_with_output(
+                    request, new_token_ids, is_stale=is_stale
+                )
+        if is_stale:
             # A block step reserved K placeholders; the AsyncScheduler discard
             # path drains only one per stale frame, so it cannot balance a
             # dropped block. Block requests are never reset-preempted
