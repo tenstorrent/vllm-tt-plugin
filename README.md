@@ -479,7 +479,9 @@ selects the TT-owned runtime classes through vLLM's extension points:
 A `TTWorker` subclass names the scheduler it runs with in `tt_scheduler_cls`.
 A requested `scheduler_cls` is kept when it derives from that class, and replaced
 by it when that class derives from the request. Any other pair raises
-`ValueError`, as does lane mode with a non-default worker or scheduler.
+`ValueError`. Lane mode also raises unless the worker declares `TTScheduler`,
+inherited or explicit, and the request is unset, `TTLaneCoordinator`, or a class
+`TTScheduler` derives from.
 
 The execution model matches TT hardware characteristics:
 

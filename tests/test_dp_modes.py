@@ -63,6 +63,10 @@ class TTStageGenerationWorker(TTWorker):
     tt_scheduler_cls = TTStageGenerationScheduler
 
 
+class TTDefaultSchedulerWorker(TTWorker):
+    pass
+
+
 class TestDPModes:
     @pytest.fixture
     def dummy_model_class(self) -> type:
@@ -571,15 +575,19 @@ class TestDPModes:
     def test_scheduler_pairing_rejects_lane_mode_with_a_stage(
         self, requested: type, worker_cls: str | type
     ) -> None:
-        with pytest.raises(ValueError, match="TT lane mode runs only TTWorker"):
+        with pytest.raises(ValueError, match="TT lane mode runs TTLaneCoordinator"):
             resolve_tt_scheduler_cls(requested, worker_cls, True)
 
     @pytest.mark.parametrize("requested", [None, Scheduler, TT_LANE_SCHEDULER_CLS])
+    @pytest.mark.parametrize(
+        "worker_cls",
+        [TT_WORKER_CLS, f"{__name__}.TTDefaultSchedulerWorker"],
+    )
     def test_scheduler_pairing_keeps_the_lane_coordinator(
-        self, requested: str | type | None
+        self, requested: str | type | None, worker_cls: str
     ) -> None:
         assert (
-            resolve_tt_scheduler_cls(requested, TT_WORKER_CLS, True)
+            resolve_tt_scheduler_cls(requested, worker_cls, True)
             == TT_LANE_SCHEDULER_CLS
         )
 

@@ -438,10 +438,14 @@ def resolve_tt_scheduler_cls(
     vLLM-Omni writes into every stage's engine args. The parent and the
     worker's re-apply see the same pair, so both resolve the same class.
 
+    Lane mode checks the declaration, not the worker class: a TTWorker
+    subclass that inherits ``TTScheduler`` runs under ``TTLaneCoordinator``.
+
     Raises:
         ValueError: the requested scheduler and the worker's TT scheduler are
             unrelated, the worker declares no TT scheduler, or lane mode is
-            asked to run a scheduler or worker other than the defaults.
+            asked to run a scheduler other than the defaults, or a worker that
+            declares a TT scheduler other than ``TTScheduler``.
     """
     if requested is None and worker_cls == TT_WORKER_CLS:
         return TT_LANE_SCHEDULER_CLS if is_lane_mode else TT_SCHEDULER_CLS
@@ -473,8 +477,9 @@ def resolve_tt_scheduler_cls(
         ):
             return TT_LANE_SCHEDULER_CLS
         raise ValueError(
-            "TT lane mode runs only TTWorker with TTLaneCoordinator; got "
-            f"scheduler {requested!r} with worker {worker_cls!r}."
+            "TT lane mode runs TTLaneCoordinator, which needs a worker that "
+            f"declares {TT_SCHEDULER_CLS!r}; got scheduler {requested!r} with "
+            f"worker {worker_cls!r} declaring {tt_scheduler_cls!r}."
         )
 
     if requested_cls is None:
