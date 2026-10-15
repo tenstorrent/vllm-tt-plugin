@@ -112,4 +112,4 @@ vllm_omni/platforms/interface.py, in get_omni_ar_worker_cls
 NotImplementedError
 ```
 
-A TT Omni platform supplies that worker class (#193).
+`TTOmniPlatform` (#200) supplies that worker class (#202).
