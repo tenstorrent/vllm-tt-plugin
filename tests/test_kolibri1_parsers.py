@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -10,17 +9,24 @@ import vllm.config  # noqa: F401  # finish vLLM init before the plugin package
 from vllm_tt_plugin import entrypoints
 from vllm_tt_plugin.kolibri1_reasoning_parser import thinking_enabled
 
-KOLIBRI_TOKENIZER = os.environ.get("KOLIBRI_TOKENIZER", "Aleph-Alpha/Kolibri-1-BF16")
+# The Kolibri wrapper tokens are single special tokens; the parser engine looks
+# them up in the vocabulary. A deterministic stand-in keeps these tests running
+# on every host instead of skipping when the real tokenizer is not cached.
+_SPECIAL = {"<think>": 1, "</think>": 2, "<tool_call>": 3, "</tool_call>": 4}
+
+
+class _StubTokenizer:
+    def get_vocab(self):
+        return dict(_SPECIAL)
+
+    def decode(self, token_ids, **kwargs):
+        by_id = {v: k for k, v in _SPECIAL.items()}
+        return "".join(by_id.get(t, "") for t in token_ids)
 
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    from transformers import AutoTokenizer
-
-    try:
-        return AutoTokenizer.from_pretrained(KOLIBRI_TOKENIZER, local_files_only=True)
-    except Exception as exc:  # no cached tokenizer on this host
-        pytest.skip(f"Kolibri tokenizer unavailable: {exc}")
+    return _StubTokenizer()
 
 
 def _request(**chat_template_kwargs):
@@ -109,3 +115,28 @@ def test_unfinished_reasoning_is_reasoning_only(tokenizer):
     reasoning, content = parser.extract_reasoning("<think>\nI am not done", _request())
     assert reasoning.strip() == "I am not done"
     assert not content
+
+
+def test_continued_final_message_is_answer_content(tokenizer):
+    # continue_final_message extends the final assistant message, whose closed
+    # think block is already in the prompt: the continuation is the answer.
+    kwargs = {"continue_final_message": True, "add_generation_prompt": False}
+    parser = _parser(tokenizer, **kwargs)
+    reasoning, content = parser.extract_reasoning(" Paris.", _request(**kwargs))
+    assert reasoning is None
+    assert content == " Paris."
+
+
+def test_continued_final_message_streams_as_content(tokenizer):
+    kwargs = {"continue_final_message": True, "add_generation_prompt": False}
+    parser = _parser(tokenizer, **kwargs)
+    deltas = []
+    text = ""
+    for piece in (" Par", "is."):
+        previous, text = text, text + piece
+        deltas.append(
+            parser.extract_reasoning_streaming(previous, text, piece, [], [], [])
+        )
+    content = "".join(d.content or "" for d in deltas if d is not None)
+    assert content == " Paris."
+    assert not any(getattr(d, "reasoning", None) for d in deltas if d is not None)

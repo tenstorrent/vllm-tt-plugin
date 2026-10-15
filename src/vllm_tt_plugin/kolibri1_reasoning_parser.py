@@ -12,8 +12,10 @@ no ``reasoning_effort`` is given, whereas the stock parser reads
 answer as reasoning (or the reverse). ``Kolibri1Parser`` derives the start
 state the same way the template does.
 
-Not covered (same as upstream): ``continue_final_message`` always renders the
-closed block, whatever the switch says.
+A request with ``continue_final_message`` extends the final assistant
+message. The template has already rendered that message's closed
+``<think>...</think>`` block in the prompt, so the continuation is answer
+content and the parser starts in content state.
 """
 
 from collections.abc import Mapping
@@ -41,8 +43,12 @@ class Kolibri1Parser(Qwen3Parser):
     """Qwen3 grammar with the starting state chosen like the Kolibri 1 template."""
 
     def __init__(self, tokenizer, tools=None, **kwargs) -> None:
+        # Parser-local copy: only the parser's starting state changes, not the
+        # inputs the chat template rendered the prompt with.
         chat_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
-        chat_kwargs["enable_thinking"] = thinking_enabled(chat_kwargs)
+        chat_kwargs["enable_thinking"] = thinking_enabled(
+            chat_kwargs
+        ) and not chat_kwargs.get("continue_final_message", False)
         kwargs["chat_template_kwargs"] = chat_kwargs
         super().__init__(tokenizer, tools, **kwargs)
 
