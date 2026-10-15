@@ -18,6 +18,16 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 
 
 @pytest.fixture(autouse=True)
+def vllm_logger_emits_info(monkeypatch):
+    # vLLM >= 0.31 configures its logger tree explicitly at CLI start-up instead
+    # of on import, so a test process that never starts a server would
+    # otherwise see ``vllm.tt.*`` INFO records dropped by the root level.
+    import logging
+
+    monkeypatch.setattr(logging.getLogger("vllm"), "level", logging.INFO)
+
+
+@pytest.fixture(autouse=True)
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.

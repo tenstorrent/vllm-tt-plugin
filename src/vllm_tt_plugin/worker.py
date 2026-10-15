@@ -25,7 +25,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
@@ -299,6 +298,9 @@ class TTWorker(WorkerBase):
         platform. The TT KV cache is a device-side pool whose layout the model
         owns, so the upstream resolution only has to pick any candidate.
         """
+        # Imported here: the helper does not exist before vLLM 0.31.
+        from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+
         return [layout.name for layout in get_supported_kv_cache_layouts([])]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
