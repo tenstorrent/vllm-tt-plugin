@@ -681,6 +681,47 @@ def get_tt_prefill_chunk_alignment(vllm_config: "VllmConfig") -> int:
     return value
 
 
+_MAX_PARTIAL_PREFILLS_KEY = "_tt_max_partial_prefills"
+
+
+def get_tt_max_partial_prefills(vllm_config: "VllmConfig") -> int:
+    """Most prompts the model can hold part-way through their prefill (0 = no cap)."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return int(additional.get(_MAX_PARTIAL_PREFILLS_KEY, 0))
+
+
+def store_tt_prefill_chunking(
+    vllm_config: "VllmConfig", alignment: int, max_partial_prefills: int
+) -> None:
+    """Record the model's prefill-piece alignment and partial-prefill cap.
+
+    Platform-to-scheduler handoff from the model capabilities
+    ``prefill_chunk_alignment`` and ``max_partial_prefills`` (integers >= 0,
+    0 = not declared / unlimited). A declared alignment becomes the default of
+    ``additional_config['tt']['prefill_chunk_alignment']`` (the operator's own
+    value wins); the cap is stored under an internal key.
+    """
+    for name, value in (
+        ("prefill_chunk_alignment", alignment),
+        ("max_partial_prefills", max_partial_prefills),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"model_capabilities['{name}'] must be an integer >= 0, got {value!r}"
+            )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_MAX_PARTIAL_PREFILLS_KEY] = int(max_partial_prefills)
+    if alignment:
+        tt = additional.get("tt")
+        if not isinstance(tt, dict):
+            tt = {}
+            additional["tt"] = tt
+        tt.setdefault(_PREFILL_CHUNK_ALIGNMENT_KEY, int(alignment))
+
+
 def get_tt_decode_interleave_config(
     vllm_config: "VllmConfig",
 ) -> tuple[bool, int, int]:

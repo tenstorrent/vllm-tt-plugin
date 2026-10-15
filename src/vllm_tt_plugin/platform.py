@@ -52,6 +52,7 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_prefill_chunking,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
@@ -297,6 +298,43 @@ def _apply_chunked_prefill_policy(
         scheduler_config.max_num_batched_tokens,
         scheduler_config.long_prefill_token_threshold,
     )
+
+
+def _store_prefill_chunking(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Hand the model's prefill-piece alignment and partial-prefill cap to the scheduler.
+
+    ``prefill_chunk_alignment`` (tokens): every piece of a split prompt ends on a
+    multiple of it, because the model resumes a prompt only at such a position
+    (a piece ending elsewhere makes the next piece recompute from position 0).
+    ``max_partial_prefills``: how many prompts may sit part-way through their
+    prefill at once (the model keeps one resumable state per prefill slot).
+    Both default to 0 (not declared) and are forced to 0 when chunked prefill is
+    off for this launch.
+    """
+    capabilities = model_capabilities or {}
+    alignment = capabilities.get("prefill_chunk_alignment", 0)
+    max_partial = capabilities.get("max_partial_prefills", 0)
+    if not vllm_config.scheduler_config.enable_chunked_prefill:
+        alignment = max_partial = 0
+    store_tt_prefill_chunking(vllm_config, alignment, max_partial)
+    if alignment:
+        budget = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        if budget < alignment:
+            raise ValueError(
+                f"TT model {model_class.__name__} declares prefill_chunk_alignment="
+                f"{alignment} but max_num_batched_tokens={budget} is smaller: a "
+                "prompt longer than the budget could never advance one aligned piece"
+            )
+        logger.info(
+            "Prefill pieces of a split prompt end on multiples of %d tokens; "
+            "at most %s prompts may be part-way through their prefill.",
+            alignment,
+            max_partial or "unlimited",
+        )
 
 
 def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
@@ -2016,6 +2054,7 @@ class TTPlatform(Platform):
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
+        _store_prefill_chunking(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         if output_tokens_per_step > 1 and seeded_sampling_policy == "host":

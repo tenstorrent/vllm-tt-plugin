@@ -218,6 +218,38 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+#### Piece alignment and the cap on split prompts
+
+A model whose prefill state is carried between pieces in fixed windows can
+resume a prompt only at a multiple of its window `C` (DeepSeek-V4.1: the traced
+chunk, 512 tokens by default). It declares two `model_capabilities` keys, which
+the platform hands to `TTScheduler` (both default to `0` = not declared, and are
+forced to `0` when chunked prefill is off):
+
+- `prefill_chunk_alignment` (`C`): every piece that does not finish its prompt
+  ends on a multiple of `C`. `TTScheduler` overrides the base scheduler's
+  `_mamba_block_aligned_split` hook (called from both the running and the
+  waiting loop once `need_mamba_block_aligned_split` is set) and rounds the
+  piece's *end position* (`num_computed_tokens + n`) down. A piece that would
+  end before the next multiple returns 0: the running loop skips that request
+  for the step, the waiting loop stops admitting (FCFS). The piece that
+  finishes the prompt and decodes are never touched. The platform rejects
+  `max_num_batched_tokens < C`.
+- `max_partial_prefills`: prompts part-way through prefill at once (one
+  resumable state per model prefill slot). In the split regime
+  (`max_num_batched_tokens < max_model_len`) a waiting prompt that fits the
+  budget left after the running continuations takes no slot; one that does not
+  takes one, and the first that would exceed the cap and everything behind it
+  waits (FIFO). In the whole-prompt regime (`max_num_batched_tokens >=
+  max_model_len`) the existing fit-whole rule applies.
+
+The step budget (`max_num_batched_tokens`) is the wall-time bound of a prefill
+step: a step costs about its token count over the model's prefill speed (about
+0.84 s per 512-token window for DeepSeek-V4.1), so 2048 to 4096 keeps a
+decode's gap short and a budget near `max_model_len` favours throughput.
+Together with `decode_interleave_prefill_steps` (default 2) the longest gap a
+running decode sees is about `prefill_steps * budget / prefill_speed`.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.

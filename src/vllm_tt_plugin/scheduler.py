@@ -18,6 +18,7 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_max_partial_prefills,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
@@ -343,6 +344,7 @@ class TTScheduler(AsyncScheduler):
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
+        self._max_partial_prefills = get_tt_max_partial_prefills(self.vllm_config)
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
@@ -939,9 +941,15 @@ class TTScheduler(AsyncScheduler):
         request); the rest wait for the next prefill step. -> the held back
         requests, in order (the caller puts them back behind what is left of the
         admitted prefix)."""
-        if not self.waiting or self.max_num_scheduled_tokens < int(
+        if not self.waiting:
+            return []
+        if self.max_num_scheduled_tokens < int(
             self.vllm_config.model_config.max_model_len
         ):
+            if getattr(self, "_prefill_chunk_alignment", 0) and getattr(
+                self, "_max_partial_prefills", 0
+            ):
+                return self._hold_back_beyond_partial_cap(partial_prefills)
             return []
         budget = self.max_num_scheduled_tokens - sum(
             r.num_tokens - r.num_computed_tokens for r in partial_prefills
@@ -957,6 +965,48 @@ class TTScheduler(AsyncScheduler):
                 continue
             admitted.add_request(request)
             used += need
+        self.waiting = admitted
+        return held
+
+    def _hold_back_beyond_partial_cap(
+        self, partial_prefills: list[Request]
+    ) -> list[Request]:
+        """Split regime (the budget cannot hold a whole prompt): cap the prompts part-way through prefill.
+
+        A model with one resumable prefill state per slot (``max_partial_prefills``
+        > 0) loses the state of a prompt whose slot another prompt takes over, and
+        that prompt then restarts from position 0. Here a prompt is split on
+        purpose, so the waiting queue is cut to the longest FIFO prefix that
+        leaves at most ``max_partial_prefills`` prompts part-way: a waiting
+        prompt that fits the budget left after the running continuations
+        finishes this step and takes no slot; one that does not will be split
+        and takes one. The first prompt that would exceed the cap and everything
+        behind it waits for a later step (FIFO is kept). -> the held back
+        requests, in order.
+        """
+        cap = getattr(self, "_max_partial_prefills", 0)
+        if not getattr(self, "_prefill_chunk_alignment", 0) or cap <= 0:
+            return []
+        slots = cap - len(partial_prefills)
+        left = self.max_num_scheduled_tokens - sum(
+            r.num_tokens - r.num_computed_tokens for r in partial_prefills
+        )
+        admitted = create_request_queue(self.policy)
+        held: list[Request] = []
+        while self.waiting:
+            request = self.waiting.pop_request()
+            need = request.num_tokens - request.num_computed_tokens
+            if held:
+                held.append(request)
+            elif need <= left:
+                admitted.add_request(request)
+                left -= need
+            elif slots > 0:
+                admitted.add_request(request)
+                slots -= 1
+                left = 0
+            else:
+                held.append(request)
         self.waiting = admitted
         return held
 
