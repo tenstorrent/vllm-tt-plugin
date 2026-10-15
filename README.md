@@ -51,7 +51,7 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.30.0` from source with
+The installation script builds vLLM `0.31.0` from source with
 `VLLM_TARGET_DEVICE=empty`.
 
 To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),
