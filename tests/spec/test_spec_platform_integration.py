@@ -249,6 +249,25 @@ def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
     assert "TTLaneInputBatch" in message
 
 
+def test_the_rust_frontend_cannot_speculate(monkeypatch, vllm_config):
+    # The Rust frontend serves HTTP outside Python, so per-request admission
+    # in TTPlatform.validate_request never sees its requests.
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    model = make_fake_spec_model(max_supported_num_seqs=4)
+    with pytest.raises(ValueError, match="Rust frontend"):
+        _run_hook(monkeypatch, _speculative(vllm_config), model)
+
+
+def test_the_rust_frontend_is_left_alone_when_nothing_speculates(
+    monkeypatch, vllm_config
+):
+    monkeypatch.setenv("VLLM_USE_RUST_FRONTEND", "1")
+    vllm_config.diffusion_config = None
+    vllm_config.parallel_config.distributed_executor_backend = None
+    _run_hook(monkeypatch, vllm_config, make_fake_spec_model())
+    assert require_tt_spec_plan(vllm_config) is None
+
+
 # region Per-request semantics
 
 

@@ -22,7 +22,8 @@ chooses, so a verify accepts every draft, and the only way a draft step can
 accept nothing is the ordinary decode that dropped the drafts.
 
 The ``mixed`` and ``async-mixed`` configurations of ``run_spec_regression.sh``
-launch the first; every ``always`` configuration exercises the second.
+launch the first; the ``accept-all``, ``accept-2`` and ``accept-0``
+configurations exercise the second.
 """
 
 from __future__ import annotations

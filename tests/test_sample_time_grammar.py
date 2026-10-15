@@ -71,6 +71,7 @@ def _grammar(num_structured: int) -> GrammarOutput:
 def _device_sampling_runner(*, supports_device_grammar: bool):
     return SimpleNamespace(
         sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
         supports_device_grammar=supports_device_grammar,
         num_devices=8,
         tt_data_parallel_size=1,
