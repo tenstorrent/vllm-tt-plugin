@@ -33,6 +33,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
+    TT_SCHEDULER_CLS,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
@@ -190,6 +191,10 @@ class TTWorker(WorkerBase):
     # Built by _create_model_runner; a subclass swaps the runner without
     # copying the device and KV-pool steps of init_device.
     model_runner_cls: type[TTModelRunner] = TTModelRunner
+
+    # The scheduler this worker runs with; resolve_tt_scheduler_cls pairs a
+    # requested scheduler against it. A stage worker names its own.
+    tt_scheduler_cls: str | type = TT_SCHEDULER_CLS
 
     def __init__(
         self,

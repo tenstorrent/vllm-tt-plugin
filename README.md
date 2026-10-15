@@ -476,6 +476,11 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
 | `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
 
+A `TTWorker` subclass names the scheduler it runs with in `tt_scheduler_cls`.
+A requested `scheduler_cls` is kept when it derives from that class, and replaced
+by it when that class derives from the request. Any other pair raises
+`ValueError`, as does lane mode with a non-default worker or scheduler.
+
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.

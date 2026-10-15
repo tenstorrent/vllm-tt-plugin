@@ -17,6 +17,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    TT_WORKER_CLS,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
@@ -27,6 +28,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_scheduler_cls,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -71,8 +73,6 @@ _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
 _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
-TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
-TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # tt-metal's fixed Tensix tile height, matching ``ttnn.TILE_SIZE``. Keep this a
 # literal so importing admission logic cannot hard-crash hosts where tt-metal is
 # absent; tests/tt enforces the agreement with the real module. The DiffusionGemma
@@ -1842,7 +1842,7 @@ class TTPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+            parallel_config.worker_cls = TT_WORKER_CLS
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -2405,17 +2405,19 @@ class TTPlatform(Platform):
                 "Use data_parallel_size=1."
             )
 
+        vllm_config.scheduler_config.scheduler_cls = resolve_tt_scheduler_cls(
+            vllm_config.scheduler_config.scheduler_cls,
+            parallel_config.worker_cls,
+            is_lane_mode,
+        )
         if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.
             validate_tt_lane_config(vllm_config)
-            vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
             logger.info(
                 "Using TTLaneCoordinator with %d in-process TT lanes",
                 get_tt_data_parallel_size(vllm_config),
             )
-        else:
-            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)
