@@ -1006,24 +1006,32 @@ class TTModelRunner:
         if mm_feature.modality != "image":
             raise NotImplementedError("Only images are supported for now")
 
+    # Multimodal fields every image model gets, even when a processor does not
+    # emit them, so adapters that read them positionally keep their keys.
+    _MM_BASE_FIELDS = ("pixel_values", "image_grid_thw")
+
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
     ) -> dict[str, Any]:
         """
         Gather and batch multi-modal inputs for the current persistent batch.
 
-        Currently only supports image inputs in the "pixel_values" and
-        "image_grid_thw" fields.
+        Every field the model's multimodal processor put on an item is
+        forwarded under its own name (``pixel_values`` and ``image_grid_thw``
+        are always present; e.g. Gemma4 adds ``pixel_position_ids``, and its
+        unified 12B adds ``input_features`` / ``input_features_mask`` for audio
+        and ``pixel_values_videos`` / ``pixel_position_ids_videos`` for video),
+        so an adapter reads the fields its processor emits without the runner
+        knowing each model's contract.
 
-        Returns a dict with keys "pixel_values" and "image_grid_thw".
-        Each value is a list aligned with the persistent batch order
-        (`self.input_batch.req_ids[:num_reqs]`).
+        Returns a dict keyed by field name. Each value is a list aligned with
+        the persistent batch order (`self.input_batch.req_ids[:num_reqs]`).
 
         For request i:
         - If it has no `mm_features`, the entry is None.
         - Otherwise the entry is a list aligned with that request's
-          `mm_features` (currently only images), where each element is a
-          tensor (or None if that feature has no data).
+          `mm_features`, where each element is a tensor (or None if that
+          feature has no data or lacks the field).
 
         Example (3 scheduled requests: text-only, 1 image, 2 images):
         {
@@ -1040,13 +1048,25 @@ class TTModelRunner:
         }
         """
 
-        multi_modal_kwargs: dict[str, Any] = {
-            "pixel_values": [],
-            "image_grid_thw": [],
-        }
-
         if req_indices is None:
             req_indices = list(range(self.input_batch.num_reqs))
+
+        # Pass 1: the field names across the batch, base fields first so the
+        # dict order (and any positional reader) is unchanged for models that
+        # only emit those two.
+        fields: list[str] = list(self._MM_BASE_FIELDS)
+        for batch_index in req_indices:
+            req_state = self.requests[self.input_batch.req_ids[batch_index]]
+            for mm_feature in req_state.mm_features or ():
+                item = mm_feature.data
+                if item is None:
+                    continue
+                for key in item:
+                    if key not in fields:
+                        fields.append(key)
+
+        multi_modal_kwargs: dict[str, Any] = {key: [] for key in fields}
+
         # The model input tensors are built in persistent batch order, so
         # multi-modal inputs must follow the same order (not just new reqs).
         for batch_index in req_indices:
@@ -1054,34 +1074,29 @@ class TTModelRunner:
             req_state = self.requests[req_id]
 
             if not req_state.mm_features:
-                multi_modal_kwargs["pixel_values"].append(None)
-                multi_modal_kwargs["image_grid_thw"].append(None)
+                for key in fields:
+                    multi_modal_kwargs[key].append(None)
                 continue
 
-            pv_array: list[torch.Tensor | None] = []
-            image_grid_thw_array: list[torch.Tensor | None] = []
+            per_field: dict[str, list[torch.Tensor | None]] = {
+                key: [] for key in fields
+            }
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
                 item = mm_feature.data
-                if item is None:
-                    pv_array.append(None)
-                    image_grid_thw_array.append(None)
-                    continue
-                # With prefix caching, an image whose tokens are fully inside the
+                # With prefix caching, an item whose tokens are fully inside the
                 # cached prefix arrives with its tensor payload stripped; M-RoPE
                 # models keep the CPU-side grid so positions can still be built.
-                pv_array.append(
-                    item["pixel_values"].data if "pixel_values" in item else None
-                )
-                image_grid_thw_array.append(
-                    item["image_grid_thw"].data if "image_grid_thw" in item else None
-                )
+                for key in fields:
+                    if item is None or key not in item:
+                        per_field[key].append(None)
+                    else:
+                        per_field[key].append(item[key].data)
 
-            multi_modal_kwargs["pixel_values"].append(pv_array)
-            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
+            for key in fields:
+                multi_modal_kwargs[key].append(per_field[key])
 
         return multi_modal_kwargs
-
     def _sampling_params_for_padded_decode(
         self,
         sample_params,
