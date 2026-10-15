@@ -13,6 +13,23 @@ import torch
 from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
+try:
+    # vLLM >= 0.31 maps only ``VLLMClientError`` raised while a request is
+    # being validated to an HTTP 4xx; a bare ``ValueError`` out of
+    # ``AsyncLLM.generate`` is wrapped in ``EngineGenerateError`` and answered
+    # with an empty HTTP 500.
+    from vllm.exceptions import VLLMValidationError as _VLLMValidationError
+
+    class TTRequestError(_VLLMValidationError, ValueError):
+        """A request this TT launch cannot serve (HTTP 400 on vLLM >= 0.31;
+        still a ``ValueError`` for callers and tests written against 0.26)."""
+
+except ImportError:  # vLLM < 0.31: ValueError was mapped to 400 already
+
+    class TTRequestError(ValueError):  # type: ignore[no-redef]
+        """A request this TT launch cannot serve (HTTP 400)."""
+
+
 from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
@@ -944,7 +961,7 @@ def _install_block_output_input_processor_patch() -> None:
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
         is_block_output_model = is_tt_block_output_model(self.vllm_config)
         if is_block_output_model and kwargs.get("resumable", False):
-            raise ValueError(
+            raise TTRequestError(
                 "TT block-output models do not support resumable "
                 "streaming-input requests"
             )
@@ -996,7 +1013,7 @@ def _install_block_output_streaming_input_patch() -> None:
 
     async def add_streaming_input_request_tt(self, *args, **kwargs):
         if is_tt_block_output_model(self.vllm_config):
-            raise ValueError(
+            raise TTRequestError(
                 "TT block-output models do not support resumable "
                 "streaming-input requests"
             )
@@ -2369,7 +2386,7 @@ class TTPlatform(Platform):
                 if requested_max_tokens is None
                 else f"max_tokens={requested_max_tokens}"
             )
-            raise ValueError(
+            raise TTRequestError(
                 "Block output is committed in physical "
                 f"{output_size}-token canvases: prompt length {prompt_len} "
                 f"(aligned to {aligned_prompt_len}) plus "
@@ -2437,7 +2454,7 @@ class TTPlatform(Platform):
             unsupported.append(f"min_tokens={params.min_tokens!r}")
 
         if unsupported:
-            raise ValueError(
+            raise TTRequestError(
                 f"Speculative decoding on {cls.device_name} cannot serve this "
                 f"request's {unsupported}. No path on this launch applies "
                 "those, so answering without them would change what was asked "
@@ -2459,10 +2476,10 @@ class TTPlatform(Platform):
         dev = cls.device_name
 
         if processed_inputs.get("prompt_embeds") is not None:
-            raise ValueError(f"prompt_embeds are not supported on {dev}")
+            raise TTRequestError(f"prompt_embeds are not supported on {dev}")
 
         if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
-            raise ValueError(f"Not yet supporting prompt_logprobs on {dev}")
+            raise TTRequestError(f"Not yet supporting prompt_logprobs on {dev}")
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)
@@ -2513,7 +2530,7 @@ class TTPlatform(Platform):
             unsupported.append("extra_args (accepted: omitted/empty)")
 
         if unsupported:
-            raise ValueError(
+            raise TTRequestError(
                 "This block-output model owns its Gumbel sampling and does not "
                 "support these request parameters: " + "; ".join(unsupported)
             )
