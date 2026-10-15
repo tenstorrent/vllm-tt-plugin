@@ -79,5 +79,12 @@ def test_the_pin_defeats_the_upstream_default_for_any_config():
 
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
-    cfg = SimpleNamespace(attention_config=SimpleNamespace(hisparse_config=None))
-    assert VllmConfig.use_v2_model_runner.fget(cfg) is False
+    # vLLM 0.31 consults ``attention_config.hisparse_config`` and
+    # ``watermark_config`` (both features that force V2) before the env, so the
+    # bare object must carry those two (unset) fields; every other term
+    # (model_config, HAS_TRITON, ...) still has to come after the env check.
+    class _Cfg:
+        attention_config = type("_Attn", (), {"hisparse_config": None})()
+        watermark_config = None
+
+    assert VllmConfig.use_v2_model_runner.fget(_Cfg()) is False
