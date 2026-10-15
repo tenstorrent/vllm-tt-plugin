@@ -80,10 +80,13 @@ def _model_budget(max_tokens: int, hybrid_enabled: bool = False):
     whether to add sliding-window headroom. It is set explicitly (rather
     than left to ``MagicMock``'s auto-attribute, which is always truthy) so
     the flag defaults to ``False`` like a real model class that opts out.
+    The stub has no ``get_kv_cache_spec`` hook for the same reason, so the
+    hybrid admission floor stays out of these budget tests.
     """
     fake_model_class = MagicMock()
     fake_model_class.get_max_tokens_all_users.return_value = max_tokens
     fake_model_class._HYBRID_KV_CACHE_GROUPS_ENABLED = hybrid_enabled
+    fake_model_class.get_kv_cache_spec = None
     return patch(
         "vllm_tt_plugin.worker.get_model_architecture",
         return_value=(fake_model_class, "arch"),
@@ -359,7 +362,7 @@ def _unresolved_layout_cache_config(block_size: int):
 
 @pytest.mark.parametrize(
     ("batch", "in_flight", "expected"),
-    [(1, 1024, 32965), (32, 1024, 36904), (1, 512, 32901), (1, 4096, 33349)],
+    [(1, 1024, 32966), (32, 1024, 36904), (1, 512, 32902), (1, 4096, 33350)],
 )
 def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
     """Real upstream grouping/planning must admit the unchanged full context."""
@@ -422,6 +425,13 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
         blocks = get_num_available_blocks_tt(cfg)
 
     assert blocks == expected
+    if batch == 1:
+        # The floor decides at batch 1, and it is tight: without the one
+        # output-reservation block the pool is exactly upstream's admission
+        # minimum (one max_model_len request plus BlockPool's null block).
+        from vllm_tt_plugin.worker import _upstream_admission_blocks
+
+        assert blocks == _upstream_admission_blocks(cfg, specs) + 1
     # The engine core resolves the layout before memory planning.
     cfg.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
     cfg.cache_config.num_gpu_blocks_override = blocks
@@ -448,3 +458,49 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
             return_value=(HybridModel, "hybrid-test"),
         ):
             assert get_num_available_blocks_tt(cfg) == 32898
+
+
+def test_hybrid_pool_floor_skips_a_hook_that_returns_none():
+    """A hybrid-enabled class whose hook returns None keeps the model budget."""
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="hybrid-test",
+            max_model_len=8192,
+            original_max_model_len=8192,
+            get_sliding_window=lambda: None,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=1, disable_hybrid_kv_cache_manager=False
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, decode_context_parallel_size=1
+        ),
+        cache_config=_unresolved_layout_cache_config(block_size=32),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        additional_config={},
+        speculative_config=None,
+        kv_transfer_config=None,
+        max_in_flight_tokens=1024,
+    )
+
+    class HybridModelWithoutSpecs:
+        _HYBRID_KV_CACHE_GROUPS_ENABLED = True
+
+        @staticmethod
+        def get_max_tokens_all_users(**kwargs):
+            return kwargs["max_model_len"]
+
+        @staticmethod
+        def get_kv_cache_spec(config):
+            return None
+
+    with patch(
+        "vllm_tt_plugin.worker.get_model_architecture",
+        return_value=(HybridModelWithoutSpecs, "hybrid-test"),
+    ):
+        blocks = get_num_available_blocks_tt(cfg)
+
+    # Budget plus one output-reservation block; no floor, no TypeError.
+    assert blocks == 8192 // 32 + 1

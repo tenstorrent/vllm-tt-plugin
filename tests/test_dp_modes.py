@@ -276,15 +276,17 @@ class TestDPModes:
 
         assert assigned_devices == [mesh_device]
 
-    @pytest.mark.parametrize("declares_fabric", [False, True])
-    def test_init_device_tracks_mesh_as_worker_device(
-        self,
+    @staticmethod
+    def _init_device_worker(
         monkeypatch: pytest.MonkeyPatch,
-        declares_fabric: bool,
-    ) -> None:
-        mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
-        model_runner = SimpleNamespace()
+        worker_cls: type[TTWorker] = TTWorker,
+        model_capabilities: dict | None = None,
+    ) -> tuple[TTWorker, SimpleNamespace, list[str]]:
+        """A worker whose init_device steps run against test doubles.
 
+        Returns the worker, its mesh double, and the list each step appends to.
+        """
+        mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
         parallel_config = SimpleNamespace(
             data_parallel_size=4,
             data_parallel_rank_local=0,
@@ -292,7 +294,7 @@ class TestDPModes:
             assigned_physical_gpu_ids=None,
         )
 
-        worker_instance = TTWorker.__new__(TTWorker)
+        worker_instance = worker_cls.__new__(worker_cls)
         worker_instance.vllm_config = SimpleNamespace(
             additional_config={}, parallel_config=parallel_config
         )
@@ -302,30 +304,24 @@ class TestDPModes:
         worker_instance.model_config = SimpleNamespace()
         worker_instance.trace_mode = "all"
         worker_instance.enable_model_warmup = True
+        worker_instance._num_tt_blocks = None
 
         monkeypatch.setattr(TTPlatform, "check_and_update_config", lambda _cfg: None)
         monkeypatch.setattr(worker, "get_tt_config", lambda _cfg: {})
-        fabric_config = (
-            {"config": worker.ttnn.FabricConfig.FABRIC_1D_RING}
-            if declares_fabric
-            else None
-        )
         model_class = SimpleNamespace()
-        if declares_fabric:
-            model_class.model_capabilities = {"fabric_config": fabric_config}
+        if model_capabilities is not None:
+            model_class.model_capabilities = model_capabilities
         monkeypatch.setattr(
             worker, "get_model_architecture", lambda _cfg: (model_class, "model")
         )
 
+        steps: list[str] = []
+        fabric_config = (model_capabilities or {}).get("fabric_config")
+
         def open_mesh(_tt_config, _trace_mode, _local_dp_rank, *, model_fabric_config):
             assert model_fabric_config is fabric_config
+            steps.append("mesh")
             return mesh_device
-
-        monkeypatch.setattr(worker, "open_mesh_device", open_mesh)
-
-        # The KV pool is sized and --max-model-len settled during init_device so
-        # the model sees the fitted length when load_model runs next.
-        steps: list[str] = []
 
         def size_pool(_cfg, _num_devices):
             steps.append("size")
@@ -334,15 +330,35 @@ class TestDPModes:
         def fit_max_model_len(_cfg, _num_tt_blocks):
             steps.append("fit")
 
-        def build_runner(**_kwargs):
-            steps.append("runner")
-            return model_runner
-
+        monkeypatch.setattr(worker, "open_mesh_device", open_mesh)
         monkeypatch.setattr(worker, "get_num_available_blocks_tt", size_pool)
         monkeypatch.setattr(
             worker, "_fit_block_output_max_model_len", fit_max_model_len
         )
-        monkeypatch.setattr(worker, "TTModelRunner", build_runner)
+        return worker_instance, mesh_device, steps
+
+    @pytest.mark.parametrize("declares_fabric", [False, True])
+    def test_init_device_tracks_mesh_as_worker_device(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        declares_fabric: bool,
+    ) -> None:
+        model_capabilities = (
+            {"fabric_config": {"config": worker.ttnn.FabricConfig.FABRIC_1D_RING}}
+            if declares_fabric
+            else None
+        )
+        worker_instance, mesh_device, steps = self._init_device_worker(
+            monkeypatch, model_capabilities=model_capabilities
+        )
+        model_runner = SimpleNamespace()
+
+        def build_runner(**kwargs):
+            assert kwargs["mesh_device"] is mesh_device
+            steps.append("runner")
+            return model_runner
+
+        monkeypatch.setattr(TTWorker, "model_runner_cls", staticmethod(build_runner))
 
         try:
             TTWorker.init_device(worker_instance)
@@ -351,10 +367,61 @@ class TestDPModes:
             assert worker_instance.device is mesh_device
             assert worker_instance.device_config.device is mesh_device
             assert worker_instance.model_runner is model_runner
-            assert steps == ["size", "fit", "runner"]
+            # The KV pool is sized and --max-model-len settled before the runner
+            # exists, so the model sees the fitted length when load_model runs.
+            assert steps == ["mesh", "size", "fit", "runner"]
             assert worker_instance._num_tt_blocks == 7
         finally:
             # The test double cannot be passed to TT device cleanup.
+            worker_instance.mesh_device = None
+
+    def test_init_device_builds_the_subclass_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class StageRunner:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class StageWorker(TTWorker):
+            model_runner_cls = StageRunner
+
+        worker_instance, mesh_device, steps = self._init_device_worker(
+            monkeypatch, worker_cls=StageWorker
+        )
+
+        try:
+            worker_instance.init_device()
+
+            assert type(worker_instance.model_runner) is StageRunner
+            assert worker_instance.model_runner.kwargs["mesh_device"] is mesh_device
+            assert worker_instance.model_runner.kwargs["num_devices"] == 8
+            assert steps == ["mesh", "size", "fit"]
+        finally:
+            worker_instance.mesh_device = None
+
+    def test_init_device_skips_pool_sizing_when_subclass_overrides_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class NoKVWorker(TTWorker):
+            def _init_kv_pool(self) -> None:
+                pass
+
+        worker_instance, mesh_device, steps = self._init_device_worker(
+            monkeypatch, worker_cls=NoKVWorker
+        )
+        model_runner = SimpleNamespace()
+        monkeypatch.setattr(
+            NoKVWorker, "model_runner_cls", staticmethod(lambda **_kw: model_runner)
+        )
+
+        try:
+            worker_instance.init_device()
+
+            assert worker_instance.mesh_device is mesh_device
+            assert worker_instance.model_runner is model_runner
+            assert steps == ["mesh"]
+            assert worker_instance._num_tt_blocks is None
+        finally:
             worker_instance.mesh_device = None
 
     def test_legacy_tt_dp_override_is_ignored_by_platform(

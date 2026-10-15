@@ -288,6 +288,17 @@ submitted batch. If any request or batch feature cannot use on-device
 sampling, the batch uses vLLM's host-side path. Structured outputs have
 additional rules; see [Structured Output Sampling](#structured-output-sampling).
 
+Single-token-output models can explicitly use
+`"seeded_sampling_policy": "host"` to sample requests with an API seed on
+host during both prefill and decode. The default, `"auto"`, preserves the
+existing routing. With the host policy, one submitted seeded request moves
+the whole forward to host sampling, including its unseeded companions.
+Seeded greedy requests also use host sampling. This can reduce throughput
+and increase latency; batches without submitted seeded requests retain
+their existing routing. Models that own multi-token sampling and speculative
+decoding configurations reject this option. It does not promise
+batch-independent model logits or waive tests.
+
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
 base64 `data:image/...` URL or a real URL such as
@@ -309,6 +320,7 @@ Common options:
 | Key | Purpose |
 | --- | --- |
 | `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
+| `seeded_sampling_policy` | `auto` (default) or `host`. Select host sampling for submitted seeded requests during prefill and decode; affects the whole submitted forward. Single-token-output models only; incompatible with speculative decoding. |
 | `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
 | `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
 | `trace_region_size` | Trace region size for TT runtime tracing. |
@@ -396,7 +408,8 @@ With `VLLM_LOGGING_LEVEL=DEBUG`, each device-grammar step logs
 [`docs/SCHEDULING.md`](docs/SCHEDULING.md#when-steady-async-decode-is-allowed)
 for the execution flow and
 [`docs/MODEL_CAPABILITIES.md`](docs/MODEL_CAPABILITIES.md#sampling-and-async-capabilities)
-for the capability contract.
+for the capability contract. Model authors implement the
+[device grammar contract](docs/DEVICE_GRAMMAR_CONTRACT.md).
 
 ### Model Fabric Configuration
 
@@ -441,7 +454,7 @@ sizes and validates the KV cache against it, the two must be chosen together:
 | `--max-model-len` | Behavior |
 | --- | --- |
 | numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
-| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. |
+| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. Hybrid models with a `get_kv_cache_spec` hook are the exception: the TT worker raises the pool to the smallest size upstream admits for one `max_model_len` request, plus the output reservation, and logs the change. That pool must still fit device memory, which TT does not profile; KV allocation fails at startup if it does not. With chunked prefill off, every sliding-window group is sized at the full context, so the raised pool can be several times `max_model_len`. |
 | `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. For block-output models the TT worker fits `max_model_len` to the pool minus one output canvas before vLLM's auto-fit runs. |
 | omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
 
@@ -723,6 +736,8 @@ refuses a request with a non-zero temperature or a penalty on that launch.
 `TTPlatform.validate_request` rejects logprobs, structured output,
 `logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
 speculative launch. Prompt logprobs remain unsupported for all TT models.
+Only vLLM's Python frontend runs these checks, so a speculative launch with
+`VLLM_USE_RUST_FRONTEND=1` is refused at startup.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
 acceptance, K+1 lookahead reservation and lifecycle hooks. See

@@ -7,6 +7,7 @@ import os
 import time
 import warnings
 from contextlib import suppress
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import ttnn
@@ -19,8 +20,6 @@ from vllm.utils.torch_utils import (
     set_torch_threads_for_runtime,
 )
 from vllm.v1.core.kv_cache_utils import (
-    _max_memory_usage_bytes_from_groups,
-    _pool_bytes_per_block,
     get_kv_cache_groups,
     get_uniform_page_size,
 )
@@ -29,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -190,6 +190,10 @@ def _available_kv_cache_memory_bytes_for_num_blocks(
 
 
 class TTWorker(WorkerBase):
+    # Built by _create_model_runner; a subclass swaps the runner without
+    # copying the device and KV-pool steps of init_device.
+    model_runner_cls: type[TTModelRunner] = TTModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -227,6 +231,11 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        self._init_tt_device()
+        self._init_kv_pool()
+        self.model_runner: TTModelRunner = self._create_model_runner()
+
+    def _init_tt_device(self) -> None:
         # tt-metal latches the visible set at first cluster construction and never
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
@@ -260,6 +269,7 @@ class TTWorker(WorkerBase):
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
 
+    def _init_kv_pool(self) -> None:
         # Size the KV pool and settle --max-model-len here, not in
         # determine_available_memory: upstream runs the whole executor init
         # (init_device, then load_model) before it asks for available memory
@@ -274,8 +284,9 @@ class TTWorker(WorkerBase):
         )
         _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
 
-        # Init ModelRunner here, so that we have access to self.mesh_device.
-        self.model_runner: TTModelRunner = TTModelRunner(
+    def _create_model_runner(self) -> TTModelRunner:
+        # Needs the mesh that _init_tt_device opened.
+        return self.model_runner_cls(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
@@ -368,20 +379,7 @@ class TTWorker(WorkerBase):
         model_cls, _ = ModelRegistry.resolve_model_cls(
             arch, model_config=self.model_config
         )
-        hook = getattr(model_cls, "get_kv_cache_spec", None)
-        if hook is None:
-            return None
-        spec = hook(self.vllm_config)
-        if spec is None:
-            return None
-        if not isinstance(spec, dict) or not all(
-            isinstance(k, str) and isinstance(v, KVCacheSpec) for k, v in spec.items()
-        ):
-            raise TypeError(
-                f"{model_cls.__name__}.get_kv_cache_spec() must return "
-                f"dict[str, KVCacheSpec] or None, got {type(spec).__name__}"
-            )
-        return spec
+        return kv_cache_spec_from_model_class(model_cls, self.vllm_config)
 
     def _build_default_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Single-layer spec used by the legacy non-hybrid path. Downstream
@@ -567,6 +565,31 @@ class TTWorker(WorkerBase):
             super().__del__()  # type: ignore
 
 
+def kv_cache_spec_from_model_class(
+    model_cls: type, vllm_config: VllmConfig
+) -> dict[str, KVCacheSpec] | None:
+    """The model class's ``get_kv_cache_spec`` result, validated.
+
+    ``None`` when the class has no hook or the hook returns ``None`` (the
+    single-spec default applies). The worker's spec resolution and the
+    hybrid pool floor both go through here, so they cannot disagree.
+    """
+    hook = getattr(model_cls, "get_kv_cache_spec", None)
+    if hook is None:
+        return None
+    spec = hook(vllm_config)
+    if spec is None:
+        return None
+    if not isinstance(spec, dict) or not all(
+        isinstance(k, str) and isinstance(v, KVCacheSpec) for k, v in spec.items()
+    ):
+        raise TypeError(
+            f"{model_cls.__name__}.get_kv_cache_spec() must return "
+            f"dict[str, KVCacheSpec] or None, got {type(spec).__name__}"
+        )
+    return spec
+
+
 def _kv_cache_groups_for_sizing(vllm_config: VllmConfig, kv_cache_specs: dict):
     """Group ``kv_cache_specs`` the way the engine will, for pool sizing.
 
@@ -586,6 +609,49 @@ def _kv_cache_groups_for_sizing(vllm_config: VllmConfig, kv_cache_specs: dict):
     sizing_config.cache_config = copy.copy(cache_config)
     sizing_config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
     return sizing_config, get_kv_cache_groups(sizing_config, kv_cache_specs)
+
+
+def _upstream_admission_blocks(
+    vllm_config: VllmConfig, kv_cache_specs: dict[str, KVCacheSpec]
+) -> int:
+    """Smallest pool, in blocks, that upstream ``get_kv_cache_configs`` admits.
+
+    Mirrors its steps for one worker: tag sliding-window specs with
+    ``extra_retained_tokens`` (multi-module MTP only), group the specs, take
+    the memory one request at ``max_model_len`` needs, and add BlockPool's
+    null block, which the admission check subtracts from the pool before
+    comparing. The private helpers are imported here, not at module scope,
+    so a vLLM rename breaks only this path.
+    """
+    from vllm.v1.core.kv_cache_utils import (
+        _max_memory_usage_bytes_from_groups,
+        _pool_bytes_per_block,
+    )
+
+    spec_config = vllm_config.speculative_config
+    extra_retained_tokens = (
+        spec_config.num_speculative_tokens - 1
+        if spec_config is not None and spec_config.use_multi_module_mtp()
+        else 0
+    )
+    if extra_retained_tokens:
+        kv_cache_specs = {
+            name: (
+                replace(spec, extra_retained_tokens=extra_retained_tokens)
+                if isinstance(spec, SlidingWindowSpec)
+                else spec
+            )
+            for name, spec in kv_cache_specs.items()
+        }
+    sizing_config, groups = _kv_cache_groups_for_sizing(
+        vllm_config, dict(kv_cache_specs)
+    )
+    if not groups:
+        return 0
+    bytes_per_block = _pool_bytes_per_block(groups)
+    one_request_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
+    null_block = 1
+    return -(-one_request_bytes // bytes_per_block) + null_block
 
 
 def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -> int:
@@ -679,41 +745,53 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     )
     sliding_window = model_config.get_sliding_window()
     if hybrid_kv_cache_groups_enabled and sliding_window is not None:
-        # Conservative cap: assume up to a few sliding groups per buffer
-        # (typical for Gemma3 5:1 / GPT-OSS 1:1 hybrid patterns) and add
-        # ``sliding_window * max_batch`` worth of tokens per group as
-        # padding. The exact number of sliding groups isn't known here
-        # (the spec hook hasn't run yet); bound it with a small constant
-        # rather than walking the model layer types from raw HF config.
+        # Heuristic padding: ``sliding_window * max_batch`` tokens for up to
+        # eight sliding groups (Gemma3 5:1 / GPT-OSS 1:1 patterns). It ignores
+        # ``max_in_flight_tokens``, upstream's extra block per sliding group
+        # and the null block, so it under-counts at small ``max_batch``; for
+        # models with a ``get_kv_cache_spec`` hook the upstream admission
+        # floor below corrects that from the real groups.
         _MAX_SLIDING_GROUPS_HEURISTIC = 8
         max_tokens_all_users += (
             sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
-    spec_hook = getattr(model_class, "get_kv_cache_spec", None)
-    if (
-        hybrid_kv_cache_groups_enabled
-        and callable(spec_hook)
+    # Hybrid models: the budget above can be smaller than what upstream needs
+    # to admit one request at max_model_len (sliding groups retain blocks for
+    # in-flight prefill), and startup then fails in get_kv_cache_configs.
+    # Raise the pool to upstream's admission requirement plus the output
+    # reservation. Auto-fit (-1) keeps the model budget: vLLM fits the length
+    # to it instead.
+    specs = (
+        kv_cache_spec_from_model_class(model_class, vllm_config)
+        if hybrid_kv_cache_groups_enabled
         and getattr(model_config, "original_max_model_len", None) != -1
-    ):
-        # A window-only estimate can miss blocks retained by in-flight
-        # prefill batches, especially at small batch sizes. Use upstream's
-        # actual groups and admission bound, including group padding. Keep
-        # the model budget if larger and preserve the output reservation.
-        # Auto-fit (-1) must keep its fixed pool rather than grow to HF length.
-        sizing_config, groups = _kv_cache_groups_for_sizing(
-            vllm_config, dict(spec_hook(vllm_config))
+        else None
+    )
+    if specs:
+        output_reservation_blocks = (
+            math.ceil(per_user_output_reservation / cache_config.block_size) * max_batch
         )
-        if groups:
-            required_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
-            bytes_per_block = _pool_bytes_per_block(groups)
-            minimum_blocks = (required_bytes + bytes_per_block - 1) // bytes_per_block
-            reserved_blocks = (
-                math.ceil(per_user_output_reservation / cache_config.block_size)
-                * max_batch
+        admission_floor = (
+            _upstream_admission_blocks(vllm_config, specs) + output_reservation_blocks
+        )
+        if admission_floor > num_tt_blocks:
+            # TT does not profile device memory, so nothing here checks that
+            # the larger pool fits; if it does not, KV allocation on the
+            # device fails at startup.
+            logger.info(
+                "Raising the TT KV pool from %d to %d blocks: one request at "
+                "max_model_len=%d needs %d blocks upstream (including the null "
+                "block) plus %d output-reservation blocks, more than "
+                "max_tokens_all_users provides.",
+                num_tt_blocks,
+                admission_floor,
+                model_config.max_model_len,
+                admission_floor - output_reservation_blocks,
+                output_reservation_blocks,
             )
-            num_tt_blocks = max(num_tt_blocks, minimum_blocks + reserved_blocks)
+            num_tt_blocks = admission_floor
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step

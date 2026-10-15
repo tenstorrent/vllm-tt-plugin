@@ -1475,6 +1475,14 @@ class TTLaneInputBatch(InputBatch):
         # Host sampling over the full slot batch.
         total = self.max_num_reqs
         precompacted = isinstance(tt_out, TTCompactedHostLogits)
+        # Compacted logits hold only the scheduled rows; a full decode readback
+        # holds every slot.
+        runner._check_host_logits(
+            tt_out.logits if precompacted else tt_out,
+            rows_needed=total if is_decode and not precompacted else n,
+            live_rows=n,
+            where="lane decode" if is_decode else "lane prefill",
+        )
         bitmask = model_input.grammar_bitmask[0]
         if precompacted:
             if (

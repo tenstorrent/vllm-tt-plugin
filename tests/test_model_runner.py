@@ -79,7 +79,6 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         model_config=SimpleNamespace(is_multimodal_model=False),
-        model=SimpleNamespace(model_capabilities={}),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
         _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
@@ -265,40 +264,6 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
 
 # endregion Prefill classification
 
-
-@pytest.mark.parametrize(
-    "capabilities",
-    [
-        None,
-        {},
-        {"supports_intermediate_prefill_output_mask": False},
-        {"supports_intermediate_prefill_output_mask": True},
-    ],
-)
-@pytest.mark.parametrize("num_computed_tokens", [2, 6])
-@pytest.mark.parametrize("device_sampling_allowed", [False, True])
-def test_intermediate_prefill_device_sampling_requires_output_mask_opt_in(
-    capabilities, num_computed_tokens, device_sampling_allowed
-):
-    batch, request = _batch_with_one_request(8, 0, num_computed_tokens)
-    runner = _fake_runner(batch, request)
-    runner.model = SimpleNamespace()
-    if capabilities is not None:
-        runner.model.model_capabilities = capabilities
-    runner.check_perform_device_sampling = lambda **_: device_sampling_allowed
-
-    model_input = _prepare(runner, ("r", 2, num_computed_tokens, 0))
-
-    intermediate = num_computed_tokens + 2 < 8
-    opted_in = bool(
-        (capabilities or {}).get("supports_intermediate_prefill_output_mask")
-    )
-    assert model_input.intermediate_prefill_mask.tolist() == [intermediate]
-    assert bool(model_input.perform_device_sampling) is (
-        device_sampling_allowed and (not intermediate or opted_in)
-    )
-
-
 # region Decode input construction
 
 
@@ -472,6 +437,7 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     capabilities = {} if declared is None else {"supports_device_penalties": declared}
     runner = SimpleNamespace(
         sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
         num_devices=4,
         tt_data_parallel_size=1,
         model=SimpleNamespace(model_capabilities=capabilities),
