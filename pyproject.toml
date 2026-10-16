@@ -42,6 +42,9 @@ tt = "vllm_tt_plugin.entrypoints:platform_plugin"
 [project.entry-points."vllm_omni.platform_plugins"]
 tt = "vllm_tt_plugin.omni.entrypoints:omni_platform_plugin"
 
+[project.entry-points."vllm_omni.general_plugins"]
+tt = "vllm_tt_plugin.omni.entrypoints:register"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vllm_tt_plugin*"]

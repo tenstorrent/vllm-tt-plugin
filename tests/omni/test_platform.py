@@ -91,3 +91,25 @@ def test_the_talker_stage_architecture_is_registered(monkeypatch: pytest.MonkeyP
         "models.demos.audio.qwen3_tts.tt.generator_vllm:"
         "Qwen3TTSTalkerForConditionalGeneration"
     )
+
+
+def test_the_omni_plugin_registers_the_talker_where_omni_validates_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_omni.config import pipeline_registry
+    from vllm_omni.model_executor.models.registry import OmniModelRegistry
+
+    registered: dict[str, str] = {}
+    monkeypatch.setattr(
+        OmniModelRegistry,
+        "register_model",
+        lambda arch, target: registered.setdefault(arch, target),
+    )
+    monkeypatch.setattr(pipeline_registry, "OMNI_PIPELINES", {})
+
+    entrypoints.register()
+
+    assert registered == {
+        tt_platform.TT_QWEN3_TTS_TALKER_ARCH: tt_platform.TT_QWEN3_TTS_TALKER_TARGET
+    }
+    assert "tt_qwen3_tts_talker" in pipeline_registry.OMNI_PIPELINES

@@ -1283,6 +1283,15 @@ def _builtin_models_enabled() -> bool:
     return val.strip().lower() not in ("0", "false", "no", "off")
 
 
+# vLLM-Omni validates stage architectures against its own registry, so
+# ``vllm_tt_plugin.omni.entrypoints.register`` registers this one there too.
+TT_QWEN3_TTS_TALKER_ARCH = "TTQwen3TTSTalkerForConditionalGeneration"
+TT_QWEN3_TTS_TALKER_TARGET = (
+    "models.demos.audio.qwen3_tts.tt.generator_vllm:"
+    "Qwen3TTSTalkerForConditionalGeneration"
+)
+
+
 def register_tt_models(register_test_models=False) -> None:
     from vllm.model_executor.models.registry import ModelRegistry
 
@@ -1381,10 +1390,7 @@ def register_tt_models(register_test_models=False) -> None:
 
     # Qwen3-TTS talker: stage 0 (AR) of vLLM-Omni's Qwen3-TTS pipeline.
     _register_model_if_missing(
-        ModelRegistry,
-        "TTQwen3TTSTalkerForConditionalGeneration",
-        "models.demos.audio.qwen3_tts.tt.generator_vllm:"
-        "Qwen3TTSTalkerForConditionalGeneration",
+        ModelRegistry, TT_QWEN3_TTS_TALKER_ARCH, TT_QWEN3_TTS_TALKER_TARGET
     )
 
     # Qwen3.5 - Text
