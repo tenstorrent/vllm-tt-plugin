@@ -691,3 +691,52 @@ def test_finish_requests_result_is_routable_per_client():
     for r in aborted:
         by_client[r.client_index].add(r.request_id)
     assert by_client == {0: {"a", "c"}, 1: {"b"}}
+
+
+def _prompt(rid, ids):
+    return SimpleNamespace(request_id=rid, prompt_token_ids=list(ids))
+
+
+def _affinity_coordinator(lanes, tokens=8, slack=4):
+    coordinator = _make_coordinator(lanes)
+    coordinator._prefix_affinity_tokens = tokens
+    coordinator._prefix_affinity_slack = slack
+    coordinator._prefix_lane = collections.OrderedDict()
+    return coordinator
+
+
+def test_prefix_affinity_keeps_a_shared_prefix_on_its_lane():
+    lanes = [FakeLane() for _ in range(4)]
+    coordinator = _affinity_coordinator(lanes)
+    shared = list(range(100, 116))
+    first = coordinator._pick_lane(_prompt("a", shared + [1]))
+    # Another lane is now strictly less loaded, but the cached lane is within the slack.
+    lanes[first].running.append(SimpleNamespace(is_prefill_chunk=False))
+    assert coordinator._pick_lane(_prompt("b", shared + [2])) == first
+    # A different prefix follows the plain least-loaded rule.
+    assert coordinator._pick_lane(_prompt("c", list(range(200, 216)))) != first
+    # Past the slack, load wins again.
+    lanes[first].waiting.extend([object()] * 2)
+    assert coordinator._pick_lane(_prompt("d", shared + [3])) != first
+
+
+def test_prefix_affinity_ignores_short_prompts_and_can_be_disabled():
+    lanes = [FakeLane(running=1), FakeLane()]
+    coordinator = _affinity_coordinator(lanes, tokens=8)
+    assert (
+        coordinator._pick_lane(_prompt("a", [1, 2, 3])) == 1
+    )  # too short for a prefix: least-loaded
+    lanes[1].running.append(SimpleNamespace(is_prefill_chunk=False))
+    lanes[1].running.append(SimpleNamespace(is_prefill_chunk=False))
+    assert coordinator._pick_lane(_prompt("b", [1, 2, 3])) == 0
+    disabled = _affinity_coordinator([FakeLane(running=1), FakeLane()], tokens=0)
+    shared = list(range(16))
+    assert disabled._pick_lane(_prompt("c", shared)) == 1
+    disabled.lanes[1].running.extend([SimpleNamespace(is_prefill_chunk=False)] * 2)
+    assert disabled._pick_lane(_prompt("d", shared)) == 0  # no memory of the prefix
+
+
+def test_coordinators_built_without_affinity_state_keep_the_plain_policy():
+    coordinator = _make_coordinator([FakeLane(running=2), FakeLane()])
+    assert coordinator._pick_lane(_prompt("a", list(range(64)))) == 1
+    assert coordinator._pick_lane() == 1
