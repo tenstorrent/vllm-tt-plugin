@@ -11,6 +11,7 @@ from tests.tt.utils import (
     assert_pairwise_varied,
     assert_varied,
     run_concurrent_batch,
+    run_concurrent_batch_native_tokens,
     run_concurrent_batch_tokens,
 )
 
@@ -321,8 +322,12 @@ class TestSeedingAndVariety:
         ]
         joint_configs = greedy_config + topk_configs
 
-        results_1 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
-        results_2 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
+        results_1 = run_concurrent_batch_native_tokens(
+            tt_server, tt_model_name, joint_configs
+        )
+        results_2 = run_concurrent_batch_native_tokens(
+            tt_server, tt_model_name, joint_configs
+        )
 
         # Within each batch:
         for results in [results_1, results_2]:

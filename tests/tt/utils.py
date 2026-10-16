@@ -74,6 +74,8 @@ async def send_request(
         extra_body["allowed_token_ids"] = config.allowed_token_ids
     if config.return_tokens_as_token_ids:
         extra_body["return_tokens_as_token_ids"] = True
+    if config.return_token_ids:
+        extra_body["return_token_ids"] = True
     if config.bad_words is not None:
         raise ValueError("bad_words is not supported in legacy completions API")
 
@@ -230,6 +232,26 @@ def run_concurrent_batch_tokens(tt_server, tt_model_name, configs):
         tt_server, tt_model_name, token_configs, return_full_response=True
     )
     return [extract_token_ids(r) for r in responses]
+
+
+def run_concurrent_batch_native_tokens(tt_server, tt_model_name, configs):
+    """Return token tuples without adding logprobs or changing sampling routes.
+
+    Unlike the logprobs-based helper, this requires the completion API's native
+    token_ids extension. Never fall back to text: character slices cannot test
+    first-token variety when distinct tokens share a decoded prefix.
+    """
+    token_configs = [replace(cfg, return_token_ids=True) for cfg in configs]
+    responses = run_concurrent_batch(
+        tt_server, tt_model_name, token_configs, return_full_response=True
+    )
+    results = []
+    for index, response in enumerate(responses):
+        token_ids = getattr(response.choices[0], "token_ids", None)
+        if token_ids is None:
+            raise ValueError(f"Completion {index} did not return requested token_ids")
+        results.append(tuple(token_ids))
+    return results
 
 
 def assert_varied(results, min_varied, explanation):
