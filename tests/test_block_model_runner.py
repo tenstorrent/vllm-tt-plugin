@@ -326,7 +326,10 @@ def test_worker_shutdown_releases_the_model_before_closing_the_mesh():
         runner._shutdown_complete = False
         # An async step that ran but was never sampled, with the ``_controller``
         # back-edge an engine-held output really has.
-        controller = _Weakrefable(runner=runner)
+        controller = _Weakrefable(
+            runner=runner,
+            wait_for_all_pending_async_steps=lambda: order.append("drained"),
+        )
         in_flight = _Weakrefable(_controller=controller)
         runner._pending_samples = deque([partial(_finish_step, runner, in_flight)])
         runner.async_decode = controller
@@ -358,7 +361,7 @@ def test_worker_shutdown_releases_the_model_before_closing_the_mesh():
     finally:
         gc.enable()
 
-    assert order == ["capture-released", "mesh-closed"]
+    assert order == ["drained", "capture-released", "mesh-closed"]
     # The safety property: the model is gone before the close, not after.
     assert at_close["model_alive"] is False
     assert model_ref() is None
@@ -396,6 +399,28 @@ def test_worker_shutdown_closes_the_mesh_even_if_the_runner_raises():
 
     assert len(closed) == 1
     assert worker.mesh_device is None
+
+
+def test_runner_shutdown_releases_the_model_when_the_async_drain_fails():
+    """The drain is best effort: a failed read must not keep the model alive."""
+    releases = []
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.model = SimpleNamespace(
+        release_persistent_capture=lambda: releases.append("released")
+    )
+    controller = SimpleNamespace(
+        runner=runner,
+        wait_for_all_pending_async_steps=lambda: (_ for _ in ()).throw(
+            RuntimeError("device read failed")
+        ),
+    )
+    runner.async_decode = controller
+
+    runner.shutdown()
+
+    assert releases == ["released"]
+    assert runner.model is None
+    assert controller.runner is None
 
 
 def test_runner_shutdown_is_idempotent():

@@ -453,15 +453,24 @@ class TTModelRunner:
         reclaims either and a destructor runs whenever the cyclic collector gets
         to it -- for interpreter teardown, after the devices closed.
 
-        Scope is the model and its caches. An in-flight async decode submission
-        is deliberately not released: its read destination and ttnn read events
-        may still be the target of a device read, and no wait for that can be
-        bounded against the close. Those leak to process exit, which is the safe
-        direction.
+        Scope is the model and its caches. Pending async decode reads are
+        finalized first, best effort, so that no device read still targets the
+        model or its KV caches when they are released; a failed read is logged
+        and the release continues. The submissions themselves are deliberately
+        not released: after a failed read, its read destination and ttnn read
+        events may still be the target of a device read. Those leak to process
+        exit, which is the safe direction.
         """
         if getattr(self, "_shutdown_complete", False):
             return
         self._shutdown_complete = True
+
+        async_decode = getattr(self, "async_decode", None)
+        if async_decode is not None:
+            try:
+                async_decode.wait_for_all_pending_async_steps()
+            except Exception:
+                logger.exception("Async decode drain failed during shutdown")
 
         # Neither ``_pending_samples`` nor ``_pending_async_steps`` is cleared: a
         # step that ran but was not sampled sits in both, and between
@@ -484,7 +493,6 @@ class TTModelRunner:
         self.model = None
         self.kv_caches = []
 
-        async_decode = getattr(self, "async_decode", None)
         if async_decode is not None:
             # An engine-held async output keeps ``_controller``, so cut the
             # controller's edge back to this runner: otherwise it walks into a
