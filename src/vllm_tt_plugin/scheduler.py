@@ -21,6 +21,8 @@ from vllm_tt_plugin.config import (
     get_tt_max_partial_prefills,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefix_hit_policy,
+    round_tt_prefix_hit,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -355,6 +357,7 @@ class TTScheduler(AsyncScheduler):
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         self._pending_prefix_cache_reset = False
         self._max_partial_prefills = get_tt_max_partial_prefills(self.vllm_config)
+        self._prefix_hit_policy = get_tt_prefix_hit_policy(self.vllm_config)
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
@@ -936,6 +939,27 @@ class TTScheduler(AsyncScheduler):
             if saved_active is not None:
                 self.max_num_active_reqs = saved_active
         return result
+
+    def _get_local_prefix_cache_hit(self, request: Request):
+        """vLLM's prefix-cache hit, rounded down to what the model can resume from (``prefix_cache_hit_policy``).
+
+        A model that reuses a prefix through host snapshots at chunk boundaries (DeepSeek-V4.1) can honor only hits on its snapshot grid. An arbitrary block hit would make it recompute the
+        whole prompt in ONE call (the scheduler believes only the tail is left, so it would not split the prompt: the decodes starve, measured 31 s inter-token gap behind a 32k prompt).
+        Rounded hits keep the piece the scheduler hands out bounded by the budget. Also covers same-step phantom hits (vLLM registers blocks at schedule time).
+        """
+        blocks, num_local, boundary, diverged = super()._get_local_prefix_cache_hit(request)
+        policy = getattr(self, "_prefix_hit_policy", "")
+        align = getattr(self, "_prefill_chunk_alignment", 0)
+        if not (policy and align and num_local):
+            return blocks, num_local, boundary, diverged
+        rounded = round_tt_prefix_hit(num_local, request.num_tokens, align, policy)
+        if rounded == num_local:
+            return blocks, num_local, boundary, diverged
+        if rounded:
+            blocks = self.kv_cache_manager.truncate_computed_blocks(blocks, rounded)
+        else:
+            blocks = self.kv_cache_manager.empty_kv_cache_blocks
+        return blocks, rounded, boundary, diverged
 
     def _hold_back_partial_prefills(self, partial_prefills: list[Request]) -> list[Request]:
         """Keep a new prompt out of a prefill step that cannot hold all of it.

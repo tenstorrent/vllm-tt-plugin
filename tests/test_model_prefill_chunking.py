@@ -59,12 +59,13 @@ def _stub_model_resolution(model_class):
         yield
 
 
-def _scheduler(*, budget, align=0, cap=0, max_num_seqs=8):
+def _scheduler(*, budget, align=0, cap=0, max_num_seqs=8, hit_policy=""):
     class _Model:
         model_capabilities = {
             "supports_chunked_prefill": True,
             "prefill_chunk_alignment": align,
             "max_partial_prefills": cap,
+            **({"supports_prefix_caching": True, "prefix_cache_hit_policy": hit_policy} if hit_policy else {}),
         }
 
     model_config = ModelConfig(model=str(LOCAL_MODEL_CONFIG), dtype="float16", seed=42, skip_tokenizer_init=True)
@@ -78,7 +79,7 @@ def _scheduler(*, budget, align=0, cap=0, max_num_seqs=8):
         is_encoder_decoder=model_config.is_encoder_decoder,
     )
     cache_config = CacheConfig(
-        block_size=BLOCK, gpu_memory_utilization=0.9, cache_dtype="auto", enable_prefix_caching=False
+        block_size=BLOCK, gpu_memory_utilization=0.9, cache_dtype="auto", enable_prefix_caching=bool(hit_policy)
     )
     with _stub_model_resolution(_Model):
         config = VllmConfig(
@@ -140,13 +141,17 @@ def _drain(scheduler, requests, max_steps=200):
         before = {r.request_id: r.num_computed_tokens for r in requests}
         out = scheduler.schedule()
         ids = list(out.num_scheduled_tokens)
+        if not ids:  # (the decode-interleave policy may spend one step on decodes: none are running here)
+            out = scheduler.schedule()
+            ids = list(out.num_scheduled_tokens)
         assert ids, "scheduler stalled with prefill work pending"
         sampled = []
         for rid in ids:
             r = next(x for x in requests if x.request_id == rid)
             n = out.num_scheduled_tokens[rid]
-            pieces[rid].append((before[rid], before[rid] + n))
-            fin = before[rid] + n >= r.num_prompt_tokens
+            start = r.num_computed_tokens - n  # (scheduling advances num_computed_tokens; a prefix-cache hit moves the start of the first piece)
+            pieces[rid].append((start, start + n))
+            fin = r.num_computed_tokens >= r.num_prompt_tokens
             sampled.append([7] if fin else [])
             if fin:
                 done.add(rid)
@@ -337,3 +342,35 @@ def test_prefix_cache_reset_flag_rides_on_the_next_scheduler_output():
     assert get_tt_prefix_cache_reset(out)
     s.add_request(_request("c", 700))
     assert not get_tt_prefix_cache_reset(s.schedule())  # one-shot
+
+
+# ---- prefix-cache hits are rounded to the model's snapshot grid -------------------------------------------------------------------
+
+
+def test_round_tt_prefix_hit():
+    from vllm_tt_plugin.config import round_tt_prefix_hit as r
+
+    assert r(640, 727, 512, "pow2") == 512
+    assert r(4992, 5000, 512, "pow2") == 4096  # 9 chunks -> 8
+    assert r(4992, 5000, 512, "all") == 4608  # 9 chunks, but 5000 - 128 = 4872 -> 9 * 512 = 4608
+    assert r(4992, 5000, 512, "3") == 1536
+    assert r(640, 700, 512, "pow2") == 512 and r(640, 600, 512, "pow2") == 0  # the last 128 positions are replayed: 600 - 128 = 472 < 512
+    assert r(300, 5000, 512, "pow2") == 0
+    assert r(640, 727, 512, "") == 640  # no policy: untouched
+
+
+def test_scheduler_rounds_the_prefix_hit_and_keeps_the_prompt_chunked():
+    s = _scheduler(budget=2048, align=512, hit_policy="pow2")
+    a = _request("a", 6000)
+    pieces_a, _ = _drain(s, [a])
+    assert pieces_a["a"][0] == (0, 2048)
+    b = _request("b", 6000)  # identical prompt: vLLM reports a 5888-token hit (46 blocks)
+    pieces_b, _ = _drain(s, [b])
+    # rounded to 4096 (8 chunks), not 5888: the rest is scheduled in aligned pieces of the budget
+    assert pieces_b["b"][0][0] == 4096, pieces_b["b"]
+    assert all(end % 512 == 0 for _, end in pieces_b["b"][:-1]) and pieces_b["b"][-1][1] == 6000
+
+
+def test_scheduler_without_the_policy_keeps_vllm_hits_untouched():
+    s = _scheduler(budget=2048, align=512, hit_policy="")
+    assert s.kv_cache_manager.enable_caching is False  # (no capability: the platform disabled the cache)

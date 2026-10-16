@@ -722,6 +722,39 @@ def store_tt_prefill_chunking(
         tt.setdefault(_PREFILL_CHUNK_ALIGNMENT_KEY, int(alignment))
 
 
+_PREFIX_HIT_POLICY_KEY = "_tt_prefix_hit_policy"
+
+
+def get_tt_prefix_hit_policy(vllm_config: "VllmConfig") -> str:
+    """Grid of prefix-cache hit lengths the model can honor ("" = any: no rounding). ``pow2``: multiples of the prefill alignment whose count is a power of two; ``all``: multiples of the
+    alignment; an integer N: at most N alignments. See ``round_tt_prefix_hit``."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return str(additional.get(_PREFIX_HIT_POLICY_KEY, ""))
+
+
+def store_tt_prefix_hit_policy(vllm_config: "VllmConfig", policy: str) -> None:
+    if not isinstance(policy, str) or not (policy in ("", "pow2", "all") or policy.isdigit()):
+        raise ValueError(f"model_capabilities['prefix_cache_hit_policy'] must be '', 'pow2', 'all' or an integer string, got {policy!r}")
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFIX_HIT_POLICY_KEY] = policy
+
+
+def round_tt_prefix_hit(hit_tokens: int, num_tokens: int, alignment: int, policy: str, margin: int = 128) -> int:
+    """Round a vLLM prefix-cache hit DOWN to what a model with host prefix snapshots can resume from: a multiple of ``alignment`` on the policy's grid, at least ``margin`` tokens
+    before the prompt end (the model replays the last ``margin`` positions). 0 = no usable hit (the request starts from 0)."""
+    if not policy or alignment <= 0:
+        return hit_tokens
+    k = min(hit_tokens, max(num_tokens - margin, 0)) // alignment
+    if policy == "pow2":
+        k = 1 << (k.bit_length() - 1) if k > 0 else 0
+    elif policy.isdigit():
+        k = min(k, int(policy))
+    return k * alignment
+
+
 def get_tt_decode_interleave_config(
     vllm_config: "VllmConfig",
 ) -> tuple[bool, int, int]:
