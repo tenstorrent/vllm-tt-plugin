@@ -412,6 +412,17 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
 
 
+def test_max_tokens_clamp_before_prompt_truncation_fails_loudly():
+    """The clamp relies on the prompt truncation having left room for a whole
+    canvas; run out of order, it must raise instead of admitting a request with
+    a zero budget."""
+    scheduler = _scheduler()
+    request = _request(CANVAS, prompt_length=MAX_MODEL_LEN)
+
+    with pytest.raises(RuntimeError, match="left no budget"):
+        scheduler._clamp_max_tokens_to_whole_canvases(request)
+
+
 @pytest.mark.parametrize("repaired", [False, True])
 def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired):
     """Drive the runner's own predicate rather than a field list, so a host
