@@ -262,6 +262,12 @@ class TTLaneCoordinator(SchedulerInterface):
     device rows and slots.
     """
 
+    # Lane-group prefill gather state (see __init__). Class-level defaults keep a
+    # coordinator a test builds without running __init__ in the capability-off state.
+    _lane_prefill_group: bool = False
+    _group_gather_ms: float = 0.0
+    _group_gather_start: float | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,

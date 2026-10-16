@@ -292,6 +292,11 @@ class TTScheduler(AsyncScheduler):
       prefill cannot make progress and running decode requests exist.
     """
 
+    # Lane-group prefill capability: at most this many new prefills per step
+    # (0 = off). The class-level default keeps a scheduler built without
+    # __init__ (tests) in the off state.
+    _prefill_admissions_per_step: int = 0
+
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
