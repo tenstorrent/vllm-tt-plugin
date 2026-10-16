@@ -174,3 +174,120 @@ Sources: `submit_prefill`, `check_perform_device_sampling`, and
 `_get_output_tokens` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
 `submit_decode`, `finalize_decode`, and `complete_deferred_device_sampling` in
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py).
+
+## Adapter sketches: DP=1 and lane-DP
+
+The sketches below are pseudocode. They show how an adapter maps submitted
+rows to KV storage and device state in the two single-process layouts. They
+omit tracing, device sampling, readback options, multimodal inputs, and
+`page_tables_per_layer`. Helper names such as `run_prefill`, `run_decode`, and
+`split_mesh` are adapter-internal, not plugin API.
+
+### DP=1 (front-packed)
+
+`tt_data_parallel` is 1. One KV cache serves all rows. Prefill row `i` uses
+`page_table[i]` and writes its device state to `empty_slots[i]`, which need
+not equal `i`. Decode padding rows have `start_pos=-1`.
+
+```python
+class MyModel:
+    @classmethod
+    def initialize_vllm_model(cls, hf_config, mesh_device, max_batch_size,
+                              max_seq_len, tt_data_parallel=1,
+                              optimizations=None):
+        assert tt_data_parallel == 1
+        return cls(hf_config, mesh_device, max_batch_size, max_seq_len)
+
+    def allocate_kv_cache(self, shape, dtype, num_layers):
+        # shape = (num_blocks, heads_per_device, block_size, head_size)
+        return [alloc_kv(self.mesh, shape, dtype) for _ in range(num_layers)]
+
+    def prefill_forward(self, tokens, start_pos, prompt_lens, page_table,
+                        kv_cache, empty_slots, **kwargs):
+        logits = []
+        for i in range(tokens.shape[0]):
+            chunk = tokens[i, start_pos[i]:prompt_lens[i]]
+            logits.append(run_prefill(chunk, start_pos[i], page_table[i],
+                                      kv_cache, state_slot=empty_slots[i]))
+        return stack(logits)  # [B, 1, V] in submitted row order
+
+    def decode_forward(self, tokens, start_pos, page_table, kv_cache,
+                       slot_remap=None, **kwargs):
+        if slot_remap is not None:
+            permute_device_state(slot_remap)  # slot i reads old slot_remap[i]
+        active = start_pos >= 0
+        return run_decode(tokens, start_pos, page_table, kv_cache, active)
+```
+
+### Lane-DP (`tt_data_parallel = L > 1`)
+
+`max_batch_size` is `L * per_lane`. Lane `l` owns slots
+`[l * per_lane, (l + 1) * per_lane)`. Each lane scheduler allocates block IDs
+from its own lane-local space, so each lane needs separate KV storage. Prefill
+rows are front-packed scheduled requests from any lane; `empty_slots[i]` is
+the stable slot of row `i`, so its lane is `empty_slots[i] // per_lane`.
+Decode submits all `L * per_lane` rows in slot order. Gap rows have
+`start_pos=-1` and zeroed page-table rows, and `slot_remap` is the identity.
+
+```python
+class MyLaneModel:
+    @classmethod
+    def initialize_vllm_model(cls, hf_config, mesh_device, max_batch_size,
+                              max_seq_len, tt_data_parallel=1,
+                              optimizations=None):
+        return cls(hf_config, mesh_device, max_batch_size, max_seq_len,
+                   lanes=tt_data_parallel)
+
+    def __init__(self, hf_config, mesh_device, max_batch_size, max_seq_len,
+                 lanes):
+        self.lanes = lanes
+        self.per_lane = max_batch_size // lanes
+        self.submeshes = split_mesh(mesh_device, lanes)
+        self.models = [build_model(m, self.per_lane) for m in self.submeshes]
+
+    def allocate_kv_cache(self, shape, dtype, num_layers):
+        # One replica per lane. shape is per lane: heads_per_device uses
+        # devices_per_lane, and num_blocks is the lane's block budget.
+        return [[alloc_kv(m, shape, dtype) for _ in range(num_layers)]
+                for m in self.submeshes]
+
+    def prefill_forward(self, tokens, start_pos, prompt_lens, page_table,
+                        kv_cache, empty_slots, **kwargs):
+        logits = []
+        for i in range(tokens.shape[0]):
+            lane = empty_slots[i] // self.per_lane
+            chunk = tokens[i, start_pos[i]:prompt_lens[i]]
+            logits.append(self.models[lane].run_prefill(
+                chunk, start_pos[i], page_table[i], kv_cache[lane],
+                state_slot=empty_slots[i] % self.per_lane))
+        return stack(logits)  # [B, 1, V] in submitted row order
+
+    def decode_forward(self, tokens, start_pos, page_table, kv_cache,
+                       **kwargs):
+        outs = []
+        for lane in range(self.lanes):
+            rows = slice(lane * self.per_lane, (lane + 1) * self.per_lane)
+            outs.append(self.models[lane].run_decode(
+                tokens[rows], start_pos[rows], page_table[rows],
+                kv_cache[lane], active=start_pos[rows] >= 0))
+        return concat(outs)  # [L * per_lane, 1, V] in slot order
+```
+
+Lane-DP rejects request-specific RoPE and speculative decode. Lane-DP output
+handling is in
+[Decode readback and output conversion](#decode-readback-and-output-conversion).
+
+The tt-metal `tt_transformers` adapters follow the lane-DP sketch: the shared
+`Generator` keeps one model and one KV cache list per sub-mesh, maps a prefill
+slot to `user_id // max_batch_size_per_model`, and splits decode inputs with
+`torch.chunk`. The Llama 3 70B Galaxy adapter divides `tt_data_parallel` by
+the mesh width, builds fewer models, and allocates one KV cache list
+replicated across its mesh. Its own generator maps users to devices; this
+page does not describe that mapping. Any layout is valid if each lane's
+lane-local block IDs address storage that no other lane uses.
+
+Sources: `TTLaneInputBatch` in [input_batch.py](../src/vllm_tt_plugin/input_batch.py);
+in [tt-metal](https://github.com/tenstorrent/tt-metal),
+`models/tt_transformers/tt/generator.py`,
+`models/tt_transformers/tt/generator_vllm.py`, and
+`models/demos/llama3_70b_galaxy/tt/generator_vllm.py`.
