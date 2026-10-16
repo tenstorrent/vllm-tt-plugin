@@ -715,9 +715,14 @@ def test_prefix_affinity_keeps_a_shared_prefix_on_its_lane():
     assert coordinator._pick_lane(_prompt("b", shared + [2])) == first
     # A different prefix follows the plain least-loaded rule.
     assert coordinator._pick_lane(_prompt("c", list(range(200, 216)))) != first
-    # Past the slack, load wins again.
+    # Queued work on the cached lane does not push the prefix away while the
+    # lane still has a free slot: re-prefilling the prefix elsewhere costs more
+    # than waiting for the slot.
     lanes[first].waiting.extend([object()] * 2)
-    assert coordinator._pick_lane(_prompt("d", shared + [3])) != first
+    assert coordinator._pick_lane(_prompt("d", shared + [3])) == first
+    # Once the cached lane is full, the slack rule decides: past it, load wins.
+    coordinator._per_lane_max = len(lanes[first].waiting) + len(lanes[first].running)
+    assert coordinator._pick_lane(_prompt("e", shared + [4])) != first
 
 
 def test_prefix_affinity_ignores_short_prompts_and_can_be_disabled():

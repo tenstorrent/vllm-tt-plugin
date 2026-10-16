@@ -402,10 +402,12 @@ class TTLaneCoordinator(SchedulerInterface):
         is a possible future follow-up.
 
         Prefix affinity: each lane keeps its own prefix cache, so a prompt that
-        starts like an earlier one is sent to that earlier lane whenever its
-        load score is within ``TT_LANE_PREFIX_AFFINITY_SLACK`` of the best
-        lane (a fan-out over one shared context then hits the cache instead of
-        re-prefilling it on every lane).
+        starts like an earlier one is sent to that earlier lane whenever that
+        lane still has a free slot for it, or failing that whenever its load
+        score is within ``TT_LANE_PREFIX_AFFINITY_SLACK`` of the best lane (a
+        fan-out over one shared context then hits the cache instead of
+        re-prefilling it on every lane). Balancing lanes buys nothing on its
+        own: all lanes run on the same device in one step.
         """
         best_lane = 0
         best_score: int | None = None
@@ -421,12 +423,19 @@ class TTLaneCoordinator(SchedulerInterface):
             return best_lane
         lanes = self._prefix_lane
         affine = lanes.get(key)
-        if (
-            affine is not None
-            and affine < len(scores)
-            and scores[affine] <= int(best_score or 0) + self._prefix_affinity_slack
-        ):
-            best_lane = affine
+        if affine is not None and affine < len(scores):
+            # The lanes share one device, so a request costs the same compute on
+            # any lane; what a cache hit saves is the whole prefix prefill. Keep
+            # the request on the cached lane while that lane can still admit it
+            # (a free slot, counting what is already queued there), and only
+            # then compare loads with the slack.
+            sched = self.lanes[affine]
+            queued = len(sched.waiting) + len(sched.running)
+            per_lane_max = int(getattr(self, "_per_lane_max", 0) or 0)
+            if (per_lane_max > 0 and queued < per_lane_max) or scores[affine] <= int(
+                best_score or 0
+            ) + self._prefix_affinity_slack:
+                best_lane = affine
         lanes[key] = best_lane
         lanes.move_to_end(key)
         while len(lanes) > _PREFIX_AFFINITY_ENTRIES:
