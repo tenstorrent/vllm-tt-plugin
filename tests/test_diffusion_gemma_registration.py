@@ -163,16 +163,13 @@ def test_gemma4_parsers_are_owned_by_upstream_vllm():
         ToolParserManager.get_tool_parser("diffusion_gemma")
 
 
-def test_gemma4_bare_architectures_are_owned_by_upstream_vllm(monkeypatch):
-    """vLLM 0.25.1 registers all three Gemma4 architectures itself, and
-    ``_register_model_if_missing`` never overrides an existing entry, so
-    registering the bare names was a no-op that read as the opposite. The TT
-    class is reached through the ``TT``-prefix rewrite instead.
-
-    Also pins the upstream ownership the comment now claims: if a future vLLM
-    drops these, the assertion below fails and the registration story has to be
-    revisited rather than silently regressing to a fallback resolution.
-    """
+def test_gemma4_bare_architectures_are_owned_by_upstream_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Upstream vLLM owns the three bare Gemma4 architectures."""
+    # register_tt_models (src/vllm_tt_plugin/platform.py) registers only the TT
+    # aliases, because _register_model_if_missing never overrides an upstream
+    # entry. If upstream drops a bare name, that registration needs rechecking.
     from vllm.model_executor.models.registry import ModelRegistry
 
     # worker.py runs the real registration at module import, so it has already
@@ -229,15 +226,14 @@ def test_gemma4_bare_architectures_are_owned_by_upstream_vllm(monkeypatch):
 
 
 def test_gemma4_conditional_archs_are_multimodal_upstream():
-    """Pins what the ``TT`` prefix does *not* buy, which the old comment got
-    wrong: ``ModelConfig`` inspects the bare architecture and caches its model
-    info before ``check_and_update_config`` -- the hook that does the rewrite --
-    so for two of the three names the cached info is upstream's multimodal class
-    and ``multimodal_config`` is already built. (The DiffusionGemma
-    ``get_config`` patch pre-empts this because it is installed earlier still,
-    on import of the ``vllm.general_plugins`` entry point, rather than from a
-    config hook.) The prefix only selects the class the loader instantiates.
-    """
+    """The TT prefix does not change upstream's multimodal inspection of the
+    bare name."""
+    # ModelConfig inspects the bare architecture and builds multimodal_config
+    # before check_and_update_config rewrites it, so two of the three names
+    # arrive with upstream's multimodal config, which
+    # _reconcile_multimodal_config (src/vllm_tt_plugin/platform.py) then drops.
+    # The DiffusionGemma get_config patch avoids this because the
+    # vllm.general_plugins entry point installs it before ModelConfig runs.
     from vllm.model_executor.models.registry import ModelRegistry
 
     expected = {
@@ -268,3 +264,20 @@ def test_gemma4_conditional_archs_are_multimodal_upstream():
         actual[arch] = info.supports_multimodal
 
     assert actual == expected
+
+
+@pytest.mark.parametrize("tt_class_is_multimodal", [False, True])
+def test_multimodal_config_follows_the_tt_class(tt_class_is_multimodal):
+    """A text-only TT class drops the multimodal config built from the bare
+    architecture; a multimodal TT class keeps it."""
+    model_class = type("TTModel", (), {"supports_multimodal": tt_class_is_multimodal})
+    upstream_mm_config = object()
+    model_config = SimpleNamespace(
+        model="checkpoint", multimodal_config=upstream_mm_config
+    )
+
+    tt_platform._reconcile_multimodal_config(model_config, model_class)
+
+    assert model_config.multimodal_config is (
+        upstream_mm_config if tt_class_is_multimodal else None
+    )
