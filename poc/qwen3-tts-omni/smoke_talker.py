@@ -6,7 +6,8 @@ One Base (voice clone, x-vector only) request through the `tt_qwen3_tts_talker`
 pipeline: codebook-0 ids come back and stop at end-of-speech (2150), and the 16-code
 frames come back as `codes.audio` [frames, 16].
 
-    python poc/qwen3-tts-omni/smoke_talker.py --model <Qwen3-TTS-12Hz-1.7B-Base snapshot> \
+    python poc/qwen3-tts-omni/smoke_talker.py \
+        --model <Qwen3-TTS-12Hz-1.7B-Base snapshot> \
         --deploy-config poc/qwen3-tts-omni/deploy/tt_qwen3_tts_talker.yaml \
         --ref-audio <clip.wav> --text "..."
 """
@@ -99,7 +100,8 @@ def main():
         shape = None if audio is None else tuple(audio.shape)
         print(
             f"SMOKE tokens={len(ids)} last={ids[-1] if ids else None} "
-            f"finish={completion.finish_reason} codes_audio={shape} gen_s={elapsed:.1f}",
+            f"finish={completion.finish_reason} codes_audio={shape} "
+            f"gen_s={elapsed:.1f}",
             flush=True,
         )
         print(f"SMOKE first_ids={ids[:12]}", flush=True)

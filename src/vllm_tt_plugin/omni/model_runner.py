@@ -86,9 +86,9 @@ class TTOmniARModelRunner(OmniConnectorModelRunnerMixin, TTModelRunner):
                 new_req_data.additional_information = (
                     deserialize_additional_information(info)
                 )
-            # A stage's stop ids include the tokenizer's end-of-text, which lies past a
-            # codec vocabulary; vLLM's min_tokens processor indexes the logits with every
-            # stop id. An id the logits do not have can never be sampled, so it goes.
+            # A stage's stop ids include the tokenizer's end-of-text, which lies past
+            # a codec vocabulary; vLLM's min_tokens processor indexes the logits with
+            # every stop id. An id the logits do not have is never sampled: drop it.
             params = new_req_data.sampling_params
             if params is not None:
                 params._all_stop_token_ids = {
