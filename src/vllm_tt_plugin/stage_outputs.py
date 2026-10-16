@@ -19,7 +19,7 @@ output token ``k`` (position ``num_prompt_tokens + k``) completes stage frame
 Prefill completes no stage frame and is never asked.
 """
 
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -93,13 +93,3 @@ def set_tt_stage_outputs(
 def get_tt_stage_outputs(runner_output: "ModelRunnerOutput") -> dict[str, TTStageFrame]:
     """The frames a step published, by request ID; empty when it published none."""
     return dict(getattr(runner_output, _TT_STAGE_OUTPUTS_ATTR, {}))
-
-
-def drop_tt_stage_outputs(
-    runner_output: "ModelRunnerOutput", req_ids: Collection[str]
-) -> None:
-    """Withdraw published frames of requests whose output must not reach a consumer."""
-    frames = getattr(runner_output, _TT_STAGE_OUTPUTS_ATTR, None)
-    if frames:
-        for req_id in req_ids:
-            frames.pop(req_id, None)

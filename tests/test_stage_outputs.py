@@ -4,24 +4,16 @@
 
 The model returns one frame-or-None per decode row from ``pop_stage_outputs()``.
 The runner pops right after ``decode_forward``, tags each frame with its request
-and ``frame_index``, publishes them on that step's ``ModelRunnerOutput``, and
-withdraws the frames of requests whose output must not reach the next stage.
+and ``frame_index``, and publishes them on that step's ``ModelRunnerOutput``.
 """
 
-import threading
-from collections import deque
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_tt_plugin.async_decode import (
-    CompletedDecodeStep,
-    SubmittedStepContext,
-    TTAsyncDecodeController,
-)
+from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.config import (
     get_tt_supports_stage_outputs,
     resolve_tt_supports_stage_outputs,
@@ -143,25 +135,6 @@ def test_each_frame_is_tagged_with_its_request_and_frame_index():
     }
 
 
-def test_frames_follow_the_submission_not_the_live_batch():
-    """Two overlapped steps around a batch condense: each keeps its own rows."""
-    controller, model = _controller({"a": 4, "b": 4})
-
-    first = _submit(
-        controller, model, _decode_input(["a", "b"], tokens=[10, 20], positions=[5, 5])
-    )
-    # "a" left; "b" moved to row 0 before the first step completed.
-    second = _submit(
-        controller, model, _decode_input(["b"], tokens=[21], positions=[6])
-    )
-
-    assert first.stage_outputs == {
-        "a": TTStageFrame(1, ("frame", 10)),
-        "b": TTStageFrame(1, ("frame", 20)),
-    }
-    assert second.stage_outputs == {"b": TTStageFrame(2, ("frame", 21))}
-
-
 def test_a_row_without_a_frame_publishes_nothing():
     controller, model = _controller({"a": 4})
     model.decode_forward = lambda **kwargs: torch.zeros((1, 1))
@@ -228,10 +201,7 @@ def test_prefill_never_asks_for_stage_outputs():
     assert captured, "the prefill ran"
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True])
-def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos(
-    async_scheduling,
-):
+def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos():
     """EOS on the first decode: that forward still completes frame 0."""
     frames = {"a": TTStageFrame(0, ("frame", 7))}
     fwd = _SyncForward(
@@ -259,9 +229,8 @@ def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos(
     runner = SimpleNamespace(
         _apply_grammar_to_input=lambda model_input, grammar, lane_total: model_input,
         _sample_sync_forward=lambda fwd: ([torch.tensor([[EOS]])], []),
-        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         apply_and_build_runner_output=build,
-        defer_state_apply_and_build_runner_output=build,
         input_batch=SimpleNamespace(req_ids=["a"], num_reqs=1),
         _num_speculative_tokens=0,
     )
@@ -270,88 +239,6 @@ def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos(
 
     assert output.sampled_token_ids == [[EOS]]
     assert get_tt_stage_outputs(output) == frames
-
-
-def _completed_step(token, runner_output, frames=None):
-    return CompletedDecodeStep(
-        sampled_token_ids=torch.tensor([[token]], dtype=torch.int32),
-        logprobs=None,
-        context=SubmittedStepContext(
-            req_ids=["request"], req_id_to_index={"request": 0}, submit_time_ns=1
-        ),
-        completion_time_ns=2,
-        runner_output=runner_output,
-        stage_outputs=frames,
-    )
-
-
-def _published(token, frame_index):
-    output = ModelRunnerOutput(
-        req_ids=["request"], req_id_to_index={"request": 0}, sampled_token_ids=[[token]]
-    )
-    set_tt_stage_outputs(output, {"request": TTStageFrame(frame_index, token)})
-    return output
-
-
-def _async_apply_runner(request_state):
-    runner = SimpleNamespace(
-        _num_speculative_tokens=0,
-        _output_tokens_per_step=1,
-        _is_adaptive_block_output=False,
-        scheduler_config=SimpleNamespace(async_scheduling=True),
-        requests={"request": request_state},
-        input_batch=SimpleNamespace(
-            req_id_to_index={},
-            num_tokens=np.zeros(1, dtype=np.int32),
-            token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
-        ),
-        model_config=SimpleNamespace(max_model_len=8),
-        _steady_decode_lock=threading.Lock(),
-        _completed_decode_steps=deque(),
-        _pending_async_steps=deque(),
-        _pending_async_overlap_ok=deque(),
-    )
-    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
-        runner, toks
-    )
-    runner._apply_sampled_tokens_to_state = lambda **kwargs: (
-        TTModelRunner._apply_sampled_tokens_to_state(runner, **kwargs)
-    )
-    return runner
-
-
-def test_the_async_path_publishes_the_submissions_frames():
-    frames = {"request": TTStageFrame(3, ("frame", 9))}
-    runner = SimpleNamespace(
-        _build_runner_output=lambda **kw: TTModelRunner._build_runner_output(
-            SimpleNamespace(
-                input_batch=None,
-                _tt_committed_width=lambda tokens: 1,
-            ),
-            **kw,
-        )
-    )
-    controller = TTAsyncDecodeController(runner)
-
-    output = controller.build_runner_output_from_completed_step(
-        _completed_step(9, None, frames)
-    )
-
-    assert get_tt_stage_outputs(output) == frames
-
-
-def test_a_frame_in_flight_when_its_request_is_cancelled_is_withdrawn():
-    request_state = SimpleNamespace(output_token_ids=[])
-    controller = TTAsyncDecodeController(_async_apply_runner(request_state))
-    output = _published(7, 0)
-
-    controller.apply_completed_decode_step(
-        _completed_step(7, output),
-        suppress_output_req_ids={"request"},
-        skip_state_req_ids={"request"},
-    )
-
-    assert get_tt_stage_outputs(output) == {}
 
 
 def test_preempting_a_stage_request_fails_loudly():

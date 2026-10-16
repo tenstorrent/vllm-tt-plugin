@@ -23,11 +23,7 @@ from vllm_tt_plugin.spec_decode import (
     PLACEHOLDER_TOKEN_ID,
     VerifyOutput,
 )
-from vllm_tt_plugin.stage_outputs import (
-    TTStageFrame,
-    drop_tt_stage_outputs,
-    pop_tt_stage_outputs,
-)
+from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 
@@ -144,9 +140,6 @@ class CompletedDecodeStep:
     context: SubmittedStepContext
     completion_time_ns: int
     runner_output: ModelRunnerOutput | None = None
-    # The submission's stage frames, until ``build_runner_output_from_completed_step``
-    # puts them on ``runner_output``; ``runner_output`` is where they are withdrawn.
-    stage_outputs: dict[str, TTStageFrame] | None = None
     # Kept for a speculating launch only, whose draftless decode steps owe the
     # next proposal at their commit: the drafter is called with this step's own
     # rows and positions, and the commit runs a step later than the build.
@@ -783,9 +776,6 @@ class TTAsyncDecodeController:
         * Forced-reset output: publish, but do not apply. vLLM discards it.
         * Request already finished or aborted: remove any late output and do
           not apply it.
-        * Stage frames (``supports_stage_outputs``) follow their token, except
-          that forced reset never reaches a stage model: it is refused, or the
-          request is aborted first.
 
         For example, request R has two completed decode results: result A and
         result B. vLLM accepted result A before the reset, but the runner has
@@ -999,7 +989,6 @@ class TTAsyncDecodeController:
             context=context,
             completion_time_ns=time.perf_counter_ns(),
             model_input=model_input,
-            stage_outputs=submission.stage_outputs,
         )
 
     def complete_spec_decode_step(
@@ -1050,7 +1039,6 @@ class TTAsyncDecodeController:
             logprobs=completed.logprobs,
             req_ids=completed.context.req_ids,
             req_id_to_index=completed.context.req_id_to_index,
-            stage_outputs=completed.stage_outputs,
         )
 
     def apply_completed_decode_step(
@@ -1078,9 +1066,6 @@ class TTAsyncDecodeController:
                 req_idx = completed.runner_output.req_id_to_index.get(req_id)
                 if req_idx is not None:
                     completed.runner_output.sampled_token_ids[req_idx] = []
-            # A late stage frame goes with its late token. A stage model's request
-            # cannot be force-reset: the platform refuses the reset or aborts it.
-            drop_tt_stage_outputs(completed.runner_output, suppressed)
         if isinstance(completed, CompletedSpecDecodeStep):
             # The commit and the next proposal, on the engine thread, for the
             # step whose acceptance was walked at completion. The lifecycle

@@ -3071,11 +3071,6 @@ class TTModelRunner:
                     defer_state_apply=TTModelRunner._uses_async_scheduler(self),
                 )
 
-        stage_outputs = (
-            fwd.decode_submission.stage_outputs
-            if fwd.decode_submission is not None
-            else None
-        )
         if TTModelRunner._uses_async_scheduler(self):
             return self.defer_state_apply_and_build_runner_output(
                 sampled_token_ids,
@@ -3085,15 +3080,20 @@ class TTModelRunner:
                     if is_prefill
                     else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
                 ),
-                stage_outputs=stage_outputs,
             )
+        # Stage-output models run only here: they cannot declare async decode, so
+        # their scheduling is never async.
         output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
             # Only a prefill build can filter rows. Decode rows are the front-packed
             # batch rows, so it keeps the vectorized state write.
             req_ids=row_req_ids if is_prefill else None,
-            stage_outputs=stage_outputs,
+            stage_outputs=(
+                fwd.decode_submission.stage_outputs
+                if fwd.decode_submission is not None
+                else None
+            ),
         )
         if not is_prefill and self._num_speculative_tokens:
             self.propose_after_plain_step(
@@ -4022,7 +4022,6 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
-        stage_outputs: dict[str, TTStageFrame] | None = None,
     ) -> ModelRunnerOutput:
         assert req_ids is not None, "deferred synchronous output needs request IDs"
         runner_output = self._build_runner_output(
@@ -4030,7 +4029,6 @@ class TTModelRunner:
             logprobs=logprobs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
-            stage_outputs=stage_outputs,
         )
         self._enqueue_deferred_state_apply(sampled_token_ids, req_ids, runner_output)
         return runner_output

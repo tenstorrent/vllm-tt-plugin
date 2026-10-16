@@ -116,8 +116,9 @@ A model that declares `supports_stage_outputs` implements
   length: the step that consumes output token `k` completes stage frame `k`.
 - The stage frames are published on the step's `ModelRunnerOutput`. Read
   them with `stage_outputs.get_tt_stage_outputs`.
-- Under async scheduling, a step's stage frames for a request that finished
-  or was aborted while the step was in flight are withdrawn with its token.
+- Scheduling is synchronous for these models: they cannot declare
+  `supports_async_decode`, without which the platform turns async
+  scheduling off.
 - Prefill completes no stage frame, and the runner never calls the hook for
   it.
 
