@@ -121,6 +121,16 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
 
+## Pipeline-stage capability
+
+| `model_capabilities` key | Default when absent | Meaning and current validation |
+|---|---|---|
+| `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload (vLLM-Omni's `additional_information`) or `None`. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Request-state construction (`build_cached_request_state`) refuses a request that carries a payload when this declaration is false. The payload is opaque to the plugin and is passed with every prefill of the request, chunked and resumed prefills included. |
+
+Sources: [config.py](../src/vllm_tt_plugin/config.py),
+[input_batch.py](../src/vllm_tt_plugin/input_batch.py), and
+[model_runner.py](../src/vllm_tt_plugin/model_runner.py).
+
 ## Speculative capabilities and admission
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |

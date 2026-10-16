@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 from collections.abc import Collection
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -54,13 +55,27 @@ SEED_NONE_SENTINEL = -1
 LOGPROBS_NONE_SENTINEL = -2
 
 
-def build_cached_request_state(new_req_data) -> CachedRequestState:
-    """Build a ``CachedRequestState`` for one newly-scheduled request.
+@dataclass
+class TTCachedRequestState(CachedRequestState):
+    # A pipeline stage's per-request input (vLLM-Omni's ``additional_information``),
+    # opaque here. It lives exactly as long as the cached state: kept across
+    # preemption, so a resumed prefill sees it again, and dropped on finish or abort.
+    stage_inputs: Any = None
+
+
+def build_cached_request_state(
+    new_req_data, accepts_stage_inputs: bool = False
+) -> TTCachedRequestState:
+    """Build the cached state for one newly-scheduled request.
 
     Shared by the front-packed (``TTModelRunner._update_states``) and lane-DP
     (``TTLaneInputBatch.apply_step_plan``) state updates so request-cache
     construction -- prompt validation and per-request generator seeding -- lives
     in exactly one place.
+
+    ``accepts_stage_inputs`` is the model's ``supports_stage_inputs``
+    declaration. A request carrying stage inputs to a model that cannot take
+    them is refused rather than served without them.
     """
     assert new_req_data.sampling_params is not None, (
         "Pooling is not supported for TT yet"
@@ -73,7 +88,14 @@ def build_cached_request_state(new_req_data) -> CachedRequestState:
         generator.manual_seed(sampling_params.seed)
     else:
         generator = None
-    return CachedRequestState(
+    stage_inputs = getattr(new_req_data, "additional_information", None)
+    if stage_inputs is not None and not accepts_stage_inputs:
+        raise ValueError(
+            f"Request {new_req_data.req_id} carries stage inputs "
+            "(additional_information), but the TT model does not declare "
+            "model_capabilities['supports_stage_inputs']=True."
+        )
+    return TTCachedRequestState(
         req_id=new_req_data.req_id,
         prompt_token_ids=new_req_data.prompt_token_ids,
         mm_features=new_req_data.mm_features,
@@ -85,6 +107,7 @@ def build_cached_request_state(new_req_data) -> CachedRequestState:
         output_token_ids=[],
         lora_request=new_req_data.lora_request,
         prompt_embeds=new_req_data.prompt_embeds,
+        stage_inputs=stage_inputs,
     )
 
 

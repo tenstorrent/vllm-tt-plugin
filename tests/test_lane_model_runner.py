@@ -359,6 +359,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         prompt_lens=[1],
         input_positions=torch.zeros((1,), dtype=torch.int32),
         block_tables_per_layer=None,
+        stage_inputs=None,
         multi_modal_kwargs={},
         perform_device_sampling=False,
         prefill_empty_slots=[4],

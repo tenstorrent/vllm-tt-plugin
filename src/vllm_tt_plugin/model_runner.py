@@ -48,6 +48,7 @@ from vllm_tt_plugin.config import (
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
+    get_tt_supports_stage_inputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
@@ -241,6 +242,9 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 
 
 class TTModelRunner:
+    # Resolved from ``supports_stage_inputs`` in ``__init__``; off by default.
+    supports_stage_inputs: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -305,6 +309,7 @@ class TTModelRunner:
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
+        self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
             trace_mode=self.trace_mode,
@@ -950,7 +955,9 @@ class TTModelRunner:
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            self.requests[req_id] = build_cached_request_state(new_req_data)
+            self.requests[req_id] = build_cached_request_state(
+                new_req_data, accepts_stage_inputs=self.supports_stage_inputs
+            )
             req_ids_to_add.append(req_id)
 
         # Update the states of the running/resumed requests.
@@ -2099,6 +2106,12 @@ class TTModelRunner:
             )
         else:
             multi_modal_kwargs = {}
+        # Sent with every prefill chunk, a resumed request's included.
+        stage_inputs = None
+        if self.supports_stage_inputs and is_prompt:
+            stage_inputs = [
+                self.requests[req_id].stage_inputs for req_id in row_req_ids
+            ]
 
         # If we're not using structured outputs, grammar_bitmask is None.
         bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
@@ -2266,6 +2279,7 @@ class TTModelRunner:
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
+            stage_inputs=stage_inputs,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -3294,6 +3308,8 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        if model_input.stage_inputs is not None:
+            kwargs["stage_inputs"] = model_input.stage_inputs
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
