@@ -1379,6 +1379,14 @@ def register_tt_models(register_test_models=False) -> None:
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
+    # Qwen3-TTS talker: stage 0 (AR) of vLLM-Omni's Qwen3-TTS pipeline.
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3TTSTalkerForConditionalGeneration",
+        "models.demos.audio.qwen3_tts.tt.generator_vllm:"
+        "Qwen3TTSTalkerForConditionalGeneration",
+    )
+
     # Qwen3.5 - Text
     qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
     if qwen35_text_version == "qwen36_blackhole":
