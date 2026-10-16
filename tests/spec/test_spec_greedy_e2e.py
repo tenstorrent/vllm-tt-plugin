@@ -106,6 +106,7 @@ def _runner(
         kv_caches=object(),
         trace_mode="decode_only",
         request_specific_rope=False,
+        supports_stage_outputs=False,
         _output_tokens_per_step=1,
         _is_block_output_model=False,
         _is_adaptive_block_output=False,

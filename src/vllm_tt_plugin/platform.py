@@ -29,6 +29,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
     resolve_tt_scheduler_cls,
+    resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -2409,6 +2410,9 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.scheduler_cls,
             parallel_config.worker_cls,
             is_lane_mode,
+        )
+        resolve_tt_supports_stage_outputs(
+            vllm_config, model_capabilities, model_class, is_lane_mode
         )
         if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
