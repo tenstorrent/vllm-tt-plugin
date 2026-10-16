@@ -55,25 +55,43 @@ def test_bad_word_allowance_preserves_masks_seeds_and_output_assertion(monkeypat
 
     def run_batch(server, model, configs, **kwargs):
         seen.append((configs, kwargs))
-        return [result_text if c.max_tokens >= 612 else None for c in configs]
+        return [
+            NS(
+                choices=[
+                    NS(
+                        message=NS(
+                            content=result_text if c.max_tokens >= 612 else None
+                        ),
+                        token_ids=[7] if result_text == "Hello" else [8],
+                    )
+                ]
+            )
+            for c in configs
+        ]
 
     monkeypatch.setattr(host, "run_concurrent_batch", run_batch)
+    monkeypatch.setattr(host, "_served_bad_word_token_patterns", lambda *args: [[7]])
     test = host.TestHostOnlyParameters().test_bad_words
     with pytest.raises(AssertionError, match="content is None"):
         test(None, "reference", 32, 0)
     test(None, "reference", 32, 512)
     before, before_kwargs = seen[0]
     after, after_kwargs = seen[1]
-    assert before_kwargs == after_kwargs == {"use_chat": True}
+    assert (
+        before_kwargs
+        == after_kwargs
+        == {"use_chat": True, "return_full_response": True}
+    )
     assert len(after) == 5
     for first, second in zip(before, after):
         assert first.max_tokens == 100
         assert second.max_tokens == 612
+        assert first.return_token_ids and second.return_token_ids
         assert {k: v for k, v in vars(first).items() if k != "max_tokens"} == {
             k: v for k, v in vars(second).items() if k != "max_tokens"
         }
     result_text = "Hello"
-    with pytest.raises(AssertionError, match="bad_word"):
+    with pytest.raises(AssertionError, match="Forbidden token sequence"):
         test(None, "reference", 32, 512)
 
 

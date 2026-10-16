@@ -165,6 +165,40 @@ def test_accepting_the_decode_remap_advances_the_ownership_map():
     assert r._req_state_slot["A"] == 0 and r._req_state_slot["B"] == 1
 
 
+@pytest.mark.parametrize(
+    "rows,expected", [(["NEW", "LONG"], [2, 1]), (["LONG", "NEW"], [1, 2])]
+)
+def test_chunked_prefill_preserves_continuation_slot_before_allocating_arrivals(
+    rows, expected
+):
+    """A packed prefill row can change between chunks without a state gather.
+
+    LONG owns its recurrent prefix in slot 1 while DECODER owns slot 0. A new
+    prompt must not take LONG's slot merely because LONG is also prefilling.
+    """
+    r = _runner(slots=3)
+    assert _prefill(r, ["DECODER", "LONG"]) == [0, 1]
+    state = ["DECODER", "LONG", None]
+
+    slots = _prefill(r, rows)
+    assert slots == expected
+    for request, slot in zip(rows, slots):
+        if request == "LONG":
+            assert state[slot] == "LONG", "continuation must read its existing prefix"
+        else:
+            assert state[slot] is None, "new prefill must not overwrite live state"
+            state[slot] = request
+    _assert_state_found(r, state)
+
+    # Further chunks retain ownership even when only one continuation is
+    # packed at row 0; a later decode gather remains responsible for moving it.
+    assert _prefill(r, ["LONG"]) == [1]
+    assert _prefill(r, ["NEW", "LONG"]) == [2, 1]
+    state = _gather(state, _decode(r, ["NEW", "DECODER", "LONG"]))
+    _assert_state_found(r, state)
+    assert _prefill(r, ["LONG", "NEW"]) == [2, 0]
+
+
 def test_release_keeps_a_merely_unscheduled_request():
     """Every prefill step leaves the whole decode batch unscheduled, and that state is
     still live. The release predicate must not read "unscheduled" as "dead"."""

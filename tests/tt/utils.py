@@ -49,6 +49,7 @@ class RequestConfig:
     allowed_token_ids: list[int] | None = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
+    return_token_ids: bool = False
     reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
@@ -114,6 +115,8 @@ async def send_chat_request(
         extra_body["logit_bias"] = config.logit_bias
     if config.allowed_token_ids is not None:
         extra_body["allowed_token_ids"] = config.allowed_token_ids
+    if config.return_token_ids:
+        extra_body["return_token_ids"] = True
 
     response = await async_client.chat.completions.create(
         model=model,

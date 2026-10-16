@@ -1360,10 +1360,11 @@ class TTLaneInputBatch(InputBatch):
             has_structured_outputs=has_structured,
             sampling_rows=rows,
         )
-        if intermediate_prefill_mask.any():
-            # Device sampling advances device RNG state for every row it reads,
-            # which an intermediate chunk must not do. Host sampling can hand
-            # those rows a generator clone instead.
+        if intermediate_prefill_mask.any() and not getattr(
+            getattr(runner, "model", None), "model_capabilities", {}
+        ).get("supports_intermediate_prefill_device_sampling", False):
+            # Preserve cloned host RNG unless discarded device samples are
+            # proven not to affect later committed outputs or request state.
             perform_device_sampling = False
 
         # Device-side penalties only; host sampling rebuilds these in
@@ -1454,10 +1455,13 @@ class TTLaneInputBatch(InputBatch):
                 # tokens are dropped by the caller.
                 return torch.zeros((n, 1), dtype=torch.int32), None
         if model_input.perform_device_sampling:
-            assert not intermediate_rows, (
-                "Intermediate prefill rows must use host sampling so their "
-                "device RNG state is not advanced."
-            )
+            if intermediate_rows and not getattr(
+                getattr(runner, "model", None), "model_capabilities", {}
+            ).get("supports_intermediate_prefill_device_sampling", False):
+                raise ValueError(
+                    "Intermediate prefill device sampling requires "
+                    "supports_intermediate_prefill_device_sampling"
+                )
             assert model_input.grammar_bitmask[0] is None, (
                 "grammar bitmask is set but device sampling can't apply it"
             )
