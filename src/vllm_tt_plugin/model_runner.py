@@ -3823,12 +3823,15 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         skip_req_ids: set[str] | None = None,
     ) -> None:
-        # When applying a deferred async step, the write row is resolved live
-        # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime,
-        # while the scheduler lifecycle skip set rejects stale results before a
-        # live row is resolved. ``req_id_to_index`` is therefore the source of
-        # truth for the target row.
+        # A deferred async step resolves its write row live from
+        # ``req_id_to_index`` (below), not from the row it was submitted at. A
+        # resume between submit and apply can move the request to another row;
+        # lane mode, for example, re-places a resumed request wherever the
+        # coordinator's free list sends it. The live row is still the right
+        # target, because ``InputBatch.add_request`` re-derives ``num_tokens``
+        # from the request state when it places the request. ``skip_req_ids``
+        # (finished requests and forced-reset frames) is checked before any
+        # row is resolved.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         num_out_tokens = self._tt_committed_width(sampled_token_ids)
