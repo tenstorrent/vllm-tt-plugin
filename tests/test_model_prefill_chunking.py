@@ -319,3 +319,21 @@ def test_platform_rejects_a_budget_below_one_window():
 def test_platform_rejects_invalid_values(bad):
     with pytest.raises(ValueError):
         _store_prefill_chunking(_cfg(), {"prefill_chunk_alignment": bad}, _M)
+
+
+# ---- reset_prefix_cache reaches the model through the next SchedulerOutput ---------------------------------------------------------
+
+
+def test_prefix_cache_reset_flag_rides_on_the_next_scheduler_output():
+    from vllm_tt_plugin.scheduler import get_tt_prefix_cache_reset
+
+    s = _scheduler(budget=2048, align=512)
+    s.add_request(_request("a", 700))
+    assert not get_tt_prefix_cache_reset(s.schedule())
+    assert s.reset_prefix_cache() in (True, False)
+    s._pending_prefix_cache_reset = True  # (a successful reset sets it; the base reset may refuse while a request runs)
+    s.add_request(_request("b", 700))
+    out = s.schedule()
+    assert get_tt_prefix_cache_reset(out)
+    s.add_request(_request("c", 700))
+    assert not get_tt_prefix_cache_reset(s.schedule())  # one-shot

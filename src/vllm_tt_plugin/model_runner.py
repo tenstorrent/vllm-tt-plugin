@@ -65,6 +65,7 @@ from vllm_tt_plugin.input_batch import (
     clone_torch_generator,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
+from vllm_tt_plugin.scheduler import get_tt_prefix_cache_reset
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
@@ -966,6 +967,11 @@ class TTModelRunner:
         Based on _update_states for GPU/TPU backends.
         """
         persistent_batch_layout_changed = False
+
+        if get_tt_prefix_cache_reset(scheduler_output):
+            reset = getattr(self.model, "reset_prefix_cache", None)
+            if callable(reset):
+                reset()
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:

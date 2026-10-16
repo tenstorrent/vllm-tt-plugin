@@ -53,6 +53,15 @@ def set_tt_forced_reset_discard_counts(
         )
 
 
+# A successful ``reset_prefix_cache`` must also drop the model-owned prefix state (``model.reset_prefix_cache()``, e.g. the DeepSeek-V4.1 host snapshots): the worker is
+# another process, so the flag rides on the next ``SchedulerOutput`` like the discard counts above.
+_TT_PREFIX_CACHE_RESET_ATTR = "_tt_prefix_cache_reset"
+
+
+def get_tt_prefix_cache_reset(scheduler_output: SchedulerOutput) -> bool:
+    return bool(getattr(scheduler_output, _TT_PREFIX_CACHE_RESET_ATTR, False))
+
+
 def get_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, int]:
@@ -344,6 +353,7 @@ class TTScheduler(AsyncScheduler):
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
+        self._pending_prefix_cache_reset = False
         self._max_partial_prefills = get_tt_max_partial_prefills(self.vllm_config)
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -884,6 +894,9 @@ class TTScheduler(AsyncScheduler):
                     "TT scheduler: widest decode batch reached %d request row(s)",
                     rows,
                 )
+        if getattr(self, "_pending_prefix_cache_reset", False):
+            setattr(scheduler_output, _TT_PREFIX_CACHE_RESET_ATTR, True)
+            self._pending_prefix_cache_reset = False
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -1088,7 +1101,10 @@ class TTScheduler(AsyncScheduler):
             else []
         )
         try:
-            return super().reset_prefix_cache(reset_running_requests, reset_connector)
+            ok = super().reset_prefix_cache(reset_running_requests, reset_connector)
+            if ok:
+                self._pending_prefix_cache_reset = True
+            return ok
         finally:
             for request, frame_count in reset_candidates:
                 if request.status == RequestStatus.PREEMPTED and frame_count > 0:
