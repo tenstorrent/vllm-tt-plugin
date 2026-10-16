@@ -41,7 +41,7 @@ class _StageModel:
     """Completes, in each decode, the frame whose codec-0 is the row's input token."""
 
     decode_input_update_contract = 1
-    model_capabilities = {"supports_async_decode": True}
+    model_capabilities = {"supports_stage_outputs": True}
 
     def __init__(self, padding_frames: bool = False):
         self._pending: list = []
@@ -247,12 +247,14 @@ def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos(
         decode_submission=SimpleNamespace(stage_outputs=frames),
     )
 
-    def build(sampled, logprobs, req_ids=None):
-        return ModelRunnerOutput(
+    def build(sampled, logprobs, req_ids=None, stage_outputs=None):
+        output = ModelRunnerOutput(
             req_ids=["a"],
             req_id_to_index={"a": 0},
             sampled_token_ids=[sampled[0].tolist()],
         )
+        set_tt_stage_outputs(output, stage_outputs)
+        return output
 
     runner = SimpleNamespace(
         _apply_grammar_to_input=lambda model_input, grammar, lane_total: model_input,
@@ -270,7 +272,7 @@ def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos(
     assert get_tt_stage_outputs(output) == frames
 
 
-def _completed_step(token, runner_output, frames):
+def _completed_step(token, runner_output, frames=None):
     return CompletedDecodeStep(
         sampled_token_ids=torch.tensor([[token]], dtype=torch.int32),
         logprobs=None,
@@ -321,10 +323,12 @@ def _async_apply_runner(request_state):
 def test_the_async_path_publishes_the_submissions_frames():
     frames = {"request": TTStageFrame(3, ("frame", 9))}
     runner = SimpleNamespace(
-        _build_runner_output=lambda **kw: ModelRunnerOutput(
-            req_ids=kw["req_ids"],
-            req_id_to_index=kw["req_id_to_index"],
-            sampled_token_ids=[[9]],
+        _build_runner_output=lambda **kw: TTModelRunner._build_runner_output(
+            SimpleNamespace(
+                input_batch=None,
+                _tt_committed_width=lambda tokens: 1,
+            ),
+            **kw,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -342,35 +346,12 @@ def test_a_frame_in_flight_when_its_request_is_cancelled_is_withdrawn():
     output = _published(7, 0)
 
     controller.apply_completed_decode_step(
-        _completed_step(7, output, get_tt_stage_outputs(output)),
+        _completed_step(7, output),
         suppress_output_req_ids={"request"},
         skip_state_req_ids={"request"},
     )
 
     assert get_tt_stage_outputs(output) == {}
-
-
-def test_forced_reset_withdraws_only_the_frames_it_discards():
-    request_state = SimpleNamespace(output_token_ids=[])
-    runner = _async_apply_runner(request_state)
-    controller = TTAsyncDecodeController(runner)
-    outputs = [_published(token, index) for index, token in enumerate((5, 6, 7))]
-    runner._completed_decode_steps.extend(
-        _completed_step(token, output, get_tt_stage_outputs(output))
-        for token, output in zip((5, 6, 7), outputs)
-    )
-
-    controller.apply_ready_completed_decode_steps(
-        forced_reset_discard_counts={"request": 2}
-    )
-
-    assert [get_tt_stage_outputs(output) for output in outputs] == [
-        {"request": TTStageFrame(0, 5)},
-        {},
-        {},
-    ]
-    # The tokens stay published, for the scheduler's stale-token count.
-    assert [output.sampled_token_ids for output in outputs] == [[[5]], [[6]], [[7]]]
 
 
 def test_preempting_a_stage_request_fails_loudly():
@@ -395,10 +376,11 @@ class _Model:
     pass
 
 
-def _config(output_tokens_per_step=1, speculative_config=None):
+def _config(output_tokens_per_step=1, speculative_config=None, max_num_seqs=1):
     return SimpleNamespace(
         additional_config={"_tt_output_tokens_per_step": output_tokens_per_step},
         speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
     )
 
 
@@ -420,12 +402,25 @@ def test_the_resolved_capability_is_stored_on_the_config():
         (_config(), True, "lane mode"),
         (_config(output_tokens_per_step=4), False, "output_tokens_per_step=4"),
         (_config(speculative_config=object()), False, "speculative decoding"),
+        (_config(max_num_seqs=2), False, "max_num_seqs=2"),
     ],
 )
 def test_stage_outputs_need_one_token_front_packed_steps(config, is_lane_mode, message):
     with pytest.raises(ValueError, match=message):
         resolve_tt_supports_stage_outputs(
             config, {"supports_stage_outputs": True}, _Model, is_lane_mode
+        )
+
+
+def test_stage_outputs_refuse_async_decode():
+    """An overlapped steady step builds from host positions one step behind, so
+    its stage frames would be tagged one frame low."""
+    with pytest.raises(ValueError, match="supports_async_decode"):
+        resolve_tt_supports_stage_outputs(
+            _config(),
+            {"supports_stage_outputs": True, "supports_async_decode": True},
+            _Model,
+            False,
         )
 
 

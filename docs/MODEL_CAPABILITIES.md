@@ -125,7 +125,7 @@ Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
-| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, or speculative decoding. `TTModelRunner` raises when such a model's request is preempted, because the plugin cannot resume one. |
+| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, speculative decoding, `supports_async_decode` (an overlapped decode builds from host positions one step behind, which would mistag stage frames), or `max_num_seqs != 1`. Forced prefix-cache resets are refused, or abort the request first, as for block-output models. |
 
 Sources: [config.py](../src/vllm_tt_plugin/config.py),
 [stage_outputs.py](../src/vllm_tt_plugin/stage_outputs.py),

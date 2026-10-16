@@ -5,14 +5,18 @@
 A model that declares ``supports_stage_outputs`` implements
 ``pop_stage_outputs()``. The runner calls it right after every
 ``decode_forward``, so each step's outputs stay attached to the submission
-that produced them, whatever the async overlap. It returns one entry per
-submitted decode row: the frame this forward completed for that row's
-request, or ``None``. The runner tags each frame with its request and
-``frame_index`` and publishes them on the step's ``ModelRunnerOutput``.
+that produced them. It returns one entry per submitted decode row: the stage
+frame this forward completed for that row's request, or ``None``. The runner
+tags each stage frame with its request and ``frame_index`` and publishes them on
+the step's ``ModelRunnerOutput``.
+
+"Stage frame" is the model's per-request payload, distinct from the output
+frames ``TTScheduler`` counts per published step.
 
 ``frame_index`` comes from the row's decode position: the step that consumes
-output token ``k`` (position ``num_prompt_tokens + k``) completes frame ``k``.
-Prefill completes no frame and is never asked.
+output token ``k`` (position ``num_prompt_tokens + k``) completes stage frame
+``k``. Positions are current because async decode is refused for these models.
+Prefill completes no stage frame and is never asked.
 """
 
 from collections.abc import Collection, Mapping

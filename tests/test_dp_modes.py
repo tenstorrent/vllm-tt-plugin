@@ -194,6 +194,7 @@ class TestDPModes:
         dummy_model_class: type,
     ) -> None:
         dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+        vllm_config.scheduler_config.max_num_seqs = 1
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
