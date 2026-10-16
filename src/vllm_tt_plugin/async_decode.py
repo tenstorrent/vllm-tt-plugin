@@ -785,6 +785,12 @@ class TTAsyncDecodeController:
         ended the request was already accepted. Only the late result is
         removed.
         """
+        # Prune before the drain. A step's completion is enqueued before its
+        # event is set, so the drain sees every step this prune removes. A
+        # prune after the drain can remove a step that resolved in between.
+        # Its token is then neither applied nor pending, and the build that
+        # follows treats stale host state as current.
+        self.prune_finished_async_events()
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
         discard_counts = forced_reset_discard_counts or {}
@@ -836,7 +842,6 @@ class TTAsyncDecodeController:
                 skip_state_req_ids=suppressed | forced_reset_req_ids,
             )
             remaining_results.subtract(published_req_ids)
-        self.prune_finished_async_events()
 
     def apply_completed_decode_steps_before_build(
         self, scheduler_output: SchedulerOutput
