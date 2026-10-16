@@ -32,7 +32,8 @@ otherwise the phases below stand alone.
 - Check for an in-flight bump first: search PRs (all states) and remote branches for TARGET
   or any intermediate version (e.g., `gh pr list --state all --search "vllm in:title"`,
   `git ls-remote --heads origin '*compat*'`). If exists, ask before working on the existing
-  PR/branch or starting a parallel one.
+  PR/branch or starting a parallel one. A tracking issue's **Generated** section lists them
+  as of its creation — check again anyway.
 - Activate the tt-metal venv, then resolve the installed checkout (the only authority):
   `python -c "import importlib.util as u; print(u.find_spec('vllm_tt_plugin').origin)"`.
   Confirm it is the tree you intend to assess.
@@ -106,6 +107,12 @@ added or removed, the greps catch it and this list will not — update the snaps
 diverge.
 
 ## Phase 2 — Diff upstream release by release, then shadow-run the tests
+- Start from the tracking issue's **Generated** section when it applies: per-release change
+  summaries (full diffs: the `upstream-diffs` artifact, via the `gh run download` command
+  given there) and host-test results on BASELINE and TARGET, with TARGET installed for real.
+  They are inputs, not findings. Skip them and do the steps below when the issue's
+  TARGET/BASELINE differ from yours, when `git diff --quiet <generated-at commit> origin/main
+  -- src tests docs` fails (`main` moved since), or when the artifact has expired.
 - Fetch source tarballs for BASELINE (the pin, per the Phase 0 gate), every intermediate
   minor (`vX.Y.0`), and TARGET:
   `mkdir -p /tmp/vllm-assess/<tag> && curl -sL https://github.com/vllm-project/vllm/archive/refs/tags/<tag>.tar.gz | tar xz --strip-components=1 -C /tmp/vllm-assess/<tag>`.
@@ -168,15 +175,105 @@ workarounds (`platform.py` patches, scheduler/lane overrides) for `REDUNDANT` on
   plugin. Re-verify the import origin and `vllm.__version__`. The rebuild replaces BASELINE
   for everything else using that venv — ask first, and offer the Phase 2 shadow run instead.
 - Host-only tests: `python -m pytest tests/ --ignore=tests/tt`. They miss device-only
-  regressions; validate on device before merging, covering DP, multimodal, and
-  multi-KV-group (hybrid) models.
+  regressions; Phase 6 covers those.
 
-## Phase 6 — Record & ship
-- Findings → the tracking issue: a concise summary + concise per-version diffs, **no
-  proposed solutions**.
+## Phase 6 — Device CI (before merging)
+This repo has no hardware CI. tt-metal's "vLLM Model Tests" (`vllm-model-tests.yaml`)
+installs the plugin through `docs/install-vllm-tt.sh` and runs one job per model/SKU. A full
+run holds shared hardware for hours — confirm with the user before dispatching.
+
+```bash
+REPO=tenstorrent/tt-metal
+WORKFLOW=vllm-model-tests.yaml
+
+# One TSV row per model job: name, result, first failing step, job id.
+# Works on runs still in progress.
+JOB_ROW='.jobs[]
+  | select(.name | startswith("vllm-tests / "))
+  | [
+      (.name | ltrimstr("vllm-tests / ")),
+      (.conclusion // .status),
+      ([.steps[]? | select(.conclusion == "failure") | .name] | first // "-"),
+      .id
+    ]
+  | @tsv'
+
+run_jobs() {
+  local run_id=$1
+  gh api "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" --paginate --jq "$JOB_ROW" \
+    | LC_ALL=C sort -t $'\t' -k 1,1
+}
+```
+
+- **Reference nightly.** Scheduled runs test plugin `main`; use the latest one that tested
+  the branch's merge-base:
+  ```bash
+  git fetch origin main
+  gh run list --repo "$REPO" --workflow "$WORKFLOW" --event schedule --limit 5 \
+      --json databaseId,createdAt --jq '.[] | "\(.databaseId) \(.createdAt)"' |
+    while read -r run_id started_at; do
+      plugin_commit=$(git rev-list -1 --before="$started_at" origin/main)
+      echo "$run_id  $started_at  plugin=$plugin_commit"
+    done
+  ```
+  A job that fails the same way across several nightlies is pre-existing: list it, don't
+  chase it.
+- **Dispatch** the full matrix once the branch is stable, then only the affected model (and
+  SKU) after each fix:
+  ```bash
+  gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
+    -f vllm-tt-plugin-ref=<branch> \
+    -f model=all -f sku=all -f tier=all
+
+  # Your latest dispatched run
+  gh run list --repo "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch \
+    --user "$(gh api user --jq .login)" --limit 1 --json databaseId,url
+  ```
+  `--ref` is the tt-metal ref: `main`, or a tt-metal branch carrying CI fixes the bump needs
+  (`BREAKING-ENV`). `model` takes an HF id from the workflow's choice list. Check back later
+  instead of polling.
+- **Compare** with the nightly, side by side:
+  ```bash
+  BRANCH_RUN=<run-id>
+  NIGHTLY_RUN=<run-id>
+
+  # job | branch result | branch failing step | nightly result | nightly failing step | branch job id
+  # "-" marks a job absent from one of the runs.
+  LC_ALL=C join -t $'\t' -a 1 -a 2 -e - -o 0,1.2,1.3,2.2,2.3,1.4 \
+      <(run_jobs "$BRANCH_RUN") <(run_jobs "$NIGHTLY_RUN") \
+    | column -t -s $'\t'
+  ```
+- **Classify** each job:
+  - Same result, same failing step, same error → unchanged. Compare the errors in the
+    server logs, not just the conclusions.
+  - Fails only on the branch, or at a different step → regression until the logs show
+    otherwise; reproduce with a targeted dispatch.
+  - Failed in a setup or checkout step → infra; re-dispatch that model.
+  - Several jobs on one machine failing at server start → check the tt-smi snapshot's
+    `"processes"` list in the job log for a foreign process holding the devices before
+    blaming code.
+  - Passes only on the branch → note it; not a blocker.
+- **Green is not enough:**
+  - Compare benchmark TPOT and throughput with the nightly's (`grep "Mean TPOT"` in the
+    log), DP jobs especially — a large slowdown is a regression even when the job passes.
+  - Multimodal jobs: read the answer. The check only greps for a keyword, so a wrong
+    description can pass.
+  - AI job and run summaries can invent root causes; confirm each one in the server log.
+- **Logs** of a finished job are available while the run continues (`gh run view
+  --log-failed` waits for the whole run). Save each log once and grep locally; the server
+  log is in the "Show server log" step:
+  ```bash
+  mkdir -p /tmp/ci
+  gh api "repos/$REPO/actions/jobs/<job-id>/logs" > "/tmp/ci/<job-id>.log"
+  ```
+
+## Phase 7 — Record & ship
+- Findings → the tracking issue: fill its Summary and per-release sections (tag each finding
+  with its Phase 3 class) and keep the Generated section — concise, **no proposed solutions**.
 - Change → a PR per `.github/pull_request_template.md`, title prefixed `[deps]`. Keep its
-  validation section to the final full device run plus one confirmation run per device fix;
-  drop superseded runs.
+  validation section to the final full Phase 6 run plus one confirmation run per device fix,
+  each with its run link, plugin commit, and per-job result against the nightly; list
+  pre-existing failures separately and drop superseded runs.
 - Version model: `main` follows the latest supported vLLM; there are no release branches.
   Before merging, tag the last `main` commit that targets BASELINE as an annotated
   `compat/vllm-<BASELINE>` and push it — the README points older-version users at these
