@@ -147,6 +147,18 @@ def test_supports_device_grammar_defaults_false_and_round_trips():
     assert tt_config.get_tt_supports_device_grammar(pickle.loads(pickle.dumps(config)))
 
 
+def test_supports_stage_inputs_defaults_false_and_round_trips():
+    config = _vllm_config()
+
+    assert not tt_config.get_tt_supports_stage_inputs(config)
+
+    tt_config.validate_and_store_tt_supports_stage_inputs(
+        config, {"supports_stage_inputs": True}, object, False
+    )
+
+    assert tt_config.get_tt_supports_stage_inputs(pickle.loads(pickle.dumps(config)))
+
+
 @pytest.mark.parametrize(
     ("trace_mode", "enable_model_warmup", "expected"),
     [

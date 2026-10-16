@@ -46,6 +46,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
+| `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
 For row `i`, `prefill_forward` computes
 `tokens[i, start_pos[i]:prompt_lens[i]]`. For example, `start_pos[i]=128` and

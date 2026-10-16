@@ -39,6 +39,7 @@ from vllm_tt_plugin.config import (
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -2408,6 +2409,10 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.scheduler_cls,
             parallel_config.worker_cls,
             is_lane_mode,
+        )
+        # Here rather than with the other capability reads: it needs is_lane_mode.
+        validate_and_store_tt_supports_stage_inputs(
+            vllm_config, model_capabilities, model_class, is_lane_mode
         )
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
