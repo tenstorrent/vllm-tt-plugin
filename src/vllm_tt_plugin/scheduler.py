@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import contextlib
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -1089,16 +1090,25 @@ class TTScheduler(AsyncScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        with self._committing_step(scheduler_output):
+            return super().update_from_output(scheduler_output, model_runner_output)
+
+    @contextlib.contextmanager
+    def _committing_step(self, scheduler_output: SchedulerOutput):
         """Bind this step's block-step decisions before the base loop commits
         its outputs, so ``_update_request_with_output`` reads the decision that
         produced THIS output rather than a later schedule's overwrite, and
-        consume only the output frames this scheduled step reserved."""
+        consume only the output frames this scheduled step reserved.
+
+        Separate from ``update_from_output`` for a subclass whose base loop does
+        not reach this class's ``update_from_output``.
+        """
         if self._is_block_output_model:
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
             )
         try:
-            return super().update_from_output(scheduler_output, model_runner_output)
+            yield
         finally:
             self._committing_block_step_decisions = {}
             pending = self._pending_async_output_frames
