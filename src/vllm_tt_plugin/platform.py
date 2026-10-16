@@ -598,6 +598,30 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
         ModelRegistry.register_model(model_arch, model_path)
 
 
+def _reconcile_multimodal_config(model_config, model_class) -> None:
+    """Drop the multimodal config when the resolved TT class is text-only.
+
+    ``ModelConfig`` builds ``multimodal_config`` from the bare architecture,
+    before ``check_and_update_config`` rewrites it to the TT name. A checkpoint
+    whose upstream class is multimodal therefore keeps that config even when
+    its TT class is not, and the frontend then accepts multimodal inputs: the
+    upstream processor injects placeholder tokens and the TT model answers on
+    them without ever seeing the media.
+    """
+    from vllm.model_executor.models.interfaces import supports_multimodal
+
+    if model_config.multimodal_config is None or supports_multimodal(model_class):
+        return
+    logger.warning(
+        "%s declares a multimodal architecture, but the TT implementation "
+        "(%s) is text only. Multimodal inputs will be refused; text "
+        "inference is unaffected.",
+        model_config.model,
+        model_class.__name__,
+    )
+    model_config.multimodal_config = None
+
+
 def _tt_model_class_overrides() -> dict[str, str]:
     """Parse ``TT_MODEL_CLASS_OVERRIDES`` into an {architecture: target} map.
 
@@ -1429,22 +1453,27 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:Gemma3ForConditionalGeneration",
     )
 
-    # Gemma4 — text-only TT bridge.
+    # Gemma4: text-only TT bridge.
     #
     # Only the ``TT``-prefixed aliases. Do not add the bare HF names: vLLM
-    # 0.25.1 registers all three itself and ``_register_model_if_missing``
-    # never overrides an existing entry, so those calls are no-ops.
+    # registers all three itself and ``_register_model_if_missing`` never
+    # overrides an existing entry, so those calls would be no-ops.
     #
     # The prefix rewrite in ``check_and_update_config`` decides which class the
     # loader instantiates, and nothing more. ``ModelConfig.__post_init__`` has
-    # already inspected the *bare* architecture by then, and for
-    # ``Gemma4ForConditionalGeneration`` and
-    # ``Gemma4UnifiedForConditionalGeneration`` that resolves to upstream's
-    # multimodal class -- so ``multimodal_config``, ``runner_type`` and
-    # ``convert_type`` are upstream's, and upstream's ``Gemma4Config`` hook has
-    # run against the TT config. Do not read the prefix as isolating Gemma4
-    # from upstream's Gemma4 handling; closing that would mean generalizing
-    # ``_install_diffusion_gemma_architecture_patch`` beyond one family.
+    # already inspected the *bare* architecture by then. The conditional
+    # checkpoints declare ``Gemma4ForConditionalGeneration``, and the 12B
+    # checkpoint is the "unified" variant
+    # (``Gemma4UnifiedForConditionalGeneration``, with nested text, vision and
+    # audio configs). Both resolve to upstream's multimodal classes, so
+    # ``runner_type``, ``convert_type`` and ``multimodal_config`` are upstream's,
+    # and upstream's ``Gemma4Config`` hook has run against the TT config. All
+    # three names map to the same text-only TT class, so
+    # ``_reconcile_multimodal_config`` drops the multimodal config again and
+    # multimodal requests are refused. The prefix does not isolate Gemma4 from
+    # the rest of upstream's Gemma4 handling; closing that would mean
+    # generalizing ``_install_diffusion_gemma_architecture_patch`` beyond one
+    # family.
     _gemma4_target = "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
     for arch in (
         "TTGemma4ForCausalLM",
@@ -1896,6 +1925,7 @@ class TTPlatform(Platform):
         from vllm.model_executor.model_loader.utils import get_model_architecture
 
         model_class, _ = get_model_architecture(vllm_config.model_config)
+        _reconcile_multimodal_config(vllm_config.model_config, model_class)
 
         # Get model capabilities from the class
         model_capabilities: dict | None = getattr(
