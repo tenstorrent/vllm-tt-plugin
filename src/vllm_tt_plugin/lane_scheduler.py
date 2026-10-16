@@ -28,7 +28,10 @@ negotiates that mode before scheduling any lane.
 
 from __future__ import annotations
 
+import collections
 import copy
+import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -46,6 +49,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
+    is_tt_lane_prefill_group,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
@@ -101,6 +105,9 @@ class _LaneStepState:
 # no ``__slots__``; the attribute is invisible in that class's definition, so
 # every access goes through the two helpers below to keep the name in one place.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
+
+
+_PREFIX_AFFINITY_ENTRIES = 4096
 
 
 def _set_tt_step_state(
@@ -259,6 +266,12 @@ class TTLaneCoordinator(SchedulerInterface):
     device rows and slots.
     """
 
+    # Lane-group prefill gather state (see __init__). Class-level defaults keep a
+    # coordinator a test builds without running __init__ in the capability-off state.
+    _lane_prefill_group: bool = False
+    _group_gather_ms: float = 0.0
+    _group_gather_start: float | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -279,6 +292,18 @@ class TTLaneCoordinator(SchedulerInterface):
         self._per_lane_max = get_tt_per_lane_max_num_seqs(vllm_config)
         self._req_to_lane: dict[str, int] = {}
         self._req_to_row: dict[str, int] = {}
+        # Prefix affinity: lanes have independent prefix caches, so a request
+        # whose prompt starts like an earlier one only hits if it lands on the
+        # same lane. Remember the lane per prompt prefix (the first N token
+        # ids) and prefer it while that lane is not clearly more loaded.
+        self._prefix_affinity_tokens = int(
+            os.environ.get("TT_LANE_PREFIX_AFFINITY_TOKENS", "256")
+        )
+        self._prefix_affinity_slack = int(
+            os.environ.get("TT_LANE_PREFIX_AFFINITY_SLACK", "4")
+        )
+        self._prefix_lane: collections.OrderedDict[int, int]
+        self._prefix_lane = collections.OrderedDict()
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
@@ -289,6 +314,20 @@ class TTLaneCoordinator(SchedulerInterface):
         # the single negotiated mode, so per-lane instances would each see only
         # their own lane's work and disagree about when to interleave.
         self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
+        # Lane-group prefill gather: while SOME but not ALL lanes hold a new
+        # waiting prefill (and none is mid-chunks), prefer a decode step for up
+        # to TT_PREFILL_GROUP_GATHER_MS so a burst lands as one pure group
+        # instead of a lone B=1 step followed by a forever-partial remainder.
+        # Only bites when a decode exists to run; an idle server admits
+        # immediately (b1 latency untouched). 0 disables.
+        self._lane_prefill_group = is_tt_lane_prefill_group(vllm_config)
+        try:
+            self._group_gather_ms = float(
+                os.environ.get("TT_PREFILL_GROUP_GATHER_MS", "150")
+            )
+        except ValueError:
+            self._group_gather_ms = 150.0
+        self._group_gather_start: float | None = None
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -343,8 +382,8 @@ class TTLaneCoordinator(SchedulerInterface):
     # Lane selection / mode negotiation
     # ------------------------------------------------------------------
 
-    def _pick_lane(self) -> int:
-        """Choose the least-loaded lane for a newly arriving request.
+    def _pick_lane(self, request=None) -> int:
+        """Choose the lane for a new request: least-loaded, with prefix affinity.
 
         Scores each lane ``waiting * 4 + running`` and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
@@ -361,15 +400,62 @@ class TTLaneCoordinator(SchedulerInterface):
         later migration. So a lane can sit idle while another has queued work,
         the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
         is a possible future follow-up.
+
+        Prefix affinity: each lane keeps its own prefix cache, so a prompt that
+        starts like an earlier one is sent to that earlier lane whenever that
+        lane still has a free slot for it, or failing that whenever its load
+        score is within ``TT_LANE_PREFIX_AFFINITY_SLACK`` of the best lane (a
+        fan-out over one shared context then hits the cache instead of
+        re-prefilling it on every lane). Balancing lanes buys nothing on its
+        own: all lanes run on the same device in one step.
         """
         best_lane = 0
         best_score: int | None = None
+        scores: list[int] = []
         for lane, sched in enumerate(self.lanes):
             score = len(sched.waiting) * 4 + len(sched.running)
+            scores.append(score)
             if best_score is None or score < best_score:
                 best_score = score
                 best_lane = lane
+        key = self._prefix_key(request)
+        if key is None:
+            return best_lane
+        lanes = self._prefix_lane
+        affine = lanes.get(key)
+        if affine is not None and affine < len(scores):
+            # The lanes share one device, so a request costs the same compute on
+            # any lane; what a cache hit saves is the whole prefix prefill. Keep
+            # the request on the cached lane while that lane can still admit it
+            # (a free slot, counting what is already queued there), and only
+            # then compare loads with the slack.
+            sched = self.lanes[affine]
+            queued = len(sched.waiting) + len(sched.running)
+            per_lane_max = int(getattr(self, "_per_lane_max", 0) or 0)
+            if (per_lane_max > 0 and queued < per_lane_max) or scores[affine] <= int(
+                best_score or 0
+            ) + self._prefix_affinity_slack:
+                best_lane = affine
+        lanes[key] = best_lane
+        lanes.move_to_end(key)
+        while len(lanes) > _PREFIX_AFFINITY_ENTRIES:
+            lanes.popitem(last=False)
         return best_lane
+
+    def _prefix_key(self, request) -> int | None:
+        """Hash of the prompt's first ``TT_LANE_PREFIX_AFFINITY_TOKENS`` ids.
+
+        Short prompts carry no prefix worth a cache hit and keep the plain
+        least-loaded policy; ``TT_LANE_PREFIX_AFFINITY_TOKENS=0`` disables
+        affinity altogether.
+        """
+        n = int(getattr(self, "_prefix_affinity_tokens", 0) or 0)
+        if request is None or n <= 0:
+            return None
+        ids = getattr(request, "prompt_token_ids", None)
+        if ids is None or len(ids) < n:
+            return None
+        return hash(tuple(int(t) for t in ids[:n]))
 
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
@@ -418,12 +504,37 @@ class TTLaneCoordinator(SchedulerInterface):
         bound and some lane holds a decode that a decode step can advance.
         """
         intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
+        if intent == 1 and self._wants_group_gather_decode():
+            return TTSchedulingMode.DECODE_ONLY
         if intent == 1 and self._decode_interleave.wants_decode_step(
             has_pending_prefill=True,
             has_running_decode=self._has_running_decode(),
         ):
             return TTSchedulingMode.DECODE_ONLY
         return TTSchedulingMode.from_prefill_intent(intent)
+
+    def _wants_group_gather_decode(self) -> bool:
+        """Hold prefill briefly while a lane group gathers (see __init__)."""
+        if not self._lane_prefill_group or self._group_gather_ms <= 0:
+            return False
+        if any(r.is_prefill_chunk for sched in self.lanes for r in sched.running):
+            self._group_gather_start = None
+            return False  # a partial prefill must advance; never hold it
+        lanes_with_new = sum(1 for sched in self.lanes if len(sched.waiting) > 0)
+        if lanes_with_new == 0 or lanes_with_new >= len(self.lanes):
+            self._group_gather_start = None
+            return False
+        if not self._has_running_decode():
+            self._group_gather_start = None
+            return False  # idle server: admit immediately
+        now = time.monotonic()
+        if self._group_gather_start is None:
+            self._group_gather_start = now
+            return True
+        if (now - self._group_gather_start) * 1000.0 < self._group_gather_ms:
+            return True
+        self._group_gather_start = None
+        return False
 
     def _schedule_all_lanes(
         self, forced_mode: TTSchedulingMode
@@ -739,7 +850,7 @@ class TTLaneCoordinator(SchedulerInterface):
         # coordinator-owned state; the shared vLLM Request object stays generic.
         lane = self._req_to_lane.get(request.request_id)
         if lane is None:
-            lane = self._pick_lane()
+            lane = self._pick_lane(request)
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
 
