@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.config import (
@@ -23,7 +22,6 @@ from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 from vllm_tt_plugin.stage_outputs import (
     TTStageFrame,
     get_tt_stage_outputs,
-    set_tt_stage_outputs,
 )
 
 EOS = 2150
@@ -218,13 +216,13 @@ def test_the_sync_path_publishes_the_frame_of_a_step_that_samples_eos():
     )
 
     def build(sampled, logprobs, req_ids=None, stage_outputs=None):
-        output = ModelRunnerOutput(
-            req_ids=["a"],
-            req_id_to_index={"a": 0},
-            sampled_token_ids=[sampled[0].tolist()],
+        # The real builder: it is what puts the frames on the output.
+        return TTModelRunner._build_runner_output(
+            SimpleNamespace(input_batch=runner.input_batch, _tt_committed_width=len),
+            sampled,
+            logprobs,
+            stage_outputs=stage_outputs,
         )
-        set_tt_stage_outputs(output, stage_outputs)
-        return output
 
     runner = SimpleNamespace(
         _apply_grammar_to_input=lambda model_input, grammar, lane_total: model_input,
