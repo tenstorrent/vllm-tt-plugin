@@ -396,11 +396,17 @@ class TTScheduler(AsyncScheduler):
     # Host-only sampling controls and their neutral values: any of these
     # forces the step onto host sampling (check_perform_device_sampling),
     # which cannot construct a multi-token canvas and kills the engine.
-    # Penalties do not force host sampling, but a non-neutral value flips
+    # Penalties force host sampling only for a model that declares
+    # supports_device_penalties=False. Otherwise a non-neutral value flips
     # InputBatch.no_penalties and makes every block decode step build (and
     # discard) penalty token tensors that grow with the committed session
     # length; the frontend neutralizes them, so mirror that here for
     # prebuilt requests that bypassed it.
+    # The predicate's other request-driven triggers cannot fire for a
+    # block-output model: add_request strips structured outputs, the
+    # block-output InputBatch drops logprobs (disable_logprobs), and the
+    # platform refuses seeded_sampling_policy="host" and max_device_top_k
+    # for block output at config time.
     _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
         ("min_p", 0.0),
         ("min_tokens", 0),

@@ -30,7 +30,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
@@ -342,11 +344,9 @@ def test_add_request_clamps_max_tokens_that_would_overshoot_max_model_len():
     assert request.sampling_params.max_tokens == 224
 
 
-def test_add_request_strips_host_sampling_controls_from_bypassed_request():
-    """A prebuilt EngineCoreRequest skips frontend validation; any of these
-    controls flips the step onto host sampling, which cannot construct a
-    multi-token canvas and would kill the engine."""
-    scheduler = _scheduler()
+def _bypassed_host_sampling_request() -> Request:
+    """A prebuilt EngineCoreRequest that skipped frontend validation and
+    carries every request-level control that can force host sampling."""
     init_none_hash(sha256)
     params = SamplingParams(
         max_tokens=CANVAS,
@@ -359,6 +359,7 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         presence_penalty=0.5,
         frequency_penalty=0.5,
         repetition_penalty=1.1,
+        logprobs=1,
         structured_outputs=StructuredOutputsParams(json_object=True),
     )
     params.update_from_generation_config({}, eos_token_id=2)
@@ -366,7 +367,7 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     # (InputBatch reads bad_words_token_ids, not the strings); with
     # skip_tokenizer_init it stays unset unless seeded here.
     params._bad_words_token_ids = [[7]]
-    request = Request(
+    return Request(
         request_id="bypass-0",
         prompt_token_ids=[1] * 32,
         sampling_params=params,
@@ -374,6 +375,15 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         resumable=True,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
     )
+
+
+def test_add_request_strips_host_sampling_controls_from_bypassed_request():
+    """A prebuilt EngineCoreRequest skips frontend validation; any of these
+    controls flips the step onto host sampling, which cannot construct a
+    multi-token canvas and would kill the engine."""
+    scheduler = _scheduler()
+    request = _bypassed_host_sampling_request()
+    params = request.sampling_params
     assert request.use_structured_output
     assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
@@ -400,6 +410,69 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     assert request.status == RequestStatus.WAITING
     scheduled = scheduler.schedule()
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
+
+
+@pytest.mark.parametrize("repaired", [False, True])
+def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired):
+    """Drive the runner's own predicate rather than a field list, so a host
+    trigger the repair misses fails here. The four-device mesh is outside the
+    device-logprobs set, and the model declares no device penalties, so
+    logprobs and penalties would both force host sampling if they reached the
+    predicate."""
+    request = _bypassed_host_sampling_request()
+    if repaired:
+        _scheduler().add_request(request)
+    batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=64,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+        logitsprocs=build_logitsprocs(
+            SimpleNamespace(
+                speculative_config=None,
+                scheduler_config=SimpleNamespace(max_num_seqs=1),
+            ),
+            torch.device("cpu"),
+            is_pin_memory=False,
+            is_pooling_model=False,
+        ),
+        disable_logprobs=True,
+        output_tokens_per_step=CANVAS,
+    )
+    batch.add_request(
+        CachedRequestState(
+            req_id=request.request_id,
+            prompt_token_ids=list(request.prompt_token_ids),
+            mm_features=None,
+            sampling_params=request.sampling_params,
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=len(request.prompt_token_ids),
+            output_token_ids=[],
+        )
+    )
+    batch.refresh_logitsprocs()
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        model=SimpleNamespace(model_capabilities={"supports_device_penalties": False}),
+        num_devices=4,
+        tt_data_parallel_size=1,
+        input_batch=batch,
+        seeded_sampling_policy="auto",
+        model_config=SimpleNamespace(logits_processors=[]),
+        supports_device_grammar=False,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        supports_topk_logprobs=False,
+    )
+
+    assert (
+        TTModelRunner.check_perform_device_sampling(
+            runner, True, request.use_structured_output
+        )
+        is repaired
+    )
 
 
 # Largest tile-aligned prompt that still fits one whole canvas: the
