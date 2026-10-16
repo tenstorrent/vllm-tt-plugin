@@ -240,6 +240,11 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
         note(dict(moves))
 
 
+# Multimodal item kinds a TT model forward may consume (images, video frames
+# and audio clips); see ``TTModelRunner._validate_mm_feature``.
+_SUPPORTED_MM_MODALITIES = frozenset({"image", "video", "audio"})
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -1002,9 +1007,18 @@ class TTModelRunner:
         self.input_batch.refresh_logitsprocs()
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
-        """Validate the multimodal feature is an image."""
-        if mm_feature.modality != "image":
-            raise NotImplementedError("Only images are supported for now")
+        """Validate the multimodal feature is a modality TT models consume.
+
+        The model's registered multimodal processor has already limited the
+        request to the modalities that model supports (vLLM rejects the others
+        at the API), so this only guards against an item kind no TT forward
+        knows how to read.
+        """
+        if mm_feature.modality not in _SUPPORTED_MM_MODALITIES:
+            raise NotImplementedError(
+                f"Multimodal items of kind {mm_feature.modality!r} are not "
+                f"supported (supported: {sorted(_SUPPORTED_MM_MODALITIES)})"
+            )
 
     # Multimodal fields every image model gets, even when a processor does not
     # emit them, so adapters that read them positionally keep their keys.

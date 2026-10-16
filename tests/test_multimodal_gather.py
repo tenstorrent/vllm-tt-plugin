@@ -98,16 +98,33 @@ def test_req_indices_select_and_order_rows():
     assert out["image_grid_thw"] == [[None], [None]]
 
 
-def test_non_image_features_are_rejected():
+def test_video_and_audio_items_are_forwarded_like_images():
+    af, vf = torch.zeros(5, 640), torch.zeros(2, 4, 3)
     runner = _runner(
         {
             "a": SimpleNamespace(
-                mm_features=[
-                    _feature({"input_features": _field(torch.zeros(1))}, "audio")
-                ]
+                mm_features=[_feature({"input_features": _field(af)}, "audio")]
+            ),
+            "v": SimpleNamespace(
+                mm_features=[_feature({"pixel_values_videos": _field(vf)}, "video")]
+            ),
+        },
+        ["a", "v"],
+    )
+    out = TTModelRunner._gather_multi_modal_inputs(runner)
+    assert out["input_features"] == [[af], [None]]
+    assert out["pixel_values_videos"] == [[None], [vf]]
+    assert out["pixel_values"] == [[None], [None]]
+
+
+def test_unknown_item_kinds_are_rejected():
+    runner = _runner(
+        {
+            "p": SimpleNamespace(
+                mm_features=[_feature({"points": _field(torch.zeros(1))}, "point_cloud")]
             )
         },
-        ["a"],
+        ["p"],
     )
     with pytest.raises(NotImplementedError):
         TTModelRunner._gather_multi_modal_inputs(runner)
