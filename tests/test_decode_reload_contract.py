@@ -146,6 +146,7 @@ def _verifying_controller():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     return TTAsyncDecodeController(runner), model
@@ -354,6 +355,7 @@ def test_submit_decode_delivers_page_table_only_refresh():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -454,6 +456,7 @@ def test_state_slot_ownership_commits_only_after_accepted_decode():
         trace_mode="decode_only",
         kv_caches=object(),
         request_specific_rope=False,
+        supports_stage_outputs=False,
         tt_per_lane_max_num_seqs=2,
         _req_state_slot={"a": 1, "b": 0},
         _pending_state_slot_settle=None,
@@ -677,6 +680,7 @@ def test_contract_v1_receives_commands_without_legacy_reset():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -709,6 +713,7 @@ def test_contract_v1_host_sampling_still_receives_commands_and_remap():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -744,6 +749,7 @@ def test_contract_v0_keeps_legacy_call_shape_and_warns_once(monkeypatch):
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
             async_decode_scheduling=True,
         )
     )
@@ -789,6 +795,7 @@ def test_contract_v0_sync_mode_is_informational_once(monkeypatch):
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
             async_decode_scheduling=False,
         )
     )

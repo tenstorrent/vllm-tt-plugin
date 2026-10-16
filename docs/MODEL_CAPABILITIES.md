@@ -121,14 +121,17 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
 
-## Pipeline-stage capability
+## Pipeline-stage capabilities
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
 | `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload (vLLM-Omni's `additional_information`) or `None`. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Request-state construction (`build_cached_request_state`) refuses a request that carries a payload when this declaration is false. The payload is opaque to the plugin and is passed with every prefill of the request, chunked and resumed prefills included. |
+| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, or speculative decoding. `TTModelRunner` raises when such a model's request is preempted, because the plugin cannot resume one. |
 
 Sources: [config.py](../src/vllm_tt_plugin/config.py),
-[input_batch.py](../src/vllm_tt_plugin/input_batch.py), and
+[input_batch.py](../src/vllm_tt_plugin/input_batch.py),
+[stage_outputs.py](../src/vllm_tt_plugin/stage_outputs.py),
+[async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Speculative capabilities and admission
@@ -223,7 +226,8 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
-implements model-owned proposal. Adding a similarly named dictionary key
+implements model-owned proposal. `pop_stage_outputs` is consumed only with
+`supports_stage_outputs`. Adding a similarly named dictionary key
 does not implement any of these hooks.
 See [model setup](MODEL_SETUP.md), [execution](MODEL_EXECUTION.md), and
 [lifecycle](MODEL_LIFECYCLE.md) for the complete common hook interface.

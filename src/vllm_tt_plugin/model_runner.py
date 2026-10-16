@@ -49,6 +49,7 @@ from vllm_tt_plugin.config import (
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
     get_tt_supports_stage_inputs,
+    get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
@@ -81,6 +82,7 @@ from vllm_tt_plugin.spec_decode import (
     DraftOutput,
     accept_greedy_drafts,
 )
+from vllm_tt_plugin.stage_outputs import set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -244,6 +246,8 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 class TTModelRunner:
     # Resolved from ``supports_stage_inputs`` in ``__init__``; off by default.
     supports_stage_inputs: bool = False
+    # Resolved from ``supports_stage_outputs`` in ``__init__``; off by default.
+    supports_stage_outputs: bool = False
 
     def __init__(
         self,
@@ -310,6 +314,7 @@ class TTModelRunner:
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
+        self.supports_stage_outputs = get_tt_supports_stage_outputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
             trace_mode=self.trace_mode,
@@ -927,6 +932,14 @@ class TTModelRunner:
         # Explicit preemption invalidates model-owned request state. Temporary
         # unscheduling does not: a request may simply be hidden for this step.
         for req_id in scheduler_output.preempted_req_ids or ():
+            if self.supports_stage_outputs:
+                # A resume re-prefills from the token history alone, which
+                # does not hold the frames this request already emitted.
+                raise RuntimeError(
+                    f"Request {req_id} was preempted, but a model with "
+                    "supports_stage_outputs cannot resume a request; preempted "
+                    f"this step: {sorted(scheduler_output.preempted_req_ids)}"
+                )
             self._release_model_request(req_id)
 
         # Only after the model released by slot: the release calls above read
@@ -3075,7 +3088,7 @@ class TTModelRunner:
                 )
 
         if TTModelRunner._uses_async_scheduler(self):
-            return self.defer_state_apply_and_build_runner_output(
+            output = self.defer_state_apply_and_build_runner_output(
                 sampled_token_ids,
                 logprobs,
                 req_ids=(
@@ -3084,6 +3097,9 @@ class TTModelRunner:
                     else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
                 ),
             )
+            if fwd.decode_submission is not None:
+                set_tt_stage_outputs(output, fwd.decode_submission.stage_outputs)
+            return output
         output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
@@ -3091,6 +3107,8 @@ class TTModelRunner:
             # batch rows, so it keeps the vectorized state write.
             req_ids=row_req_ids if is_prefill else None,
         )
+        if fwd.decode_submission is not None:
+            set_tt_stage_outputs(output, fwd.decode_submission.stage_outputs)
         if not is_prefill and self._num_speculative_tokens:
             self.propose_after_plain_step(
                 fwd.model_input, sampled_token_ids, row_req_ids

@@ -100,6 +100,26 @@ inputs, `num_valid_drafts`, `accepted_counts`, `spec_mode`, `VerifyOutput`, and
 `propose_draft_tokens`. An ordinary decode receives no `spec_mode` and must
 not return `VerifyOutput`.
 
+### Stage outputs
+
+A model that declares `supports_stage_outputs` implements
+`pop_stage_outputs()`. `submit_decode` calls it right after every
+`decode_forward` and keeps the result with that submission, so overlapped
+async steps keep their own outputs.
+
+- Return one entry per decode row: the frame this forward completed for
+  the row's request, or `None`. Padding rows must be `None`. The frame is
+  opaque to the plugin.
+- The runner tags each frame `(request ID, frame_index)`. `frame_index` is
+  the row's decode position minus the request's prompt length. The step
+  that consumes output token `k` completes frame `k`.
+- The frames are published on the step's `ModelRunnerOutput`. Read them with
+  `stage_outputs.get_tt_stage_outputs`.
+- Under async scheduling, a step's frames for a request that finished, was
+  aborted, or was force-reset while the step was in flight are withdrawn
+  before the scheduler reads the output.
+- Prefill completes no frame, and the runner never calls the hook for it.
+
 ## Decode readback and output conversion
 
 1. `TTAsyncDecodeController` calls `decode_forward`. The model adapter may

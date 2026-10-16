@@ -350,6 +350,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         kv_caches=object(),
         trace_mode="none",
         request_specific_rope=False,
+        supports_stage_outputs=False,
         model=FakeModel(),
         async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
     )
@@ -403,6 +404,7 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         kv_caches=object(),
         trace_mode="none",
         request_specific_rope=False,
+        supports_stage_outputs=False,
         model=FakeModel(),
         note_decode_layout_consumed=lambda: None,
         note_decode_state_slots_settled=lambda: None,

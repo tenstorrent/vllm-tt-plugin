@@ -144,6 +144,7 @@ def _submit(runner: SimpleNamespace, model: object, model_input) -> None:
     runner.model = model
     runner.kv_caches = object()
     runner.request_specific_rope = False
+    runner.supports_stage_outputs = False
     runner.trace_mode = "decode_only"
     runner.note_decode_layout_consumed = lambda: None
     runner.note_decode_state_slots_settled = lambda: None
