@@ -23,6 +23,7 @@ def test_top_k_routes_only_active_sampling_rows(cap, top_k, temperature):
     sampling.temperature[[0, 3]] = temperature
     runner = SimpleNamespace(
         sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
         num_devices=4,
         tt_data_parallel_size=1,
         model=SimpleNamespace(
@@ -45,6 +46,7 @@ def test_top_k_routes_only_active_sampling_rows(cap, top_k, temperature):
 def test_loaded_model_without_device_sampler_uses_host(supports_device_sampler):
     runner = SimpleNamespace(
         sample_on_device_mode="decode_only",
+        seeded_sampling_policy="auto",
         model=SimpleNamespace(
             model_capabilities={"supports_sample_on_device": supports_device_sampler}
         ),

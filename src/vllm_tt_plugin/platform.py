@@ -17,15 +17,18 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    TT_WORKER_CLS,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
+    get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_scheduler_cls,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -70,8 +73,6 @@ _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
 _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
-TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
-TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # tt-metal's fixed Tensix tile height, matching ``ttnn.TILE_SIZE``. Keep this a
 # literal so importing admission logic cannot hard-crash hosts where tt-metal is
 # absent; tests/tt enforces the agreement with the real module. The DiffusionGemma
@@ -1820,6 +1821,17 @@ class TTPlatform(Platform):
         # may be inspected (e.g. multimodal processor cache init) before this
         # `check_and_update_config()` hook is reached in that process.
         tt_config = get_tt_config(vllm_config)
+        seeded_sampling_policy = get_tt_seeded_sampling_policy(vllm_config)
+        if (
+            seeded_sampling_policy == "host"
+            and vllm_config.speculative_config is not None
+        ):
+            # A speculative verify commits through the model-owned accept walk,
+            # bypassing the host sampler even when the model's base width is 1.
+            raise ValueError(
+                "seeded_sampling_policy='host' requires single-token sampling "
+                "and cannot be combined with speculative decoding."
+            )
         register_test_models = False
         if tt_config and "register_test_models" in tt_config:
             register_test_models = tt_config["register_test_models"]
@@ -1830,7 +1842,7 @@ class TTPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+            parallel_config.worker_cls = TT_WORKER_CLS
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -1907,6 +1919,11 @@ class TTPlatform(Platform):
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
+        if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
+            raise ValueError(
+                "seeded_sampling_policy='host' requires single-token model "
+                "output; block-output models own their sampling."
+            )
         if (
             output_tokens_per_step > 1
             and model_capabilities is not None
@@ -2349,6 +2366,16 @@ class TTPlatform(Platform):
             get_tt_max_batch_size(vllm_config),
         )
         if spec_plan is not None:
+            # The Rust frontend handles HTTP outside Python, so nothing runs
+            # TTPlatform.validate_request: a sampled request on a launch whose
+            # every decode step verifies would commit the target argmax, and
+            # logprobs, grammars and token filters would go unapplied.
+            if bool(int(os.environ.get("VLLM_USE_RUST_FRONTEND", "0"))):
+                raise ValueError(
+                    "Speculative decoding requires the Python frontend: the "
+                    "Rust frontend bypasses the TT request validation; unset "
+                    "VLLM_USE_RUST_FRONTEND or drop the speculative flags"
+                )
             requested_k = vllm_config.speculative_config.num_speculative_tokens
             if spec_plan.effective_k != requested_k:
                 # Published back, because vLLM's own scheduler budgets its
@@ -2378,17 +2405,19 @@ class TTPlatform(Platform):
                 "Use data_parallel_size=1."
             )
 
+        vllm_config.scheduler_config.scheduler_cls = resolve_tt_scheduler_cls(
+            vllm_config.scheduler_config.scheduler_cls,
+            parallel_config.worker_cls,
+            is_lane_mode,
+        )
         if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.
             validate_tt_lane_config(vllm_config)
-            vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
             logger.info(
                 "Using TTLaneCoordinator with %d in-process TT lanes",
                 get_tt_data_parallel_size(vllm_config),
             )
-        else:
-            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)

@@ -15,13 +15,56 @@ import torch
 import ttnn
 from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 from vllm.v1.core.sched import interface as sched_interface
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_tt_plugin import worker
+from vllm_tt_plugin.config import (
+    TT_LANE_SCHEDULER_CLS,
+    TT_SCHEDULER_CLS,
+    TT_WORKER_CLS,
+    resolve_tt_scheduler_cls,
+)
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import TTScheduler
 from vllm_tt_plugin.worker import TTWorker
 
 if not hasattr(sched_interface, "PauseState"):
     sched_interface.PauseState = type("PauseState", (), {})
+
+
+# Same class layout as vLLM-Omni's stage schedulers, which write themselves into
+# every stage's engine args; vLLM-Omni is not a test dependency.
+class OmniARScheduler(Scheduler):
+    pass
+
+
+class OmniARAsyncScheduler(OmniARScheduler, AsyncScheduler):
+    pass
+
+
+class OmniGenerationScheduler(Scheduler):
+    pass
+
+
+class TTStageARScheduler(OmniARAsyncScheduler, TTScheduler):
+    pass
+
+
+class TTStageGenerationScheduler(OmniGenerationScheduler):
+    pass
+
+
+class TTStageARWorker(TTWorker):
+    tt_scheduler_cls = TTStageARScheduler
+
+
+class TTStageGenerationWorker(TTWorker):
+    tt_scheduler_cls = TTStageGenerationScheduler
+
+
+class TTDefaultSchedulerWorker(TTWorker):
+    pass
 
 
 class TestDPModes:
@@ -276,15 +319,17 @@ class TestDPModes:
 
         assert assigned_devices == [mesh_device]
 
-    @pytest.mark.parametrize("declares_fabric", [False, True])
-    def test_init_device_tracks_mesh_as_worker_device(
-        self,
+    @staticmethod
+    def _init_device_worker(
         monkeypatch: pytest.MonkeyPatch,
-        declares_fabric: bool,
-    ) -> None:
-        mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
-        model_runner = SimpleNamespace()
+        worker_cls: type[TTWorker] = TTWorker,
+        model_capabilities: dict | None = None,
+    ) -> tuple[TTWorker, SimpleNamespace, list[str]]:
+        """A worker whose init_device steps run against test doubles.
 
+        Returns the worker, its mesh double, and the list each step appends to.
+        """
+        mesh_device = SimpleNamespace(get_num_devices=lambda: 8)
         parallel_config = SimpleNamespace(
             data_parallel_size=4,
             data_parallel_rank_local=0,
@@ -292,7 +337,7 @@ class TestDPModes:
             assigned_physical_gpu_ids=None,
         )
 
-        worker_instance = TTWorker.__new__(TTWorker)
+        worker_instance = worker_cls.__new__(worker_cls)
         worker_instance.vllm_config = SimpleNamespace(
             additional_config={}, parallel_config=parallel_config
         )
@@ -302,30 +347,24 @@ class TestDPModes:
         worker_instance.model_config = SimpleNamespace()
         worker_instance.trace_mode = "all"
         worker_instance.enable_model_warmup = True
+        worker_instance._num_tt_blocks = None
 
         monkeypatch.setattr(TTPlatform, "check_and_update_config", lambda _cfg: None)
         monkeypatch.setattr(worker, "get_tt_config", lambda _cfg: {})
-        fabric_config = (
-            {"config": worker.ttnn.FabricConfig.FABRIC_1D_RING}
-            if declares_fabric
-            else None
-        )
         model_class = SimpleNamespace()
-        if declares_fabric:
-            model_class.model_capabilities = {"fabric_config": fabric_config}
+        if model_capabilities is not None:
+            model_class.model_capabilities = model_capabilities
         monkeypatch.setattr(
             worker, "get_model_architecture", lambda _cfg: (model_class, "model")
         )
 
+        steps: list[str] = []
+        fabric_config = (model_capabilities or {}).get("fabric_config")
+
         def open_mesh(_tt_config, _trace_mode, _local_dp_rank, *, model_fabric_config):
             assert model_fabric_config is fabric_config
+            steps.append("mesh")
             return mesh_device
-
-        monkeypatch.setattr(worker, "open_mesh_device", open_mesh)
-
-        # The KV pool is sized and --max-model-len settled during init_device so
-        # the model sees the fitted length when load_model runs next.
-        steps: list[str] = []
 
         def size_pool(_cfg, _num_devices):
             steps.append("size")
@@ -334,15 +373,35 @@ class TestDPModes:
         def fit_max_model_len(_cfg, _num_tt_blocks):
             steps.append("fit")
 
-        def build_runner(**_kwargs):
-            steps.append("runner")
-            return model_runner
-
+        monkeypatch.setattr(worker, "open_mesh_device", open_mesh)
         monkeypatch.setattr(worker, "get_num_available_blocks_tt", size_pool)
         monkeypatch.setattr(
             worker, "_fit_block_output_max_model_len", fit_max_model_len
         )
-        monkeypatch.setattr(worker, "TTModelRunner", build_runner)
+        return worker_instance, mesh_device, steps
+
+    @pytest.mark.parametrize("declares_fabric", [False, True])
+    def test_init_device_tracks_mesh_as_worker_device(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        declares_fabric: bool,
+    ) -> None:
+        model_capabilities = (
+            {"fabric_config": {"config": worker.ttnn.FabricConfig.FABRIC_1D_RING}}
+            if declares_fabric
+            else None
+        )
+        worker_instance, mesh_device, steps = self._init_device_worker(
+            monkeypatch, model_capabilities=model_capabilities
+        )
+        model_runner = SimpleNamespace()
+
+        def build_runner(**kwargs):
+            assert kwargs["mesh_device"] is mesh_device
+            steps.append("runner")
+            return model_runner
+
+        monkeypatch.setattr(TTWorker, "model_runner_cls", staticmethod(build_runner))
 
         try:
             TTWorker.init_device(worker_instance)
@@ -351,10 +410,61 @@ class TestDPModes:
             assert worker_instance.device is mesh_device
             assert worker_instance.device_config.device is mesh_device
             assert worker_instance.model_runner is model_runner
-            assert steps == ["size", "fit", "runner"]
+            # The KV pool is sized and --max-model-len settled before the runner
+            # exists, so the model sees the fitted length when load_model runs.
+            assert steps == ["mesh", "size", "fit", "runner"]
             assert worker_instance._num_tt_blocks == 7
         finally:
             # The test double cannot be passed to TT device cleanup.
+            worker_instance.mesh_device = None
+
+    def test_init_device_builds_the_subclass_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class StageRunner:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class StageWorker(TTWorker):
+            model_runner_cls = StageRunner
+
+        worker_instance, mesh_device, steps = self._init_device_worker(
+            monkeypatch, worker_cls=StageWorker
+        )
+
+        try:
+            worker_instance.init_device()
+
+            assert type(worker_instance.model_runner) is StageRunner
+            assert worker_instance.model_runner.kwargs["mesh_device"] is mesh_device
+            assert worker_instance.model_runner.kwargs["num_devices"] == 8
+            assert steps == ["mesh", "size", "fit"]
+        finally:
+            worker_instance.mesh_device = None
+
+    def test_init_device_skips_pool_sizing_when_subclass_overrides_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class NoKVWorker(TTWorker):
+            def _init_kv_pool(self) -> None:
+                pass
+
+        worker_instance, mesh_device, steps = self._init_device_worker(
+            monkeypatch, worker_cls=NoKVWorker
+        )
+        model_runner = SimpleNamespace()
+        monkeypatch.setattr(
+            NoKVWorker, "model_runner_cls", staticmethod(lambda **_kw: model_runner)
+        )
+
+        try:
+            worker_instance.init_device()
+
+            assert worker_instance.mesh_device is mesh_device
+            assert worker_instance.model_runner is model_runner
+            assert steps == ["mesh"]
+            assert worker_instance._num_tt_blocks is None
+        finally:
             worker_instance.mesh_device = None
 
     def test_legacy_tt_dp_override_is_ignored_by_platform(
@@ -410,3 +520,116 @@ class TestDPModes:
                 match="TT standard DP does not support MoE models yet",
             ):
                 TTPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls", "expected"),
+        [
+            (None, TT_WORKER_CLS, TT_SCHEDULER_CLS),
+            (Scheduler, TT_WORKER_CLS, TT_SCHEDULER_CLS),
+            (OmniARScheduler, TTStageARWorker, TTStageARScheduler),
+            (OmniARAsyncScheduler, TTStageARWorker, TTStageARScheduler),
+            (
+                OmniGenerationScheduler,
+                TTStageGenerationWorker,
+                TTStageGenerationScheduler,
+            ),
+        ],
+    )
+    def test_scheduler_pairing_selects_the_workers_tt_scheduler(
+        self, requested: type | None, worker_cls: str | type, expected: str | type
+    ) -> None:
+        assert resolve_tt_scheduler_cls(requested, worker_cls, False) == expected
+        # The worker re-applies the config to the scheduler chosen above.
+        assert resolve_tt_scheduler_cls(expected, worker_cls, False) == expected
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls"),
+        [
+            (OmniARAsyncScheduler, TT_WORKER_CLS),
+            (OmniGenerationScheduler, TT_WORKER_CLS),
+            (OmniGenerationScheduler, TTStageARWorker),
+            (OmniARScheduler, TTStageGenerationWorker),
+            (TTStageARScheduler, TTStageGenerationWorker),
+        ],
+    )
+    def test_scheduler_pairing_rejects_a_mismatched_pair(
+        self, requested: type, worker_cls: str | type
+    ) -> None:
+        with pytest.raises(ValueError, match="cannot run on TT worker"):
+            resolve_tt_scheduler_cls(requested, worker_cls, False)
+
+    def test_scheduler_pairing_rejects_a_worker_without_a_tt_scheduler(
+        self,
+    ) -> None:
+        with pytest.raises(ValueError, match="declares no tt_scheduler_cls"):
+            resolve_tt_scheduler_cls(OmniARScheduler, Scheduler, False)
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls"),
+        [
+            (OmniARAsyncScheduler, TTStageARWorker),
+            (OmniGenerationScheduler, TTStageGenerationWorker),
+            (OmniARAsyncScheduler, TT_WORKER_CLS),
+        ],
+    )
+    def test_scheduler_pairing_rejects_lane_mode_with_a_stage(
+        self, requested: type, worker_cls: str | type
+    ) -> None:
+        with pytest.raises(ValueError, match="TT lane mode runs TTLaneCoordinator"):
+            resolve_tt_scheduler_cls(requested, worker_cls, True)
+
+    @pytest.mark.parametrize("requested", [None, Scheduler, TT_LANE_SCHEDULER_CLS])
+    @pytest.mark.parametrize(
+        "worker_cls",
+        [TT_WORKER_CLS, f"{__name__}.TTDefaultSchedulerWorker"],
+    )
+    def test_scheduler_pairing_keeps_the_lane_coordinator(
+        self, requested: str | type | None, worker_cls: str
+    ) -> None:
+        assert (
+            resolve_tt_scheduler_cls(requested, worker_cls, True)
+            == TT_LANE_SCHEDULER_CLS
+        )
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls", "expected"),
+        [
+            (None, "auto", TT_SCHEDULER_CLS),
+            (OmniARAsyncScheduler, TTStageARWorker, TTStageARScheduler),
+            (
+                OmniGenerationScheduler,
+                TTStageGenerationWorker,
+                TTStageGenerationScheduler,
+            ),
+        ],
+    )
+    def test_check_and_update_config_keeps_the_pair_on_worker_reapply(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+        requested: type | None,
+        worker_cls: str | type,
+        expected: str | type,
+    ) -> None:
+        vllm_config.scheduler_config.scheduler_cls = requested
+        vllm_config.parallel_config.worker_cls = worker_cls
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+        assert vllm_config.scheduler_config.scheduler_cls == expected
+
+        # TTWorker.init_device re-applies the hook in the worker process.
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+        assert vllm_config.scheduler_config.scheduler_cls == expected
+
+    def test_check_and_update_config_rejects_a_mismatched_pair(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.scheduler_config.scheduler_cls = OmniGenerationScheduler
+        vllm_config.parallel_config.worker_cls = TTStageARWorker
+
+        with pytest.raises(ValueError, match="cannot run on TT worker"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)

@@ -125,6 +125,7 @@ def _runner(
         vllm_config=_vllm_config(num_speculative_tokens),
         tt_per_lane_max_num_seqs=MAX_NUM_REQS,
         tt_data_parallel_size=1,
+        vocab_size=FAKE_VOCAB_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         model_config=SimpleNamespace(
             is_multimodal_model=False, max_model_len=MAX_MODEL_LEN

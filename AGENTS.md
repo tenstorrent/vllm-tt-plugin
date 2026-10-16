@@ -245,7 +245,14 @@ pasted host, model, and mesh result in Validation, or a named tt-metal job
 with `vllm-tt-plugin-ref` set to this branch. The pull request template has a
 `Validation` section for exactly this.
 
-## 6. Model capabilities: the gating contract
+## 6. Model interface and capabilities
+
+Before changing model registration, construction, KV allocation, forward calls,
+or lifecycle hooks, read [docs/MODEL_INTERFACE.md](docs/MODEL_INTERFACE.md)
+and the relevant linked references. Update the affected interface pages in the
+same PR when changing model-facing arguments, return values, capability
+consumers, or state ownership. Keep API reference details in `docs/`; keep
+contribution rules in `AGENTS.md`.
 
 New behaviour is gated on capabilities a model class declares, not on a new
 model-type allowlist. `TTPlatform.check_and_update_config` reads a

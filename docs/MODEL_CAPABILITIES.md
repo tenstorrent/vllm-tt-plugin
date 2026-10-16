@@ -15,6 +15,8 @@ class and the corresponding model guide to determine model-specific support.
 See [README.md](../README.md) for launch instructions and
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) for speculative execution,
 request restrictions, and lifecycle requirements.
+Start with the [model-plugin interface](MODEL_INTERFACE.md) for construction,
+KV allocation, forward calls, and model lifecycle.
 
 ## Ownership and resolution
 
@@ -83,6 +85,12 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, with async scheduling, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. The [device grammar contract](DEVICE_GRAMMAR_CONTRACT.md) lists what the model must implement. |
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
 | `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
+| `supports_compact_host_logits` | `False` | Permits `process_decode_output_host(..., sample_rows=...)` to return only selected lane-DP host-sampling rows in the supplied order. Active or custom logits processors can require full-slot output instead. |
+| `supports_selective_host_readback` | `False` | Permits `read_decode_output(..., async_read=True, sample_rows=...)` to read only selected lane-DP host-sampling rows. The adapter must also declare `supports_compact_host_logits` and retain an output handle for host processing. |
+
+The [selective-read contract](DECODE_RELOAD_CONTRACT.md#host-sampling-output-and-selective-reads)
+defines buffer ownership, row ordering, and output shapes for both host-output
+capabilities. Neither host-output capability changes decode input reloads.
 
 The async capability combination has a specific order: the platform first
 disables async scheduling for a model without `supports_async_decode`; the
@@ -207,6 +215,8 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
 implements model-owned proposal. Adding a similarly named dictionary key
 does not implement any of these hooks.
+See [model setup](MODEL_SETUP.md), [execution](MODEL_EXECUTION.md), and
+[lifecycle](MODEL_LIFECYCLE.md) for the complete common hook interface.
 
 Model authors should add new feature gates through explicit capability
 declarations and matching plugin consumers, with linked changes when tt-metal

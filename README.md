@@ -12,6 +12,10 @@ validation, scheduling, worker execution, model loading, async decode, single-
 process standard and multi-lane execution, data-parallel execution all live
 here. Nothing TT-specific needs to touch vLLM core.
 
+For model authors, the [model-plugin interface](docs/MODEL_INTERFACE.md)
+documents registration, construction, KV storage, execution, and lifecycle,
+and links to the capability, speculative-decode, and input-reload contracts.
+
 ## Package Layout
 
 ```text
@@ -288,6 +292,17 @@ submitted batch. If any request or batch feature cannot use on-device
 sampling, the batch uses vLLM's host-side path. Structured outputs have
 additional rules; see [Structured Output Sampling](#structured-output-sampling).
 
+Single-token-output models can explicitly use
+`"seeded_sampling_policy": "host"` to sample requests with an API seed on
+host during both prefill and decode. The default, `"auto"`, preserves the
+existing routing. With the host policy, one submitted seeded request moves
+the whole forward to host sampling, including its unseeded companions.
+Seeded greedy requests also use host sampling. This can reduce throughput
+and increase latency; batches without submitted seeded requests retain
+their existing routing. Models that own multi-token sampling and speculative
+decoding configurations reject this option. It does not promise
+batch-independent model logits or waive tests.
+
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
 base64 `data:image/...` URL or a real URL such as
@@ -309,6 +324,7 @@ Common options:
 | Key | Purpose |
 | --- | --- |
 | `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
+| `seeded_sampling_policy` | `auto` (default) or `host`. Select host sampling for submitted seeded requests during prefill and decode; affects the whole submitted forward. Single-token-output models only; incompatible with speculative decoding. |
 | `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
 | `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
 | `trace_region_size` | Trace region size for TT runtime tracing. |
@@ -463,6 +479,13 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | --- | --- |
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
 | `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
+
+A `TTWorker` subclass names the scheduler it runs with in `tt_scheduler_cls`.
+A requested `scheduler_cls` is kept when it derives from that class, and replaced
+by it when that class derives from the request. Any other pair raises
+`ValueError`. Lane mode also raises unless the worker declares `TTScheduler`,
+inherited or explicit, and the request is unset, `TTLaneCoordinator`, or a class
+`TTScheduler` derives from.
 
 The execution model matches TT hardware characteristics:
 
@@ -724,6 +747,8 @@ refuses a request with a non-zero temperature or a penalty on that launch.
 `TTPlatform.validate_request` rejects logprobs, structured output,
 `logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
 speculative launch. Prompt logprobs remain unsupported for all TT models.
+Only vLLM's Python frontend runs these checks, so a speculative launch with
+`VLLM_USE_RUST_FRONTEND=1` is refused at startup.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
 acceptance, K+1 lookahead reservation and lifecycle hooks. See
@@ -882,38 +907,16 @@ on real hardware fails loudly rather than passing against a fake.
 
 ## Hybrid Attention Models
 
-Hybrid attention models have mixed sliding-window and full-attention layers
-such as Gemma 3, Gemma 4, and GPT-OSS. They opt in to upstream vLLM's hybrid KV
-cache manager through a per-model spec hook on the registered TT model class.
+Hybrid attention models combine sliding-window and full-attention layers.
+The registered TT model class supplies `get_kv_cache_spec(vllm_config)` so
+vLLM can plan KV groups. The model adapter allocates physical storage through
+`allocate_kv_cache_per_layer(per_layer_specs)` and consumes
+`page_tables_per_layer` when the resolved cache has multiple groups.
 
-The hybrid manager packs sliding and full layers into separate
-`KVCacheGroupSpec`s, sized by upstream's
-[Hybrid KV Cache Manager design](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/).
-Sliding-window layers then occupy only `sliding_window` worth of KV state per
-request instead of `max_seq_len`. On Gemma 4 31B at 256k context this is roughly
-a 6x reduction in KV cache memory.
-
-To enable hybrid KV cache support for a TT model:
-
-1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`
-   instead of `Generator`. The base class provides a default
-   `get_kv_cache_spec` classmethod that builds per-layer specs from
-   `hf_config.text_config.layer_types`.
-2. Implement `prefill_forward` and `decode_forward` to consume the
-   `page_tables_per_group` kwarg and route each layer to the right group's page
-   table.
-3. Implement `allocate_kv_cache_per_layer(per_layer_specs)`. The base class
-   default delegates to `allocate_vllm_kv_cache_per_layer`.
-
-Models that do not opt in stay on the legacy `Generator` path: uniform
-single-group KV cache, one page table, and no behavioral change. The plugin only
-sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
-
-Hybrid models with `data_parallel_size > 1` have not been validated on
-hardware. Both DP modes carry the full per-group block tables (a standard-DP
-rank is an independent DP=1 engine, and lane-DP builds per-group tables for the
-merged batch), so there is no known blocker, but the combination is untested.
-
+See [model setup and KV storage](docs/MODEL_SETUP.md#kv-budget-and-specifications)
+for specification names, allocation triples, storage sharing, and page-table
+routing. Model-specific device and DP support must be validated for the
+selected adapter and mesh; the interface alone does not establish support.
 
 ## Development Notes
 
