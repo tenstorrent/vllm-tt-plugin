@@ -76,6 +76,19 @@ Block-output models must implement callable `release_request` and
 Stateful speculative adapters have additional ownership duties in the
 [speculative contract](SPEC_DECODE_CONTRACT.md).
 
+### Stage inputs
+
+A model that declares `supports_stage_inputs` receives each request's payload
+on prefill only, as a read-only snapshot without the request ID. So:
+
+- Decode-time state derived from the payload is the model's to keep, in its
+  slot-owned state, written by the request's last prefill chunk.
+- Work derived from the payload, such as a speaker embedding, cannot be cached
+  across prefill chunks by slot: a request's row and slot can change between
+  chunks.
+- `warmup_model_prefill` receives no `stage_inputs`. A model whose prefill is
+  built from the payload supplies its own warmup payload.
+
 Sources: `_alloc_prefill_state_slots`, `_decode_state_slot_remap`,
 `_release_model_request`, and `_update_states` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py);

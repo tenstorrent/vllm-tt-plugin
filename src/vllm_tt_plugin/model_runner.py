@@ -56,8 +56,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
-    CachedRequestState,
     InputBatch,
+    TTCachedRequestState,
     TTLaneInputBatch,
     apply_cached_req_state_update,
     build_cached_request_state,
@@ -242,9 +242,6 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 
 
 class TTModelRunner:
-    # Resolved from ``supports_stage_inputs`` in ``__init__``; off by default.
-    supports_stage_inputs: bool = False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -369,7 +366,7 @@ class TTModelRunner:
         # they don't need to be re-sent every scheduling step. For requests
         # that have been scheduled before, only the diff is received from
         # the scheduler output.
-        self.requests: dict[str, CachedRequestState] = {}
+        self.requests: dict[str, TTCachedRequestState] = {}
 
         # Cache the arange needed for unpacking structured output bitmask
         self.structured_output_arange = torch.arange(0, 32)
@@ -956,7 +953,7 @@ class TTModelRunner:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             self.requests[req_id] = build_cached_request_state(
-                new_req_data, accepts_stage_inputs=self.supports_stage_inputs
+                new_req_data, supports_stage_inputs=self.supports_stage_inputs
             )
             req_ids_to_add.append(req_id)
 

@@ -227,6 +227,7 @@ def test_prefill_fallback_releases_finished_runner_state(async_scheduling):
     runner._pending_state_slot_settle = None
     runner.requests = {}
     runner.encoder_cache = {}
+    runner.supports_stage_inputs = False
     runner._decode_layout_changed_since_last_decode = False
     released_slots = []
     runner.model = SimpleNamespace(release_request=released_slots.append)

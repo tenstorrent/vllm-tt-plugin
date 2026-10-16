@@ -29,7 +29,6 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
     resolve_tt_scheduler_cls,
-    resolve_tt_supports_stage_inputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -38,6 +37,7 @@ from vllm_tt_plugin.config import (
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -2411,7 +2411,8 @@ class TTPlatform(Platform):
             parallel_config.worker_cls,
             is_lane_mode,
         )
-        resolve_tt_supports_stage_inputs(
+        # Here rather than with the other capability reads: it needs is_lane_mode.
+        validate_and_store_tt_supports_stage_inputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
         if is_lane_mode:

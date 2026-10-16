@@ -316,7 +316,7 @@ def get_tt_supports_stage_inputs(vllm_config: "VllmConfig") -> bool:
     return bool(additional.get(_SUPPORTS_STAGE_INPUTS_KEY, False))
 
 
-def resolve_tt_supports_stage_inputs(
+def validate_and_store_tt_supports_stage_inputs(
     vllm_config: "VllmConfig",
     model_capabilities: dict | None,
     model_class: type,
