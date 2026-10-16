@@ -975,6 +975,44 @@ def test_async_scheduled_final_prefill_applies_on_ordinary_next_step():
     assert runner_output.sampled_token_ids == [[7]]
 
 
+def test_step_resolved_during_apply_stays_pending_until_drained():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    resolved = threading.Event()
+    runner._pending_async_steps.append(SimpleNamespace(is_resolved=resolved.is_set))
+    runner._pending_async_overlap_ok.append(True)
+    drain = controller.drain_completed_decode_steps
+
+    def drain_then_resolve_on_output_thread():
+        completed = drain()
+        # The output thread finalizes the step after the drain released the
+        # lock: it enqueues the completion, then sets the event.
+        runner._completed_decode_steps.append(
+            _completed_step(
+                7,
+                SimpleNamespace(
+                    req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+                ),
+            )
+        )
+        resolved.set()
+        return completed
+
+    controller.drain_completed_decode_steps = drain_then_resolve_on_output_thread
+    controller.apply_ready_completed_decode_steps()
+
+    # The step's token is not applied yet, so the step must stay pending.
+    assert request_state.output_token_ids == []
+    assert len(runner._pending_async_steps) == 1
+
+    controller.drain_completed_decode_steps = drain
+    controller.apply_ready_completed_decode_steps()
+
+    assert request_state.output_token_ids == [7]
+    assert not runner._pending_async_steps
+
+
 def test_forced_reset_discard_count_requires_all_stale_frames():
     request_state = SimpleNamespace(output_token_ids=[])
     runner = _async_apply_runner(request_state)
