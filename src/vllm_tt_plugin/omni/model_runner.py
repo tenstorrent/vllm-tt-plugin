@@ -8,9 +8,10 @@
     to the plain dict the stage model reads from ``stage_inputs``.
   * Out: the frames the model published (``stage_outputs``) become Omni's per-row
     ``multimodal_outputs`` and ``inter_stage_outputs``, in the shape vLLM-Omni's
-    Qwen3-TTS talker emits: ``{"codes": {"audio": [1, 16]}, "meta":
-    {"codec_frame_valid": True}}``. Omni's scheduler sends them on to the next stage,
-    or to the client when this stage is the last.
+    Qwen3-TTS talker emits, flattened to tensor values as Omni's wire format requires:
+    ``{"codes.audio": [1, 16], "meta.codec_frame_valid": True}``. Omni's scheduler
+    sends them on to the next stage, which unflattens them, or to the client when this
+    stage is the last.
 
 Synchronous scheduling only: under async scheduling a published output is still
 amended after it is returned, which a converted copy would not see.
@@ -20,6 +21,7 @@ from dataclasses import fields
 
 import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -32,10 +34,12 @@ from vllm_tt_plugin.stage_outputs import get_tt_stage_outputs
 
 def omni_frame(data) -> dict:
     """One completed frame as one row of Omni's stage output."""
-    return {
-        "codes": {"audio": torch.as_tensor(data, dtype=torch.long).reshape(1, -1)},
-        "meta": {"codec_frame_valid": torch.tensor(True)},
-    }
+    return flatten_payload(
+        {
+            "codes": {"audio": torch.as_tensor(data, dtype=torch.long).reshape(1, -1)},
+            "meta": {"codec_frame_valid": torch.tensor(True)},
+        }
+    )
 
 
 def to_omni_output(output: ModelRunnerOutput) -> OmniModelRunnerOutput:
@@ -75,12 +79,21 @@ class TTOmniARModelRunner(OmniConnectorModelRunnerMixin, TTModelRunner):
         super().__init__(vllm_config, *args, **kwargs)
 
     def _update_states(self, scheduler_output):
+        vocab = self.model_config.get_vocab_size()
         for new_req_data in scheduler_output.scheduled_new_reqs:
             info = getattr(new_req_data, "additional_information", None)
             if info is not None and not isinstance(info, dict):
                 new_req_data.additional_information = (
                     deserialize_additional_information(info)
                 )
+            # A stage's stop ids include the tokenizer's end-of-text, which lies past a
+            # codec vocabulary; vLLM's min_tokens processor indexes the logits with every
+            # stop id. An id the logits do not have can never be sampled, so it goes.
+            params = new_req_data.sampling_params
+            if params is not None:
+                params._all_stop_token_ids = {
+                    token for token in params.all_stop_token_ids if token < vocab
+                }
         return super()._update_states(scheduler_output)
 
     def execute_model(self, scheduler_output):

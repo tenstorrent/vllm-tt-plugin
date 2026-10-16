@@ -15,6 +15,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import (  # noqa: E402
     OmniARAsyncScheduler,
     OmniARScheduler,
 )
+from vllm_omni.data_entry_keys import unflatten_payload  # noqa: E402
 from vllm_omni.engine.serialization import (  # noqa: E402
     serialize_additional_information,
 )
@@ -73,8 +74,10 @@ def test_frames_land_in_their_requests_rows():
     assert converted.sampled_token_ids == [[7], [7], [7]]
     assert converted.multimodal_outputs[:2] == [None, None]
     row = converted.multimodal_outputs[2]
-    assert row["codes"]["audio"].tolist() == [FRAME]
-    assert bool(row["meta"]["codec_frame_valid"])
+    assert set(row) == {"codes.audio", "meta.codec_frame_valid"}, "flat, as on the wire"
+    assert all(isinstance(value, torch.Tensor) for value in row.values())
+    assert row["codes.audio"].tolist() == [FRAME]
+    assert bool(row["meta.codec_frame_valid"])
     assert converted.inter_stage_outputs == converted.multimodal_outputs
 
 
@@ -98,7 +101,8 @@ def test_the_row_is_a_frame_the_qwen3_tts_chunker_appends():
     """The two checks vLLM-Omni's talker-to-code2wav chunker makes before it
     appends a row's frame for the next stage."""
     row = to_omni_output(_output(["a"], {"a": TTStageFrame(0, FRAME)}))
-    stage_output = row.inter_stage_outputs[0]
+    # The chunk adapter unflattens a row before the chunker reads it.
+    stage_output = unflatten_payload(row.inter_stage_outputs[0])
 
     frame = _extract_last_frame(stage_output)
 
@@ -117,15 +121,40 @@ def test_a_new_requests_payload_reaches_the_runner_as_a_dict(monkeypatch):
     )
     info = {"task_type": ["Base"], "text": ["hi"], "ref_text": ["ref"]}
     new_request = SimpleNamespace(
-        additional_information=serialize_additional_information(info)
+        additional_information=serialize_additional_information(info),
+        sampling_params=None,
     )
 
     TTOmniARModelRunner._update_states(
-        object.__new__(TTOmniARModelRunner),
-        SimpleNamespace(scheduled_new_reqs=[new_request]),
+        _runner(vocab=3072), SimpleNamespace(scheduled_new_reqs=[new_request])
     )
 
     assert seen == [info]
+
+
+def _runner(vocab):
+    runner = object.__new__(TTOmniARModelRunner)
+    runner.model_config = SimpleNamespace(get_vocab_size=lambda: vocab)
+    return runner
+
+
+def test_stop_ids_past_the_codec_vocabulary_are_dropped(monkeypatch):
+    """min_tokens masks every stop id in the logits; the tokenizer's end-of-text
+    (151645) is past the talker's 3072 ids and would index out of range."""
+    from vllm import SamplingParams
+
+    monkeypatch.setattr(TTModelRunner, "_update_states", lambda self, out: None)
+    params = SamplingParams(min_tokens=2, stop_token_ids=[2150])
+    params.update_from_generation_config({}, eos_token_id=151645)
+    assert params.all_stop_token_ids == {2150, 151645}
+    new_request = SimpleNamespace(additional_information=None, sampling_params=params)
+
+    TTOmniARModelRunner._update_states(
+        _runner(vocab=3072), SimpleNamespace(scheduled_new_reqs=[new_request])
+    )
+
+    assert params.all_stop_token_ids == {2150}
+    assert params.stop_token_ids == [2150], "the stop condition itself is unchanged"
 
 
 @pytest.mark.parametrize(
@@ -149,4 +178,24 @@ def test_a_frame_tensor_round_trips_as_long():
         _output(["a"], {"a": TTStageFrame(0, torch.tensor(FRAME))})
     ).multimodal_outputs[0]
 
-    assert row["codes"]["audio"].dtype == torch.long
+    assert row["codes.audio"].dtype == torch.long
+
+
+def test_a_row_survives_the_engine_core_wire():
+    """The client decodes ``multimodal_output`` as ``dict[str, Tensor]``; a nested
+    row fails there, after the engine has already run the step."""
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+    from vllm_omni.engine import OmniEngineCoreOutput
+
+    row = to_omni_output(
+        _output(["a"], {"a": TTStageFrame(0, FRAME)})
+    ).multimodal_outputs[0]
+    sent = OmniEngineCoreOutput(
+        request_id="a", new_token_ids=[7], multimodal_output=row
+    )
+
+    received = MsgpackDecoder(OmniEngineCoreOutput).decode(
+        MsgpackEncoder().encode(sent)
+    )
+
+    assert received.multimodal_output["codes.audio"].tolist() == [FRAME]
