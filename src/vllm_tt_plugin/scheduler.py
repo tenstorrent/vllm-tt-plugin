@@ -23,6 +23,7 @@ from vllm_tt_plugin.config import (
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
+    tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
@@ -328,6 +329,7 @@ class TTScheduler(AsyncScheduler):
             )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
+        self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
         # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
         self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
@@ -861,10 +863,11 @@ class TTScheduler(AsyncScheduler):
         bypassed the engine layer; refusing here beats silently removing a
         request someone is still waiting on.
         """
-        if self._is_block_output_model and reset_running_requests and self.running:
+        if self._requests_cannot_resume and reset_running_requests and self.running:
             message = (
-                "Cannot reset prefix cache while a block-output request is "
-                "running; finish or abort the request first."
+                "Cannot reset prefix cache while a request that cannot resume "
+                "(block output or stage outputs) is running; finish or abort the "
+                "request first."
             )
             # pause_generation(mode="keep") reaches this through an unguarded
             # idle-state callback while intentionally retaining live requests.

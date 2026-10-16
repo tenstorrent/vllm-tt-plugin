@@ -125,7 +125,7 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens():
         perform_device_sampling=True,
         defer_device_sampling=True,
     )
-    submission = object()
+    submission = SimpleNamespace(stage_outputs=None)
     fwd = replace(
         _sync_forward(model_input),
         perform_device_sampling=True,

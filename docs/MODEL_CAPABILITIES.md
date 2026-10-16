@@ -127,9 +127,12 @@ Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
 | `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload or `None`. The payload is vLLM-Omni's `additional_information` as it stood when the request arrived, decoded to a plain dict, engine bookkeeping entries included. vLLM-Omni's other channels, `model_intermediate_buffer` and mid-request `additional_information` updates on cached requests, are not delivered. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Without the declaration the payload is not kept: vLLM-Omni puts one on every request. See [stage inputs](MODEL_LIFECYCLE.md#stage-inputs) for what the model must own. |
+| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, speculative decoding, `supports_async_decode` (an overlapped decode builds from host positions one step behind, which would mistag stage frames), or `max_num_seqs != 1`. Forced prefix-cache resets are refused, or abort the request first, as for block-output models. |
 
 Sources: [config.py](../src/vllm_tt_plugin/config.py),
-[input_batch.py](../src/vllm_tt_plugin/input_batch.py), and
+[input_batch.py](../src/vllm_tt_plugin/input_batch.py),
+[stage_outputs.py](../src/vllm_tt_plugin/stage_outputs.py),
+[async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Speculative capabilities and admission
@@ -224,7 +227,8 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
-implements model-owned proposal. Adding a similarly named dictionary key
+implements model-owned proposal. `pop_stage_outputs` is consumed only with
+`supports_stage_outputs`. Adding a similarly named dictionary key
 does not implement any of these hooks.
 See [model setup](MODEL_SETUP.md), [execution](MODEL_EXECUTION.md), and
 [lifecycle](MODEL_LIFECYCLE.md) for the complete common hook interface.

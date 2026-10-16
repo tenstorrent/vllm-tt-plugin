@@ -100,6 +100,36 @@ inputs, `num_valid_drafts`, `accepted_counts`, `spec_mode`, `VerifyOutput`, and
 `propose_draft_tokens`. An ordinary decode receives no `spec_mode` and must
 not return `VerifyOutput`.
 
+### Stage outputs
+
+A model that declares `supports_stage_outputs` implements
+`pop_stage_outputs()`. `submit_decode` calls it right after every
+`decode_forward` and keeps the result with that submission.
+
+- Return one entry per decode row: the stage frame this forward completed
+  for the row's request, or `None`. Padding rows must be `None`.
+- The call comes before any device synchronization, and the plugin never
+  synchronizes or reads a stage frame's `data`. `data` must be host-resident,
+  picklable, and own its storage until the consumer reads it. Reading from
+  the device inside `pop_stage_outputs()` is allowed; it blocks the step.
+- The runner tags each stage frame `(request ID, frame_index)`.
+  `frame_index` is the row's decode position minus the request's prompt
+  length: the step that consumes output token `k` completes stage frame `k`.
+- The stage frames are published on the step's `ModelRunnerOutput`. Read
+  them with `stage_outputs.get_tt_stage_outputs`.
+- Scheduling is synchronous for these models: they cannot declare
+  `supports_async_decode`, without which the platform turns async
+  scheduling off.
+- Prefill completes no stage frame, and the runner never calls the hook for
+  it.
+
+A stage model's request cannot be preempted and resumed: a resume re-prefills
+from the token history, which does not hold the stage frames already emitted.
+The platform therefore requires `max_num_seqs=1`, refuses a forced
+prefix-cache reset while such a request runs (or aborts it first when the
+engine can tell its client), and `TTModelRunner` raises if a preemption
+reaches it anyway.
+
 ## Decode readback and output conversion
 
 1. `TTAsyncDecodeController` calls `decode_forward`. The model adapter may

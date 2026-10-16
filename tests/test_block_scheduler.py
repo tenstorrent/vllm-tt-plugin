@@ -33,6 +33,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_tt_plugin.config import (
+    resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_output_tokens_per_step,
@@ -91,6 +92,7 @@ def _scheduler(
     adaptive: bool = False,
     max_num_seqs: int = 1,
     kv_extent: int = 0,
+    stage_outputs: bool = False,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -132,6 +134,10 @@ def _scheduler(
         config.model_config.__dict__.pop("is_diffusion", None)
         assert config.model_config.is_diffusion is False
     store_tt_output_tokens_per_step(config, output_width)
+    if stage_outputs:
+        resolve_tt_supports_stage_outputs(
+            config, {"supports_stage_outputs": True}, object, False
+        )
     if adaptive:
         store_tt_adaptive_block_output(config, True)
     if kv_extent:
@@ -190,8 +196,14 @@ def _scheduled(
     output_width: int = CANVAS,
     ignore_eos: bool = True,
     async_scheduling: bool = False,
+    stage_outputs: bool = False,
 ) -> tuple[TTScheduler, Request, SchedulerOutput]:
-    scheduler = _scheduler(output_width, async_scheduling=async_scheduling)
+    # A stage-output model decodes one token per step.
+    if stage_outputs:
+        output_width = 1
+    scheduler = _scheduler(
+        output_width, async_scheduling=async_scheduling, stage_outputs=stage_outputs
+    )
     request = _request(max_tokens, ignore_eos=ignore_eos)
     scheduler.add_request(request)
     return scheduler, request, scheduler.schedule()
@@ -739,10 +751,11 @@ def test_zero_max_tokens_bypassed_request_finishes_after_first_canvas():
     assert scheduler.running == []
 
 
-def test_running_block_request_rejects_prefix_cache_reset():
+@pytest.mark.parametrize("stage_outputs", [False, True])
+def test_running_block_request_rejects_prefix_cache_reset(stage_outputs):
     # Direct scheduler-level backstop: the engine-layer patch aborts running
     # block requests first, so reaching this guard means it was bypassed.
-    scheduler, request, _ = _scheduled()
+    scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
 
     assert scheduler.running == [request]
     with pytest.raises(RuntimeError, match="Cannot reset prefix cache"):
@@ -761,8 +774,9 @@ def _patched_engine(scheduler: TTScheduler, sent: list) -> SimpleNamespace:
     return SimpleNamespace(scheduler=scheduler, _send_abort_outputs=sent.append)
 
 
-def test_engine_level_reset_aborts_running_block_requests():
-    scheduler, request, _ = _scheduled()
+@pytest.mark.parametrize("stage_outputs", [False, True])
+def test_engine_level_reset_aborts_running_block_requests(stage_outputs):
+    scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
     sent: list = []
     engine = _patched_engine(scheduler, sent)
 
@@ -833,11 +847,12 @@ def _pause_guarded_engine(scheduler: TTScheduler) -> SimpleNamespace:
     )
 
 
-def test_keep_pause_with_clear_cache_is_refused_up_front():
+@pytest.mark.parametrize("stage_outputs", [False, True])
+def test_keep_pause_with_clear_cache_is_refused_up_front(stage_outputs):
     # The keep-mode reset runs from an idle callback whose result upstream
     # discards, so the only honest failure is a synchronous one before any
     # pause state changes.
-    scheduler, request, _ = _scheduled()
+    scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
     engine = _pause_guarded_engine(scheduler)
 
     with pytest.raises(ValueError, match="clear_cache=False or mode='abort'"):
@@ -862,7 +877,7 @@ def test_keep_pause_guard_covers_engine_core_proc():
     scheduler, request, _ = _scheduled()
     engine = _pause_guarded_engine(scheduler)
 
-    with pytest.raises(ValueError, match="live block-output request"):
+    with pytest.raises(ValueError, match="cannot be preempted and resumed"):
         EngineCoreProc.pause_scheduler(engine, mode="keep", clear_cache=True)
 
     assert scheduler.running == [request]

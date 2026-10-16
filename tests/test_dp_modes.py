@@ -24,6 +24,7 @@ from vllm_tt_plugin.config import (
     TT_SCHEDULER_CLS,
     TT_WORKER_CLS,
     get_tt_supports_stage_inputs,
+    get_tt_supports_stage_outputs,
     resolve_tt_scheduler_cls,
 )
 from vllm_tt_plugin.platform import TTPlatform
@@ -210,6 +211,32 @@ class TestDPModes:
         dummy_model_class.model_capabilities = {"supports_stage_inputs": True}
 
         with pytest.raises(ValueError, match="lane mode does not pass stage inputs"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+    def test_check_and_update_config_stores_stage_output_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+        vllm_config.scheduler_config.max_num_seqs = 1
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert get_tt_supports_stage_outputs(vllm_config) is True
+
+    def test_check_and_update_config_refuses_stage_outputs_in_lane_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
+        vllm_config.parallel_config.data_parallel_size = 1
+        dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+
+        with pytest.raises(ValueError, match="needs one-token front-packed"):
             self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_collapsed_standard_dp_rank_warms_up_model(self) -> None:
