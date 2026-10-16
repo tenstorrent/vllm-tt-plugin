@@ -211,6 +211,9 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
                 # non-idempotent device readback a second time.
                 try:
                     self._cached_output = self._get_output_impl()
+                    phase = getattr(self, "_execution_phase", None)
+                    if phase is not None:
+                        phase.complete()
                 except BaseException as exc:
                     self._cached_exception = exc
                     raise

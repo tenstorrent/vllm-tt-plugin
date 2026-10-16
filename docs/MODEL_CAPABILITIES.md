@@ -214,3 +214,17 @@ declarations and matching plugin consumers, with linked changes when tt-metal
 and the plugin must land together. Existing identity checks for Galaxy/GPT-OSS
 lane conversion and GPT-OSS top-K logprobs are not a pattern for new feature
 gates.
+
+### Optional execution phase observer
+
+A model may expose `begin_execution_phase(model_input, scheduler_output,
+start_ns)` for host-only benchmark evidence on the front-packed execution path.
+The hook returns `None` when disabled, or an object with `mark_submitted()` and
+`complete()` methods. `start_ns` is monotonic time at runner entry, before
+pending drains and input construction. Submission is observed immediately
+before the existing forward call. Completion follows the existing synchronous
+sampler/output construction or the async wrapper's first successful readback
+and output construction, including drain-driven finalization. Failed forwards
+or readbacks do not emit a successful completion. The observer must not perform
+device reads, add synchronization, or change request state. It owns buffering
+and export; lane-DP is not instrumented by this hook.

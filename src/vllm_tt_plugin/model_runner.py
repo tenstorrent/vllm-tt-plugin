@@ -52,6 +52,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
 )
+from vllm_tt_plugin.execution_phase import finish_observed_phase
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
@@ -2612,6 +2613,10 @@ class TTModelRunner:
         nothing was scheduled (no sampler is enqueued). Standard multi-process
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
+        phase_start_ns = time.monotonic_ns()
+        observe_phase = getattr(
+            getattr(self, "model", None), "begin_execution_phase", None
+        )
         TTModelRunner._raise_if_device_grammar_poisoned(self)
 
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
@@ -2638,6 +2643,11 @@ class TTModelRunner:
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
+        phase = (
+            observe_phase(model_input, scheduler_output, phase_start_ns)
+            if observe_phase is not None
+            else None
+        )
         is_decode = model_input.prompt_lens is None
         if model_input.defer_device_sampling:
             self.async_decode.wait_for_all_pending_async_steps()
@@ -2646,7 +2656,11 @@ class TTModelRunner:
             and is_decode
             and not model_input.defer_device_sampling
         ):
+            if phase is not None:
+                phase.mark_submitted()
             wrapper = self.async_decode.submit_async_decode(model_input)
+            if phase is not None:
+                wrapper._execution_phase = phase
             self._pending_samples.append(
                 partial(
                     self._finish_async_decode,
@@ -2659,8 +2673,13 @@ class TTModelRunner:
 
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
+        if phase is not None:
+            phase.mark_submitted()
         fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
+        finish = partial(self._finish_front_packed_sync, fwd=fwd)
+        if phase is not None:
+            finish = partial(finish_observed_phase, finish, phase)
+        self._pending_samples.append(finish)
         return None
 
     def _reorder_grammar_bitmask(
