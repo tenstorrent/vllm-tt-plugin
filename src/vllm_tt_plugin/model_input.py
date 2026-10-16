@@ -205,6 +205,11 @@ class TTModelInput:
     # the persistent slots.
     row_req_ids: list[str] | None = None
 
+    # Prefill-only: each row's stage inputs, passed to ``prefill_forward`` as
+    # ``stage_inputs``. ``None`` unless the model declares
+    # ``supports_stage_inputs``.
+    stage_inputs: list[Any] | None = None
+
     # Decode-only: retain device logits until sample_tokens supplies the grammar,
     # then invoke the model's device sampler. Structured prefills stay on host.
     defer_device_sampling: bool = False

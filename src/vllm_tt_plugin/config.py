@@ -62,6 +62,7 @@ _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
 _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
+_SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -307,6 +308,44 @@ def store_tt_supports_device_grammar(
         additional = {}
         vllm_config.additional_config = additional
     additional[_SUPPORTS_DEVICE_GRAMMAR_KEY] = supported
+
+
+def get_tt_supports_stage_inputs(vllm_config: "VllmConfig") -> bool:
+    """Return whether prefill passes each row's stage inputs to the model."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_STAGE_INPUTS_KEY, False))
+
+
+def resolve_tt_supports_stage_inputs(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+    is_lane_mode: bool,
+) -> None:
+    """Validate ``supports_stage_inputs`` and store it on the vLLM config.
+
+    Raises:
+        ValueError: the declaration is not a boolean, or it is declared in
+            lane mode, whose prefill does not carry per-row stage inputs.
+    """
+    supported = (model_capabilities or {}).get("supports_stage_inputs", False)
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {name} must declare model_capabilities['supports_stage_inputs'] "
+            f"as a boolean, got {supported!r}"
+        )
+    if supported and is_lane_mode:
+        raise ValueError(
+            f"Model {name} declares model_capabilities['supports_stage_inputs']"
+            "=True, but TT lane mode does not pass stage inputs to prefill; "
+            f"got {get_tt_data_parallel_size(vllm_config)} lanes."
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_STAGE_INPUTS_KEY] = supported
 
 
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
