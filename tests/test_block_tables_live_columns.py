@@ -11,6 +11,7 @@ zeroes them (0 is the null block, never allocated).
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 import vllm  # noqa: F401
 
@@ -57,3 +58,48 @@ def test_a_singleton_tensor_selector_keeps_its_row_dimension():
     out = InputBatch.block_tables_for_rows(_batch(bt), torch.tensor([1]), width=3)
     assert out[0].shape == (1, 3)
     assert out[0].tolist() == [[4, 0, 0]]
+
+
+@pytest.mark.parametrize("tensor_selector", [False, True])
+def test_fixed_width_snapshots_survive_growth_move_remove_and_reuse(tensor_selector):
+    table = _FakeBlockTable(
+        [[11, 12, 99, 98], [21, 97, 96, 95], [31, 32, 33, 94]], [2, 1, 3]
+    )
+    batch = _batch(table)
+
+    def select(rows):
+        selector = torch.tensor(rows, dtype=torch.long) if tensor_selector else rows
+        return InputBatch.block_tables_for_rows(batch, selector, width=8192)[0]
+
+    original = select([0, 1, 2])
+    assert original.shape == (3, 8192)
+    assert original[:, :4].tolist() == [[11, 12, 0, 0], [21, 0, 0, 0], [31, 32, 33, 0]]
+    # Growth inside the backing width, followed by a row permutation.
+    table._table[1, 1] = 22
+    table.num_blocks_per_row[1] = 2
+    moved = select([2, 1, 0])
+    assert moved[:, :4].tolist() == [[31, 32, 33, 0], [21, 22, 0, 0], [11, 12, 0, 0]]
+    # Removing all live blocks and reusing a row must not expose stale suffixes.
+    table.num_blocks_per_row[0] = 0
+    removed = select([0])
+    assert not removed.any()
+    table._table[0, 0] = 41
+    table.num_blocks_per_row[0] = 1
+    reused = select([0])
+    assert reused[0, :4].tolist() == [41, 0, 0, 0]
+    assert not reused[:, 4:].any()
+    # A queued submission retains the original mapping after every mutation.
+    assert original[:, :4].tolist() == [[11, 12, 0, 0], [21, 0, 0, 0], [31, 32, 33, 0]]
+    assert moved[2, :4].tolist() == [11, 12, 0, 0]
+    assert table._table[0].tolist() == [41, 12, 99, 98]
+
+
+@pytest.mark.parametrize("rows", [[0], torch.tensor([0]), torch.tensor([True, False])])
+def test_unpadded_selection_owns_storage_without_extra_clone(rows):
+    table = _FakeBlockTable([[11, 12, 99, 98], [21, 97, 96, 95]], [2, 1])
+    original = table._table.clone()
+    out = InputBatch.block_tables_for_rows(_batch(table), rows, width=4)[0]
+    assert out.data_ptr() != table._table.data_ptr()
+    assert torch.equal(table._table, original)
+    out.fill_(7)
+    assert torch.equal(table._table, original)

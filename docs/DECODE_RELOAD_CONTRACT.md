@@ -26,6 +26,15 @@ These are commands, not hints. A version-1 adapter must not replace them with
 model-local sampling-mode checks, tensor comparisons, or prior-call
 heuristics.
 
+The plugin retains the submission's reload plan for overlap eligibility; it
+does not recompute the plan after accepting the submission and advancing its
+residency ledger. For ordinary resident device sampling, it also reuses the
+accepted, list-valued sampling parameter snapshot until a reload is commanded.
+Adapters must treat these parameters as read-only. They remain non-`None` on
+resident steps, including page-only refreshes. Legacy adapters, deferred device
+sampling, verifies, and nonresident input reloads receive newly converted
+parameters. Host sampling retains its tensor-valued parameters.
+
 ### Command defaults
 
 The plugin sends all four commands explicitly on every version-1 decode. If an

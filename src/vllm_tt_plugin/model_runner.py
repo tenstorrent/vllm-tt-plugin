@@ -2646,13 +2646,7 @@ class TTModelRunner:
             and is_decode
             and not model_input.defer_device_sampling
         ):
-            steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
-                model_input
-            )
-            wrapper = self.async_decode.submit_async_decode(
-                model_input,
-                steady_decode_fast_path=steady_decode_fast_path,
-            )
+            wrapper = self.async_decode.submit_async_decode(model_input)
             self._pending_samples.append(
                 partial(
                     self._finish_async_decode,

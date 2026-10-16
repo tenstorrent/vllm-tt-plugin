@@ -696,7 +696,9 @@ class InputBatch:
         """
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
-            bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            # A list or 1D tensor row selector uses advanced indexing, which
+            # already owns its storage. Sanitizing it cannot modify vLLM's table.
+            bt_cpu = bt.get_cpu_tensor()[rows, :width]
             # vLLM tracks only the live prefix of a row; the columns past it
             # keep earlier occupants' block ids (condense/move leave them), so a
             # consumer that writes padded rows would reach another request's

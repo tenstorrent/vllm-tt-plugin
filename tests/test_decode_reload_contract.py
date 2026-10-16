@@ -158,6 +158,179 @@ def _submit(controller, *, spec_mode=None, layout_changed=False):
     )
 
 
+def _count_decode_host_work(monkeypatch, controller):
+    counts = dict(plans=0, comparisons=0, conversions=0)
+    plan = controller.plan_decode_reload
+    compare = controller._page_tables_changed
+    tolist = torch.Tensor.tolist
+
+    def counted_plan(model_input):
+        counts["plans"] += 1
+        return plan(model_input)
+
+    def counted_compare(model_input):
+        counts["comparisons"] += 1
+        return compare(model_input)
+
+    def counted_tolist(tensor):
+        counts["conversions"] += 1
+        return tolist(tensor)
+
+    monkeypatch.setattr(controller, "plan_decode_reload", counted_plan)
+    monkeypatch.setattr(controller, "_page_tables_changed", counted_compare)
+    monkeypatch.setattr(torch.Tensor, "tolist", counted_tolist)
+    return counts
+
+
+@pytest.mark.parametrize("lane", [False, True])
+def test_async_submission_reuses_its_plan_and_resident_params(monkeypatch, lane):
+    controller, model = _verifying_controller()
+    controller.runner.async_decode_scheduling = True
+    overlaps = []
+    context = SubmittedStepContext(["a"], {"a": 0}, 1)
+    monkeypatch.setattr(controller, "capture_submitted_step_context", lambda: context)
+    monkeypatch.setattr(
+        controller,
+        "register_pending_async_step",
+        lambda step, *, overlap_ok: overlaps.append(overlap_ok),
+    )
+    counts = _count_decode_host_work(monkeypatch, controller)
+
+    def submit(*, page=7, layout=False, device=True):
+        model_input = _submission_input(layout_changed=layout, device_sampling=device)
+        # One live request on a fixed B32/full-context page-table shape.
+        table = torch.zeros((32, 8192), dtype=torch.int32)
+        table[0, 0] = 7
+        table[0, 1] = page
+        model_input.block_tables = table
+        model_input.block_tables_per_group = [table]
+        model_input.tt_sampling_params = _sampling_params(32)
+        model_input.prompt_lens = None
+        model_input.allowed_token_ids_mask_list = [None]
+        model_input.bad_words_token_ids_list = [{}]
+        model_input.max_num_logprobs = [None]
+        if lane:
+            step = controller.submit_async_lane_decode(model_input, context, [0])
+        else:
+            step = controller.submit_async_decode(model_input)
+        return step._submission
+
+    first = submit()
+    assert counts == dict(plans=1, comparisons=0, conversions=9)
+    assert overlaps == [False]  # Must use the plan from before acceptance.
+    snapshot = controller._submitted_page_tables
+    params = first.device_sampling_params
+    assert params.seed == [None] * 32
+
+    steady = submit()
+    assert counts == dict(plans=2, comparisons=1, conversions=9)
+    assert overlaps[-1]
+    assert steady.device_sampling_params is params
+    assert controller._submitted_page_tables is snapshot
+
+    growth = submit(page=19)
+    assert counts == dict(plans=3, comparisons=2, conversions=9)
+    assert growth.reload_plan.reload_page_table
+    assert not growth.reload_plan.reload_inputs
+    assert growth.device_sampling_params is params
+    assert controller._submitted_page_tables is not snapshot
+    assert snapshot[0][0, 1].item() == 7
+    snapshot = controller._submitted_page_tables
+    submit(page=19)
+    assert counts == dict(plans=4, comparisons=3, conversions=9)
+    assert controller._submitted_page_tables is snapshot
+
+    controller.note_prefill_submitted()
+    after_prefill = submit(page=19)
+    assert counts == dict(plans=5, comparisons=3, conversions=18)
+    assert after_prefill.reload_plan.reset_sampling_state
+    assert after_prefill.device_sampling_params is not params
+    reordered = submit(layout=True)
+    assert counts == dict(plans=6, comparisons=3, conversions=27)
+    assert reordered.reload_plan.reload_sampling_params
+    assert not overlaps[-1]
+
+    host = submit(device=False)
+    assert counts == dict(plans=7, comparisons=3, conversions=27)
+    assert host.device_sampling_params is None
+    assert isinstance(host.sampling_params.seed, torch.Tensor)
+    submit(device=False)
+    assert counts == dict(plans=8, comparisons=3, conversions=27)
+    device = submit()
+    assert counts == dict(plans=9, comparisons=3, conversions=36)
+    assert device.reload_plan.reset_sampling_state
+    assert device.device_sampling_params is not reordered.device_sampling_params
+    assert all(
+        call["sampling_params"] is not None
+        for call in model.calls
+        if "sampling_params" in call
+    )
+
+
+def test_rejected_reload_does_not_replace_sampling_or_page_snapshots(monkeypatch):
+    controller, model = _verifying_controller()
+    first_input = _submission_input()
+    first = controller.submit_decode(first_input, read_from_device=True)
+    snapshot = controller._submitted_page_tables
+    params = first.device_sampling_params
+    # Converted fields belong to the accepted submission, not the tensor source.
+    first_input.tt_sampling_params.top_k.fill_(3)
+    first_input.block_tables.fill_(91)
+    assert params.top_k == [32]
+    assert snapshot[0][0, 0].item() == 0
+
+    counts = _count_decode_host_work(monkeypatch, controller)
+    model.fail = "plain"
+    with pytest.raises(RuntimeError, match="submission failed"):
+        controller.submit_decode(
+            _submission_input(layout_changed=True, page=9), read_from_device=True
+        )
+    assert counts == dict(plans=1, comparisons=0, conversions=9)
+    assert controller._resident_sampling_params is params
+    assert controller._submitted_page_tables is snapshot
+    model.fail = None
+    accepted = controller.submit_decode(
+        _submission_input(layout_changed=True, page=9), read_from_device=True
+    )
+    assert accepted.reload_plan.reset_sampling_state
+    assert accepted.device_sampling_params is not params
+    assert controller._submitted_page_tables[0][0, 0].item() == 9
+    assert counts == dict(plans=2, comparisons=0, conversions=18)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "deferred", "untraced", "nonresident"])
+def test_nonresident_sampling_routes_keep_per_submission_conversion(monkeypatch, mode):
+    controller, model = _verifying_controller()
+    if mode == "legacy":
+        model.decode_input_update_contract = 0
+    elif mode == "untraced":
+        controller.runner.trace_mode = "none"
+    elif mode == "nonresident":
+        model.model_capabilities = {"supports_async_decode": False}
+    counts = _count_decode_host_work(monkeypatch, controller)
+    submissions = []
+    for top_k in (4, 16):
+        model_input = _submission_input(layout_changed=False)
+        model_input.prompt_lens = None
+        model_input.defer_device_sampling = mode == "deferred"
+        model_input.tt_sampling_params.top_k.fill_(top_k)
+        submissions.append(
+            controller.submit_decode(model_input, read_from_device=False)
+        )
+    assert counts["conversions"] == 18
+    assert [s.device_sampling_params.top_k for s in submissions] == [[4], [16]]
+    assert (
+        submissions[0].device_sampling_params
+        is not submissions[1].device_sampling_params
+    )
+    if mode == "legacy":
+        assert counts["plans"] == 0
+    if mode == "deferred":
+        assert all("sampling_params" not in call for call in model.calls)
+        assert all(call["defer_device_sampling"] for call in model.calls)
+        assert controller._resident_sampling_params is None
+
+
 def _cached_reqs(req_ids, *, context_phase=(), resumed=()):
     req_ids = list(req_ids)
     context_phase = set(context_phase)

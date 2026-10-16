@@ -349,6 +349,7 @@ class TTAsyncDecodeController:
         self._previous_device_sampling: bool | None = None
         self._previous_submission_verified = False
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
+        self._resident_sampling_params: Any | None = None
         self._legacy_contract_warning_emitted = False
         self.device_grammar_sample_count = 0
         # How many submissions found a step already outstanding, and how many
@@ -610,7 +611,12 @@ class TTAsyncDecodeController:
             decode_layout_changed=decode_layout_changed,
         )
 
-    def can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
+    def can_use_steady_decode_fast_path(
+        self,
+        model_input: TTModelInput,
+        *,
+        reload_plan: TTDecodeReloadPlan | None = None,
+    ) -> bool:
         if not self.steady_decode_base_enabled():
             return False
         if model_input.prompt_lens is not None:
@@ -635,7 +641,9 @@ class TTAsyncDecodeController:
             return False
         if self.decode_input_update_contract_version() < 1:
             return True
-        return self.plan_decode_reload(model_input).overlap_safe
+        if reload_plan is None:
+            reload_plan = self.plan_decode_reload(model_input)
+        return reload_plan.overlap_safe
 
     def enqueue_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
         with self.runner._steady_decode_lock:
@@ -1098,8 +1106,6 @@ class TTAsyncDecodeController:
     def submit_async_decode(
         self,
         model_input: TTModelInput,
-        *,
-        steady_decode_fast_path: bool,
     ) -> DeferredDecodeOutput:
         event = threading.Event()
         context = self.capture_submitted_step_context()
@@ -1110,6 +1116,11 @@ class TTAsyncDecodeController:
         )
         if submission.tt_out is None:
             event.set()
+        # Use the pre-submit decision retained by submit_decode, not a new
+        # plan against its now-committed residency ledger.
+        steady_decode_fast_path = self.can_use_steady_decode_fast_path(
+            model_input, reload_plan=submission.reload_plan
+        )
         step: DeferredDecodeOutput
         if model_input.spec_mode is not None:
             # A speculative step resolves through the accept walk, not the
@@ -1146,7 +1157,6 @@ class TTAsyncDecodeController:
         scheduled_rows: list[int],
     ) -> AsyncTTModelRunnerOutput:
         """Submit a non-blocking single-process multi-lane decode step."""
-        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(
             model_input,
@@ -1156,6 +1166,9 @@ class TTAsyncDecodeController:
         )
         if submission.tt_out is None:
             completion_event.set()
+        overlap_ok = self.can_use_steady_decode_fast_path(
+            model_input, reload_plan=submission.reload_plan
+        )
         step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
@@ -1239,6 +1252,9 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        reload_plan = (
+            self.plan_decode_reload(model_input) if contract_version >= 1 else None
+        )
         device_sampling_params = None
         # Speculative side tensors, sent only on a speculating decode step so a
         # model that never speculates keeps its present call shape. A verify
@@ -1253,19 +1269,31 @@ class TTAsyncDecodeController:
         if model_input.accepted_counts is not None:
             kwargs["accepted_counts"] = model_input.accepted_counts
         if perform_device_sampling:
-            sampling_param_dict = {
-                field.name: (
-                    getattr(sampling_params, field.name).tolist()
-                    if getattr(sampling_params, field.name) is not None
-                    else None
-                )
-                for field in fields(sampling_params)
-            }
-            sampling_param_dict["seed"] = [
-                None if s == SEED_NONE_SENTINEL else s
-                for s in sampling_param_dict["seed"]
-            ]
-            device_sampling_params = type(sampling_params)(**sampling_param_dict)
+            reuse_sampling_params = (
+                reload_plan is not None
+                and not reload_plan.reload_inputs
+                and not reload_plan.reload_sampling_params
+                and not reload_plan.reset_sampling_state
+                and not deferred_device_sampling
+                and model_input.spec_mode is None
+                and self._resident_sampling_params is not None
+            )
+            if reuse_sampling_params:
+                device_sampling_params = self._resident_sampling_params
+            else:
+                sampling_param_dict = {
+                    field.name: (
+                        getattr(sampling_params, field.name).tolist()
+                        if getattr(sampling_params, field.name) is not None
+                        else None
+                    )
+                    for field in fields(sampling_params)
+                }
+                sampling_param_dict["seed"] = [
+                    None if s == SEED_NONE_SENTINEL else s
+                    for s in sampling_param_dict["seed"]
+                ]
+                device_sampling_params = type(sampling_params)(**sampling_param_dict)
             if deferred_device_sampling:
                 kwargs["defer_device_sampling"] = True
             else:
@@ -1281,9 +1309,7 @@ class TTAsyncDecodeController:
 
         # Versioned compatibility seam. Refactored tt-metal adapters opt into
         # the four explicit commands; legacy adapters keep their old call shape.
-        reload_plan = None
-        if contract_version >= 1:
-            reload_plan = self.plan_decode_reload(model_input)
+        if reload_plan is not None:
             kwargs.update(
                 reload_inputs=reload_plan.reload_inputs,
                 reload_page_table=reload_plan.reload_page_table,
@@ -1359,6 +1385,16 @@ class TTAsyncDecodeController:
         runner.note_decode_state_slots_settled()
         if reload_plan is not None:
             self.commit_decode_submission(model_input, reload_plan)
+            # Own the converted lists, independent of mutable input tensors.
+            # Deferred sampling and verify consume parameters independently;
+            # neither establishes ordinary resident sampler state.
+            self._resident_sampling_params = (
+                device_sampling_params
+                if perform_device_sampling
+                and not deferred_device_sampling
+                and model_input.spec_mode is None
+                else None
+            )
         else:
             # Preserve version-0 overlap behavior. The legacy adapter remains
             # reload-policy owner; this records only that submission succeeded.
