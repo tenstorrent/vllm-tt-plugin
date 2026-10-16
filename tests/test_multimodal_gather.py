@@ -118,13 +118,7 @@ def test_video_and_audio_items_are_forwarded_like_images():
 
 
 def test_unknown_item_kinds_are_rejected():
-    runner = _runner(
-        {
-            "p": SimpleNamespace(
-                mm_features=[_feature({"points": _field(torch.zeros(1))}, "point_cloud")]
-            )
-        },
-        ["p"],
-    )
+    feature = _feature({"points": _field(torch.zeros(1))}, "point_cloud")
+    runner = _runner({"p": SimpleNamespace(mm_features=[feature])}, ["p"])
     with pytest.raises(NotImplementedError):
         TTModelRunner._gather_multi_modal_inputs(runner)

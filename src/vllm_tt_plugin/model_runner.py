@@ -1111,6 +1111,7 @@ class TTModelRunner:
                 multi_modal_kwargs[key].append(per_field[key])
 
         return multi_modal_kwargs
+
     def _sampling_params_for_padded_decode(
         self,
         sample_params,
