@@ -902,8 +902,14 @@ class TTScheduler(AsyncScheduler):
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        # vLLM >= 0.31 admits waiting requests against ``max_num_active_reqs`` (a copy of max_num_seqs made at construction), not ``max_num_running_reqs``: both have to shrink by the hidden
+        # decodes, or a queue longer than max_num_seqs admits past the slot count and trips ``assert len(self.running) <= self.max_num_running_reqs`` (engine dead on the 5th concurrent
+        # request of a B=4 server; the 0.31 port did not hit it because no test sent more concurrent requests than slots).
+        saved_active = getattr(self, "max_num_active_reqs", None)
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        if saved_active is not None:
+            self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
         held_back = self._hold_back_partial_prefills(partial_prefills)
         try:
             result = super().schedule()
@@ -912,6 +918,8 @@ class TTScheduler(AsyncScheduler):
                 self.waiting.add_request(request)
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            if saved_active is not None:
+                self.max_num_active_reqs = saved_active
         return result
 
     def _hold_back_partial_prefills(self, partial_prefills: list[Request]) -> list[Request]:
