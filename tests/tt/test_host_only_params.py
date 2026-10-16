@@ -31,14 +31,16 @@ class TestHostOnlyParameters:
             "should produce non-empty output"
         )
 
-    def test_bad_words(self, tt_server, tt_model_name, max_batch_size):
+    def test_bad_words(
+        self, tt_server, tt_model_name, max_batch_size, reasoning_token_budget
+    ):
         """Test bad_words parameter prevents specified words from appearing."""
         bad_words = ["hello", "Hello", "hi", "Hi", "hey", "Hey"]
         configs = [
             # Run multiple times with high temperature to increase coverage
             RequestConfig(
                 prompt="Say hello to me",
-                max_tokens=100,
+                max_tokens=100 + reasoning_token_budget,
                 bad_words=bad_words,
                 temperature=1.0,
                 seed=i,

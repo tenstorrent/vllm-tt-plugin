@@ -5,13 +5,22 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm.sampling_params import SamplingParams
+import torch
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.worker import TTWorker
 
 # region Constants
 VOCAB_SIZE = 64
@@ -29,6 +38,7 @@ def _batch_with_one_request(
     prompt_len: int,
     output_len: int,
     num_computed_tokens: int,
+    sampling_params: SamplingParams | None = None,
 ) -> tuple[InputBatch, CachedRequestState]:
     """Creates a batch with a single request, for testing purposes."""
     batch = InputBatch(
@@ -43,7 +53,11 @@ def _batch_with_one_request(
         req_id="r",
         prompt_token_ids=list(range(prompt_len)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=0.0),
+        sampling_params=(
+            sampling_params
+            if sampling_params is not None
+            else SamplingParams(temperature=0.0)
+        ),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -55,13 +69,16 @@ def _batch_with_one_request(
 
 def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamespace:
     """Creates a fake runner with the given batch and request, for testing purposes."""
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         input_batch=batch,
         requests={"r": request},
+        _num_speculative_tokens=0,
         _output_tokens_per_step=1,
+        _is_adaptive_block_output=False,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
+        supports_stage_inputs=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
@@ -71,6 +88,78 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
     )
+    # The output-commit methods resolve the step's committed width through
+    # _tt_committed_width (reads _is_adaptive_block_output + _output_tokens_per_step).
+    runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
+        runner, toks
+    )
+    return runner
+
+
+def test_hybrid_kv_cache_uses_v029_tensor_layers():
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=1024,
+                layers=["model.layers.0.self_attn", "model.layers.1.self_attn"],
+                layer_stride=512,
+                block_stride=256,
+            ),
+            KVCacheTensor(
+                size=1024,
+                layers=["model.layers.2.self_attn"],
+                layer_stride=512,
+                block_stride=256,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn", "model.layers.1.self_attn"], spec
+            ),
+            KVCacheGroupSpec(["model.layers.2.self_attn"], spec),
+        ],
+    )
+    runner = SimpleNamespace(
+        num_devices=1,
+        tt_data_parallel_size=1,
+    )
+    runner._kv_cache_shape = lambda spec, num_blocks: TTModelRunner._kv_cache_shape(
+        runner, spec, num_blocks
+    )
+
+    per_layer = TTModelRunner._build_per_layer_specs(runner, config, 3)
+
+    # Groups alias from byte 0: the i-th layer of each group shares buffer i.
+    assert [entry[2] for entry in per_layer] == [0, 1, 0]
+
+
+def test_kv_cache_layout_resolves_to_lbnhc_for_mixed_specs():
+    specs = [
+        FullAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=num_kv_heads,
+            head_size=8,
+            dtype=torch.float32,
+        )
+        for num_kv_heads in (1, 4)
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_layout=None),
+        kv_transfer_config=None,
+    )
+    supported = TTWorker.get_supported_kv_cache_layouts(TTWorker.__new__(TTWorker))
+
+    layout = resolve_kv_cache_layout(vllm_config, [supported], specs)
+
+    assert supported == ["LBNHC"]
+    assert layout.name == "LBNHC"
 
 
 def _prepare(runner, *rows):
@@ -125,7 +214,6 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens=[num_computed_tokens],
         num_output_tokens=[0],
     )
-
     model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
 
     assert model_input is not None
@@ -216,6 +304,33 @@ def test_completed_cached_request_builds_decode_input(output_len: int):
     )
     assert model_input.input_tokens.shape == (MAX_NUM_SEQS, 1)
     assert model_input.input_tokens[0, 0] == batch.token_ids_cpu[0, num_tokens - 1]
+
+
+def test_structured_decode_build_captures_expected_grammar_request_ids():
+    prompt_len = 8
+    output_len = 1
+    num_computed_tokens = prompt_len
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=output_len,
+        num_computed_tokens=num_computed_tokens,
+        sampling_params=SamplingParams(
+            temperature=0.0,
+            structured_outputs=StructuredOutputsParams(json_object=True),
+        ),
+    )
+    runner = _fake_runner(batch, request)
+    runner.check_perform_device_sampling = lambda **_: True
+
+    model_input = _prepare(
+        runner,
+        ("r", 1, num_computed_tokens, output_len),
+    )
+
+    assert model_input.prompt_lens is None
+    assert model_input.grammar_bitmask == [None]
+    assert model_input.structured_output_req_ids == frozenset({"r"})
+    assert model_input.defer_device_sampling is True
 
 
 def test_final_one_token_prompt_chunk_stays_prefill():
@@ -315,3 +430,27 @@ def test_apply_sampled_token_updates_request_state():
 
 
 # endregion Output state
+
+
+@pytest.mark.parametrize("declared", [None, True, False])
+@pytest.mark.parametrize("has_penalties", [False, True])
+def test_device_penalties_follow_model_capability(declared, has_penalties):
+    capabilities = {} if declared is None else {"supports_device_penalties": declared}
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        model=SimpleNamespace(model_capabilities=capabilities),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            no_penalties=not has_penalties,
+            no_allowed_token_ids=True,
+            max_num_logprobs=None,
+            sampling=SimpleNamespace(
+                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            ),
+        ),
+    )
+    expected = not (has_penalties and declared is False)
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected

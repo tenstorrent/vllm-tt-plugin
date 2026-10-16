@@ -1,0 +1,116 @@
+name: vLLM release watch
+
+# Opens a tracking issue when upstream vLLM publishes a release newer than the
+# version this plugin pins in docs/install-vllm-tt.sh, so the compatibility
+# assessment (.github/prompts/vllm-upgrade-assessment.prompt.md) can be run.
+#
+# It runs on the default branch, so the pin it compares against is whatever that
+# branch currently targets. Adjust the schedule to taste.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays, 06:00 UTC
+  workflow_dispatch: {}
+
+# Serialize runs so an overlapping schedule + manual dispatch can't both pass the
+# dedup check and double-create. cancel-in-progress: false queues rather than kills.
+concurrency:
+  group: vllm-release-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve pinned vs latest vLLM
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Source of truth for what the plugin currently targets. Capture the full
+          # version token (not just X.Y.Z) so a .postN / rcN suffix is preserved.
+          pinned=$(sed -nE 's/.*vllm==([^[:space:]]+).*/\1/p' docs/install-vllm-tt.sh | head -1)
+          # Latest stable upstream release (prereleases are excluded by the API).
+          latest=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name | sed 's/^v//')
+          if [ -z "$pinned" ] || [ -z "$latest" ]; then
+            echo "could not resolve versions (pinned='$pinned' latest='$latest')" >&2
+            exit 1
+          fi
+          # newer := latest is strictly greater than pinned by version sort.
+          if [ "$pinned" != "$latest" ] && \
+             [ "$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+            newer=true
+          else
+            newer=false
+          fi
+          {
+            echo "pinned=$pinned"
+            echo "latest=$latest"
+            echo "newer=$newer"
+          } >> "$GITHUB_OUTPUT"
+          echo "pinned=$pinned latest=$latest newer=$newer"
+
+      - name: Open assessment issue
+        if: steps.ver.outputs.newer == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.ver.outputs.latest }}
+          PINNED: ${{ steps.ver.outputs.pinned }}
+        run: |
+          set -euo pipefail
+          title="vLLM v${LATEST} compatibility assessment"
+          # Dedup — mainly to stop the weekly schedule re-filing the same issue
+          # until the pin is bumped. Use the list endpoint (not --search, which is
+          # eventually consistent and can lag), scoped by our label; --state all so
+          # a version's issue is never re-created even after it is closed.
+          exists=$(gh issue list --state all --label type:compatibility --limit 200 \
+            --json title --jq "map(select(.title == \"$title\")) | length")
+          if [ "${exists:-0}" -gt 0 ]; then
+            echo "issue already exists for v${LATEST}; nothing to do."
+            exit 0
+          fi
+          # Auto-fill the one section CI can compute without analysis: the
+          # requirements/common.txt delta between the two tags.
+          raw=https://raw.githubusercontent.com/vllm-project/vllm
+          base=$(mktemp); tgt=$(mktemp)
+          if curl -fsSL "$raw/v${PINNED}/requirements/common.txt" -o "$base" \
+             && curl -fsSL "$raw/v${LATEST}/requirements/common.txt" -o "$tgt"; then
+            deps_delta=$(diff "$base" "$tgt" | sed -n 's/^< /- /p; s/^> /+ /p') || true
+            [ -n "$deps_delta" ] || deps_delta="No changes to requirements/common.txt."
+          else
+            deps_delta="(could not fetch requirements/common.txt for one or both tags)"
+          fi
+          rm -f "$base" "$tgt"
+
+          # Seed the issue in the #64 shape; the assessing agent fills the
+          # placeholders per the playbook's Phase 6. printf format strings are
+          # single-quoted so backticks/`$` stay literal; only %s is substituted.
+          body=$(mktemp)
+          {
+            printf 'Upstream vLLM **v%s** is available; the plugin pins **%s** (`docs/install-vllm-tt.sh`).\n\n' "$LATEST" "$PINNED"
+            printf 'Run `.github/prompts/vllm-upgrade-assessment.prompt.md` (TARGET = `v%s`, BASELINE = `%s`) and edit this issue with the findings — a concise summary plus concise per-version diffs, no proposed solutions.\n\n' "$LATEST" "$PINNED"
+            printf '## Summary\n_(to be completed by the assessment)_\n\n'
+            printf '## Diffs relevant to the plugin (%s → %s)\n' "$PINNED" "$LATEST"
+            printf '**Breaking** — _(to be completed)_\n\n'
+            printf '**Behavioral** — _(to be completed)_\n\n'
+            printf '**Unchanged / byte-identical** — _(to be completed)_\n\n'
+            printf '## Dependencies (`requirements/common.txt`, %s → %s)\n' "$PINNED" "$LATEST"
+            printf '```diff\n%s\n```\n\n' "$deps_delta"
+            printf '## Method\nDiffed the installed baseline against the upstream tag, per coupled symbol.\n\n'
+            printf '_Opened automatically by `.github/workflows/vllm-release-watch.yml`._\n'
+          } > "$body"
+
+          gh issue create --title "$title" --body-file "$body" \
+            --label "type:compatibility" --label "type:dependencies"
+          rm -f "$body"
+          # To hand the assessment off automatically, assign the issue to the
+          # Copilot coding agent (requires the coding agent enabled for the repo):
+          # add `--assignee "@copilot"` above, or a follow-up `gh issue edit`.
+          # Left off by default so a human triages first.

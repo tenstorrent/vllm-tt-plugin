@@ -12,7 +12,11 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import (
+    OMP_NUM_THREADS_SET_BY_VLLM,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    set_torch_threads_for_runtime,
+)
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_uniform_page_size,
@@ -24,10 +28,12 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
+    TT_SCHEDULER_CLS,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
@@ -52,6 +58,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.outputs import DraftTokenIds
 
 logger = init_tt_logger(__name__)
 
@@ -181,6 +188,14 @@ def _available_kv_cache_memory_bytes_for_num_blocks(
 
 
 class TTWorker(WorkerBase):
+    # Built by _create_model_runner; a subclass swaps the runner without
+    # copying the device and KV-pool steps of init_device.
+    model_runner_cls: type[TTModelRunner] = TTModelRunner
+
+    # The scheduler this worker runs with; resolve_tt_scheduler_cls pairs a
+    # requested scheduler against it. A stage worker names its own.
+    tt_scheduler_cls: str | type = TT_SCHEDULER_CLS
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -218,6 +233,11 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        self._init_tt_device()
+        self._init_kv_pool()
+        self.model_runner: TTModelRunner = self._create_model_runner()
+
+    def _init_tt_device(self) -> None:
         # tt-metal latches the visible set at first cluster construction and never
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
@@ -238,14 +258,20 @@ class TTWorker(WorkerBase):
             os.environ.get(TTPlatform.device_control_env_var),
             os.environ.get("MESH_DEVICE"),
         )
+        model_class, _ = get_model_architecture(self.model_config)
+        model_capabilities = getattr(model_class, "model_capabilities", None) or {}
         self.mesh_device = open_mesh_device(
-            get_tt_config(self.vllm_config), self.trace_mode, local_dp_rank
+            get_tt_config(self.vllm_config),
+            self.trace_mode,
+            local_dp_rank,
+            model_fabric_config=model_capabilities.get("fabric_config"),
         )
         self.device = self.mesh_device
         self.device_config.device = self.mesh_device
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
 
+    def _init_kv_pool(self) -> None:
         # Size the KV pool and settle --max-model-len here, not in
         # determine_available_memory: upstream runs the whole executor init
         # (init_device, then load_model) before it asks for available memory
@@ -260,8 +286,9 @@ class TTWorker(WorkerBase):
         )
         _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
 
-        # Init ModelRunner here, so that we have access to self.mesh_device.
-        self.model_runner: TTModelRunner = TTModelRunner(
+    def _create_model_runner(self) -> TTModelRunner:
+        # Needs the mesh that _init_tt_device opened.
+        return self.model_runner_cls(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
@@ -272,8 +299,22 @@ class TTWorker(WorkerBase):
     def load_model(self):
         self.model_runner.load_model()
 
+    def take_draft_token_ids(self) -> "DraftTokenIds | None":
+        """Hand the runner's proposed drafts to the engine.
+
+        ``EngineCore`` calls this on every step of a speculative run and there
+        is no base implementation, so without it a launch that passes
+        admission raises ``AttributeError`` on its first step.
+        """
+        return self.model_runner.take_draft_token_ids()
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        # TT cache setup handles only LBNHC's per-group packing; it is also
+        # block-compact, so models with mixed KV shapes still resolve to it.
+        return [KVCacheLayout.LBNHC.name]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -453,11 +494,15 @@ class TTWorker(WorkerBase):
         # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return CompilationTimes(language_model=0.0, encoder=0.0)
+            elapsed = 0.0
+        else:
+            start = time.perf_counter()
+            self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
 
-        start = time.perf_counter()
-        self.model_runner.warmup_model()
-        elapsed = time.perf_counter() - start
+        # vLLM sizes multiproc workers' torch threads for startup only.
+        if os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) == "1":
+            set_torch_threads_for_runtime()
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 
@@ -465,7 +510,7 @@ class TTWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | None:
-        """Run the device forward for a non-DP or lane-DP step.
+        """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None``: the forward leaves a pending sampler that the engine
         finalizes via ``sample_tokens``. The runner dispatches plain
@@ -780,20 +825,24 @@ def get_reliability_mode(tt_config):
     return reliability_mode
 
 
-# From tt-metal/conftest.py:
-# Set fabric config to passed in value
-# Do nothing if not set
-# Must be called before creating the mesh device
-def set_fabric(tt_config, num_devices):
-    fabric_config = get_fabric_config(tt_config, num_devices)
-    if fabric_config:
-        reliability_mode = get_reliability_mode(tt_config)
-        logger.info(
-            "Setting fabric config: %s, reliability mode: %s",
-            fabric_config,
-            reliability_mode,
-        )
-        ttnn.set_fabric_config(fabric_config, reliability_mode)
+def set_fabric(tt_config, num_devices, model_fabric_config=None):
+    """Apply hardware defaults, model defaults, then explicit launch overrides."""
+    if num_devices == 1:
+        return
+
+    fabric_kwargs = {
+        "config": get_fabric_config(None, num_devices),
+        "reliability_mode": get_reliability_mode(None),
+    }
+    if model_fabric_config is not None:
+        fabric_kwargs = {**fabric_kwargs, **model_fabric_config}
+    if tt_config and "fabric_config" in tt_config:
+        fabric_kwargs["config"] = get_fabric_config(tt_config, num_devices)
+    if tt_config and "fabric_reliability_mode" in tt_config:
+        fabric_kwargs["reliability_mode"] = get_reliability_mode(tt_config)
+
+    logger.info("Setting fabric config: %s", fabric_kwargs)
+    ttnn.set_fabric_config(**fabric_kwargs)
 
 
 # From tt-metal/conftest.py:
@@ -852,7 +901,9 @@ def get_mesh_grid(*args: Any, **kwargs: Any):
     return mesh_grid
 
 
-def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
+def open_mesh_device(
+    tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
+):
     mesh_grid = get_mesh_grid()
     logger.info("Attempting to open mesh device with grid shape %s", mesh_grid)
 
@@ -860,7 +911,7 @@ def open_mesh_device(tt_config, trace_mode, local_dp_rank=0):
 
     # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested)
+    set_fabric(tt_config, num_devices_requested, model_fabric_config)
 
     mesh_device = ttnn.open_mesh_device(
         ttnn.MeshShape(*mesh_grid),
