@@ -751,6 +751,9 @@ def test_the_joint_check_catches_temperature_missing_from_drafted_columns(
     """
     import vllm_tt_plugin.spec_accept as spec_accept
 
+    # The mutation patches the dense probabilities, which only the old walk
+    # reads; the statistic's power does not depend on which walk is under it.
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "0")
     original = spec_accept._constrained_probs
 
     def column_zero_only(target_logits, temperature, top_k, top_p, min_p=None):

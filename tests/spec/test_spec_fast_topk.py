@@ -1,5 +1,7 @@
 """The fast top-k/top-p path of _constrained_probs equals the reference path."""
 
+import os
+
 import pytest
 import torch
 
@@ -97,27 +99,176 @@ def test_caller_logits_are_not_modified(monkeypatch):
     assert torch.equal(before, logits)
 
 
-def test_accept_walk_is_identical_with_the_flag_on_and_off(monkeypatch):
-    rows, k_drafts = 4, 3
-    for trial in range(40):
-        g = torch.Generator().manual_seed(1000 + trial)
-        logits = torch.randn(rows, k_drafts + 1, V, generator=g) * 3
-        if trial % 2:
-            logits = logits.to(torch.bfloat16).to(torch.float32)
-        drafts = logits[:, :k_drafts].argmax(-1).to(torch.int32)
-        drafts[:, 1] = torch.randint(0, V, (rows,), generator=g, dtype=torch.int32)
-        valid = torch.tensor([3, 2, 0, 3], dtype=torch.int32)
-        outs = []
-        for flag in ("0", "1"):
-            monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", flag)
-            sampling = SpecSamplingInputs(
-                vocab_size=V,
-                temperature=torch.tensor([0.6, 0.6, 0.8, 0.0]),
-                top_k=torch.tensor([20, 20, 1, 20], dtype=torch.int32),
-                top_p=torch.tensor([0.95, 0.95, 0.95, 1.0]),
-                generators={r: torch.Generator().manual_seed(7 + r) for r in range(rows)},
+# region The support-only walk (point-mass draft)
+
+W = 8
+N = 200_000
+CONTROLS = {
+    "dense": dict(top_k=None, top_p=None),
+    "top-k": dict(top_k=5, top_p=None),
+    "top-k-top-p": dict(top_k=6, top_p=0.9),
+    "top-p-only": dict(top_k=None, top_p=0.9),
+}
+
+
+def _target(controls, temperature=0.8):
+    """The analytic target for one row: the reference path's probabilities."""
+    logits = torch.tensor([2.0, 1.5, 1.0, 0.5, 0.2, 0.0, -1.0, -3.0])
+    k, p = controls["top_k"], controls["top_p"]
+    old = os.environ.get("VLLM_TT_SPEC_FAST_TOPK")
+    os.environ["VLLM_TT_SPEC_FAST_TOPK"] = "0"
+    try:
+        probs = _constrained_probs(
+            logits.view(1, 1, W),
+            torch.tensor([temperature]),
+            None if k is None else torch.tensor([k], dtype=torch.int32),
+            None if p is None else torch.tensor([p]),
+        )
+    finally:
+        if old is None:
+            os.environ.pop("VLLM_TT_SPEC_FAST_TOPK")
+        else:
+            os.environ["VLLM_TT_SPEC_FAST_TOPK"] = old
+    return logits, probs[0, 0]
+
+
+def _controls_tensors(controls, rows):
+    k, p = controls["top_k"], controls["top_p"]
+    return (
+        None if k is None else torch.full((rows,), k, dtype=torch.int32),
+        None if p is None else torch.full((rows,), p),
+    )
+
+
+def _assert_distribution(samples, expected, sigmas=4.5):
+    count = samples.numel()
+    freq = torch.bincount(samples.to(torch.int64), minlength=W).double() / count
+    sigma = (expected.double() * (1 - expected.double()) / count).sqrt().clamp_min(1e-9)
+    z = ((freq - expected.double()).abs() / sigma)
+    assert float(z.max()) < sigmas, (freq.tolist(), expected.tolist())
+    # Mass outside the support is exactly zero, not merely small.
+    assert float(freq[expected == 0].sum()) == 0.0
+
+
+@pytest.mark.parametrize("name", list(CONTROLS))
+def test_a_draftless_draw_follows_the_target(monkeypatch, name):
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    torch.manual_seed(1)
+    controls = CONTROLS[name]
+    logits, expected = _target(controls)
+    top_k, top_p = _controls_tensors(controls, N)
+    result = accept_sampled_drafts(
+        logits.view(1, 1, W).expand(N, 2, W).contiguous(),
+        torch.zeros(N, 1, dtype=torch.int32),
+        torch.zeros(N, dtype=torch.int32),
+        SpecSamplingInputs(
+            vocab_size=W, temperature=torch.full((N,), 0.8), top_k=top_k, top_p=top_p
+        ),
+    )
+    _assert_distribution(result.committed_token_ids[:, 0], expected)
+
+
+@pytest.mark.parametrize("name", list(CONTROLS))
+def test_the_residual_draw_is_the_target_without_the_draft(monkeypatch, name):
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    torch.manual_seed(2)
+    controls = CONTROLS[name]
+    logits, expected = _target(controls)
+    draft = int(expected.argmax())
+    top_k, top_p = _controls_tensors(controls, N)
+    result = accept_sampled_drafts(
+        logits.view(1, 1, W).expand(N, 2, W).contiguous(),
+        torch.full((N, 1), draft, dtype=torch.int32),
+        torch.ones(N, dtype=torch.int32),
+        SpecSamplingInputs(
+            vocab_size=W, temperature=torch.full((N,), 0.8), top_k=top_k, top_p=top_p
+        ),
+    )
+    rejected = result.accepted_counts == 1
+    # Accepted with probability p(draft).
+    accept_rate = 1.0 - float(rejected.double().mean())
+    sigma = (float(expected[draft]) * (1 - float(expected[draft])) / N) ** 0.5
+    assert abs(accept_rate - float(expected[draft])) < 4.5 * sigma
+    residual = expected.clone()
+    residual[draft] = 0.0
+    residual /= residual.sum()
+    _assert_distribution(result.committed_token_ids[rejected, 0], residual)
+
+
+@pytest.mark.parametrize("name", list(CONTROLS))
+def test_the_committed_tokens_follow_the_target_end_to_end(monkeypatch, name):
+    """Speculative sampling with a point-mass draft is lossless."""
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    torch.manual_seed(3)
+    controls = CONTROLS[name]
+    logits, expected = _target(controls)
+    top_k, top_p = _controls_tensors(controls, N)
+    # Drafts come from an unrelated distribution, some outside the support.
+    drafts = torch.randint(0, W, (N, 1), dtype=torch.int32)
+    result = accept_sampled_drafts(
+        logits.view(1, 1, W).expand(N, 2, W).contiguous(),
+        drafts,
+        torch.ones(N, dtype=torch.int32),
+        SpecSamplingInputs(
+            vocab_size=W, temperature=torch.full((N,), 0.8), top_k=top_k, top_p=top_p
+        ),
+    )
+    _assert_distribution(result.committed_token_ids[:, 0], expected)
+    # The bonus after a full accept is a draw from the target at column 1.
+    full = result.accepted_counts == 2
+    assert int(full.sum()) > 1000
+    _assert_distribution(result.committed_token_ids[full, 1], expected)
+
+
+def _seeded_batch(composition, seed=5):
+    """Row 0 is the row under test; the others vary between runs."""
+    g = torch.Generator().manual_seed(77)
+    logits = torch.randn(1, 4, V, generator=g) * 3
+    drafts = torch.tensor([[int(logits[0, 0].argmax()), 5, 9]], dtype=torch.int32)
+    valid = torch.tensor([3], dtype=torch.int32)
+    extra = len(composition)
+    if extra:
+        og = torch.Generator().manual_seed(1000 + extra)
+        logits = torch.cat([logits, torch.randn(extra, 4, V, generator=og) * 3])
+        drafts = torch.cat(
+            [drafts, torch.randint(0, V, (extra, 3), generator=og, dtype=torch.int32)]
+        )
+        valid = torch.cat([valid, torch.tensor(composition, dtype=torch.int32)])
+    rows = 1 + extra
+    generators = {0: torch.Generator().manual_seed(seed)}
+    for row in range(1, rows):
+        if row % 2:
+            generators[row] = torch.Generator().manual_seed(seed + row)
+    return accept_sampled_drafts(
+        logits,
+        drafts,
+        valid,
+        SpecSamplingInputs(
+            vocab_size=V,
+            temperature=torch.full((rows,), 0.6),
+            top_k=torch.full((rows,), 20, dtype=torch.int32),
+            top_p=torch.full((rows,), 0.95),
+            generators=generators,
+        ),
+    )
+
+
+def test_a_seeded_row_is_deterministic_and_independent_of_other_rows(monkeypatch):
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    seen = set()
+    for seed in range(30):
+        alone = _seeded_batch([], seed)
+        again = _seeded_batch([], seed)
+        assert torch.equal(alone.committed_token_ids, again.committed_token_ids)
+        for composition in ([0], [3, 1], [2, 3, 0, 3, 1]):
+            torch.manual_seed(seed + 99)  # unseeded rows draw differently
+            batch = _seeded_batch(composition, seed)
+            assert torch.equal(
+                batch.committed_token_ids[0], alone.committed_token_ids[0]
             )
-            res = accept_sampled_drafts(logits, drafts, valid, sampling)
-            outs.append((res.committed_token_ids, res.accepted_counts))
-        assert torch.equal(outs[0][0], outs[1][0])
-        assert torch.equal(outs[0][1], outs[1][1])
+            assert int(batch.accepted_counts[0]) == int(alone.accepted_counts[0])
+        seen.add(tuple(alone.committed_token_ids[0].tolist()))
+    assert len(seen) > 5  # the seed matters
+
+
+# endregion

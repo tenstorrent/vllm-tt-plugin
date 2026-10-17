@@ -522,6 +522,20 @@ def _random_walk(
     vocab: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
+    if draft_probs is None and _fast_enabled():
+        return _point_mass_walk(
+            target_logits,
+            draft_token_ids,
+            num_valid_drafts,
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            generators,
+            rows,
+            num_drafts,
+            vocab,
+        )
     probs = _constrained_probs(target_logits, temperature, top_k, top_p, min_p)
     # Replaced inside the vocabulary before any gather, because a draft column
     # past its row's count holds padding, the runner pads with
@@ -593,6 +607,10 @@ def _random_walk(
     return accepted, candidates
 
 
+def _fast_enabled() -> bool:
+    return os.environ.get("VLLM_TT_SPEC_FAST_TOPK", "1") != "0"
+
+
 def _constrained_probs(
     target_logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -612,32 +630,40 @@ def _constrained_probs(
     needs the raw logits afterwards.
     """
     rows, width, vocab = target_logits.shape
-    safe_temperature = torch.where(
-        temperature <= 0.0, torch.ones_like(temperature), temperature
-    )
+    if _fast_enabled():
+        return _constrained_table(
+            target_logits, temperature, top_k, top_p, min_p
+        ).to_dense().reshape(rows, width, vocab)
+
+    safe_temperature = _safe_temperature(temperature)
     logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
-
-    if min_p is not None and bool((min_p > 0).any()):
-        # vLLM's MinPLogitsProcessor arithmetic, on the tempered logits. A row
-        # at 0 has a threshold of 0, which nothing falls below.
-        probs = logits.softmax(dim=-1)
-        threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(torch.float32).view(
-            rows, 1, 1
-        )
-        logits = logits.masked_fill(probs < threshold, float("-inf"))
-
+    logits = _apply_min_p(logits, min_p)
     if top_k is None and top_p is None:
         return logits.softmax(dim=-1, dtype=torch.float32)
 
     flat = logits.reshape(rows * width, vocab)
-    k_flat = None if top_k is None else _expand_to_columns(top_k, width)
-    p_flat = None if top_p is None else _expand_to_columns(top_p, width)
-    if os.environ.get("VLLM_TT_SPEC_FAST_TOPK", "1") != "0":
-        probs = _fast_top_k_top_p_probs(flat, k_flat, p_flat)
-        return probs.reshape(rows, width, vocab)
-    return _reference_top_k_top_p(flat, k_flat, p_flat).reshape(
-        rows, width, vocab
-    ).softmax(dim=-1, dtype=torch.float32)
+    flat = _reference_top_k_top_p(
+        flat,
+        None if top_k is None else _expand_to_columns(top_k, width),
+        None if top_p is None else _expand_to_columns(top_p, width),
+    )
+    return flat.reshape(rows, width, vocab).softmax(dim=-1, dtype=torch.float32)
+
+
+def _safe_temperature(temperature: torch.Tensor) -> torch.Tensor:
+    return torch.where(temperature <= 0.0, torch.ones_like(temperature), temperature)
+
+
+def _apply_min_p(logits: torch.Tensor, min_p: torch.Tensor | None) -> torch.Tensor:
+    if min_p is None or not bool((min_p > 0).any()):
+        return logits
+    # vLLM's MinPLogitsProcessor arithmetic, on the tempered logits. A row
+    # at 0 has a threshold of 0, which nothing falls below.
+    probs = logits.softmax(dim=-1)
+    threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(torch.float32).view(
+        logits.shape[0], 1, 1
+    )
+    return logits.masked_fill(probs < threshold, float("-inf"))
 
 
 def _reference_top_k_top_p(
@@ -661,79 +687,297 @@ _FAST_TOPK_MAX = 1024
 _FAST_TOPK_MARGIN = 64
 
 
-def _fast_top_k_top_p_probs(
-    flat: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-) -> torch.Tensor:
-    """Probabilities after top-k then top-p, without a full-vocab sort.
+class _ProbTable:
+    """Per-position target probabilities, stored by support where it is small.
+
+    ``N = rows * width`` flat positions. A sparse position keeps its candidate
+    token ids and their probabilities (everything else is exactly 0). A dense
+    position keeps all ``vocab`` probabilities; those are rows with no top-k
+    (or one the fast path cannot serve) and cost what the old path cost.
+    """
+
+    def __init__(self, n: int, vocab: int):
+        self.n = n
+        self.vocab = vocab
+        self.is_sparse = torch.zeros(n, dtype=torch.bool)
+        self.slot = torch.zeros(n, dtype=torch.long)
+        self.sparse_ids = torch.empty(0, dtype=torch.long)
+        self.idx = torch.empty(0, 0, dtype=torch.long)
+        self.sp = torch.empty(0, 0, dtype=torch.float32)
+        self.dense_ids = torch.empty(0, dtype=torch.long)
+        self.dp = torch.empty(0, vocab, dtype=torch.float32)
+
+    def set_sparse(self, ids, idx, p):
+        self.sparse_ids, self.idx, self.sp = ids, idx, p
+        self.is_sparse[ids] = True
+        self.slot[ids] = torch.arange(ids.numel())
+
+    def set_dense(self, ids, p):
+        self.dense_ids, self.dp = ids, p
+        self.slot[ids] = torch.arange(ids.numel())
+
+    def to_dense(self) -> torch.Tensor:
+        out = torch.zeros(self.n, self.vocab, dtype=torch.float32)
+        if self.sparse_ids.numel():
+            out[self.sparse_ids] = torch.zeros(
+                self.sparse_ids.numel(), self.vocab
+            ).scatter_(1, self.idx, self.sp)
+        if self.dense_ids.numel():
+            out[self.dense_ids] = self.dp
+        return out
+
+    def _split(self, flat_ids):
+        sparse = self.is_sparse[flat_ids]
+        return sparse, ~sparse
+
+    def prob_of(self, flat_ids: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Probability each flat position gives its own token."""
+        out = torch.zeros(flat_ids.numel(), dtype=torch.float32)
+        sparse, dense = self._split(flat_ids)
+        if bool(sparse.any()):
+            slot = self.slot[flat_ids[sparse]]
+            hit = self.idx[slot] == tokens[sparse].unsqueeze(1)
+            out[sparse] = (self.sp[slot] * hit).sum(dim=1)
+        if bool(dense.any()):
+            slot = self.slot[flat_ids[dense]]
+            out[dense] = self.dp[slot, tokens[dense]]
+        return out
+
+    def sample(
+        self,
+        flat_ids: torch.Tensor,
+        u: torch.Tensor,
+        exclude: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Inverse-CDF draw per flat position from p (minus ``exclude``).
+
+        ``u`` is float64 in [0, 1). Scale free: ``exclude`` removes a token's
+        mass without renormalising, and the threshold is ``u * total``.
+        """
+        out = torch.zeros(flat_ids.numel(), dtype=torch.long)
+        sparse, dense = self._split(flat_ids)
+        if bool(sparse.any()):
+            slot = self.slot[flat_ids[sparse]]
+            idx = self.idx[slot]
+            w = self.sp[slot].to(torch.float64)
+            if exclude is not None:
+                w = w.masked_fill(idx == exclude[sparse].unsqueeze(1), 0.0)
+            pick = _inverse_cdf(w, u[sparse])
+            out[sparse] = idx.gather(1, pick.unsqueeze(1)).squeeze(1)
+        if bool(dense.any()):
+            slot = self.slot[flat_ids[dense]]
+            w = self.dp[slot].to(torch.float64)
+            if exclude is not None:
+                w.scatter_(1, exclude[dense].unsqueeze(1), 0.0)
+            out[dense] = _inverse_cdf(w, u[dense])
+        return out.to(torch.int32)
+
+    def race_pick(self, flat_id: int, noise: torch.Tensor) -> int:
+        """The old exponential race for one position, ``noise`` of size vocab.
+
+        Used for a seeded row's bonus so its generator advances exactly as the
+        ordinary sampler's does.
+        """
+        slot = int(self.slot[flat_id])
+        if bool(self.is_sparse[flat_id]):
+            idx = self.idx[slot]
+            scored = self.sp[slot] / noise[idx]
+            return int(idx[scored.argmax()])
+        return int((self.dp[slot] / noise).argmax())
+
+
+def _inverse_cdf(weights: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """Column index drawn from each row of non-negative ``weights`` (float64)."""
+    cdf = weights.cumsum(dim=1)
+    threshold = (u * cdf[:, -1]).unsqueeze(1)
+    pick = (cdf <= threshold).sum(dim=1)
+    # u * total can round up to total; stay on the last positive weight.
+    last_positive = (weights > 0).to(torch.int8).flip(1).argmax(dim=1)
+    last_positive = weights.shape[1] - 1 - last_positive
+    return torch.minimum(pick, last_positive)
+
+
+def _constrained_table(
+    target_logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
+) -> _ProbTable:
+    """The same probabilities as the reference path, without full-vocab work.
 
     Same masks as ``apply_top_k_top_p_pytorch`` followed by a softmax: top-k
-    keeps every logit ``>= `` the k-th largest (ties kept), then top-p drops
+    keeps every logit ``>=`` the k-th largest (ties kept), then top-p drops
     the ascending-cumsum prefix ``<= 1 - p`` but always keeps the largest. Both
     are evaluated on the top ``k_max + margin`` candidates only, which holds
-    every survivor of top-k. Rows the candidates cannot decide (top-k off or
-    above the cap with top-p active, tie overflow) use the reference path.
-    ``flat`` is not modified.
+    every survivor of top-k. Temperature is applied to the candidates, which is
+    the same division of the same values; it is monotone, so the candidates of
+    the raw logits are the candidates of the tempered ones. Rows the candidates
+    cannot decide (top-k off or above the cap with top-p active, tie overflow,
+    a top-p cut inside a group of equal logits) use the reference path.
     """
-    n, vocab = flat.shape
+    rows, width, vocab = target_logits.shape
+    n = rows * width
+    flat = target_logits.reshape(n, vocab)
+    temp = _expand_to_columns(_safe_temperature(temperature), width).to(torch.float32)
+    k = None if top_k is None else _expand_to_columns(top_k, width)
+    p = None if top_p is None else _expand_to_columns(top_p, width)
+
+    if min_p is not None and bool((min_p > 0).any()):
+        # min_p reads the tempered softmax of the whole row, so it stays full.
+        flat = _apply_min_p(
+            flat.to(torch.float32).reshape(rows, width, vocab)
+            / _safe_temperature(temperature).view(rows, 1, 1),
+            min_p,
+        ).reshape(n, vocab)
+        temp = torch.ones_like(temp)
+
     off = torch.zeros(n, dtype=torch.bool)
     k_on = off if k is None else (k > 0) & (k < vocab)
     p_on = off if p is None else p < 1.0
-    # Rows with nothing to filter need no work at all.
     active = k_on | p_on
     fast = off if k is None else k_on & (k <= _FAST_TOPK_MAX)
     fallback = active & ~fast
 
-    probs = torch.empty_like(flat)
-    idle = ~active
-    if bool(idle.any()):
-        probs[idle] = flat[idle].softmax(dim=-1, dtype=torch.float32)
+    table = _ProbTable(n, vocab)
+    dense_ids = (~active).nonzero().squeeze(1)
+    dense_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+    if dense_ids.numel():
+        sub = flat[dense_ids].to(torch.float32) / temp[dense_ids].unsqueeze(1)
+        dense_rows.append((dense_ids, sub.softmax(dim=-1)))
 
     if bool(fast.any()):
-        rows_f = fast.nonzero().squeeze(1)
-        sub = flat[rows_f] if rows_f.numel() != n else flat
-        k_f = k[rows_f].to(torch.long)
-        width = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
-        vals, idx = torch.topk(sub, width, dim=-1)
+        ids = fast.nonzero().squeeze(1)
+        sub = flat if ids.numel() == n else flat[ids]
+        k_f = k[ids].to(torch.long)
+        cand = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
+        vals, idx = torch.topk(sub, cand, dim=-1)
+        vals = vals.to(torch.float32) / temp[ids].unsqueeze(1)
         kth = vals.gather(1, (k_f - 1).unsqueeze(1))
         keep = vals >= kth
         # Candidates cannot show how many logits tie with the k-th beyond
         # the last one they hold, unless that tie is -inf (probability 0).
-        overflow = (vals[:, -1:] >= kth) & (kth > float("-inf"))
-        overflow = overflow.squeeze(1) & (width < vocab)
+        overflow = ((vals[:, -1:] >= kth) & (kth > float("-inf"))).squeeze(1)
+        overflow = overflow & (cand < vocab)
         vals = vals.masked_fill(~keep, float("-inf"))
         if p is not None:
-            p_f = p[rows_f]
-            # Ascending cumsum of the reference is the reversed descending one.
-            pr = vals.softmax(dim=-1)
-            cum = torch.cumsum(pr.flip(-1), dim=-1).flip(-1)
-            # cum[j] is the sum of entries at or below j in ascending order.
+            p_f = p[ids]
+            # The reference's ascending cumsum is the reversed descending one.
+            cum = torch.cumsum(vals.softmax(dim=-1).flip(-1), dim=-1).flip(-1)
             drop = cum <= (1 - p_f).unsqueeze(1)
             drop[:, 0] = False
             # The reference sort is not stable, so when the cut falls inside
             # a group of equal logits it keeps an arbitrary member of the
             # group. Such a row takes the reference path to match it.
             kept = (~drop).sum(dim=1, keepdim=True)
-            nxt = vals.gather(1, kept.clamp(max=width - 1))
+            nxt = vals.gather(1, kept.clamp(max=cand - 1))
             last = vals.gather(1, kept - 1)
-            overflow = overflow | ((kept < width) & (nxt == last)).squeeze(1)
+            overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
             vals = vals.masked_fill(drop, float("-inf"))
-        sub_probs = torch.zeros_like(sub)
-        sub_probs.scatter_(1, idx, vals.softmax(dim=-1, dtype=torch.float32))
+        ok = ~overflow
+        if bool(ok.any()):
+            table.set_sparse(
+                ids[ok], idx[ok], vals[ok].softmax(dim=-1, dtype=torch.float32)
+            )
         if bool(overflow.any()):
             fallback = fallback.clone()
-            fallback[rows_f[overflow]] = True
-        ok = ~overflow
-        probs[rows_f[ok]] = sub_probs[ok]
+            fallback[ids[overflow]] = True
 
     if bool(fallback.any()):
-        rows_b = fallback.nonzero().squeeze(1)
-        out = _reference_top_k_top_p(
-            flat[rows_b].clone(),
-            None if k is None else torch.where(k_on, k, vocab)[rows_b],
-            None if p is None else p[rows_b],
+        ids = fallback.nonzero().squeeze(1)
+        sub = flat[ids].to(torch.float32) / temp[ids].unsqueeze(1)
+        k_ref = None if k is None else torch.where(k_on, k, vocab)[ids]
+        out = _reference_top_k_top_p(sub, k_ref, None if p is None else p[ids])
+        dense_rows.append((ids, out.softmax(dim=-1, dtype=torch.float32)))
+
+    if dense_rows:
+        table.set_dense(
+            torch.cat([i for i, _ in dense_rows]), torch.cat([d for _, d in dense_rows])
         )
-        probs[rows_b] = out.softmax(dim=-1, dtype=torch.float32)
-    return probs
+    return table
+
+
+def _point_mass_walk(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
+    generators: dict[int, torch.Generator],
+    rows: int,
+    num_drafts: int,
+    vocab: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The random walk for a point-mass draft, drawing over supports only.
+
+    Accept draft ``d`` with probability ``p(d)`` (q is a point mass), and on a
+    rejection draw from ``p`` with ``d`` removed, renormalised: exactly the
+    general walk with ``q = 1`` at ``d``. Only the first rejection of a row can
+    commit, so only that position's correction is drawn.
+
+    Unseeded rows draw their uniforms in batched calls. A seeded row draws
+    from its own generator in the old order (bonus, accept uniforms,
+    correction), so its values depend on nothing outside the row. A seeded row
+    with no drafts keeps the old full-vocabulary exponential race for its
+    bonus, so that it reads exactly what an ordinary sampled step reads and
+    leaves the generator where that step does; every other seeded draw is a
+    uniform.
+    """
+    width = num_drafts + 1
+    table = _constrained_table(target_logits, temperature, top_k, top_p, min_p)
+    valid = num_valid_drafts.to(torch.long)
+    draft_ids = draft_token_ids.to(torch.long).clamp(0, vocab - 1)
+    row_ids = torch.arange(rows)
+
+    # One batched draw for the unseeded rows: column 0 the bonus, column 1
+    # the correction. Seeded rows overwrite their own entries below.
+    draws = torch.rand((rows, 2), dtype=torch.float64)
+    bonus_ids = row_ids * width + valid
+    # A seeded row with drafts draws its bonus as a uniform, first, from its own
+    # generator. A seeded row without drafts is an ordinary sampled step and
+    # draws what the ordinary sampler draws.
+    draftless = {row: g for row, g in generators.items() if int(valid[row]) == 0}
+    for row, generator in generators.items():
+        if row not in draftless:
+            draws[row, 0] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+    bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
+    for row, generator in draftless.items():
+        noise = torch.empty(vocab, dtype=torch.float32)
+        noise.exponential_(generator=generator)
+        bonus[row] = table.race_pick(int(bonus_ids[row]), noise)
+    accept_uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
+    for row, generator in generators.items():
+        if int(valid[row]):
+            draws[row, 1] = torch.rand(
+                (1,), dtype=torch.float64, generator=generator
+            )[0]
+
+    flat_ids = (row_ids.unsqueeze(1) * width + torch.arange(num_drafts)).reshape(-1)
+    p_draft = table.prob_of(flat_ids, draft_ids.reshape(-1)).reshape(rows, num_drafts)
+    accepted = (p_draft > 0) & (p_draft.to(torch.float64) >= accept_uniform)
+
+    in_row = torch.arange(num_drafts).unsqueeze(0) < valid.unsqueeze(1)
+    rejected = in_row & ~accepted
+    needs = rejected.any(dim=1)
+    first = rejected.to(torch.int8).argmax(dim=1)
+    candidates = torch.cat(
+        [
+            draft_token_ids.to(torch.int32),
+            torch.full((rows, 1), PLACEHOLDER_TOKEN_ID, dtype=torch.int32),
+        ],
+        dim=1,
+    )
+    corr_rows = needs.nonzero().squeeze(1)
+    if corr_rows.numel():
+        pos = first[corr_rows]
+        recovered = table.sample(
+            corr_rows * width + pos, draws[corr_rows, 1], exclude=draft_ids[corr_rows, pos]
+        )
+        candidates[corr_rows, pos] = recovered
+    candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
+    return accepted, candidates
 
 
 def _sample_per_row(
