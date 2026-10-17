@@ -19,6 +19,9 @@ def _both(monkeypatch, logits, temperature, top_k, top_p, min_p=None):
     monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "0")
     ref = _constrained_probs(logits, temperature, top_k, top_p, min_p)
     monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    # The reference breaks a top-p cut inside a tie group by its unstable sort;
+    # these comparisons pin the fast path to it, so they ask for that choice.
+    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "1")
     fast = _constrained_probs(logits, temperature, top_k, top_p, min_p)
     return ref, fast
 
@@ -272,3 +275,60 @@ def test_a_seeded_row_is_deterministic_and_independent_of_other_rows(monkeypatch
 
 
 # endregion
+
+
+def _no_reference(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a tie-cut row took the full-vocabulary sort")
+
+    monkeypatch.setattr(spec_accept, "_reference_top_k_top_p", refuse)
+
+
+def test_tie_cut_keeps_lowest_ids_without_a_full_sort(monkeypatch):
+    # Six equal logits at the top, and a top-p that cuts inside them.
+    logits = torch.randn(1, 1, V, generator=torch.Generator().manual_seed(3))
+    tied = torch.tensor([900, 7, 3000, 41, 2, 77])
+    logits[0, 0, tied] = 8.0
+    temperature = torch.ones(1)
+    top_k = torch.tensor([20], dtype=torch.int32)
+    top_p = torch.tensor([0.5])
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "0")
+    ref = _constrained_probs(logits, temperature, top_k, top_p)
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
+    _no_reference(monkeypatch)
+    fast = _constrained_probs(logits, temperature, top_k, top_p)
+    kept = (fast[0, 0] > 0).nonzero().squeeze(1).tolist()
+    # The cut kept as many members as the reference did, the lowest ids.
+    n = int((ref > 0).sum())
+    assert 1 <= n < 6
+    assert kept == sorted(tied.tolist())[:n]
+    assert torch.allclose(fast.sum(), torch.tensor(1.0))
+    assert torch.allclose(fast[fast > 0].sort().values, ref[ref > 0].sort().values)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_bf16_rows_need_no_full_sort_and_keep_the_reference_masses(monkeypatch, seed):
+    g = torch.Generator().manual_seed(seed)
+    logits = (torch.randn(4, 4, 50000, generator=g) * 3).to(torch.bfloat16)
+    logits[..., :40] += torch.randint(5, 12, (4, 4, 40), generator=g).to(
+        torch.bfloat16
+    )
+    temperature = torch.tensor([0.6, 1.0, 0.6, 1.0])
+    top_k = torch.full((4,), 20, dtype=torch.int32)
+    top_p = torch.full((4,), 0.95)
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "0")
+    ref = _constrained_probs(logits, temperature, top_k, top_p)
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
+    _no_reference(monkeypatch)
+    fast = _constrained_probs(logits, temperature, top_k, top_p)
+    # Same probability values per position; only which equal-logit token
+    # holds one can differ.
+    assert torch.allclose(
+        fast.sort(dim=-1).values[..., -64:],
+        ref.sort(dim=-1).values[..., -64:],
+        rtol=1e-6,
+        atol=1e-9,
+    )
+    assert torch.equal((fast > 0).sum(-1), (ref > 0).sum(-1))

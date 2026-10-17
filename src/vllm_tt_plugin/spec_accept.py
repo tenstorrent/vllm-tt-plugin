@@ -611,6 +611,20 @@ def _fast_enabled() -> bool:
     return os.environ.get("VLLM_TT_SPEC_FAST_TOPK", "1") != "0"
 
 
+def _tie_exact() -> bool:
+    """True when a top-p cut inside a tie group must follow the reference sort.
+
+    The reference sort is unstable, so which members of a tie group survive a
+    top-p cut is an accident of the sort. Matching it needs a full-vocabulary
+    sort (about 20 ms per position on the host), and bf16 logits tie often
+    enough that most live steps paid it. Off by default: the cut then keeps
+    the lowest token ids of the group. The kept probabilities are the same
+    values as the reference's, and only which of the equal-logit tokens holds
+    them can differ. Set VLLM_TT_SPEC_TIE_EXACT=1 for the reference's choice.
+    """
+    return os.environ.get("VLLM_TT_SPEC_TIE_EXACT", "0") == "1"
+
+
 def _constrained_probs(
     target_logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -852,6 +866,13 @@ def _constrained_table(
         k_f = k[ids].to(torch.long)
         cand = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
         vals, idx = torch.topk(sub, cand, dim=-1)
+        if not _tie_exact():
+            # A fixed tie order: value descending, token id ascending. The
+            # top-p cut below then drops the highest ids of a tie group first.
+            by_id = idx.argsort(dim=1)
+            idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
+            vals, by_value = vals.sort(dim=1, descending=True, stable=True)
+            idx = idx.gather(1, by_value)
         vals = vals.to(torch.float32) / temp[ids].unsqueeze(1)
         kth = vals.gather(1, (k_f - 1).unsqueeze(1))
         keep = vals >= kth
@@ -866,13 +887,14 @@ def _constrained_table(
             cum = torch.cumsum(vals.softmax(dim=-1).flip(-1), dim=-1).flip(-1)
             drop = cum <= (1 - p_f).unsqueeze(1)
             drop[:, 0] = False
-            # The reference sort is not stable, so when the cut falls inside
-            # a group of equal logits it keeps an arbitrary member of the
-            # group. Such a row takes the reference path to match it.
-            kept = (~drop).sum(dim=1, keepdim=True)
-            nxt = vals.gather(1, kept.clamp(max=cand - 1))
-            last = vals.gather(1, kept - 1)
-            overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
+            if _tie_exact():
+                # The reference sort is not stable, so when the cut falls
+                # inside a group of equal logits it keeps an arbitrary member
+                # of the group. Such a row takes the reference path to match.
+                kept = (~drop).sum(dim=1, keepdim=True)
+                nxt = vals.gather(1, kept.clamp(max=cand - 1))
+                last = vals.gather(1, kept - 1)
+                overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
             vals = vals.masked_fill(drop, float("-inf"))
         ok = ~overflow
         if bool(ok.any()):
