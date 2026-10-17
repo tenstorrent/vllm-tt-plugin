@@ -69,6 +69,7 @@ so synthetic distributions are sufficient to exercise the acceptance
 arithmetic.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -625,24 +626,114 @@ def _constrained_probs(
         )
         logits = logits.masked_fill(probs < threshold, float("-inf"))
 
-    if top_k is not None or top_p is not None:
-        # Deferred: vllm.v1.sample.ops resolves current_platform at import
-        # time, which loads this plugin, so importing it at module scope from
-        # inside the plugin is a cycle. The pytorch entry point is named
-        # directly rather than the dispatching apply_top_k_top_p, which would
-        # route to Triton on a machine that has it and to torch here, and
-        # the two are not required to break ties identically.
-        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+    if top_k is None and top_p is None:
+        return logits.softmax(dim=-1, dtype=torch.float32)
 
-        flat = logits.reshape(rows * width, vocab)
-        flat = apply_top_k_top_p_pytorch(
-            flat,
-            None if top_k is None else _expand_to_columns(top_k, width),
-            None if top_p is None else _expand_to_columns(top_p, width),
+    flat = logits.reshape(rows * width, vocab)
+    k_flat = None if top_k is None else _expand_to_columns(top_k, width)
+    p_flat = None if top_p is None else _expand_to_columns(top_p, width)
+    if os.environ.get("VLLM_TT_SPEC_FAST_TOPK", "1") != "0":
+        probs = _fast_top_k_top_p_probs(flat, k_flat, p_flat)
+        return probs.reshape(rows, width, vocab)
+    return _reference_top_k_top_p(flat, k_flat, p_flat).reshape(
+        rows, width, vocab
+    ).softmax(dim=-1, dtype=torch.float32)
+
+
+def _reference_top_k_top_p(
+    flat: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    # Deferred: vllm.v1.sample.ops resolves current_platform at import
+    # time, which loads this plugin, so importing it at module scope from
+    # inside the plugin is a cycle. The pytorch entry point is named
+    # directly rather than the dispatching apply_top_k_top_p, which would
+    # route to Triton on a machine that has it and to torch here, and
+    # the two are not required to break ties identically.
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    return apply_top_k_top_p_pytorch(flat, k, p)
+
+
+# Largest top_k the fast path serves, and the extra candidates it keeps so
+# that ties at the k-th value are seen. A row whose ties overflow the margin
+# takes the reference path.
+_FAST_TOPK_MAX = 1024
+_FAST_TOPK_MARGIN = 64
+
+
+def _fast_top_k_top_p_probs(
+    flat: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """Probabilities after top-k then top-p, without a full-vocab sort.
+
+    Same masks as ``apply_top_k_top_p_pytorch`` followed by a softmax: top-k
+    keeps every logit ``>= `` the k-th largest (ties kept), then top-p drops
+    the ascending-cumsum prefix ``<= 1 - p`` but always keeps the largest. Both
+    are evaluated on the top ``k_max + margin`` candidates only, which holds
+    every survivor of top-k. Rows the candidates cannot decide (top-k off or
+    above the cap with top-p active, tie overflow) use the reference path.
+    ``flat`` is not modified.
+    """
+    n, vocab = flat.shape
+    off = torch.zeros(n, dtype=torch.bool)
+    k_on = off if k is None else (k > 0) & (k < vocab)
+    p_on = off if p is None else p < 1.0
+    # Rows with nothing to filter need no work at all.
+    active = k_on | p_on
+    fast = off if k is None else k_on & (k <= _FAST_TOPK_MAX)
+    fallback = active & ~fast
+
+    probs = torch.empty_like(flat)
+    idle = ~active
+    if bool(idle.any()):
+        probs[idle] = flat[idle].softmax(dim=-1, dtype=torch.float32)
+
+    if bool(fast.any()):
+        rows_f = fast.nonzero().squeeze(1)
+        sub = flat[rows_f] if rows_f.numel() != n else flat
+        k_f = k[rows_f].to(torch.long)
+        width = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
+        vals, idx = torch.topk(sub, width, dim=-1)
+        kth = vals.gather(1, (k_f - 1).unsqueeze(1))
+        keep = vals >= kth
+        # Candidates cannot show how many logits tie with the k-th beyond
+        # the last one they hold, unless that tie is -inf (probability 0).
+        overflow = (vals[:, -1:] >= kth) & (kth > float("-inf"))
+        overflow = overflow.squeeze(1) & (width < vocab)
+        vals = vals.masked_fill(~keep, float("-inf"))
+        if p is not None:
+            p_f = p[rows_f]
+            # Ascending cumsum of the reference is the reversed descending one.
+            pr = vals.softmax(dim=-1)
+            cum = torch.cumsum(pr.flip(-1), dim=-1).flip(-1)
+            # cum[j] is the sum of entries at or below j in ascending order.
+            drop = cum <= (1 - p_f).unsqueeze(1)
+            drop[:, 0] = False
+            # The reference sort is not stable, so when the cut falls inside
+            # a group of equal logits it keeps an arbitrary member of the
+            # group. Such a row takes the reference path to match it.
+            kept = (~drop).sum(dim=1, keepdim=True)
+            nxt = vals.gather(1, kept.clamp(max=width - 1))
+            last = vals.gather(1, kept - 1)
+            overflow = overflow | ((kept < width) & (nxt == last)).squeeze(1)
+            vals = vals.masked_fill(drop, float("-inf"))
+        sub_probs = torch.zeros_like(sub)
+        sub_probs.scatter_(1, idx, vals.softmax(dim=-1, dtype=torch.float32))
+        if bool(overflow.any()):
+            fallback = fallback.clone()
+            fallback[rows_f[overflow]] = True
+        ok = ~overflow
+        probs[rows_f[ok]] = sub_probs[ok]
+
+    if bool(fallback.any()):
+        rows_b = fallback.nonzero().squeeze(1)
+        out = _reference_top_k_top_p(
+            flat[rows_b].clone(),
+            None if k is None else torch.where(k_on, k, vocab)[rows_b],
+            None if p is None else p[rows_b],
         )
-        logits = flat.reshape(rows, width, vocab)
-
-    return logits.softmax(dim=-1, dtype=torch.float32)
+        probs[rows_b] = out.softmax(dim=-1, dtype=torch.float32)
+    return probs
 
 
 def _sample_per_row(
