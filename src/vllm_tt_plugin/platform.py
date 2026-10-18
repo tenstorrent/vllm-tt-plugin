@@ -250,7 +250,17 @@ def _apply_chunked_prefill_policy(
     # their positions. Only meaningful while prefill can be split, and vLLM
     # rejects the flag outright when one item exceeds the token budget, so it
     # stays off for every model that does not reach here.
-    scheduler_config.disable_chunked_mm_input = True
+    #
+    # Exception: a text-only checkpoint that upstream classifies as hybrid
+    # (e.g. Lfm2MoeForCausalLM) gets mamba_cache_mode="align" from core when
+    # prefix caching is on, and VllmConfig asserts chunked MM input stays
+    # allowed in that mode. The flag only governs multimodal items, so it is
+    # a no-op for such a model; not setting it keeps prefix caching usable.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    text_only_mamba_align = getattr(
+        cache_config, "mamba_cache_mode", "none"
+    ) == "align" and not getattr(vllm_config.model_config, "is_multimodal_model", False)
+    scheduler_config.disable_chunked_mm_input = not text_only_mamba_align
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
