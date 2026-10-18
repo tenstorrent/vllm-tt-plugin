@@ -1023,6 +1023,8 @@ class TTModelRunner:
     # Multimodal fields every image model gets, even when a processor does not
     # emit them, so adapters that read them positionally keep their keys.
     _MM_BASE_FIELDS = ("pixel_values", "image_grid_thw")
+    # Per-item placeholder ranges (vLLM ``mm_position``), after the processor fields.
+    _MM_PLACEHOLDER_FIELDS = ("mm_placeholder_offsets", "mm_placeholder_lengths")
 
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
@@ -1079,6 +1081,11 @@ class TTModelRunner:
                     if key not in fields:
                         fields.append(key)
 
+        # Each item's placeholder range in its prompt, so a model that prefills in
+        # chunks can tell which items the current chunk covers (an item whose
+        # placeholders lie past the chunk end has no slots yet). Appended after
+        # the processor fields so positional readers of those are unchanged.
+        fields = fields + list(self._MM_PLACEHOLDER_FIELDS)
         multi_modal_kwargs: dict[str, Any] = {key: [] for key in fields}
 
         # The model input tensors are built in persistent batch order, so
@@ -1098,11 +1105,18 @@ class TTModelRunner:
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
                 item = mm_feature.data
+                position = getattr(mm_feature, "mm_position", None)
+                offset = getattr(position, "offset", None)
+                length = getattr(position, "length", None)
                 # With prefix caching, an item whose tokens are fully inside the
                 # cached prefix arrives with its tensor payload stripped; M-RoPE
                 # models keep the CPU-side grid so positions can still be built.
                 for key in fields:
-                    if item is None or key not in item:
+                    if key == "mm_placeholder_offsets":
+                        per_field[key].append(None if offset is None else int(offset))
+                    elif key == "mm_placeholder_lengths":
+                        per_field[key].append(None if length is None else int(length))
+                    elif item is None or key not in item:
                         per_field[key].append(None)
                     else:
                         per_field[key].append(item[key].data)

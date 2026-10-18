@@ -26,7 +26,11 @@ def _runner(requests_by_id, req_ids):
             None, mm_feature
         ),
         _MM_BASE_FIELDS=TTModelRunner._MM_BASE_FIELDS,
+        _MM_PLACEHOLDER_FIELDS=TTModelRunner._MM_PLACEHOLDER_FIELDS,
     )
+
+
+PLACEHOLDER_FIELDS = list(TTModelRunner._MM_PLACEHOLDER_FIELDS)
 
 
 def test_qwen_shaped_items_keep_the_two_base_keys():
@@ -45,7 +49,7 @@ def test_qwen_shaped_items_keep_the_two_base_keys():
         ["text", "img"],
     )
     out = TTModelRunner._gather_multi_modal_inputs(runner)
-    assert list(out) == ["pixel_values", "image_grid_thw"]
+    assert list(out) == ["pixel_values", "image_grid_thw"] + PLACEHOLDER_FIELDS
     assert out["pixel_values"] == [None, [pv]]
     assert out["image_grid_thw"] == [None, [grid]]
 
@@ -77,7 +81,10 @@ def test_extra_processor_fields_are_forwarded_by_name():
         ["a", "b"],
     )
     out = TTModelRunner._gather_multi_modal_inputs(runner)
-    assert list(out) == ["pixel_values", "image_grid_thw", "pixel_position_ids"]
+    assert (
+        list(out)
+        == ["pixel_values", "image_grid_thw", "pixel_position_ids"] + PLACEHOLDER_FIELDS
+    )
     assert out["pixel_values"] == [[pv0, pv1], None]
     assert out["image_grid_thw"] == [[None, None], None]
     assert out["pixel_position_ids"] == [[pos0, pos1], None]
@@ -122,3 +129,24 @@ def test_unknown_item_kinds_are_rejected():
     runner = _runner({"p": SimpleNamespace(mm_features=[feature])}, ["p"])
     with pytest.raises(NotImplementedError):
         TTModelRunner._gather_multi_modal_inputs(runner)
+
+
+def test_each_items_placeholder_range_is_forwarded_after_the_processor_fields():
+    pv0, pv1 = torch.zeros(5, 3), torch.zeros(7, 3)
+    with_range = _feature({"pixel_values": _field(pv0)})
+    with_range.mm_position = SimpleNamespace(offset=12, length=270, is_embed=None)
+    stripped = _feature(None)  # inside the cached prefix: payload gone, range kept
+    stripped.mm_position = SimpleNamespace(offset=300, length=256, is_embed=None)
+    no_range = _feature({"pixel_values": _field(pv1)})
+    runner = _runner(
+        {
+            "a": SimpleNamespace(mm_features=[with_range, stripped, no_range]),
+            "b": SimpleNamespace(mm_features=[]),
+        },
+        ["a", "b"],
+    )
+    out = TTModelRunner._gather_multi_modal_inputs(runner)
+    assert list(out)[-2:] == PLACEHOLDER_FIELDS
+    assert out["pixel_values"] == [[pv0, None, pv1], None]
+    assert out["mm_placeholder_offsets"] == [[12, 300, None], None]
+    assert out["mm_placeholder_lengths"] == [[270, 256, None], None]
