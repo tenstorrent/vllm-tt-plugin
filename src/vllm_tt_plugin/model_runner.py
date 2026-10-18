@@ -56,6 +56,7 @@ from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
+    FULL_PROMPT_CHUNKED_MODEL_TYPES,
     TTModelInput,
     TTSamplingParams,
     slice_tt_sampling_params,
@@ -159,6 +160,12 @@ class TTModelRunner:
         # https://github.com/tenstorrent/tt-metal/issues/40810
         self.supports_topk_logprobs = (
             self.model_config.hf_config.model_type == "gpt_oss"
+        )
+        # Chunked prefill passes the whole prompt (not just the prefix up to
+        # the chunk's end) to the generators that pipeline the next chunk's
+        # host inputs behind the device (DeepSeek-V4.1's).
+        self.full_prompt_chunked = (
+            self.model_config.hf_config.model_type in FULL_PROMPT_CHUNKED_MODEL_TYPES
         )
 
         logger.info(
@@ -1016,6 +1023,7 @@ class TTModelRunner:
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        prompt_total_lens: torch.Tensor | None = None
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
             # cached on the worker", not necessarily "decode". During a prefill
@@ -1077,6 +1085,12 @@ class TTModelRunner:
                 prompt_lens < input_batch.num_tokens[req_indices]
             )
             max_prefill_tokens = int(prompt_lens.max())
+            if self.full_prompt_chunked:
+                # the whole prompt of every row, its length per row (the
+                # generator still computes [start_pos, prompt_lens))
+                total_lens = input_batch.num_tokens[req_indices]
+                prompt_total_lens = torch.from_numpy(np.asarray(total_lens, dtype=np.int64))
+                max_prefill_tokens = max(max_prefill_tokens, int(total_lens.max()))
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
@@ -1300,6 +1314,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prompt_total_lens=prompt_total_lens,
         )
 
     def build_model_input(
@@ -1792,6 +1807,8 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        if model_input.prompt_total_lens is not None:
+            kwargs["prompt_total_lens"] = model_input.prompt_total_lens
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has

@@ -59,6 +59,12 @@ def slice_tt_sampling_params(
     )
 
 
+# HF ``model_type`` values whose generator takes the whole prompt in every
+# chunked-prefill call (``TTModelInput.prompt_total_lens``), so it can prepare
+# the next chunk's host inputs while the device runs this chunk.
+FULL_PROMPT_CHUNKED_MODEL_TYPES = {"deepseek_v41"}
+
+
 @dataclass(frozen=True)
 class TTModelInput:
     input_tokens: torch.Tensor
@@ -130,3 +136,7 @@ class TTModelInput:
     # sampled token, because more prompt tokens remain after this chunk.
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
+    # Chunked prefill with the whole prompt in ``input_tokens`` (the generators
+    # of ``FULL_PROMPT_CHUNKED_MODEL_TYPES``): each row's prompt length, so the
+    # generator can prepare the next chunk's host inputs while this one runs.
+    prompt_total_lens: torch.Tensor | None = None
