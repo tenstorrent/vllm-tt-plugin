@@ -29,6 +29,8 @@ negotiates that mode before scheduling any lane.
 from __future__ import annotations
 
 import copy
+import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -46,6 +48,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
+    is_tt_lane_prefill_group,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
@@ -259,6 +262,12 @@ class TTLaneCoordinator(SchedulerInterface):
     device rows and slots.
     """
 
+    # Lane-group prefill gather state (see __init__). Class-level defaults keep a
+    # coordinator a test builds without running __init__ in the capability-off state.
+    _lane_prefill_group: bool = False
+    _group_gather_ms: float = 0.0
+    _group_gather_start: float | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -289,6 +298,20 @@ class TTLaneCoordinator(SchedulerInterface):
         # the single negotiated mode, so per-lane instances would each see only
         # their own lane's work and disagree about when to interleave.
         self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
+        # Lane-group prefill gather: while SOME but not ALL lanes hold a new
+        # waiting prefill (and none is mid-chunks), prefer a decode step for up
+        # to TT_PREFILL_GROUP_GATHER_MS so a burst lands as one pure group
+        # instead of a lone B=1 step followed by a forever-partial remainder.
+        # Only bites when a decode exists to run; an idle server admits
+        # immediately (b1 latency untouched). 0 disables.
+        self._lane_prefill_group = is_tt_lane_prefill_group(vllm_config)
+        try:
+            self._group_gather_ms = float(
+                os.environ.get("TT_PREFILL_GROUP_GATHER_MS", "150")
+            )
+        except ValueError:
+            self._group_gather_ms = 150.0
+        self._group_gather_start: float | None = None
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -418,12 +441,37 @@ class TTLaneCoordinator(SchedulerInterface):
         bound and some lane holds a decode that a decode step can advance.
         """
         intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
+        if intent == 1 and self._wants_group_gather_decode():
+            return TTSchedulingMode.DECODE_ONLY
         if intent == 1 and self._decode_interleave.wants_decode_step(
             has_pending_prefill=True,
             has_running_decode=self._has_running_decode(),
         ):
             return TTSchedulingMode.DECODE_ONLY
         return TTSchedulingMode.from_prefill_intent(intent)
+
+    def _wants_group_gather_decode(self) -> bool:
+        """Hold prefill briefly while a lane group gathers (see __init__)."""
+        if not self._lane_prefill_group or self._group_gather_ms <= 0:
+            return False
+        if any(r.is_prefill_chunk for sched in self.lanes for r in sched.running):
+            self._group_gather_start = None
+            return False  # a partial prefill must advance; never hold it
+        lanes_with_new = sum(1 for sched in self.lanes if len(sched.waiting) > 0)
+        if lanes_with_new == 0 or lanes_with_new >= len(self.lanes):
+            self._group_gather_start = None
+            return False
+        if not self._has_running_decode():
+            self._group_gather_start = None
+            return False  # idle server: admit immediately
+        now = time.monotonic()
+        if self._group_gather_start is None:
+            self._group_gather_start = now
+            return True
+        if (now - self._group_gather_start) * 1000.0 < self._group_gather_ms:
+            return True
+        self._group_gather_start = None
+        return False
 
     def _schedule_all_lanes(
         self, forced_mode: TTSchedulingMode

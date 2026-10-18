@@ -10,6 +10,8 @@ N`` is folded into ``N`` in-process TT lanes by
 
 from types import SimpleNamespace
 
+import pytest
+
 # ``vllm`` must finish importing before any plugin module, otherwise vllm's own
 # platform resolution re-enters the plugin against a partially initialized
 # ``vllm.platforms``. No other import here pulls ``vllm`` in first.
@@ -150,3 +152,102 @@ def test_non_gpt_oss_model_not_converted(monkeypatch):
 
     assert config.parallel_config.data_parallel_size == 4
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
+
+
+def _capability_model_class(
+    name, *, folds, prefill_group=None, raises=False, as_callable=True
+):
+    """A stand-in model class declaring the lane fold in ``model_capabilities``."""
+
+    def _folds():
+        if raises:
+            raise RuntimeError("declaration exploded")
+        return folds
+
+    capabilities = {"folds_dp_into_lanes": _folds if as_callable else folds}
+    if prefill_group is not None:
+        capabilities["lane_prefill_group"] = (
+            (lambda: prefill_group) if as_callable else prefill_group
+        )
+    return type(name, (), {"model_capabilities": capabilities})
+
+
+def test_model_capability_folds_dp_into_lanes(monkeypatch):
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=32)
+
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("Gemma4Lanes", folds=True)
+    )
+
+    assert config.parallel_config.data_parallel_size == 1
+    assert tt_config.get_tt_data_parallel_size(config) == 4
+    assert tt_config.uses_tt_lane_coordinator(config)
+    assert config.scheduler_config.max_num_seqs == 128
+    assert tt_config.get_tt_per_lane_max_num_seqs(config) == 32
+    assert not tt_config.is_tt_lane_prefill_group(config)
+
+
+def test_plain_boolean_capabilities_fold_and_group(monkeypatch):
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=2, max_num_seqs=4)
+
+    tt_platform._convert_dp_to_lanes(
+        config,
+        _capability_model_class(
+            "PlainBooleans", folds=True, prefill_group=True, as_callable=False
+        ),
+    )
+
+    assert tt_config.get_tt_data_parallel_size(config) == 2
+    assert tt_config.is_tt_lane_prefill_group(config)
+
+
+def test_false_capability_keeps_standard_dp(monkeypatch):
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
+
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("FoldOff", folds=False)
+    )
+
+    assert config.parallel_config.data_parallel_size == 4
+    assert config.scheduler_config.max_num_seqs == 8
+    assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
+
+
+def test_raising_capability_fails_the_launch(monkeypatch):
+    """A broken declaration must not fall back to standard DP: that would run
+    the model in the wrong execution mode."""
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"DeclarationBroken\.model_capabilities\["
+        r"'folds_dp_into_lanes'\]",
+    ):
+        tt_platform._convert_dp_to_lanes(
+            config,
+            _capability_model_class("DeclarationBroken", folds=True, raises=True),
+        )
+
+    assert config.parallel_config.data_parallel_size == 4
+    assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
+
+
+def test_lane_prefill_group_capability_recorded(monkeypatch):
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=2, max_num_seqs=4)
+
+    tt_platform._convert_dp_to_lanes(
+        config, _capability_model_class("GroupOn", folds=True, prefill_group=True)
+    )
+
+    assert tt_config.get_tt_data_parallel_size(config) == 2
+    assert tt_config.is_tt_lane_prefill_group(config)

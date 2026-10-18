@@ -31,6 +31,7 @@ from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
+    store_tt_lane_prefill_group,
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
@@ -501,7 +502,35 @@ def _model_folds_dp_into_lanes(model_class) -> bool:
     """
     if _galaxy_generator_version() is not None:
         return True
+    # A model class declares the fold itself through
+    # ``model_capabilities["folds_dp_into_lanes"]`` (e.g. gemma4's Galaxy
+    # one-instance lanes), so an env-gated rail opts in without a plugin
+    # change per model.
+    if _model_capability_flag(model_class, "folds_dp_into_lanes"):
+        return True
     return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
+
+
+def _model_capability_flag(model_class, key: str) -> bool:
+    """A Boolean ``model_capabilities`` entry, or a zero-argument callable one.
+
+    The lane declarations may depend on the serving environment (an env-gated
+    rail), so a model may declare them as callables that the platform evaluates
+    at config time. A declaration that raises fails the launch: silently falling
+    back to standard DP would run the model in the wrong execution mode.
+    """
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    value = capabilities.get(key, False)
+    if callable(value):
+        try:
+            value = value()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{getattr(model_class, '__name__', model_class)}."
+                f"model_capabilities[{key!r}] raised while resolving the lane "
+                f"declaration: {exc}"
+            ) from exc
+    return bool(value)
 
 
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
@@ -573,6 +602,19 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     global_max_num_seqs = per_lane_max_num_seqs * lanes
 
     store_tt_lane_count(vllm_config, lanes)
+    # Optional capability: a model that prefills whole lane groups in one
+    # multi-pipe walk declares ``model_capabilities["lane_prefill_group"]``
+    # (Boolean or callable, like the fold). The lane schedulers then admit at
+    # most one new prefill per step and the coordinator gathers lanes briefly,
+    # so merged prefill steps arrive as pure groups. Model-agnostic: only the
+    # declaration and the lane fold are consulted.
+    if _model_capability_flag(model_class, "lane_prefill_group"):
+        store_tt_lane_prefill_group(vllm_config)
+        logger.info(
+            "Model %s declares lane-group prefill: capping new prefill "
+            "admissions at one per lane per step.",
+            getattr(model_class, "__name__", model_class),
+        )
     scheduler_config.max_num_seqs = global_max_num_seqs
     _collapse_parallel_config_to_single_process(parallel_config)
 
