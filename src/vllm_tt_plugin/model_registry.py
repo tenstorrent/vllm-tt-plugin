@@ -9,6 +9,7 @@ from vllm_tt_plugin.platform import (
     register_tt_models,
     register_tt_test_models,
 )
+from vllm_tt_plugin.video_guard import install_molmo2_video_guard
 
 __all__ = [
     "register_tt_models",
@@ -44,3 +45,6 @@ def register_tt_models_from_plugin() -> None:
     # launch fails upstream's async gate there after KV cache allocation.
     _install_tt_async_spec_method_patch()
     _install_torch_accelerator_cleanup_patch()
+    # The API server decodes request videos in-process, and some files make
+    # OpenCV segfault, taking the server down and orphaning the engine core.
+    install_molmo2_video_guard()
