@@ -54,7 +54,11 @@ _GALAXY_GENERATOR_VERSIONS = {
 
 # HF ``model_type`` values whose tt-metal generator accepts a ``chunk_start_idx``
 # prefill, i.e. the ones token-chunked prefill has been validated against.
-_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified"}
+# deepseek_v41: the V4.1 generator resumes a prefill at any multiple of its
+# chunk (``start_pos``) and joins the request into its decode slot at the
+# first decode step; ``TTScheduler`` keeps its chunks aligned
+# (``scheduler.ALIGNED_CHUNK_MODEL_TYPES``).
+_CHUNKED_PREFILL_MODEL_TYPES = {"gemma4", "gemma4_unified", "deepseek_v41"}
 
 
 def _apply_chunked_prefill_policy(vllm_config: "VllmConfig") -> None:

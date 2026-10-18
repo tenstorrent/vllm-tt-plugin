@@ -28,6 +28,12 @@ class TTSchedulingMode(Enum):
         raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
 
 
+# HF ``model_type`` values whose generator resumes a prefill only at a multiple
+# of the token budget (the V4.1 generator's chunk): ``_schedule_prefill_only``
+# admits one new prefill a step and advances a partial prefill alone.
+ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -81,6 +87,11 @@ class TTScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._forced_mode = TTSchedulingMode.DEFAULT
+        # see _schedule_prefill_only: the model types whose generator needs
+        # every chunk of a prompt to start at a multiple of the token budget
+        model_config = getattr(self.vllm_config, "model_config", None)
+        model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
+        self._aligned_chunks = model_type in ALIGNED_CHUNK_MODEL_TYPES
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -165,9 +176,33 @@ class TTScheduler(AsyncScheduler):
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        # Aligned chunks (``ALIGNED_CHUNK_MODEL_TYPES``, the V4.1 generator):
+        # a partial prefill advances alone (the waiting queues hidden), and a
+        # step with no partial prefill admits at most one new request, so every
+        # chunk of a prompt starts at a multiple of the token budget and no
+        # prompt is split at the remainder another prompt left of it.
+        aligned = self._aligned_chunks
+        saved_waiting = saved_skipped = None
+        if aligned:
+            if partial_prefills:
+                saved_waiting = self.waiting
+                saved_skipped = getattr(self, "skipped_waiting", None)
+                self.waiting = create_request_queue(self.policy)
+                if saved_skipped is not None:
+                    self.skipped_waiting = create_request_queue(self.policy)
+            else:
+                self.max_num_running_reqs = min(self.max_num_running_reqs, 1)
         try:
             result = super().schedule()
         finally:
+            if saved_waiting is not None:
+                if self.waiting:
+                    saved_waiting.prepend_requests(self.waiting)
+                self.waiting = saved_waiting
+                if saved_skipped is not None:
+                    if self.skipped_waiting:
+                        saved_skipped.prepend_requests(self.skipped_waiting)
+                    self.skipped_waiting = saved_skipped
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
