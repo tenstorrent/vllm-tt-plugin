@@ -17,6 +17,8 @@
 opencv-python-headless==4.11.0.86
 numpy>=1.24.4,<2
 
+# CI test branch (Qwen3.8-Flash-Next: qwen4_exp is absent in transformers 5.14.x): ceiling raised to
+# <5.20.0; the bring-up validated vLLM 0.30.0 with transformers 5.19.0.
 # Retarget this ceiling when the pinned vLLM moves; do not just delete it. common.txt
 # declares no upper bound, so an uncapped install resolves the newest transformers
 # release, which is validated against neither the pinned vLLM nor the tt-metal env
@@ -26,4 +28,4 @@ numpy>=1.24.4,<2
 # fixed that read (vllm-project/vllm#49797), so the cap now holds only until a newer
 # release is validated. The floor restates vLLM's own: --override replaces a
 # requirement instead of intersecting it.
-transformers>=5.10.4,<5.15.0
+transformers>=5.10.4,<5.20.0
