@@ -71,3 +71,14 @@ def test_install_wraps_molmo2_backend_once(monkeypatch):
         assert backend.__dict__["load_bytes"] is wrapped
     finally:
         backend.load_bytes = original
+
+
+def test_decode_that_exceeds_the_timeout_is_killed(monkeypatch):
+    monkeypatch.setattr(
+        video_guard,
+        "_WORKER_ARGV",
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    pool = video_guard._Pool(1)
+    with pytest.raises(ValueError, match="took longer than 1s"):
+        pool.run(b"abc", 4, {}, timeout=1)

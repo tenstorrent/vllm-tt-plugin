@@ -18,6 +18,7 @@ import contextlib
 import os
 import pickle
 import queue
+import resource
 import struct
 import subprocess
 import sys
@@ -53,6 +54,7 @@ def _recv(stream):
 class _Worker:
     def __init__(self) -> None:
         env = dict(os.environ, **{_WORKER_ENV: "1"})
+        self.timed_out = False
         self.proc = subprocess.Popen(
             _WORKER_ARGV,
             stdin=subprocess.PIPE,
@@ -61,13 +63,17 @@ class _Worker:
         )
 
     def run(self, data, num_frames, kwargs, timeout):
-        timer = threading.Timer(timeout, self.kill)
+        timer = threading.Timer(timeout, self._expire)
         timer.start()
         try:
             _send(self.proc.stdin, (data, num_frames, kwargs))
             status, value = _recv(self.proc.stdout)
         except (EOFError, BrokenPipeError, OSError):
             code = self.proc.wait()
+            if self.timed_out:
+                raise ValueError(
+                    f"Video decoder crashed: decoding took longer than {timeout:g}s"
+                ) from None
             raise ValueError(
                 f"Video decoder crashed (exit code {code}); the video is "
                 "corrupt or unsupported"
@@ -77,6 +83,10 @@ class _Worker:
         if status == "err":
             raise value
         return value
+
+    def _expire(self) -> None:
+        self.timed_out = True
+        self.kill()
 
     def kill(self) -> None:
         with contextlib.suppress(OSError):
@@ -140,6 +150,11 @@ def install_molmo2_video_guard() -> None:
 
 
 def _worker_main() -> None:
+    # A decoder segfault must end this process immediately: writing a core file
+    # of a multi-GB helper (or piping it to a crash handler) stalls the exit for
+    # minutes, and the parent only sees the failure once the pipe closes. A
+    # limit of 0 still runs a piped core_pattern handler (apport); 1 skips it.
+    resource.setrlimit(resource.RLIMIT_CORE, (1, 1))
     # Keep the protocol pipe private so library output on fd 1 cannot corrupt it.
     out = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)
