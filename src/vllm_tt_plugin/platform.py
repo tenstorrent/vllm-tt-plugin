@@ -1290,6 +1290,12 @@ TT_QWEN3_TTS_TALKER_TARGET = (
     "models.demos.audio.qwen3_tts.tt.generator_vllm:"
     "Qwen3TTSTalkerForConditionalGeneration"
 )
+# Qwen3-TTS Code2Wav runs vLLM-Omni's PyTorch decoder on the host until a TT
+# decoder exists.
+TT_QWEN3_TTS_CODE2WAV_ARCH = "TTQwen3TTSCode2Wav"
+TT_QWEN3_TTS_CODE2WAV_TARGET = (
+    "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav:Qwen3TTSCode2Wav"
+)
 
 
 def register_tt_models(register_test_models=False) -> None:
@@ -1391,6 +1397,10 @@ def register_tt_models(register_test_models=False) -> None:
     # Qwen3-TTS talker: stage 0 (AR) of vLLM-Omni's Qwen3-TTS pipeline.
     _register_model_if_missing(
         ModelRegistry, TT_QWEN3_TTS_TALKER_ARCH, TT_QWEN3_TTS_TALKER_TARGET
+    )
+    # Qwen3-TTS Code2Wav: stage 1 (generation).
+    _register_model_if_missing(
+        ModelRegistry, TT_QWEN3_TTS_CODE2WAV_ARCH, TT_QWEN3_TTS_CODE2WAV_TARGET
     )
 
     # Qwen3.5 - Text

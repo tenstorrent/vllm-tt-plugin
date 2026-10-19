@@ -30,11 +30,16 @@ def register() -> None:
 
     from vllm_tt_plugin.omni.pipelines import register_tt_pipelines
     from vllm_tt_plugin.platform import (
+        TT_QWEN3_TTS_CODE2WAV_ARCH,
+        TT_QWEN3_TTS_CODE2WAV_TARGET,
         TT_QWEN3_TTS_TALKER_ARCH,
         TT_QWEN3_TTS_TALKER_TARGET,
     )
 
     OmniModelRegistry.register_model(
         TT_QWEN3_TTS_TALKER_ARCH, TT_QWEN3_TTS_TALKER_TARGET
+    )
+    OmniModelRegistry.register_model(
+        TT_QWEN3_TTS_CODE2WAV_ARCH, TT_QWEN3_TTS_CODE2WAV_TARGET
     )
     register_tt_pipelines()

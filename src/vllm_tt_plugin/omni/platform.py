@@ -16,6 +16,7 @@ from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_tt_plugin.platform import TTPlatform
 
 TT_OMNI_AR_WORKER_CLS = "vllm_tt_plugin.omni.worker.TTOmniARWorker"
+TT_OMNI_GENERATION_WORKER_CLS = "vllm_tt_plugin.omni.worker.TTOmniGenerationWorker"
 
 
 class TTOmniPlatform(OmniPlatform, TTPlatform):
@@ -27,10 +28,7 @@ class TTOmniPlatform(OmniPlatform, TTPlatform):
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
-        raise NotImplementedError(
-            "TT has no vLLM-Omni generation worker yet, so a generation stage (such "
-            "as Qwen3-TTS Code2Wav) cannot run on TT"
-        )
+        return TT_OMNI_GENERATION_WORKER_CLS
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:

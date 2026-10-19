@@ -15,6 +15,7 @@ import vllm_tt_plugin.platform as tt_platform  # noqa: E402
 from vllm_tt_plugin.omni import entrypoints  # noqa: E402
 from vllm_tt_plugin.omni.platform import (  # noqa: E402
     TT_OMNI_AR_WORKER_CLS,
+    TT_OMNI_GENERATION_WORKER_CLS,
     TTOmniPlatform,
 )
 
@@ -57,10 +58,11 @@ def test_a_stage_is_confined_through_tt_visible_devices(
     assert os.environ["TT_VISIBLE_DEVICES"] == "1"
 
 
-def test_ar_stages_run_the_tt_worker_and_generation_stages_are_refused():
+def test_ar_and_generation_stages_run_their_tt_workers():
     assert TTOmniPlatform.get_omni_ar_worker_cls() == TT_OMNI_AR_WORKER_CLS
-    with pytest.raises(NotImplementedError, match="no vLLM-Omni generation worker"):
-        TTOmniPlatform.get_omni_generation_worker_cls()
+    assert TTOmniPlatform.get_omni_generation_worker_cls() == (
+        TT_OMNI_GENERATION_WORKER_CLS
+    )
 
 
 def test_devices_are_counted_from_the_driver_nodes(monkeypatch: pytest.MonkeyPatch):
@@ -72,7 +74,7 @@ def test_devices_are_counted_from_the_driver_nodes(monkeypatch: pytest.MonkeyPat
     assert TTOmniPlatform.get_device_count() == 2
 
 
-def test_the_talker_stage_architecture_is_registered(monkeypatch: pytest.MonkeyPatch):
+def test_the_tts_stage_architectures_are_registered(monkeypatch: pytest.MonkeyPatch):
     from vllm.model_executor.models.registry import ModelRegistry
 
     registered: dict[str, str] = {}
@@ -91,9 +93,12 @@ def test_the_talker_stage_architecture_is_registered(monkeypatch: pytest.MonkeyP
         "models.demos.audio.qwen3_tts.tt.generator_vllm:"
         "Qwen3TTSTalkerForConditionalGeneration"
     )
+    assert registered["TTQwen3TTSCode2Wav"] == (
+        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav:Qwen3TTSCode2Wav"
+    )
 
 
-def test_the_omni_plugin_registers_the_talker_where_omni_validates_it(
+def test_the_omni_plugin_registers_the_tts_stages_where_omni_validates_them(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_omni.config import pipeline_registry
@@ -110,6 +115,9 @@ def test_the_omni_plugin_registers_the_talker_where_omni_validates_it(
     entrypoints.register()
 
     assert registered == {
-        tt_platform.TT_QWEN3_TTS_TALKER_ARCH: tt_platform.TT_QWEN3_TTS_TALKER_TARGET
+        tt_platform.TT_QWEN3_TTS_TALKER_ARCH: tt_platform.TT_QWEN3_TTS_TALKER_TARGET,
+        tt_platform.TT_QWEN3_TTS_CODE2WAV_ARCH: (
+            tt_platform.TT_QWEN3_TTS_CODE2WAV_TARGET
+        ),
     }
     assert "tt_qwen3_tts_talker" in pipeline_registry.OMNI_PIPELINES
