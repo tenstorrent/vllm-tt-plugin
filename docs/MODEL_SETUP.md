@@ -105,6 +105,14 @@ For per-layer specifications, use names containing `layers.<index>`, such as
 groups. `UniformTypeKVCacheSpecs` can carry different per-layer shapes within
 one group. The worker advertises only the vLLM `LBNHC` cache layout.
 
+A stage with no token KV cache, such as an audio decoder, uses a `TTWorker`
+subclass that sets `uses_token_kv_cache = False`. That worker sizes no KV pool
+and reports an empty KV specification. vLLM then treats the stage as
+attention-free: it skips `determine_available_memory`, which returns `0`, and
+passes the runner a KV cache config with no groups. `TTModelRunner` refuses
+that config, so the subclass also names a runner, in `model_runner_cls`, that
+accepts it.
+
 Sources: `get_num_available_blocks_tt`, `TTWorker.get_kv_cache_spec`, and
 `TTWorker.determine_available_memory` in [worker.py](../src/vllm_tt_plugin/worker.py).
 

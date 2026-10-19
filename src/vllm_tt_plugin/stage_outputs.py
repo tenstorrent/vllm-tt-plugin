@@ -5,17 +5,21 @@
 A model that declares ``supports_stage_outputs`` implements
 ``pop_stage_outputs()``. The runner calls it right after every
 ``decode_forward``, so each step's outputs stay attached to the submission
-that produced them, whatever the async overlap. It returns one entry per
-submitted decode row: the frame this forward completed for that row's
-request, or ``None``. The runner tags each frame with its request and
-``frame_index`` and publishes them on the step's ``ModelRunnerOutput``.
+that produced them. It returns one entry per submitted decode row: the stage
+frame this forward completed for that row's request, or ``None``. The runner
+tags each stage frame with its request and ``frame_index`` and publishes them on
+the step's ``ModelRunnerOutput``.
+
+"Stage frame" is the model's per-request payload, distinct from the output
+frames ``TTScheduler`` counts per published step.
 
 ``frame_index`` comes from the row's decode position: the step that consumes
-output token ``k`` (position ``num_prompt_tokens + k``) completes frame ``k``.
-Prefill completes no frame and is never asked.
+output token ``k`` (position ``num_prompt_tokens + k``) completes stage frame
+``k``. Positions are current because async decode is refused for these models.
+Prefill completes no stage frame and is never asked.
 """
 
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -89,13 +93,3 @@ def set_tt_stage_outputs(
 def get_tt_stage_outputs(runner_output: "ModelRunnerOutput") -> dict[str, TTStageFrame]:
     """The frames a step published, by request ID; empty when it published none."""
     return dict(getattr(runner_output, _TT_STAGE_OUTPUTS_ATTR, {}))
-
-
-def drop_tt_stage_outputs(
-    runner_output: "ModelRunnerOutput", req_ids: Collection[str]
-) -> None:
-    """Withdraw published frames of requests whose output must not reach a consumer."""
-    frames = getattr(runner_output, _TT_STAGE_OUTPUTS_ATTR, None)
-    if frames:
-        for req_id in req_ids:
-            frames.pop(req_id, None)

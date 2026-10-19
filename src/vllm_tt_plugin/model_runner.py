@@ -57,8 +57,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
-    CachedRequestState,
     InputBatch,
+    TTCachedRequestState,
     TTLaneInputBatch,
     apply_cached_req_state_update,
     build_cached_request_state,
@@ -82,7 +82,7 @@ from vllm_tt_plugin.spec_decode import (
     DraftOutput,
     accept_greedy_drafts,
 )
-from vllm_tt_plugin.stage_outputs import set_tt_stage_outputs
+from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -244,11 +244,6 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
 
 
 class TTModelRunner:
-    # Resolved from ``supports_stage_inputs`` in ``__init__``; off by default.
-    supports_stage_inputs: bool = False
-    # Resolved from ``supports_stage_outputs`` in ``__init__``; off by default.
-    supports_stage_outputs: bool = False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -374,7 +369,7 @@ class TTModelRunner:
         # they don't need to be re-sent every scheduling step. For requests
         # that have been scheduled before, only the diff is received from
         # the scheduler output.
-        self.requests: dict[str, CachedRequestState] = {}
+        self.requests: dict[str, TTCachedRequestState] = {}
 
         # Cache the arange needed for unpacking structured output bitmask
         self.structured_output_arange = torch.arange(0, 32)
@@ -969,7 +964,7 @@ class TTModelRunner:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             self.requests[req_id] = build_cached_request_state(
-                new_req_data, accepts_stage_inputs=self.supports_stage_inputs
+                new_req_data, supports_stage_inputs=self.supports_stage_inputs
             )
             req_ids_to_add.append(req_id)
 
@@ -3088,7 +3083,7 @@ class TTModelRunner:
                 )
 
         if TTModelRunner._uses_async_scheduler(self):
-            output = self.defer_state_apply_and_build_runner_output(
+            return self.defer_state_apply_and_build_runner_output(
                 sampled_token_ids,
                 logprobs,
                 req_ids=(
@@ -3097,18 +3092,20 @@ class TTModelRunner:
                     else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
                 ),
             )
-            if fwd.decode_submission is not None:
-                set_tt_stage_outputs(output, fwd.decode_submission.stage_outputs)
-            return output
+        # Stage-output models run only here: they cannot declare async decode, so
+        # their scheduling is never async.
         output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
             # Only a prefill build can filter rows. Decode rows are the front-packed
             # batch rows, so it keeps the vectorized state write.
             req_ids=row_req_ids if is_prefill else None,
+            stage_outputs=(
+                fwd.decode_submission.stage_outputs
+                if fwd.decode_submission is not None
+                else None
+            ),
         )
-        if fwd.decode_submission is not None:
-            set_tt_stage_outputs(output, fwd.decode_submission.stage_outputs)
         if not is_prefill and self._num_speculative_tokens:
             self.propose_after_plain_step(
                 fwd.model_input, sampled_token_ids, row_req_ids
@@ -3802,6 +3799,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        stage_outputs: dict[str, TTStageFrame] | None = None,
     ) -> ModelRunnerOutput:
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         output_req_ids = (
@@ -3829,7 +3827,7 @@ class TTModelRunner:
             [int(token_id) for token_id in row] for row in sampled_token_ids_np.tolist()
         ]
 
-        return ModelRunnerOutput(
+        output = ModelRunnerOutput(
             req_ids=output_req_ids,
             req_id_to_index=output_req_id_to_index,
             sampled_token_ids=sampled_token_id_lists,
@@ -3837,6 +3835,8 @@ class TTModelRunner:
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )
+        set_tt_stage_outputs(output, stage_outputs)
+        return output
 
     def _apply_sampled_tokens_to_state(
         self,
@@ -3981,6 +3981,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        stage_outputs: dict[str, TTStageFrame] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -3996,6 +3997,7 @@ class TTModelRunner:
             logprobs=logprobs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            stage_outputs=stage_outputs,
         )
 
     def _enqueue_deferred_state_apply(

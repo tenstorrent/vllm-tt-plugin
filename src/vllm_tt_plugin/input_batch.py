@@ -57,14 +57,28 @@ LOGPROBS_NONE_SENTINEL = -2
 
 @dataclass
 class TTCachedRequestState(CachedRequestState):
-    # A pipeline stage's per-request input (vLLM-Omni's ``additional_information``),
-    # opaque here. It lives exactly as long as the cached state: kept across
-    # preemption, so a resumed prefill sees it again, and dropped on finish or abort.
+    # A pipeline stage's per-request input: vLLM-Omni's ``additional_information``
+    # as it stood when the request arrived, decoded to a plain dict. It lives
+    # exactly as long as the cached state: kept across preemption, so a resumed
+    # prefill sees it again, and dropped on finish or abort.
     stage_inputs: Any = None
 
 
+def _decode_stage_inputs(payload: Any) -> dict | None:
+    """vLLM-Omni's ``additional_information`` as the plain dict it was built from.
+
+    vLLM-Omni carries it as a serialized ``AdditionalInformationPayload``. Such a
+    struct exists only when vLLM-Omni is installed, so the import is lazy.
+    """
+    if payload is None or isinstance(payload, dict):
+        return payload
+    from vllm_omni.engine.serialization import deserialize_additional_information
+
+    return deserialize_additional_information(payload)
+
+
 def build_cached_request_state(
-    new_req_data, accepts_stage_inputs: bool = False
+    new_req_data, *, supports_stage_inputs: bool
 ) -> TTCachedRequestState:
     """Build the cached state for one newly-scheduled request.
 
@@ -73,9 +87,9 @@ def build_cached_request_state(
     construction -- prompt validation and per-request generator seeding -- lives
     in exactly one place.
 
-    ``accepts_stage_inputs`` is the model's ``supports_stage_inputs``
-    declaration. A request carrying stage inputs to a model that cannot take
-    them is refused rather than served without them.
+    ``supports_stage_inputs`` is the model's declaration. Without it the request's
+    ``additional_information`` is not kept: vLLM-Omni puts engine bookkeeping on
+    every request, so its presence does not mean the model needs it.
     """
     assert new_req_data.sampling_params is not None, (
         "Pooling is not supported for TT yet"
@@ -88,12 +102,10 @@ def build_cached_request_state(
         generator.manual_seed(sampling_params.seed)
     else:
         generator = None
-    stage_inputs = getattr(new_req_data, "additional_information", None)
-    if stage_inputs is not None and not accepts_stage_inputs:
-        raise ValueError(
-            f"Request {new_req_data.req_id} carries stage inputs "
-            "(additional_information), but the TT model does not declare "
-            "model_capabilities['supports_stage_inputs']=True."
+    stage_inputs = None
+    if supports_stage_inputs:
+        stage_inputs = _decode_stage_inputs(
+            getattr(new_req_data, "additional_information", None)
         )
     return TTCachedRequestState(
         req_id=new_req_data.req_id,
@@ -897,7 +909,7 @@ class TTLaneInputBatch(InputBatch):
         self,
         scheduler_output: "SchedulerOutput",
         plan: "TTStepPlan",
-        requests: dict[str, CachedRequestState],
+        requests: dict[str, TTCachedRequestState],
         encoder_cache: dict,
     ) -> bool:
         """Apply one lane step plan to this batch and the runner's request map.
@@ -944,7 +956,11 @@ class TTLaneInputBatch(InputBatch):
         req_ids_to_add: list[str] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            requests[req_id] = build_cached_request_state(new_req_data)
+            # Lane mode refuses supports_stage_inputs at config time: its prefill
+            # inputs carry no per-row stage inputs.
+            requests[req_id] = build_cached_request_state(
+                new_req_data, supports_stage_inputs=False
+            )
             req_ids_to_add.append(req_id)
 
         # Running / resumed requests.

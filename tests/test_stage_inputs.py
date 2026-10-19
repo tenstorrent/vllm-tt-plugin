@@ -18,7 +18,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.config import (
     get_tt_supports_stage_inputs,
-    resolve_tt_supports_stage_inputs,
+    validate_and_store_tt_supports_stage_inputs,
 )
 from vllm_tt_plugin.input_batch import InputBatch, build_cached_request_state
 from vllm_tt_plugin.model_runner import TTModelRunner
@@ -91,7 +91,6 @@ def _runner(*, supports_stage_inputs: bool) -> SimpleNamespace:
         ),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
-        _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
         _decode_state_slot_remap=lambda row_req_ids: None,
         _sampling_params_for_padded_decode=lambda params, req_indices, n: params,
         _decode_layout_changed_since_last_decode=False,
@@ -111,8 +110,9 @@ def _runner(*, supports_stage_inputs: bool) -> SimpleNamespace:
 
 
 def _new_request(req_id: str, stage_inputs=None) -> NewRequestData:
-    """A request as vLLM-Omni's scheduler hands it over: plain request data plus
-    ``additional_information`` when the stage has a payload for it."""
+    """A request as the scheduler hands it to the runner, with
+    ``additional_information`` when there is a payload. vLLM-Omni sends the payload
+    serialized; a plain dict stands in here except where the decode is under test."""
     data = NewRequestData(
         req_id=req_id,
         prompt_token_ids=[1] * PROMPT_LEN,
@@ -190,7 +190,9 @@ def test_stage_inputs_follow_the_request_until_it_finishes():
     assert by_row["b"] is None, "a request without a payload gets None in its row"
 
     # Preemption frees the KV and the model state, not the cached request state.
+    slot = runner._req_state_slot["a"]
     runner._update_states(_step(preempted={"a"}, scheduled={"b": 1}))
+    assert runner.model.released == [slot], "the model released the request's state"
     assert runner.requests["a"].stage_inputs is payload
 
     kwargs = _run_prefill(
@@ -214,20 +216,48 @@ def test_a_model_without_the_capability_gets_no_stage_inputs_keyword():
     assert "stage_inputs" not in kwargs
 
 
-def test_a_payload_for_a_model_without_the_capability_is_refused():
+def test_a_model_without_the_capability_serves_a_request_that_carries_a_payload():
+    """vLLM-Omni puts engine bookkeeping on every request, wanted or not."""
+    bookkeeping = {"global_request_id": ["g-1"], "omni_final_stage_id": [0]}
     runner = _runner(supports_stage_inputs=False)
 
-    with pytest.raises(ValueError, match="supports_stage_inputs"):
-        runner._update_states(
-            _step(new=[_new_request("a", {"voice": "x"})], scheduled={"a": PROMPT_LEN})
-        )
+    kwargs = _run_prefill(
+        runner,
+        _step(new=[_new_request("a", bookkeeping)], scheduled={"a": PROMPT_LEN}),
+    )
+
+    assert "stage_inputs" not in kwargs
+    assert runner.requests["a"].stage_inputs is None
 
 
-def test_the_lane_dp_state_builder_refuses_a_payload():
-    """Lane mode builds request state without the capability, so it cannot drop one."""
-    with pytest.raises(ValueError, match="supports_stage_inputs"):
-        build_cached_request_state(_new_request("a", {"voice": "x"}))
-    assert build_cached_request_state(_new_request("a")).stage_inputs is None
+def test_the_builder_keeps_no_payload_without_the_capability():
+    """The lane-DP call site passes ``supports_stage_inputs=False``."""
+    state = build_cached_request_state(
+        _new_request("a", {"voice": "x"}), supports_stage_inputs=False
+    )
+
+    assert state.stage_inputs is None
+
+
+def test_a_serialized_vllm_omni_payload_reaches_prefill_as_a_dict():
+    """vLLM-Omni serializes ``additional_information``; the model gets the dict."""
+    serialization = pytest.importorskip("vllm_omni.engine.serialization")
+    payload = {"task_type": ["Base"], "text": ["Hello."], "voice": {"name": ["v"]}}
+    runner = _runner(supports_stage_inputs=True)
+
+    kwargs = _run_prefill(
+        runner,
+        _step(
+            new=[
+                _new_request(
+                    "a", serialization.serialize_additional_information(payload)
+                )
+            ],
+            scheduled={"a": PROMPT_LEN},
+        ),
+    )
+
+    assert kwargs["stage_inputs"] == [payload]
 
 
 class _Model:
@@ -241,14 +271,16 @@ class _Model:
 def test_the_resolved_capability_is_stored_on_the_config(capabilities, expected):
     vllm_config = SimpleNamespace(additional_config={})
 
-    resolve_tt_supports_stage_inputs(vllm_config, capabilities, _Model, False)
+    validate_and_store_tt_supports_stage_inputs(
+        vllm_config, capabilities, _Model, False
+    )
 
     assert get_tt_supports_stage_inputs(vllm_config) is expected
 
 
 def test_a_non_boolean_declaration_is_refused():
     with pytest.raises(ValueError, match="as a boolean"):
-        resolve_tt_supports_stage_inputs(
+        validate_and_store_tt_supports_stage_inputs(
             SimpleNamespace(additional_config={}),
             {"supports_stage_inputs": 1},
             _Model,
@@ -258,7 +290,7 @@ def test_a_non_boolean_declaration_is_refused():
 
 def test_lane_mode_refuses_the_capability():
     with pytest.raises(ValueError, match="lane mode"):
-        resolve_tt_supports_stage_inputs(
+        validate_and_store_tt_supports_stage_inputs(
             SimpleNamespace(additional_config={}),
             {"supports_stage_inputs": True},
             _Model,

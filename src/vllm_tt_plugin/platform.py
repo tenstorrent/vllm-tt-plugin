@@ -29,7 +29,6 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
     resolve_tt_scheduler_cls,
-    resolve_tt_supports_stage_inputs,
     resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
@@ -38,7 +37,9 @@ from vllm_tt_plugin.config import (
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
+    tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -1110,7 +1111,7 @@ def _install_block_output_reset_abort_patch() -> None:
     ) -> bool:
         scheduler = self.scheduler
         require_tt_output_tokens_per_step(scheduler.vllm_config)
-        is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
+        cannot_resume = tt_requests_cannot_resume(scheduler.vllm_config)
         # Aborting is only legal when the engine can tell the owning clients
         # (EngineCoreProc._send_abort_outputs finishes their streams).
         # ``finish_requests`` emits no output itself -- upstream assumes the
@@ -1120,7 +1121,7 @@ def _install_block_output_reset_abort_patch() -> None:
         if (
             reset_running_requests
             and send_abort_outputs is not None
-            and is_block_output_model
+            and cannot_resume
             and scheduler.running
             and scheduler.pause_state != PauseState.PAUSED_ALL
         ):
@@ -1129,8 +1130,8 @@ def _install_block_output_reset_abort_patch() -> None:
                 RequestStatus.FINISHED_ABORTED,
             )
             logger.warning(
-                "Prefix-cache reset aborted %d running block-output "
-                "request(s); a half-generated canvas cannot resume.",
+                "Prefix-cache reset aborted %d running request(s) that cannot "
+                "resume (block output or stage outputs).",
                 len(aborted),
             )
             send_abort_outputs(aborted)
@@ -1168,18 +1169,17 @@ def _install_block_output_pause_guard_patch() -> None:
         def pause_scheduler_tt(self, mode="abort", clear_cache=True):
             scheduler = self.scheduler
             require_tt_output_tokens_per_step(scheduler.vllm_config)
-            is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
             if (
                 mode == "keep"
                 and clear_cache
-                and is_block_output_model
+                and tt_requests_cannot_resume(scheduler.vllm_config)
                 and scheduler.running
             ):
                 raise ValueError(
                     "pause_generation(mode='keep', clear_cache=True) cannot "
-                    "clear the cache of a live block-output request: a "
-                    "half-generated canvas cannot be preempted and resumed. "
-                    "Retry with clear_cache=False or mode='abort'."
+                    "clear the cache of a live request that cannot be preempted "
+                    "and resumed (block output or stage outputs). Retry with "
+                    "clear_cache=False or mode='abort'."
                 )
             return original(self, mode, clear_cache)
 
@@ -2268,8 +2268,6 @@ class TTPlatform(Platform):
         _install_tt_input_processor_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
-            _install_block_output_reset_abort_patch()
-            _install_block_output_pause_guard_patch()
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
@@ -2426,12 +2424,16 @@ class TTPlatform(Platform):
             parallel_config.worker_cls,
             is_lane_mode,
         )
-        resolve_tt_supports_stage_inputs(
+        # Here rather than with the other capability reads: it needs is_lane_mode.
+        validate_and_store_tt_supports_stage_inputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
+        if tt_requests_cannot_resume(vllm_config):
+            _install_block_output_reset_abort_patch()
+            _install_block_output_pause_guard_patch()
         if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.

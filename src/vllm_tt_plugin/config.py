@@ -317,7 +317,7 @@ def get_tt_supports_stage_inputs(vllm_config: "VllmConfig") -> bool:
     return bool(additional.get(_SUPPORTS_STAGE_INPUTS_KEY, False))
 
 
-def resolve_tt_supports_stage_inputs(
+def validate_and_store_tt_supports_stage_inputs(
     vllm_config: "VllmConfig",
     model_capabilities: dict | None,
     model_class: type,
@@ -355,6 +355,17 @@ def get_tt_supports_stage_outputs(vllm_config: "VllmConfig") -> bool:
     return bool(additional.get(_SUPPORTS_STAGE_OUTPUTS_KEY, False))
 
 
+def tt_requests_cannot_resume(vllm_config: "VllmConfig") -> bool:
+    """Whether a running request's state is lost if it is preempted.
+
+    A resume re-prefills from the token history, which holds neither a block-output
+    model's half-generated canvas nor the stage frames a stage model already emitted.
+    """
+    return is_tt_block_output_model(vllm_config) or get_tt_supports_stage_outputs(
+        vllm_config
+    )
+
+
 def resolve_tt_supports_stage_outputs(
     vllm_config: "VllmConfig",
     model_capabilities: dict | None,
@@ -363,12 +374,14 @@ def resolve_tt_supports_stage_outputs(
 ) -> None:
     """Validate ``supports_stage_outputs`` and store it on the vLLM config.
 
-    A stage output is one frame per request per one-token decode step, tagged
-    through the front-packed build's row request IDs.
+    A stage output is one stage frame per request per one-token decode step,
+    tagged through the front-packed build's row request IDs and decode positions.
 
     Raises:
-        ValueError: the declaration is not a boolean, or it is declared with
-            lane mode, block output or speculative decoding.
+        ValueError: the declaration is not a boolean, or it is declared with lane
+            mode, block output, speculative decoding, async decode (whose overlapped
+            steps build from host positions one step behind) or more than one
+            sequence (a stage model's request cannot be preempted and resumed).
     """
     supported = (model_capabilities or {}).get("supports_stage_outputs", False)
     name = f"{model_class.__module__}.{model_class.__name__}"
@@ -388,11 +401,16 @@ def resolve_tt_supports_stage_outputs(
             conflicts.append(f"output_tokens_per_step={output_tokens_per_step}")
         if getattr(vllm_config, "speculative_config", None) is not None:
             conflicts.append("speculative decoding")
+        if (model_capabilities or {}).get("supports_async_decode", False):
+            conflicts.append("supports_async_decode")
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        if max_num_seqs != 1:
+            conflicts.append(f"max_num_seqs={max_num_seqs}")
         if conflicts:
             raise ValueError(
                 f"Model {name} declares model_capabilities['supports_stage_outputs']"
-                "=True, which needs one-token front-packed decode steps; got "
-                + ", ".join(conflicts)
+                "=True, which needs one-token front-packed decode steps of one "
+                "sequence at a time; got " + ", ".join(conflicts)
             )
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, dict):

@@ -46,7 +46,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
-| `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. |
+| `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
 For row `i`, `prefill_forward` computes
 `tokens[i, start_pos[i]:prompt_lens[i]]`. For example, `start_pos[i]=128` and
@@ -104,21 +104,31 @@ not return `VerifyOutput`.
 
 A model that declares `supports_stage_outputs` implements
 `pop_stage_outputs()`. `submit_decode` calls it right after every
-`decode_forward` and keeps the result with that submission, so overlapped
-async steps keep their own outputs.
+`decode_forward` and keeps the result with that submission.
 
-- Return one entry per decode row: the frame this forward completed for
-  the row's request, or `None`. Padding rows must be `None`. The frame is
-  opaque to the plugin.
-- The runner tags each frame `(request ID, frame_index)`. `frame_index` is
-  the row's decode position minus the request's prompt length. The step
-  that consumes output token `k` completes frame `k`.
-- The frames are published on the step's `ModelRunnerOutput`. Read them with
-  `stage_outputs.get_tt_stage_outputs`.
-- Under async scheduling, a step's frames for a request that finished, was
-  aborted, or was force-reset while the step was in flight are withdrawn
-  before the scheduler reads the output.
-- Prefill completes no frame, and the runner never calls the hook for it.
+- Return one entry per decode row: the stage frame this forward completed
+  for the row's request, or `None`. Padding rows must be `None`.
+- The call comes before any device synchronization, and the plugin never
+  synchronizes or reads a stage frame's `data`. `data` must be host-resident,
+  picklable, and own its storage until the consumer reads it. Reading from
+  the device inside `pop_stage_outputs()` is allowed; it blocks the step.
+- The runner tags each stage frame `(request ID, frame_index)`.
+  `frame_index` is the row's decode position minus the request's prompt
+  length: the step that consumes output token `k` completes stage frame `k`.
+- The stage frames are published on the step's `ModelRunnerOutput`. Read
+  them with `stage_outputs.get_tt_stage_outputs`.
+- Scheduling is synchronous for these models: they cannot declare
+  `supports_async_decode`, without which the platform turns async
+  scheduling off.
+- Prefill completes no stage frame, and the runner never calls the hook for
+  it.
+
+A stage model's request cannot be preempted and resumed: a resume re-prefills
+from the token history, which does not hold the stage frames already emitted.
+The platform therefore requires `max_num_seqs=1`, refuses a forced
+prefix-cache reset while such a request runs (or aborts it first when the
+engine can tell its client), and `TTModelRunner` raises if a preemption
+reaches it anyway.
 
 ## Decode readback and output conversion
 

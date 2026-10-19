@@ -29,7 +29,8 @@ behavior by supplying internal `_tt_*` values.
    reads `model_capabilities` before model construction.
 2. `TTPlatform.check_and_update_config` updates scheduler and cache settings,
    validates incompatible combinations, and stores resolved TT values on
-   `VllmConfig.additional_config` through `store_tt_*` helpers.
+   `VllmConfig.additional_config` through `store_tt_*` and
+   `validate_and_store_tt_*` helpers.
 3. `TTWorker.init_device` repeats `TTPlatform.check_and_update_config` in each
    worker process and reads `model_capabilities["fabric_config"]` before
    `open_mesh_device` opens the device mesh.
@@ -121,12 +122,12 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
 
-## Pipeline-stage capabilities
+## Pipeline-stage capability
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
-| `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload (vLLM-Omni's `additional_information`) or `None`. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Request-state construction (`build_cached_request_state`) refuses a request that carries a payload when this declaration is false. The payload is opaque to the plugin and is passed with every prefill of the request, chunked and resumed prefills included. |
-| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, or speculative decoding. `TTModelRunner` raises when such a model's request is preempted, because the plugin cannot resume one. |
+| `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload or `None`. The payload is vLLM-Omni's `additional_information` as it stood when the request arrived, decoded to a plain dict, engine bookkeeping entries included. vLLM-Omni's other channels, `model_intermediate_buffer` and mid-request `additional_information` updates on cached requests, are not delivered. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Without the declaration the payload is not kept: vLLM-Omni puts one on every request. See [stage inputs](MODEL_LIFECYCLE.md#stage-inputs) for what the model must own. |
+| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, speculative decoding, `supports_async_decode` (an overlapped decode builds from host positions one step behind, which would mistag stage frames), or `max_num_seqs != 1`. Forced prefix-cache resets are refused, or abort the request first, as for block-output models. |
 
 Sources: [config.py](../src/vllm_tt_plugin/config.py),
 [input_batch.py](../src/vllm_tt_plugin/input_batch.py),
