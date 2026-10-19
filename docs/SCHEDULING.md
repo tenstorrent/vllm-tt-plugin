@@ -649,11 +649,12 @@ merged multi-lane step; decode overlap uses the same steady-state checks, and
 if any lane breaks them pending async decode work is drained before the next
 step.
 
-For single-execute models, `--data_parallel_size N` is transparently folded
-into `N` in-process lanes. This covers Galaxy generators selected with
-`TT_LLAMA_TEXT_VER=llama3_70b_galaxy` or
-`TT_QWEN3_TEXT_VER=qwen3_32b_galaxy`, and GPT-OSS selected by its model
-architecture. The user-provided `--max_num_seqs M` remains the capacity per
+For models that drive every replica from one process, `--data_parallel_size N`
+is transparently folded into `N` in-process lanes. This covers Galaxy
+generators selected with `TT_LLAMA_TEXT_VER=llama3_70b_galaxy` or
+`TT_QWEN3_TEXT_VER=qwen3_32b_galaxy`, GPT-OSS selected by its model
+architecture, and model classes that declare
+`model_capabilities["folds_dp_into_lanes"]`. The user-provided `--max_num_seqs M` remains the capacity per
 lane, so the engine's global capacity becomes `N * M`.
 
 Lane-DP does not currently support request-specific RoPE state, including mRoPE
@@ -688,8 +689,9 @@ Async decode is also rank-local. Each rank has its own queue and applies the
 same steady-decode checks described above. One rank draining or switching to
 prefill does not force the other ranks to do the same.
 
-Standard DP does not currently support MoE models. Single-execute models that
-need internal data-parallel lanes, such as GPT-OSS, are folded into lane-DP
+Standard DP does not currently support MoE models. MoE models that drive
+their data-parallel replicas from one process, such as GPT-OSS and models
+declaring `model_capabilities["folds_dp_into_lanes"]`, are folded into lane-DP
 instead.
 
 ## Non-DP vs Standard DP

@@ -122,6 +122,18 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
 
+## Data-parallel capability
+
+| `model_capabilities` key | Default when absent | Meaning and current validation |
+|---|---|---|
+| `folds_dp_into_lanes` | `False` | Declares that the model drives every data-parallel replica from one process on one mesh. With `data_parallel_size > 1`, `TTPlatform.check_and_update_config` then runs the launch as in-process TT lanes (`TTLaneCoordinator`) instead of standard multi-process DP: `initialize_vllm_model` receives the whole mesh and `tt_data_parallel` equal to the requested DP size, and `--max_num_seqs` stays the per-lane capacity. Standard DP refuses MoE models, so a MoE model needs this declaration to serve with `data_parallel_size > 1`. The platform rejects a non-boolean value. Lane-DP restrictions apply, including the refusal of speculative decoding and request-specific RoPE. |
+
+The Galaxy generators and GPT-OSS fold into lanes without this declaration,
+through an older identity check. New models declare the capability.
+
+Sources: `_model_folds_dp_into_lanes` and `_convert_dp_to_lanes` in
+[platform.py](../src/vllm_tt_plugin/platform.py).
+
 ## Pipeline-stage capability
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |

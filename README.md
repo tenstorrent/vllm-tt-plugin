@@ -544,8 +544,9 @@ python examples/server_example_tt.py \
 
 `--data_parallel_size 4 --max_num_seqs 8` runs `4` TT lanes of `8` requests
 each (`32` concurrent total); `--max_num_seqs` is the per-lane capacity. This
-conversion is specific to the Galaxy generators and GPT-OSS; other model
-families still run `--data_parallel_size` as multi-process DP.
+conversion applies to the Galaxy generators, GPT-OSS, and model classes that
+declare `model_capabilities["folds_dp_into_lanes"]` (such as MiMo-V2.6-Flash);
+other model families still run `--data_parallel_size` as multi-process DP.
 At startup the backend logs that it is running single-process lane-DP.
 
 ## Supported Model Families

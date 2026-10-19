@@ -283,6 +283,7 @@ Leftover identity gates still exist. Do not copy them for new work, and do
 not remove them in an unrelated pull request:
 
 - lane-DP folding: Galaxy generator version plus `model_class.__name__ == "GptOssForCausalLM"`
+  (new models declare `model_capabilities["folds_dp_into_lanes"]` instead)
 - GPT-OSS top-K logprobs: `hf_config.model_type == "gpt_oss"`
 - hybrid KV: `get_kv_cache_spec` on the model class, not `model_capabilities`
 

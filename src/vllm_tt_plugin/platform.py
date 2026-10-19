@@ -498,11 +498,22 @@ _GPT_OSS_ARCH = "GptOssForCausalLM"
 def _model_folds_dp_into_lanes(model_class) -> bool:
     """Whether the model's ``--data_parallel_size`` folds into in-process lanes.
 
-    True for the Galaxy generators and for GPT-OSS, both of which drive data
-    parallelism within a single process. Other models keep standard
+    True for a model class that declares
+    ``model_capabilities["folds_dp_into_lanes"]``, and for the Galaxy
+    generators and GPT-OSS, which predate that declaration. All of them drive
+    data parallelism within a single process. Other models keep standard
     multi-process DP.
     """
     if _galaxy_generator_version() is not None:
+        return True
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    folds = capabilities.get("folds_dp_into_lanes", False)
+    if not isinstance(folds, bool):
+        raise ValueError(
+            "model_capabilities['folds_dp_into_lanes'] must be a bool, got "
+            f"{folds!r} on {getattr(model_class, '__name__', model_class)}"
+        )
+    if folds:
         return True
     return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
 
@@ -547,9 +558,11 @@ def _collapse_parallel_config_to_single_process(parallel_config) -> None:
 def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     """Transparently convert multi-process DP into in-process TT lanes.
 
-    Models that run as a single shared device execute on one mesh -- the Galaxy
-    generators (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``) and GPT-OSS under
-    user-row sharding -- do not need multi-process DP. Rather than asking users
+    Models that drive every DP replica from one process on one mesh -- the
+    Galaxy generators (``llama3_70b_galaxy``, ``qwen3_32b_galaxy``), GPT-OSS
+    under user-row sharding, and model classes declaring
+    ``model_capabilities["folds_dp_into_lanes"]`` -- do not need multi-process
+    DP. Rather than asking users
     to migrate flags, we run ``--data_parallel_size N`` as ``N`` in-process
     lanes: record the resolved lane count and reset ``data_parallel_size`` to 1.
 
@@ -2301,12 +2314,14 @@ class TTPlatform(Platform):
             )
             vllm_config.scheduler_config.async_scheduling = False
 
-        # Single-execute models (Galaxy generators, GPT-OSS under user-row
-        # sharding) run one shared device execute on the full mesh, so
-        # multi-process DP is folded transparently into single-process TT lanes
-        # -- users keep passing --data_parallel_size with no other flag changes.
-        # Must run before the validation/routing below so the lane path is
-        # selected. model_class carries the single-execute decision for GPT-OSS.
+        # Models that drive every DP replica from one process (the Galaxy
+        # generators, GPT-OSS under user-row sharding, and any model class
+        # declaring model_capabilities['folds_dp_into_lanes']) open the full
+        # mesh once, so multi-process DP is folded transparently into
+        # single-process TT lanes -- users keep passing --data_parallel_size
+        # with no other flag changes. Must run before the validation/routing
+        # below so the lane path is selected. model_class carries the decision
+        # for GPT-OSS and for declaring models.
         _convert_dp_to_lanes(vllm_config, model_class)
 
         if (
@@ -2402,7 +2417,9 @@ class TTPlatform(Platform):
         ):
             raise ValueError(
                 "TT standard DP does not support MoE models yet. "
-                "Use data_parallel_size=1."
+                "Use data_parallel_size=1, or serve a model class that declares "
+                "model_capabilities['folds_dp_into_lanes'] to run DP as "
+                "in-process TT lanes."
             )
 
         vllm_config.scheduler_config.scheduler_cls = resolve_tt_scheduler_cls(

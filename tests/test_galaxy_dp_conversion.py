@@ -5,10 +5,13 @@
 Single-execute models are served on one device mesh, so ``--data_parallel_size
 N`` is folded into ``N`` in-process TT lanes by
 ``platform._convert_dp_to_lanes``. This covers the Galaxy generators
-(llama3_70b_galaxy, qwen3_32b_galaxy) and GPT-OSS under user-row sharding.
+(llama3_70b_galaxy, qwen3_32b_galaxy), GPT-OSS under user-row sharding, and
+model classes declaring ``model_capabilities["folds_dp_into_lanes"]``.
 """
 
 from types import SimpleNamespace
+
+import pytest
 
 # ``vllm`` must finish importing before any plugin module, otherwise vllm's own
 # platform resolution re-enters the plugin against a partially initialized
@@ -150,3 +153,49 @@ def test_non_gpt_oss_model_not_converted(monkeypatch):
 
     assert config.parallel_config.data_parallel_size == 4
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
+
+
+def _declaring_model_class(name, folds):
+    return type(name, (), {"model_capabilities": {"folds_dp_into_lanes": folds}})
+
+
+def test_declared_capability_dp_converted_to_lanes(monkeypatch):
+    # A model class that drives every DP replica from one process declares it,
+    # so the fold needs no Galaxy env var and no class-name match.
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=4)
+
+    tt_platform._convert_dp_to_lanes(
+        config, _declaring_model_class("MiMoV2ForCausalLM", True)
+    )
+
+    assert config.parallel_config.data_parallel_size == 1
+    assert tt_config.get_tt_data_parallel_size(config) == 4
+    assert tt_config.uses_tt_lane_coordinator(config)
+    assert config.scheduler_config.max_num_seqs == 16
+    assert tt_config.get_tt_per_lane_max_num_seqs(config) == 4
+
+
+def test_declared_false_keeps_standard_dp(monkeypatch):
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=4)
+
+    tt_platform._convert_dp_to_lanes(
+        config, _declaring_model_class("MiMoV2ForCausalLM", False)
+    )
+
+    assert config.parallel_config.data_parallel_size == 4
+    assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
+
+
+def test_non_bool_declaration_is_rejected(monkeypatch):
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=4)
+
+    with pytest.raises(ValueError, match="folds_dp_into_lanes"):
+        tt_platform._convert_dp_to_lanes(
+            config, _declaring_model_class("MiMoV2ForCausalLM", "yes")
+        )

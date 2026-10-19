@@ -23,6 +23,8 @@ from vllm_tt_plugin.config import (
     TT_LANE_SCHEDULER_CLS,
     TT_SCHEDULER_CLS,
     TT_WORKER_CLS,
+    get_tt_data_parallel_size,
+    get_tt_per_lane_max_num_seqs,
     get_tt_supports_stage_inputs,
     get_tt_supports_stage_outputs,
     resolve_tt_scheduler_cls,
@@ -573,6 +575,33 @@ class TestDPModes:
                 match="TT standard DP does not support MoE models yet",
             ):
                 TTPlatform.check_and_update_config(vllm_config)
+
+    def test_moe_model_folding_dp_into_lanes_runs_lane_dp(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+    ) -> None:
+        # A MoE model that drives its replicas from one process declares the
+        # fold, so --data-parallel-size selects lane DP instead of the
+        # standard-DP MoE refusal.
+        vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.model_config.is_moe = True
+        lane_model_class = type(
+            "DummyModel",
+            (),
+            {
+                "__module__": "models.experimental.dummy.tt.generator_vllm",
+                "model_capabilities": {"folds_dp_into_lanes": True},
+            },
+        )
+
+        self.register_dummy_model(monkeypatch, vllm_config, lane_model_class)
+
+        assert vllm_config.parallel_config.data_parallel_size == 1
+        assert get_tt_data_parallel_size(vllm_config) == 4
+        assert get_tt_per_lane_max_num_seqs(vllm_config) == 4
+        assert vllm_config.scheduler_config.max_num_seqs == 16
+        assert vllm_config.scheduler_config.scheduler_cls == TT_LANE_SCHEDULER_CLS
 
     @pytest.mark.parametrize(
         ("requested", "worker_cls", "expected"),
