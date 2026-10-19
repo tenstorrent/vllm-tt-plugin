@@ -247,9 +247,13 @@ jobs:
               printf '| %s | ok | %s |\n' "$1" "$(cat "$d/summary" 2>/dev/null)"
             fi
           }
-          only_latest=$(comm -13 \
-            <(sort -u artifacts/host-tests-"$PINNED"-py*/failures 2>/dev/null) \
-            <(sort -u artifacts/host-tests-"$LATEST"-py*/failures 2>/dev/null) || true)
+          only_latest=
+          if compgen -G "artifacts/host-tests-$PINNED-py*/failures" >/dev/null &&
+             compgen -G "artifacts/host-tests-$LATEST-py*/failures" >/dev/null; then
+            only_latest=$(comm -13 \
+              <(sort -u artifacts/host-tests-"$PINNED"-py*/failures) \
+              <(sort -u artifacts/host-tests-"$LATEST"-py*/failures))
+          fi
           n_only_latest=$(grep -c . <<<"$only_latest" || true)
 
           # Seed the issue in the #64 shape; the assessing agent fills the
