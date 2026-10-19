@@ -268,12 +268,11 @@ class TTWorker(WorkerBase):
             os.environ.get("MESH_DEVICE"),
         )
         model_class, _ = get_model_architecture(self.model_config)
-        model_capabilities = getattr(model_class, "model_capabilities", None) or {}
         self.mesh_device = open_mesh_device(
             get_tt_config(self.vllm_config),
             self.trace_mode,
             local_dp_rank,
-            model_fabric_config=model_capabilities.get("fabric_config"),
+            model_fabric_config=_model_fabric_config(model_class, self.model_config),
         )
         self.device = self.mesh_device
         self.device_config.device = self.mesh_device
@@ -787,6 +786,23 @@ def get_dispatch_core_config(tt_config):
         )
 
     return ttnn.DispatchCoreConfig(axis=dispatch_core_axis)
+
+
+def _model_fabric_config(model_class, model_config):
+    """Return the ``fabric_config`` the model declares for the served checkpoint.
+
+    The fabric is set before the mesh opens, so before any model exists. A
+    class registered for an architecture can serve several checkpoints that
+    need different fabrics; such a class defines the classmethod
+    ``fabric_config_for(model_name)``, which is called with
+    ``model_config.model``, and its answer replaces the class-level
+    ``model_capabilities["fabric_config"]``.
+    """
+    fabric_config_for = getattr(model_class, "fabric_config_for", None)
+    if fabric_config_for is not None:
+        return fabric_config_for(model_config.model)
+    model_capabilities = getattr(model_class, "model_capabilities", None) or {}
+    return model_capabilities.get("fabric_config")
 
 
 def get_fabric_config(tt_config, num_devices):

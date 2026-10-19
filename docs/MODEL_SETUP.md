@@ -36,8 +36,9 @@ Sources: `register_tt_models`, `_register_models_from_extra_dir`, and
 1. `TTWorker.init_device` binds visible devices and repeats platform validation
    in the worker process.
 2. `TTWorker.init_device` opens a `ttnn.MeshDevice`. `set_fabric` applies hardware
-   defaults, `model_capabilities["fabric_config"]`, then explicit launch
-   overrides. `set_fabric` does nothing for a single-device mesh.
+   defaults, the model's fabric (`fabric_config_for(model)` when the class
+   defines it, otherwise `model_capabilities["fabric_config"]`), then explicit
+   launch overrides. `set_fabric` does nothing for a single-device mesh.
 3. `TTWorker.init_device` computes the KV block budget and fits block-output
    `max_model_len` before model construction.
 4. `TTModelLoader.load_model` calls the required class-callable factory:
