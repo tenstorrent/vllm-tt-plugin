@@ -205,17 +205,17 @@ run_jobs() {
 }
 ```
 
-- **Reference nightly.** Scheduled runs test plugin `main`; use the latest one that tested
-  the branch's merge-base:
+- **Reference nightly.** Scheduled jobs resolve plugin `main` at checkout, not at run
+  creation. List candidate runs and determine the branch's merge-base:
   ```bash
   git fetch origin main
+  git merge-base HEAD origin/main
   gh run list --repo "$REPO" --workflow "$WORKFLOW" --event schedule --limit 5 \
-      --json databaseId,createdAt --jq '.[] | "\(.databaseId) \(.createdAt)"' |
-    while read -r run_id started_at; do
-      plugin_commit=$(git rev-list -1 --before="$started_at" origin/main)
-      echo "$run_id  $started_at  plugin=$plugin_commit"
-    done
+      --json databaseId,createdAt,url
   ```
+  Read the actual plugin SHA from each relevant model job's checkout log and choose
+  reference results that tested the merge-base. Jobs in one run can test different
+  commits; do not infer their SHAs from run creation time or commit timestamps.
   A job that fails the same way across several nightlies is pre-existing: list it, don't
   chase it.
 - **Dispatch** the full matrix once the branch is stable, then only the affected model (and
