@@ -303,6 +303,48 @@ tt-metal change that declares it. Those two land as a pair. Say so in both pull
 request bodies and cross-link them. A plugin pull request that reads a
 capability no tt-metal model declares is incomplete.
 
+### Model capabilities require explicit human authorization
+
+Model capabilities describe supported model behavior so shared code can choose
+compatible execution paths. Each capability adds interface, branching, testing,
+and maintenance costs. Keep the capability interface small and add capabilities
+only for demonstrated requirements.
+
+1. **Require a specific human request.** An agent must not introduce a model
+   capability on its own initiative. A human must explicitly request the
+   capability or approve a concrete capability proposal before implementation.
+   A general request to add a model, support a feature, or fix a failure does
+   not authorize a new capability.
+
+2. **Verify that the capability is necessary.** Before implementation, the agent
+   must inspect the existing model interface, capability declarations, and
+   affected callers. The agent must explain the required behavior, why existing
+   mechanisms cannot express the required behavior, and why a change inside the
+   model implementation is insufficient. Human authorization does not replace
+   this check.
+
+3. **Do not hide model defects or missing features.** An agent must not introduce
+   a capability to bypass a model bug, exempt a model from required interface
+   behavior, suppress a failing test, or present an incomplete implementation as
+   an intentional model limitation. Fix the model implementation or report the
+   missing implementation directly. A capability must describe a justified
+   support boundary.
+
+4. **Keep the addition minimal.** The agent must use existing mechanisms when
+   existing mechanisms satisfy the requirement. Do not add speculative
+   capabilities for hypothetical future models. These requirements also apply
+   to new capability values and equivalent support checks implemented through
+   model-name conditions, attributes, configuration options, or environment
+   variables.
+
+5. **Expect additional code-review scrutiny.** Every PR that introduces a
+   capability must identify the human request or approval and provide the
+   necessity assessment, precise semantics, affected models and callers, default
+   behavior, and relevant validation. Reviewers must challenge whether the
+   capability belongs in the shared interface and whether the added complexity
+   is justified. Missing authorization or an unsupported necessity claim blocks
+   acceptance.
+
 ## 7. What reviewers in this repository actually enforce
 
 These are the recurring review themes. Check your own diff against them before
