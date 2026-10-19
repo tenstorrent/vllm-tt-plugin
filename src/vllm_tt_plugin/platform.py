@@ -1502,12 +1502,16 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
-    # MiMo-V2.6-Flash (Blackhole Galaxy: one TP=8 replica per mesh row)
-    _register_model_if_missing(
-        ModelRegistry,
-        "TTMiMoV2ForCausalLM",
-        "models.experimental.mimo_v2_6_flash.tt.generator_vllm:MiMoV2ForCausalLM",
-    )
+    # MiMo-V2.6-Flash (Blackhole Galaxy: one TP=8 replica per mesh row). vLLM
+    # renames MiMoV2ForCausalLM to MiMoV2OmniForCausalLM when the checkpoint
+    # carries a vision_config, as the MiMo-V2.6-Flash checkpoints do; the TT
+    # adapter serves their text model under either name.
+    for _mimo_arch in ("TTMiMoV2ForCausalLM", "TTMiMoV2OmniForCausalLM"):
+        _register_model_if_missing(
+            ModelRegistry,
+            _mimo_arch,
+            "models.experimental.mimo_v2_6_flash.tt.generator_vllm:MiMoV2ForCausalLM",
+        )
 
     # Optionally register test models if explicitly enabled
     if register_test_models:
