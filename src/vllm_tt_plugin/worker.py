@@ -196,6 +196,13 @@ class TTWorker(WorkerBase):
     # requested scheduler against it. A stage worker names its own.
     tt_scheduler_cls: str | type = TT_SCHEDULER_CLS
 
+    # False for a stage with no token KV cache, such as an audio decoder. Its
+    # empty KV spec makes vLLM treat the stage as attention-free: the engine
+    # skips determine_available_memory and hands initialize_from_config a
+    # config with no KV groups, which TTModelRunner refuses. Such a worker
+    # therefore names a runner that accepts it.
+    uses_token_kv_cache: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -272,6 +279,8 @@ class TTWorker(WorkerBase):
         self.num_devices = self.mesh_device.get_num_devices()
 
     def _init_kv_pool(self) -> None:
+        if not self.uses_token_kv_cache:
+            return
         # Size the KV pool and settle --max-model-len here, not in
         # determine_available_memory: upstream runs the whole executor init
         # (init_device, then load_model) before it asks for available memory
@@ -347,6 +356,8 @@ class TTWorker(WorkerBase):
            we don't run profiling for available memory and instead override
            num blocks via ``self.cache_config.num_gpu_blocks_override``.
         """
+        if not self.uses_token_kv_cache:
+            return {}
         spec_from_hook = self._try_get_spec_from_model_hook()
         if spec_from_hook is not None:
             return spec_from_hook
@@ -446,6 +457,8 @@ class TTWorker(WorkerBase):
               synthetic byte budget that makes the upstream KV planner
               reconstruct that same block count in the engine process.
         """
+        if not self.uses_token_kv_cache:
+            return 0
         if self._num_tt_blocks is None:
             raise RuntimeError(
                 "The TT KV pool has not been sized; determine_available_memory "
@@ -461,10 +474,12 @@ class TTWorker(WorkerBase):
         )
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate TT KV cache and initialize persistent input batch.
+        """Hand the engine's KV cache config to the runner.
 
+        The runner allocates the TT KV cache and the persistent input batch.
         Every standard-DP rank owns its own TT mesh/KV cache, while
-        single-process lane mode has only one rank.
+        single-process lane mode has only one rank. Without a token KV cache
+        the config has no KV groups.
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
