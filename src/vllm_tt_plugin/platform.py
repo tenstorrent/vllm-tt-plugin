@@ -1502,6 +1502,13 @@ def register_tt_models(register_test_models=False) -> None:
         "models.tt_transformers.tt.generator_vllm:GptOssForCausalLM",
     )
 
+    # MiMo-V2.6-Flash (Blackhole Galaxy: one TP=8 replica per mesh row)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTMiMoV2ForCausalLM",
+        "models.experimental.mimo_v2_6_flash.tt.generator_vllm:MiMoV2ForCausalLM",
+    )
+
     # Optionally register test models if explicitly enabled
     if register_test_models:
         register_tt_test_models()

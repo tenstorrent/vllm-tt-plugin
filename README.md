@@ -568,6 +568,7 @@ implementations. Current families:
   `TTDiffusionGemmaForCausalLM`)
 - DeepSeek V3 (`TTDeepseekV3ForCausalLM`)
 - GPT-OSS 20B / 120B (`TTGptOssForCausalLM`)
+- MiMo-V2.6-Flash on Blackhole Galaxy (`TTMiMoV2ForCausalLM`)
 
 Model availability, supported device shapes, max sequence limits, and required
 environment variables are documented in the corresponding tt-metal model demos.
