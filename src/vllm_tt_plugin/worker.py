@@ -780,14 +780,16 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
             # TT does not profile device memory, so nothing here checks that
             # the larger pool fits; if it does not, KV allocation on the
             # device fails at startup.
-            logger.info(
+            logger.warning(
                 "Raising the TT KV pool from %d to %d blocks: one request at "
-                "max_model_len=%d needs %d blocks upstream (including the null "
-                "block) plus %d output-reservation blocks, more than "
-                "max_tokens_all_users provides.",
+                "max_model_len=%d (max_in_flight_tokens=%d) needs %d blocks "
+                "upstream (including the null block) plus %d "
+                "output-reservation blocks, more than max_tokens_all_users "
+                "provides. Device memory for the larger pool is not checked.",
                 num_tt_blocks,
                 admission_floor,
                 model_config.max_model_len,
+                vllm_config.max_in_flight_tokens,
                 admission_floor - output_reservation_blocks,
                 output_reservation_blocks,
             )
