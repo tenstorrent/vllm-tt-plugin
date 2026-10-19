@@ -691,3 +691,49 @@ def test_finish_requests_result_is_routable_per_client():
     for r in aborted:
         by_client[r.client_index].add(r.request_id)
     assert by_client == {0: {"a", "c"}, 1: {"b"}}
+
+
+def test_make_stats_sums_every_lanes_prefix_cache_stats():
+    # Each lane's KV cache manager owns its prefix-cache counters and resets them
+    # when read; the engine-facing stats must carry the sum over the lanes, or
+    # lane-DP serving reports a zero prefix-cache hit rate.
+    from vllm.v1.metrics.stats import PrefixCacheStats
+
+    class _KV:
+        usage = 0.5
+
+        def __init__(self, stats):
+            self._stats = stats
+
+        def make_prefix_cache_stats(self):
+            stats, self._stats = self._stats, PrefixCacheStats()
+            return stats
+
+    lane_stats = [
+        PrefixCacheStats(requests=2, queries=300, hits=128),
+        PrefixCacheStats(
+            requests=1,
+            queries=200,
+            hits=0,
+            preempted_requests=1,
+            preempted_queries=64,
+            preempted_hits=64,
+        ),
+    ]
+    lanes = [FakeLane() for _ in lane_stats]
+    for lane, stats in zip(lanes, lane_stats):
+        lane.kv_cache_manager = _KV(stats)
+        lane.get_request_counts = lambda: (0, 0)
+    coordinator = _make_coordinator(lanes, log_stats=True)
+
+    stats = coordinator.make_stats().prefix_cache_stats
+
+    assert (stats.requests, stats.queries, stats.hits) == (3, 500, 128)
+    assert (
+        stats.preempted_requests,
+        stats.preempted_queries,
+        stats.preempted_hits,
+    ) == (1, 64, 64)
+    assert (
+        coordinator.make_stats().prefix_cache_stats.queries == 0
+    )  # read once per update

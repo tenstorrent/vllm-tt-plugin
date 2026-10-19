@@ -41,7 +41,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.engine import EngineCoreOutputs
-from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
@@ -808,7 +808,31 @@ class TTLaneCoordinator(SchedulerInterface):
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting,
             kv_cache_usage=kv_cache_usage,
+            prefix_cache_stats=self._merged_prefix_cache_stats(),
         )
+
+    def _merged_prefix_cache_stats(self) -> PrefixCacheStats:
+        """Every lane's prefix-cache stats since the last call, summed.
+
+        Each lane has its own KV cache manager, which resets its stats when they
+        are read, so the coordinator reads every lane once per stats update.
+        """
+        merged = PrefixCacheStats()
+        for sched in self.lanes:
+            stats = sched.kv_cache_manager.make_prefix_cache_stats()
+            if stats is None:
+                continue
+            merged.reset = merged.reset or stats.reset
+            for field in (
+                "requests",
+                "queries",
+                "hits",
+                "preempted_requests",
+                "preempted_queries",
+                "preempted_hits",
+            ):
+                setattr(merged, field, getattr(merged, field) + getattr(stats, field))
+        return merged
 
     def shutdown(self) -> None:
         for sched in self.lanes:
