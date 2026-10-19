@@ -156,7 +156,13 @@ only position `S - 1`. Lane-DP host extraction also accepts `[B, V]` logits.
 For device logprobs, the adapter returns `(token_ids, logprobs)` through the
 same prefill or decode output boundary. `build_device_logprobs` accepts sampled
 logprobs or `(topk_logprobs, topk_indices)` according to the selected model's
-support. Exact payload handling is in
+support. It reports each sampled token's rank as vLLM defines it: the number
+of vocabulary scores at or above the sampled one, ties included. From a sorted
+top-K set the plugin counts it, exactly unless the sampled score ties the lowest
+returned score. A single sampled logprob cannot be ranked, so an adapter that
+can rank on device returns an object with `sampled_logprobs` and
+`selected_token_ranks` attributes, such as a named tuple, instead of the bare
+logprob tensor; a bare tensor reports rank `-1`. Exact payload handling is in
 [logprobs.py](../src/vllm_tt_plugin/logprobs.py).
 
 The optional `supports_compact_host_logits` and
