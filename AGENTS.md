@@ -290,7 +290,9 @@ Other contracts are methods, not dictionary keys: hybrid KV opt-in is
 `get_kv_cache_spec`; block-output lifecycle uses `release_request`,
 `release_persistent_capture`, and, for adaptive block output with multiple
 requests, `note_state_slots_moved`; speculative feasibility is `spec_plan`, a
-classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRACT.md).
+classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRACT.md);
+a class serving several checkpoints resolves `fabric_config` per checkpoint
+with the classmethod `fabric_config_for`.
 `supports_narrow_decode` belongs to `SpecPlan`, not `model_capabilities`.
 `SpecPlan` resource declarations do not yet enforce row or byte budgets.
 

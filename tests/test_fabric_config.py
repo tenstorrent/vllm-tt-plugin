@@ -124,3 +124,68 @@ def test_model_fabric_is_applied_before_mesh_open(monkeypatch, fabric):
     assert result is mesh
     assert [step for step, _ in steps] == ["fabric", "mesh"]
     assert steps[0][1]["config"] == ttnn.FabricConfig.FABRIC_1D_RING
+
+
+def test_fabric_and_mesh_open_hold_the_host_device_lock(monkeypatch, fabric, tmp_path):
+    monkeypatch.setattr(worker, "get_mesh_grid", lambda: (1, 2))
+    monkeypatch.setattr(worker, "get_dispatch_core_config", lambda _cfg: None)
+    monkeypatch.setattr(
+        worker, "_device_open_lock_path", lambda: str(tmp_path / "open.lock")
+    )
+    steps = []
+    real_flock = worker.fcntl.flock
+
+    def flock(fd, op):
+        steps.append("lock" if op == worker.fcntl.LOCK_EX else "unlock")
+        real_flock(fd, op)
+
+    monkeypatch.setattr(worker.fcntl, "flock", flock)
+    fabric.side_effect = lambda **kwargs: steps.append("fabric")
+    mesh = SimpleNamespace(get_num_devices=lambda: 2)
+
+    def open_mesh(*args, **kwargs):
+        steps.append("mesh")
+        return mesh
+
+    monkeypatch.setattr(ttnn, "open_mesh_device", open_mesh)
+    assert worker.open_mesh_device(None, "off") is mesh
+    assert steps == ["lock", "fabric", "mesh", "unlock"]
+
+    steps.clear()
+    monkeypatch.setattr(
+        ttnn, "open_mesh_device", Mock(side_effect=RuntimeError("flush timeout"))
+    )
+    with pytest.raises(RuntimeError, match="flush timeout"):
+        worker.open_mesh_device(None, "off")
+    assert steps == ["lock", "fabric", "unlock"]
+
+
+def test_class_level_fabric_declaration_applies_without_a_resolver():
+    ring = {"config": ttnn.FabricConfig.FABRIC_1D_RING}
+    model_class = SimpleNamespace(model_capabilities={"fabric_config": ring})
+
+    # A class without the resolver never needs the served model's name.
+    assert worker._model_fabric_config(model_class, SimpleNamespace()) is ring
+    assert worker._model_fabric_config(SimpleNamespace(), SimpleNamespace()) is None
+
+
+def test_a_class_serving_several_checkpoints_resolves_the_served_ones_fabric():
+    """One registered class can serve checkpoints that need different fabrics, so
+    it answers for the checkpoint being served, and that answer wins over a
+    class-level declaration."""
+    ring = {"config": ttnn.FabricConfig.FABRIC_1D_RING}
+    asked = []
+
+    class Dispatcher:
+        model_capabilities = {"fabric_config": {"config": ttnn.FabricConfig.FABRIC_1D}}
+
+        @classmethod
+        def fabric_config_for(cls, model_name):
+            asked.append(model_name)
+            return ring if model_name == "org/ring-model" else None
+
+    ring_model = SimpleNamespace(model="org/ring-model")
+    line_model = SimpleNamespace(model="org/line-model")
+    assert worker._model_fabric_config(Dispatcher, ring_model) is ring
+    assert worker._model_fabric_config(Dispatcher, line_model) is None
+    assert asked == ["org/ring-model", "org/line-model"]

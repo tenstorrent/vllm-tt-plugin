@@ -32,8 +32,9 @@ behavior by supplying internal `_tt_*` values.
    `VllmConfig.additional_config` through `store_tt_*` and
    `validate_and_store_tt_*` helpers.
 3. `TTWorker.init_device` repeats `TTPlatform.check_and_update_config` in each
-   worker process and reads `model_capabilities["fabric_config"]` before
-   `open_mesh_device` opens the device mesh.
+   worker process and reads the model's fabric before `open_mesh_device` opens
+   the device mesh: `fabric_config_for(model)` when the class defines it,
+   otherwise `model_capabilities["fabric_config"]`.
 4. `TTModelRunner` and `TTAsyncDecodeController` also read runtime declarations for
    sampling, hidden-state handoff, and resident decode. Model authors must
    keep class and instance declarations consistent.
@@ -117,7 +118,7 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
-| `fabric_config` | `None` | Supplies a dictionary of keyword arguments to `ttnn.set_fabric_config`, using TTNN enum and configuration objects. `set_fabric` merges hardware defaults, then model defaults, then explicit `tt.fabric_config` and `tt.fabric_reliability_mode` launch overrides. `set_fabric` does nothing for a single-device mesh. The plugin forwards the merged dictionary to TTNN; the model declaration is not the string accepted by the operator's `tt.fabric_config` setting. |
+| `fabric_config` | `None` | Supplies a dictionary of keyword arguments to `ttnn.set_fabric_config`, using TTNN enum and configuration objects. `set_fabric` merges hardware defaults, then model defaults, then explicit `tt.fabric_config` and `tt.fabric_reliability_mode` launch overrides. `set_fabric` does nothing for a single-device mesh. The plugin forwards the merged dictionary to TTNN; the model declaration is not the string accepted by the operator's `tt.fabric_config` setting. A class that serves several checkpoints can define the classmethod `fabric_config_for(model_name)` instead; its return value, for the served model, replaces this key. |
 
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
@@ -227,7 +228,8 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
-implements model-owned proposal. `pop_stage_outputs` is consumed only with
+implements model-owned proposal. `fabric_config_for` resolves `fabric_config`
+per checkpoint for a class that serves several. `pop_stage_outputs` is consumed only with
 `supports_stage_outputs`. Adding a similarly named dictionary key
 does not implement any of these hooks.
 See [model setup](MODEL_SETUP.md), [execution](MODEL_EXECUTION.md), and
