@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import copy
 import gc
 import json
 import multiprocessing
@@ -1837,7 +1838,24 @@ class TTPlatform(Platform):
         # strategy. Backend stays "auto" so schemas xgrammar cannot compile still
         # fall back to guidance (which also honors this flag); outlines and
         # lm-format-enforcer ignore it.
-        vllm_config.structured_outputs_config.disable_any_whitespace = True
+        #
+        # Set on a copy, never on the object vLLM handed in. EngineArgs passes
+        # its CLI-parsed StructuredOutputsConfig to VllmConfig by reference, so
+        # an in-place write also rewrites the parsed args. `vllm serve` with
+        # more than one API server (its default under --data-parallel-size N,
+        # standard DP and lane-DP alike) pickles those args to every API server
+        # process, which builds its own VllmConfig from them. Validating that
+        # field runs StructuredOutputsConfig's model validator on the instance
+        # again, and the validator rejects disable_any_whitespace with backend
+        # "auto". With the args left untouched, each process builds a valid
+        # config and this hook sets the flag on its own copy. The copy still
+        # holds that rejected pair, so it must not be passed back through a
+        # config constructor.
+        structured_outputs_config = vllm_config.structured_outputs_config
+        if not structured_outputs_config.disable_any_whitespace:
+            structured_outputs_config = copy.copy(structured_outputs_config)
+            structured_outputs_config.disable_any_whitespace = True
+            vllm_config.structured_outputs_config = structured_outputs_config
 
         # Import and register models from tt-metal.
         #

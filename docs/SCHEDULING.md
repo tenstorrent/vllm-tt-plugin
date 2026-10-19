@@ -657,6 +657,13 @@ architecture, and model classes that declare
 `model_capabilities["folds_dp_into_lanes"]`. The user-provided `--max_num_seqs M` remains the capacity per
 lane, so the engine's global capacity becomes `N * M`.
 
+The fold happens while the engine config is built, after `vllm serve` has
+chosen its API-server count, so a lane-DP launch keeps upstream's default of
+`N` API server processes, all attached to the one lane engine. Each API server
+builds its own config from the CLI arguments and folds DP the same way.
+`--api-server-count` overrides that count; `--api-server-count 1` is not
+required.
+
 Lane-DP does not currently support request-specific RoPE state, including mRoPE
 vision models.
 
