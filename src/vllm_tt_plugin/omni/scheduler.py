@@ -22,6 +22,7 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 
+from vllm_tt_plugin.config import get_tt_output_tokens_per_step
 from vllm_tt_plugin.scheduler import TTScheduler
 
 # What TT attaches to a SchedulerOutput beside its dataclass fields.
@@ -29,6 +30,25 @@ TT_SCHEDULER_OUTPUT_PREFIX = "_tt_"
 
 
 class TTOmniARScheduler(OmniARAsyncScheduler, TTScheduler):
+    def __init__(self, vllm_config, *args, **kwargs):
+        # Block output and speculative decoding commit several tokens per step
+        # through Omni's update loop, which no TT stage has run. Lane mode is
+        # refused earlier, when the scheduler is paired with the worker.
+        conflicts = []
+        output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+        if output_tokens_per_step > 1:
+            conflicts.append(
+                f"block output (output_tokens_per_step={output_tokens_per_step})"
+            )
+        if vllm_config.speculative_config is not None:
+            conflicts.append("speculative decoding")
+        if conflicts:
+            raise ValueError(
+                "a TT vLLM-Omni AR stage runs one-token steps; got "
+                + ", ".join(conflicts)
+            )
+        super().__init__(vllm_config, *args, **kwargs)
+
     def _wrap_omni_scheduler_output(self, base: SchedulerOutput, **kwargs):
         wrapped = super()._wrap_omni_scheduler_output(base, **kwargs)
         for name, value in vars(base).items():
