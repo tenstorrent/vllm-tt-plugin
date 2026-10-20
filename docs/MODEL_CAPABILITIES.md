@@ -15,6 +15,8 @@ class and the corresponding model guide to determine model-specific support.
 See [README.md](../README.md) for launch instructions and
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) for speculative execution,
 request restrictions, and lifecycle requirements.
+Start with the [model-plugin interface](MODEL_INTERFACE.md) for construction,
+KV allocation, forward calls, and model lifecycle.
 
 ## Ownership and resolution
 
@@ -27,7 +29,8 @@ behavior by supplying internal `_tt_*` values.
    reads `model_capabilities` before model construction.
 2. `TTPlatform.check_and_update_config` updates scheduler and cache settings,
    validates incompatible combinations, and stores resolved TT values on
-   `VllmConfig.additional_config` through `store_tt_*` helpers.
+   `VllmConfig.additional_config` through `store_tt_*` and
+   `validate_and_store_tt_*` helpers.
 3. `TTWorker.init_device` repeats `TTPlatform.check_and_update_config` in each
    worker process and reads `model_capabilities["fabric_config"]` before
    `open_mesh_device` opens the device mesh.
@@ -83,6 +86,12 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, with async scheduling, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. The [device grammar contract](DEVICE_GRAMMAR_CONTRACT.md) lists what the model must implement. |
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
 | `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
+| `supports_compact_host_logits` | `False` | Permits `process_decode_output_host(..., sample_rows=...)` to return only selected lane-DP host-sampling rows in the supplied order. Active or custom logits processors can require full-slot output instead. |
+| `supports_selective_host_readback` | `False` | Permits `read_decode_output(..., async_read=True, sample_rows=...)` to read only selected lane-DP host-sampling rows. The adapter must also declare `supports_compact_host_logits` and retain an output handle for host processing. |
+
+The [selective-read contract](DECODE_RELOAD_CONTRACT.md#host-sampling-output-and-selective-reads)
+defines buffer ownership, row ordering, and output shapes for both host-output
+capabilities. Neither host-output capability changes decode input reloads.
 
 The async capability combination has a specific order: the platform first
 disables async scheduling for a model without `supports_async_decode`; the
@@ -112,6 +121,19 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
+
+## Pipeline-stage capability
+
+| `model_capabilities` key | Default when absent | Meaning and current validation |
+|---|---|---|
+| `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload or `None`. The payload is vLLM-Omni's `additional_information` as it stood when the request arrived, decoded to a plain dict, engine bookkeeping entries included. vLLM-Omni's other channels, `model_intermediate_buffer` and mid-request `additional_information` updates on cached requests, are not delivered. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Without the declaration the payload is not kept: vLLM-Omni puts one on every request. See [stage inputs](MODEL_LIFECYCLE.md#stage-inputs) for what the model must own. |
+| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, speculative decoding, `supports_async_decode` (an overlapped decode builds from host positions one step behind, which would mistag stage frames), or `max_num_seqs != 1`. Forced prefix-cache resets are refused, or abort the request first, as for block-output models. |
+
+Sources: [config.py](../src/vllm_tt_plugin/config.py),
+[input_batch.py](../src/vllm_tt_plugin/input_batch.py),
+[stage_outputs.py](../src/vllm_tt_plugin/stage_outputs.py),
+[async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
+[model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Speculative capabilities and admission
 
@@ -205,8 +227,11 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
-implements model-owned proposal. Adding a similarly named dictionary key
+implements model-owned proposal. `pop_stage_outputs` is consumed only with
+`supports_stage_outputs`. Adding a similarly named dictionary key
 does not implement any of these hooks.
+See [model setup](MODEL_SETUP.md), [execution](MODEL_EXECUTION.md), and
+[lifecycle](MODEL_LIFECYCLE.md) for the complete common hook interface.
 
 Model authors should add new feature gates through explicit capability
 declarations and matching plugin consumers, with linked changes when tt-metal

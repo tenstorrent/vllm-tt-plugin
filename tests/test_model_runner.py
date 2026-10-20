@@ -78,6 +78,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
+        supports_stage_inputs=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,

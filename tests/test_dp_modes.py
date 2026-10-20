@@ -15,13 +15,58 @@ import torch
 import ttnn
 from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 from vllm.v1.core.sched import interface as sched_interface
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_tt_plugin import worker
+from vllm_tt_plugin.config import (
+    TT_LANE_SCHEDULER_CLS,
+    TT_SCHEDULER_CLS,
+    TT_WORKER_CLS,
+    get_tt_supports_stage_inputs,
+    get_tt_supports_stage_outputs,
+    resolve_tt_scheduler_cls,
+)
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import TTScheduler
 from vllm_tt_plugin.worker import TTWorker
 
 if not hasattr(sched_interface, "PauseState"):
     sched_interface.PauseState = type("PauseState", (), {})
+
+
+# Same class layout as vLLM-Omni's stage schedulers, which write themselves into
+# every stage's engine args; vLLM-Omni is not a test dependency.
+class OmniARScheduler(Scheduler):
+    pass
+
+
+class OmniARAsyncScheduler(OmniARScheduler, AsyncScheduler):
+    pass
+
+
+class OmniGenerationScheduler(Scheduler):
+    pass
+
+
+class TTStageARScheduler(OmniARAsyncScheduler, TTScheduler):
+    pass
+
+
+class TTStageGenerationScheduler(OmniGenerationScheduler):
+    pass
+
+
+class TTStageARWorker(TTWorker):
+    tt_scheduler_cls = TTStageARScheduler
+
+
+class TTStageGenerationWorker(TTWorker):
+    tt_scheduler_cls = TTStageGenerationScheduler
+
+
+class TTDefaultSchedulerWorker(TTWorker):
+    pass
 
 
 class TestDPModes:
@@ -142,6 +187,57 @@ class TestDPModes:
             vllm_config.parallel_config.dp_engine_core_proc_cls
             == "vllm.v1.engine.core.DPEngineCoreProc"
         )
+
+    def test_check_and_update_config_stores_stage_input_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        dummy_model_class.model_capabilities = {"supports_stage_inputs": True}
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert get_tt_supports_stage_inputs(vllm_config) is True
+
+    def test_check_and_update_config_refuses_stage_inputs_in_lane_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
+        vllm_config.parallel_config.data_parallel_size = 1
+        dummy_model_class.model_capabilities = {"supports_stage_inputs": True}
+
+        with pytest.raises(ValueError, match="lane mode does not pass stage inputs"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+    def test_check_and_update_config_stores_stage_output_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+        vllm_config.scheduler_config.max_num_seqs = 1
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert get_tt_supports_stage_outputs(vllm_config) is True
+
+    def test_check_and_update_config_refuses_stage_outputs_in_lane_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
+        vllm_config.parallel_config.data_parallel_size = 1
+        dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+
+        with pytest.raises(ValueError, match="needs one-token front-packed"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_collapsed_standard_dp_rank_warms_up_model(self) -> None:
         worker = TTWorker.__new__(TTWorker)
@@ -477,3 +573,116 @@ class TestDPModes:
                 match="TT standard DP does not support MoE models yet",
             ):
                 TTPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls", "expected"),
+        [
+            (None, TT_WORKER_CLS, TT_SCHEDULER_CLS),
+            (Scheduler, TT_WORKER_CLS, TT_SCHEDULER_CLS),
+            (OmniARScheduler, TTStageARWorker, TTStageARScheduler),
+            (OmniARAsyncScheduler, TTStageARWorker, TTStageARScheduler),
+            (
+                OmniGenerationScheduler,
+                TTStageGenerationWorker,
+                TTStageGenerationScheduler,
+            ),
+        ],
+    )
+    def test_scheduler_pairing_selects_the_workers_tt_scheduler(
+        self, requested: type | None, worker_cls: str | type, expected: str | type
+    ) -> None:
+        assert resolve_tt_scheduler_cls(requested, worker_cls, False) == expected
+        # The worker re-applies the config to the scheduler chosen above.
+        assert resolve_tt_scheduler_cls(expected, worker_cls, False) == expected
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls"),
+        [
+            (OmniARAsyncScheduler, TT_WORKER_CLS),
+            (OmniGenerationScheduler, TT_WORKER_CLS),
+            (OmniGenerationScheduler, TTStageARWorker),
+            (OmniARScheduler, TTStageGenerationWorker),
+            (TTStageARScheduler, TTStageGenerationWorker),
+        ],
+    )
+    def test_scheduler_pairing_rejects_a_mismatched_pair(
+        self, requested: type, worker_cls: str | type
+    ) -> None:
+        with pytest.raises(ValueError, match="cannot run on TT worker"):
+            resolve_tt_scheduler_cls(requested, worker_cls, False)
+
+    def test_scheduler_pairing_rejects_a_worker_without_a_tt_scheduler(
+        self,
+    ) -> None:
+        with pytest.raises(ValueError, match="declares no tt_scheduler_cls"):
+            resolve_tt_scheduler_cls(OmniARScheduler, Scheduler, False)
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls"),
+        [
+            (OmniARAsyncScheduler, TTStageARWorker),
+            (OmniGenerationScheduler, TTStageGenerationWorker),
+            (OmniARAsyncScheduler, TT_WORKER_CLS),
+        ],
+    )
+    def test_scheduler_pairing_rejects_lane_mode_with_a_stage(
+        self, requested: type, worker_cls: str | type
+    ) -> None:
+        with pytest.raises(ValueError, match="TT lane mode runs TTLaneCoordinator"):
+            resolve_tt_scheduler_cls(requested, worker_cls, True)
+
+    @pytest.mark.parametrize("requested", [None, Scheduler, TT_LANE_SCHEDULER_CLS])
+    @pytest.mark.parametrize(
+        "worker_cls",
+        [TT_WORKER_CLS, f"{__name__}.TTDefaultSchedulerWorker"],
+    )
+    def test_scheduler_pairing_keeps_the_lane_coordinator(
+        self, requested: str | type | None, worker_cls: str
+    ) -> None:
+        assert (
+            resolve_tt_scheduler_cls(requested, worker_cls, True)
+            == TT_LANE_SCHEDULER_CLS
+        )
+
+    @pytest.mark.parametrize(
+        ("requested", "worker_cls", "expected"),
+        [
+            (None, "auto", TT_SCHEDULER_CLS),
+            (OmniARAsyncScheduler, TTStageARWorker, TTStageARScheduler),
+            (
+                OmniGenerationScheduler,
+                TTStageGenerationWorker,
+                TTStageGenerationScheduler,
+            ),
+        ],
+    )
+    def test_check_and_update_config_keeps_the_pair_on_worker_reapply(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+        requested: type | None,
+        worker_cls: str | type,
+        expected: str | type,
+    ) -> None:
+        vllm_config.scheduler_config.scheduler_cls = requested
+        vllm_config.parallel_config.worker_cls = worker_cls
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+        assert vllm_config.scheduler_config.scheduler_cls == expected
+
+        # TTWorker.init_device re-applies the hook in the worker process.
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+        assert vllm_config.scheduler_config.scheduler_cls == expected
+
+    def test_check_and_update_config_rejects_a_mismatched_pair(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.scheduler_config.scheduler_cls = OmniGenerationScheduler
+        vllm_config.parallel_config.worker_cls = TTStageARWorker
+
+        with pytest.raises(ValueError, match="cannot run on TT worker"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)

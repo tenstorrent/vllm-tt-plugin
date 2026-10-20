@@ -31,11 +31,11 @@ Pull requests are reviewed on a **weekly basis**.
   every commit. Run `pre-commit run --all-files` to check the complete checkout.
   Record the commands and results in the pull request's Validation section.
 - For model integrations, use the
-  [model capability reference](docs/MODEL_CAPABILITIES.md) and
-  [speculative decoding contract](docs/SPEC_DECODE_CONTRACT.md) to identify the
-  plugin and tt-metal responsibilities. Keep plugin changes in this repository
-  and model adapter changes in `tenstorrent/tt-metal`; cross-link paired pull
-  requests.
+  [model-plugin interface](docs/MODEL_INTERFACE.md) for construction, KV storage,
+  execution, and lifecycle responsibilities, with links to the capability,
+  reload, and speculative contracts. Update the affected interface pages when
+  changing model-facing behavior. Keep plugin changes in this repository and
+  model adapter changes in `tenstorrent/tt-metal`; cross-link paired pull requests.
 - Write clear commit messages in the imperative mood (e.g., "Fix scheduler edge
   case" rather than "Fixed scheduler edge case").
 

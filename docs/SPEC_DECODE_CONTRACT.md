@@ -11,6 +11,8 @@ https://github.com/tenstorrent/vllm-tt-plugin/issues/110. For launch settings an
 current model adapters, see [Speculative Decoding](../README.md#speculative-decoding).
 For every `model_capabilities` key consumed by the plugin, see
 [MODEL_CAPABILITIES.md](MODEL_CAPABILITIES.md).
+For common model construction, KV allocation, execution, and lifecycle hooks,
+start with the [model-plugin interface](MODEL_INTERFACE.md).
 
 ## Status
 

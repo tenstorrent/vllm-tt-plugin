@@ -17,6 +17,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
+    TT_WORKER_CLS,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
@@ -27,6 +28,8 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_scheduler_cls,
+    resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -34,7 +37,9 @@ from vllm_tt_plugin.config import (
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
+    tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -71,8 +76,6 @@ _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
 _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 
-TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
-TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # tt-metal's fixed Tensix tile height, matching ``ttnn.TILE_SIZE``. Keep this a
 # literal so importing admission logic cannot hard-crash hosts where tt-metal is
 # absent; tests/tt enforces the agreement with the real module. The DiffusionGemma
@@ -1124,7 +1127,7 @@ def _install_block_output_reset_abort_patch() -> None:
     ) -> bool:
         scheduler = self.scheduler
         require_tt_output_tokens_per_step(scheduler.vllm_config)
-        is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
+        cannot_resume = tt_requests_cannot_resume(scheduler.vllm_config)
         # Aborting is only legal when the engine can tell the owning clients
         # (EngineCoreProc._send_abort_outputs finishes their streams).
         # ``finish_requests`` emits no output itself -- upstream assumes the
@@ -1134,7 +1137,7 @@ def _install_block_output_reset_abort_patch() -> None:
         if (
             reset_running_requests
             and send_abort_outputs is not None
-            and is_block_output_model
+            and cannot_resume
             and scheduler.running
             and scheduler.pause_state != PauseState.PAUSED_ALL
         ):
@@ -1143,8 +1146,8 @@ def _install_block_output_reset_abort_patch() -> None:
                 RequestStatus.FINISHED_ABORTED,
             )
             logger.warning(
-                "Prefix-cache reset aborted %d running block-output "
-                "request(s); a half-generated canvas cannot resume.",
+                "Prefix-cache reset aborted %d running request(s) that cannot "
+                "resume (block output or stage outputs).",
                 len(aborted),
             )
             send_abort_outputs(aborted)
@@ -1182,18 +1185,17 @@ def _install_block_output_pause_guard_patch() -> None:
         def pause_scheduler_tt(self, mode="abort", clear_cache=True):
             scheduler = self.scheduler
             require_tt_output_tokens_per_step(scheduler.vllm_config)
-            is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
             if (
                 mode == "keep"
                 and clear_cache
-                and is_block_output_model
+                and tt_requests_cannot_resume(scheduler.vllm_config)
                 and scheduler.running
             ):
                 raise ValueError(
                     "pause_generation(mode='keep', clear_cache=True) cannot "
-                    "clear the cache of a live block-output request: a "
-                    "half-generated canvas cannot be preempted and resumed. "
-                    "Retry with clear_cache=False or mode='abort'."
+                    "clear the cache of a live request that cannot be preempted "
+                    "and resumed (block output or stage outputs). Retry with "
+                    "clear_cache=False or mode='abort'."
                 )
             return original(self, mode, clear_cache)
 
@@ -1872,7 +1874,7 @@ class TTPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_tt_plugin.worker.TTWorker"
+            parallel_config.worker_cls = TT_WORKER_CLS
 
         # For TT models, prepend "TT" to the architecture name,
         # e.g. "TTLlamaForCausalLM"
@@ -2282,8 +2284,6 @@ class TTPlatform(Platform):
         _install_tt_input_processor_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
-            _install_block_output_reset_abort_patch()
-            _install_block_output_pause_guard_patch()
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
@@ -2435,17 +2435,29 @@ class TTPlatform(Platform):
                 "Use data_parallel_size=1."
             )
 
+        vllm_config.scheduler_config.scheduler_cls = resolve_tt_scheduler_cls(
+            vllm_config.scheduler_config.scheduler_cls,
+            parallel_config.worker_cls,
+            is_lane_mode,
+        )
+        # Here rather than with the other capability reads: it needs is_lane_mode.
+        validate_and_store_tt_supports_stage_inputs(
+            vllm_config, model_capabilities, model_class, is_lane_mode
+        )
+        resolve_tt_supports_stage_outputs(
+            vllm_config, model_capabilities, model_class, is_lane_mode
+        )
+        if tt_requests_cannot_resume(vllm_config):
+            _install_block_output_reset_abort_patch()
+            _install_block_output_pause_guard_patch()
         if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.
             validate_tt_lane_config(vllm_config)
-            vllm_config.scheduler_config.scheduler_cls = TT_LANE_SCHEDULER_CLS
             logger.info(
                 "Using TTLaneCoordinator with %d in-process TT lanes",
                 get_tt_data_parallel_size(vllm_config),
             )
-        else:
-            vllm_config.scheduler_config.scheduler_cls = TT_SCHEDULER_CLS
 
         if not is_lane_mode:
             cls._standard_dp_mesh_grids = _load_standard_dp_mesh_grids(vllm_config)

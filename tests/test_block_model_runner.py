@@ -194,6 +194,7 @@ def test_update_states_releases_model_request_before_removing_row(
 
     runner = TTModelRunner.__new__(TTModelRunner)
     runner.requests = {"req-0": object()}
+    runner.supports_stage_outputs = False
     runner.encoder_cache = {}
     runner.input_batch = input_batch
     runner.model = SimpleNamespace(release_request=release_request)

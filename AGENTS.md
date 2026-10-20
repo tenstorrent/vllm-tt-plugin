@@ -220,7 +220,9 @@ pull request to draft cancels its run in progress. Its jobs:
 - `pre-commit` on `ubuntu-latest`
 - `host-tests-stubbed` on Python 3.10 and 3.12 with `tests/host-stubs`, which
   installs through `docs/install-vllm-tt.sh`. That job therefore also fails
-  when the documented install path rots, which is intentional.
+  when the documented install path rots, which is intentional. It calls the
+  reusable `.github/workflows/host-tests-stubbed.yaml`, which
+  `vllm-release-watch.yml` also runs against the pinned and the latest vLLM.
 - `host-tests-ttnn` with real `ttnn`, inside tt-metal's Ubuntu 22.04 and 24.04
   release images for the latest stable tag and the latest release tag (dev or
   rc). Its failures show on the pull request but do not block merging, and
@@ -233,8 +235,8 @@ pull request to draft cancels its run in progress. Its jobs:
 Torch comes from tt-metal's `tt_metal/python_env/requirements-dev.txt`, read by
 `.github/scripts/tt-metal-torch-pin.sh`: `host-tests-ttnn` installs the pin of
 the tag each leg tests, and `host-tests-stubbed`, which tests no tag, installs
-the latest stable tag's pin. The two lookups are separate jobs:
-`resolve-stable` feeds the required path, and `resolve-tt-metal` feeds only
+the latest stable tag's pin. The two lookups are independent:
+`host-tests-stubbed` resolves its own, and `resolve-tt-metal` feeds only
 `host-tests-ttnn`, so a newer or requested tag that cannot be resolved fails
 only the advisory job. Both test jobs install pytest through the `dev` extra.
 
@@ -245,7 +247,14 @@ pasted host, model, and mesh result in Validation, or a named tt-metal job
 with `vllm-tt-plugin-ref` set to this branch. The pull request template has a
 `Validation` section for exactly this.
 
-## 6. Model capabilities: the gating contract
+## 6. Model interface and capabilities
+
+Before changing model registration, construction, KV allocation, forward calls,
+or lifecycle hooks, read [docs/MODEL_INTERFACE.md](docs/MODEL_INTERFACE.md)
+and the relevant linked references. Update the affected interface pages in the
+same PR when changing model-facing arguments, return values, capability
+consumers, or state ownership. Keep API reference details in `docs/`; keep
+contribution rules in `AGENTS.md`.
 
 New behaviour is gated on capabilities a model class declares, not on a new
 model-type allowlist. `TTPlatform.check_and_update_config` reads a

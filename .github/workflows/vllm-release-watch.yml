@@ -3,6 +3,8 @@ name: vLLM release watch
 # Opens a tracking issue when upstream vLLM publishes a release newer than the
 # version this plugin pins in docs/install-vllm-tt.sh, so the compatibility
 # assessment (.github/prompts/vllm-upgrade-assessment.prompt.md) can be run.
+# The issue is seeded with what CI can compute without analysis: open bump PRs
+# and branches, host-test results on both versions, and per-release upstream changes.
 #
 # It runs on the default branch, so the pin it compares against is whatever that
 # branch currently targets. Adjust the schedule to taste.
@@ -20,11 +22,18 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      pinned: ${{ steps.ver.outputs.pinned }}
+      latest: ${{ steps.ver.outputs.latest }}
+      open: ${{ steps.dedup.outputs.open }}
+      versions: ${{ steps.chain.outputs.versions }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,12 +66,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "pinned=$pinned latest=$latest newer=$newer"
 
-      - name: Open assessment issue
+      - name: Skip a version that already has an issue
+        id: dedup
         if: steps.ver.outputs.newer == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           LATEST: ${{ steps.ver.outputs.latest }}
-          PINNED: ${{ steps.ver.outputs.pinned }}
         run: |
           set -euo pipefail
           title="vLLM v${LATEST} compatibility assessment"
@@ -74,37 +83,207 @@ jobs:
             --json title --jq "map(select(.title == \"$title\")) | length")
           if [ "${exists:-0}" -gt 0 ]; then
             echo "issue already exists for v${LATEST}; nothing to do."
-            exit 0
-          fi
-          # Auto-fill the one section CI can compute without analysis: the
-          # requirements/common.txt delta between the two tags.
-          raw=https://raw.githubusercontent.com/vllm-project/vllm
-          base=$(mktemp); tgt=$(mktemp)
-          if curl -fsSL "$raw/v${PINNED}/requirements/common.txt" -o "$base" \
-             && curl -fsSL "$raw/v${LATEST}/requirements/common.txt" -o "$tgt"; then
-            deps_delta=$(diff "$base" "$tgt" | sed -n 's/^< /- /p; s/^> /+ /p') || true
-            [ -n "$deps_delta" ] || deps_delta="No changes to requirements/common.txt."
+            echo "open=false" >> "$GITHUB_OUTPUT"
           else
-            deps_delta="(could not fetch requirements/common.txt for one or both tags)"
+            echo "open=true" >> "$GITHUB_OUTPUT"
           fi
-          rm -f "$base" "$tgt"
+
+      - name: List the releases to diff
+        id: chain
+        if: steps.dedup.outputs.open == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED: ${{ steps.ver.outputs.pinned }}
+          LATEST: ${{ steps.ver.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # The pin, every intermediate X.Y.0, and the latest release, in version order.
+          versions=$(
+            {
+              gh api "repos/vllm-project/vllm/releases?per_page=100" --paginate \
+                --jq '.[] | select((.draft or .prerelease) | not) | .tag_name | ltrimstr("v")'
+              echo "$PINNED"
+            } |
+            sort -Vu |
+            awk -v lo="$PINNED" -v hi="$LATEST" '
+              $0 == lo { on = 1 }
+              on && ($0 == lo || $0 == hi || /^[0-9]+\.[0-9]+\.0$/) { print }
+              $0 == hi { exit }' |
+            xargs
+          )
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "versions=$versions"
+
+  host-tests:
+    needs: check
+    if: needs.check.outputs.open == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        vllm: ["${{ needs.check.outputs.pinned }}", "${{ needs.check.outputs.latest }}"]
+    uses: ./.github/workflows/host-tests-stubbed.yaml
+    with:
+      vllm-version: ${{ matrix.vllm }}
+      python-versions: '["3.10"]'
+      report: true
+
+  upstream-diffs:
+    needs: check
+    if: needs.check.outputs.open == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSIONS: ${{ needs.check.outputs.versions }}
+    steps:
+      - name: Fetch the sources
+        run: |
+          set -euo pipefail
+          for v in $VERSIONS; do
+            mkdir -p "src/$v"
+            curl -fsSL "https://github.com/vllm-project/vllm/archive/refs/tags/v$v.tar.gz" \
+              | tar xz --strip-components=1 -C "src/$v"
+          done
+
+      - name: Diff each consecutive pair
+        run: |
+          set -euo pipefail
+          read -ra vs <<<"$VERSIONS"
+          mkdir -p out/diffs
+          cd src
+          env_vars() { grep -oE '^    "[A-Z][A-Z0-9_]*":' "$1/vllm/envs.py" | tr -d ' ":' | sort -u; }
+          code_list() { sed 's/.*/`&`/' | paste -sd, - | sed 's/,/, /g'; }
+          # git diff --no-index exits 1 when the inputs differ; only >1 is an error.
+          for ((i = 1; i < ${#vs[@]}; i++)); do
+            a=${vs[i-1]} b=${vs[i]}
+            {
+              printf '#### %s → %s\n\n| Path | Change |\n|---|---|\n' "$a" "$b"
+              for p in vllm/v1 vllm/config vllm/distributed vllm/envs.py requirements/common.txt; do
+                stat=$(git diff --no-index --shortstat "$a/$p" "$b/$p" || [ $? -eq 1 ])
+                printf '| `%s` | %s |\n' "$p" "${stat:- unchanged}"
+                git diff --no-index "$a/$p" "$b/$p" >> "../out/diffs/$a..$b.diff" || [ $? -eq 1 ]
+              done
+
+              # Moved symbols often show up only as removed or renamed modules.
+              git diff --no-index --name-status -M --diff-filter=ADR "$a/vllm" "$b/vllm" \
+                | awk 'BEGIN { FS = "\t" }
+                       { sub(/^[^\/]+\//, "", $2) }
+                       NF > 2 { sub(/^[^\/]+\//, "", $3); print "R " $2 " → " $3; next }
+                       { print $1 " " $2 }' > "../out/$a..$b.files" || [ $? -eq 1 ]
+              n_added=$(grep -c '^A ' "../out/$a..$b.files" || true)
+              moved=$(grep -v '^A ' "../out/$a..$b.files" || true)
+              n_moved=$(grep -c . <<<"$moved" || true)
+              printf '\nModules under `vllm/`: %s removed (D) or renamed (R), %s added.\n' "$n_moved" "$n_added"
+              if [ "$n_moved" -gt 0 ]; then
+                printf '\n<details><summary>Removed and renamed</summary>\n\n```\n'
+                head -n 100 <<<"$moved"
+                [ "$n_moved" -le 100 ] || printf '… %s more in the artifact\n' "$((n_moved - 100))"
+                printf '```\n</details>\n'
+              fi
+
+              added=$(comm -13 <(env_vars "$a") <(env_vars "$b") | code_list)
+              removed=$(comm -23 <(env_vars "$a") <(env_vars "$b") | code_list)
+              printf '\nEnvironment variables — added: %s; removed: %s.\n\n' "${added:-none}" "${removed:-none}"
+            } >> ../out/summary.md
+          done
+
+          deps=$(diff "${vs[0]}/requirements/common.txt" "${vs[-1]}/requirements/common.txt" \
+            | sed -n 's/^< /- /p; s/^> /+ /p' || true)
+          echo "${deps:-No changes to requirements/common.txt.}" > ../out/deps.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-diffs
+          path: out/
+
+  open-issue:
+    needs: [check, host-tests, upstream-diffs]
+    # Generated sections that failed are marked as such; the issue is still opened.
+    if: always() && needs.check.outputs.open == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PINNED: ${{ needs.check.outputs.pinned }}
+      LATEST: ${{ needs.check.outputs.latest }}
+      VERSIONS: ${{ needs.check.outputs.versions }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Open assessment issue
+        run: |
+          set -euo pipefail
+          title="vLLM v${LATEST} compatibility assessment"
+          read -ra vs <<<"$VERSIONS"
+          diffs=artifacts/upstream-diffs
+
+          # Open PRs and branches that may already carry this bump.
+          new_versions=${VERSIONS#* }
+          prs=$(gh pr list --state open --limit 100 --json number,title \
+            | jq -r --arg versions "$new_versions" '
+                ($versions | split(" ")) as $vs
+                | .[] | .title as $t
+                | select(($t | test("\\[deps\\]"; "i")) or any($vs[]; . as $v | $t | contains($v)))
+                | "- #\(.number) \(.title)"')
+          version_re=$(sed 's/\./[.-]/g; s/ /|/g' <<<"$new_versions")
+          branches=$(gh api "repos/$GH_REPO/branches?per_page=100" --paginate --jq '.[].name' \
+            | grep -E "$version_re" | sed 's/.*/- `&`/' || true)
+          inflight=$(printf '%s\n%s' "$prs" "$branches" | sed '/^$/d')
+
+          tests_row() {
+            local d
+            d=$(compgen -G "artifacts/host-tests-$1-py*" | head -n 1 || true)
+            if [ ! -f "$d/install" ]; then
+              printf '| %s | | no result; see the run |\n' "$1"
+            elif [ "$(cat "$d/install")" != success ]; then
+              printf '| %s | **%s** | |\n' "$1" "$(cat "$d/install")"
+            else
+              printf '| %s | ok | %s |\n' "$1" "$(cat "$d/summary" 2>/dev/null)"
+            fi
+          }
+          only_latest=
+          if compgen -G "artifacts/host-tests-$PINNED-py*/failures" >/dev/null &&
+             compgen -G "artifacts/host-tests-$LATEST-py*/failures" >/dev/null; then
+            only_latest=$(comm -13 \
+              <(sort -u artifacts/host-tests-"$PINNED"-py*/failures) \
+              <(sort -u artifacts/host-tests-"$LATEST"-py*/failures))
+          fi
+          n_only_latest=$(grep -c . <<<"$only_latest" || true)
 
           # Seed the issue in the #64 shape; the assessing agent fills the
-          # placeholders per the playbook's Phase 6. printf format strings are
+          # placeholders per the playbook's Phase 7. printf format strings are
           # single-quoted so backticks/`$` stay literal; only %s is substituted.
           body=$(mktemp)
           {
             printf 'Upstream vLLM **v%s** is available; the plugin pins **%s** (`docs/install-vllm-tt.sh`).\n\n' "$LATEST" "$PINNED"
-            printf 'Run `.github/prompts/vllm-upgrade-assessment.prompt.md` (TARGET = `v%s`, BASELINE = `%s`) and edit this issue with the findings — a concise summary plus concise per-version diffs, no proposed solutions.\n\n' "$LATEST" "$PINNED"
+            printf 'Run `.github/prompts/vllm-upgrade-assessment.prompt.md` (TARGET = `v%s`, BASELINE = `%s`) and edit this issue with the findings — a concise summary plus concise per-release diffs, no proposed solutions. Keep the **Generated** section: it is input for the assessment, not findings.\n\n' "$LATEST" "$PINNED"
             printf '## Summary\n_(to be completed by the assessment)_\n\n'
-            printf '## Diffs relevant to the plugin (%s → %s)\n' "$PINNED" "$LATEST"
-            printf '**Breaking** — _(to be completed)_\n\n'
-            printf '**Behavioral** — _(to be completed)_\n\n'
-            printf '**Unchanged / byte-identical** — _(to be completed)_\n\n'
+            printf '## Diffs relevant to the plugin\n_(tag each finding with its severity class, e.g. `BREAKING-IMPORT`, `BEHAVIORAL`, `REDUNDANT`)_\n\n'
+            for ((i = 1; i < ${#vs[@]}; i++)); do
+              printf '### %s → %s\n_(to be completed)_\n\n' "${vs[i-1]}" "${vs[i]}"
+            done
             printf '## Dependencies (`requirements/common.txt`, %s → %s)\n' "$PINNED" "$LATEST"
-            printf '```diff\n%s\n```\n\n' "$deps_delta"
-            printf '## Method\nDiffed the installed baseline against the upstream tag, per coupled symbol.\n\n'
-            printf '_Opened automatically by `.github/workflows/vllm-release-watch.yml`._\n'
+            printf '```diff\n%s\n```\n\n' "$(cat "$diffs/deps.txt" 2>/dev/null || echo '(not generated; see the run)')"
+            printf '## Generated\n'
+            printf 'By [the release watch](%s) at plugin `main` `%s`. Full diffs: `gh run download %s -R %s -n upstream-diffs`.\n\n' \
+              "$RUN_URL" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GH_REPO"
+            printf '### Open bump PRs and branches\n%s\n\n' "${inflight:-None found.}"
+            printf '### Host tests (stubbed ttnn)\n| vLLM | Install | Result |\n|---|---|---|\n'
+            tests_row "$PINNED"
+            tests_row "$LATEST"
+            if [ "$n_only_latest" -gt 0 ]; then
+              printf '\n<details><summary>Failing only on %s (%s)</summary>\n\n```\n%s\n```\n</details>\n' \
+                "$LATEST" "$n_only_latest" "$(head -n 100 <<<"$only_latest")"
+            fi
+            printf '\n### Upstream changes per release\n'
+            cat "$diffs/summary.md" 2>/dev/null || printf '_(not generated; see the run)_\n'
+            printf '\n_Opened automatically by `.github/workflows/vllm-release-watch.yml`._\n'
           } > "$body"
 
           gh issue create --title "$title" --body-file "$body" \
