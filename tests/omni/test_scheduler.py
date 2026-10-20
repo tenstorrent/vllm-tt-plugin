@@ -30,8 +30,6 @@ from vllm_tt_plugin.scheduler import (  # noqa: E402
 def _bare(pending=None):
     """The scheduler's own state only: what the seams under test read."""
     scheduler = object.__new__(TTOmniARScheduler)
-    scheduler._is_block_output_model = False
-    scheduler._committing_block_step_decisions = {}
     scheduler._pending_async_output_frames = dict(pending or {})
     return scheduler
 

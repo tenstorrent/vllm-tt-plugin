@@ -14,7 +14,7 @@ Two seams need joining:
   * Omni re-wraps the ``SchedulerOutput`` into an ``OmniSchedulerOutput`` from its
     dataclass fields alone, which drops the per-step state TT attaches beside them.
   * Omni's ``update_from_output`` replaces the base loop instead of extending it, so
-    ``TTScheduler.update_from_output`` never runs; its commit bookkeeping runs here.
+    ``TTScheduler.update_from_output`` never runs; its output-frame release runs here.
 """
 
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -23,10 +23,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 
 from vllm_tt_plugin.config import get_tt_output_tokens_per_step
-from vllm_tt_plugin.scheduler import TTScheduler
-
-# What TT attaches to a SchedulerOutput beside its dataclass fields.
-TT_SCHEDULER_OUTPUT_PREFIX = "_tt_"
+from vllm_tt_plugin.scheduler import TTScheduler, carry_tt_scheduler_output_fields
 
 
 class TTOmniARScheduler(OmniARAsyncScheduler, TTScheduler):
@@ -51,9 +48,7 @@ class TTOmniARScheduler(OmniARAsyncScheduler, TTScheduler):
 
     def _wrap_omni_scheduler_output(self, base: SchedulerOutput, **kwargs):
         wrapped = super()._wrap_omni_scheduler_output(base, **kwargs)
-        for name, value in vars(base).items():
-            if name.startswith(TT_SCHEDULER_OUTPUT_PREFIX):
-                setattr(wrapped, name, value)
+        carry_tt_scheduler_output_fields(base, wrapped)
         return wrapped
 
     def update_from_output(
@@ -61,5 +56,7 @@ class TTOmniARScheduler(OmniARAsyncScheduler, TTScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        with self._committing_step(scheduler_output):
+        try:
             return super().update_from_output(scheduler_output, model_runner_output)
+        finally:
+            self.tt_release_output_frames(scheduler_output)
