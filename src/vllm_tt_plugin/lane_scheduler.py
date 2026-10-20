@@ -49,11 +49,13 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
+    _TT_STEP_STATE_ATTR,
     TTDecodeInterleavePolicy,
     TTScheduler,
     TTSchedulingMode,
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
+    set_tt_scheduler_output_field,
 )
 
 if TYPE_CHECKING:
@@ -99,14 +101,11 @@ class _LaneStepState:
 # coordinator's own update paths can still recover each lane's unmerged output.
 # This relies on ``SchedulerOutput`` being a plain attrs-mutable dataclass with
 # no ``__slots__``; the attribute is invisible in that class's definition, so
-# every access goes through the two helpers below to keep the name in one place.
-_TT_STEP_STATE_ATTR = "_tt_step_state"
-
-
+# every access goes through the two helpers below.
 def _set_tt_step_state(
     scheduler_output: SchedulerOutput, state: _LaneStepState
 ) -> None:
-    setattr(scheduler_output, _TT_STEP_STATE_ATTR, state)
+    set_tt_scheduler_output_field(scheduler_output, _TT_STEP_STATE_ATTR, state)
 
 
 def _get_tt_step_state(scheduler_output: SchedulerOutput) -> _LaneStepState | None:
