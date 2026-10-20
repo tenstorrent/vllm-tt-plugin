@@ -24,6 +24,8 @@ from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (  # noqa:
     _should_append_async_frame,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput  # noqa: E402
+from vllm_omni.outputs.mm_outputs import MultimodalPayload  # noqa: E402
+from vllm_omni.outputs.output_modality import OutputModality  # noqa: E402
 from vllm_omni.worker.omni_connector_validation import (  # noqa: E402
     validate_worker_omni_connector,
 )
@@ -77,7 +79,7 @@ def test_frames_land_in_their_requests_rows():
     assert set(row) == {"codes.audio", "meta.codec_frame_valid"}, "flat, as on the wire"
     assert all(isinstance(value, torch.Tensor) for value in row.values())
     assert row["codes.audio"].tolist() == [FRAME]
-    assert bool(row["meta.codec_frame_valid"])
+    assert row["meta.codec_frame_valid"].tolist() == [1]
     assert converted.inter_stage_outputs == converted.multimodal_outputs
 
 
@@ -108,6 +110,21 @@ def test_the_row_is_a_frame_the_qwen3_tts_chunker_appends():
 
     assert frame.tolist() == FRAME
     assert _should_append_async_frame(stage_output, frame)
+
+
+def test_a_requests_frames_accumulate_as_omni_returns_them():
+    """Omni joins a request's rows across steps before it returns them."""
+    accumulated = MultimodalPayload()
+    for index, frame in enumerate([FRAME, FRAME[::-1]]):
+        row = to_omni_output(_output(["a"], {"a": TTStageFrame(index, frame)}))
+        accumulated = accumulated.merged_with(
+            MultimodalPayload.from_raw(row.multimodal_outputs[0], "audio")
+        )
+
+    accumulated.consolidate_tensors(OutputModality.AUDIO)
+
+    assert accumulated["codes.audio"].tolist() == [FRAME, FRAME[::-1]]
+    assert accumulated["meta.codec_frame_valid"].tolist() == [1, 1]
 
 
 def test_a_new_requests_payload_reaches_the_runner_as_a_dict(monkeypatch):

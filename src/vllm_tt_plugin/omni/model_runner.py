@@ -9,7 +9,7 @@
   * Out: the frames the model published (``stage_outputs``) become Omni's per-row
     ``multimodal_outputs`` and ``inter_stage_outputs``, in the shape vLLM-Omni's
     Qwen3-TTS talker emits, flattened to tensor values as Omni's wire format requires:
-    ``{"codes.audio": [1, 16], "meta.codec_frame_valid": True}``. Omni's scheduler
+    ``{"codes.audio": [1, 16], "meta.codec_frame_valid": [1]}``. Omni's scheduler
     sends them on to the next stage, which unflattens them, or to the client when this
     stage is the last.
 
@@ -37,7 +37,8 @@ def omni_frame(data) -> dict:
     return flatten_payload(
         {
             "codes": {"audio": torch.as_tensor(data, dtype=torch.long).reshape(1, -1)},
-            "meta": {"codec_frame_valid": torch.tensor(True)},
+            # One flag per codes row, as Omni concatenates both along dim 0.
+            "meta": {"codec_frame_valid": torch.ones(1, dtype=torch.int8)},
         }
     )
 
