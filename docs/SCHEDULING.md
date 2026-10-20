@@ -250,7 +250,9 @@ requests that reaches an idle engine a few milliseconds apart prefills in one
 step instead of one step for the first arrival and another for the rest. The
 held steps schedule nothing (a decode-only pass, which admits no waiting
 request); the engine loop takes in new arrivals and schedules again. It never
-holds while a decode runs.
+holds while a decode runs. `prefill_gather_quiet_ms` (default 10) ends the hold
+early once no request has arrived for that long, so a lone request waits that
+long rather than the whole window.
 
 Four properties keep the policy contained:
 

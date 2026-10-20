@@ -110,6 +110,7 @@ def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False, **interleave_k
     coordinator.num_lanes = len(lanes)
     coordinator._per_lane_max = per_lane_max
     coordinator._prefill_gather_s = 0.0
+    coordinator._prefill_gather_quiet_s = 0.01
     coordinator.log_stats = log_stats
     coordinator.structured_output_manager = None
     coordinator.connector = None
@@ -751,6 +752,7 @@ def test_prefill_gather_holds_an_idle_engine_until_the_window_passes(monkeypatch
     lane1 = FakeLane()
     coordinator = _make_coordinator([lane0, lane1], per_lane_max=2)
     coordinator._prefill_gather_s = 0.05
+    coordinator._prefill_gather_quiet_s = 0.05  # the window, not the quiet gap, ends it
 
     monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.02)
     held = coordinator.schedule()
@@ -788,3 +790,19 @@ def test_prefill_gather_stops_holding_once_every_slot_has_a_request(monkeypatch)
     coordinator.schedule()
 
     assert lane0.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
+
+
+def test_prefill_gather_stops_holding_once_arrivals_go_quiet(monkeypatch):
+    lane0 = _waiting_since(FakeLane(), 100.0, 100.03)
+    coordinator = _make_coordinator([lane0, FakeLane()], per_lane_max=2)
+    coordinator._prefill_gather_s = 0.2
+
+    # The newest arrival is 5 ms old: still arriving, hold.
+    monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.035)
+    coordinator.schedule()
+    assert lane0.scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
+
+    # 15 ms without an arrival: prefill now, long before the 200 ms window ends.
+    monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.045)
+    coordinator.schedule()
+    assert lane0.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY

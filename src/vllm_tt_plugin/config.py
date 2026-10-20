@@ -646,12 +646,33 @@ def get_tt_prefill_gather_ms(vllm_config: "VllmConfig") -> float:
     otherwise prefill as one step for the first arrival and another for the
     rest, and TT runs each step as all-prefill or all-decode.
     """
-    tt_config = get_tt_config(vllm_config)
-    value = tt_config.get(_PREFILL_GATHER_MS_KEY, 0)
+    return _read_tt_nonnegative_number(
+        get_tt_config(vllm_config), _PREFILL_GATHER_MS_KEY, 0
+    )
+
+
+_PREFILL_GATHER_QUIET_MS_KEY = "prefill_gather_quiet_ms"
+_PREFILL_GATHER_QUIET_MS_DEFAULT = 10
+
+
+def get_tt_prefill_gather_quiet_ms(vllm_config: "VllmConfig") -> float:
+    """Milliseconds without a new arrival after which a held prefill step stops
+    waiting before ``prefill_gather_ms`` runs out (default 10): a lone request
+    waits this long, not the whole window."""
+    return _read_tt_nonnegative_number(
+        get_tt_config(vllm_config),
+        _PREFILL_GATHER_QUIET_MS_KEY,
+        _PREFILL_GATHER_QUIET_MS_DEFAULT,
+    )
+
+
+def _read_tt_nonnegative_number(
+    tt_config: dict[str, Any], key: str, default: float
+) -> float:
+    value = tt_config.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError(
-            f"additional_config['tt']['{_PREFILL_GATHER_MS_KEY}'] must be a number "
-            f">= 0 (0 disables), got {value!r}"
+            f"additional_config['tt']['{key}'] must be a number >= 0, got {value!r}"
         )
     return float(value)
 

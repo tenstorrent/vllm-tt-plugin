@@ -48,6 +48,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
     get_tt_prefill_gather_ms,
+    get_tt_prefill_gather_quiet_ms,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
@@ -292,6 +293,9 @@ class TTLaneCoordinator(SchedulerInterface):
         # their own lane's work and disagree about when to interleave.
         self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
         self._prefill_gather_s = get_tt_prefill_gather_ms(vllm_config) / 1000.0
+        self._prefill_gather_quiet_s = (
+            get_tt_prefill_gather_quiet_ms(vllm_config) / 1000.0
+        )
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -570,8 +574,9 @@ class TTLaneCoordinator(SchedulerInterface):
         """Whether this step waits for more arrivals (``prefill_gather_ms``).
 
         Only while no lane runs a request (so no decode waits on it), some
-        request waits, the waiting requests fill fewer than every slot, and the
-        oldest of them arrived less than the window ago.
+        request waits, the waiting requests fill fewer than every slot, the
+        oldest of them arrived less than ``prefill_gather_ms`` ago and the
+        newest less than ``prefill_gather_quiet_ms`` ago (arrivals still come).
         """
         if self._prefill_gather_s <= 0:
             return False
@@ -580,8 +585,12 @@ class TTLaneCoordinator(SchedulerInterface):
         waiting = [req for sched in self.lanes for req in sched.waiting]
         if not waiting or len(waiting) >= self.num_lanes * self._per_lane_max:
             return False
-        oldest = min(req.arrival_time for req in waiting)
-        return time.time() - oldest < self._prefill_gather_s
+        arrivals = [req.arrival_time for req in waiting]
+        now = time.time()
+        return (
+            now - min(arrivals) < self._prefill_gather_s
+            and now - max(arrivals) < self._prefill_gather_quiet_s
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if self._hold_for_prefill_gather():
