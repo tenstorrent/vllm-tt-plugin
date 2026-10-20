@@ -52,8 +52,41 @@ class TTTopKTopPSampler(TopKTopPSampler):
             state, vocab, size, self._sampling_pool.submit(generate)
         )
 
+    # Unseeded top-p draws from the TOP_P_CANDIDATES largest logits when they
+    # already hold p of the probability mass: the nucleus then lies inside them,
+    # so the draw has the same distribution as sorting the whole vocabulary.
+    TOP_P_CANDIDATES = 2048
+
+    def _sample_top_p_candidates(self, logits, p):
+        top_logits, top_ids = logits.topk(self.TOP_P_CANDIDATES, dim=-1)
+        probs = (top_logits - torch.logsumexp(logits, dim=-1, keepdim=True)).exp_()
+        mass_before = probs.cumsum(dim=-1).sub_(probs)
+        inside = (mass_before[:, -1] + probs[:, -1]) >= p
+        # The same nucleus as apply_top_k_top_p: drop a token once the tokens
+        # ranked above it reach p, and always keep the most likely one.
+        drop = mass_before >= p.unsqueeze(1)
+        drop[:, 0] = False
+        probs.masked_fill_(drop, 0.0)
+        noise = torch.empty_like(probs).exponential_()
+        picks = probs.div_(noise).argmax(dim=-1, keepdim=True)
+        tokens = top_ids.gather(1, picks).view(-1)
+        if not bool(inside.all()):
+            rows = (~inside).nonzero().view(-1)
+            full = super().forward_native(logits[rows], {}, None, p[rows])
+            tokens[rows] = full[0]
+        return tokens, None
+
     def forward_native(self, logits, generators, k, p):
         batch, vocab = logits.shape
+        if (
+            not generators
+            and k is None
+            and p is not None
+            and logits.device.type == "cpu"
+            and vocab > 4 * self.TOP_P_CANDIDATES
+            and self.logprobs_mode not in ("processed_logits", "processed_logprobs")
+        ):
+            return self._sample_top_p_candidates(logits, p)
         if (
             logits.device.type != "cpu"
             or batch == 0
