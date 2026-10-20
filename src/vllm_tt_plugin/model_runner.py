@@ -3290,6 +3290,10 @@ class TTModelRunner:
             # or force-argmax placeholder metadata.
             return False
         if max_lp is not None:
+            # A model whose device sampler returns no logprobs keeps every
+            # logprob request on host sampling.
+            if not self.model.model_capabilities.get("supports_device_logprobs", True):
+                return False
             if num_devices not in (8, 32):
                 return False
             if max_lp > 0 and not self.supports_topk_logprobs:
