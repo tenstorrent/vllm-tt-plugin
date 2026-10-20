@@ -605,6 +605,26 @@ def resolve_tt_scheduler_cls(
     )
 
 
+def validate_tt_scheduler_config(vllm_config: "VllmConfig") -> None:
+    """Let the paired scheduler refuse a resolved TT config it cannot run.
+
+    A scheduler class may define a ``validate_tt_config(vllm_config)`` classmethod.
+    It runs here, after pairing and capability resolution, so a refusal comes
+    before any device opens; vLLM builds the scheduler only after the model loads.
+    TT's own schedulers define none and are not imported here.
+    """
+    scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+    if scheduler_cls in (TT_SCHEDULER_CLS, TT_LANE_SCHEDULER_CLS):
+        return
+    if isinstance(scheduler_cls, str):
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        scheduler_cls = resolve_obj_by_qualname(scheduler_cls)
+    validate = getattr(scheduler_cls, "validate_tt_config", None)
+    if validate is not None:
+        validate(vllm_config)
+
+
 # Decode-interleave policy. TT executes a step as all-prefill or all-decode, so
 # a run of prefill steps stalls every running decode for its whole duration.
 # These bound that run. Read by the scheduler and by the lane coordinator.

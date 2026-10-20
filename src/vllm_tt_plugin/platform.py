@@ -41,6 +41,7 @@ from vllm_tt_plugin.config import (
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
+    validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import (
@@ -2447,6 +2448,7 @@ class TTPlatform(Platform):
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
+        validate_tt_scheduler_config(vllm_config)
         if tt_requests_cannot_resume(vllm_config):
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()

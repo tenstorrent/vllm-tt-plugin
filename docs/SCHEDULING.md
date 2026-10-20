@@ -454,6 +454,11 @@ in its `finally`, through `tt_release_output_frames`. A subclass whose
 `update_from_output` does not reach `TTScheduler`'s calls that hook once per
 committed step itself.
 
+A scheduler paired with a TT worker may define a `validate_tt_config(vllm_config)`
+classmethod. `TTPlatform.check_and_update_config` calls it once pairing and
+capability resolution are done, so a scheduler can refuse a config it cannot run
+before any device opens. vLLM builds the scheduler only after the model loads.
+
 ### Why TT uses an async-style scheduler even in TT-specific flows
 
 TT uses an async-capable scheduler base because decode overlap needs output placeholders: a request can be scheduled one step ahead before the previous step's output has been fully applied on the host.

@@ -61,6 +61,20 @@ class TTStageARWorker(TTWorker):
     tt_scheduler_cls = TTStageARScheduler
 
 
+class TTRefusingStageARScheduler(TTStageARScheduler):
+    seen: list = []
+
+    @classmethod
+    def validate_tt_config(cls, vllm_config) -> None:
+        cls.seen.append(vllm_config.scheduler_config.scheduler_cls)
+        if vllm_config.scheduler_config.max_num_seqs != 1:
+            raise ValueError("this stage runs one sequence")
+
+
+class TTRefusingStageARWorker(TTWorker):
+    tt_scheduler_cls = TTRefusingStageARScheduler
+
+
 class TTStageGenerationWorker(TTWorker):
     tt_scheduler_cls = TTStageGenerationScheduler
 
@@ -674,6 +688,25 @@ class TestDPModes:
         # TTWorker.init_device re-applies the hook in the worker process.
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
         assert vllm_config.scheduler_config.scheduler_cls == expected
+
+    def test_the_paired_scheduler_validates_the_resolved_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        monkeypatch.setattr(TTRefusingStageARScheduler, "seen", [])
+        vllm_config.scheduler_config.scheduler_cls = OmniARAsyncScheduler
+        vllm_config.parallel_config.worker_cls = TTRefusingStageARWorker
+        vllm_config.scheduler_config.max_num_seqs = 1
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert TTRefusingStageARScheduler.seen == [TTRefusingStageARScheduler]
+
+        vllm_config.scheduler_config.max_num_seqs = 2
+        with pytest.raises(ValueError, match="this stage runs one sequence"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_check_and_update_config_rejects_a_mismatched_pair(
         self,
