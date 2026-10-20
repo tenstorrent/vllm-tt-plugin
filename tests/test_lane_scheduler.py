@@ -16,6 +16,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.request import RequestStatus
 
+from vllm_tt_plugin import lane_scheduler
 from vllm_tt_plugin.lane_scheduler import (
     TTLaneCoordinator,
     TTStepPlan,
@@ -108,6 +109,7 @@ def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False, **interleave_k
     )
     coordinator.num_lanes = len(lanes)
     coordinator._per_lane_max = per_lane_max
+    coordinator._prefill_gather_s = 0.0
     coordinator.log_stats = log_stats
     coordinator.structured_output_manager = None
     coordinator.connector = None
@@ -737,3 +739,52 @@ def test_make_stats_sums_every_lanes_prefix_cache_stats():
     assert (
         coordinator.make_stats().prefix_cache_stats.queries == 0
     )  # read once per update
+
+
+def _waiting_since(lane, *arrivals):
+    lane.waiting = [SimpleNamespace(arrival_time=t) for t in arrivals]
+    return lane
+
+
+def test_prefill_gather_holds_an_idle_engine_until_the_window_passes(monkeypatch):
+    lane0 = _waiting_since(FakeLane(), 100.0)
+    lane1 = FakeLane()
+    coordinator = _make_coordinator([lane0, lane1], per_lane_max=2)
+    coordinator._prefill_gather_s = 0.05
+
+    monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.02)
+    held = coordinator.schedule()
+    assert held.total_num_scheduled_tokens == 0
+    assert get_tt_step_plan(held).is_decode is True
+    # The held step runs no prefill pass, so it admits nothing.
+    assert lane0.scheduled_modes == [TTSchedulingMode.DECODE_ONLY]
+
+    monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.06)
+    coordinator.schedule()
+    assert lane0.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_prefill_gather_never_holds_running_decodes(monkeypatch):
+    lane0 = _waiting_since(FakeLane(), 100.0)
+    lane1 = FakeLane(running=1)
+    coordinator = _make_coordinator([lane0, lane1], per_lane_max=2)
+    coordinator._prefill_gather_s = 0.05
+    monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.0)
+
+    coordinator.schedule()
+
+    # Not held: the step negotiates prefill first (the fake lanes then fall
+    # back to decode).
+    assert lane0.scheduled_modes[0] == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_prefill_gather_stops_holding_once_every_slot_has_a_request(monkeypatch):
+    lane0 = _waiting_since(FakeLane(), 100.0, 100.0)
+    lane1 = _waiting_since(FakeLane(), 100.0, 100.0)
+    coordinator = _make_coordinator([lane0, lane1], per_lane_max=2)
+    coordinator._prefill_gather_s = 0.05
+    monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.0)
+
+    coordinator.schedule()
+
+    assert lane0.scheduled_modes == [TTSchedulingMode.PREFILL_ONLY]
