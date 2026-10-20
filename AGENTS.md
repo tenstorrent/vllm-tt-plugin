@@ -303,6 +303,63 @@ tt-metal change that declares it. Those two land as a pair. Say so in both pull
 request bodies and cross-link them. A plugin pull request that reads a
 capability no tt-metal model declares is incomplete.
 
+### Model capabilities and plugin configuration require human authorization
+
+Model capabilities describe supported model behavior so shared code can choose
+compatible execution paths. Environment variables read by the plugin and
+options accepted through `--additional-config` also affect plugin behavior.
+Each capability, environment variable, and `--additional-config` option adds
+interface, branching, testing, and maintenance costs. Keep these interfaces
+small and extend them only for demonstrated requirements.
+
+These requirements apply to new model capabilities, environment variables that
+the plugin starts reading, and new user-facing JSON keys accepted through
+`--additional-config`, including keys nested under `tt`. An environment variable
+already used outside the plugin still requires authorization before the plugin
+starts reading that environment variable.
+
+1. **Require a specific human request.** An agent must not introduce a model
+   capability, start reading another environment variable in the plugin, or
+   expose a new `--additional-config` option on its own initiative. A human must
+   explicitly request or approve the specific model capability, environment
+   variable, or `--additional-config` option before implementation. A general
+   request to add a model, support a feature, or fix a failure does not authorize
+   a new model capability, environment variable, or `--additional-config` option.
+
+2. **Verify necessity before implementation.** The agent must inspect the
+   existing model interface, capability declarations, environment variables read
+   by the plugin, `--additional-config` options, and affected callers. The agent
+   must explain the required behavior, why existing mechanisms cannot express
+   the required behavior, and why a change inside the model or plugin
+   implementation is insufficient. Human authorization does not replace this
+   check.
+
+3. **Do not hide bugs or missing features.** An agent must not introduce a model
+   capability, environment-variable read, or `--additional-config` option to
+   bypass a model or plugin bug, exempt a model from required interface behavior,
+   suppress a failing test, or present an incomplete implementation as an
+   intentional limitation. The agent must fix the model or plugin implementation
+   or report the missing implementation directly. A model capability must
+   describe a justified support boundary.
+
+4. **Keep the addition minimal.** The agent must use existing mechanisms when
+   existing mechanisms satisfy the requirement. The agent must not add
+   speculative model capabilities, environment-variable reads, or
+   `--additional-config` options for hypothetical future needs. These requirements
+   also apply to new capability values and equivalent support checks implemented
+   through model-name conditions, attributes, configuration options, or
+   environment variables.
+
+5. **Expect additional code-review scrutiny.** Every PR that introduces a
+   model capability, starts reading another environment variable in the plugin,
+   or exposes a new `--additional-config` option must identify the human request
+   or approval and provide the necessity assessment, precise semantics, affected
+   models and callers, default behavior, and relevant validation. Reviewers must
+   challenge whether the model capability, environment variable, or
+   `--additional-config` option belongs in the shared interface and whether the
+   added complexity is justified. Missing authorization or an unsupported
+   necessity claim blocks acceptance.
+
 ## 7. What reviewers in this repository actually enforce
 
 These are the recurring review themes. Check your own diff against them before
