@@ -243,6 +243,17 @@ waits at most `decode_interleave_prefill_steps` steps for its next step, and
 pending prefill work waits at most `decode_interleave_decode_steps` steps for
 its next step. Neither side starves.
 
+`prefill_gather_ms` (lane-DP, default 0: off): while no lane runs a request, a
+step that would prefill waits until the oldest waiting request is this many
+milliseconds old, or until the waiting requests fill every slot, so a burst of
+requests that reaches an idle engine a few milliseconds apart prefills in one
+step instead of one step for the first arrival and another for the rest. The
+held steps schedule nothing (a decode-only pass, which admits no waiting
+request); the engine loop takes in new arrivals and schedules again. It never
+holds while a decode runs. `prefill_gather_quiet_ms` (default 10) ends the hold
+early once no request has arrived for that long, so a lone request waits that
+long rather than the whole window.
+
 Four properties keep the policy contained:
 
 - It only ever chooses decode *in place of* prefill. It never forces prefill,

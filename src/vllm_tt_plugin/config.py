@@ -635,6 +635,48 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+_PREFILL_GATHER_MS_KEY = "prefill_gather_ms"
+
+
+def get_tt_prefill_gather_ms(vllm_config: "VllmConfig") -> float:
+    """Milliseconds a lane-DP prefill step may wait for more arrivals while no
+    lane runs a request (0, the default, never waits).
+
+    A burst of requests reaching an idle engine a few milliseconds apart would
+    otherwise prefill as one step for the first arrival and another for the
+    rest, and TT runs each step as all-prefill or all-decode.
+    """
+    return _read_tt_nonnegative_number(
+        get_tt_config(vllm_config), _PREFILL_GATHER_MS_KEY, 0
+    )
+
+
+_PREFILL_GATHER_QUIET_MS_KEY = "prefill_gather_quiet_ms"
+_PREFILL_GATHER_QUIET_MS_DEFAULT = 10
+
+
+def get_tt_prefill_gather_quiet_ms(vllm_config: "VllmConfig") -> float:
+    """Milliseconds without a new arrival after which a held prefill step stops
+    waiting before ``prefill_gather_ms`` runs out (default 10): a lone request
+    waits this long, not the whole window."""
+    return _read_tt_nonnegative_number(
+        get_tt_config(vllm_config),
+        _PREFILL_GATHER_QUIET_MS_KEY,
+        _PREFILL_GATHER_QUIET_MS_DEFAULT,
+    )
+
+
+def _read_tt_nonnegative_number(
+    tt_config: dict[str, Any], key: str, default: float
+) -> float:
+    value = tt_config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{key}'] must be a number >= 0, got {value!r}"
+        )
+    return float(value)
+
+
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
 # that starts off that grid is realigned down by the model and the whole

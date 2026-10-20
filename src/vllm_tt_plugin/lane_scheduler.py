@@ -29,6 +29,7 @@ negotiates that mode before scheduling any lane.
 from __future__ import annotations
 
 import copy
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -46,6 +47,8 @@ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_per_lane_max_num_seqs,
+    get_tt_prefill_gather_ms,
+    get_tt_prefill_gather_quiet_ms,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
@@ -289,6 +292,10 @@ class TTLaneCoordinator(SchedulerInterface):
         # the single negotiated mode, so per-lane instances would each see only
         # their own lane's work and disagree about when to interleave.
         self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
+        self._prefill_gather_s = get_tt_prefill_gather_ms(vllm_config) / 1000.0
+        self._prefill_gather_quiet_s = (
+            get_tt_prefill_gather_quiet_ms(vllm_config) / 1000.0
+        )
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -563,7 +570,40 @@ class TTLaneCoordinator(SchedulerInterface):
             decode_layout_changed=decode_layout_changed,
         )
 
+    def _hold_for_prefill_gather(self) -> bool:
+        """Whether this step waits for more arrivals (``prefill_gather_ms``).
+
+        Only while no lane runs a request (so no decode waits on it), some
+        request waits, the waiting requests fill fewer than every slot, the
+        oldest of them arrived less than ``prefill_gather_ms`` ago and the
+        newest less than ``prefill_gather_quiet_ms`` ago (arrivals still come).
+        """
+        if self._prefill_gather_s <= 0:
+            return False
+        if any(sched.running for sched in self.lanes):
+            return False
+        waiting = [req for sched in self.lanes for req in sched.waiting]
+        if not waiting or len(waiting) >= self.num_lanes * self._per_lane_max:
+            return False
+        arrivals = [req.arrival_time for req in waiting]
+        now = time.time()
+        return (
+            now - min(arrivals) < self._prefill_gather_s
+            and now - max(arrivals) < self._prefill_gather_quiet_s
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self._hold_for_prefill_gather():
+            # A decode-only pass hides the waiting queues, and nothing runs, so
+            # this step schedules nothing; the engine loop takes in new
+            # arrivals and schedules again.
+            lane_outputs = self._schedule_all_lanes(TTSchedulingMode.DECODE_ONLY)
+            merged = merge_lane_scheduler_outputs(lane_outputs)
+            plan = self._build_step_plan(lane_outputs, merged, True)
+            _set_tt_step_state(
+                merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan)
+            )
+            return merged
         prefill_intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
         forced_mode = self._negotiate_forced_mode()
         lane_outputs = self._schedule_all_lanes(forced_mode)
