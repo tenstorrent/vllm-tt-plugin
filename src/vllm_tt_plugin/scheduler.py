@@ -47,7 +47,9 @@ def set_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput, counts: dict[str, int]
 ) -> None:
     if counts:
-        setattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts))
+        set_tt_scheduler_output_field(
+            scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts)
+        )
 
 
 def get_tt_forced_reset_discard_counts(
@@ -72,13 +74,50 @@ _TT_BLOCK_STEP_DECISIONS_ATTR = "_tt_block_step_decisions"
 def set_tt_block_step_decisions(
     scheduler_output: SchedulerOutput, decisions: dict[str, bool]
 ) -> None:
-    setattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions))
+    set_tt_scheduler_output_field(
+        scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions)
+    )
 
 
 def get_tt_block_step_decisions(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, bool]:
     return dict(getattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, {}))
+
+
+# The lane coordinator's per-step state; see ``lane_scheduler.py``.
+_TT_STEP_STATE_ATTR = "_tt_step_state"
+
+# Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
+# Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
+# carries them over with ``carry_tt_scheduler_output_fields``.
+TT_SCHEDULER_OUTPUT_FIELDS = (
+    _TT_FORCED_RESET_DISCARD_COUNTS_ATTR,
+    _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
+    _TT_BLOCK_STEP_DECISIONS_ATTR,
+    _TT_STEP_STATE_ATTR,
+)
+
+
+def set_tt_scheduler_output_field(
+    scheduler_output: SchedulerOutput, name: str, value
+) -> None:
+    """Attach a TT field; ``carry_tt_scheduler_output_fields`` copies only these."""
+    if name not in TT_SCHEDULER_OUTPUT_FIELDS:
+        raise ValueError(
+            f"TT SchedulerOutput field {name!r} is not in TT_SCHEDULER_OUTPUT_FIELDS "
+            f"{TT_SCHEDULER_OUTPUT_FIELDS}"
+        )
+    setattr(scheduler_output, name, value)
+
+
+def carry_tt_scheduler_output_fields(
+    src: SchedulerOutput, dst: SchedulerOutput
+) -> None:
+    """Copy the TT fields set on ``src`` onto ``dst``."""
+    for name in TT_SCHEDULER_OUTPUT_FIELDS:
+        if hasattr(src, name):
+            setattr(dst, name, getattr(src, name))
 
 
 class TTSchedulingMode(Enum):
@@ -924,7 +963,9 @@ class TTScheduler(AsyncScheduler):
         )
         # The parent computes whether this chunk produces output. Retain that
         # decision on this step because a later schedule changes the request.
-        setattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids)
+        set_tt_scheduler_output_field(
+            scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids
+        )
         pending = getattr(self, "_pending_async_output_frames", None)
         if pending is None:
             pending = self._pending_async_output_frames = {}
@@ -1104,13 +1145,22 @@ class TTScheduler(AsyncScheduler):
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
             self._committing_block_step_decisions = {}
-            pending = self._pending_async_output_frames
-            for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
-                count = pending.get(req_id, 0)
-                if count <= 1:
-                    pending.pop(req_id, None)
-                else:
-                    pending[req_id] = count - 1
+            self.tt_release_output_frames(scheduler_output)
+
+    def tt_release_output_frames(self, scheduler_output: SchedulerOutput) -> None:
+        """Release the output frames ``scheduler_output`` reserved.
+
+        Call it exactly once per committed step, as ``update_from_output`` does from
+        its ``finally``. A subclass whose ``update_from_output`` does not reach this
+        class's must call it the same way.
+        """
+        pending = self._pending_async_output_frames
+        for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
+            count = pending.get(req_id, 0)
+            if count <= 1:
+                pending.pop(req_id, None)
+            else:
+                pending[req_id] = count - 1
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False

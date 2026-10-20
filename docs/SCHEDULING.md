@@ -439,6 +439,21 @@ output with no recorded decision. It sits next to the forced-reset discard
 counts, which block steps reject outright: a stale async frame cannot balance a
 K-placeholder reservation.
 
+### TT fields on `SchedulerOutput`
+
+TT attaches per-step state to `SchedulerOutput` beside its dataclass fields:
+forced-reset discard counts, the requests whose output frames the step
+reserved, block-step decisions, and lane step state.
+`TT_SCHEDULER_OUTPUT_FIELDS` in `scheduler.py` lists them all, and
+`set_tt_scheduler_output_field` refuses any other name. A scheduler that
+rebuilds a `SchedulerOutput` from its dataclass fields alone loses them; it
+copies them over with `carry_tt_scheduler_output_fields`.
+
+`TTScheduler.update_from_output` releases the step's output-frame reservations
+in its `finally`, through `tt_release_output_frames`. A subclass whose
+`update_from_output` does not reach `TTScheduler`'s calls that hook once per
+committed step itself.
+
 ### Why TT uses an async-style scheduler even in TT-specific flows
 
 TT uses an async-capable scheduler base because decode overlap needs output placeholders: a request can be scheduled one step ahead before the previous step's output has been fully applied on the host.
