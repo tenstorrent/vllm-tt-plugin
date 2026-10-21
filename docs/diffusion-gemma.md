@@ -115,6 +115,37 @@ OpenAI endpoints any output limit, omitted or explicit, is capped to the
 largest whole-canvas capacity that fits; the formula rejects an oversized
 `max_tokens` only for offline `SamplingParams` callers.
 
+### Requests that skip TT request validation
+
+The rejections above happen in `TTPlatform.validate_request`, which vLLM's
+`InputProcessor` calls for every request from the OpenAI server and the `LLM`
+class. A prebuilt `EngineCoreRequest` passed to `AsyncLLM.add_request` or
+`LLMEngine.add_request` (an API upstream deprecates), or sent through
+`EngineCoreClient`, skips that check.
+
+An exception while the engine admits a request stops the engine for every
+client, so `TTScheduler.add_request` does not reject such a request. It
+changes the request until the model can serve it, logs a warning for each
+change, and the request then finishes normally. The caller is not told about
+the change.
+
+| Input | Change | Engine log |
+|---|---|---|
+| Multimodal features | Dropped; placeholder positions decode as ordinary tokens | `... with multimodal features a block-output model cannot encode; dropping them` |
+| `prompt_embeds` only | Replaced with placeholder tokens of the same length | `... with a prompt_embeds-only prompt the TT backend does not support; replacing with N placeholder tokens` |
+| Mixed token ids and `prompt_embeds` | Embeds dropped; placeholder ids decode as ordinary tokens | `... with mixed token/embeds prompt content the TT backend does not support; dropping the embeds ...` |
+| Empty prompt | Padded to one placeholder token | `... with an empty prompt; padding to one placeholder token` |
+| Prompt with no room for a whole canvas | Truncated to the longest tile-aligned prompt that leaves room for one canvas | `... with a N-token prompt that leaves no room for a whole K-token canvas within max_model_len; truncating to M tokens ...` |
+| `max_tokens` above the canvas capacity | Clamped to the largest whole-canvas budget that fits | Debug only: `Clamping block-output max_tokens from ... to ...` |
+| Structured outputs, resumable session, `min_p`, `min_tokens`, `logit_bias`, `allowed_token_ids`, bad words, penalties | Removed or reset to neutral | `...; stripped controls unsupported by block-output models: ...` |
+| Further input for a session whose resumable flag was removed | Dropped; the running request finishes on its own | `Dropping streaming-input continuation for request ...` |
+| `logprobs` | Ignored by the worker; no logprobs are returned | None |
+
+In the log column, a leading `...` stands for `Request <id> bypassed frontend
+validation`. `VLLM_USE_RUST_FRONTEND=1` is refused at launch for this reason:
+that frontend never calls `validate_request`, so every request would take this
+path and be changed silently instead of rejected.
+
 ## Metrics
 
 vLLM request metrics count logical output tokens after EOS, stop-token, and
