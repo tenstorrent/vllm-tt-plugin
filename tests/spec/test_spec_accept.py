@@ -468,6 +468,29 @@ def test_a_seeded_row_is_reproducible():
     assert torch.equal(first.accepted_counts, second.accepted_counts)
 
 
+def test_seeded_rows_do_not_draw_from_the_global_stream():
+    """A walk whose rows all carry a seed and drafts leaves the global stream alone.
+
+    A seeded row's values come from its own generator. Filling that row from
+    the global stream first and then overwriting it costs a full-vocabulary
+    draw per row, the largest cost of the walk, and moves the global stream
+    for values nothing reads.
+    """
+    logits = torch.randn(3, 4, VOCAB)
+    before = torch.get_rng_state()
+    accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 0, 1]], dtype=torch.int32
+        ),
+        num_valid_drafts=torch.tensor([3, 2, 1], dtype=torch.int32),
+        temperature=torch.ones(3),
+        generators={row: torch.Generator().manual_seed(row) for row in range(3)},
+    )
+
+    assert torch.equal(torch.get_rng_state(), before)
+
+
 # endregion The distribution
 
 # region Sampling constraints

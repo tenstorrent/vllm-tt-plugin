@@ -734,13 +734,26 @@ def _sample_per_row(
     The weights are divided by the race, as vLLM's ``random_sample`` does, so a
     seeded row with no drafts draws exactly the token the ordinary sampler
     draws from the same distribution.
+
+    A seeded row's values come only from its generator, so the global stream
+    fills only the other rows: a full-vocabulary fill per row is the largest
+    cost of the walk, and a value a seeded row would overwrite is wasted.
     """
     race = torch.empty((rows, vocab), dtype=torch.float32)
-    race.exponential_()
+    unseeded = _unseeded_rows(rows, generators)
+    if len(unseeded) == rows:
+        race.exponential_()
+    elif unseeded:
+        race[unseeded] = race[unseeded].exponential_()
     for row, generator in generators.items():
         race[row].exponential_(generator=generator)
     scored = weights / race.unsqueeze(1)
     return scored.argmax(dim=-1).to(torch.int32)
+
+
+def _unseeded_rows(rows: int, generators: dict[int, torch.Generator]) -> list[int]:
+    """The rows that draw from the global stream, in row order."""
+    return [row for row in range(rows) if row not in generators]
 
 
 def _drafting_rows(
@@ -773,8 +786,15 @@ def _uniform(
 
     float64 rather than float32 because float32 draws exact 0.0 often enough to
     matter, and a 0 would accept a draft the target assigns no probability.
+
+    As in ``_sample_per_row``, only unseeded rows draw from the global stream.
+    A seeded row's columns past its own count stay at 1; the count masks them
+    out of the result, so their value is never read.
     """
-    uniform = torch.rand((rows, num_drafts), dtype=torch.float64)
+    uniform = torch.ones((rows, num_drafts), dtype=torch.float64)
+    unseeded = _unseeded_rows(rows, generators)
+    if unseeded:
+        uniform[unseeded] = torch.rand((len(unseeded), num_drafts), dtype=torch.float64)
     for row, generator in generators.items():
         valid = int(num_valid_drafts[row])
         if valid == 0:
