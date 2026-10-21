@@ -195,6 +195,23 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
             )
             scheduler_config.max_num_batched_tokens = max_model_len
 
+        # With a speculative config, VllmConfig copies max_num_batched_tokens
+        # into max_num_scheduled_tokens before this hook runs, and the
+        # scheduler budgets each step by max_num_scheduled_tokens. Left below
+        # max_model_len, an unsplit prompt longer than it is never scheduled.
+        max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+        if (
+            max_num_scheduled_tokens is not None
+            and max_num_scheduled_tokens < max_model_len
+        ):
+            logger.warning(
+                "max_num_scheduled_tokens=%d < max_model_len=%d with chunked "
+                "prefill disabled, bumping max_num_scheduled_tokens to match.",
+                max_num_scheduled_tokens,
+                max_model_len,
+            )
+            scheduler_config.max_num_scheduled_tokens = max_model_len
+
     # The base scheduler caps a prefill at this threshold before it consults
     # ``enable_chunked_prefill``, so leaving it nonzero still splits prefills
     # for a model that cannot resume one.
