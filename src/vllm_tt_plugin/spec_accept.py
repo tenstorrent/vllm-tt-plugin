@@ -903,6 +903,13 @@ def _start_walk_noise(
     threads share a generator and a walk still repeats under
     ``torch.manual_seed``. Below ``_PARALLEL_NOISE_MIN_VOCAB`` everything is
     drawn on the calling thread, as one chunk.
+
+    An unseeded row draws one race and uses it for both the bonus and the
+    correction. A row commits either its bonus, when it accepts every draft,
+    or its correction, at its first rejection, never both, and the accept
+    test reads only the uniforms, so the committed token reads that race
+    once. A seeded row cannot share: its stream must stay the one a serial
+    walk leaves.
     """
     noise = _WalkNoise(
         bonus=torch.empty((rows, vocab), dtype=torch.float32),
@@ -923,11 +930,12 @@ def _start_walk_noise(
     def draw_unseeded(chunk: list[int], seed: int) -> None:
         generator = torch.Generator().manual_seed(seed)
         shape = (len(chunk), vocab)
-        noise.bonus[chunk] = torch.empty(shape).exponential_(generator=generator)
+        race = torch.empty(shape).exponential_(generator=generator)
+        noise.bonus[chunk] = race
         noise.uniform[chunk] = torch.rand(
             (len(chunk), num_drafts), dtype=torch.float64, generator=generator
         )
-        noise.recovered[chunk] = torch.empty(shape).exponential_(generator=generator)
+        noise.recovered[chunk] = race
 
     unseeded = [row for row in range(rows) if row not in generators]
     parallel = vocab >= _PARALLEL_NOISE_MIN_VOCAB
