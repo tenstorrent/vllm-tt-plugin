@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """The TT Omni AR scheduler keeps TT's per-step state across Omni's seams."""
 
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("vllm_omni")
@@ -17,7 +19,11 @@ from vllm_omni.core.sched.omni_ar_scheduler import (  # noqa: E402
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin  # noqa: E402
 
 from tests import test_block_scheduler  # noqa: E402
-from vllm_tt_plugin.config import resolve_tt_scheduler_cls  # noqa: E402
+from vllm_tt_plugin.config import (  # noqa: E402
+    resolve_tt_scheduler_cls,
+    store_tt_output_tokens_per_step,
+    validate_tt_scheduler_config,
+)
 from vllm_tt_plugin.omni.scheduler import TTOmniARScheduler  # noqa: E402
 from vllm_tt_plugin.omni.worker import TTOmniARWorker  # noqa: E402
 from vllm_tt_plugin.scheduler import (  # noqa: E402
@@ -102,23 +108,28 @@ def test_a_one_token_stage_builds(monkeypatch):
     assert isinstance(_built(monkeypatch, output_width=1), TTOmniARScheduler)
 
 
-def test_block_output_is_refused(monkeypatch):
-    with pytest.raises(ValueError, match="output_tokens_per_step=4"):
-        _built(monkeypatch, output_width=4)
-
-
-def test_speculative_decoding_is_refused(monkeypatch):
-    original = test_block_scheduler.store_tt_output_tokens_per_step
-
-    def with_spec(config, width):
-        config.speculative_config = object()
-        original(config, width)
-
-    monkeypatch.setattr(
-        test_block_scheduler, "store_tt_output_tokens_per_step", with_spec
+def _stage_config(output_width=1, speculative_config=None):
+    config = SimpleNamespace(
+        additional_config={},
+        speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(scheduler_cls=TTOmniARScheduler),
     )
+    store_tt_output_tokens_per_step(config, output_width)
+    return config
+
+
+def test_config_validation_accepts_a_one_token_stage():
+    validate_tt_scheduler_config(_stage_config())
+
+
+def test_config_validation_refuses_block_output():
+    with pytest.raises(ValueError, match="output_tokens_per_step=4"):
+        validate_tt_scheduler_config(_stage_config(output_width=4))
+
+
+def test_config_validation_refuses_speculative_decoding():
     with pytest.raises(ValueError, match="speculative decoding"):
-        _built(monkeypatch, output_width=1)
+        validate_tt_scheduler_config(_stage_config(speculative_config=object()))
 
 
 def test_lane_mode_is_refused_when_the_scheduler_is_paired():

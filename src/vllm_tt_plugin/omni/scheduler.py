@@ -27,7 +27,8 @@ from vllm_tt_plugin.scheduler import TTScheduler, carry_tt_scheduler_output_fiel
 
 
 class TTOmniARScheduler(OmniARAsyncScheduler, TTScheduler):
-    def __init__(self, vllm_config, *args, **kwargs):
+    @classmethod
+    def validate_tt_config(cls, vllm_config) -> None:
         # Block output and speculative decoding commit several tokens per step
         # through Omni's update loop, which no TT stage has run. Lane mode is
         # refused earlier, when the scheduler is paired with the worker.
@@ -44,7 +45,6 @@ class TTOmniARScheduler(OmniARAsyncScheduler, TTScheduler):
                 "a TT vLLM-Omni AR stage runs one-token steps; got "
                 + ", ".join(conflicts)
             )
-        super().__init__(vllm_config, *args, **kwargs)
 
     def _wrap_omni_scheduler_output(self, base: SchedulerOutput, **kwargs):
         wrapped = super()._wrap_omni_scheduler_output(base, **kwargs)
