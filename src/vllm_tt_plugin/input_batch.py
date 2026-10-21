@@ -31,6 +31,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -1264,6 +1265,11 @@ class TTLaneInputBatch(InputBatch):
             tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
         input_tokens = torch.from_numpy(tokens_np)
 
+        spec = self._build_spec_block(
+            runner, scheduler_output, plan, input_tokens, input_positions, total
+        )
+        input_tokens, input_positions = spec["input_tokens"], spec["input_positions"]
+
         block_tables_per_group = lane_batch.slot_block_tables(
             occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
         )
@@ -1333,7 +1339,90 @@ class TTLaneInputBatch(InputBatch):
             ),
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(lane_batch.req_ids[:total]),
+            row_req_ids=spec["row_req_ids"],
+            num_valid_drafts=spec["num_valid_drafts"],
+            accepted_counts=spec["accepted_counts"],
+            draft_token_ids=spec["draft_token_ids"],
+            spec_mode=spec["spec_mode"],
         )
+
+    def _build_spec_block(
+        self,
+        runner: "TTModelRunner",
+        scheduler_output: "SchedulerOutput",
+        plan: "TTStepPlan",
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+        total: int,
+    ) -> dict[str, Any]:
+        """The speculative half of a lane decode, from the runner's own helpers.
+
+        The front-packed builder's rules, over the slot grid instead of a
+        packed prefix: a row is a device slot, and a gap is a row no request
+        owns, which ``_spec_row_state`` already reads as the post-prefill
+        default (no drafts, count 1) because its request id is ``None``. A gap's
+        input position is -1, and ``_spec_candidate_block`` pads every draft
+        column of a row with no valid drafts to -1, so a gap stays positionless
+        across the whole block. ``row_req_ids`` is slot-ordered with ``None``
+        at the gaps; the accept walk and the drafter run over every slot, as
+        they run over every padded row of a front-packed verify, and only the
+        scheduled rows reach a request. The draft cap counts the step's live
+        rows, the global count ``SpecPlan.k_by_rows`` is declared against.
+        """
+        none = {
+            "input_tokens": input_tokens,
+            "input_positions": input_positions,
+            "row_req_ids": None,
+            "num_valid_drafts": None,
+            "accepted_counts": None,
+            "draft_token_ids": None,
+            "spec_mode": None,
+        }
+        num_drafts = int(getattr(runner, "_num_speculative_tokens", 0) or 0)
+        if not num_drafts:
+            return none
+        # Imported here: model_runner imports this module.
+        from vllm_tt_plugin.model_runner import _has_unresolved_commit, _step_verifies
+
+        row_req_ids = list(self.req_ids[:total])
+        live_req_ids = [self.req_ids[row] for row in plan.scheduled_rows]
+        spec_plan = getattr(runner, "_spec_plan", None)
+        drafts, num_valid, counts = runner._spec_row_state(
+            runner._req_accepted_counts,
+            runner._drafts_to_verify(scheduler_output, live_req_ids),
+            row_req_ids,
+            num_drafts,
+            spec_plan.draft_cap(len(live_req_ids)) if spec_plan is not None else None,
+        )
+        if _step_verifies(
+            runner._spec_supports_narrow_decode,
+            all(runner._request_is_speculable(req_id) for req_id in live_req_ids),
+            num_valid,
+            counts,
+            total,
+        ):
+            tokens, positions = runner._spec_candidate_block(
+                drafts, num_valid, input_tokens, input_positions
+            )
+            return {
+                "input_tokens": tokens,
+                "input_positions": positions,
+                "row_req_ids": row_req_ids,
+                "num_valid_drafts": num_valid,
+                "accepted_counts": counts,
+                "draft_token_ids": drafts,
+                "spec_mode": ACCEPT_MODE_ARGMAX_IDS,
+            }
+        # The ordinary decode inside a speculating launch, as in the
+        # front-packed builder: every row commits one token, so the counts reset
+        # here, and an unresolved commit reaches the model as ``accepted_counts``.
+        out = dict(none)
+        out["row_req_ids"] = row_req_ids
+        if _has_unresolved_commit(counts, total):
+            out["accepted_counts"] = counts
+        for req_id in live_req_ids:
+            runner._req_accepted_counts.pop(req_id, None)
+        return out
 
     def _build_prefill_input(
         self,
@@ -1370,6 +1459,11 @@ class TTLaneInputBatch(InputBatch):
         )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
+        if getattr(runner, "_num_speculative_tokens", 0):
+            # A prefill commits one token, so the next verify reads the
+            # post-prefill count of 1, as in the front-packed builder.
+            for row in rows:
+                runner._req_accepted_counts.pop(lane_batch.req_ids[row], None)
 
         block_tables_per_group = lane_batch.slot_block_tables(
             rows, zero_gaps=False, total=0, width=runner.max_num_blocks_per_req

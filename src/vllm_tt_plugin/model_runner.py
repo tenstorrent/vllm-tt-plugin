@@ -2449,18 +2449,21 @@ class TTModelRunner:
                     )
                 )
                 return None
+            # A verify answers every slot with its argmax block, so it reads no
+            # selected rows back: the accept walk runs over the whole grid.
+            sampling_rows = scheduled_rows if model_input.spec_mode is None else None
             submission = self.async_decode.submit_decode(
                 model_input,
                 read_from_device=not model_input.defer_device_sampling,
                 async_read=False,
-                sampling_rows=scheduled_rows,
+                sampling_rows=sampling_rows,
             )
             if model_input.defer_device_sampling:
                 tt_out = submission.tt_out
                 tt_log_probs = None
             else:
                 finalized = self.async_decode.finalize_decode(
-                    submission, sampling_rows=scheduled_rows
+                    submission, sampling_rows=sampling_rows
                 )
                 assert finalized is not None
                 tt_out = finalized.tt_out
@@ -2564,6 +2567,13 @@ class TTModelRunner:
                 grammar_bitmask=[None],
                 defer_device_sampling=False,
             )
+        if getattr(model_input, "spec_mode", None) is not None:
+            spec_hidden = (
+                decode_submission.spec_hidden if decode_submission is not None else None
+            )
+            return TTModelRunner._finish_lane_spec_decode(
+                self, model_input, tt_out, spec_hidden, scheduled_rows
+            )
         sampled, logprobs = self.lane_batch.extract_output(
             self, tt_out, tt_log_probs, model_input, scheduled_rows, is_decode=is_decode
         )
@@ -2611,7 +2621,47 @@ class TTModelRunner:
             return self.defer_state_apply_and_build_runner_output(
                 sampled, logprobs, req_ids=req_ids
             )
-        return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
+        output = self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
+        if is_decode and getattr(self, "_num_speculative_tokens", 0):
+            # The proposal after an ordinary decode, as on the front-packed
+            # path. The drafter's rows are the device slots, so this step's
+            # tokens go back to the slots they were sampled at; a gap carries
+            # no request id and position -1, which is what marks it unowned.
+            committed = torch.zeros(
+                (int(model_input.input_positions.shape[0]), 1), dtype=torch.int32
+            )
+            committed[torch.as_tensor(scheduled_rows, dtype=torch.long)] = sampled
+            self.propose_after_plain_step(
+                model_input, committed, list(model_input.row_req_ids)
+            )
+        return output
+
+    def _finish_lane_spec_decode(
+        self,
+        model_input: TTModelInput,
+        argmax_ids: Any,
+        spec_hidden: Any,
+        scheduled_rows: list[int],
+    ) -> ModelRunnerOutput:
+        """Accept, commit and re-propose for one synchronous lane verify.
+
+        ``_finish_spec_decode`` over the slot grid. The walk, the commit and the
+        drafter run over every slot, gaps included, because the drafter's rows
+        are the verify's; a gap's request id is ``None``, so it reaches no
+        request state. Only the scheduled slots are published.
+        """
+        committed, counts = self.walk_spec_acceptance(model_input, argmax_ids)
+        prefixes = self.spec_committed_prefixes(model_input, committed, counts)
+        self.commit_spec_acceptance(model_input, committed, counts, spec_hidden)
+        req_ids = [model_input.row_req_ids[row] for row in scheduled_rows]
+        if any(req_id is None for req_id in req_ids):
+            raise RuntimeError(
+                "a scheduled lane slot has no request in the verify's row identity: "
+                f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+            )
+        return self.build_spec_runner_output(
+            req_ids, [prefixes[row] for row in scheduled_rows]
+        )
 
     @torch.no_grad()
     def execute_model(

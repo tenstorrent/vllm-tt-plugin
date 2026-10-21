@@ -304,7 +304,9 @@ class MyLaneModel:
         return concat(outs)  # [L * per_lane, 1, V] in slot order
 ```
 
-Lane-DP rejects request-specific RoPE and speculative decode. Lane-DP output
+Lane-DP rejects request-specific RoPE. It speculates only through the
+model-owned drafter (`custom_class`) with synchronous scheduling; see the
+[speculative decoding contract](SPEC_DECODE_CONTRACT.md#status). Lane-DP output
 handling is in
 [Decode readback and output conversion](#decode-readback-and-output-conversion).
 

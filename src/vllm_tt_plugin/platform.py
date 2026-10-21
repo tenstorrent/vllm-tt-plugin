@@ -2389,14 +2389,32 @@ class TTPlatform(Platform):
             # selected model can serve the combined async speculative path.
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
-            raise ValueError(
-                "TT lane mode and speculative decoding cannot be combined. "
-                "Lane mode builds its device input from TTLaneInputBatch, "
-                "which has no candidate-block builder, so a speculating lane "
-                "launch would send plain single-token decodes and silently "
-                "serve no speculation. Drop the speculative flags, or set "
-                "--data-parallel-size 1 to leave lane mode"
-            )
+            # Lane mode verifies through the model-owned drafter, synchronously.
+            # ``TTLaneInputBatch`` builds the candidate block over its stable
+            # slots and the lane tail walks, commits and proposes in one go, so
+            # both refusals below are about what that path does not cover:
+            # the n-gram proposer indexes the front-packed rows
+            # ``req_ids[:num_reqs]``, which a slot grid with gaps is not, and
+            # the asynchronous lane decode has no deferred speculative tail.
+            method = str(vllm_config.speculative_config.method)
+            if method != MODEL_OWNED_DRAFT_METHOD:
+                raise ValueError(
+                    "TT lane mode speculates only through the model-owned "
+                    f"drafter (speculative_config method "
+                    f"{MODEL_OWNED_DRAFT_METHOD!r}), got {method!r}. The "
+                    "n-gram proposer reads the front-packed persistent batch, "
+                    "and lane mode lays requests out at stable slots with "
+                    "gaps. Use the model's drafter, or set "
+                    "--data-parallel-size 1 to leave lane mode"
+                )
+            if vllm_config.scheduler_config.async_scheduling:
+                raise ValueError(
+                    "TT lane mode speculates with synchronous scheduling only: "
+                    "the asynchronous lane decode has no deferred speculative "
+                    "tail to walk acceptance and propose at its readback. "
+                    "Launch with --no-async-scheduling, or drop the "
+                    "speculative flags"
+                )
 
         # After the lane fold: _convert_dp_to_lanes rewrites
         # scheduler_config.max_num_seqs and stores the lane count, and a plan is

@@ -53,8 +53,17 @@ serve speculative decoding within the following execution limits:
   `supports_async_spec_decode`, which is about the model's readback and hidden
   handle rather than about step order: a speculative step never overlaps the
   next one, so verify, accept and propose stay ordered per request.
-- **front-packed** execution. Lane mode is refused: it builds its device input
-  from `TTLaneInputBatch`, which has no candidate-block builder.
+- **front-packed** execution, and **lane mode** with the model-owned drafter
+  (`custom_class`) under synchronous scheduling. `TTLaneInputBatch` builds the
+  candidate block over its stable slots: a row is a device slot, and a gap
+  carries request id `None`, position -1 in every column, no drafts and count
+  1, as a padding row does. The drafter and the accept walk run over every
+  slot, and only scheduled slots are committed. `num_valid_drafts`, the draft
+  cap of `SpecPlan.k_by_rows` and `_step_verifies` read the step's live rows
+  across all lanes; a per-lane policy, such as drafting only for a lane with
+  one live request, is the adapter's, through `DraftOutput.num_valid`. Lane
+  mode refuses `ngram`, whose proposer indexes front-packed rows, and
+  asynchronous scheduling, whose lane decode has no deferred speculative tail.
 
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative

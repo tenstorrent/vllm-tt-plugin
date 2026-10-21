@@ -27,6 +27,10 @@ from vllm_tt_plugin.config import (
     get_tt_spec_plan,
     require_tt_spec_plan,
 )
+from vllm_tt_plugin.spec_admission import (
+    MODEL_OWNED_DRAFT_METHOD,
+    MODEL_OWNED_DRAFT_SENTINEL,
+)
 
 
 def _speculative(vllm_config, *, method="ngram", requested_k=7):
@@ -235,18 +239,58 @@ def test_declaring_async_spec_decode_does_not_admit_async_decode_itself(
     assert vllm_config.scheduler_config.async_scheduling is False
 
 
-def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
-    # Lane mode builds its device input from TTLaneInputBatch, which has no
-    # candidate-block builder, so the refusal is what stops a lane launch from
-    # accepting the flags and sending plain single-token decodes.
+def _lane_mode(vllm_config):
     vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
     vllm_config.parallel_config.data_parallel_size = 1
+    return vllm_config
+
+
+def _model_owned(vllm_config):
+    vllm_config = _speculative(vllm_config, method=MODEL_OWNED_DRAFT_METHOD)
+    vllm_config.speculative_config.model = MODEL_OWNED_DRAFT_SENTINEL
+    return vllm_config
+
+
+def test_lane_mode_speculates_through_the_model_owned_drafter(monkeypatch, vllm_config):
+    # TTLaneInputBatch builds the candidate block over its stable slots and the
+    # synchronous lane tail walks, commits and proposes, so a lane launch with
+    # the model's own drafter is admitted and its plan published.
+    model = make_fake_spec_model(max_supported_num_seqs=1024)
+    _run_hook(monkeypatch, _model_owned(_lane_mode(vllm_config)), model)
+    plan = get_tt_spec_plan(vllm_config)
+    assert plan is not None
+    assert plan.effective_k == 7
+
+
+def test_lane_mode_cannot_speculate_with_ngram(monkeypatch, vllm_config):
+    # The n-gram proposer indexes the front-packed rows req_ids[:num_reqs], and
+    # a lane batch is a slot grid with gaps.
     model = make_fake_spec_model(max_supported_num_seqs=1024)
     with pytest.raises(ValueError) as excinfo:
-        _run_hook(monkeypatch, _speculative(vllm_config), model)
+        _run_hook(monkeypatch, _speculative(_lane_mode(vllm_config)), model)
     message = str(excinfo.value)
     assert "lane mode" in message
-    assert "TTLaneInputBatch" in message
+    assert MODEL_OWNED_DRAFT_METHOD in message
+    assert "'ngram'" in message
+
+
+def test_lane_mode_cannot_speculate_asynchronously(monkeypatch, vllm_config):
+    # Even a model that serves a deferred verify: the asynchronous lane decode
+    # has no deferred speculative tail.
+    vllm_config.scheduler_config.async_scheduling = True
+    model = make_fake_spec_model(
+        max_supported_num_seqs=1024,
+        model_capabilities={
+            **FakeSpecModel.model_capabilities,
+            "supports_async_decode": True,
+            "supports_async_spec_decode": True,
+        },
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _run_hook(monkeypatch, _model_owned(_lane_mode(vllm_config)), model)
+    message = str(excinfo.value)
+    assert "lane mode" in message
+    assert "--no-async-scheduling" in message
 
 
 def test_the_rust_frontend_cannot_speculate(monkeypatch, vllm_config):
