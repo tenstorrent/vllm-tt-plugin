@@ -66,3 +66,41 @@ def test_loaded_model_without_device_sampler_uses_host(supports_device_sampler):
         TTModelRunner.check_perform_device_sampling(runner, True, False)
         is supports_device_sampler
     )
+
+
+@pytest.mark.parametrize("top_p", [0.95, 1.0])
+@pytest.mark.parametrize("top_k", [-1, 0, 20, 256, 257, 1000])
+@pytest.mark.parametrize("declared", [False, True])
+def test_top_p_without_top_k_routes_only_nucleus_rows(declared, top_k, top_p):
+    """With ``supports_device_top_p_without_top_k`` a sampled row without top_k
+    (stored as the vocabulary size) stays on device only when top_p < 1; a
+    top_k past ``max_device_top_k`` still selects host sampling."""
+    vocab_size = 1000
+    sampling = SamplingInputBatch(2)
+    sampling.temperature[:] = 1.0
+    sampling.top_k[:] = 20
+    sampling.top_p[:] = 0.95
+    sampling.top_k[1] = top_k
+    sampling.top_p[1] = top_p
+    capabilities = {"max_device_top_k": 256}
+    if declared:
+        capabilities["supports_device_top_p_without_top_k"] = True
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
+        num_devices=4,
+        tt_data_parallel_size=1,
+        model=SimpleNamespace(model_capabilities=capabilities),
+        model_config=SimpleNamespace(logits_processors=[]),
+        input_batch=SimpleNamespace(
+            sampling=sampling,
+            req_id_to_index={"bounded": 0, "row": 1},
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            max_num_logprobs=None,
+            vocab_size=vocab_size,
+        ),
+    )
+    no_top_k = top_k < 1 or top_k >= vocab_size
+    expected = (declared and top_p < 1) if no_top_k else top_k <= 256
+    assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
