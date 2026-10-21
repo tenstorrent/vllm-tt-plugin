@@ -789,11 +789,10 @@ def test_empty_bypassed_prompt_is_padded_and_served():
     assert scheduler.running == []
 
 
-def test_empty_embeds_oversized_bypassed_request_is_repaired_in_order():
-    """Enter through add_request with an empty prompt, prompt_embeds and an
-    oversized max_tokens together. The max_tokens clamp reads the prompt the
-    earlier repairs leave, so a wrong step order leaves max_tokens unclamped
-    or the prompt unpadded."""
+def test_embeds_only_oversized_bypassed_request_is_repaired_in_order():
+    """Enter through add_request with an embeds-only prompt and an oversized
+    max_tokens together. The max_tokens clamp reads the prompt the embeds
+    replacement leaves, so a wrong step order leaves max_tokens unclamped."""
     scheduler = _scheduler()
     init_none_hash(sha256)
     params = SamplingParams(max_tokens=MAX_MODEL_LEN * 4, ignore_eos=True)
@@ -801,7 +800,7 @@ def test_empty_embeds_oversized_bypassed_request_is_repaired_in_order():
     request = Request(
         request_id="combined-0",
         prompt_token_ids=None,
-        prompt_embeds=torch.zeros(0, 4),
+        prompt_embeds=torch.zeros(8, 4),
         sampling_params=params,
         pooling_params=None,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
@@ -809,12 +808,12 @@ def test_empty_embeds_oversized_bypassed_request_is_repaired_in_order():
 
     scheduler.add_request(request)
 
-    assert request.prompt_token_ids == [0]
+    assert request.prompt_token_ids == [0] * 8
     assert request.prompt_embeds is None
-    assert request.num_prompt_tokens == 1
+    assert request.num_prompt_tokens == 8
     assert 0 < request.max_tokens < MAX_MODEL_LEN * 4
     assert request.max_tokens % CANVAS == 0
-    assert 1 + request.max_tokens <= MAX_MODEL_LEN
+    assert 8 + request.max_tokens <= MAX_MODEL_LEN
     assert request.sampling_params.max_tokens == request.max_tokens
 
 

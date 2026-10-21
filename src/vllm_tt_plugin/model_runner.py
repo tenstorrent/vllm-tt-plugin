@@ -457,40 +457,40 @@ class TTModelRunner:
         """
         if getattr(self, "_shutdown_complete", False):
             return
-        try:
-            async_decode = getattr(self, "async_decode", None)
-            if async_decode is not None:
-                try:
-                    async_decode.wait_for_all_pending_async_steps()
-                except Exception:
-                    logger.exception("Async decode drain failed during shutdown")
+        async_decode = getattr(self, "async_decode", None)
+        if async_decode is not None:
+            try:
+                async_decode.wait_for_all_pending_async_steps()
+            except Exception:
+                logger.exception("Async decode drain failed during shutdown")
 
-            # ``_pending_samples`` and ``_pending_async_steps`` are not cleared:
-            # a step that ran but was not sampled is held only by this runner,
-            # and clearing would free a buffer ttnn may still be writing into.
+        # ``_pending_samples`` and ``_pending_async_steps`` are not cleared:
+        # a step that ran but was not sampled is held only by this runner,
+        # and clearing would free a buffer ttnn may still be writing into.
 
-            # While the model is still alive, and before the mesh closes.
-            release = getattr(
-                getattr(self, "model", None), "release_persistent_capture", None
-            )
-            if callable(release):
-                try:
-                    release()
-                except Exception:
-                    logger.exception("Failed to release persistent model capture")
+        # While the model is still alive, and before the mesh closes.
+        release = getattr(
+            getattr(self, "model", None), "release_persistent_capture", None
+        )
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                logger.exception("Failed to release persistent model capture")
 
-            self.model = None
-            self.kv_caches = []
+        self.model = None
+        self.kv_caches = []
 
-            if async_decode is not None:
-                # An engine-held async output keeps ``_controller``, so cut the
-                # controller's edge back to this runner: otherwise it walks into
-                # a runner whose model is gone and fails as a missing
-                # ``process_decode_output_host``.
-                async_decode.runner = None
-                self.async_decode = None
-        finally:
-            self._shutdown_complete = True
+        if async_decode is not None:
+            # An engine-held async output keeps ``_controller``, so cut the
+            # controller's edge back to this runner: otherwise it walks into
+            # a runner whose model is gone and fails as a missing
+            # ``process_decode_output_host``.
+            async_decode.runner = None
+            self.async_decode = None
+
+        # Last, so an interrupted drain or release leaves shutdown retryable.
+        self._shutdown_complete = True
 
     @property
     def lane_batch(self) -> TTLaneInputBatch:
