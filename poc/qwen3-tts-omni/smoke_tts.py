@@ -39,6 +39,13 @@ def main():
         model=args.model, deploy_config=args.deploy_config, trust_remote_code=True
     )
     print(f"SMOKE engine_up_s={time.time() - started:.1f}", flush=True)
+    talker = omni.default_sampling_params_list[0]
+    print(
+        f"SMOKE talker_sampling temperature={talker.temperature} top_k={talker.top_k} "
+        f"repetition_penalty={talker.repetition_penalty} "
+        f"min_tokens={talker.min_tokens} max_tokens={talker.max_tokens}",
+        flush=True,
+    )
     started = time.time()
     outputs = omni.generate(
         [{"prompt_token_ids": [1] * length, "additional_information": info}]
