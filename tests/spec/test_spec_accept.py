@@ -628,6 +628,31 @@ def test_top_k_and_top_p_together_constrain_the_committed_distribution():
     assert committed <= {0, 1}, f"committed outside the top 2: {sorted(committed)}"
 
 
+def test_the_unsorted_top_k_top_p_cut_matches_the_sorted_one():
+    """Without ties, the cut from the k largest logits equals vLLM's sorted cut.
+
+    An unseeded row with a top-k takes the unsorted path, which skips sorting
+    the whole vocabulary of every candidate column. The two cuts can differ
+    only where logits tie at the cut or a cumulative sum lands within rounding
+    of ``1 - p``; random float32 logits have no ties, and with this seed no
+    sum lands that close.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from vllm_tt_plugin.spec_accept import _top_k_top_p_without_sort
+
+    generator = torch.Generator().manual_seed(3)
+    rows, vocab = 256, 2048
+    logits = torch.randn(rows, vocab, generator=generator) * 3.0
+    k = torch.randint(1, 64, (rows,), dtype=torch.int32, generator=generator)
+    p = torch.rand(rows, generator=generator) * 0.9 + 0.1
+
+    sorted_cut = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    unsorted_cut = _top_k_top_p_without_sort(logits.clone(), k, p)
+
+    assert torch.equal(torch.isinf(sorted_cut), torch.isinf(unsorted_cut))
+
+
 def test_the_caller_s_logits_are_not_modified():
     """A caller that also wants logprobs needs the raw logits afterwards."""
     logits = torch.randn(2, 3, VOCAB)
