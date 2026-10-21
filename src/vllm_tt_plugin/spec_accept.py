@@ -59,6 +59,9 @@ vLLM helper is imported inside the function that uses it. This module reads no
 distributions are sufficient to exercise the acceptance arithmetic.
 """
 
+import os
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -615,6 +618,9 @@ def _random_walk(
     vocab: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
+    noise, pending = _start_walk_noise(
+        rows, num_drafts, vocab, num_valid_drafts, generators
+    )
     probs = _constrained_probs(target_logits, temperature, top_k, top_p)
     # Replaced inside the vocabulary before any gather, because a draft column
     # past its row's count holds padding, the runner pads with
@@ -625,17 +631,12 @@ def _random_walk(
     # known to be real token ids, because _check_inputs validated them.
     draft_ids = draft_token_ids.to(torch.int64).clamp(0, probs.shape[-1] - 1)
 
-    # The bonus comes first, before any other draw, so a seeded row's bonus
-    # depends only on the generator state the call started from. Drawing it
-    # after the accept uniforms would make it depend on the block width and on
-    # how many drafts the row happened to receive, which is how a row carrying
-    # no drafts at all would stop agreeing with an ordinary sampled step.
-    # Upstream orders it the same way, sampling bonus tokens in
-    # RejectionSampler.forward before it calls rejection_sample.
+    for future in pending:
+        future.result()
     bonus_probs = probs.gather(
         1, num_valid_drafts.to(torch.int64).view(rows, 1, 1).expand(rows, 1, vocab)
     )
-    bonus = _sample_per_row(bonus_probs, generators, rows, vocab).squeeze(1)
+    bonus = _race_argmax(bonus_probs, noise.bonus).squeeze(1)
 
     # The accept test, upstream's form: accept when p/q >= u. q is 0 only for a
     # drafter that proposed a token its own distribution rules out, which is a
@@ -651,11 +652,10 @@ def _random_walk(
     else:
         _check_draft_probs(draft_probs, rows, num_drafts, vocab)
         draft_of_draft = _gather_ids(draft_probs, draft_ids)
-    uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
     accepted = (
         (draft_of_draft > 0)
         & (target_of_draft > 0)
-        & (target_of_draft.to(torch.float64) / draft_of_draft >= uniform)
+        & (target_of_draft.to(torch.float64) / draft_of_draft >= noise.uniform)
     )
 
     # The correction for a rejected position, drawn from the positive part of
@@ -665,11 +665,7 @@ def _random_walk(
         residual.scatter_(2, draft_ids.unsqueeze(2), 0.0)
     else:
         residual = (probs[:, :num_drafts] - draft_probs).clamp_min(0.0)
-    # A row with no drafts has nothing to correct, so its seeded generator must
-    # not advance here. Upstream skips the same draw for the same reason.
-    recovered = _sample_per_row(
-        residual, _drafting_rows(num_valid_drafts, generators), rows, vocab
-    )
+    recovered = _race_argmax(residual, noise.recovered)
 
     candidates = torch.cat(
         [
@@ -725,91 +721,144 @@ def _constrained_probs(
     return logits.softmax(dim=-1, dtype=torch.float32)
 
 
-def _sample_per_row(
-    weights: torch.Tensor,
-    generators: dict[int, torch.Generator],
-    rows: int,
-    vocab: int,
-) -> torch.Tensor:
+def _race_argmax(weights: torch.Tensor, race: torch.Tensor) -> torch.Tensor:
     """Draw one id per position from unnormalised ``[B, S, V]`` weights.
 
     Uses the exponential race: with independent ``e_v ~ Exponential(1)``, the
-    argmax of ``w_v / e_v`` is distributed as ``w`` normalised. One race per
-    row rather than per position, matching upstream, so a seeded request draws
-    the same number of values however many positions it carries.
+    argmax of ``w_v / e_v`` is distributed as ``w`` normalised. ``race`` is one
+    ``[B, V]`` race per row rather than per position, matching upstream, so a
+    seeded request draws the same number of values however many positions it
+    carries.
 
     The weights are divided by the race, as vLLM's ``random_sample`` does, so a
     seeded row with no drafts draws exactly the token the ordinary sampler
     draws from the same distribution.
-
-    A seeded row's values come only from its generator, so the global stream
-    fills only the other rows: a full-vocabulary fill per row is the largest
-    cost of the walk, and a value a seeded row would overwrite is wasted.
     """
-    race = torch.empty((rows, vocab), dtype=torch.float32)
-    unseeded = _unseeded_rows(rows, generators)
-    if len(unseeded) == rows:
-        race.exponential_()
-    elif unseeded:
-        race[unseeded] = race[unseeded].exponential_()
-    for row, generator in generators.items():
-        race[row].exponential_(generator=generator)
-    scored = weights / race.unsqueeze(1)
-    return scored.argmax(dim=-1).to(torch.int32)
+    return (weights / race.unsqueeze(1)).argmax(dim=-1).to(torch.int32)
 
 
-def _unseeded_rows(rows: int, generators: dict[int, torch.Generator]) -> list[int]:
-    """The rows that draw from the global stream, in row order."""
-    return [row for row in range(rows) if row not in generators]
+@dataclass(frozen=True)
+class _WalkNoise:
+    """Every random value one walk reads.
 
-
-def _drafting_rows(
-    num_valid_drafts: torch.Tensor, generators: dict[int, torch.Generator]
-) -> dict[int, torch.Generator]:
-    """The seeded rows that carry at least one draft.
-
-    A row with no drafts takes no part in the accept test or the correction, so
-    its generator must not advance for either. Its unseeded values are drawn
-    anyway and discarded, which costs nothing and keeps the shapes uniform.
+    ``bonus`` and ``recovered`` are ``[B, V]`` exponential races, for the bonus
+    and for the correction at a rejected position. ``uniform`` is ``[B, K]``
+    float64, one accept-test value per drafted position. float64 rather than
+    float32 because float32 draws exact 0.0 often enough to matter, and a 0
+    would accept a draft the target assigns no probability.
     """
-    return {
-        row: generator
-        for row, generator in generators.items()
-        if int(num_valid_drafts[row]) > 0
-    }
+
+    bonus: torch.Tensor
+    uniform: torch.Tensor
+    recovered: torch.Tensor
 
 
-def _uniform(
+_NOISE_POOL: ThreadPoolExecutor | None = None
+_NOISE_POOL_LOCK = threading.Lock()
+# Below this vocabulary a row's draws cost less than handing them to a worker,
+# so they run on the calling thread. The ordinary host sampler, TTTopKTopPSampler,
+# uses the same bound for its worker-thread noise.
+_PARALLEL_NOISE_MIN_VOCAB = 4096
+
+
+def _noise_workers() -> int:
+    available = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else (os.cpu_count() or 1)
+    )
+    return max(1, min(16, available))
+
+
+def _noise_pool() -> ThreadPoolExecutor:
+    global _NOISE_POOL
+    with _NOISE_POOL_LOCK:
+        if _NOISE_POOL is None:
+            _NOISE_POOL = ThreadPoolExecutor(
+                max_workers=_noise_workers(), thread_name_prefix="tt-spec-noise"
+            )
+        return _NOISE_POOL
+
+
+def _start_walk_noise(
     rows: int,
     num_drafts: int,
+    vocab: int,
     num_valid_drafts: torch.Tensor,
     generators: dict[int, torch.Generator],
-) -> torch.Tensor:
-    """Uniform values in [0, 1) for the accept test, one per drafted position.
+) -> tuple[_WalkNoise, list[Future]]:
+    """Start drawing every random value of one walk on worker threads.
 
-    A seeded row advances its generator by its own draft count and not by the
-    block width, so a row's stream does not depend on how wide the block it
-    happened to travel in was. Upstream draws per request for the same reason.
+    No value depends on the logits, so the walk computes the target
+    probabilities while these are drawn. The full-vocabulary races are the
+    largest cost of the walk, and torch draws exponential values on a single
+    thread per call, so the rows draw on several workers. The caller waits on
+    the returned futures before it reads the noise.
 
-    float64 rather than float32 because float32 draws exact 0.0 often enough to
-    matter, and a 0 would accept a draft the target assigns no probability.
+    A seeded row is one task that draws from its generator in the order a
+    serial walk reads, so its stream is the one that walk would leave:
 
-    As in ``_sample_per_row``, only unseeded rows draw from the global stream.
-    A seeded row's columns past its own count stay at 1; the count masks them
-    out of the result, so their value is never read.
+    - The bonus race first, so a seeded row's bonus depends only on the
+      generator state the call started from. Drawing it after the accept
+      uniforms would make it depend on how many drafts the row carried, which
+      is how a row carrying no drafts would stop agreeing with an ordinary
+      sampled step. Upstream samples bonus tokens before it calls
+      rejection_sample.
+    - Then one uniform per draft the row carries, not per column of the block,
+      so a row's stream does not depend on the width of the block it travelled
+      in. Upstream draws per request for the same reason.
+    - Then the correction race. A row with no drafts takes no part in the
+      accept test or the correction, so it draws neither, and its generator
+      stays where an ordinary sampled step leaves it. Upstream skips both.
+      Its correction race stays at 1 and is never read.
+
+    The unseeded rows draw in chunks, one per worker, each from a private
+    generator seeded from the global stream on the calling thread, so no two
+    threads share a generator and a walk still repeats under
+    ``torch.manual_seed``. Below ``_PARALLEL_NOISE_MIN_VOCAB`` everything is
+    drawn on the calling thread, as one chunk.
     """
-    uniform = torch.ones((rows, num_drafts), dtype=torch.float64)
-    unseeded = _unseeded_rows(rows, generators)
-    if unseeded:
-        uniform[unseeded] = torch.rand((len(unseeded), num_drafts), dtype=torch.float64)
-    for row, generator in generators.items():
-        valid = int(num_valid_drafts[row])
-        if valid == 0:
-            continue
-        uniform[row, :valid] = torch.rand(
-            (valid,), dtype=torch.float64, generator=generator
+    noise = _WalkNoise(
+        bonus=torch.empty((rows, vocab), dtype=torch.float32),
+        uniform=torch.ones((rows, num_drafts), dtype=torch.float64),
+        recovered=torch.ones((rows, vocab), dtype=torch.float32),
+    )
+    counts = num_valid_drafts.tolist()
+
+    def draw_seeded(row: int) -> None:
+        generator = generators[row]
+        noise.bonus[row].exponential_(generator=generator)
+        if counts[row]:
+            noise.uniform[row, : counts[row]] = torch.rand(
+                (counts[row],), dtype=torch.float64, generator=generator
+            )
+            noise.recovered[row].exponential_(generator=generator)
+
+    def draw_unseeded(chunk: list[int], seed: int) -> None:
+        generator = torch.Generator().manual_seed(seed)
+        shape = (len(chunk), vocab)
+        noise.bonus[chunk] = torch.empty(shape).exponential_(generator=generator)
+        noise.uniform[chunk] = torch.rand(
+            (len(chunk), num_drafts), dtype=torch.float64, generator=generator
         )
-    return uniform
+        noise.recovered[chunk] = torch.empty(shape).exponential_(generator=generator)
+
+    unseeded = [row for row in range(rows) if row not in generators]
+    parallel = vocab >= _PARALLEL_NOISE_MIN_VOCAB
+    pool = _noise_pool() if parallel else None
+    pieces = min(len(unseeded), _noise_workers()) if parallel else 1
+    chunks = [unseeded[i::pieces] for i in range(pieces)] if unseeded else []
+    seeds = torch.randint(0, 2**63 - 1, (len(chunks),)).tolist() if chunks else []
+
+    tasks = [lambda row=row: draw_seeded(row) for row in generators] + [
+        lambda chunk=chunk, seed=seed: draw_unseeded(chunk, seed)
+        for chunk, seed in zip(chunks, seeds)
+    ]
+    if pool is None:
+        for task in tasks:
+            task()
+        return noise, []
+    return noise, [pool.submit(task) for task in tasks]
 
 
 def _counts_from_accepted(

@@ -25,7 +25,6 @@ import torch
 
 from vllm_tt_plugin.spec_accept import (
     AcceptResult,
-    _sample_per_row,
     accept_speculated_tokens,
 )
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
@@ -454,7 +453,7 @@ def test_a_draftless_seeded_row_consumes_only_its_bonus_draw():
 
     Deliberately white box: a generator-consumption contract is only visible in
     the generator's state, so the test compares that state against the one
-    draw the row is permitted, using the same helper the walk draws with.
+    draw the row is permitted: one full-vocabulary exponential race.
     """
     target = torch.tensor([0.30, 0.25, 0.20, 0.15, 0.06, 0.03, 0.01, 0.00])
     logits = target.log().view(1, 1, VOCAB).expand(1, 4, VOCAB).contiguous()
@@ -469,7 +468,7 @@ def test_a_draftless_seeded_row_consumes_only_its_bonus_draw():
     )
 
     bonus_only = torch.Generator().manual_seed(99)
-    _sample_per_row(target.view(1, 1, VOCAB), {0: bonus_only}, 1, VOCAB)
+    torch.empty(VOCAB).exponential_(generator=bonus_only)
 
     assert torch.equal(walked.get_state(), bonus_only.get_state()), (
         "a draftless row advanced its generator past its bonus draw, so every "
@@ -492,6 +491,30 @@ def test_a_seeded_row_is_reproducible():
                 0: torch.Generator().manual_seed(7),
                 1: torch.Generator().manual_seed(8),
             },
+        )
+
+    first, second = run(), run()
+    assert torch.equal(first.committed_token_ids, second.committed_token_ids)
+    assert torch.equal(first.accepted_counts, second.accepted_counts)
+
+
+def test_an_unseeded_walk_repeats_under_the_same_global_seed():
+    """Unseeded rows draw concurrently and still repeat under ``manual_seed``.
+
+    Each row draws on a worker thread from a private generator, seeded from
+    the global stream on the calling thread, so the draws' interleaving across
+    threads cannot change what any row reads.
+    """
+    logits = torch.randn(4, 3, VOCAB)
+    drafts = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 0]], dtype=torch.int32)
+
+    def run() -> AcceptResult:
+        torch.manual_seed(2024)
+        return accept_speculated_tokens(
+            target_logits=logits,
+            draft_token_ids=drafts,
+            num_valid_drafts=torch.tensor([2, 2, 1, 0], dtype=torch.int32),
+            temperature=torch.ones(4),
         )
 
     first, second = run(), run()
