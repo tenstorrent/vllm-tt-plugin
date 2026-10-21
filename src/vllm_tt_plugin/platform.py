@@ -41,6 +41,7 @@ from vllm_tt_plugin.config import (
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
+    validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import (
@@ -2471,6 +2472,7 @@ class TTPlatform(Platform):
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
+        validate_tt_scheduler_config(vllm_config)
         if tt_requests_cannot_resume(vllm_config):
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()
@@ -2761,32 +2763,3 @@ class TTPlatform(Platform):
                 "This block-output model owns its Gumbel sampling and does not "
                 "support these request parameters: " + "; ".join(unsupported)
             )
-
-    @staticmethod
-    def compat_sampling_required(sampling_params, num_devices) -> bool:
-        # Device logprobs only supported on multi-device setups and only
-        # the sampled token's logprob is returned (not top-k alternatives).
-        # Single device: any logprobs require host sampling.
-        # Multi-device: logprobs > 1 requires host sampling because device
-        # can only return the sampled token's logprob.
-        # https://github.com/tenstorrent/tt-metal/issues/34077
-        if (
-            sampling_params.logprobs is not None
-            and sampling_params.logprobs > 0
-            and (num_devices == 1 or sampling_params.logprobs > 1)
-        ):
-            return True
-
-        # all of the following sampling params require compat sampling
-        return (
-            sampling_params.min_p != 0.0
-            or (
-                sampling_params.bad_words is not None
-                and len(sampling_params.bad_words) > 0
-            )
-            or sampling_params.prompt_logprobs is not None
-            or sampling_params.structured_outputs is not None
-            or sampling_params.logit_bias is not None
-            or sampling_params.allowed_token_ids is not None
-            or sampling_params.min_tokens != 0
-        )

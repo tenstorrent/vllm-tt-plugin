@@ -264,8 +264,8 @@ class TTModelRunner:
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
+        self._shutdown_complete = False
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
-        self._persistent_capture_released = False
         self._device_grammar_poisoned = False
 
         # Resolved and validated by the platform's config-time admission;
@@ -446,16 +446,32 @@ class TTModelRunner:
         )
 
     def shutdown(self) -> None:
-        """Deterministically release optional model-lifetime captures.
+        """Release the model and its KV caches while the mesh is still open.
 
-        Called from ``TTWorker.shutdown`` while the mesh is still open. This
-        is intentionally not wired to ``__del__``: the runner sits in
-        reference cycles, so a destructor can fire during interpreter
-        teardown after the devices closed, where a device-side release is
-        worse than leaking the capture to process exit.
+        Called from ``TTWorker.shutdown``, which explains why this is explicit
+        rather than left to reference counting. Idempotent.
+
+        Pending async decode reads are finalized first, best effort, so that no
+        device read still targets the model or its KV caches when they are
+        released; a failed read is logged and the release continues. The
+        submissions themselves are not released: after a failed read, its read
+        destination and ttnn read events may still be a device read target, so
+        they leak to process exit.
         """
-        if getattr(self, "_persistent_capture_released", False):
+        if getattr(self, "_shutdown_complete", False):
             return
+        async_decode = getattr(self, "async_decode", None)
+        if async_decode is not None:
+            try:
+                async_decode.wait_for_all_pending_async_steps()
+            except Exception:
+                logger.exception("Async decode drain failed during shutdown")
+
+        # ``_pending_samples`` and ``_pending_async_steps`` are not cleared:
+        # a step that ran but was not sampled is held only by this runner,
+        # and clearing would free a buffer ttnn may still be writing into.
+
+        # While the model is still alive, and before the mesh closes.
         release = getattr(
             getattr(self, "model", None), "release_persistent_capture", None
         )
@@ -464,7 +480,20 @@ class TTModelRunner:
                 release()
             except Exception:
                 logger.exception("Failed to release persistent model capture")
-        self._persistent_capture_released = True
+
+        self.model = None
+        self.kv_caches = []
+
+        if async_decode is not None:
+            # An engine-held async output keeps ``_controller``, so cut the
+            # controller's edge back to this runner: otherwise it walks into
+            # a runner whose model is gone and fails as a missing
+            # ``process_decode_output_host``.
+            async_decode.runner = None
+            self.async_decode = None
+
+        # Last, so an interrupted drain or release leaves shutdown retryable.
+        self._shutdown_complete = True
 
     @property
     def lane_batch(self) -> TTLaneInputBatch:
@@ -3844,12 +3873,15 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         skip_req_ids: set[str] | None = None,
     ) -> None:
-        # When applying a deferred async step, the write row is resolved live
-        # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime,
-        # while the scheduler lifecycle skip set rejects stale results before a
-        # live row is resolved. ``req_id_to_index`` is therefore the source of
-        # truth for the target row.
+        # A deferred async step resolves its write row live from
+        # ``req_id_to_index`` (below), not from the row it was submitted at. A
+        # resume between submit and apply can move the request to another row;
+        # lane mode, for example, re-places a resumed request wherever the
+        # coordinator's free list sends it. The live row is still the right
+        # target, because ``InputBatch.add_request`` re-derives ``num_tokens``
+        # from the request state when it places the request. ``skip_req_ids``
+        # (finished requests and forced-reset frames) is checked before any
+        # row is resolved.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         num_out_tokens = self._tt_committed_width(sampled_token_ids)

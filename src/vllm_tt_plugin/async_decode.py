@@ -788,6 +788,10 @@ class TTAsyncDecodeController:
         ended the request was already accepted. Only the late result is
         removed.
         """
+        # Prune before draining: completions are enqueued before their event
+        # is set, so every step pruned here is already in the queue the drain
+        # reads.
+        self.prune_finished_async_events()
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
         discard_counts = forced_reset_discard_counts or {}
@@ -839,7 +843,6 @@ class TTAsyncDecodeController:
                 skip_state_req_ids=suppressed | forced_reset_req_ids,
             )
             remaining_results.subtract(published_req_ids)
-        self.prune_finished_async_events()
 
     def apply_completed_decode_steps_before_build(
         self, scheduler_output: SchedulerOutput
