@@ -789,6 +789,35 @@ def test_empty_bypassed_prompt_is_padded_and_served():
     assert scheduler.running == []
 
 
+def test_empty_embeds_oversized_bypassed_request_is_repaired_in_order():
+    """Enter through add_request with an empty prompt, prompt_embeds and an
+    oversized max_tokens together. The max_tokens clamp reads the prompt the
+    earlier repairs leave, so a wrong step order leaves max_tokens unclamped
+    or the prompt unpadded."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=MAX_MODEL_LEN * 4, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="combined-0",
+        prompt_token_ids=None,
+        prompt_embeds=torch.zeros(0, 4),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.prompt_token_ids == [0]
+    assert request.prompt_embeds is None
+    assert request.num_prompt_tokens == 1
+    assert 0 < request.max_tokens < MAX_MODEL_LEN * 4
+    assert request.max_tokens % CANVAS == 0
+    assert 1 + request.max_tokens <= MAX_MODEL_LEN
+    assert request.sampling_params.max_tokens == request.max_tokens
+
+
 def test_zero_max_tokens_bypassed_request_finishes_after_first_canvas():
     """A hand-crafted prebuilt request can carry max_tokens=0 (SamplingParams
     itself forbids it); the stop check must finish it length-capped on its

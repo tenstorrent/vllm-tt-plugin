@@ -547,7 +547,7 @@ class TTWorker(WorkerBase):
         cannot establish the order -- the runner sits in reference cycles and is
         reclaimed whenever the cyclic collector runs. ``__del__`` stays a
         best-effort backstop and deliberately does not call it; see the note
-        there. What is not covered is in that method's scope paragraph.
+        there.
         """
         if getattr(self, "model_runner", None) is not None:
             try:

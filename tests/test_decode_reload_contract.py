@@ -12,6 +12,7 @@ import torch
 from vllm.v1.core.sched.output import CachedRequestData
 
 from vllm_tt_plugin.async_decode import (
+    AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
     SubmittedStepContext,
@@ -979,25 +980,32 @@ def test_step_resolved_during_apply_stays_pending_until_drained():
     request_state = SimpleNamespace(output_token_ids=[])
     runner = _async_apply_runner(request_state)
     controller = TTAsyncDecodeController(runner)
-    resolved = threading.Event()
-    runner._pending_async_steps.append(SimpleNamespace(is_resolved=resolved.is_set))
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+    completed = _completed_step(7, runner_output)
+    # The step's completion goes through the real output path: ensure_finalized
+    # runs _get_output_impl, whose enqueue_completed_decode_step is followed by
+    # the event set.
+    controller.complete_decode_step = lambda **_: completed
+    controller.build_runner_output_from_completed_step = lambda _: runner_output
+    step = AsyncTTModelRunnerOutput(
+        controller,
+        submission=None,
+        model_input=None,
+        completion_event=threading.Event(),
+        context=completed.context,
+    )
+    runner._pending_async_steps.append(step)
     runner._pending_async_overlap_ok.append(True)
     drain = controller.drain_completed_decode_steps
 
     def drain_then_resolve_on_output_thread():
-        completed = drain()
+        completed_steps = drain()
         # The output thread finalizes the step after the drain released the
-        # lock: it enqueues the completion, then sets the event.
-        runner._completed_decode_steps.append(
-            _completed_step(
-                7,
-                SimpleNamespace(
-                    req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
-                ),
-            )
-        )
-        resolved.set()
-        return completed
+        # lock.
+        step.ensure_finalized()
+        return completed_steps
 
     controller.drain_completed_decode_steps = drain_then_resolve_on_output_thread
     controller.apply_ready_completed_decode_steps()

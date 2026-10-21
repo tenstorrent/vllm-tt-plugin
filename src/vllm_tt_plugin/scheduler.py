@@ -604,8 +604,8 @@ class TTScheduler(AsyncScheduler):
             return
         # _truncate_overlong_prompt leaves room for one whole canvas, and the
         # platform's startup floor (_min_block_output_max_model_len) makes
-        # that room exist, so a clamp leaves a positive budget. Zero means a
-        # repair ran out of order.
+        # that room exist. Deliberate fail-fast for developers: it fires only
+        # if the repair steps are reordered, never for a client request.
         if fitted <= 0:
             raise RuntimeError(
                 f"Block-output max_tokens clamp for request {request.request_id} "

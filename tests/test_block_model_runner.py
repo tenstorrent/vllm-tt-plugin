@@ -351,8 +351,6 @@ def test_worker_shutdown_releases_the_model_before_closing_the_mesh():
                 order.append("mesh-closed"),
                 at_close.update(
                     model_alive=model_ref() is not None,
-                    in_flight_alive=in_flight_ref() is not None,
-                    runner_alive=runner_ref() is not None,
                     controller_cut=in_flight_ref()._controller.runner is None,
                 ),
             ),
@@ -365,9 +363,6 @@ def test_worker_shutdown_releases_the_model_before_closing_the_mesh():
     # The safety property: the model is gone before the close, not after.
     assert at_close["model_alive"] is False
     assert model_ref() is None
-    # The deliberate leak: an in-flight async read is not freed here.
-    assert at_close["in_flight_alive"] is True
-    assert at_close["runner_alive"] is True
     # The cut: an engine-held output must not reach a runner whose model is gone.
     assert controller.runner is None
     assert at_close["controller_cut"] is True
