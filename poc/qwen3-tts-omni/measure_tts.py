@@ -21,8 +21,11 @@ per-frame step time on the host clock).
 
 import argparse
 import copy
+import os
 import time
 
+import soundfile
+import torch
 from smoke_talker import prompt_len, tts_params
 from vllm.sampling_params import RequestOutputKind
 from vllm_omni.entrypoints.omni import Omni
@@ -47,20 +50,19 @@ PROMPTS = {
 }
 
 
-def _samples(output):
-    """Audio samples carried by one streamed output, and its sample rate."""
+def _audio(output):
+    """The audio chunks one streamed output carries, and their sample rate."""
     multimodal = output.outputs[0].multimodal_output or {}
     audio = multimodal.get("audio")
     if audio is None:
-        return 0, None
-    chunks = audio if isinstance(audio, list) else [audio]
+        return [], None
     rate = multimodal.get("sr")
     rate = rate[-1] if isinstance(rate, list) else rate
     rate = int(rate.item() if hasattr(rate, "item") else rate)
-    return sum(chunk.numel() for chunk in chunks), rate
+    return (audio if isinstance(audio, list) else [audio]), rate
 
 
-def run(omni, params, args, text):
+def run(omni, params, args, text, out=None):
     args.text = text
     info = tts_params(args)
     prompt = {"prompt_token_ids": [1] * prompt_len(args, info)}
@@ -68,10 +70,13 @@ def run(omni, params, args, text):
     submitted = time.perf_counter()
     first = last = None
     samples, rate, outputs, start = 0, None, 0, 0.0
+    received = []
     for output in omni.generate([prompt], params, py_generator=True, use_tqdm=False):
-        count, output_rate = _samples(output)
+        chunks, output_rate = _audio(output)
+        count = sum(chunk.numel() for chunk in chunks)
         if not count:
             continue
+        received += chunks
         now = time.perf_counter()
         first = first if first is not None else now
         last = now
@@ -79,6 +84,9 @@ def run(omni, params, args, text):
         rate = output_rate
         start = max(start, now - submitted - samples / rate)
         samples += count
+    if out:
+        audio = torch.cat([chunk.reshape(-1) for chunk in received]).float()
+        soundfile.write(out, audio.cpu().numpy(), samplerate=rate, format="WAV")
     return first - submitted, start, last - submitted, samples / rate, outputs
 
 
@@ -89,6 +97,7 @@ def main():
     parser.add_argument("--ref-audio", required=True)
     parser.add_argument("--language", default="English")
     parser.add_argument("--log-stats", action="store_true")
+    parser.add_argument("--out-dir", help="write each prompt's streamed audio here")
     args = parser.parse_args()
 
     omni = Omni(
@@ -103,7 +112,8 @@ def main():
     params[-1].output_kind = RequestOutputKind.DELTA
     run(omni, params, args, PROMPTS["short"])
     for name, text in PROMPTS.items():
-        ttfa, start, total, audio_s, outputs = run(omni, params, args, text)
+        out = args.out_dir and os.path.join(args.out_dir, f"{name}.wav")
+        ttfa, start, total, audio_s, outputs = run(omni, params, args, text, out)
         print(
             f"MEASURE prompt={name} chars={len(text)} ttfa_s={ttfa:.3f} "
             f"start_s={start:.3f} "

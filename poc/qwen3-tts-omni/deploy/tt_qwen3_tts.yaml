@@ -18,7 +18,12 @@ connectors:
       # The talker cuts chunks and Code2Wav joins them from these same values.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
-      initial_codec_chunk_frames: 1
+      # Chunk sizes until the steady 25; the first entry replaces
+      # initial_codec_chunk_frames. A frame takes ~62 ms to generate and plays for
+      # 80 ms, so a chunk can be at most ~1.3x the one before it without the player
+      # running dry. A jump from 1 frame straight to 25 needs ~1.9 s of buffering;
+      # this ramp needs ~0.7 s.
+      codec_chunk_ramp: [2, 2, 3, 4, 6, 8, 11, 15, 20, 25]
 
 stages:
   - stage_id: 0
