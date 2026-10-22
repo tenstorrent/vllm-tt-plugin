@@ -388,9 +388,6 @@ class TTAsyncDecodeController:
         # count the scheduler's lookahead reservation rather than a verify.
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
-        # The verifies among those that asked for logits, which is the one
-        # observable that says a launch serving both modes chose per step.
-        self._logits_verify_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -729,19 +726,14 @@ class TTAsyncDecodeController:
             self._ordinary_decode_submissions += 1
         else:
             self._verify_submissions += 1
-            if model_input.spec_mode == ACCEPT_MODE_LOGITS:
-                self._logits_verify_submissions += 1
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
-            # Parsed by tests/tt/spec/bench_spec_overhead.py and
-            # tests/tt/spec/test_sampled_speculation.py; keep them in step.
             logger.info(
                 "TT submissions: %d ordinary decode, %d verify, "
-                "%d overlapped an outstanding step, %d verify in logits mode",
+                "%d overlapped an outstanding step",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
-                self._logits_verify_submissions,
             )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:

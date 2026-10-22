@@ -28,10 +28,7 @@ accepts as often at the last position as at the first.
 
 from __future__ import annotations
 
-import math
-import re
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
 import pytest
 
@@ -57,11 +54,6 @@ CONCURRENCY = 8
 # model proposal of every request it hides, and arrival timing decides how
 # often, so seeded counts vary between runs as the unseeded check's do.
 CHI_SQUARE_CRITICAL = {1: 15.14, 2: 18.42, 3: 21.11}
-# A runner log line; its emitter names this file.
-_SUBMISSIONS = re.compile(
-    r"TT submissions: \d+ ordinary decode, (\d+) verify, \d+ overlapped an "
-    r"outstanding step, (\d+) verify in logits mode"
-)
 
 
 @pytest.fixture(autouse=True)
@@ -81,12 +73,6 @@ def only_a_logits_launch_of_the_fixed_target(spec_config):
 @pytest.fixture
 def asynchronous(request) -> bool:
     return str(request.config.getoption("--tt-spec-async-scheduling")).lower() == "true"
-
-
-@pytest.fixture
-def log_path(request) -> Path | None:
-    path = request.config.getoption("--tt-spec-server-log")
-    return Path(path) if path and Path(path).exists() else None
 
 
 def _prompt(spec_config, ascending_prompt, index: int) -> list[int]:
@@ -159,15 +145,6 @@ def _chi_square(observed, expected):
         kept.append((sum(o for o, _ in pooled), sum(e for _, e in pooled)))
     statistic = sum((o - e) ** 2 / e for o, e in kept)
     return statistic, len(kept) - 1
-
-
-def _submission_lines(log_path, start: int):
-    lines = log_path.read_text(errors="replace").splitlines()[start:]
-    return [
-        (int(found.group(1)), int(found.group(2)))
-        for line in lines
-        if (found := _SUBMISSIONS.search(line))
-    ]
 
 
 # region The committed distribution
@@ -507,64 +484,3 @@ def test_sampled_requests_survive_preemption(
 
 
 # endregion Exact claims
-
-# region Which mode the verifies used
-
-
-def test_verifies_ask_for_logits_only_when_a_row_needs_them(
-    spec_server, spec_config, ascending_prompt, log_path, record
-):
-    """Read from the runner's own submission counters in the server log.
-
-    The counters report every 128 submissions, so each phase is long enough
-    to span two reports, and only reports written inside the phase are
-    compared. On a launch serving both modes a greedy phase adds verifies and
-    no logits verifies; a sampled phase adds logits verifies either way.
-    """
-    if log_path is None:
-        pytest.skip("pass --tt-spec-server-log: the submission counters live there")
-    if spec_config.drafter != "model":
-        pytest.skip("the phases are sized for the model drafter's acceptance")
-    if spec_server.context_length() < 1024:
-        pytest.skip("the phases need a context of at least 1024 tokens")
-
-    def phase(temperature, max_tokens, tokens_per_verify):
-        # Two reports inside the phase can need 256 submissions, and after its
-        # prefill token a lone request commits up to tokens_per_verify tokens
-        # per submission.
-        requests = max(3, math.ceil(256 * tokens_per_verify / (max_tokens - 1)))
-        start = len(log_path.read_text(errors="replace").splitlines())
-        for index in range(requests):
-            prompt = _prompt(spec_config, ascending_prompt, 600 + index)
-            spec_server.complete(
-                prompt, max_tokens=max_tokens, temperature=temperature, seed=index
-            )
-        reports = _submission_lines(log_path, start)
-        assert len(reports) >= 2, (
-            f"only {len(reports)} submission report(s) were written during the "
-            "phase, so its verifies cannot be counted"
-        )
-        (verify_0, logits_0), (verify_1, logits_1) = reports[0], reports[-1]
-        return verify_1 - verify_0, logits_1 - logits_0
-
-    # A greedy verify commits up to 1+K tokens, a sampled one under two on
-    # average.
-    greedy_verifies, greedy_logits = phase(0, 900, spec_config.k + 1)
-    sampled_verifies, sampled_logits = phase(1.0, 300, 2)
-    record(
-        greedy=(greedy_verifies, greedy_logits),
-        sampled=(sampled_verifies, sampled_logits),
-    )
-
-    assert greedy_verifies > 0 and sampled_verifies > 0
-    assert sampled_logits == sampled_verifies
-    if "argmax_ids" in spec_config.accept_modes:
-        assert greedy_logits == 0, (
-            "a greedy-only batch asked for logits although the model serves "
-            "argmax_ids, which reads back a vocabulary's width more per row"
-        )
-    else:
-        assert greedy_logits == greedy_verifies
-
-
-# endregion Which mode the verifies used

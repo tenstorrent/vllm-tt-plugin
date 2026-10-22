@@ -885,8 +885,7 @@ temperature, a penalty, logprobs (including `logprobs=0`), structured output,
 `allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not
 reached yet. The mode is per step, and that row would otherwise commit the
 target argmax even with no draft of its own. Padding rows do not decide the
-mode. The runner reports the count of `logits` verifies in its
-`TT submissions:` log line.
+mode.
 
 **What the model returns.** `VerifyOutput(spec_mode="logits", logits=...)`,
 with `logits` a floating point `[B, 1+K, V]` tensor: every submitted row,
