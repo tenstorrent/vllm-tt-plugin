@@ -875,3 +875,59 @@ def test_prefill_gather_stops_holding_once_arrivals_go_quiet(monkeypatch):
     monkeypatch.setattr(lane_scheduler.time, "time", lambda: 100.045)
     coordinator.schedule()
     assert lane0.scheduled_modes[-1] == TTSchedulingMode.PREFILL_ONLY
+
+
+def test_a_request_the_in_flight_step_finishes_is_named_finishing():
+    # vLLM's running loop skips a request whose step in flight is sure to reach
+    # max_tokens even if every draft is rejected; the lane names it for the
+    # runner, unless the same schedule preempted or finished it.
+    from vllm_tt_plugin.scheduler import (
+        get_tt_finishing_req_ids,
+        request_will_reach_max_tokens,
+    )
+
+    def request(req_id, computed, placeholders, status=RequestStatus.RUNNING):
+        return SimpleNamespace(
+            request_id=req_id,
+            num_output_placeholders=placeholders,
+            num_computed_tokens=computed,
+            num_prompt_tokens=10,
+            max_tokens=8,
+            status=status,
+        )
+
+    # 10 prompt + 8 max: in flight with 4 placeholders, computed 20 means at
+    # least 20 + 2 - 4 = 18 committed tokens once the step lands.
+    assert request_will_reach_max_tokens(request("a", 20, 4))
+    assert not request_will_reach_max_tokens(request("a", 19, 4))
+    assert not request_will_reach_max_tokens(request("a", 20, 0))
+
+    lane = TTScheduler.__new__(TTScheduler)
+    lane.requests = {
+        "a": request("a", 20, 4),
+        "b": request("b", 20, 4),
+        "c": request("c", 20, 4, status=RequestStatus.PREEMPTED),
+        "d": request("d", 12, 4),
+    }
+    lane._finishing_candidates = ["a", "b", "c"]
+    out = SchedulerOutput.make_empty()
+    out.num_scheduled_tokens = {"d": 4}
+    out.finished_req_ids = {"b"}
+    lane._record_finishing_requests(out)
+    assert get_tt_finishing_req_ids(out) == ("a",)
+    assert lane._finishing_candidates == []
+
+
+def test_merge_carries_every_lanes_finishing_requests():
+    from vllm_tt_plugin.scheduler import (
+        _TT_FINISHING_REQ_IDS_ATTR,
+        get_tt_finishing_req_ids,
+        set_tt_scheduler_output_field,
+    )
+
+    outs = [SchedulerOutput.make_empty() for _ in range(3)]
+    set_tt_scheduler_output_field(outs[0], _TT_FINISHING_REQ_IDS_ATTR, ("a",))
+    set_tt_scheduler_output_field(outs[2], _TT_FINISHING_REQ_IDS_ATTR, ("c", "d"))
+    merged = merge_lane_scheduler_outputs(outs)
+    assert get_tt_finishing_req_ids(merged) == ("a", "c", "d")
+    assert get_tt_finishing_req_ids(merge_lane_scheduler_outputs(outs[1:2])) == ()

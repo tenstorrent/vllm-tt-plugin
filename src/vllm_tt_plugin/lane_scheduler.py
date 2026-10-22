@@ -53,10 +53,12 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.scheduler import (
+    _TT_FINISHING_REQ_IDS_ATTR,
     _TT_STEP_STATE_ATTR,
     TTDecodeInterleavePolicy,
     TTScheduler,
     TTSchedulingMode,
+    get_tt_finishing_req_ids,
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
     set_tt_scheduler_output_field,
@@ -159,6 +161,7 @@ def merge_lane_scheduler_outputs(
     pending_structured_output_tokens = False
     num_invalid_spec_tokens: dict[str, int] | None = None
     forced_reset_discard_counts: dict[str, int] = {}
+    finishing_req_ids: list[str] = []
 
     for out in lane_outputs:
         scheduled_new_reqs.extend(out.scheduled_new_reqs)
@@ -222,6 +225,7 @@ def merge_lane_scheduler_outputs(
             forced_reset_discard_counts[req_id] = (
                 forced_reset_discard_counts.get(req_id, 0) + count
             )
+        finishing_req_ids.extend(get_tt_finishing_req_ids(out))
 
     total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
     merged = SchedulerOutput(
@@ -240,6 +244,10 @@ def merge_lane_scheduler_outputs(
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
     set_tt_forced_reset_discard_counts(merged, forced_reset_discard_counts)
+    if finishing_req_ids:
+        set_tt_scheduler_output_field(
+            merged, _TT_FINISHING_REQ_IDS_ATTR, tuple(finishing_req_ids)
+        )
     return merged
 
 

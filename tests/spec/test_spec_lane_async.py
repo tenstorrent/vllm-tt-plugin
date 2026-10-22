@@ -46,7 +46,12 @@ from vllm_tt_plugin.lane_scheduler import (
     _set_tt_step_state,
 )
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.scheduler import TTScheduler, get_tt_verified_drafts
+from vllm_tt_plugin.scheduler import (
+    _TT_FINISHING_REQ_IDS_ATTR,
+    TTScheduler,
+    get_tt_verified_drafts,
+    set_tt_scheduler_output_field,
+)
 from vllm_tt_plugin.spec_accept import accept_speculated_tokens
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -211,24 +216,49 @@ class LaneEngine:
         self.finished_pending: set[str] = set()
         self.done: set[str] = set()
         self.computed: dict[str, int] = {}
+        # AsyncScheduler's num_output_placeholders, and each request's
+        # max_tokens (which counts the token the prefill sampled).
+        self.placeholders: dict[str, int] = {}
+        self.max_tokens: dict[str, int] = {}
+        self.finishing_log: list[tuple[str, ...]] = []
         self.inflight: deque = deque()
         self.wrappers: list = []
 
-    def add(self, req_id, row, first_token, params=GREEDY, stop_after=None):
+    def add(
+        self, req_id, row, first_token, params=GREEDY, stop_after=None, max_tokens=None
+    ):
         tokens = add_request(self.runner, req_id, row, first_token, params)
         self.live[req_id] = row
         self.outputs[req_id] = []
         self.computed[req_id] = len(tokens) - 1
+        self.placeholders[req_id] = 0
+        if max_tokens is not None:
+            self.max_tokens[req_id] = max_tokens
+            stop_after = max_tokens - 1
         if stop_after is not None:
             self.stop_after[req_id] = stop_after
         return tokens
+
+    def _reaches_max_tokens(self, req_id: str) -> bool:
+        """``request_will_reach_max_tokens`` on this scheduler's books."""
+        limit = self.max_tokens.get(req_id)
+        held = self.placeholders[req_id]
+        return (
+            limit is not None
+            and held > 0
+            and self.computed[req_id] + 2 - held >= PROMPT_LEN + limit
+        )
 
     def schedule(self) -> SchedulerOutput:
         finished, self.finished_pending = self.finished_pending, set()
         for req_id in finished:
             self.live.pop(req_id, None)
-        live = sorted(self.live, key=self.live.get)
+        finishing = tuple(r for r in self.live if self._reaches_max_tokens(r))
+        self.finishing_log.append(finishing)
+        live = sorted((r for r in self.live if r not in finishing), key=self.live.get)
         so = SchedulerOutput.make_empty()
+        if finishing:
+            set_tt_scheduler_output_field(so, _TT_FINISHING_REQ_IDS_ATTR, finishing)
         if self.runner.async_decode_scheduling:
             offered = {r: [PLACEHOLDER_TOKEN_ID] * K for r in live}
         else:
@@ -264,6 +294,7 @@ class LaneEngine:
         _set_tt_step_state(so, _LaneStepState(lane_outputs=[], plan=plan))
         for r in live:
             self.computed[r] += so.num_scheduled_tokens[r]
+            self.placeholders[r] += so.num_scheduled_tokens[r]
         return so
 
     def iterate(self) -> None:
@@ -312,6 +343,7 @@ class LaneEngine:
             if not tokens:
                 continue
             self.computed[req_id] -= so.num_scheduled_tokens[req_id] - len(tokens)
+            self.placeholders[req_id] -= so.num_scheduled_tokens[req_id]
             limit = self.stop_after.get(req_id)
             if limit is not None:
                 tokens = tokens[: limit - len(self.outputs[req_id])]
@@ -858,6 +890,45 @@ def test_a_deferred_verify_nobody_asked_for_is_refused():
     engine.add("s", 0, 5, params=SamplingParams(temperature=1.0, top_k=3, seed=3))
     with pytest.raises(ValueError, match="did not send defer_read"):
         engine.run(6)
+
+
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
+def test_a_request_finishing_at_max_tokens_frees_its_slot_and_the_chain_goes_on(
+    declared,
+):
+    """The scheduler leaves ``a`` out once its verify in flight is sure to reach
+    ``max_tokens``. That step still chains for ``b``; a model declaring
+    ``supports_finishing_slots`` is told ``a``'s slot, once, and frees it."""
+    capabilities = dict(LaneDeviceTarget.model_capabilities)
+    if declared:
+        capabilities["supports_finishing_slots"] = True
+    model = lane_device_target(model_capabilities=capabilities)()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    # 15 lands a verify in flight that is sure to reach it (the skip fires
+    # only when even an all-rejected step reaches max_tokens).
+    prompts = {
+        "a": engine.add("a", 0, 1, max_tokens=15),
+        "b": engine.add("b", 2, 9),
+    }
+    engine.run(16)
+    engine.drain()
+
+    assert engine.outputs["a"] == expected_greedy(prompts["a"], 14)
+    produced = engine.outputs["b"]
+    assert produced == expected_greedy(prompts["b"], len(produced))
+    left_out = [i for i, ids in enumerate(engine.finishing_log) if "a" in ids]
+    assert len(left_out) == 1
+    sent = [c["finishing_slots"] for c in model.calls if c["finishing_slots"]]
+    assert sent == ([[0]] if declared else [])
+    assert model.freed == ([0] if declared else [])
+    # The step that left ``a`` out chained for ``b`` alone.
+    chained, breaks = chain_counters(runner)
+    assert "layout" not in breaks
+    assert any(
+        c["chain_rows"].tolist() == [False, False, True, False]
+        for c in model.chained_calls
+    )
 
 
 # endregion Chained fused verifies

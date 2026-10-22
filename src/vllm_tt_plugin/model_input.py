@@ -249,3 +249,9 @@ class TTModelInput:
     # on every other step.
     chain_rows: torch.Tensor | None = None
     chain_tip: int | None = None
+
+    # Lane decode only, for a model declaring ``supports_finishing_slots``: the
+    # slots of requests this step leaves out only because the step in flight
+    # reaches their ``max_tokens`` (``get_tt_finishing_req_ids``). None when
+    # there are none.
+    finishing_slots: list[int] | None = None

@@ -31,6 +31,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin.scheduler import get_tt_finishing_req_ids
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
@@ -1340,6 +1341,7 @@ class TTLaneInputBatch(InputBatch):
             walk_inputs["max_num_logprobs"] = [None]
         decode_layout_changed = runner._decode_layout_changed_since_last_decode
         slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
+        finishing_slots = self._finishing_slots(runner, scheduler_output)
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1389,7 +1391,36 @@ class TTLaneInputBatch(InputBatch):
             spec_min_tokens=walk_inputs.get("spec_min_tokens"),
             chain_rows=spec["chain_rows"],
             chain_tip=spec["chain_tip"],
+            finishing_slots=finishing_slots,
         )
+
+    def _finishing_slots(
+        self, runner: "TTModelRunner", scheduler_output: "SchedulerOutput"
+    ) -> list[int] | None:
+        """The slots of the requests this decode leaves out because they finish.
+
+        ``TTScheduler`` names the running requests the base loop skipped since
+        the step in flight reaches their ``max_tokens``. They still hold their
+        slots until the scheduler reports them finished, and are never
+        scheduled again; a model declaring ``supports_finishing_slots`` is told
+        it may free them now. None for any other model, or when there are none.
+        """
+        finishing = get_tt_finishing_req_ids(scheduler_output)
+        if not finishing:
+            return None
+        capabilities = getattr(runner.model, "model_capabilities", None) or {}
+        if not capabilities.get("supports_finishing_slots", False):
+            return None
+        slots = []
+        for req_id in finishing:
+            if req_id in scheduler_output.num_scheduled_tokens:
+                raise RuntimeError(
+                    f"request {req_id!r} is both scheduled and finishing"
+                )
+            row = self.req_id_to_index.get(req_id)
+            if row is not None:
+                slots.append(row)
+        return sorted(slots) or None
 
     def _logits_walk_inputs(
         self,

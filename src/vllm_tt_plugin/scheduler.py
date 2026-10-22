@@ -104,6 +104,32 @@ def get_tt_block_step_decisions(
 # The lane coordinator's per-step state; see ``lane_scheduler.py``.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
 
+# Requests a decode step left out only because the step in flight is sure to
+# reach their ``max_tokens`` (``request_will_reach_max_tokens``).
+_TT_FINISHING_REQ_IDS_ATTR = "_tt_finishing_req_ids"
+
+
+def get_tt_finishing_req_ids(scheduler_output: SchedulerOutput) -> tuple[str, ...]:
+    return tuple(getattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, ()))
+
+
+def request_will_reach_max_tokens(request: Request) -> bool:
+    """vLLM 0.30's running-loop skip condition, verbatim.
+
+    ``Scheduler.schedule`` (vllm/v1/core/sched/scheduler.py, the first check of
+    the RUNNING loop): an async step is in flight
+    (``num_output_placeholders > 0``) and, even if every draft it carries is
+    rejected, it commits the request's last allowed token. The base loop then
+    does not schedule the request again, although the scheduler has not seen
+    that output yet and the request is still running.
+    """
+    return (
+        request.num_output_placeholders > 0
+        and request.num_computed_tokens + 2 - request.num_output_placeholders
+        >= request.num_prompt_tokens + request.max_tokens
+    )
+
+
 # Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
 # Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
 # carries them over with ``carry_tt_scheduler_output_fields``.
@@ -112,6 +138,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
     _TT_STEP_STATE_ATTR,
+    _TT_FINISHING_REQ_IDS_ATTR,
 )
 
 
@@ -373,6 +400,9 @@ class TTScheduler(AsyncScheduler):
         # _mirror_spec_session). Only its owner can emit a block.
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
+        # Running requests the base loop is about to skip because the step in
+        # flight reaches their max_tokens; read at each schedule().
+        self._finishing_candidates: list[str] = []
         self._widest_decode_batch_size = 0
         self._prefill_chunk_alignment = (
             get_tt_prefill_chunk_alignment(self.vllm_config)
@@ -823,6 +853,15 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
+        # Read on the state the base running loop is about to see: the skip is
+        # a pure function of request state, and the loop advances the
+        # computed-token counts of the requests it schedules.
+        self._finishing_candidates = [
+            request.request_id
+            for request in self.running
+            if getattr(request, "num_output_placeholders", 0) > 0
+            and request_will_reach_max_tokens(request)
+        ]
         has_pending_prefill = self._has_pending_prefill()
         # A partial prefill occupies ``running`` but cannot produce a decode
         # token, so it must not make the decode fallback below look viable.
@@ -903,6 +942,7 @@ class TTScheduler(AsyncScheduler):
                     "TT scheduler: widest decode batch reached %d request row(s)",
                     rows,
                 )
+            self._record_finishing_requests(scheduler_output)
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -910,6 +950,36 @@ class TTScheduler(AsyncScheduler):
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
         return scheduler_output
+
+    def _record_finishing_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Name the requests this decode step left out because they finish.
+
+        A candidate (``request_will_reach_max_tokens`` before the schedule)
+        counts only if the step really left it out and it is still running:
+        not preempted or finished by this very schedule, since a preempted
+        request resumes and is scheduled again. ``TTModelRunner`` reads the
+        result (``get_tt_finishing_req_ids``) for a model declaring
+        ``supports_finishing_slots``.
+        """
+        candidates = getattr(self, "_finishing_candidates", ())
+        self._finishing_candidates = []
+        if not candidates:
+            return
+        gone = set(scheduler_output.preempted_req_ids or ()) | set(
+            scheduler_output.finished_req_ids
+        )
+        finishing = tuple(
+            req_id
+            for req_id in candidates
+            if req_id not in scheduler_output.num_scheduled_tokens
+            and req_id not in gone
+            and req_id in self.requests
+            and self.requests[req_id].status == RequestStatus.RUNNING
+        )
+        if finishing:
+            set_tt_scheduler_output_field(
+                scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, finishing
+            )
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.

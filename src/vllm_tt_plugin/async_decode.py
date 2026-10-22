@@ -18,6 +18,7 @@ from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
 from vllm_tt_plugin.scheduler import (
+    get_tt_finishing_req_ids,
     get_tt_forced_reset_discard_counts,
     set_tt_verified_drafts,
 )
@@ -859,8 +860,9 @@ class TTAsyncDecodeController:
         """Each scheduled lane's reason not to chain (None: it chains), and the plan.
 
         A lane chains when its layout is unchanged since step n (the same
-        requests at the same slots, less the finished ones, with nothing
-        joined, preempted or left out) and every one of its requests:
+        requests at the same slots, less the finished ones and those left out
+        because they finish at ``max_tokens``, with nothing joined, preempted
+        or otherwise left out) and every one of its requests:
 
         - is ``fused_sample``-servable (``_request_is_fused_servable``: no
           penalties, logprobs, grammar, allowlist, bad words or pending
@@ -880,7 +882,11 @@ class TTAsyncDecodeController:
         num_drafts = int(runner._num_speculative_tokens)
         width = num_drafts + 1
         max_model_len = int(runner.model_config.max_model_len)
-        gone = set(scheduler_output.finished_req_ids)
+        # A request left out because the step in flight reaches its max_tokens
+        # is as good as finished: it is not scheduled again.
+        gone = set(scheduler_output.finished_req_ids) | set(
+            get_tt_finishing_req_ids(scheduler_output)
+        )
         pending_rows = {
             row: req_id
             for row, req_id in enumerate(pending.row_req_ids)
@@ -1771,6 +1777,9 @@ class TTAsyncDecodeController:
         # sampling modes. Preserve that behavior for legacy adapters too.
         if model_input.slot_remap is not None:
             kwargs["slot_remap"] = model_input.slot_remap
+        finishing_slots = getattr(model_input, "finishing_slots", None)
+        if finishing_slots:
+            kwargs["finishing_slots"] = list(finishing_slots)
 
         # Versioned compatibility seam. Refactored tt-metal adapters opt into
         # the four explicit commands; legacy adapters keep their old call shape.

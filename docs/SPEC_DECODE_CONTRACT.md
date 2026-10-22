@@ -131,6 +131,7 @@ launches without `speculative_config`.
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. On a plan offering `fused_sample`, in lane mode, it also declares the deferred and chained fused verify of section 4j. |
+| `supports_finishing_slots` | `False` | Lane mode under async scheduling: `decode_forward` accepts `finishing_slots`, the slots of requests left out because the step in flight reaches their `max_tokens`: see section 4j. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -1251,6 +1252,19 @@ request that finished at step n has already been scheduled into n+1; that
 output is published and vLLM drops it, and its slot is a gap from n+2. A
 drafter that drafts only for a lane holding one request therefore chains a
 step while every busy lane holds one request.
+
+**Requests finishing at `max_tokens`.** Under async scheduling vLLM leaves a
+running request out of a step once the step in flight is sure to reach its
+`max_tokens`, even with every draft rejected, though it has not seen that
+output yet. `TTScheduler` names such requests per lane
+(`request_will_reach_max_tokens`, `get_tt_finishing_req_ids`) and
+`merge_lane_scheduler_outputs` merges them. A chain treats them as finished:
+their lane chains without them. A model declaring `supports_finishing_slots`
+receives `finishing_slots`, a sorted list of their slots, on every lane decode
+step (ordinary or verify) that leaves them out for that reason, which under
+vLLM's two-deep batch queue is one step. The request still holds the slot
+until the scheduler reports it finished, is never scheduled again, and its
+slot's state may be freed at once; a chained verify sends the slot as a gap.
 
 The `TT submissions:` log line adds the count of chained verifies and of the
 chains refused, by reason, once chaining is enabled.

@@ -38,11 +38,26 @@ def _lane_step():
     return _make_coordinator([FakeLane(running=1), FakeLane()]).schedule()
 
 
+def _finishing_step():
+    """A decode that leaves out a request its step in flight finishes."""
+    scheduler = _scheduler(output_width=1, async_scheduling=True)
+    request = _request(2)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, _runner_output(prefill, [7]))
+    scheduler.schedule()  # in flight: it commits the second and last token
+    step = scheduler.schedule()
+    assert request.request_id not in step.num_scheduled_tokens
+    return step
+
+
 def _tt_fields(scheduler_output):
     return {name for name in vars(scheduler_output) if name.startswith("_tt_")}
 
 
-@pytest.mark.parametrize("step", [_block_step, _forced_reset_step, _lane_step])
+@pytest.mark.parametrize(
+    "step", [_block_step, _forced_reset_step, _lane_step, _finishing_step]
+)
 def test_the_tt_fields_a_step_sets_survive_a_rebuild_from_dataclass_fields(step):
     scheduler_output = step()
     attached = _tt_fields(scheduler_output)
@@ -65,7 +80,10 @@ def test_the_tt_fields_a_step_sets_survive_a_rebuild_from_dataclass_fields(step)
 
 def test_the_inventory_covers_every_tt_field_a_step_sets():
     seen = set().union(
-        *(_tt_fields(step()) for step in (_block_step, _forced_reset_step, _lane_step))
+        *(
+            _tt_fields(step())
+            for step in (_block_step, _forced_reset_step, _lane_step, _finishing_step)
+        )
     )
 
     assert seen == set(TT_SCHEDULER_OUTPUT_FIELDS)
