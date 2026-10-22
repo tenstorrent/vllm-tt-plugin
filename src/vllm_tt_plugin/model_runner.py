@@ -3282,7 +3282,13 @@ class TTModelRunner:
         if logprobs is None:
             return None
         starts = logprobs.cu_num_generated_tokens
-        assert starts is not None and len(starts) == len(prefixes) + 1
+        if starts is None or len(starts) != len(prefixes) + 1:
+            raise ValueError(
+                "spec_committed_logprobs needs one cu_num_generated_tokens "
+                f"boundary per published prefix plus one: got "
+                f"{None if starts is None else len(starts)} boundaries for "
+                f"{len(prefixes)} prefixes"
+            )
         keep = [
             index
             for row, prefix in enumerate(prefixes)
