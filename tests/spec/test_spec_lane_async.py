@@ -901,6 +901,32 @@ def test_a_request_that_stops_mid_chain_leaves_the_others_chaining():
     assert int(runner.lane_batch.num_tokens[2]) == 0
 
 
+@pytest.mark.parametrize("stop_after", [1, 2, 3])
+def test_a_lane_that_lost_a_co_resident_request_does_not_chain_onto_that_step(
+    stop_after,
+):
+    """``a`` speculates alone in lane 0, then ``b`` joins it and stops soon
+    after. Steps that held both drafted nothing for the lane (the solo
+    drafter, as MiMo's), so ``a`` never chains onto one of them; once a step
+    ran the lane with ``a`` alone again, ``a`` chains and every token is the
+    argmax chain."""
+    model = lane_device_target(draft_policy="solo")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompt_a = engine.add("a", 0, 1)
+    engine.run(6)
+    prompt_b = engine.prefill("b", 1, 9)
+    engine.stop_after["b"] = stop_after
+    engine.run(12)
+    engine.drain()
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompt_a, len(produced))
+    produced_b = [engine.first["b"], *engine.outputs["b"]]
+    assert produced_b[: len(produced_b)] == expected_greedy(prompt_b, len(produced_b))
+    # ``a`` chains again once a step ran its lane alone.
+    assert chain_counters(runner)[0] > 0
+
+
 @pytest.mark.parametrize(
     "params, reason",
     [

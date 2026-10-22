@@ -867,9 +867,12 @@ class TTAsyncDecodeController:
         """Each scheduled lane's reason not to chain (None: it chains), and the plan.
 
         A lane chains when its layout is unchanged since step n (the same
-        requests at the same slots, less the finished ones and those left out
-        because they finish at ``max_tokens``, with nothing joined, preempted
-        or otherwise left out) and every one of its requests:
+        requests at the same slots, with nothing joined, preempted or otherwise
+        left out; a lane whose only request finished, or is left out because
+        it finishes at ``max_tokens``, has nothing to chain and does not hold
+        the others back, but a lane that also held a request now gone does not
+        chain: its drafter may have drafted nothing for a lane of several) and
+        every one of its requests:
 
         - is ``fused_sample``-servable (``_request_is_fused_servable``: no
           penalties, logprobs, grammar, allowlist, bad words or pending
@@ -899,6 +902,14 @@ class TTAsyncDecodeController:
             for row, req_id in enumerate(pending.row_req_ids)
             if req_id is not None and req_id not in gone
         }
+        # Lanes whose step n also held a request that is gone now: step n ran
+        # that lane with several requests, and a drafter may draft only for a
+        # lane that held one (MiMo's), so the survivors' drafts may not exist.
+        shared_lanes = {
+            row // per_lane
+            for row, req_id in enumerate(pending.row_req_ids)
+            if req_id is not None and req_id in gone
+        }
         scheduled = dict(zip(plan.scheduled_rows, plan.scheduled_req_ids, strict=True))
         spec_plan = getattr(runner, "_spec_plan", None)
         full = (
@@ -921,7 +932,9 @@ class TTAsyncDecodeController:
                 for row, req_id in scheduled.items()
                 if row // per_lane == lane
             }
-            if lane_scheduled != lane_pending:
+            if lane_scheduled != lane_pending or (
+                lane_scheduled and lane in shared_lanes
+            ):
                 reasons[lane] = "layout"
                 continue
             reason = None
