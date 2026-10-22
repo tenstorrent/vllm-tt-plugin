@@ -49,13 +49,14 @@ from vllm_tt_plugin.spec_accept import (
 )
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
-from .test_spec_sampled_accept import (
+from .sampled_reference import (
     PROMPT,
     SMALL_VOCAB,
     _argmax_drafter,
     _causal_table,
     _chi_square,
     _chi_square_critical,
+    _pack,
     _reference_distribution,
     _sampling_drafter,
     _wrong_drafter,
@@ -64,18 +65,6 @@ from .test_spec_sampled_accept import (
 VOCAB = 32
 
 # region Helpers
-
-
-def _pack(allowed: torch.Tensor) -> torch.Tensor:
-    """xgrammar's packed layout for a ``[..., V]`` bool allowlist."""
-    words = (allowed.shape[-1] + 31) // 32
-    padded = torch.zeros((*allowed.shape[:-1], words * 32), dtype=torch.bool)
-    padded[..., : allowed.shape[-1]] = allowed
-    bits = padded.reshape(*allowed.shape[:-1], words, 32).to(torch.int64)
-    weights = torch.tensor([1 << b for b in range(32)], dtype=torch.int64)
-    packed = (bits * weights).sum(-1)
-    # Two's complement, which is how an int32 word holds bit 31.
-    return torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
 
 
 def _min_tokens_processor(

@@ -15,7 +15,7 @@ runner that does not speculate, so its tokens come from vLLM's ordinary host
 sampler with the same grammar bitmask and the same logits processors.
 
 The asynchronous tests drive ``execute_model`` and ``sample_tokens`` with the
-held readback of ``test_spec_async_sampled.py``, and between the two they do
+held readback of ``sampled_async_harness.py``, and between the two they do
 what ``EngineCore.step_with_batch_queue`` does for a step with a structured
 request: take the runner's drafts, validate them against each grammar, and
 build the bitmask from what survived.
@@ -45,16 +45,16 @@ from vllm_tt_plugin.spec_decode import (
 )
 from vllm_tt_plugin.structured_output import spec_grammar_bitmask_for_tt_batch
 
+from . import sampled_async_harness as async_sampled
+from . import sampled_sync_harness as sync_harness
 from . import test_spec_async as async_harness
-from . import test_spec_async_sampled as async_sampled
-from . import test_spec_sampled_runner as sync_harness
+from .sampled_reference import _pack
 from .sampled_target import (
     SAMPLED_VOCAB_SIZE,
     SUPPORT_PROBABILITIES,
     SampledTarget,
     support,
 )
-from .test_spec_sampled_controls import _pack
 
 wait_for_released_reads = async_harness.wait_for_released_reads
 
@@ -775,7 +775,7 @@ def test_an_asynchronous_structured_row_rejects_the_drafts_its_grammar_forbids()
     for token in runner.requests["j"].output_token_ids:
         assert _grammar_allows(history, token), (history, token)
         history.append(token)
-    async_sampled.sync_harness._assert_in_support(
+    sync_harness._assert_in_support(
         (3 + async_sampled.PROMPT_LEN - 1, async_sampled.PROMPT_LEN - 1),
         runner.requests["j"].output_token_ids,
     )
