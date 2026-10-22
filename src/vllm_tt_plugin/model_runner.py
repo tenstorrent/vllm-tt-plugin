@@ -3111,17 +3111,7 @@ class TTModelRunner:
             )
         output = self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
         if is_decode and getattr(self, "_num_speculative_tokens", 0):
-            # The proposal after an ordinary decode, as on the front-packed
-            # path. The drafter's rows are the device slots, so this step's
-            # tokens go back to the slots they were sampled at; a gap carries
-            # no request id and position -1, which is what marks it unowned.
-            committed = torch.zeros(
-                (int(model_input.input_positions.shape[0]), 1), dtype=torch.int32
-            )
-            committed[torch.as_tensor(scheduled_rows, dtype=torch.long)] = sampled
-            self.propose_after_plain_step(
-                model_input, committed, list(model_input.row_req_ids)
-            )
+            self.propose_after_lane_plain_step(model_input, sampled, scheduled_rows)
         return output
 
     def _finish_lane_spec_decode(
@@ -3138,13 +3128,8 @@ class TTModelRunner:
         already unwrapped from its ``VerifyOutput``. The walk, the commit and
         the drafter run over every slot, gaps included, because the drafter's
         rows are the verify's; a gap's request id is ``None``, so it reaches no
-        request state. Only the scheduled slots are published.
-
-        A ``logits`` walk returns logprobs for its live rows, the slots with a
-        request id, and the published rows are the scheduled slots. The lane
-        builder names exactly the scheduled slots, so the two are the same
-        rows in the same order; a mismatch would publish a slot with no request
-        or hand one request another's logprobs, so it raises.
+        request state. Only the scheduled slots are published
+        (``lane_spec_published``).
         """
         walk = self.walk_spec_acceptance(model_input, verified)
         prefixes = self.spec_committed_prefixes(
@@ -3153,16 +3138,37 @@ class TTModelRunner:
         self.commit_spec_acceptance(
             model_input, walk.committed, walk.counts, spec_hidden
         )
+        req_ids, published = self.lane_spec_published(
+            model_input, prefixes, scheduled_rows
+        )
+        return self.build_spec_runner_output(
+            req_ids, published, self.spec_committed_logprobs(walk.logprobs, published)
+        )
+
+    @staticmethod
+    def lane_spec_published(
+        model_input: TTModelInput,
+        prefixes: list[list[int]],
+        scheduled_rows: list[int],
+    ) -> tuple[list[str], list[list[int]]]:
+        """A lane verify's published requests and prefixes: its scheduled slots.
+
+        The walk ran over every slot. A ``logits`` walk's logprobs cover the
+        slots with a request id, and the lane builder names exactly the
+        scheduled slots, so the two are the same rows in the same order; a
+        mismatch would publish a slot with no request or hand one request
+        another's logprobs, so it raises. Touches no runner state, so the
+        deferred readback calls it too.
+        """
         if _spec_live_rows(model_input) != list(scheduled_rows):
             raise RuntimeError(
                 "a lane verify's row identity does not name exactly the "
                 f"scheduled slots: scheduled_rows={list(scheduled_rows)}, "
                 f"row_req_ids={model_input.row_req_ids}"
             )
-        req_ids = [model_input.row_req_ids[row] for row in scheduled_rows]
-        published = [prefixes[row] for row in scheduled_rows]
-        return self.build_spec_runner_output(
-            req_ids, published, self.spec_committed_logprobs(walk.logprobs, published)
+        return (
+            [model_input.row_req_ids[row] for row in scheduled_rows],
+            [prefixes[row] for row in scheduled_rows],
         )
 
     @torch.no_grad()
@@ -3730,6 +3736,34 @@ class TTModelRunner:
                 for row, req_id in enumerate(row_req_ids)
                 if req_id not in skipped
             }
+        )
+
+    def propose_after_lane_plain_step(
+        self,
+        model_input: TTModelInput,
+        sampled_token_ids: torch.Tensor,
+        scheduled_rows: list[int],
+        *,
+        skip_req_ids: set[str] | None = None,
+    ) -> None:
+        """``propose_after_plain_step`` for an ordinary lane decode.
+
+        ``sampled_token_ids`` holds one token per scheduled slot, in slot
+        order. The drafter's rows are the device slots, so each token goes back
+        to the slot it was sampled at; a gap carries no request id and
+        position -1, which is what marks it unowned.
+        """
+        committed = torch.zeros(
+            (int(model_input.input_positions.shape[0]), 1), dtype=torch.int32
+        )
+        committed[torch.as_tensor(scheduled_rows, dtype=torch.long)] = (
+            sampled_token_ids.reshape(len(scheduled_rows), -1)[:, :1].to(torch.int32)
+        )
+        self.propose_after_plain_step(
+            model_input,
+            committed,
+            list(model_input.row_req_ids),
+            skip_req_ids=skip_req_ids,
         )
 
     def build_spec_runner_output(

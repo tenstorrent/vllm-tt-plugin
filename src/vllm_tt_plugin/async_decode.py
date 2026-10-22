@@ -169,6 +169,10 @@ class CompletedDecodeStep:
     # next proposal at their commit: the drafter is called with this step's own
     # rows and positions, and the commit runs a step later than the build.
     model_input: TTModelInput | None = None
+    # Lane-DP only: the slots ``sampled_token_ids`` was read from, in its row
+    # order. The drafter's rows are the slot grid, so a lane step's proposal
+    # puts each token back at its slot.
+    scheduled_rows: list[int] | None = None
 
 
 @dataclass
@@ -193,6 +197,9 @@ class CompletedSpecDecodeStep:
 
     committed: torch.Tensor
     counts: torch.Tensor
+    # The published rows' requests and accepted prefixes, in output order: the
+    # verify's rows front-packed, the scheduled slots in lane mode.
+    published_req_ids: list[str]
     prefixes: list[list[int]]
     model_input: TTModelInput
     spec_hidden: Any | None
@@ -324,6 +331,9 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
 
     It never mutates runner state. The walk reads only this step's own tensors,
     and the commit waits in the completed queue for the engine thread.
+
+    ``scheduled_rows`` marks a lane-DP verify: the walk runs over the whole slot
+    grid and only the scheduled slots are published, in slot order.
     """
 
     def __init__(
@@ -333,12 +343,14 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         model_input: TTModelInput,
         completion_event: threading.Event,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
         self._completion_event = completion_event
         self._context = context
+        self._scheduled_rows = scheduled_rows
         self._init_deferred()
 
     def set_grammar_bitmask(
@@ -370,9 +382,10 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
             submission=self._submission,
             model_input=self._model_input,
             context=self._context,
+            scheduled_rows=self._scheduled_rows,
         )
         runner_output = self._controller.runner.build_spec_runner_output(
-            self._model_input.row_req_ids, completed.prefixes, completed.logprobs
+            completed.published_req_ids, completed.prefixes, completed.logprobs
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
@@ -1045,6 +1058,7 @@ class TTAsyncDecodeController:
             context=context,
             completion_time_ns=time.perf_counter_ns(),
             model_input=model_input,
+            scheduled_rows=scheduled_rows,
         )
 
     def complete_spec_decode_step(
@@ -1052,6 +1066,7 @@ class TTAsyncDecodeController:
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ) -> CompletedSpecDecodeStep:
         """Finalize a speculative read and walk acceptance over what came back.
 
@@ -1060,6 +1075,9 @@ class TTAsyncDecodeController:
         ``logits`` walk also advances the step's request generators, which is
         why ``DeferredDecodeOutput`` resolves a step once. The commit and the
         next proposal are left for the engine thread.
+
+        ``scheduled_rows`` (lane DP) publishes the scheduled slots only, as the
+        synchronous lane tail does (``TTModelRunner.lane_spec_published``).
         """
         finalized = self.finalize_decode(submission)
         if finalized is None:
@@ -1067,6 +1085,7 @@ class TTAsyncDecodeController:
             return CompletedSpecDecodeStep(
                 committed=torch.empty((0, 0), dtype=torch.int32),
                 counts=torch.empty((0,), dtype=torch.int32),
+                published_req_ids=list(model_input.row_req_ids),
                 prefixes=[[] for _ in range(rows)],
                 model_input=model_input,
                 spec_hidden=submission.spec_hidden,
@@ -1077,9 +1096,15 @@ class TTAsyncDecodeController:
         prefixes = self.runner.spec_committed_prefixes(
             model_input, walk.committed, walk.counts
         )
+        published_req_ids = list(model_input.row_req_ids)
+        if scheduled_rows is not None:
+            published_req_ids, prefixes = self.runner.lane_spec_published(
+                model_input, prefixes, scheduled_rows
+            )
         return CompletedSpecDecodeStep(
             committed=walk.committed,
             counts=walk.counts,
+            published_req_ids=published_req_ids,
             prefixes=prefixes,
             model_input=model_input,
             spec_hidden=submission.spec_hidden,
@@ -1149,6 +1174,14 @@ class TTAsyncDecodeController:
             # this step owes the next proposal or the launch never drafts
             # again. It runs here, a step after the submission, because the
             # drafts continue the token that just came back.
+            if completed.scheduled_rows is not None:
+                self.runner.propose_after_lane_plain_step(
+                    completed.model_input,
+                    completed.sampled_token_ids,
+                    completed.scheduled_rows,
+                    skip_req_ids=skipped_state,
+                )
+                return
             self.runner.propose_after_plain_step(
                 completed.model_input,
                 completed.sampled_token_ids,
@@ -1205,10 +1238,32 @@ class TTAsyncDecodeController:
         model_input: TTModelInput,
         context: SubmittedStepContext,
         scheduled_rows: list[int],
-    ) -> AsyncTTModelRunnerOutput:
-        """Submit a non-blocking single-process multi-lane decode step."""
-        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+    ) -> DeferredDecodeOutput:
+        """Submit a non-blocking single-process multi-lane decode step.
+
+        A verify reads back the whole slot grid, which its accept walk runs
+        over, and resolves through ``AsyncTTSpecDecodeOutput``. It is never
+        overlap-safe, for the reason ``submit_async_decode`` gives: the next
+        candidate block starts from this step's committed tokens.
+        """
         completion_event = threading.Event()
+        if model_input.spec_mode is not None:
+            submission = self.submit_decode(
+                model_input, read_from_device=False, async_read=True
+            )
+            if submission.tt_out is None:
+                completion_event.set()
+            spec_step = AsyncTTSpecDecodeOutput(
+                controller=self,
+                submission=submission,
+                model_input=model_input,
+                completion_event=completion_event,
+                context=context,
+                scheduled_rows=scheduled_rows,
+            )
+            self.register_pending_async_step(spec_step, overlap_ok=False)
+            return spec_step
+        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         submission = self.submit_decode(
             model_input,
             read_from_device=False,

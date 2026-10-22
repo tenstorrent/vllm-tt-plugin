@@ -2438,13 +2438,15 @@ class TTPlatform(Platform):
             # selected model can serve the combined async speculative path.
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
-            # Lane mode verifies through the model-owned drafter, synchronously.
+            # Lane mode verifies through the model-owned drafter.
             # ``TTLaneInputBatch`` builds the candidate block over its stable
-            # slots and the lane tail walks, commits and proposes in one go, so
-            # both refusals below are about what that path does not cover:
-            # the n-gram proposer indexes the front-packed rows
-            # ``req_ids[:num_reqs]``, which a slot grid with gaps is not, and
-            # the asynchronous lane decode has no deferred speculative tail.
+            # slots; the synchronous lane tail walks, commits and proposes in
+            # one go, and the asynchronous one defers a verify through
+            # ``AsyncTTSpecDecodeOutput`` like the front-packed path, which the
+            # check above already admits only for a model declaring
+            # ``supports_async_spec_decode``. The refusal below is what neither
+            # covers: the n-gram proposer indexes the front-packed rows
+            # ``req_ids[:num_reqs]``, which a slot grid with gaps is not.
             method = str(vllm_config.speculative_config.method)
             if method != MODEL_OWNED_DRAFT_METHOD:
                 raise ValueError(
@@ -2455,14 +2457,6 @@ class TTPlatform(Platform):
                     "and lane mode lays requests out at stable slots with "
                     "gaps. Use the model's drafter, or set "
                     "--data-parallel-size 1 to leave lane mode"
-                )
-            if vllm_config.scheduler_config.async_scheduling:
-                raise ValueError(
-                    "TT lane mode speculates with synchronous scheduling only: "
-                    "the asynchronous lane decode has no deferred speculative "
-                    "tail to walk acceptance and propose at its readback. "
-                    "Launch with --no-async-scheduling, or drop the "
-                    "speculative flags"
                 )
 
         # After the lane fold: _convert_dp_to_lanes rewrites

@@ -360,8 +360,9 @@ each rank runs the policy on its own scheduler state.
 The generic speculative path uses `speculative_config` and a model's
 `spec_plan` admission result. `TTPlatform.check_and_update_config` rejects
 speculation for models with `output_tokens_per_step > 1`, and admits lane-DP
-speculation only for the model-owned drafter (`custom_class`) with synchronous
-scheduling.
+speculation only for the model-owned drafter (`custom_class`). Asynchronous
+scheduling with speculation, in lane mode as front-packed, needs
+`supports_async_spec_decode`.
 Standard multi-process DP keeps speculation local to each independent rank.
 The [speculative decoding contract](SPEC_DECODE_CONTRACT.md) defines supported
 methods, model hooks, request controls, and acceptance semantics.

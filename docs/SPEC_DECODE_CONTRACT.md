@@ -74,7 +74,7 @@ serve speculative decoding within the following execution limits:
   handle rather than about step order: a speculative step never overlaps the
   next one, so verify, accept and propose stay ordered per request.
 - **front-packed** execution, and **lane mode** with the model-owned drafter
-  (`custom_class`) under synchronous scheduling. `TTLaneInputBatch` builds the
+  (`custom_class`), under either scheduling. `TTLaneInputBatch` builds the
   candidate block over its stable slots: a row is a device slot, and a gap
   carries request id `None`, position -1 in every column, no drafts and count
   1, as a padding row does. A slot whose request the step does not schedule,
@@ -88,9 +88,11 @@ serve speculative decoding within the following execution limits:
   front-packed execution: a sampled request in any lane makes the whole step
   a `logits` verify, or a `fused_sample` one (section 4i), the model answers
   every slot of the grid, gaps included, and only the scheduled slots are
-  sampled (section 4h). Lane mode
-  refuses `ngram`, whose proposer indexes front-packed rows, and asynchronous
-  scheduling, whose lane decode has no deferred speculative tail.
+  sampled (section 4h). Under asynchronous scheduling a lane verify is
+  deferred like a front-packed one (section 4c) and publishes its scheduled
+  slots, and a lane step that verifies nothing is the ordinary lane decode,
+  which overlaps the step in flight when the steady-decode checks allow it.
+  Lane mode refuses `ngram`, whose proposer indexes front-packed rows.
 
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative
@@ -553,6 +555,13 @@ next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
 unapplied, and verify, accept and propose stay serialized per request. What
 this path defers is the readback and the commit, not the order of the steps.
+An ordinary decode inside the speculating launch keeps its overlap: it is
+registered overlap-safe when the steady-decode checks pass, and its proposal
+runs at its commit, a step after its submission. A verify about to be built
+over such a step drains it first, so the proposal the verify carries continues
+the newest token. Lane mode follows the same rules over its slot grid: the
+drafter is called with every slot, and a lane step's tokens go back to the
+slots they were sampled at.
 
 Two demands nevertheless reach the model, and they are what
 `supports_async_spec_decode` declares:

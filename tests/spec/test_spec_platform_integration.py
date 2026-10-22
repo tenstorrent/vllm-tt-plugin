@@ -253,8 +253,8 @@ def _model_owned(vllm_config):
 
 def test_lane_mode_speculates_through_the_model_owned_drafter(monkeypatch, vllm_config):
     # TTLaneInputBatch builds the candidate block over its stable slots and the
-    # synchronous lane tail walks, commits and proposes, so a lane launch with
-    # the model's own drafter is admitted and its plan published.
+    # lane tail walks, commits and proposes, so a lane launch with the model's
+    # own drafter is admitted and its plan published.
     model = make_fake_spec_model(max_supported_num_seqs=1024)
     _run_hook(monkeypatch, _model_owned(_lane_mode(vllm_config)), model)
     plan = get_tt_spec_plan(vllm_config)
@@ -274,9 +274,12 @@ def test_lane_mode_cannot_speculate_with_ngram(monkeypatch, vllm_config):
     assert "'ngram'" in message
 
 
-def test_lane_mode_cannot_speculate_asynchronously(monkeypatch, vllm_config):
-    # Even a model that serves a deferred verify: the asynchronous lane decode
-    # has no deferred speculative tail.
+def test_lane_mode_speculates_asynchronously_on_a_deferred_verify_model(
+    monkeypatch, vllm_config
+):
+    # The asynchronous lane decode defers a verify through the speculative
+    # tail, as the front-packed path does, so a model that serves a deferred
+    # verify keeps async scheduling in lane mode.
     vllm_config.scheduler_config.async_scheduling = True
     model = make_fake_spec_model(
         max_supported_num_seqs=1024,
@@ -286,10 +289,28 @@ def test_lane_mode_cannot_speculate_asynchronously(monkeypatch, vllm_config):
             "supports_async_spec_decode": True,
         },
     )
+    _run_hook(monkeypatch, _model_owned(_lane_mode(vllm_config)), model)
+    assert vllm_config.scheduler_config.async_scheduling
+    assert get_tt_spec_plan(vllm_config) is not None
+
+
+def test_lane_mode_cannot_speculate_asynchronously_without_the_capability(
+    monkeypatch, vllm_config
+):
+    # supports_async_decode alone does not cover a deferred verify, in lane
+    # mode as anywhere else.
+    vllm_config.scheduler_config.async_scheduling = True
+    model = make_fake_spec_model(
+        max_supported_num_seqs=1024,
+        model_capabilities={
+            **FakeSpecModel.model_capabilities,
+            "supports_async_decode": True,
+        },
+    )
     with pytest.raises(ValueError) as excinfo:
         _run_hook(monkeypatch, _model_owned(_lane_mode(vllm_config)), model)
     message = str(excinfo.value)
-    assert "lane mode" in message
+    assert "supports_async_spec_decode" in message
     assert "--no-async-scheduling" in message
 
 
