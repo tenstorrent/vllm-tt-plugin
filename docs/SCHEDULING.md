@@ -192,10 +192,8 @@ or an explicit `--max-num-batched-tokens`). When chunked prefill is off and
 `max_num_batched_tokens` is smaller than `max_model_len`, it raises that token
 budget to `max_model_len` so a full prompt can be admitted instead of leaving
 an unschedulable request in `waiting`. When it turns chunked prefill off, it
-raises `max_num_scheduled_tokens` the same way if that is set: on a
-speculative launch vLLM copies the unraised `max_num_batched_tokens` into it
-before the platform hook runs, and the scheduler budgets each step by
-`max_num_scheduled_tokens`.
+raises `max_num_scheduled_tokens` the same way if that is set, because the
+scheduler budgets each step by `max_num_scheduled_tokens` when it is set.
 
 ### Chunked prefill
 

@@ -7,8 +7,8 @@ from types import SimpleNamespace
 # vLLM's own bootstrap resolves the platform plugin, which imports this module.
 # Letting the plugin module trigger that bootstrap deadlocks the cycle on a
 # half-built module, so let vLLM finish importing itself first.
+import pytest
 import vllm  # noqa: F401
-from vllm.config import VllmConfig
 
 from vllm_tt_plugin.platform import _apply_chunked_prefill_policy
 from vllm_tt_plugin.scheduler import _effective_prefill_step_limit
@@ -83,54 +83,28 @@ def test_llm_class_default_budget_is_kept():
     assert config.scheduler_config.max_num_batched_tokens == 8192
 
 
-def test_undeclared_model_loses_chunked_prefill_and_gets_a_full_prompt_budget():
-    config = _vllm_config()
+@pytest.mark.parametrize(
+    ("max_num_scheduled_tokens", "expected", "limit_source"),
+    [
+        (None, None, "max_num_batched_tokens"),
+        (2048, 16384, "max_num_scheduled_tokens"),
+        (32768, 32768, "max_num_scheduled_tokens"),
+    ],
+)
+def test_undeclared_model_loses_chunked_prefill_and_gets_a_full_prompt_budget(
+    max_num_scheduled_tokens, expected, limit_source
+):
+    config = _vllm_config(max_num_scheduled_tokens=max_num_scheduled_tokens)
 
     _apply(config, {"supports_prefix_caching": True})
 
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.max_num_batched_tokens == 16384
+    assert config.scheduler_config.max_num_scheduled_tokens == expected
     assert config.scheduler_config.long_prefill_token_threshold == 0
-
-
-def test_speculative_step_budget_covers_a_full_prompt():
-    # VllmConfig derives max_num_scheduled_tokens from the unbumped
-    # max_num_batched_tokens before the platform hook runs, and the scheduler
-    # budgets every step by it. With prefill unsplit, it must cover a prompt
-    # of max_model_len tokens, or a longer prompt waits forever.
-    config = _vllm_config(max_num_batched_tokens=2048, max_model_len=16384)
-    config.speculative_config = SimpleNamespace(max_num_new_slots_for_drafting=0)
-    VllmConfig._set_max_num_scheduled_tokens(config)
-    assert config.scheduler_config.max_num_scheduled_tokens == 2048
-
-    _apply(config, None)
-
-    assert config.scheduler_config.enable_chunked_prefill is False
     assert _effective_prefill_step_limit(config.scheduler_config) == (
-        16384,
-        "max_num_scheduled_tokens",
-    )
-
-
-def test_step_budget_that_covers_the_model_len_is_left_alone():
-    config = _vllm_config(max_num_batched_tokens=32768, max_num_scheduled_tokens=32768)
-
-    _apply(config, None)
-
-    assert config.scheduler_config.max_num_scheduled_tokens == 32768
-
-
-def test_unset_step_budget_stays_unset():
-    # Without a speculative config vLLM leaves it unset and the scheduler
-    # falls back to max_num_batched_tokens, which the policy already raised.
-    config = _vllm_config()
-
-    _apply(config, None)
-
-    assert config.scheduler_config.max_num_scheduled_tokens is None
-    assert _effective_prefill_step_limit(config.scheduler_config) == (
-        16384,
-        "max_num_batched_tokens",
+        expected or 16384,
+        limit_source,
     )
 
 

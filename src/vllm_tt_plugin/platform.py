@@ -195,10 +195,8 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
             )
             scheduler_config.max_num_batched_tokens = max_model_len
 
-        # With a speculative config, VllmConfig copies max_num_batched_tokens
-        # into max_num_scheduled_tokens before this hook runs, and the
-        # scheduler budgets each step by max_num_scheduled_tokens. Left below
-        # max_model_len, an unsplit prompt longer than it is never scheduled.
+        # Unsplit prefill needs a full prompt to fit in one step under every
+        # per-step budget the scheduler applies.
         max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
         if (
             max_num_scheduled_tokens is not None
