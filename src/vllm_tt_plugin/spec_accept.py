@@ -645,9 +645,11 @@ def _constrained_probs(
     """
     rows, width, vocab = target_logits.shape
     if _fast_enabled():
-        return _constrained_table(
-            target_logits, temperature, top_k, top_p, min_p
-        ).to_dense().reshape(rows, width, vocab)
+        return (
+            _constrained_table(target_logits, temperature, top_k, top_p, min_p)
+            .to_dense()
+            .reshape(rows, width, vocab)
+        )
 
     safe_temperature = _safe_temperature(temperature)
     logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
@@ -963,7 +965,8 @@ def _point_mass_walk(
     draftless = {row: g for row, g in generators.items() if int(valid[row]) == 0}
     for row, generator in generators.items():
         if row not in draftless:
-            draws[row, 0] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+            uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
+            draws[row, 0] = uniform[0]
     bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
     for row, generator in draftless.items():
         noise = torch.empty(vocab, dtype=torch.float32)
@@ -972,9 +975,8 @@ def _point_mass_walk(
     accept_uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
     for row, generator in generators.items():
         if int(valid[row]):
-            draws[row, 1] = torch.rand(
-                (1,), dtype=torch.float64, generator=generator
-            )[0]
+            uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
+            draws[row, 1] = uniform[0]
 
     flat_ids = (row_ids.unsqueeze(1) * width + torch.arange(num_drafts)).reshape(-1)
     p_draft = table.prob_of(flat_ids, draft_ids.reshape(-1)).reshape(rows, num_drafts)
@@ -995,7 +997,9 @@ def _point_mass_walk(
     if corr_rows.numel():
         pos = first[corr_rows]
         recovered = table.sample(
-            corr_rows * width + pos, draws[corr_rows, 1], exclude=draft_ids[corr_rows, pos]
+            corr_rows * width + pos,
+            draws[corr_rows, 1],
+            exclude=draft_ids[corr_rows, pos],
         )
         candidates[corr_rows, pos] = recovered
     candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))

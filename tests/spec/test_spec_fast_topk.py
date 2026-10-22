@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """The fast top-k/top-p path of _constrained_probs equals the reference path."""
 
 import os
@@ -96,7 +98,9 @@ def test_caller_logits_are_not_modified(monkeypatch):
     logits = torch.randn(2, 3, V, generator=torch.Generator().manual_seed(5))
     before = logits.clone()
     _constrained_probs(
-        logits, torch.ones(2), torch.tensor([20, 20], dtype=torch.int32),
+        logits,
+        torch.ones(2),
+        torch.tensor([20, 20], dtype=torch.int32),
         torch.tensor([0.9, 0.9]),
     )
     assert torch.equal(before, logits)
@@ -147,7 +151,7 @@ def _assert_distribution(samples, expected, sigmas=4.5):
     count = samples.numel()
     freq = torch.bincount(samples.to(torch.int64), minlength=W).double() / count
     sigma = (expected.double() * (1 - expected.double()) / count).sqrt().clamp_min(1e-9)
-    z = ((freq - expected.double()).abs() / sigma)
+    z = (freq - expected.double()).abs() / sigma
     assert float(z.max()) < sigmas, (freq.tolist(), expected.tolist())
     # Mass outside the support is exactly zero, not merely small.
     assert float(freq[expected == 0].sum()) == 0.0
@@ -311,9 +315,7 @@ def test_tie_cut_keeps_lowest_ids_without_a_full_sort(monkeypatch):
 def test_bf16_rows_need_no_full_sort_and_keep_the_reference_masses(monkeypatch, seed):
     g = torch.Generator().manual_seed(seed)
     logits = (torch.randn(4, 4, 50000, generator=g) * 3).to(torch.bfloat16)
-    logits[..., :40] += torch.randint(5, 12, (4, 4, 40), generator=g).to(
-        torch.bfloat16
-    )
+    logits[..., :40] += torch.randint(5, 12, (4, 4, 40), generator=g).to(torch.bfloat16)
     temperature = torch.tensor([0.6, 1.0, 0.6, 1.0])
     top_k = torch.full((4,), 20, dtype=torch.int32)
     top_p = torch.full((4,), 0.95)
