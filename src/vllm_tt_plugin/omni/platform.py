@@ -43,15 +43,17 @@ class TTOmniPlatform(OmniPlatform, TTPlatform):
         """
         return len(glob.glob("/dev/tenstorrent/[0-9]*"))
 
-    # vLLM's platform forwards a name it lacks to `torch.<device_type>`, and returns
-    # None when torch has none; vLLM-Omni calls these three, so None would be called.
+    # Torch device queries. vLLM's platform forwards a name it lacks to
+    # `torch.<device_type>` and returns None when torch has none, and vLLM-Omni calls
+    # these three. Torch here runs on the host (`get_torch_device`), so it sees no
+    # accelerator; the TT devices are `get_device_count`'s.
     @classmethod
     def device_count(cls) -> int:
-        return cls.get_device_count()
+        return 0
 
     @classmethod
     def is_available(cls) -> bool:
-        return cls.get_device_count() > 0
+        return False
 
     @classmethod
     def empty_cache(cls) -> None:
