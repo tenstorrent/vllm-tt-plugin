@@ -3,8 +3,8 @@
 """The sampled accept walk preserves the ordinary sampler's distribution.
 
 ``accept_sampled_drafts`` is what a ``logits`` verify runs: the penalties per
-candidate column against that column's own history, then temperature, min_p
-and top-k/top-p, then rejection sampling. These tests hold it to two
+candidate column against that column's own history, then temperature and
+top-k/top-p, then rejection sampling. These tests hold it to two
 references that do not share its code.
 
 vLLM's own ``Sampler``, for a row that carries no drafts. Such a row commits
@@ -28,7 +28,6 @@ from itertools import product
 import pytest
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.sampler import Sampler
@@ -45,14 +44,6 @@ from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 # region Helpers
 
 
-def _min_p_processor(min_p: torch.Tensor) -> MinPLogitsProcessor:
-    """vLLM's min_p processor holding ``min_p`` for a batch of that many rows."""
-    processor = object.__new__(MinPLogitsProcessor)
-    processor.min_p_count = int((min_p > 0).sum())
-    processor.min_p = min_p.to(torch.float32).unsqueeze(1)
-    return processor
-
-
 def _ordinary_sample(
     logits: torch.Tensor,
     *,
@@ -60,7 +51,6 @@ def _ordinary_sample(
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     generators: dict[int, torch.Generator],
-    min_p: torch.Tensor | None = None,
     prompt_token_ids: torch.Tensor | None = None,
     output_token_ids: list[list[int]] | None = None,
     presence: torch.Tensor | None = None,
@@ -89,9 +79,7 @@ def _ordinary_sample(
             output_token_ids=output_token_ids or [[] for _ in range(rows)],
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
-            logitsprocs=LogitsProcessors(
-                [] if min_p is None else [_min_p_processor(min_p)]
-            ),
+            logitsprocs=LogitsProcessors(),
         ),
     ).sampled_token_ids.view(-1)
 
@@ -149,10 +137,8 @@ VOCAB = 32
         {"temperature": 0.6, "top_k": 5},
         {"temperature": 1.3, "top_p": 0.8},
         {"temperature": 0.9, "top_k": 7, "top_p": 0.7},
-        {"temperature": 1.0, "min_p": 0.2},
-        {"temperature": 0.7, "top_k": 7, "min_p": 0.1},
     ],
-    ids=["temperature", "top-k", "top-p", "top-k-and-top-p", "min-p", "min-p-order"],
+    ids=["temperature", "top-k", "top-p", "top-k-and-top-p"],
 )
 def test_a_draftless_seeded_row_draws_the_ordinary_sampler_s_token(seed, controls):
     """Same token and same generator state as one ordinary sampled step.
@@ -168,7 +154,6 @@ def test_a_draftless_seeded_row_draws_the_ordinary_sampler_s_token(seed, control
     temperature = torch.full((rows,), controls["temperature"])
     top_k = torch.full((rows,), controls.get("top_k", VOCAB), dtype=torch.int32)
     top_p = torch.full((rows,), controls.get("top_p", 1.0))
-    min_p = torch.full((rows,), controls["min_p"]) if "min_p" in controls else None
 
     walked_generators = {
         row: torch.Generator().manual_seed(seed * 10 + row) for row in range(rows)
@@ -180,7 +165,6 @@ def test_a_draftless_seeded_row_draws_the_ordinary_sampler_s_token(seed, control
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        min_p=min_p,
         generators=walked_generators,
     )
 
@@ -192,7 +176,6 @@ def test_a_draftless_seeded_row_draws_the_ordinary_sampler_s_token(seed, control
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        min_p=min_p,
         generators=ordinary_generators,
     )
 
@@ -481,7 +464,7 @@ def _reference_distribution(
     """The ordinary sampler's distribution, computed in plain Python.
 
     Repetition first, over prompt and output, then frequency and presence over
-    the output; then temperature, min_p, top-k and top-p, in that order.
+    the output; then temperature, top-k and top-p, in that order.
     """
     logits = list(raw)
     repetition = controls.get("repetition", 1.0)
@@ -507,11 +490,6 @@ def _reference_distribution(
         total = sum(weights)
         return [w / total for w in weights]
 
-    probs = softmax(logits)
-    min_p = controls.get("min_p", 0.0)
-    if min_p:
-        threshold = max(probs) * min_p
-        logits = [v if p >= threshold else float("-inf") for v, p in zip(logits, probs)]
     top_k = controls.get("top_k")
     if top_k:
         kth = sorted(logits, reverse=True)[top_k - 1]
@@ -608,11 +586,6 @@ def _simulate(table, controls, drafter, length, rows, k, seed):
                     (rows,), controls.get("top_k", SMALL_VOCAB), dtype=torch.int32
                 ),
                 top_p=torch.full((rows,), controls.get("top_p", 1.0)),
-                min_p=(
-                    torch.full((rows,), controls["min_p"])
-                    if "min_p" in controls
-                    else None
-                ),
                 penalties=penalties,
             ),
         )
@@ -660,20 +633,10 @@ def _sampling_drafter(table):
         {"temperature": 1.0},
         {"temperature": 0.7, "top_k": 3},
         {"temperature": 1.2, "top_p": 0.8},
-        {"temperature": 1.0, "min_p": 0.15},
         {"temperature": 1.0, "presence": 0.6, "frequency": 0.4},
         {"temperature": 0.8, "repetition": 1.6},
-        {"temperature": 0.7, "top_k": 4, "min_p": 0.1},
     ],
-    ids=[
-        "temperature",
-        "top-k",
-        "top-p",
-        "min-p",
-        "presence-frequency",
-        "repetition",
-        "min-p-order",
-    ],
+    ids=["temperature", "top-k", "top-p", "presence-frequency", "repetition"],
 )
 @pytest.mark.parametrize("drafter_name", ["argmax", "wrong", "sampling"])
 def test_the_committed_sequences_follow_the_target_joint_distribution(

@@ -3,7 +3,7 @@
 """The logits walk applies grammars, token filters and logprobs as vLLM does.
 
 ``test_spec_sampled_accept.py`` holds ``accept_sampled_drafts`` to its
-references for temperature, top-k, top-p, min_p and the penalties. This file
+references for temperature, top-k, top-p and the penalties. This file
 does the same for the controls a ``logits`` verify applies beside those: the
 grammar bitmask, allowed_token_ids, bad_words and min_tokens, which rule tokens
 out, and logprobs, which report on what was committed.

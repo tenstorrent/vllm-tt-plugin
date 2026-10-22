@@ -50,14 +50,13 @@ serve speculative decoding within the following execution limits:
   speculating. Section 4d.
 - on a model serving only `argmax_ids`, a request carrying logprobs, structured
   output, `bad_words`, `allowed_token_ids` or a nonzero `min_tokens` is refused
-  per request: the greedy walk cannot apply those, so a verify would answer
-  the request without them. In both modes `logit_bias` is refused. vLLM's own
+  per request: the greedy walk cannot apply those, so a verify would answer the
+  request without them. In both modes `logit_bias` is refused. vLLM's own
   request validation refuses `logit_bias`, and a `min_p` above 1e-5, whenever
   speculation is configured, before the plugin sees the request. vLLM's
   `build_logitsprocs` builds no min_p processor for a speculating launch, so a
-  smaller `min_p` changes neither the ordinary sampler nor the accept walk, and
-  it refuses custom logits processors (`--logits-processors`) when
-  `TTModelRunner` is constructed.
+  smaller `min_p` has no effect, and it refuses custom logits processors
+  (`--logits-processors`) when `TTModelRunner` is constructed.
 - **ordinary decode steps inside a speculating launch**, for a model
   declaring `supports_narrow_decode`: a step with nothing to verify is sent as
   that model's own decode call and can overlap, so configuring speculation does
@@ -935,12 +934,7 @@ probability `min(1, p/q)` and on a rejection commit a token drawn from the
 positive part of `p - q`; a row that accepts every draft commits a bonus drawn
 from the target at its own `num_valid_drafts` column. A draft the filters gave
 probability 0 is always rejected, also on a uniform draw of exactly 0, because
-a draft the grammar forbids can reach the walk. vLLM refuses a `min_p`
-above 1e-5 on a speculating launch and builds no min_p processor there, so the
-ordinary sampler ignores a smaller one and the runner never passes it;
-`accept_speculated_tokens` applies it at every position when a caller does, as
-the ordinary sampler does, where upstream's rejection sampler skips it at the
-drafted positions.
+a draft the grammar forbids can reach the walk.
 
 **Proposals are point masses.** `draft_probs` is `None` on this path, so `q`
 is 1 at the drafted token and 0 elsewhere: the walk accepts draft `d` with

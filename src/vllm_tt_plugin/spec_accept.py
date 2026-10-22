@@ -38,24 +38,20 @@ only raise the acceptance probability from ``p(d)`` to ``min(1, p(d) / q(d))``.
 The target distribution is the one vLLM's ordinary sampler would use, built in
 the ordinary sampler's order: the grammar bitmask, which the runner applies to
 the logits before the sampler sees them; then allowed_token_ids, bad_words and
-min_tokens; then the penalties; then temperature, min_p and top-k/top-p.
-``accept_sampled_drafts`` applies everything up to the penalties per candidate
-column against that column's own state, and hands the rest to
-``accept_speculated_tokens``. Column ``j``'s state is the committed output plus
-the first ``j`` drafts: that is the history bad_words and the penalties read,
-the output length min_tokens compares, and the grammar state the scheduler
-filled column ``j``'s bitmask row from.
+min_tokens; then the penalties; then temperature and top-k/top-p. min_p is
+absent because vLLM refuses a min_p above 1e-5 on a speculating launch and
+builds no min_p processor for it. ``accept_sampled_drafts`` applies everything
+up to the penalties per candidate column against that column's own state, and
+hands the rest to ``accept_speculated_tokens``. Column ``j``'s state is the
+committed output plus the first ``j`` drafts: that is the history bad_words and
+the penalties read, the output length min_tokens compares, and the grammar
+state the scheduler filled column ``j``'s bitmask row from.
 
-Two places differ from upstream's rejection sampler, both towards the ordinary
-sampler. Upstream skips min_p at the drafted positions; this walk does not,
-because the ordinary sampler applies it at every position. vLLM 0.26 refuses a
-min_p above 1e-5 on a speculating launch and builds no min_p processor there,
-so the ordinary sampler ignores a smaller one and the runner never passes it;
-the parameter is there for when vLLM applies it. Upstream masks the stop
-tokens at the bonus position whenever the committed output is below
-min_tokens, even where the drafts before it reach min_tokens; this walk masks
-column ``j`` only while the output plus ``j`` drafts is below it, which is
-where the ordinary sampler would mask that token.
+One place differs from upstream's rejection sampler, towards the ordinary
+sampler. Upstream masks the stop tokens at the bonus position whenever the
+committed output is below min_tokens, even where the drafts before it reach
+min_tokens; this walk masks column ``j`` only while the output plus ``j``
+drafts is below it, which is where the ordinary sampler would mask that token.
 
 Logprobs are the raw logprobs, after the grammar bitmask and before any other
 control, of each committed token at its own column. That is what the plugin's
@@ -205,7 +201,6 @@ class SpecSamplingInputs:
     temperature: torch.Tensor
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
-    min_p: torch.Tensor | None = None
     generators: dict[int, torch.Generator] = field(default_factory=dict)
     penalties: SpecPenalties | None = None
     filters: SpecTokenFilters | None = None
@@ -258,7 +253,6 @@ def accept_sampled_drafts(
         temperature=sampling.temperature,
         top_k=sampling.top_k,
         top_p=sampling.top_p,
-        min_p=sampling.min_p,
         generators=sampling.generators,
     )
     if sampling.num_logprobs is None:
@@ -406,7 +400,6 @@ def accept_speculated_tokens(
     top_p: torch.Tensor | None = None,
     draft_probs: torch.Tensor | None = None,
     generators: dict[int, torch.Generator] | None = None,
-    min_p: torch.Tensor | None = None,
 ) -> AcceptResult:
     """Walk acceptance over one ``[B, 1+K]`` candidate block.
 
@@ -429,8 +422,6 @@ def accept_speculated_tokens(
             read ``target_logits`` as given; only random rows are rescaled.
         top_k: ``[B]`` or None. Applied to random rows before the softmax.
         top_p: ``[B]`` or None. Applied to random rows before the softmax.
-        min_p: ``[B]`` or None. Applied to random rows after temperature and
-            before top-k/top-p, the ordinary sampler's order. 0 disables it.
         draft_probs: ``[B, K, V]`` or None. The drafter's own distribution per
             drafted position. None treats each draft as a point mass at its
             id, which is lossless for any drafter whose choice does not read
@@ -443,7 +434,7 @@ def accept_speculated_tokens(
         An :class:`AcceptResult`.
     """
     rows, width, vocab = _check_inputs(
-        target_logits, draft_token_ids, num_valid_drafts, temperature, min_p
+        target_logits, draft_token_ids, num_valid_drafts, temperature
     )
     num_drafts = width - 1
     generators = generators or {}
@@ -471,7 +462,6 @@ def accept_speculated_tokens(
             temperature,
             top_k,
             top_p,
-            min_p,
             draft_probs,
             generators,
             rows,
@@ -513,7 +503,6 @@ def _random_walk(
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
-    min_p: torch.Tensor | None,
     draft_probs: torch.Tensor | None,
     generators: dict[int, torch.Generator],
     rows: int,
@@ -521,7 +510,7 @@ def _random_walk(
     vocab: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
-    probs = _constrained_probs(target_logits, temperature, top_k, top_p, min_p)
+    probs = _constrained_probs(target_logits, temperature, top_k, top_p)
     # Replaced inside the vocabulary before any gather, because a draft column
     # past its row's count holds padding, the runner pads with
     # PLACEHOLDER_TOKEN_ID, and torch.gather refuses a negative index rather
@@ -597,9 +586,8 @@ def _constrained_probs(
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
-    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Target probabilities after temperature, min_p, top-k and top-p.
+    """Target probabilities after temperature, top-k and top-p.
 
     The distribution the accept walk must preserve is the one the operator
     asked for, so the constraints belong before the accept test rather than
@@ -615,15 +603,6 @@ def _constrained_probs(
         temperature <= 0.0, torch.ones_like(temperature), temperature
     )
     logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
-
-    if min_p is not None and bool((min_p > 0).any()):
-        # vLLM's MinPLogitsProcessor arithmetic, on the tempered logits. A row
-        # at 0 has a threshold of 0, which nothing falls below.
-        probs = logits.softmax(dim=-1)
-        threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(torch.float32).view(
-            rows, 1, 1
-        )
-        logits = logits.masked_fill(probs < threshold, float("-inf"))
 
     if top_k is not None or top_p is not None:
         # Deferred: vllm.v1.sample.ops resolves current_platform at import
@@ -791,7 +770,6 @@ def _check_inputs(
     draft_token_ids: torch.Tensor,
     num_valid_drafts: torch.Tensor,
     temperature: torch.Tensor,
-    min_p: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if target_logits.dim() != 3:
         raise ValueError(
@@ -814,9 +792,8 @@ def _check_inputs(
     for name, tensor in (
         ("num_valid_drafts", num_valid_drafts),
         ("temperature", temperature),
-        ("min_p", min_p),
     ):
-        if tensor is not None and tensor.shape != (rows,):
+        if tensor.shape != (rows,):
             raise ValueError(
                 f"accept_speculated_tokens {name} must be [{rows}], got "
                 f"{tuple(tensor.shape)}"

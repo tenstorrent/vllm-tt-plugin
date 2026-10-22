@@ -614,7 +614,6 @@ def test_the_walk_samples_under_the_step_s_own_controls():
     assert captured.penalties.presence.tolist() == pytest.approx([0.4, 0.0])
     assert captured.penalties.output_token_ids[row] == history
     assert captured.penalties.prompt_token_ids.shape[0] == 2
-    assert captured.min_p is None
 
 
 def test_reading_the_controls_does_not_write_into_the_step():
@@ -749,9 +748,9 @@ def test_a_speculating_launch_admits_a_small_min_p_and_applies_it_nowhere():
     """A min_p up to 1e-5 reaches neither sampler on a speculating launch.
 
     vLLM admits it with speculation and builds no min_p processor for the
-    launch, so the ordinary sampler ignores it, and the walk is given none. A
-    vLLM that builds one fails here: carry min_p into ``SpecSamplingInputs``
-    then, or the two paths sample different distributions.
+    launch, so the ordinary sampler ignores it, and the walk has no min_p. A
+    vLLM that builds one fails here: the walk needs min_p then, or the two
+    paths sample different distributions.
     """
     speculative = object()
     SamplingParams(min_p=1e-5)._validate_spec_decode(speculative)

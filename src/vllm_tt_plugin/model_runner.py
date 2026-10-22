@@ -261,10 +261,6 @@ def _spec_sampling_inputs(
     out: they own no request, and sampling them would cost a vocabulary's work
     per row for tokens nothing reads.
 
-    min_p is not carried: vLLM refuses a min_p above 1e-5 on a speculating
-    launch and builds no min_p processor there, so the ordinary sampler ignores
-    a smaller one too.
-
     The grammar bitmask is the one exception to build-time capture: the
     scheduler computes it while the verify runs, and ``sample_tokens``
     attaches it to this step's input before any walk can read it.
