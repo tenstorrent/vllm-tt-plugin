@@ -689,6 +689,22 @@ def test_second_engine_config_is_rejected_when_a_block_model_is_involved(
         TTPlatform.check_and_update_config(other)
 
 
+def test_a_config_without_a_model_leaves_the_live_engine_alone(monkeypatch):
+    """vLLM builds model-less configs (a default one, test fixtures); they start no
+    engine, so they must neither fail the hook nor take a live engine's handle."""
+    from vllm.config import DeviceConfig, VllmConfig
+
+    _patch_model_resolution(monkeypatch)
+    config = _config()
+    TTPlatform.check_and_update_config(config)
+
+    VllmConfig(device_config=DeviceConfig(device="cpu"))
+
+    assert TTPlatform._tt_vllm_config is config
+    with pytest.raises(ValueError, match=r"requires 512 physical"):
+        _validate(SamplingParams(max_tokens=257), prompt_len=513)
+
+
 def test_failed_same_config_reentry_restores_live_block_contract(monkeypatch):
     """A failed in-process re-run must not leave the admission handle at None.
 

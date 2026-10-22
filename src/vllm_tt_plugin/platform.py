@@ -1731,6 +1731,11 @@ class TTPlatform(Platform):
         # a direct VllmConfig construction, then finds the gate patched.
         _install_tt_async_spec_method_patch()
         _warn_unpatched_async_spec_gate(vllm_config)
+        # A config without a model starts no engine (vLLM builds one as a default
+        # and in tests), so there is nothing to resolve, and it must not take the
+        # process's admission state from an engine that has a model.
+        if vllm_config.model_config is None:
+            return
         # The class carries process-level admission state, so a live
         # block-output engine cannot share the process with a second engine:
         # the reset below (and every class write after it) would corrupt the
