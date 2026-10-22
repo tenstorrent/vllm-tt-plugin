@@ -13,6 +13,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
@@ -308,6 +309,11 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # Set by TTLaneCoordinator on its lanes. A lane runs with log_stats off
+        # (the coordinator owns the stats), so the base scheduler would drop its
+        # drafts; the lane observes them here and the coordinator drains them.
+        self.collect_spec_decoding_stats = False
+        self.pending_spec_decoding_stats: SpecDecodingStats | None = None
         # Request id that owns the adaptive model's SINGLE speculative
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
@@ -1111,6 +1117,37 @@ class TTScheduler(AsyncScheduler):
                     pending.pop(req_id, None)
                 else:
                     pending[req_id] = count - 1
+
+    def make_spec_decoding_stats(
+        self,
+        spec_decoding_stats: SpecDecodingStats | None,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        num_invalid_spec_tokens: dict[str, int] | None,
+        request_id: str,
+    ) -> SpecDecodingStats | None:
+        """On a lane, observe the draft as the base does, into
+        ``pending_spec_decoding_stats`` for the coordinator."""
+        if not self.collect_spec_decoding_stats:
+            return super().make_spec_decoding_stats(
+                spec_decoding_stats,
+                num_draft_tokens,
+                num_accepted_tokens,
+                num_invalid_spec_tokens,
+                request_id,
+            )
+        if num_draft_tokens:
+            if self.pending_spec_decoding_stats is None:
+                self.pending_spec_decoding_stats = SpecDecodingStats.new(
+                    self.num_spec_tokens
+                )
+            if num_invalid_spec_tokens:
+                num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+            self.pending_spec_decoding_stats.observe_draft(
+                num_draft_tokens=num_draft_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+            )
+        return None
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False

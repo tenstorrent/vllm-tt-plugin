@@ -43,6 +43,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
@@ -329,6 +330,10 @@ class TTLaneCoordinator(SchedulerInterface):
             )
             for _ in range(self.num_lanes)
         ]
+        # vLLM computes spec-decode stats inside each lane's update_from_output,
+        # which drops them with stats off; the lanes keep them for make_stats.
+        for sched in self.lanes:
+            sched.collect_spec_decoding_stats = log_stats
 
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
         """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
@@ -849,7 +854,29 @@ class TTLaneCoordinator(SchedulerInterface):
             num_waiting_reqs=num_waiting,
             kv_cache_usage=kv_cache_usage,
             prefix_cache_stats=self._merged_prefix_cache_stats(),
+            spec_decoding_stats=self._merged_spec_decoding_stats(),
         )
+
+    def _merged_spec_decoding_stats(self) -> SpecDecodingStats | None:
+        """Every lane's drafts since the last call, summed; None without any."""
+        merged: SpecDecodingStats | None = None
+        for sched in self.lanes:
+            stats, sched.pending_spec_decoding_stats = (
+                sched.pending_spec_decoding_stats,
+                None,
+            )
+            if stats is None:
+                continue
+            if merged is None:
+                merged = SpecDecodingStats.new(stats.num_spec_tokens)
+            merged.num_drafts += stats.num_drafts
+            merged.num_draft_tokens += stats.num_draft_tokens
+            merged.num_accepted_tokens += stats.num_accepted_tokens
+            for pos, count in enumerate(stats.num_accepted_tokens_per_pos):
+                merged.num_accepted_tokens_per_pos[pos] += count
+            for pos, count in enumerate(stats.num_draft_tokens_per_pos):
+                merged.num_draft_tokens_per_pos[pos] += count
+        return merged
 
     def _merged_prefix_cache_stats(self) -> PrefixCacheStats:
         """Every lane's prefix-cache stats since the last call, summed.

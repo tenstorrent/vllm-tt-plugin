@@ -25,6 +25,7 @@ from vllm_tt_plugin.lane_scheduler import (
 )
 from vllm_tt_plugin.scheduler import (
     TTDecodeInterleavePolicy,
+    TTScheduler,
     TTSchedulingMode,
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
@@ -63,6 +64,7 @@ class FakeLane:
         self._eco: dict[int, EngineCoreOutputs] = {}
         self._owned = {r.request_id: r for r in owns}
         self.finish_calls: list[tuple] = []
+        self.pending_spec_decoding_stats = None
 
     def set_forced_mode(self, mode):
         self._mode = mode
@@ -740,6 +742,73 @@ def test_make_stats_sums_every_lanes_prefix_cache_stats():
     assert (
         coordinator.make_stats().prefix_cache_stats.queries == 0
     )  # read once per update
+
+
+def test_a_lane_keeps_its_drafts_for_the_coordinator():
+    # A lane runs with log_stats off, so the base scheduler would drop every
+    # draft and lane-DP serving would report no speculation at all.
+    from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+    lane = TTScheduler.__new__(TTScheduler)
+    lane.log_stats = False
+    lane.num_spec_tokens = 3
+    lane.collect_spec_decoding_stats = True
+    lane.pending_spec_decoding_stats = None
+
+    assert lane.make_spec_decoding_stats(None, 3, 2, None, "a") is None
+    assert lane.make_spec_decoding_stats(None, 3, 0, {"b": 1}, "b") is None
+    assert lane.make_spec_decoding_stats(None, 0, 0, None, "c") is None
+
+    stats = lane.pending_spec_decoding_stats
+    assert isinstance(stats, SpecDecodingStats)
+    assert (stats.num_drafts, stats.num_draft_tokens, stats.num_accepted_tokens) == (
+        2,
+        5,
+        2,
+    )
+    assert stats.num_accepted_tokens_per_pos == [1, 1, 0]
+
+    # Not on a lane: the base behaviour, which drops drafts with stats off.
+    lane.collect_spec_decoding_stats = False
+    lane.pending_spec_decoding_stats = None
+    assert lane.make_spec_decoding_stats(None, 3, 2, None, "a") is None
+    assert lane.pending_spec_decoding_stats is None
+
+
+def test_make_stats_sums_every_lanes_spec_decoding_stats():
+    from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+    def drafted(*steps):
+        stats = SpecDecodingStats.new(3)
+        for draft_tokens, accepted in steps:
+            stats.observe_draft(draft_tokens, accepted)
+        return stats
+
+    class _KV:
+        usage = 0.0
+
+        def make_prefix_cache_stats(self):
+            return None
+
+    lanes = [FakeLane() for _ in range(3)]
+    for lane in lanes:
+        lane.kv_cache_manager = _KV()
+        lane.get_request_counts = lambda: (0, 0)
+    lanes[0].pending_spec_decoding_stats = drafted((3, 3), (3, 1))
+    lanes[2].pending_spec_decoding_stats = drafted((3, 2))
+    coordinator = _make_coordinator(lanes, log_stats=True)
+
+    stats = coordinator.make_stats().spec_decoding_stats
+
+    assert (stats.num_drafts, stats.num_draft_tokens, stats.num_accepted_tokens) == (
+        3,
+        9,
+        6,
+    )
+    assert stats.num_accepted_tokens_per_pos == [3, 2, 1]
+    assert stats.num_draft_tokens_per_pos == [3, 3, 3]
+    assert all(lane.pending_spec_decoding_stats is None for lane in lanes)
+    assert coordinator.make_stats().spec_decoding_stats is None  # drained
 
 
 def _waiting_since(lane, *arrivals):
