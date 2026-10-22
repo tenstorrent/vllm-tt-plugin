@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """A sampled request beside a speculating greedy one is never answered greedily.
 
-The runner verifies in ``argmax_ids`` mode, and a verify commits the target's
-argmax on every row of the step. So a sampled or penalized request must never be
-part of a verify. Two launches enforce that two ways:
+On a launch whose model does not serve ``logits``, the runner verifies in
+``argmax_ids`` mode, and a verify commits the target's argmax on every row of
+the step. So a sampled or penalized request must never be part of a verify.
+Two launches enforce that two ways:
 
 - With narrow decode (``TT_SPEC_DRAFT_POLICY=solo``), every step a sampled
   request is part of runs as the ordinary decode, and the drafts the greedy
@@ -23,7 +24,8 @@ accept nothing is the ordinary decode that dropped the drafts.
 
 The ``mixed`` and ``async-mixed`` configurations of ``run_spec_regression.sh``
 launch the first; the ``accept-all``, ``accept-2`` and ``accept-0``
-configurations exercise the second.
+configurations exercise the second. A launch serving ``logits`` speculates
+sampled requests instead, which ``test_sampled_speculation.py`` covers.
 """
 
 from __future__ import annotations
@@ -67,8 +69,17 @@ def _is_the_argmax(prompt: list[int], tokens: list[int], index: int) -> bool:
     return tokens[index] == fixed_target_choice(previous, len(prompt) - 1 + index)
 
 
+def _skip_a_launch_serving_logits(spec_config) -> None:
+    if "logits" in spec_config.accept_modes:
+        pytest.skip(
+            "a launch serving logits speculates sampled requests; "
+            "test_sampled_speculation.py covers it"
+        )
+
+
 @pytest.fixture
 def narrow_fixed_launch(request, spec_config):
+    _skip_a_launch_serving_logits(spec_config)
     if spec_config.draft_policy != "solo" or spec_config.target != "fixed":
         pytest.skip(
             "needs a launch with narrow decode and a known distribution: "
@@ -225,6 +236,7 @@ def test_a_sampled_request_is_refused_where_every_step_verifies(
     that asked to sample would come back as greedy text with a 200, so the
     plugin refuses it with the reason.
     """
+    _skip_a_launch_serving_logits(spec_config)
     if spec_config.draft_policy != "always":
         pytest.skip("needs a launch without narrow decode: TT_SPEC_DRAFT_POLICY=always")
 

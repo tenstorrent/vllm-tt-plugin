@@ -26,6 +26,9 @@ declare the required [model capabilities](../../../docs/MODEL_CAPABILITIES.md).
 | `test_async_transitions.py` | asynchronous scheduling remains enabled, ordinary decode overlaps, verify transitions serialize, and output follows the fixed target rule |
 | `test_async_correctness.py` | fixed-target async output equality, zero/partial acceptance, cancellation/reuse, preemption, reset, concurrent prefill, and K/length boundaries under the matching launch |
 | `test_mixed_sampling.py` | with narrow decode, a sampled request that joins a speculating greedy one is sampled from the fixed target's distribution, the join step drops the greedy request's drafts, and the greedy output stays the rule's sequence; without narrow decode, a sampled or penalized request is refused |
+| `test_sampled_speculation.py` | on a launch declaring `logits`: sampled requests speculate, accept and reject, and commit the target distribution under temperature, top-k, top-p and penalties; a greedy penalized request emits its exact reference; a seeded request repeats alone and in company; greedy and sampled rows keep their own semantics in one verify; verifies ask for `logits` only when a row needs it |
+| `test_sampled_controls.py` | on a launch declaring `logits`: `allowed_token_ids`, a two-token `bad_words` entry and `min_tokens` hold at every committed token and the pooled counts match the filtered target; logprobs report the target's raw distribution for every committed token; two regular grammars in one batch each hold over their own requests; a grammar the model drafter follows accepts drafts, which under asynchronous scheduling only the deferred grammar handoff allows; one request per control in one batch keeps its own |
+| `test_request_admission.py` | logprobs, structured output, `allowed_token_ids`, `bad_words` and `min_tokens` are admitted on a launch declaring `logits` and refused with HTTP 400 on one serving only `argmax_ids`; `logit_bias` is refused on both |
 
 The suite checks token IDs, counter deltas, or direct scheduler and runner log
 evidence for each tested behavior. The capacity tests skip rather than pass
@@ -43,6 +46,7 @@ A speculative server's behaviour depends on how it was launched in ways no endpo
 | `--tt-spec-target` | the launched `TT_SPEC_TARGET`: `depth` or `fixed` |
 | `--tt-spec-drafter` | `model` for the model's own drafter, `ngram` for the host one |
 | `--tt-spec-draft-policy` | the launched `TT_SPEC_DRAFT_POLICY`: `always` or `solo` |
+| `--tt-spec-accept-modes` | the launched `TT_SPEC_ACCEPT_MODES`, comma-separated: `argmax_ids`, `logits`, or both |
 | `--tt-spec-async-scheduling` | whether the launch kept asynchronous scheduling: `true` or `false` |
 | `--tt-reference-url` | a second, unspeculated server, for the losslessness comparison |
 | `--tt-spec-artifacts` | where the run manifest is written |
@@ -88,11 +92,16 @@ and `supports_async_spec_decode`; `supports_async_decode` alone does not cover
 deferred verification. Use `--no-async-scheduling` for the synchronous
 configurations below. The `async` configuration omits that option, requests
 `sample_on_device_mode=decode_only`, and verifies the resolved mode in the
-server log. The acceptance tests send greedy requests to exercise the current
+server log. The acceptance tests send greedy requests to exercise the
 `argmax_ids` acceptance path. `test_mixed_sampling.py` checks sampled requests
-beside greedy requests: ordinary decode preserves sampling when narrow decode
-is available, and admission refuses sampled requests when every step verifies.
-The suite does not establish sampled acceptance within `argmax_ids` verification.
+beside greedy requests on a launch whose model does not serve `logits`:
+ordinary decode preserves sampling when narrow decode is available, and
+admission refuses sampled requests when every step verifies. That file does not
+establish sampled acceptance within `argmax_ids` verification.
+`test_sampled_speculation.py` and `test_sampled_controls.py` send sampled
+requests and requests with logprobs, grammars and token filters that
+speculate, and need the launch of recipe 8. `test_request_admission.py` checks
+what each kind of launch admits.
 
 **1. Acceptance accounting, full acceptance.**
 
@@ -208,7 +217,29 @@ TT_SPEC_DRAFT_POLICY=solo TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_DEPTH=-1 \
 
 The asynchronous variant is the launch of recipe 6 with this selection and `--tt-spec-async-scheduling=true`. On an `always` launch, the same file checks that a sampled request is refused instead.
 
-**8. The host n-gram drafter.** Replace the speculative config with
+**8. Sampled speculation.** The dummy declares the `logits` accept mode through `TT_SPEC_ACCEPT_MODES`, and under the fixed target its distribution after a token at a position is the rule's choice at 0.4 and the shared tokens 17, 4099 and 65537 at 0.3, 0.2 and 0.1, for a prefill, an ordinary decode and every verify column alike. The dummy declares `max_device_top_k: 0` and `supports_device_penalties: False`, so a step carrying a sampled or penalized row samples on the host even on a launch with `sample_on_device_mode`, and a greedy-only step can still sample on the device. Its device answer is the argmax, so it raises if a sampled row ever reaches device sampling.
+
+```bash
+mkdir -p /tmp/spec-run/sampled
+TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_MODES=argmax_ids,logits TT_SPEC_ACCEPT_DEPTH=-1 \
+python $PLUGIN/examples/server_example_tt.py $COMMON --no-async-scheduling \
+    --max_num_seqs 8 --max_model_len 2048 --port 8100 \
+    --speculative-config "$SPEC" >/tmp/spec-run/sampled/server.log 2>&1
+
+pytest tests/tt/spec/test_sampled_speculation.py tests/tt/spec/test_sampled_controls.py \
+    --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
+    --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
+    --tt-spec-target=fixed --tt-spec-accept-modes=argmax_ids,logits \
+    --tt-spec-async-scheduling=false \
+    --tt-spec-server-log=/tmp/spec-run/sampled/server.log \
+    --tt-spec-artifacts=/tmp/spec-run/sampled
+```
+
+The distribution tests are statistical, each against a chi-square tail of 1e-4. On a synchronous launch the seeded ones draw the same tokens on every run of a correct server, so a seeded failure repeats on a rerun and needs investigating; only the unseeded check draws afresh. Under asynchronous scheduling a prefill-only step drops the model proposal of every request it hides, so arrival timing changes the draft counts and the seeded checks draw afresh too. The deterministic checks beside them are exact: every committed token must be in its context's support, and a greedy penalized request must equal its reference.
+
+`test_sampled_controls.py` relies on how the Llama 3.1 tokenizer the recipes serve with spells the shared tokens: 17 is `"2"`, 4099 is `"pression"` and 65537 is `" Guang"`, and vLLM tokenizes the bad word `"2pression"` to `[[17, 4099]]`. Its grammars, `(2|pression)+` and `( Guang|2)+`, therefore leave the target two shared tokens to sample at every position. The model drafter proposes the rule's choice, which neither grammar admits, so structured requests accept drafts only under the n-gram drafter.
+
+**9. The host n-gram drafter.** Replace the speculative config with
 `{"method":"ngram","num_speculative_tokens":5,"prompt_lookup_min":2,"prompt_lookup_max":4}`
 and pass `--tt-spec-drafter=ngram`. The n-gram drafter only drafts where the request's own text repeats, and this model's output is an ascending run that repeats no n-gram, so the prompt has to be that same run; the suite's prompts already are.
 
@@ -221,7 +252,7 @@ tests/tt/spec/run_spec_regression.sh /tmp/spec-run                  # every conf
 tests/tt/spec/run_spec_regression.sh /tmp/spec-run capacity         # or one of them
 ```
 
-The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, `async-k3`, `mixed`, and `async-mixed`. The six `async-*` correctness configurations (all but `async-mixed`) run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `mixed` and `async-mixed` run `test_mixed_sampling.py`, and the three `accept-*` configurations run its refusal test. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
+The default configurations are `accept-all`, `accept-2`, `accept-0`, `adaptive`, `async`, `capacity`, `lossless`, `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, `async-k3`, `mixed`, `async-mixed`, `sampled`, `sampled-async`, `sampled-async-device`, `sampled-solo-async`, `sampled-accept-2`, `sampled-capacity`, `sampled-logits-only`, `sampled-ngram`, and `async-logits-only`. The `async-accept-0`, `async-accept-2`, `async-capacity`, `async-reset`, `async-k1`, and `async-k3` configurations run `test_async_correctness.py` with the corresponding acceptance, capacity, reset, or draft-width setting. `mixed` and `async-mixed` run `test_mixed_sampling.py`, and the three `accept-*` configurations run its refusal test; none of them declares `logits`. The `sampled-*` configurations run `test_sampled_speculation.py`, `test_sampled_controls.py` and `test_request_admission.py` with both accept modes declared: synchronously, asynchronously on host sampling, asynchronously with decode-only device sampling (greedy steps sample on the device, sampled steps on the host), under the `solo` policy, with deliberately wrong drafts past depth 2, under a KV budget small enough to preempt, with `logits` alone, and with the n-gram drafter. `async-logits-only` runs `test_async_correctness.py` and the sampled selection asynchronously with `logits` as the only mode. `accept-all`, `accept-2` and `accept-0` also run `test_request_admission.py`, on a launch serving only `argmax_ids`. `async-reset` enables the development reset endpoint; the other configurations do not. The `lossless` configuration needs two chips and is the only configuration that launches two servers.
 
 ## The manifest
 

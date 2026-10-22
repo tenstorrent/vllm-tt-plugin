@@ -180,6 +180,27 @@ def acceptance_delta(before: Metrics, after: Metrics, positions: int) -> Accepta
     )
 
 
+def assert_rejections_happened(delta: Acceptance, asynchronous: bool) -> None:
+    """Some draft was rejected, read in the way the scheduling mode allows.
+
+    With one draft position the per-position counter cannot show a step that
+    stopped early, so only a synchronous launch's draft-token total shows the
+    rejection, and an asynchronous launch claims none.
+    """
+    assert delta.accepted > 0, "no draft was accepted"
+    if not asynchronous:
+        assert delta.accepted < delta.draft_tokens, (
+            "every draft was accepted, so no sampled rejection was exercised"
+        )
+    if len(delta.per_position) < 2:
+        return
+    first, last = delta.per_position[0], delta.per_position[-1]
+    assert last < first, (
+        "the last draft position was accepted as often as the first, so no "
+        f"step stopped at a rejection: per-position acceptance {delta.per_position}"
+    )
+
+
 def widest_decode_batch_size(server_log: Path) -> int:
     """Return the largest decode row count reported by ``TTScheduler``."""
     widest = 0
@@ -386,3 +407,19 @@ class SpecServer:
 
     def metrics(self) -> Metrics:
         return Metrics.scrape(self.base_url)
+
+    def detokenize(self, token_ids: list[int]) -> str:
+        """The server tokenizer's text for ``token_ids``, decoded in one piece.
+
+        A completion's own ``text`` comes from vLLM's incremental detokenizer,
+        which for some of this suite's prompts, ascending id runs that end
+        inside a multi-byte character, prepends the prompt's text to the
+        output's. A check on what the tokens spell reads this instead.
+        """
+        response = httpx.post(
+            f"{self.base_url}/detokenize",
+            json={"model": self.model, "tokens": list(token_ids)},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()["prompt"]
