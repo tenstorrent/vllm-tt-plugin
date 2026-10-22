@@ -48,6 +48,8 @@ from vllm_tt_plugin.config import (
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
+    get_tt_supports_stage_inputs,
+    get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
@@ -55,8 +57,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
-    CachedRequestState,
     InputBatch,
+    TTCachedRequestState,
     TTLaneInputBatch,
     apply_cached_req_state_update,
     build_cached_request_state,
@@ -80,6 +82,7 @@ from vllm_tt_plugin.spec_decode import (
     DraftOutput,
     accept_greedy_drafts,
 )
+from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -266,8 +269,8 @@ class TTModelRunner:
         self.device_config = vllm_config.device_config
         self._output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
         self._is_block_output_model = is_tt_block_output_model(vllm_config)
+        self._shutdown_complete = False
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
-        self._persistent_capture_released = False
         self._device_grammar_poisoned = False
 
         # Resolved and validated by the platform's config-time admission;
@@ -310,6 +313,8 @@ class TTModelRunner:
         self.mesh_device = mesh_device
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
+        self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
+        self.supports_stage_outputs = get_tt_supports_stage_outputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
             trace_mode=self.trace_mode,
@@ -369,7 +374,7 @@ class TTModelRunner:
         # they don't need to be re-sent every scheduling step. For requests
         # that have been scheduled before, only the diff is received from
         # the scheduler output.
-        self.requests: dict[str, CachedRequestState] = {}
+        self.requests: dict[str, TTCachedRequestState] = {}
 
         # Cache the arange needed for unpacking structured output bitmask
         self.structured_output_arange = torch.arange(0, 32)
@@ -446,16 +451,32 @@ class TTModelRunner:
         )
 
     def shutdown(self) -> None:
-        """Deterministically release optional model-lifetime captures.
+        """Release the model and its KV caches while the mesh is still open.
 
-        Called from ``TTWorker.shutdown`` while the mesh is still open. This
-        is intentionally not wired to ``__del__``: the runner sits in
-        reference cycles, so a destructor can fire during interpreter
-        teardown after the devices closed, where a device-side release is
-        worse than leaking the capture to process exit.
+        Called from ``TTWorker.shutdown``, which explains why this is explicit
+        rather than left to reference counting. Idempotent.
+
+        Pending async decode reads are finalized first, best effort, so that no
+        device read still targets the model or its KV caches when they are
+        released; a failed read is logged and the release continues. The
+        submissions themselves are not released: after a failed read, its read
+        destination and ttnn read events may still be a device read target, so
+        they leak to process exit.
         """
-        if getattr(self, "_persistent_capture_released", False):
+        if getattr(self, "_shutdown_complete", False):
             return
+        async_decode = getattr(self, "async_decode", None)
+        if async_decode is not None:
+            try:
+                async_decode.wait_for_all_pending_async_steps()
+            except Exception:
+                logger.exception("Async decode drain failed during shutdown")
+
+        # ``_pending_samples`` and ``_pending_async_steps`` are not cleared:
+        # a step that ran but was not sampled is held only by this runner,
+        # and clearing would free a buffer ttnn may still be writing into.
+
+        # While the model is still alive, and before the mesh closes.
         release = getattr(
             getattr(self, "model", None), "release_persistent_capture", None
         )
@@ -464,7 +485,20 @@ class TTModelRunner:
                 release()
             except Exception:
                 logger.exception("Failed to release persistent model capture")
-        self._persistent_capture_released = True
+
+        self.model = None
+        self.kv_caches = []
+
+        if async_decode is not None:
+            # An engine-held async output keeps ``_controller``, so cut the
+            # controller's edge back to this runner: otherwise it walks into
+            # a runner whose model is gone and fails as a missing
+            # ``process_decode_output_host``.
+            async_decode.runner = None
+            self.async_decode = None
+
+        # Last, so an interrupted drain or release leaves shutdown retryable.
+        self._shutdown_complete = True
 
     @property
     def lane_batch(self) -> TTLaneInputBatch:
@@ -927,6 +961,14 @@ class TTModelRunner:
         # Explicit preemption invalidates model-owned request state. Temporary
         # unscheduling does not: a request may simply be hidden for this step.
         for req_id in scheduler_output.preempted_req_ids or ():
+            if self.supports_stage_outputs:
+                # A resume re-prefills from the token history alone, which
+                # does not hold the frames this request already emitted.
+                raise RuntimeError(
+                    f"Request {req_id} was preempted, but a model with "
+                    "supports_stage_outputs cannot resume a request; preempted "
+                    f"this step: {sorted(scheduler_output.preempted_req_ids)}"
+                )
             self._release_model_request(req_id)
 
         # Only after the model released by slot: the release calls above read
@@ -955,7 +997,9 @@ class TTModelRunner:
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            self.requests[req_id] = build_cached_request_state(new_req_data)
+            self.requests[req_id] = build_cached_request_state(
+                new_req_data, supports_stage_inputs=self.supports_stage_inputs
+            )
             req_ids_to_add.append(req_id)
 
         # Update the states of the running/resumed requests.
@@ -2143,6 +2187,12 @@ class TTModelRunner:
             )
         else:
             multi_modal_kwargs = {}
+        # Sent with every prefill chunk, a resumed request's included.
+        stage_inputs = None
+        if self.supports_stage_inputs and is_prompt:
+            stage_inputs = [
+                self.requests[req_id].stage_inputs for req_id in row_req_ids
+            ]
 
         # If we're not using structured outputs, grammar_bitmask is None.
         bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
@@ -2209,9 +2259,13 @@ class TTModelRunner:
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only).
+        # (decode only). Bad words need output_tokens too: vLLM's bad-words op
+        # bans a word's last token only when this history ends with the rest of
+        # the word.
         prompt_tokens = None
         output_tokens = None
+        if input_batch.sampling.bad_words_token_ids and not is_prompt:
+            output_tokens = input_batch.make_output_token_ids_tensor(req_indices)
         if (not input_batch.no_penalties) and not is_prompt:
             # Restrict to this build's requests. For lane builds ``req_indices``
             # selects one lane's rows out of the merged batch; passing them
@@ -2310,6 +2364,7 @@ class TTModelRunner:
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
+            stage_inputs=stage_inputs,
             tt_sampling_params=tt_sampling_params,
             multi_modal_kwargs=multi_modal_kwargs,
             perform_device_sampling=perform_device_sampling,
@@ -3114,12 +3169,19 @@ class TTModelRunner:
                     else list(self.input_batch.req_ids[: self.input_batch.num_reqs])
                 ),
             )
+        # Stage-output models run only here: they cannot declare async decode, so
+        # their scheduling is never async.
         output = self.apply_and_build_runner_output(
             sampled_token_ids,
             logprobs,
             # Only a prefill build can filter rows. Decode rows are the front-packed
             # batch rows, so it keeps the vectorized state write.
             req_ids=row_req_ids if is_prefill else None,
+            stage_outputs=(
+                fwd.decode_submission.stage_outputs
+                if fwd.decode_submission is not None
+                else None
+            ),
         )
         if not is_prefill and self._num_speculative_tokens:
             self.propose_after_plain_step(
@@ -3338,6 +3400,8 @@ class TTModelRunner:
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         kwargs.update(model_input.multi_modal_kwargs)
+        if model_input.stage_inputs is not None:
+            kwargs["stage_inputs"] = model_input.stage_inputs
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
@@ -3812,6 +3876,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        stage_outputs: dict[str, TTStageFrame] | None = None,
     ) -> ModelRunnerOutput:
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         output_req_ids = (
@@ -3839,7 +3904,7 @@ class TTModelRunner:
             [int(token_id) for token_id in row] for row in sampled_token_ids_np.tolist()
         ]
 
-        return ModelRunnerOutput(
+        output = ModelRunnerOutput(
             req_ids=output_req_ids,
             req_id_to_index=output_req_id_to_index,
             sampled_token_ids=sampled_token_id_lists,
@@ -3847,6 +3912,8 @@ class TTModelRunner:
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )
+        set_tt_stage_outputs(output, stage_outputs)
+        return output
 
     def _apply_sampled_tokens_to_state(
         self,
@@ -3854,12 +3921,15 @@ class TTModelRunner:
         req_ids: list[str] | None = None,
         skip_req_ids: set[str] | None = None,
     ) -> None:
-        # When applying a deferred async step, the write row is resolved live
-        # from ``req_id_to_index`` (below), not from the row captured at submit
-        # time: lane mode pins each request to a stable slot for its lifetime,
-        # while the scheduler lifecycle skip set rejects stale results before a
-        # live row is resolved. ``req_id_to_index`` is therefore the source of
-        # truth for the target row.
+        # A deferred async step resolves its write row live from
+        # ``req_id_to_index`` (below), not from the row it was submitted at. A
+        # resume between submit and apply can move the request to another row;
+        # lane mode, for example, re-places a resumed request wherever the
+        # coordinator's free list sends it. The live row is still the right
+        # target, because ``InputBatch.add_request`` re-derives ``num_tokens``
+        # from the request state when it places the request. ``skip_req_ids``
+        # (finished requests and forced-reset frames) is checked before any
+        # row is resolved.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         num_out_tokens = self._tt_committed_width(sampled_token_ids)
@@ -3991,6 +4061,7 @@ class TTModelRunner:
         logprobs: LogprobsLists | None = None,
         req_ids: list[str] | None = None,
         req_id_to_index: dict[str, int] | None = None,
+        stage_outputs: dict[str, TTStageFrame] | None = None,
     ):
         """Apply sampled tokens to runner state and build `ModelRunnerOutput`.
 
@@ -4006,6 +4077,7 @@ class TTModelRunner:
             logprobs=logprobs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
+            stage_outputs=stage_outputs,
         )
 
     def _enqueue_deferred_state_apply(

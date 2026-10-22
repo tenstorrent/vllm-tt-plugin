@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
@@ -78,6 +79,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
+        supports_stage_inputs=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
@@ -388,6 +390,31 @@ def test_block_resume_replay_past_one_canvas_remains_prefill():
     model_input = _prepare(runner, ("r", 8, 8, 16))
 
     assert model_input.prompt_lens.tolist() == [16]
+
+
+def test_decode_with_bad_words_carries_the_output_history_without_penalties():
+    """vLLM's bad-words op bans a word's last token only after the rest of it.
+
+    It reads the rest of the word from the output history the host sampler is
+    handed, so a decode with bad words carries that history even when no row
+    has a penalty.
+    """
+    params = SamplingParams(temperature=1.0)
+    params._bad_words_token_ids = [[9, 10]]
+    batch, request = _batch_with_one_request(
+        prompt_len=8, output_len=2, num_computed_tokens=9, sampling_params=params
+    )
+    assert batch.no_penalties
+
+    model_input = _prepare(_fake_runner(batch, request), ("r", 1, 9, 2))
+
+    assert model_input.output_tokens is not None
+    history = [[t for t in model_input.output_tokens[0].tolist() if t != -1]]
+    assert history == [[8, 9]]
+    logits = torch.zeros(1, VOCAB_SIZE)
+    apply_bad_words(logits, model_input.bad_words_token_ids_list[0], history)
+    assert logits[0, 10] == -torch.inf
+    assert torch.isfinite(logits[0, :10]).all()
 
 
 # endregion Decode input construction

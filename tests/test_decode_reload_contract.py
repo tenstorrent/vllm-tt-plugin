@@ -12,6 +12,7 @@ import torch
 from vllm.v1.core.sched.output import CachedRequestData
 
 from vllm_tt_plugin.async_decode import (
+    AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
     SubmittedStepContext,
@@ -146,6 +147,7 @@ def _verifying_controller():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     return TTAsyncDecodeController(runner), model
@@ -354,6 +356,7 @@ def test_submit_decode_delivers_page_table_only_refresh():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -454,6 +457,7 @@ def test_state_slot_ownership_commits_only_after_accepted_decode():
         trace_mode="decode_only",
         kv_caches=object(),
         request_specific_rope=False,
+        supports_stage_outputs=False,
         tt_per_lane_max_num_seqs=2,
         _req_state_slot={"a": 1, "b": 0},
         _pending_state_slot_settle=None,
@@ -677,6 +681,7 @@ def test_contract_v1_receives_commands_without_legacy_reset():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -709,6 +714,7 @@ def test_contract_v1_host_sampling_still_receives_commands_and_remap():
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
         )
     )
     controller = TTAsyncDecodeController(runner)
@@ -744,6 +750,7 @@ def test_contract_v0_keeps_legacy_call_shape_and_warns_once(monkeypatch):
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
             async_decode_scheduling=True,
         )
     )
@@ -789,6 +796,7 @@ def test_contract_v0_sync_mode_is_informational_once(monkeypatch):
             trace_mode="decode_only",
             kv_caches=object(),
             request_specific_rope=False,
+            supports_stage_outputs=False,
             async_decode_scheduling=False,
         )
     )
@@ -973,6 +981,51 @@ def test_async_scheduled_final_prefill_applies_on_ordinary_next_step():
 
     assert request_state.output_token_ids == [7]
     assert runner_output.sampled_token_ids == [[7]]
+
+
+def test_step_resolved_during_apply_stays_pending_until_drained():
+    request_state = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(request_state)
+    controller = TTAsyncDecodeController(runner)
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+    completed = _completed_step(7, runner_output)
+    # The step's completion goes through the real output path: ensure_finalized
+    # runs _get_output_impl, whose enqueue_completed_decode_step is followed by
+    # the event set.
+    controller.complete_decode_step = lambda **_: completed
+    controller.build_runner_output_from_completed_step = lambda _: runner_output
+    step = AsyncTTModelRunnerOutput(
+        controller,
+        submission=None,
+        model_input=None,
+        completion_event=threading.Event(),
+        context=completed.context,
+    )
+    runner._pending_async_steps.append(step)
+    runner._pending_async_overlap_ok.append(True)
+    drain = controller.drain_completed_decode_steps
+
+    def drain_then_resolve_on_output_thread():
+        completed_steps = drain()
+        # The output thread finalizes the step after the drain released the
+        # lock.
+        step.ensure_finalized()
+        return completed_steps
+
+    controller.drain_completed_decode_steps = drain_then_resolve_on_output_thread
+    controller.apply_ready_completed_decode_steps()
+
+    # The step's token is not applied yet, so the step must stay pending.
+    assert request_state.output_token_ids == []
+    assert len(runner._pending_async_steps) == 1
+
+    controller.drain_completed_decode_steps = drain
+    controller.apply_ready_completed_decode_steps()
+
+    assert request_state.output_token_ids == [7]
+    assert not runner._pending_async_steps
 
 
 def test_forced_reset_discard_count_requires_all_stale_frames():

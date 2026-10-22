@@ -12,6 +12,10 @@ validation, scheduling, worker execution, model loading, async decode, single-
 process standard and multi-lane execution, data-parallel execution all live
 here. Nothing TT-specific needs to touch vLLM core.
 
+For model authors, the [model-plugin interface](docs/MODEL_INTERFACE.md)
+documents registration, construction, KV storage, execution, and lifecycle,
+and links to the capability, speculative-decode, and input-reload contracts.
+
 ## Package Layout
 
 ```text
@@ -447,16 +451,18 @@ worst-case block allocation and for sliding-window groups on hybrid models.
 latter is what reaches the engine-side KV planner, which in standard DP runs in
 a different process from the worker that set the override.
 
-That pool is the budget shared by *all* concurrent requests, and it is
-independent of `max_model_len`, the *per-request* context limit. Since vLLM
+That pool is the budget shared by *all* concurrent requests. It is set
+independently of `max_model_len`, the *per-request* context limit, except that
+eligible hybrid models raise it to admit one `max_model_len` request (see
+below). Since vLLM
 sizes and validates the KV cache against it, the two must be chosen together:
 
 | `--max-model-len` | Behavior |
 | --- | --- |
 | numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
-| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. |
+| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. Eligible hybrid models are the exception: those that set `_HYBRID_KV_CACHE_GROUPS_ENABLED` and whose `get_kv_cache_spec` hook returns a nonempty spec. For them the TT worker raises the pool to the smallest size upstream admits for one `max_model_len` request, plus the output reservation, and logs the change. That pool must still fit device memory, which TT does not profile; KV allocation fails at startup if it does not. With chunked prefill off, every sliding-window group is sized at the full context, so the raised pool can be several times `max_model_len`. |
 | `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. For block-output models the TT worker fits `max_model_len` to the pool minus one output canvas before vLLM's auto-fit runs. |
-| omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
+| omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool, except for eligible hybrid models, which raise the pool as in the numeric case. |
 
 Explicit `-1` auto-fit picks the largest length that fits **one** request, so it
 lands at roughly the whole pool with maximum concurrency `1.00x`: a single long
@@ -475,6 +481,14 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | --- | --- |
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
 | `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
+
+A `TTWorker` subclass names the scheduler it runs with in `tt_scheduler_cls`,
+and sets `uses_token_kv_cache = False` for a stage with no token KV cache.
+A requested `scheduler_cls` is kept when it derives from that class, and replaced
+by it when that class derives from the request. Any other pair raises
+`ValueError`. Lane mode also raises unless the worker declares `TTScheduler`,
+inherited or explicit, and the request is unset, `TTLaneCoordinator`, or a class
+`TTScheduler` derives from.
 
 The execution model matches TT hardware characteristics:
 
@@ -762,11 +776,11 @@ clear error before anything reaches the device:
   `--no-enable-chunked-prefill` to opt out. When it stays on,
   `max_num_batched_tokens` is left as vLLM set it (2048 for `vllm serve` /
   `server_example_tt.py`, 8192 for `LLM()`, or an explicit
-  `--max-num-batched-tokens`). When it is disabled, a budget smaller than
-  `max_model_len` is raised to `max_model_len` so a full prompt still fits in
-  one step. Resume offsets need an alignment that depends on the model's
-  program config and on the length of each remaining span, and the tt-metal
-  generator corrects them itself.
+  `--max-num-batched-tokens`). When it is disabled, a `max_num_batched_tokens`
+  smaller than `max_model_len` is raised to `max_model_len`, and so is a set
+  `max_num_scheduled_tokens`, so a full prompt still fits in one step. Resume offsets need an
+  alignment that depends on the model's program config and on the length of
+  each remaining span, and the tt-metal generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
@@ -896,38 +910,16 @@ on real hardware fails loudly rather than passing against a fake.
 
 ## Hybrid Attention Models
 
-Hybrid attention models have mixed sliding-window and full-attention layers
-such as Gemma 3, Gemma 4, and GPT-OSS. They opt in to upstream vLLM's hybrid KV
-cache manager through a per-model spec hook on the registered TT model class.
+Hybrid attention models combine sliding-window and full-attention layers.
+The registered TT model class supplies `get_kv_cache_spec(vllm_config)` so
+vLLM can plan KV groups. The model adapter allocates physical storage through
+`allocate_kv_cache_per_layer(per_layer_specs)` and consumes
+`page_tables_per_layer` when the resolved cache has multiple groups.
 
-The hybrid manager packs sliding and full layers into separate
-`KVCacheGroupSpec`s, sized by upstream's
-[Hybrid KV Cache Manager design](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/).
-Sliding-window layers then occupy only `sliding_window` worth of KV state per
-request instead of `max_seq_len`. On Gemma 4 31B at 256k context this is roughly
-a 6x reduction in KV cache memory.
-
-To enable hybrid KV cache support for a TT model:
-
-1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`
-   instead of `Generator`. The base class provides a default
-   `get_kv_cache_spec` classmethod that builds per-layer specs from
-   `hf_config.text_config.layer_types`.
-2. Implement `prefill_forward` and `decode_forward` to consume the
-   `page_tables_per_group` kwarg and route each layer to the right group's page
-   table.
-3. Implement `allocate_kv_cache_per_layer(per_layer_specs)`. The base class
-   default delegates to `allocate_vllm_kv_cache_per_layer`.
-
-Models that do not opt in stay on the legacy `Generator` path: uniform
-single-group KV cache, one page table, and no behavioral change. The plugin only
-sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
-
-Hybrid models with `data_parallel_size > 1` have not been validated on
-hardware. Both DP modes carry the full per-group block tables (a standard-DP
-rank is an independent DP=1 engine, and lane-DP builds per-group tables for the
-merged batch), so there is no known blocker, but the combination is untested.
-
+See [model setup and KV storage](docs/MODEL_SETUP.md#kv-budget-and-specifications)
+for specification names, allocation triples, storage sharing, and page-table
+routing. Model-specific device and DP support must be validated for the
+selected adapter and mesh; the interface alone does not establish support.
 
 ## Development Notes
 

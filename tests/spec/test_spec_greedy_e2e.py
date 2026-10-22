@@ -106,6 +106,7 @@ def _runner(
         kv_caches=object(),
         trace_mode="decode_only",
         request_specific_rope=False,
+        supports_stage_outputs=False,
         _output_tokens_per_step=1,
         _is_block_output_model=False,
         _is_adaptive_block_output=False,
@@ -127,6 +128,7 @@ def _runner(
         tt_data_parallel_size=1,
         vocab_size=FAKE_VOCAB_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
+        supports_stage_inputs=False,
         model_config=SimpleNamespace(
             is_multimodal_model=False, max_model_len=MAX_MODEL_LEN
         ),

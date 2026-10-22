@@ -244,6 +244,7 @@ def _config(
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=1024,
+            max_num_scheduled_tokens=None,
             enable_chunked_prefill=True,
             long_prefill_token_threshold=128,
             async_scheduling=async_scheduling,
@@ -686,6 +687,22 @@ def test_second_engine_config_is_rejected_when_a_block_model_is_involved(
     other = _config()
     with pytest.raises(ValueError, match="One TT engine per process"):
         TTPlatform.check_and_update_config(other)
+
+
+def test_a_config_without_a_model_leaves_the_live_engine_alone(monkeypatch):
+    """vLLM builds model-less configs (a default one, test fixtures); they start no
+    engine, so they must neither fail the hook nor take a live engine's handle."""
+    from vllm.config import DeviceConfig, VllmConfig
+
+    _patch_model_resolution(monkeypatch)
+    config = _config()
+    TTPlatform.check_and_update_config(config)
+
+    VllmConfig(device_config=DeviceConfig(device="cpu"))
+
+    assert TTPlatform._tt_vllm_config is config
+    with pytest.raises(ValueError, match=r"requires 512 physical"):
+        _validate(SamplingParams(max_tokens=257), prompt_len=513)
 
 
 def test_failed_same_config_reentry_restores_live_block_contract(monkeypatch):
