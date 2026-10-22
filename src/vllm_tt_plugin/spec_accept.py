@@ -702,14 +702,26 @@ def _reference_top_k_top_p(
 _FAST_TOPK_MAX = 1024
 _FAST_TOPK_MARGIN = 64
 
+# Candidates a top-p row without top-k is decided from, by default. A row whose
+# nucleus does not fit in them takes the reference path.
+_TOP_P_CANDIDATES = 2048
+# How close a candidate's tail may come to the reference's 1 - p threshold,
+# relative to 1 - p, before the row takes the reference path instead. The two
+# tails differ by rounding only: the reference's float32 softmax does not sum
+# to exactly 1, which scales its every tail by the same factor. Over 600 random
+# 152064-wide rows that factor stayed within 4e-6 of 1; the margin is ten
+# times that.
+_TOP_P_DECISION_MARGIN = 4e-5
+
 
 class _ProbTable:
     """Per-position target probabilities, stored by support where it is small.
 
     ``N = rows * width`` flat positions. A sparse position keeps its candidate
     token ids and their probabilities (everything else is exactly 0). A dense
-    position keeps all ``vocab`` probabilities; those are rows with no top-k
-    (or one the fast path cannot serve) and cost what the old path cost.
+    position keeps all ``vocab`` probabilities; those are rows with neither
+    top-k nor top-p, and rows the fast path cannot serve, which cost what the
+    old path cost.
     """
 
     def __init__(self, n: int, vocab: int):
@@ -735,9 +747,11 @@ class _ProbTable:
     def to_dense(self) -> torch.Tensor:
         out = torch.zeros(self.n, self.vocab, dtype=torch.float32)
         if self.sparse_ids.numel():
+            # Added, not assigned: a padded support repeats a token id with
+            # probability 0, which an assignment could write over the real one.
             out[self.sparse_ids] = torch.zeros(
                 self.sparse_ids.numel(), self.vocab
-            ).scatter_(1, self.idx, self.sp)
+            ).scatter_add_(1, self.idx, self.sp)
         if self.dense_ids.numel():
             out[self.dense_ids] = self.dp
         return out
@@ -824,13 +838,16 @@ def _constrained_table(
 
     Same masks as ``apply_top_k_top_p_pytorch`` followed by a softmax: top-k
     keeps every logit ``>=`` the k-th largest (ties kept), then top-p drops
-    the ascending-cumsum prefix ``<= 1 - p`` but always keeps the largest. Both
-    are evaluated on the top ``k_max + margin`` candidates only, which holds
-    every survivor of top-k. Temperature is applied to the candidates, which is
-    the same division of the same values; it is monotone, so the candidates of
-    the raw logits are the candidates of the tempered ones. Rows the candidates
-    cannot decide (top-k off or above the cap with top-p active, tie overflow,
-    a top-p cut inside a group of equal logits) use the reference path.
+    the ascending-cumsum prefix ``<= 1 - p`` but always keeps the largest. With
+    top-k on, both are evaluated on the top ``k_max + margin`` candidates only,
+    which holds every survivor of top-k. Temperature is applied to the
+    candidates, which is the same division of the same values; it is monotone,
+    so the candidates of the raw logits are the candidates of the tempered
+    ones. A top-p row without top-k is decided by ``_top_p_only_support``. Rows
+    the candidates cannot decide (top-k above the cap with top-p active, tie
+    overflow, a nucleus wider than the top-p candidates, a top-p cut inside a
+    group of equal logits under VLLM_TT_SPEC_TIE_EXACT=1) use the reference
+    path.
     """
     rows, width, vocab = target_logits.shape
     n = rows * width
@@ -853,11 +870,14 @@ def _constrained_table(
     p_on = off if p is None else p < 1.0
     active = k_on | p_on
     fast = off if k is None else k_on & (k <= _FAST_TOPK_MAX)
-    fallback = active & ~fast
+    top_p_candidates = _top_p_candidates()
+    top_p_only = p_on & ~k_on if top_p_candidates else off
+    fallback = active & ~fast & ~top_p_only
 
     table = _ProbTable(n, vocab)
     dense_ids = (~active).nonzero().squeeze(1)
     dense_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+    sparse_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     if dense_ids.numel():
         sub = flat[dense_ids].to(torch.float32) / temp[dense_ids].unsqueeze(1)
         dense_rows.append((dense_ids, sub.softmax(dim=-1)))
@@ -869,12 +889,9 @@ def _constrained_table(
         cand = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
         vals, idx = torch.topk(sub, cand, dim=-1)
         if not _tie_exact():
-            # A fixed tie order: value descending, token id ascending. The
-            # top-p cut below then drops the highest ids of a tie group first.
-            by_id = idx.argsort(dim=1)
-            idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
-            vals, by_value = vals.sort(dim=1, descending=True, stable=True)
-            idx = idx.gather(1, by_value)
+            # The top-p cut below then drops the highest ids of a tie group
+            # first.
+            vals, idx = _by_value_then_id(vals, idx)
         vals = vals.to(torch.float32) / temp[ids].unsqueeze(1)
         kth = vals.gather(1, (k_f - 1).unsqueeze(1))
         keep = vals >= kth
@@ -900,12 +917,26 @@ def _constrained_table(
             vals = vals.masked_fill(drop, float("-inf"))
         ok = ~overflow
         if bool(ok.any()):
-            table.set_sparse(
-                ids[ok], idx[ok], vals[ok].softmax(dim=-1, dtype=torch.float32)
+            sparse_rows.append(
+                (ids[ok], idx[ok], vals[ok].softmax(dim=-1, dtype=torch.float32))
             )
         if bool(overflow.any()):
             fallback = fallback.clone()
             fallback[ids[overflow]] = True
+
+    if bool(top_p_only.any()):
+        ids = top_p_only.nonzero().squeeze(1)
+        # The division the reference makes, so the same tempered values.
+        sub = flat[ids].to(torch.float32) / temp[ids].unsqueeze(1)
+        ok, idx, probs = _top_p_only_support(sub, p[ids], top_p_candidates)
+        if bool(ok.any()):
+            sparse_rows.append((ids[ok], idx[ok], probs[ok]))
+        if not bool(ok.all()):
+            fallback = fallback.clone()
+            fallback[ids[~ok]] = True
+
+    if sparse_rows:
+        table.set_sparse(*_stack_supports(sparse_rows))
 
     if bool(fallback.any()):
         ids = fallback.nonzero().squeeze(1)
@@ -919,6 +950,162 @@ def _constrained_table(
             torch.cat([i for i, _ in dense_rows]), torch.cat([d for _, d in dense_rows])
         )
     return table
+
+
+def _top_p_candidates() -> int:
+    """How many candidates decide a top-p row without top-k; 0 disables that.
+
+    VLLM_TT_SPEC_TOPP_CANDIDATES overrides the default. With 0, such rows take
+    the reference path, as they did before the fast path served them.
+    """
+    raw = os.environ.get("VLLM_TT_SPEC_TOPP_CANDIDATES")
+    if raw is None:
+        return _TOP_P_CANDIDATES
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(
+            "VLLM_TT_SPEC_TOPP_CANDIDATES must be a non-negative integer (0 "
+            f"disables the top-p-only fast path), got {raw!r}"
+        )
+    return value
+
+
+def _by_value_then_id(
+    vals: torch.Tensor, idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Candidates reordered by value descending, then token id ascending.
+
+    A fixed tie order, so a top-p cut inside a group of equal values keeps the
+    group's lowest ids, whatever order ``torch.topk`` returned them in.
+    """
+    by_id = idx.argsort(dim=1)
+    idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
+    vals, by_value = vals.sort(dim=1, descending=True, stable=True)
+    return vals, idx.gather(1, by_value)
+
+
+def _top_p_only_support(
+    logits: torch.Tensor, top_p: torch.Tensor, candidates: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-p over the whole vocabulary without sorting it, where that is exact.
+
+    ``logits`` is ``[R, V]`` tempered, ``top_p`` is ``[R]`` below 1. Returns
+    ``(ok, idx, probs)``: where ``ok``, row ``r``'s support is ``idx[r]`` with
+    ``probs[r]`` (zero past the nucleus), in token id order; rows not ``ok``
+    must take the reference path.
+
+    The reference sorts the row ascending, takes the softmax and its cumulative
+    sum, and drops each token whose cumulative sum, the mass of that token and
+    of every smaller one, is ``<= 1 - p``; the largest token always stays. That
+    tail mass only shrinks down the descending order, so the nucleus is a
+    prefix of it, and the tail at a candidate is 1 minus the mass ranked ahead
+    of it. The float64 sum of every exponential, shifted by the row maximum
+    as the reference's softmax shifts it (a logsumexp without its
+    logarithm), gives that tail at every one of the top ``candidates`` with
+    no sort: the total, less the exponentials ranked ahead, over the total. The
+    candidates decide the nucleus when it ends before their last value,
+    strictly: every token outside them is then no larger than one already
+    dropped, so it is dropped too. A row is sent to the reference path when
+    the nucleus does not end inside the candidates, when a candidate's tail is
+    within ``_TOP_P_DECISION_MARGIN * (1 - p)`` of ``1 - p`` (where rounding
+    could decide differently), when its maximum or its normaliser is not
+    finite, and under VLLM_TT_SPEC_TIE_EXACT=1 when the cut falls inside a
+    group of equal values.
+
+    Ties at the cut are handled as the top-k fast path handles them: the
+    candidates are ordered by value, then token id, and the cut keeps the
+    lowest ids of the group. Members of a group are equally probable, so the
+    reference keeps as many of them; only which ones can differ.
+
+    The support is returned in token id order, which is the order the dense
+    reference table is walked in, so an inverse-CDF draw over it picks the
+    token the reference table picks for the same uniform.
+    """
+    rows, vocab = logits.shape
+    width = min(candidates, vocab)
+    whole = width == vocab
+    tie_exact = _tie_exact()
+
+    # The reference's float32 exponentials, shifted by the row maximum, rather
+    # than a float32 logsumexp, whose rounding grows with the logits'
+    # magnitude. Summed in float64, and the tail taken as the total less the
+    # exponentials ahead, so 1 - ahead's cancellation adds no float32 error.
+    top = logits.amax(dim=-1, keepdim=True)
+    shifted = torch.exp(logits - top)
+    total = shifted.sum(dim=-1, keepdim=True, dtype=torch.float64)
+    # The reference compares in top_p's own dtype, 1 - p included.
+    threshold = (1 - top_p).to(torch.float64).unsqueeze(1)
+    ok = (torch.isfinite(top) & torch.isfinite(total)).squeeze(1)
+    if not whole:
+        # To end the nucleus, the candidates ahead of the cut must hold p of
+        # the total, and they hold at most ``width`` of it: a shifted
+        # exponential is at most 1. A row that fails this cannot be served,
+        # so it skips the top-k and goes straight to the reference.
+        ok = ok & ((1 - threshold) * total <= width).squeeze(1)
+    live = ok.nonzero().squeeze(1)
+    if not live.numel():
+        return ok, torch.zeros(rows, 1, dtype=torch.long), torch.zeros(rows, 1)
+    if live.numel() < rows:
+        logits, shifted = logits[live], shifted[live]
+        total, threshold = total[live], threshold[live]
+
+    vals, idx = torch.topk(logits, width, dim=-1)
+    if not tie_exact:
+        vals, idx = _by_value_then_id(vals, idx)
+    ahead = torch.cumsum(shifted.gather(1, idx).to(torch.float64), dim=-1)
+    ahead = torch.nn.functional.pad(ahead[:, :-1], (1, 0))
+    tail = (total - ahead) / total
+    keep = tail > threshold
+    keep[:, 0] = True
+    kept = keep.sum(dim=1, keepdim=True)
+
+    near = (tail - threshold).abs() <= _TOP_P_DECISION_MARGIN * threshold
+    near[:, 0] = False
+    decided = ~near.any(dim=1)
+    last = vals.gather(1, kept - 1)
+    if not whole:
+        # The last candidate strictly below the last kept value: the nucleus
+        # ends inside the candidates, and no token outside them ties with it.
+        decided = decided & (vals[:, -1:] < last).squeeze(1)
+    if tie_exact:
+        nxt = vals.gather(1, kept.clamp(max=width - 1))
+        decided = decided & ~((kept < width) & (nxt == last)).squeeze(1)
+    ok[live] = decided
+
+    # Only as wide as the widest nucleus served, and in token id order.
+    served = int(kept[decided].max()) if bool(decided.any()) else 1
+    keep, vals, idx = keep[:, :served], vals[:, :served], idx[:, :served]
+    probs = vals.masked_fill(~keep, float("-inf")).softmax(dim=-1, dtype=torch.float32)
+    by_id = idx.argsort(dim=1)
+    support = torch.zeros(rows, served, dtype=torch.long)
+    support_probs = torch.zeros(rows, served, dtype=torch.float32)
+    support[live] = idx.gather(1, by_id)
+    support_probs[live] = probs.gather(1, by_id)
+    return ok, support, support_probs
+
+
+def _stack_supports(
+    parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One sparse block from supports of different widths, padded with zeros.
+
+    A padding entry is token 0 with probability 0. No draw picks a zero, a
+    lookup sums over a token's entries, and ``to_dense`` adds them, so the
+    padding never changes a token's probability.
+    """
+    width = max(int(idx.shape[1]) for _, idx, _ in parts)
+
+    def pad(t: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.pad(t, (0, width - int(t.shape[1])))
+
+    return (
+        torch.cat([ids for ids, _, _ in parts]),
+        torch.cat([pad(idx) for _, idx, _ in parts]),
+        torch.cat([pad(probs) for _, _, probs in parts]),
+    )
 
 
 def _point_mass_walk(

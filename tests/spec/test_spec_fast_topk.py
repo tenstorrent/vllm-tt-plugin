@@ -334,3 +334,269 @@ def test_bf16_rows_need_no_full_sort_and_keep_the_reference_masses(monkeypatch, 
         atol=1e-9,
     )
     assert torch.equal((fast > 0).sum(-1), (ref > 0).sum(-1))
+
+
+# region Top-p without top-k
+
+
+def _count_reference_rows(monkeypatch):
+    """Rows handed to the reference top-k/top-p from here on, call by call."""
+    rows: list[int] = []
+    real = spec_accept._reference_top_k_top_p
+
+    def counted(flat, k, p):
+        rows.append(int(flat.shape[0]))
+        return real(flat, k, p)
+
+    monkeypatch.setattr(spec_accept, "_reference_top_k_top_p", counted)
+    return rows
+
+
+def _top_p_both(monkeypatch, logits, temperature, top_k, top_p, min_p=None):
+    """Reference and fast probabilities, and how many positions fell back."""
+    ref, _ = _both(monkeypatch, logits, temperature, top_k, top_p, min_p)
+    fallen = _count_reference_rows(monkeypatch)
+    fast = _constrained_probs(logits, temperature, top_k, top_p, min_p)
+    return ref, fast, sum(fallen)
+
+
+def _peaked(g, rows, width, vocab, spread=2.0):
+    """Gaussian logits with a few tens of boosted tokens, as a language model's."""
+    logits = torch.randn(rows, width, vocab, generator=g) * spread
+    boosted = torch.randint(0, vocab, (rows, width, 40), generator=g)
+    logits.scatter_add_(2, boosted, torch.rand(rows, width, 40, generator=g) * 12)
+    return logits
+
+
+@pytest.mark.parametrize("kind", ["peaked", "peaked-bf16", "gaussian"])
+@pytest.mark.parametrize("seed", range(12))
+def test_top_p_only_rows_match_reference(monkeypatch, kind, seed):
+    g = torch.Generator().manual_seed(seed)
+    if kind == "gaussian":
+        logits = torch.randn(4, 4, V, generator=g) * 3
+    else:
+        logits = _peaked(g, 4, 4, V)
+    if kind.endswith("bf16"):
+        logits = logits.to(torch.bfloat16).to(torch.float32)
+    temperature = torch.tensor([0.6, 1.0, 1.3, 0.8])
+    top_p = torch.tensor([0.95, 0.9, 0.95, 0.5])
+    # top-k off: no tensor at all, or the vocabulary size, as vLLM passes it.
+    for top_k in (None, torch.full((4,), V, dtype=torch.int32)):
+        ref, fast, fallen = _top_p_both(monkeypatch, logits, temperature, top_k, top_p)
+        _check(ref, fast)
+        if kind != "peaked-bf16":  # bf16 cuts often tie, and those fall back
+            # The nucleus fits in the candidates, so nearly every position
+            # is served without the sort; the margin may send one back.
+            assert fallen <= 2
+    # The default tie order: the same probability values, served from the
+    # candidates however often the cut ties.
+    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
+    fallen = _count_reference_rows(monkeypatch)
+    fast = _constrained_probs(logits, temperature, None, top_p)
+    assert sum(fallen) <= 2
+    assert torch.equal((fast > 0).sum(-1), (ref > 0).sum(-1))
+    assert torch.allclose(
+        fast.sort(dim=-1).values, ref.sort(dim=-1).values, rtol=1e-6, atol=1e-9
+    )
+
+
+def test_top_p_only_tie_at_the_cut(monkeypatch):
+    # Six equal logits at the top, and a top-p that cuts inside them.
+    logits = torch.randn(1, 1, V, generator=torch.Generator().manual_seed(3))
+    tied = torch.tensor([900, 7, 3000, 41, 2, 77])
+    logits[0, 0, tied] = 8.0
+    temperature = torch.ones(1)
+    top_p = torch.tensor([0.5])
+    # Pinned to the reference's unstable sort: the row falls back.
+    ref, fast, fallen = _top_p_both(monkeypatch, logits, temperature, None, top_p)
+    _check(ref, fast)
+    assert fallen == 1
+    # The default keeps the group's lowest ids, as many as the reference keeps.
+    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
+    _no_reference(monkeypatch)
+    fast = _constrained_probs(logits, temperature, None, top_p)
+    kept = (fast[0, 0] > 0).nonzero().squeeze(1).tolist()
+    n = int((ref > 0).sum())
+    assert 1 <= n < 6
+    assert kept == sorted(tied.tolist())[:n]
+    assert torch.allclose(fast[fast > 0].sort().values, ref[ref > 0].sort().values)
+
+
+def test_top_p_only_tie_group_reaching_past_the_candidates_falls_back(monkeypatch):
+    # The cut lands in a group of equal logits wider than the candidates, so
+    # the candidates cannot show the group's lowest ids.
+    monkeypatch.setenv("VLLM_TT_SPEC_TOPP_CANDIDATES", "64")
+    logits = torch.randn(1, 1, V, generator=torch.Generator().manual_seed(4)) - 20
+    logits[0, 0, 100:300] = 5.0
+    top_p = torch.tensor([0.5])
+    ref, fast, fallen = _top_p_both(monkeypatch, logits, torch.ones(1), None, top_p)
+    _check(ref, fast)
+    assert fallen == 1
+    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
+    fallen = _count_reference_rows(monkeypatch)
+    _constrained_probs(logits, torch.ones(1), None, top_p)
+    assert sum(fallen) == 1
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+def test_a_nucleus_wider_than_the_candidates_falls_back(monkeypatch, bf16):
+    g = torch.Generator().manual_seed(5)
+    # Flat rows: a 0.95 nucleus holds most of the 4096 tokens, more than 2048.
+    logits = torch.randn(2, 3, V, generator=g) * 0.3
+    if bf16:
+        logits = logits.to(torch.bfloat16).to(torch.float32)
+    top_p = torch.tensor([0.95, 0.95])
+    ref, fast, fallen = _top_p_both(monkeypatch, logits, torch.ones(2), None, top_p)
+    assert int((ref > 0).sum(-1).min()) > 2048
+    _check(ref, fast)
+    assert fallen == 6
+    # Fewer candidates than a peaked row's nucleus: the same, by the override.
+    monkeypatch.setenv("VLLM_TT_SPEC_TOPP_CANDIDATES", "4")
+    logits = _peaked(g, 2, 3, V)
+    ref, fast, fallen = _top_p_both(monkeypatch, logits, torch.ones(2), None, top_p)
+    assert int((ref > 0).sum(-1).min()) > 4
+    _check(ref, fast)
+    assert fallen == 6
+
+
+def test_top_p_only_disabled_takes_the_reference_path(monkeypatch):
+    logits = _peaked(torch.Generator().manual_seed(6), 2, 2, V)
+    top_p = torch.tensor([0.9, 0.9])
+    monkeypatch.setenv("VLLM_TT_SPEC_TOPP_CANDIDATES", "0")
+    ref, fast, fallen = _top_p_both(monkeypatch, logits, torch.ones(2), None, top_p)
+    _check(ref, fast)
+    assert fallen == 4
+
+
+@pytest.mark.parametrize("value", ["-1", "many", "2.5"])
+def test_a_malformed_candidate_count_is_refused(monkeypatch, value):
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    monkeypatch.setenv("VLLM_TT_SPEC_TOPP_CANDIDATES", value)
+    with pytest.raises(ValueError, match="VLLM_TT_SPEC_TOPP_CANDIDATES"):
+        _constrained_probs(
+            torch.zeros(1, 1, 16), torch.ones(1), None, torch.tensor([0.9])
+        )
+
+
+@pytest.mark.parametrize("p", [0.999, 0.9999999, 0.99999994])
+def test_top_p_close_to_one_matches_reference(monkeypatch, p):
+    logits = _peaked(torch.Generator().manual_seed(7), 2, 3, V)
+    top_p = torch.full((2,), p)
+    ref, fast, _ = _top_p_both(monkeypatch, logits, torch.ones(2), None, top_p)
+    _check(ref, fast)
+
+
+def test_top_p_only_with_minus_inf_entries_matches_reference(monkeypatch):
+    g = torch.Generator().manual_seed(8)
+    logits = torch.randn(3, 4, V, generator=g) * 3
+    # A grammar or allowlist leaves only a few tokens finite: the nucleus can
+    # hold every finite token, and never a -inf one.
+    allowed = torch.zeros(3, 4, V, dtype=torch.bool)
+    allowed[0, :, :5] = True
+    allowed[1, :, torch.randperm(V, generator=g)[:300]] = True
+    allowed[2, :, :1] = True
+    logits = logits.masked_fill(~allowed, float("-inf"))
+    for p in (0.5, 0.95, 0.999):
+        top_p = torch.full((3,), p)
+        ref, fast, _ = _top_p_both(
+            monkeypatch, logits, torch.full((3,), 0.7), None, top_p
+        )
+        _check(ref, fast)
+
+
+def test_near_uniform_rows_match_reference(monkeypatch):
+    g = torch.Generator().manual_seed(9)
+    rows = torch.stack(
+        [
+            torch.zeros(V),  # every logit tied
+            torch.randn(V, generator=g) * 1e-3,
+            torch.randn(V, generator=g) * 1e-6,
+        ]
+    ).view(3, 1, V)
+    top_p = torch.full((3,), 0.95)
+    ref, fast, _ = _top_p_both(monkeypatch, rows, torch.ones(3), None, top_p)
+    _check(ref, fast)
+    # A vocabulary within the candidates: the whole row is decided by them.
+    small = rows[..., :1000].contiguous()
+    ref, fast, _ = _top_p_both(monkeypatch, small, torch.ones(3), None, top_p)
+    _check(ref, fast)
+
+
+def test_a_small_vocabulary_is_served_whole(monkeypatch):
+    g = torch.Generator().manual_seed(10)
+    logits = torch.randn(2, 4, 1000, generator=g) * 0.5
+    top_p = torch.tensor([0.95, 0.8])
+    ref, fast, fallen = _top_p_both(monkeypatch, logits, torch.ones(2), None, top_p)
+    assert int((ref > 0).sum(-1).min()) > 500
+    _check(ref, fast)
+    assert fallen <= 1
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_top_k_top_p_only_and_plain_rows_mixed(monkeypatch, seed):
+    g = torch.Generator().manual_seed(seed)
+    rows, width = 8, 4
+    logits = _peaked(g, rows, width, V)
+    logits[5] = torch.randn(width, V, generator=g) * 0.3  # falls back
+    temperature = torch.tensor([0.6, 1.0, 0.0, 0.8, 1.0, 1.0, 1.3, 0.7])
+    top_k = torch.tensor([20, V, 20, V, V, V, 1024, V], dtype=torch.int32)
+    top_p = torch.tensor([0.95, 0.95, 1.0, 0.9, 1.0, 0.95, 0.5, 0.8])
+    ref, fast, _ = _top_p_both(monkeypatch, logits, temperature, top_k, top_p)
+    _check(ref, fast)
+    min_p = torch.tensor([0.0, 0.05, 0.0, 0.1, 0.0, 0.0, 0.0, 0.02])
+    ref, fast, _ = _top_p_both(monkeypatch, logits, temperature, top_k, top_p, min_p)
+    _check(ref, fast)
+
+
+def _walk(monkeypatch, candidates, seed, logits, drafts, valid, top_k, top_p):
+    monkeypatch.setenv("VLLM_TT_SPEC_FAST_TOPK", "1")
+    monkeypatch.setenv("VLLM_TT_SPEC_TOPP_CANDIDATES", candidates)
+    rows = int(logits.shape[0])
+    generators = {
+        row: torch.Generator().manual_seed(seed * 100 + row)
+        for row in range(rows)
+        if row % 2 == 0
+    }
+    torch.manual_seed(seed)  # the unseeded rows' draws
+    return accept_sampled_drafts(
+        logits,
+        drafts,
+        valid,
+        SpecSamplingInputs(
+            vocab_size=V,
+            temperature=torch.tensor([1.0, 0.6, 1.0, 1.0, 0.8, 1.0]),
+            top_k=top_k,
+            top_p=top_p,
+            generators=generators,
+        ),
+    )
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_the_walk_draws_what_the_reference_table_draws(monkeypatch, seed):
+    """Serving top-p rows from their support changes no token the walk commits.
+
+    The support is in token id order, so an inverse-CDF draw over it visits
+    tokens in the order the dense reference table does, and the same uniform
+    picks the same token: seeded and unseeded rows, bonus, accept and
+    correction draws alike.
+    """
+    g = torch.Generator().manual_seed(seed)
+    logits = _peaked(g, 6, 4, V)
+    # Drafts the target likes, and one it does not, so rows accept, reject
+    # and correct; rows 3 and 4 carry no drafts (a draftless seeded row draws
+    # its bonus by the exponential race).
+    drafts = logits[:, :3].argmax(dim=-1).to(torch.int32)
+    drafts[1, 1] = torch.randint(0, V, (), generator=g)
+    valid = torch.tensor([3, 3, 2, 0, 0, 1], dtype=torch.int32)
+    top_k = torch.tensor([V, V, V, 20, V, V], dtype=torch.int32)
+    top_p = torch.tensor([0.95, 0.9, 0.8, 0.95, 0.95, 0.95])
+    reference = _walk(monkeypatch, "0", seed, logits, drafts, valid, top_k, top_p)
+    fallen = _count_reference_rows(monkeypatch)
+    fast = _walk(monkeypatch, "2048", seed, logits, drafts, valid, top_k, top_p)
+    assert sum(fallen) <= 1  # the top-p rows were served from their support
+    assert torch.equal(fast.accepted_counts, reference.accepted_counts)
+    assert torch.equal(fast.committed_token_ids, reference.committed_token_ids)
+
+
+# endregion
