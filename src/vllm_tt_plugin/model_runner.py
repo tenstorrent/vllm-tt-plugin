@@ -2008,6 +2008,17 @@ class TTModelRunner:
                 frequency_penalty = _take(sampling_params.frequency_penalty)
                 repetition_penalty = _take(sampling_params.repetition_penalty)
 
+                # vLLM's sampler sorts the whole vocab for every row when it
+                # is handed a top_p tensor, and gathers for a top_k one, even
+                # when they ask for nothing (top_p 1.0, top_k the vocab: the
+                # defaults without a generation_config.json): 20 ms a row on
+                # a 129,280-wide vocab. Its own InputBatch passes None then
+                # (``no_top_p`` / ``no_top_k``); do the same.
+                if bool((top_p >= 1.0).all()):
+                    top_p = None
+                if bool((top_k >= self.vocab_size).all()):
+                    top_k = None
+
                 # Determine if all greedy (temperature == 0.0) or all random
                 all_greedy = (temperature == 0.0).all().item()
                 all_random = (temperature != 0.0).all().item()
