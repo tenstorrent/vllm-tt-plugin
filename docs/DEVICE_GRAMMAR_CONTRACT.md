@@ -205,7 +205,9 @@ device:
 - logprobs, including `logprobs=0`;
 - row-sharded sampling (`sampling_dp > 1`);
 - upstream async scheduling;
-- speculative decoding, which rejects structured requests at admission;
+- speculative decoding: a `logits` verify applies the grammar on the host, and
+  a launch whose model serves only `argmax_ids` rejects structured requests at
+  admission;
 - block-output models;
 - host-only options (`min_p`, `logit_bias`, `bad_words`, `allowed_token_ids`,
   `min_tokens`, custom logits processors).
