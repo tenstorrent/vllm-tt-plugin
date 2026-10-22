@@ -31,10 +31,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
-from vllm_tt_plugin import model_runner as model_runner_module
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
+from vllm_tt_plugin.spec_accept import spec_sampling_inputs
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -557,11 +557,7 @@ def test_padding_rows_never_reach_the_output():
     assert 1 <= count <= width
     assert PLACEHOLDER_TOKEN_ID not in committed[0, :count].tolist()
     _assert_in_support(tail, committed[0, :count].tolist())
-    assert list(
-        model_runner_module._spec_sampling_inputs(
-            model_input, SAMPLED_VOCAB_SIZE
-        ).generators
-    ) == [0]
+    assert list(spec_sampling_inputs(model_input, SAMPLED_VOCAB_SIZE).generators) == [0]
 
     output = runner.build_spec_runner_output(
         model_input.row_req_ids,
@@ -599,9 +595,7 @@ def test_the_walk_samples_under_the_step_s_own_controls():
     runner.input_batch.sampling.presence_penalty[row] = 0.0
     runner.input_batch.sampling.top_k[row] = 1
     runner.input_batch.token_ids_cpu[row, :] = 0
-    captured = model_runner_module._spec_sampling_inputs(
-        model_input, SAMPLED_VOCAB_SIZE
-    )
+    captured = spec_sampling_inputs(model_input, SAMPLED_VOCAB_SIZE)
 
     assert not model_input.perform_device_sampling
     assert captured.vocab_size == SAMPLED_VOCAB_SIZE
@@ -624,7 +618,7 @@ def test_reading_the_controls_does_not_write_into_the_step():
     model_input = _build(runner, "s", drafts={"s": _argmax_drafts(runner, "s")})
     before = model_input.tt_sampling_params.top_k.clone()
 
-    model_runner_module._spec_sampling_inputs(model_input, SAMPLED_VOCAB_SIZE)
+    spec_sampling_inputs(model_input, SAMPLED_VOCAB_SIZE)
 
     assert torch.equal(model_input.tt_sampling_params.top_k, before)
 

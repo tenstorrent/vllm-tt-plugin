@@ -237,3 +237,18 @@ class TTModelInput:
     # at build time, because the walk may run on the readback thread after the
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+
+def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
+    """Each row's committed output, with TT's -1 padding removed."""
+    return [[token for token in row.tolist() if token != -1] for row in output_tokens]
+
+
+def penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Prompt ids as vLLM's penalty op reads them.
+
+    int64, with TT's -1 padding replaced by the vocabulary size, which is the
+    one index the op's bin count ignores.
+    """
+    ids = prompt_tokens.to(torch.int64)
+    return ids.masked_fill(ids == -1, vocab_size)

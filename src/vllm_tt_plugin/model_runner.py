@@ -31,7 +31,6 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import _SAMPLING_EPS
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -72,15 +71,12 @@ from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
+    penalty_history,
+    penalty_prompt_ids,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.spec_accept import (
-    SpecPenalties,
-    SpecSamplingInputs,
-    SpecTokenFilters,
-    accept_sampled_drafts,
-)
+from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -233,119 +229,6 @@ def _coerce_output_block(
             f"[num_requests, {width}]"
         )
     return sampled_token_ids
-
-
-def _penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
-    """Each row's committed output, with TT's -1 padding removed."""
-    return [[token for token in row.tolist() if token != -1] for row in output_tokens]
-
-
-def _penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    """Prompt ids as vLLM's penalty op reads them.
-
-    int64, with TT's -1 padding replaced by the vocabulary size, which is the
-    one index the op's bin count ignores.
-    """
-    ids = prompt_tokens.to(torch.int64)
-    return ids.masked_fill(ids == -1, vocab_size)
-
-
-def _spec_sampling_inputs(
-    model_input: TTModelInput, vocab_size: int
-) -> SpecSamplingInputs:
-    """The sampling a ``logits`` verify walks under, for the step's live rows.
-
-    Every field is read off what ``_prepare_model_inputs`` copied when it built
-    the step, and copied again here, so a walk on the readback thread reads
-    nothing the persistent batch can have changed since. Padding rows are left
-    out: they own no request, and sampling them would cost a vocabulary's work
-    per row for tokens nothing reads.
-
-    The grammar bitmask is the one exception to build-time capture: the
-    scheduler computes it while the verify runs, and ``sample_tokens``
-    attaches it to this step's input before any walk can read it.
-    """
-    live = len(model_input.row_req_ids)
-    params = model_input.tt_sampling_params
-
-    def per_row(values: Any, dtype: torch.dtype) -> torch.Tensor:
-        tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
-        return (
-            tensor.expand(live).clone()
-            if tensor.numel() == 1
-            else tensor[:live].clone()
-        )
-
-    # vLLM's sampler samples a row below this temperature greedily, and the
-    # persistent batch keeps the raw value, so the walk is told the same.
-    temperature = per_row(params.temperature, torch.float32)
-    temperature = temperature.masked_fill(temperature < _SAMPLING_EPS, 0.0)
-    top_k = per_row(params.top_k, torch.int32)
-    top_p = per_row(params.top_p, torch.float32)
-
-    penalties = None
-    if model_input.prompt_tokens is not None and model_input.output_tokens is not None:
-        penalties = SpecPenalties(
-            prompt_token_ids=_penalty_prompt_ids(
-                model_input.prompt_tokens[:live], vocab_size
-            ),
-            output_token_ids=_penalty_history(model_input.output_tokens[:live]),
-            presence=per_row(params.presence_penalty, torch.float32),
-            frequency=per_row(params.frequency_penalty, torch.float32),
-            repetition=per_row(params.repetition_penalty, torch.float32),
-        )
-    return SpecSamplingInputs(
-        vocab_size=vocab_size,
-        temperature=temperature,
-        # Left out when no row restricts them, which skips a sort of the whole
-        # vocabulary per candidate column and changes no probability.
-        top_k=top_k if bool((top_k < vocab_size).any()) else None,
-        top_p=top_p if bool((top_p < 1.0).any()) else None,
-        # ``_build_host_generators`` keys only live rows. The generators are
-        # the requests' own, so the walk advances them.
-        generators=dict(model_input.generators_list[0]),
-        penalties=penalties,
-        filters=_spec_token_filters(model_input, live),
-        num_logprobs=model_input.max_num_logprobs[0],
-    )
-
-
-def _spec_token_filters(
-    model_input: TTModelInput, live: int
-) -> SpecTokenFilters | None:
-    """The step's token filters for its live rows, or ``None`` when it has none."""
-    bitmask = model_input.grammar_bitmask[0]
-    if bitmask is not None and bitmask.dim() != 3:
-        raise RuntimeError(
-            "a logits verify was handed a grammar bitmask of shape "
-            f"{tuple(bitmask.shape)}; a verify reads one packed row per "
-            "candidate column, [rows, 1+K, W], which "
-            "spec_grammar_bitmask_for_tt_batch builds"
-        )
-    allowed = model_input.allowed_token_ids_mask_list[0]
-    bad_words = {
-        row: words
-        for row, words in model_input.bad_words_token_ids_list[0].items()
-        if row < live
-    }
-    min_tokens = dict(model_input.spec_min_tokens or {})
-    if bitmask is None and allowed is None and not bad_words and not min_tokens:
-        return None
-    if bad_words and model_input.output_tokens is None:
-        raise RuntimeError(
-            "a logits verify carries bad_words but no output history; "
-            "_prepare_model_inputs builds output_tokens for every decode with "
-            "bad words, because a word's prefix is matched against it"
-        )
-    return SpecTokenFilters(
-        grammar_bitmask=None if bitmask is None else bitmask[:live],
-        allowed_token_ids_mask=None if allowed is None else allowed[:live],
-        bad_words_token_ids=bad_words,
-        output_token_ids=(
-            _penalty_history(model_input.output_tokens[:live]) if bad_words else None
-        ),
-        min_tokens=min_tokens,
-    )
 
 
 def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
@@ -3230,7 +3113,7 @@ class TTModelRunner:
         vocabulary columns samples from a truncated vocabulary, and a block
         narrower than the submitted one shifts the bonus column.
         """
-        sampling = _spec_sampling_inputs(model_input, int(self.vocab_size))
+        sampling = spec_sampling_inputs(model_input, int(self.vocab_size))
         if not isinstance(logits, torch.Tensor) or not logits.is_floating_point():
             raise TypeError(
                 "a verify in logits mode must return a floating point "
@@ -4081,9 +3964,7 @@ class TTModelRunner:
                 # Output history as list[list[int]] (filter TT -1 padding).
                 output_token_ids: list[list[int]] = []
                 if is_decode and model_input.output_tokens is not None:
-                    output_token_ids = _penalty_history(
-                        _take(model_input.output_tokens)
-                    )
+                    output_token_ids = penalty_history(_take(model_input.output_tokens))
                 else:
                     output_token_ids = [[] for _ in range(sz)]
 
@@ -4092,7 +3973,7 @@ class TTModelRunner:
                 prompt_token_ids: torch.Tensor | None = None
                 if not no_penalties:
                     if is_decode and model_input.prompt_tokens is not None:
-                        prompt_token_ids = _penalty_prompt_ids(
+                        prompt_token_ids = penalty_prompt_ids(
                             _take(model_input.prompt_tokens), self.vocab_size
                         )
                     elif not is_decode:
