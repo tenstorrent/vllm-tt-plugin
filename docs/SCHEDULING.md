@@ -191,7 +191,9 @@ vLLM set it (2048 for `vllm serve` / `server_example_tt.py`, 8192 for `LLM()`,
 or an explicit `--max-num-batched-tokens`). When chunked prefill is off and
 `max_num_batched_tokens` is smaller than `max_model_len`, it raises that token
 budget to `max_model_len` so a full prompt can be admitted instead of leaving
-an unschedulable request in `waiting`.
+an unschedulable request in `waiting`. When it turns chunked prefill off, it
+raises `max_num_scheduled_tokens` the same way if that is set, because the
+scheduler budgets each step by `max_num_scheduled_tokens` when it is set.
 
 ### Chunked prefill
 
