@@ -34,7 +34,6 @@ from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
-    store_tt_lane_prefill_group,
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
@@ -621,19 +620,6 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     global_max_num_seqs = per_lane_max_num_seqs * lanes
 
     store_tt_lane_count(vllm_config, lanes)
-    # Optional capability: a model that prefills whole lane groups in one
-    # multi-pipe walk declares ``model_capabilities["lane_prefill_group"]``
-    # (Boolean or callable, like the fold). The lane schedulers then admit at
-    # most one new prefill per step and the coordinator gathers lanes briefly,
-    # so merged prefill steps arrive as pure groups. Model-agnostic: only the
-    # declaration and the lane fold are consulted.
-    if _model_capability_flag(model_class, "lane_prefill_group"):
-        store_tt_lane_prefill_group(vllm_config)
-        logger.info(
-            "Model %s declares lane-group prefill: capping new prefill "
-            "admissions at one per lane per step.",
-            getattr(model_class, "__name__", model_class),
-        )
     scheduler_config.max_num_seqs = global_max_num_seqs
     _collapse_parallel_config_to_single_process(parallel_config)
 

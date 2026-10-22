@@ -23,7 +23,6 @@ from vllm_tt_plugin.config import (
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
-    is_tt_lane_prefill_group,
     tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -332,11 +331,6 @@ class TTScheduler(AsyncScheduler):
       prefill cannot make progress and running decode requests exist.
     """
 
-    # Lane-group prefill capability: at most this many new prefills per step
-    # (0 = off). The class-level default keeps a scheduler built without
-    # __init__ (tests) in the off state.
-    _prefill_admissions_per_step: int = 0
-
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
@@ -348,12 +342,6 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
-        # Lane-group prefill (fold rails): admit at most ONE new prefill per
-        # step so the coordinator's merged step is a pure lane group the model
-        # can prefill in one multi-pipe chunk walk. 0 = off (all other rails).
-        self._prefill_admissions_per_step = (
-            1 if is_tt_lane_prefill_group(self.vllm_config) else 0
-        )
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -916,15 +904,6 @@ class TTScheduler(AsyncScheduler):
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
-        if self._prefill_admissions_per_step:
-            # Pure lane groups: while a partial prefill is mid-chunks, admit
-            # nothing new (a mixed step would serialize anyway); otherwise
-            # admit at most the declared count (one) so the coordinator's
-            # merged step covers each lane exactly once.
-            cap = len(partial_prefills) + (
-                0 if partial_prefills else self._prefill_admissions_per_step
-            )
-            self.max_num_running_reqs = min(self.max_num_running_reqs, cap)
         try:
             result = super().schedule()
         finally:

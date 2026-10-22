@@ -154,9 +154,7 @@ def test_non_gpt_oss_model_not_converted(monkeypatch):
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
 
 
-def _capability_model_class(
-    name, *, folds, prefill_group=None, raises=False, as_callable=True
-):
+def _capability_model_class(name, *, folds, raises=False, as_callable=True):
     """A stand-in model class declaring the lane fold in ``model_capabilities``."""
 
     def _folds():
@@ -165,10 +163,6 @@ def _capability_model_class(
         return folds
 
     capabilities = {"folds_dp_into_lanes": _folds if as_callable else folds}
-    if prefill_group is not None:
-        capabilities["lane_prefill_group"] = (
-            (lambda: prefill_group) if as_callable else prefill_group
-        )
     return type(name, (), {"model_capabilities": capabilities})
 
 
@@ -186,23 +180,19 @@ def test_model_capability_folds_dp_into_lanes(monkeypatch):
     assert tt_config.uses_tt_lane_coordinator(config)
     assert config.scheduler_config.max_num_seqs == 128
     assert tt_config.get_tt_per_lane_max_num_seqs(config) == 32
-    assert not tt_config.is_tt_lane_prefill_group(config)
 
 
-def test_plain_boolean_capabilities_fold_and_group(monkeypatch):
+def test_plain_boolean_capability_folds(monkeypatch):
     monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
     monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
     config = _vllm_config(data_parallel_size=2, max_num_seqs=4)
 
     tt_platform._convert_dp_to_lanes(
-        config,
-        _capability_model_class(
-            "PlainBooleans", folds=True, prefill_group=True, as_callable=False
-        ),
+        config, _capability_model_class("PlainBoolean", folds=True, as_callable=False)
     )
 
     assert tt_config.get_tt_data_parallel_size(config) == 2
-    assert tt_config.is_tt_lane_prefill_group(config)
+    assert config.scheduler_config.max_num_seqs == 8
 
 
 def test_false_capability_keeps_standard_dp(monkeypatch):
@@ -238,16 +228,3 @@ def test_raising_capability_fails_the_launch(monkeypatch):
 
     assert config.parallel_config.data_parallel_size == 4
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
-
-
-def test_lane_prefill_group_capability_recorded(monkeypatch):
-    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
-    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
-    config = _vllm_config(data_parallel_size=2, max_num_seqs=4)
-
-    tt_platform._convert_dp_to_lanes(
-        config, _capability_model_class("GroupOn", folds=True, prefill_group=True)
-    )
-
-    assert tt_config.get_tt_data_parallel_size(config) == 2
-    assert tt_config.is_tt_lane_prefill_group(config)

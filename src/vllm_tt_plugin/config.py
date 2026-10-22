@@ -59,7 +59,6 @@ def get_tt_seeded_sampling_policy(
 # store_tt_spec_plan; read by get_tt_data_parallel_size,
 # get_tt_output_tokens_per_step and get_tt_spec_plan.
 _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
-_LANE_PREFILL_GROUP_KEY = "_tt_lane_prefill_group"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
 _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
@@ -79,28 +78,6 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     """
     additional = getattr(vllm_config, "additional_config", None) or {}
     return int(additional.get(_RESOLVED_LANE_COUNT_KEY, 1))
-
-
-def is_tt_lane_prefill_group(vllm_config: "VllmConfig") -> bool:
-    """Whether the model declared lane-group prefill (fold rails only).
-
-    Set by ``TTPlatform``'s DP-to-lanes conversion when the model class
-    declares ``model_capabilities["lane_prefill_group"]``: each lane scheduler
-    then admits at most ONE new prefill per step and the lane coordinator
-    holds prefill briefly while lanes gather, so merged prefill steps arrive
-    as pure lane groups the model can prefill in one multi-pipe chunk walk.
-    """
-    additional = getattr(vllm_config, "additional_config", None) or {}
-    return bool(additional.get(_LANE_PREFILL_GROUP_KEY, False))
-
-
-def store_tt_lane_prefill_group(vllm_config: "VllmConfig") -> None:
-    """Record the model's lane-group prefill capability on the config."""
-    additional = getattr(vllm_config, "additional_config", None)
-    if not isinstance(additional, dict):
-        additional = {}
-        vllm_config.additional_config = additional
-    additional[_LANE_PREFILL_GROUP_KEY] = True
 
 
 def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
