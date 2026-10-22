@@ -188,3 +188,39 @@ def test_decode_only_hides_continuations_and_restores_them(monkeypatch):
 
     assert seen["running"] == [decode]
     assert scheduler.running == [decode, continuation]
+
+
+@pytest.mark.parametrize(
+    ("cap", "running", "expected_max"),
+    [
+        # No cap: the waiting loop sees the slots the hidden decode leaves (8 - 1).
+        (0, [_running()], 7),
+        # Cap of one, nothing mid-chunks: exactly one new prefill may be admitted.
+        (1, [_running()], 1),
+        # A partial prefill of this lane is mid-chunks: it advances, nothing new joins.
+        (1, [_running(), _running(is_prefill_chunk=True)], 1),
+        (2, [_running(is_prefill_chunk=True), _running(is_prefill_chunk=True)], 2),
+    ],
+)
+def test_lane_prefill_admission_cap_bounds_new_prefills(
+    monkeypatch, cap, running, expected_max
+):
+    """``lane_prefill_admissions_per_step`` keeps a merged prefill step a pure
+    lane group: at most ``cap`` new prefills per lane, none while a partial
+    prefill is mid-chunks."""
+    scheduler = _scheduler(
+        running=running, waiting=3, mode=TTSchedulingMode.PREFILL_ONLY
+    )
+    scheduler._prefill_admissions_per_step = cap
+    seen = {}
+
+    def fake_base_schedule(self, throttle_prefills=False):
+        seen["max_num_running_reqs"] = self.max_num_running_reqs
+        return SchedulerOutput.make_empty()
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_base_schedule)
+
+    scheduler.schedule()
+
+    assert seen["max_num_running_reqs"] == expected_max
+    assert scheduler.max_num_running_reqs == 8

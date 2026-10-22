@@ -16,6 +16,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.request import RequestStatus
 
+from vllm_tt_plugin import lane_scheduler as lane_scheduler_module
 from vllm_tt_plugin.lane_scheduler import (
     TTLaneCoordinator,
     TTStepPlan,
@@ -691,3 +692,135 @@ def test_finish_requests_result_is_routable_per_client():
     for r in aborted:
         by_client[r.client_index].add(r.request_id)
     assert by_client == {0: {"a", "c"}, 1: {"b"}}
+
+
+def _prompt(rid, ids):
+    return SimpleNamespace(request_id=rid, prompt_token_ids=list(ids))
+
+
+def _affinity_coordinator(lanes, tokens=8, slack=4):
+    coordinator = _make_coordinator(lanes)
+    coordinator._prefix_affinity_tokens = tokens
+    coordinator._prefix_affinity_slack = slack
+    coordinator._prefix_lane = collections.OrderedDict()
+    return coordinator
+
+
+def test_prefix_affinity_keeps_a_shared_prefix_on_its_lane():
+    lanes = [FakeLane() for _ in range(4)]
+    coordinator = _affinity_coordinator(lanes)
+    shared = list(range(100, 116))
+    first = coordinator._pick_lane(_prompt("a", shared + [1]))
+    # Another lane is now strictly less loaded, but the cached lane is within the slack.
+    lanes[first].running.append(SimpleNamespace(is_prefill_chunk=False))
+    assert coordinator._pick_lane(_prompt("b", shared + [2])) == first
+    # A different prefix follows the plain least-loaded rule.
+    assert coordinator._pick_lane(_prompt("c", list(range(200, 216)))) != first
+    # Queued work on the cached lane does not push the prefix away while the
+    # lane still has a free slot: re-prefilling the prefix elsewhere costs more
+    # than waiting for the slot.
+    lanes[first].waiting.extend([object()] * 2)
+    assert coordinator._pick_lane(_prompt("d", shared + [3])) == first
+    # Once the cached lane is full, the slack rule decides: past it, load wins.
+    coordinator._per_lane_max = len(lanes[first].waiting) + len(lanes[first].running)
+    assert coordinator._pick_lane(_prompt("e", shared + [4])) != first
+
+
+def test_prefix_affinity_ignores_short_prompts_and_can_be_disabled():
+    lanes = [FakeLane(running=1), FakeLane()]
+    coordinator = _affinity_coordinator(lanes, tokens=8)
+    assert (
+        coordinator._pick_lane(_prompt("a", [1, 2, 3])) == 1
+    )  # too short for a prefix: least-loaded
+    lanes[1].running.append(SimpleNamespace(is_prefill_chunk=False))
+    lanes[1].running.append(SimpleNamespace(is_prefill_chunk=False))
+    assert coordinator._pick_lane(_prompt("b", [1, 2, 3])) == 0
+    disabled = _affinity_coordinator([FakeLane(running=1), FakeLane()], tokens=0)
+    shared = list(range(16))
+    assert disabled._pick_lane(_prompt("c", shared)) == 1
+    disabled.lanes[1].running.extend([SimpleNamespace(is_prefill_chunk=False)] * 2)
+    assert disabled._pick_lane(_prompt("d", shared)) == 0  # no memory of the prefix
+
+
+def test_coordinators_built_without_affinity_state_keep_the_plain_policy():
+    coordinator = _make_coordinator([FakeLane(running=2), FakeLane()])
+    assert coordinator._pick_lane(_prompt("a", list(range(64)))) == 1
+    assert coordinator._pick_lane() == 1
+
+
+# ---------------------------------------------------------------------------
+# Lane-group prefill gather (``lane_prefill_gather_ms`` in the tt config)
+# ---------------------------------------------------------------------------
+
+
+def _gather_coordinator(lanes, *, gather_ms=150.0):
+    coordinator = _make_coordinator(lanes)
+    coordinator._group_gather_ms = gather_ms
+    coordinator._group_gather_start = None
+    return coordinator
+
+
+def _fixed_clock(monkeypatch, start=100.0):
+    """A monotonic clock the test advances by hand (seconds)."""
+    clock = [start]
+    monkeypatch.setattr(
+        lane_scheduler_module, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    return clock
+
+
+def test_group_gather_holds_prefill_until_the_window_expires(monkeypatch):
+    clock = _fixed_clock(monkeypatch)
+    lanes = [FakeLane(waiting=1), FakeLane(running=1), FakeLane(), FakeLane()]
+    coordinator = _gather_coordinator(lanes, gather_ms=150.0)
+
+    # One of four lanes holds a new prefill and a decode can run meanwhile:
+    # the step is forced to decode and the gather window opens.
+    assert coordinator._negotiate_forced_mode() is TTSchedulingMode.DECODE_ONLY
+    assert coordinator._group_gather_start == clock[0]
+    clock[0] += 0.100
+    assert coordinator._negotiate_forced_mode() is TTSchedulingMode.DECODE_ONLY
+    # Past the window the held prefill is admitted and the window is closed.
+    clock[0] += 0.060
+    assert coordinator._negotiate_forced_mode() is TTSchedulingMode.PREFILL_ONLY
+    assert coordinator._group_gather_start is None
+
+
+def test_group_gather_admits_at_once_when_every_or_no_lane_waits(monkeypatch):
+    _fixed_clock(monkeypatch)
+    every = _gather_coordinator([FakeLane(waiting=1, running=1), FakeLane(waiting=1)])
+    assert every._wants_group_gather_decode() is False
+    assert every._negotiate_forced_mode() is TTSchedulingMode.PREFILL_ONLY
+    none = _gather_coordinator([FakeLane(running=1), FakeLane()])
+    assert none._wants_group_gather_decode() is False
+    assert none._group_gather_start is None
+
+
+def test_group_gather_needs_a_running_decode_to_hold_against(monkeypatch):
+    _fixed_clock(monkeypatch)
+    idle = _gather_coordinator([FakeLane(waiting=1), FakeLane()])
+    # An idle server admits immediately: nothing would run during the hold.
+    assert idle._wants_group_gather_decode() is False
+    assert idle._negotiate_forced_mode() is TTSchedulingMode.PREFILL_ONLY
+
+
+def test_group_gather_never_holds_a_partial_prefill(monkeypatch):
+    _fixed_clock(monkeypatch)
+    lanes = [FakeLane(waiting=1), FakeLane(running=1), FakeLane(), FakeLane()]
+    coordinator = _gather_coordinator(lanes)
+    assert coordinator._wants_group_gather_decode() is True
+    # A request mid-chunks must advance; the open window is dropped, not paused.
+    lanes[2].running.append(SimpleNamespace(is_prefill_chunk=True))
+    assert coordinator._wants_group_gather_decode() is False
+    assert coordinator._group_gather_start is None
+    assert coordinator._negotiate_forced_mode() is TTSchedulingMode.PREFILL_ONLY
+
+
+def test_group_gather_is_off_without_a_window(monkeypatch):
+    _fixed_clock(monkeypatch)
+    lanes = [FakeLane(waiting=1), FakeLane(running=1)]
+    zero = _gather_coordinator(lanes, gather_ms=0.0)
+    assert zero._wants_group_gather_decode() is False
+    assert zero._negotiate_forced_mode() is TTSchedulingMode.PREFILL_ONLY
+    # A coordinator built without __init__ carries the policy-off defaults.
+    assert _make_coordinator(lanes)._wants_group_gather_decode() is False

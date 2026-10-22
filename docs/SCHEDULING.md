@@ -344,6 +344,58 @@ advance. Every lane executes the one negotiated mode, so a per-lane decision
 would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
 each rank runs the policy on its own scheduler state.
 
+### Lane scheduling policies
+
+Two optional policies tune the lane coordinator (single-process lane TT, see
+[Queueing in Single-Process Lane TT](#queueing-in-single-process-lane-tt)) for
+a traffic pattern. Both are `--additional-config '{"tt": {...}}'` settings
+read by `config.get_tt_lane_prefix_affinity` and
+`config.get_tt_lane_prefill_policy`; neither is a model capability, and a
+model that does not fold DP into lanes never sees them.
+
+**Prefix affinity** (`lane_prefix_affinity_tokens`, default 256;
+`lane_prefix_affinity_slack`, default 4). Each lane owns a KV pool and
+therefore its own prefix cache, so a prompt that shares a cached prefix with
+an earlier request only hits if it lands on that earlier request's lane. The
+plain least-loaded rule spreads a fan-out over one shared context across the
+lanes, and every lane but the first re-prefills the whole prefix.
+`TTLaneCoordinator._pick_lane` remembers the lane per prompt prefix (the hash
+of the first `lane_prefix_affinity_tokens` token ids, 4096 most recent
+prefixes) and routes a matching prompt there while that lane still has a free
+slot; once the lane is full it only stays there while its load score is within
+`lane_prefix_affinity_slack` of the least-loaded lane. Shorter prompts keep the
+least-loaded rule. `0` disables the policy, and it is off whenever vLLM prefix
+caching is off. Balancing lanes buys nothing by itself: every lane runs in the
+same device step, so a request costs the same compute on any lane and what a
+hit saves is the whole prefix prefill.
+
+**Lane-group prefill** (`lane_prefill_admissions_per_step`, default 0;
+`lane_prefill_gather_ms`, default 0). A model with a lane-parallel prefill
+path prefills one request per lane in a single chunk walk, but only when the
+merged prefill step is a pure lane group. Two independent pieces make that the
+common case:
+
+- the admission cap: with `lane_prefill_admissions_per_step: 1` each lane
+  scheduler admits at most one new prefill per step (`TTScheduler`), and admits
+  nothing new while a partial prefill of its own is mid-chunks, so the merged
+  step covers each lane at most once;
+- the gather window: while some but not all lanes hold a new request, none is
+  mid-chunks and a decode exists to run meanwhile, the coordinator prefers a
+  decode step for up to `lane_prefill_gather_ms` so the rest of a burst can
+  arrive (`TTLaneCoordinator._wants_group_gather_decode`). An idle server admits
+  immediately, so single-request latency is untouched, and a partial prefill is
+  never held.
+
+Measured on Gemma 4 26B-A4B on a Blackhole Galaxy (one engine, 4 lanes x 32
+slots, prefix caching on), with the model-side lane-parallel prefill enabled:
+
+| Workload | Without | With |
+| --- | --- | --- |
+| Prefix affinity: 8 users continuing one cached 100K context (warm fan-out) | 5/8 cache hits, 3 re-prefills of 86K tokens; wall 209 s; aggregate decode 1.1 tok/s | 8/8 hits; wall 13.6 s; 17 tok/s |
+| Prefix affinity: same at 32K | 69 s; 3.3 tok/s | 11.6 s; 20 tok/s |
+| Lane-group prefill: 32 concurrent 4K-token prompts | TTFT median 20.6 s (max 36.6 s); 92 tok/s aggregate | 10.2 s (max 18.9 s); 158 tok/s |
+| Lane-group prefill: single request, 1K / 4K / 32K | 1.05 / 0.72 / 7.03 s | unchanged |
+
 ### Generic speculative decoding
 
 The generic speculative path uses `speculative_config` and a model's

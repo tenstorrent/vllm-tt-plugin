@@ -655,6 +655,88 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+# Lane scheduling policies (lane fold only; docs/SCHEDULING.md "Lane scheduling
+# policies"). Both are ``--additional-config '{"tt": {...}}'`` settings rather
+# than model capabilities: they tune the lane coordinator for a traffic pattern
+# (shared-prefix fan-outs, bursts of fresh prompts), not a model contract.
+_LANE_PREFIX_AFFINITY_TOKENS_KEY = "lane_prefix_affinity_tokens"
+_LANE_PREFIX_AFFINITY_SLACK_KEY = "lane_prefix_affinity_slack"
+_LANE_PREFILL_ADMISSIONS_KEY = "lane_prefill_admissions_per_step"
+_LANE_PREFILL_GATHER_MS_KEY = "lane_prefill_gather_ms"
+_LANE_PREFIX_AFFINITY_TOKENS_DEFAULT = 256
+_LANE_PREFIX_AFFINITY_SLACK_DEFAULT = 4
+_LANE_PREFILL_ADMISSIONS_DEFAULT = 0  # no cap
+_LANE_PREFILL_GATHER_MS_DEFAULT = 0.0  # no hold
+
+
+def _read_tt_non_negative_int(tt_config: dict[str, Any], key: str, default: int) -> int:
+    value = tt_config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{key}'] must be an integer >= 0, got {value!r}"
+        )
+    return value
+
+
+def _read_tt_non_negative_number(
+    tt_config: dict[str, Any], key: str, default: float
+) -> float:
+    value = tt_config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{key}'] must be a number >= 0, got {value!r}"
+        )
+    return float(value)
+
+
+def get_tt_lane_prefix_affinity(vllm_config: "VllmConfig") -> tuple[int, int]:
+    """``(prefix_tokens, load_slack)`` for lane prefix affinity.
+
+    Lanes keep independent prefix caches, so a prompt that starts like an
+    earlier one only hits the cache on that earlier lane. ``prefix_tokens`` is
+    how many leading token ids identify a prefix (0 disables affinity; shorter
+    prompts take the plain least-loaded lane) and ``load_slack`` how much more
+    loaded the cached lane may be, once it has no free slot, before load wins.
+    Affinity is off whenever vLLM prefix caching is off: without a cache there
+    is nothing to stay close to.
+    """
+    tt_config = get_tt_config(vllm_config)
+    tokens = _read_tt_non_negative_int(
+        tt_config,
+        _LANE_PREFIX_AFFINITY_TOKENS_KEY,
+        _LANE_PREFIX_AFFINITY_TOKENS_DEFAULT,
+    )
+    slack = _read_tt_non_negative_int(
+        tt_config, _LANE_PREFIX_AFFINITY_SLACK_KEY, _LANE_PREFIX_AFFINITY_SLACK_DEFAULT
+    )
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if not getattr(cache_config, "enable_prefix_caching", False):
+        tokens = 0
+    return tokens, slack
+
+
+def get_tt_lane_prefill_policy(vllm_config: "VllmConfig") -> tuple[int, float]:
+    """``(admissions_per_step, gather_ms)`` for lane-group prefill.
+
+    ``admissions_per_step`` caps how many new prefills one lane scheduler admits
+    per step (0 = no cap). With 1, the coordinator's merged prefill step covers
+    each lane at most once: a pure lane group that a model with a lane-parallel
+    prefill path prefills in one chunk walk. ``gather_ms`` holds prefill for up
+    to that long while some but not all lanes hold a new request and a decode
+    can run meanwhile, so a burst lands as one group instead of a lone step
+    followed by a forever-partial remainder (0 = never hold).
+    """
+    tt_config = get_tt_config(vllm_config)
+    return (
+        _read_tt_non_negative_int(
+            tt_config, _LANE_PREFILL_ADMISSIONS_KEY, _LANE_PREFILL_ADMISSIONS_DEFAULT
+        ),
+        _read_tt_non_negative_number(
+            tt_config, _LANE_PREFILL_GATHER_MS_KEY, _LANE_PREFILL_GATHER_MS_DEFAULT
+        ),
+    )
+
+
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
 # that starts off that grid is realigned down by the model and the whole
