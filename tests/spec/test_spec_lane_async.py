@@ -46,6 +46,7 @@ from vllm_tt_plugin.lane_scheduler import (
     _set_tt_step_state,
 )
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.scheduler import TTScheduler, get_tt_verified_drafts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     PLACEHOLDER_TOKEN_ID,
@@ -195,6 +196,7 @@ class LaneEngine:
         self.runner = runner
         self.depth = depth
         self.drafts: dict[str, list[int]] = {}
+        self.stats = stats_scheduler(runner.async_decode_scheduling)
         self.live: dict[str, int] = {}
         self.outputs: dict[str, list[int]] = {}
         self.stop_after: dict[str, int] = {}
@@ -274,6 +276,7 @@ class LaneEngine:
                 self.drafts = dict(
                     zip(handed.req_ids, handed.draft_token_ids, strict=True)
                 )
+        observe_spec_stats(self.stats, so, out)
         for req_id, index in out.req_id_to_index.items():
             if req_id in self.done or req_id not in self.outputs:
                 continue
@@ -296,6 +299,35 @@ class LaneEngine:
     def drain(self) -> None:
         while self.inflight:
             self.resolve_oldest()
+
+
+def stats_scheduler(async_scheduling: bool) -> TTScheduler:
+    """The speculative-metrics half of a lane ``TTScheduler``, nothing else."""
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.log_stats = False
+    scheduler.num_spec_tokens = K
+    scheduler.collect_spec_decoding_stats = True
+    scheduler.pending_spec_decoding_stats = None
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+    return scheduler
+
+
+def observe_spec_stats(scheduler: TTScheduler, so, out) -> None:
+    """What ``TTScheduler.update_from_output`` does for the metrics: mark the
+    unverified offer invalid, then vLLM's per-request observation."""
+    if scheduler.scheduler_config.async_scheduling:
+        scheduler._mark_unverified_drafts_invalid(so, out)
+    for req_id, index in out.req_id_to_index.items():
+        offered = so.scheduled_spec_decode_tokens.get(req_id)
+        generated = out.sampled_token_ids[index]
+        if offered and generated:
+            scheduler.make_spec_decoding_stats(
+                None,
+                len(offered),
+                len(generated) - 1,
+                so.num_invalid_spec_tokens,
+                req_id,
+            )
 
 
 def expected_greedy(tokens: list[int], count: int) -> list[int]:
@@ -418,3 +450,88 @@ def test_async_lane_run_emits_what_the_synchronous_one_does(policy):
 
 
 # endregion Ordinary steps overlap, verifies drain
+
+
+# region Speculative metrics
+
+
+@pytest.mark.parametrize("policy", ["always", "solo"])
+def test_spec_metrics_count_only_what_a_verify_carried(policy):
+    """Every asynchronous step is offered K placeholders, but only a verify's
+    real drafts count as drafted, and an ordinary step is no draft at all: the
+    drafted total is what the verifies carried, as it is synchronously, where
+    the scheduler delivers the real drafts."""
+
+    def run(async_scheduling: bool):
+        model = lane_device_target(draft_policy=policy)()
+        runner = lane_runner(model, async_scheduling=async_scheduling)
+        engine = LaneEngine(runner, depth=2 if async_scheduling else 1)
+        engine.add("a", 0, 1)
+        engine.add("b", 1, 9)
+        engine.add("c", 3, 17)
+        engine.run(14)
+        engine.drain()
+        verify_calls = [c for c in model.calls if c["spec_mode"] is not None]
+        drafted = sum(
+            int(c["num_valid_drafts"][row])
+            for c in verify_calls
+            for row in range(CAPACITY)
+            if int(c["positions"][row, 0]) >= 0
+        )
+        return engine, drafted
+
+    for async_scheduling in (False, True):
+        engine, drafted = run(async_scheduling)
+        stats = engine.stats.pending_spec_decoding_stats
+        assert stats is not None
+        assert stats.num_draft_tokens == drafted
+        assert 0 < stats.num_accepted_tokens < drafted
+
+
+def test_a_verify_output_reports_its_real_draft_counts():
+    model = lane_device_target(draft_policy="solo")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    engine.add("a", 0, 1)
+    engine.add("b", 1, 9)
+    engine.add("c", 3, 17)
+    engine.run(6)
+    engine.drain()
+    reports = [
+        get_tt_verified_drafts(w.get_output())
+        for w in engine.wrappers
+        if isinstance(w, AsyncTTSpecDecodeOutput)
+    ]
+    assert reports
+    # Lane 0 holds two requests and drafts nothing; lane 1's request K.
+    assert all(report == {"a": 0, "b": 0, "c": K} for report in reports)
+    plain = [w for w in engine.wrappers if isinstance(w, AsyncTTModelRunnerOutput)]
+    assert plain and all(get_tt_verified_drafts(w.get_output()) == {} for w in plain)
+
+
+def test_an_unverified_offer_is_no_draft():
+    scheduler = stats_scheduler(True)
+    so = SchedulerOutput.make_empty()
+    so.scheduled_spec_decode_tokens = {r: [PLACEHOLDER_TOKEN_ID] * K for r in "abc"}
+    so.num_invalid_spec_tokens = {"a": 1}
+    out = SimpleNamespace()
+    from vllm_tt_plugin.scheduler import set_tt_verified_drafts
+
+    set_tt_verified_drafts(out, {"a": K, "b": 1})
+    scheduler._mark_unverified_drafts_invalid(so, out)
+    # A grammar-invalidated draft stays invalid; b verified one of three; c,
+    # not reported, verified none.
+    assert so.num_invalid_spec_tokens == {"a": 1, "b": 2, "c": K}
+    for req_id, accepted in (("a", 1), ("b", 1), ("c", 0)):
+        scheduler.make_spec_decoding_stats(
+            None, K, accepted, so.num_invalid_spec_tokens, req_id
+        )
+    stats = scheduler.pending_spec_decoding_stats
+    assert (stats.num_drafts, stats.num_draft_tokens, stats.num_accepted_tokens) == (
+        2,
+        (K - 1) + 1,
+        2,
+    )
+
+
+# endregion Speculative metrics

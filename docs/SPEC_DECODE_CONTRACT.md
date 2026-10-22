@@ -563,6 +563,17 @@ the newest token. Lane mode follows the same rules over its slot grid: the
 drafter is called with every slot, and a lane step's tokens go back to the
 slots they were sampled at.
 
+vLLM's speculative decoding metrics read what the scheduler offered, and under
+asynchronous scheduling `AsyncScheduler` offers `[-1] * K` placeholders to
+every decode, so vLLM alone would count every ordinary step as K rejected
+drafts. A deferred verify's `ModelRunnerOutput` therefore reports each
+request's `num_valid_drafts` (`set_tt_verified_drafts`), and
+`TTScheduler.update_from_output` marks the rest of the offer, and the whole
+offer of a request no verify reported, in `num_invalid_spec_tokens`. vLLM
+subtracts that from the drafted count only; its rollback of
+`num_computed_tokens` still covers the whole reservation. A step left with
+nothing drafted is not counted as a draft.
+
 Two demands nevertheless reach the model, and they are what
 `supports_async_spec_decode` declares:
 
@@ -790,8 +801,10 @@ four proposals. The drafter is still asked for `effective_k` drafts on every
 step, because the next step's row count is not known when it proposes. vLLM's
 `Scheduler.update_from_output` counts each dropped draft as a rejected draft:
 it subtracts the drafts that did not commit from `num_computed_tokens`, so the
-KV accounting stays correct, and vLLM's speculative decoding metrics count the
-dropped drafts as proposed and rejected.
+KV accounting stays correct. Under synchronous scheduling vLLM's speculative
+decoding metrics count the dropped drafts as proposed and rejected; under
+asynchronous scheduling they count only the drafts a verify carried (section
+4c).
 
 **Returning to drafting is a model obligation.** The plugin keeps asking:
 `TTModelRunner.propose_after_plain_step` calls `propose_draft_tokens` after an

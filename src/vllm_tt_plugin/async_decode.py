@@ -16,7 +16,10 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    set_tt_verified_drafts,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_FUSED_SAMPLE,
@@ -386,6 +389,17 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         )
         runner_output = self._controller.runner.build_spec_runner_output(
             completed.published_req_ids, completed.prefixes, completed.logprobs
+        )
+        # What the verify really carried, per request, for vLLM's speculative
+        # metrics: the scheduler only ever offered placeholders.
+        valid = self._model_input.num_valid_drafts
+        set_tt_verified_drafts(
+            runner_output,
+            {
+                req_id: int(valid[row])
+                for row, req_id in enumerate(self._model_input.row_req_ids)
+                if req_id is not None
+            },
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)

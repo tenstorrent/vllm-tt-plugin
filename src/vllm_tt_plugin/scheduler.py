@@ -42,6 +42,21 @@ logger = init_tt_logger(__name__)
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
 _TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
+# Per request, how many real drafts the runner verified on a step, attached to
+# that step's ModelRunnerOutput (``set_tt_verified_drafts``). Under async
+# scheduling the scheduler offers placeholders, not drafts, so this is the only
+# record of what a verify carried; ``TTScheduler.update_from_output`` reads it.
+_TT_VERIFIED_DRAFTS_ATTR = "_tt_verified_drafts"
+
+
+def set_tt_verified_drafts(
+    runner_output: ModelRunnerOutput, verified: dict[str, int]
+) -> None:
+    setattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, dict(verified))
+
+
+def get_tt_verified_drafts(runner_output: ModelRunnerOutput) -> dict[str, int]:
+    return dict(getattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, {}))
 
 
 def set_tt_forced_reset_discard_counts(
@@ -1202,6 +1217,8 @@ class TTScheduler(AsyncScheduler):
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
             )
+        if self.num_spec_tokens and self.scheduler_config.async_scheduling:
+            self._mark_unverified_drafts_invalid(scheduler_output, model_runner_output)
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
@@ -1223,6 +1240,34 @@ class TTScheduler(AsyncScheduler):
             else:
                 pending[req_id] = count - 1
 
+    def _mark_unverified_drafts_invalid(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Keep vLLM's speculative metrics from counting unverified placeholders.
+
+        ``AsyncScheduler`` offers ``[-1] * K`` to every scheduled decode, and
+        vLLM's update counts the offer as drafted and everything past the
+        accepted ones as rejected (``make_spec_decoding_stats``), so an ordinary
+        decode or a verify of fewer real drafts would read as rejections. The
+        runner reports each row's real draft count on the output
+        (``set_tt_verified_drafts``); a request it did not report verified
+        none. The excess goes to ``num_invalid_spec_tokens``, which vLLM
+        subtracts from the drafted count and nothing else reads: the rollback
+        of ``num_computed_tokens`` still counts the whole reservation.
+        """
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        if not offered:
+            return
+        verified = get_tt_verified_drafts(model_runner_output)
+        invalid = dict(scheduler_output.num_invalid_spec_tokens or {})
+        for req_id, tokens in offered.items():
+            unverified = len(tokens) - min(len(tokens), verified.get(req_id, 0))
+            if unverified > invalid.get(req_id, 0):
+                invalid[req_id] = unverified
+        scheduler_output.num_invalid_spec_tokens = invalid or None
+
     def make_spec_decoding_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None,
@@ -1231,27 +1276,32 @@ class TTScheduler(AsyncScheduler):
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
     ) -> SpecDecodingStats | None:
-        """On a lane, observe the draft as the base does, into
-        ``pending_spec_decoding_stats`` for the coordinator."""
+        """Observe a step that verified at least one draft; on a lane, into
+        ``pending_spec_decoding_stats`` for the coordinator.
+
+        A step whose offer was all invalid verified nothing, and is not a draft:
+        the base scheduler would count it in ``num_drafts`` with zero tokens.
+        """
+        if num_invalid_spec_tokens:
+            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+        if num_draft_tokens <= 0:
+            return spec_decoding_stats
         if not self.collect_spec_decoding_stats:
             return super().make_spec_decoding_stats(
                 spec_decoding_stats,
                 num_draft_tokens,
                 num_accepted_tokens,
-                num_invalid_spec_tokens,
+                None,
                 request_id,
             )
-        if num_draft_tokens:
-            if self.pending_spec_decoding_stats is None:
-                self.pending_spec_decoding_stats = SpecDecodingStats.new(
-                    self.num_spec_tokens
-                )
-            if num_invalid_spec_tokens:
-                num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
-            self.pending_spec_decoding_stats.observe_draft(
-                num_draft_tokens=num_draft_tokens,
-                num_accepted_tokens=num_accepted_tokens,
+        if self.pending_spec_decoding_stats is None:
+            self.pending_spec_decoding_stats = SpecDecodingStats.new(
+                self.num_spec_tokens
             )
+        self.pending_spec_decoding_stats.observe_draft(
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+        )
         return None
 
     def _update_request_with_output(
