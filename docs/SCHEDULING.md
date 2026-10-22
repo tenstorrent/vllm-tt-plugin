@@ -191,7 +191,9 @@ vLLM set it (2048 for `vllm serve` / `server_example_tt.py`, 8192 for `LLM()`,
 or an explicit `--max-num-batched-tokens`). When chunked prefill is off and
 `max_num_batched_tokens` is smaller than `max_model_len`, it raises that token
 budget to `max_model_len` so a full prompt can be admitted instead of leaving
-an unschedulable request in `waiting`.
+an unschedulable request in `waiting`. When it turns chunked prefill off, it
+raises `max_num_scheduled_tokens` the same way if that is set, because the
+scheduler budgets each step by `max_num_scheduled_tokens` when it is set.
 
 ### Chunked prefill
 
@@ -453,6 +455,26 @@ read against the wrong output, while the engine core always hands back the
 output with no recorded decision. It sits next to the forced-reset discard
 counts, which block steps reject outright: a stale async frame cannot balance a
 K-placeholder reservation.
+
+### TT fields on `SchedulerOutput`
+
+TT attaches per-step state to `SchedulerOutput` beside its dataclass fields:
+forced-reset discard counts, the requests whose output frames the step
+reserved, block-step decisions, and lane step state.
+`TT_SCHEDULER_OUTPUT_FIELDS` in `scheduler.py` lists them all, and
+`set_tt_scheduler_output_field` refuses any other name. A scheduler that
+rebuilds a `SchedulerOutput` from its dataclass fields alone loses them; it
+copies them over with `carry_tt_scheduler_output_fields`.
+
+`TTScheduler.update_from_output` releases the step's output-frame reservations
+in its `finally`, through `tt_release_output_frames`. A subclass whose
+`update_from_output` does not reach `TTScheduler`'s calls that hook once per
+committed step itself.
+
+A scheduler paired with a TT worker may define a `validate_tt_config(vllm_config)`
+classmethod. `TTPlatform.check_and_update_config` calls it once pairing and
+capability resolution are done, so a scheduler can refuse a config it cannot run
+before any device opens. vLLM builds the scheduler only after the model loads.
 
 ### Why TT uses an async-style scheduler even in TT-specific flows
 

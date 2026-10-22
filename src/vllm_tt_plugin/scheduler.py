@@ -48,7 +48,9 @@ def set_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput, counts: dict[str, int]
 ) -> None:
     if counts:
-        setattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts))
+        set_tt_scheduler_output_field(
+            scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts)
+        )
 
 
 def get_tt_forced_reset_discard_counts(
@@ -73,13 +75,50 @@ _TT_BLOCK_STEP_DECISIONS_ATTR = "_tt_block_step_decisions"
 def set_tt_block_step_decisions(
     scheduler_output: SchedulerOutput, decisions: dict[str, bool]
 ) -> None:
-    setattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions))
+    set_tt_scheduler_output_field(
+        scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions)
+    )
 
 
 def get_tt_block_step_decisions(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, bool]:
     return dict(getattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, {}))
+
+
+# The lane coordinator's per-step state; see ``lane_scheduler.py``.
+_TT_STEP_STATE_ATTR = "_tt_step_state"
+
+# Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
+# Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
+# carries them over with ``carry_tt_scheduler_output_fields``.
+TT_SCHEDULER_OUTPUT_FIELDS = (
+    _TT_FORCED_RESET_DISCARD_COUNTS_ATTR,
+    _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
+    _TT_BLOCK_STEP_DECISIONS_ATTR,
+    _TT_STEP_STATE_ATTR,
+)
+
+
+def set_tt_scheduler_output_field(
+    scheduler_output: SchedulerOutput, name: str, value
+) -> None:
+    """Attach a TT field; ``carry_tt_scheduler_output_fields`` copies only these."""
+    if name not in TT_SCHEDULER_OUTPUT_FIELDS:
+        raise ValueError(
+            f"TT SchedulerOutput field {name!r} is not in TT_SCHEDULER_OUTPUT_FIELDS "
+            f"{TT_SCHEDULER_OUTPUT_FIELDS}"
+        )
+    setattr(scheduler_output, name, value)
+
+
+def carry_tt_scheduler_output_fields(
+    src: SchedulerOutput, dst: SchedulerOutput
+) -> None:
+    """Copy the TT fields set on ``src`` onto ``dst``."""
+    for name in TT_SCHEDULER_OUTPUT_FIELDS:
+        if hasattr(src, name):
+            setattr(dst, name, getattr(src, name))
 
 
 class TTSchedulingMode(Enum):
@@ -404,11 +443,17 @@ class TTScheduler(AsyncScheduler):
     # Host-only sampling controls and their neutral values: any of these
     # forces the step onto host sampling (check_perform_device_sampling),
     # which cannot construct a multi-token canvas and kills the engine.
-    # Penalties do not force host sampling, but a non-neutral value flips
+    # Penalties force host sampling only for a model that declares
+    # supports_device_penalties=False. Otherwise a non-neutral value flips
     # InputBatch.no_penalties and makes every block decode step build (and
     # discard) penalty token tensors that grow with the committed session
     # length; the frontend neutralizes them, so mirror that here for
     # prebuilt requests that bypassed it.
+    # The predicate's other request-driven triggers cannot fire for a
+    # block-output model: _strip_unsupported_block_controls strips structured
+    # outputs, the block-output InputBatch drops logprobs (disable_logprobs),
+    # and the platform refuses seeded_sampling_policy="host" and
+    # max_device_top_k for block output at config time.
     _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
         ("min_p", 0.0),
         ("min_tokens", 0),
@@ -422,11 +467,33 @@ class TTScheduler(AsyncScheduler):
     )
 
     def add_request(self, request: Request) -> None:
+        """Admit a request, first repairing a block-output request that skipped
+        TT request validation.
+
+        Block-output requests normally pass ``TTPlatform.validate_request``
+        through the patched ``InputProcessor``, which rejects what a
+        block-output model cannot serve. A prebuilt ``EngineCoreRequest``
+        passed to ``AsyncLLM.add_request`` or ``LLMEngine.add_request`` (an
+        API upstream deprecates), or sent through ``EngineCoreClient``, skips
+        ``InputProcessor.process_inputs`` and so skips that validation. vLLM's
+        own entrypoints never build such a request, and the platform refuses
+        the Rust frontend for block-output models at startup, so this is a
+        safety net for programmatic engine callers, not a path the served API
+        reaches.
+
+        An exception from ``add_request`` tears down EngineCore for every
+        client. So instead of rejecting, the request repair layer
+        (``_repair_unvalidated_block_request``) changes the request until it
+        is servable, logs one warning per change, and lets the request finish
+        normally; the caller is not told. Because the change is silent, the
+        Rust frontend stays refused: it would send all traffic down this path
+        instead of rejecting unsupported requests.
+        """
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
                 # A continuation (next input chunk or the closing sentinel) of
-                # a session whose resumable flag the neutralization below
+                # a session whose resumable flag _strip_unsupported_block_controls
                 # scrubbed. The base scheduler asserts on the missing
                 # streaming_queue, which would tear down EngineCore. The
                 # session cannot accept more input, so drop the message; the
@@ -437,32 +504,24 @@ class TTScheduler(AsyncScheduler):
                     request.request_id,
                 )
                 return
-            self._truncate_unservable_block_prompt(request)
-            self._align_block_output_max_tokens(request)
-            self._neutralize_block_output_host_sampling(request)
+            self._repair_unvalidated_block_request(request)
         super().add_request(request)
 
-    def _truncate_unservable_block_prompt(self, request: Request) -> None:
-        """Contain a bypassed prompt that leaves no room for a whole canvas.
+    def _repair_unvalidated_block_request(self, request: Request) -> None:
+        """Make a block-output request that skipped validation servable.
 
-        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
-        skips it, and neither upstream EngineCore.add_request nor the base
-        scheduler re-checks prompt length. Admitted untouched, the prompt
-        either can never be scheduled (chunked prefill is disabled and the
-        prompt exceeds the token budget: parked in WAITING forever,
-        head-of-line blocking every later request), overflows the worker's
-        max_model_len-wide token buffer, or — even when it fits
-        max_model_len — trips the adapter's own canvas-capacity validation,
-        which raises out of execute_model in eager (no-upfront-capture) mode
-        where there is no graceful stop-canvas rejection. Truncate to the
-        largest tile-aligned prompt that still fits one whole canvas below
-        the tile-floored max_model_len, so every admitted request is
-        genuinely servable and finishes through the normal notifying path.
-        Prefix caching is disabled for block models (__init__ asserts it), so
-        the request's stale block hashes stay inert.
+        The prompt repairs run first, in this order, because each reads the
+        prompt the previous one left. The max_tokens clamp needs the final
+        prompt length. The control strip is independent of the prompt.
         """
-        from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
+        self._drop_unencodable_mm_features(request)
+        self._replace_prompt_embeds_with_placeholders(request)
+        self._pad_empty_prompt(request)
+        self._truncate_overlong_prompt(request)
+        self._clamp_max_tokens_to_whole_canvases(request)
+        self._strip_unsupported_block_controls(request)
 
+    def _drop_unencodable_mm_features(self, request: Request) -> None:
         if request.mm_features:
             # A text-only block model has a zero encoder budget: a feature at
             # offset 0 forces zero-token schedules forever (head-of-line
@@ -475,6 +534,8 @@ class TTScheduler(AsyncScheduler):
                 request.request_id,
             )
             request.mm_features = []
+
+    def _replace_prompt_embeds_with_placeholders(self, request: Request) -> None:
         if request.prompt_token_ids is None and request.num_prompt_tokens > 0:
             # The frontend rejects prompt_embeds for every TT model; admitted
             # bare, the worker's request-state builder raises
@@ -506,6 +567,8 @@ class TTScheduler(AsyncScheduler):
             )
             request.prompt_embeds = None
             request.prompt_is_token_ids = None
+
+    def _pad_empty_prompt(self, request: Request) -> None:
         if request.num_prompt_tokens == 0:
             # The frontend rejects empty prompts; admitted bare, the waiting
             # loop schedules zero new tokens and upstream's num_new_tokens
@@ -520,7 +583,28 @@ class TTScheduler(AsyncScheduler):
             request.prompt_embeds = None
             request._all_token_ids.append(0)
             request.num_prompt_tokens = 1
-            return
+
+    def _truncate_overlong_prompt(self, request: Request) -> None:
+        """Contain a bypassed prompt that leaves no room for a whole canvas.
+
+        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
+        skips it, and neither upstream EngineCore.add_request nor the base
+        scheduler re-checks prompt length. Admitted untouched, the prompt
+        either can never be scheduled (chunked prefill is disabled and the
+        prompt exceeds the token budget: parked in WAITING forever,
+        head-of-line blocking every later request), overflows the worker's
+        max_model_len-wide token buffer, or, even when it fits
+        max_model_len, trips the adapter's own canvas-capacity validation,
+        which raises out of execute_model in eager (no-upfront-capture) mode
+        where there is no graceful stop-canvas rejection. Truncate to the
+        largest tile-aligned prompt that still fits one whole canvas below
+        the tile-floored max_model_len, so every admitted request is
+        genuinely servable and finishes through the normal notifying path.
+        Prefix caching is disabled for block models (__init__ asserts it), so
+        the request's stale block hashes stay inert.
+        """
+        from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
+
         tile = _TT_TOKEN_TILE_SIZE
         max_model_len = int(self.vllm_config.model_config.max_model_len)
         aligned_max_model_len = max_model_len // tile * tile
@@ -544,7 +628,7 @@ class TTScheduler(AsyncScheduler):
         del request._all_token_ids[keep:]
         request.num_prompt_tokens = keep
 
-    def _align_block_output_max_tokens(self, request: Request) -> None:
+    def _clamp_max_tokens_to_whole_canvases(self, request: Request) -> None:
         """Clamp max_tokens so a bypassed EngineCoreRequest cannot overshoot.
 
         Frontend validation rejects an oversized limit. Prebuilt requests skip
@@ -565,8 +649,18 @@ class TTScheduler(AsyncScheduler):
         )
         if fitted == request.max_tokens:
             return
-        # The prompt truncation above guarantees at least one whole canvas
-        # fits, so a clamp always leaves a positive, servable budget.
+        # _truncate_overlong_prompt leaves room for one whole canvas, and the
+        # platform's startup floor (_min_block_output_max_model_len) makes
+        # that room exist. Deliberate fail-fast for developers: it fires only
+        # if the repair steps are reordered, never for a client request.
+        if fitted <= 0:
+            raise RuntimeError(
+                f"Block-output max_tokens clamp for request {request.request_id} "
+                f"left no budget: prompt_len={len(prompt_ids)}, "
+                f"max_tokens={request.max_tokens}, fitted={fitted}, "
+                f"output_tokens_per_step={self._output_tokens_per_step}, "
+                f"max_model_len={self.vllm_config.model_config.max_model_len}"
+            )
         logger.debug(
             "Clamping block-output max_tokens from %s to %s for request %s "
             "so physical canvases fit max_model_len",
@@ -577,7 +671,7 @@ class TTScheduler(AsyncScheduler):
         request.max_tokens = fitted
         request.sampling_params.max_tokens = fitted
 
-    def _neutralize_block_output_host_sampling(self, request: Request) -> None:
+    def _strip_unsupported_block_controls(self, request: Request) -> None:
         """Strip controls a block-output model cannot honor from a bypassed
         request: host-sampling forcers, structured outputs, and resumable
         streaming-input sessions.
@@ -930,7 +1024,9 @@ class TTScheduler(AsyncScheduler):
         )
         # The parent computes whether this chunk produces output. Retain that
         # decision on this step because a later schedule changes the request.
-        setattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids)
+        set_tt_scheduler_output_field(
+            scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids
+        )
         pending = getattr(self, "_pending_async_output_frames", None)
         if pending is None:
             pending = self._pending_async_output_frames = {}
@@ -1110,13 +1206,22 @@ class TTScheduler(AsyncScheduler):
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
             self._committing_block_step_decisions = {}
-            pending = self._pending_async_output_frames
-            for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
-                count = pending.get(req_id, 0)
-                if count <= 1:
-                    pending.pop(req_id, None)
-                else:
-                    pending[req_id] = count - 1
+            self.tt_release_output_frames(scheduler_output)
+
+    def tt_release_output_frames(self, scheduler_output: SchedulerOutput) -> None:
+        """Release the output frames ``scheduler_output`` reserved.
+
+        Call it exactly once per committed step, as ``update_from_output`` does from
+        its ``finally``. A subclass whose ``update_from_output`` does not reach this
+        class's must call it the same way.
+        """
+        pending = self._pending_async_output_frames
+        for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
+            count = pending.get(req_id, 0)
+            if count <= 1:
+                pending.pop(req_id, None)
+            else:
+                pending[req_id] = count - 1
 
     def make_spec_decoding_stats(
         self,
