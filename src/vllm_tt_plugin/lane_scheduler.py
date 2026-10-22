@@ -47,7 +47,8 @@ from vllm.v1.metrics.stats import SchedulerStats
 
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
-    get_tt_lane_prefill_policy,
+    get_tt_lane_prefill_gather_ms,
+    get_tt_lane_prefill_group,
     get_tt_lane_prefix_affinity,
     get_tt_per_lane_max_num_seqs,
 )
@@ -317,7 +318,12 @@ class TTLaneCoordinator(SchedulerInterface):
         # group instead of a lone B=1 step followed by a forever-partial
         # remainder. Only bites when a decode exists to run; an idle server
         # admits immediately (b1 latency untouched). 0 (the default) disables.
-        _, self._group_gather_ms = get_tt_lane_prefill_policy(vllm_config)
+        # A gathered step only pays off for a model that prefills the lanes as a group.
+        self._group_gather_ms = (
+            get_tt_lane_prefill_gather_ms(vllm_config)
+            if get_tt_lane_prefill_group(vllm_config)
+            else 0.0
+        )
         self._group_gather_start: float | None = None
 
         # Each lane scheduler must cap its running set at the *per-lane*

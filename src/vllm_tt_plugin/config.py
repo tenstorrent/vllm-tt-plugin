@@ -98,6 +98,36 @@ def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
     additional[_RESOLVED_LANE_COUNT_KEY] = lanes
 
 
+# Platform-derived, like _RESOLVED_LANE_COUNT_KEY: the model's
+# ``model_capabilities["lane_prefill_group"]`` as resolved by the Galaxy
+# DP-to-lanes conversion, so the lane schedulers (built in the engine process)
+# can read it without the model class.
+_LANE_PREFILL_GROUP_KEY = "_tt_lane_prefill_group"
+
+
+def get_tt_lane_prefill_group(vllm_config: "VllmConfig") -> bool:
+    """Whether the model prefills a merged lane step as one lane group.
+
+    True only under the lane fold, for a model declaring
+    ``model_capabilities["lane_prefill_group"]``: it prefills one request per
+    lane in a single chunk walk, so a merged prefill step should cover each
+    lane at most once (``TTScheduler``) and a partial burst may briefly gather
+    (``lane_prefill_gather_ms``). Recorded by ``store_tt_lane_prefill_group``;
+    not user-facing.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_LANE_PREFILL_GROUP_KEY, False))
+
+
+def store_tt_lane_prefill_group(vllm_config: "VllmConfig", enabled: bool) -> None:
+    """Record the model's lane-group prefill declaration on the config."""
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_LANE_PREFILL_GROUP_KEY] = bool(enabled)
+
+
 def get_tt_output_tokens_per_step(vllm_config: "VllmConfig") -> int:
     """Return the normalized model output width, defaulting to AR behavior.
 
@@ -656,16 +686,15 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
 
 
 # Lane scheduling policies (lane fold only; docs/SCHEDULING.md "Lane scheduling
-# policies"). Both are ``--additional-config '{"tt": {...}}'`` settings rather
-# than model capabilities: they tune the lane coordinator for a traffic pattern
-# (shared-prefix fan-outs, bursts of fresh prompts), not a model contract.
+# policies"). These are ``--additional-config '{"tt": {...}}'`` settings: they
+# tune the lane coordinator for a traffic pattern (shared-prefix fan-outs,
+# bursts of fresh prompts). What the model can do with a lane step is a model
+# capability instead (``lane_prefill_group``, see get_tt_lane_prefill_group).
 _LANE_PREFIX_AFFINITY_TOKENS_KEY = "lane_prefix_affinity_tokens"
 _LANE_PREFIX_AFFINITY_SLACK_KEY = "lane_prefix_affinity_slack"
-_LANE_PREFILL_ADMISSIONS_KEY = "lane_prefill_admissions_per_step"
 _LANE_PREFILL_GATHER_MS_KEY = "lane_prefill_gather_ms"
 _LANE_PREFIX_AFFINITY_TOKENS_DEFAULT = 256
 _LANE_PREFIX_AFFINITY_SLACK_DEFAULT = 4
-_LANE_PREFILL_ADMISSIONS_DEFAULT = 0  # no cap
 _LANE_PREFILL_GATHER_MS_DEFAULT = 0.0  # no hold
 
 
@@ -715,25 +744,18 @@ def get_tt_lane_prefix_affinity(vllm_config: "VllmConfig") -> tuple[int, int]:
     return tokens, slack
 
 
-def get_tt_lane_prefill_policy(vllm_config: "VllmConfig") -> tuple[int, float]:
-    """``(admissions_per_step, gather_ms)`` for lane-group prefill.
+def get_tt_lane_prefill_gather_ms(vllm_config: "VllmConfig") -> float:
+    """How long a partial lane group may gather before prefill goes ahead.
 
-    ``admissions_per_step`` caps how many new prefills one lane scheduler admits
-    per step (0 = no cap). With 1, the coordinator's merged prefill step covers
-    each lane at most once: a pure lane group that a model with a lane-parallel
-    prefill path prefills in one chunk walk. ``gather_ms`` holds prefill for up
-    to that long while some but not all lanes hold a new request and a decode
-    can run meanwhile, so a burst lands as one group instead of a lone step
-    followed by a forever-partial remainder (0 = never hold).
+    While some but not all lanes hold a new request and a decode can run
+    meanwhile, the coordinator prefers decode for up to this long so a burst
+    lands as one lane group instead of a lone step followed by a forever-partial
+    remainder (0 = never hold). Only consulted for a model that declares
+    ``lane_prefill_group``; other models gain nothing from a gathered step.
     """
     tt_config = get_tt_config(vllm_config)
-    return (
-        _read_tt_non_negative_int(
-            tt_config, _LANE_PREFILL_ADMISSIONS_KEY, _LANE_PREFILL_ADMISSIONS_DEFAULT
-        ),
-        _read_tt_non_negative_number(
-            tt_config, _LANE_PREFILL_GATHER_MS_KEY, _LANE_PREFILL_GATHER_MS_DEFAULT
-        ),
+    return _read_tt_non_negative_number(
+        tt_config, _LANE_PREFILL_GATHER_MS_KEY, _LANE_PREFILL_GATHER_MS_DEFAULT
     )
 
 

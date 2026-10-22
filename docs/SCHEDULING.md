@@ -350,8 +350,11 @@ Two optional policies tune the lane coordinator (single-process lane TT, see
 [Queueing in Single-Process Lane TT](#queueing-in-single-process-lane-tt)) for
 a traffic pattern. Both are `--additional-config '{"tt": {...}}'` settings
 read by `config.get_tt_lane_prefix_affinity` and
-`config.get_tt_lane_prefill_policy`; neither is a model capability, and a
-model that does not fold DP into lanes never sees them.
+`config.get_tt_lane_prefill_gather_ms`; they tune the coordinator for a traffic
+pattern and a model that does not fold DP into lanes never sees them. Whether a
+model prefills a lane step as one group is its own declaration
+(`model_capabilities["lane_prefill_group"]`, recorded with the fold and read by
+`config.get_tt_lane_prefill_group`).
 
 **Prefix affinity** (`lane_prefix_affinity_tokens`, default 256;
 `lane_prefix_affinity_slack`, default 4). Each lane owns a KV pool and
@@ -369,16 +372,15 @@ caching is off. Balancing lanes buys nothing by itself: every lane runs in the
 same device step, so a request costs the same compute on any lane and what a
 hit saves is the whole prefix prefill.
 
-**Lane-group prefill** (`lane_prefill_admissions_per_step`, default 0;
-`lane_prefill_gather_ms`, default 0). A model with a lane-parallel prefill
-path prefills one request per lane in a single chunk walk, but only when the
-merged prefill step is a pure lane group. Two independent pieces make that the
-common case:
+**Lane-group prefill** (`lane_prefill_group` capability; `lane_prefill_gather_ms`,
+default 0). A model with a lane-parallel prefill path prefills one request per
+lane in a single chunk walk, but only when the merged prefill step is a pure
+lane group. Two pieces make that the common case:
 
-- the admission cap: with `lane_prefill_admissions_per_step: 1` each lane
-  scheduler admits at most one new prefill per step (`TTScheduler`), and admits
-  nothing new while a partial prefill of its own is mid-chunks, so the merged
-  step covers each lane at most once;
+- the admission cap, from the capability: each lane scheduler admits at most
+  one new prefill per step (`TTScheduler`), and admits nothing new while a
+  partial prefill of its own is mid-chunks, so the merged step covers each lane
+  at most once;
 - the gather window: while some but not all lanes hold a new request, none is
   mid-chunks and a decode exists to run meanwhile, the coordinator prefers a
   decode step for up to `lane_prefill_gather_ms` so the rest of a burst can

@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_tt_plugin.config import (
-    get_tt_lane_prefill_policy,
+    get_tt_lane_prefill_gather_ms,
+    get_tt_lane_prefill_group,
     get_tt_lane_prefix_affinity,
+    store_tt_lane_prefill_group,
 )
 
 
@@ -41,19 +43,29 @@ def test_prefix_affinity_settings_are_read_and_validated():
             get_tt_lane_prefix_affinity(_config(bad))
 
 
-def test_lane_prefill_policy_defaults_to_no_cap_and_no_hold():
-    assert get_tt_lane_prefill_policy(_config()) == (0, 0.0)
-    assert get_tt_lane_prefill_policy(SimpleNamespace(additional_config={})) == (0, 0.0)
+def test_lane_prefill_gather_defaults_to_no_hold():
+    assert get_tt_lane_prefill_gather_ms(_config()) == 0.0
+    assert get_tt_lane_prefill_gather_ms(SimpleNamespace(additional_config={})) == 0.0
 
 
-def test_lane_prefill_policy_settings_are_read_and_validated():
-    tt = {"lane_prefill_admissions_per_step": 1, "lane_prefill_gather_ms": 150}
-    assert get_tt_lane_prefill_policy(_config(tt)) == (1, 150.0)
-    assert get_tt_lane_prefill_policy(_config({"lane_prefill_gather_ms": 12.5})) == (
-        0,
-        12.5,
+def test_lane_prefill_gather_is_read_and_validated():
+    assert (
+        get_tt_lane_prefill_gather_ms(_config({"lane_prefill_gather_ms": 150})) == 150.0
     )
-    with pytest.raises(ValueError, match="must be an integer >= 0"):
-        get_tt_lane_prefill_policy(_config({"lane_prefill_admissions_per_step": True}))
+    assert (
+        get_tt_lane_prefill_gather_ms(_config({"lane_prefill_gather_ms": 12.5})) == 12.5
+    )
     with pytest.raises(ValueError, match="must be a number >= 0"):
-        get_tt_lane_prefill_policy(_config({"lane_prefill_gather_ms": -1}))
+        get_tt_lane_prefill_gather_ms(_config({"lane_prefill_gather_ms": -1}))
+
+
+def test_lane_prefill_group_is_a_recorded_model_declaration_not_a_setting():
+    """The group behaviour comes from the model's capability (recorded by the
+    fold), never from the user's tt config."""
+    config = _config({"lane_prefill_group": True})
+    assert get_tt_lane_prefill_group(config) is False
+    store_tt_lane_prefill_group(config, True)
+    assert get_tt_lane_prefill_group(config) is True
+    store_tt_lane_prefill_group(config, False)
+    assert get_tt_lane_prefill_group(config) is False
+    assert get_tt_lane_prefill_group(SimpleNamespace(additional_config={})) is False

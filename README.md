@@ -339,8 +339,7 @@ Common options:
 | `decode_interleave_decode_steps` | How many decode-only steps one insertion runs. Reaching this count stops the policy choosing decode; it never forces a prefill step. Does not loosen the latency bound; buys more decode progress per insertion, and more cheaply than a shorter prefill run does. Default: `1`. |
 | `lane_prefix_affinity_tokens` | Lane fold only. Lanes keep independent prefix caches, so a prompt whose first N token ids match an earlier prompt is sent to that earlier lane while it has a free slot (otherwise within `lane_prefix_affinity_slack` of the least-loaded lane). `0` disables; off whenever `--no-enable-prefix-caching`. Default: `256`. See [SCHEDULING.md](docs/SCHEDULING.md#lane-scheduling-policies). |
 | `lane_prefix_affinity_slack` | How much higher the cached lane's load score may be, once it has no free slot, before the least-loaded lane wins. Default: `4`. |
-| `lane_prefill_admissions_per_step` | Lane fold only. New prefills each lane scheduler admits per step; `1` makes every merged prefill step a pure lane group (each lane at most once) for models with a lane-parallel prefill path. Default: `0` (token budget only). |
-| `lane_prefill_gather_ms` | Lane fold only. While some but not all lanes hold a new request and a decode can run meanwhile, hold prefill for up to this long so a burst lands as one lane group. Default: `0` (never hold). |
+| `lane_prefill_gather_ms` | Lane fold only, for a model declaring `lane_prefill_group`. While some but not all lanes hold a new request and a decode can run meanwhile, hold prefill for up to this long so a burst lands as one lane group. Default: `0` (never hold). |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
 

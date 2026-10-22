@@ -228,3 +228,23 @@ def test_raising_capability_fails_the_launch(monkeypatch):
 
     assert config.parallel_config.data_parallel_size == 4
     assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
+
+
+def _group_model_class(name, *, group):
+    """A folding model class that may also declare lane-group prefill."""
+    capabilities = {"folds_dp_into_lanes": True, "lane_prefill_group": group}
+    return type(name, (), {"model_capabilities": capabilities})
+
+
+@pytest.mark.parametrize("group", [False, True])
+def test_fold_records_the_lane_prefill_group_declaration(monkeypatch, group):
+    """The lane schedulers are built in the engine process without the model
+    class, so the fold records the declaration next to the lane count."""
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=8)
+
+    tt_platform._convert_dp_to_lanes(config, _group_model_class("Grouped", group=group))
+
+    assert tt_config.get_tt_data_parallel_size(config) == 4
+    assert tt_config.get_tt_lane_prefill_group(config) is group
