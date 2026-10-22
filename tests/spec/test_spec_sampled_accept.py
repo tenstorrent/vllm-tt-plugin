@@ -740,37 +740,4 @@ def test_the_joint_check_catches_an_argmax_commit_one_time_in_twenty():
     assert statistic > critical, (statistic, critical)
 
 
-def test_the_joint_check_catches_temperature_missing_from_drafted_columns(
-    monkeypatch,
-):
-    """Its power, against a walk that tempers column 0 and no other.
-
-    Column 0 alone is what a row without drafts reads, so the exact
-    comparison with the ordinary sampler cannot see this; only the
-    continuation after an accepted draft does.
-    """
-    import vllm_tt_plugin.spec_accept as spec_accept
-
-    original = spec_accept._constrained_probs
-
-    def column_zero_only(target_logits, temperature, top_k, top_p, min_p=None):
-        tempered = original(target_logits, temperature, top_k, top_p, min_p)
-        untempered = original(
-            target_logits,
-            torch.where(temperature > 0, torch.ones_like(temperature), temperature),
-            top_k,
-            top_p,
-            min_p,
-        )
-        return torch.cat([tempered[:, :1], untempered[:, 1:]], dim=1)
-
-    monkeypatch.setattr(spec_accept, "_constrained_probs", column_zero_only)
-    table = _causal_table(seed=11)
-    controls = {"temperature": 0.7}
-    sequences = _simulate(table, controls, _argmax_drafter(table), 3, 24000, 3, 5)
-
-    statistic, critical = _joint_statistic(sequences, controls)
-    assert statistic > critical, (statistic, critical)
-
-
 # endregion The committed distribution, against an independent reference

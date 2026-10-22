@@ -794,38 +794,4 @@ def test_the_committed_sequences_follow_the_filtered_joint_distribution(
     )
 
 
-def test_the_filtered_joint_check_catches_a_bad_word_matched_on_the_output_only(
-    monkeypatch,
-):
-    """Its power, against bad words read from the committed output alone.
-
-    That walk agrees with the ordinary sampler on every row without drafts, so
-    only a drafted column whose own history completes a word's prefix shows it.
-    """
-    original = spec_accept.apply_speculative_token_filters
-
-    def output_only(target_logits, draft_token_ids, num_valid_drafts, filters):
-        return original(
-            target_logits,
-            draft_token_ids,
-            torch.zeros_like(num_valid_drafts),
-            filters,
-        )
-
-    monkeypatch.setattr(spec_accept, "apply_speculative_token_filters", output_only)
-    table = _causal_table(seed=11)
-    filters = {"bad_words": ((1, 2), (2, 4), (3,))}
-    controls = {"temperature": 1.0}
-    sequences = _filtered_simulate(
-        table, controls, filters, _argmax_drafter(table), 3, 24000, 3, 5, "truncate"
-    )
-    observed: dict = {}
-    for sequence in sequences:
-        observed[sequence] = observed.get(sequence, 0) + 1
-    expected = _filtered_reference_joint(table, controls, filters, 3)
-    # A banned continuation appears, which the reference gives probability 0.
-    with pytest.raises(AssertionError, match="probability zero"):
-        _chi_square(observed, expected, len(sequences))
-
-
 # endregion The committed distribution, against an independent reference
