@@ -43,6 +43,20 @@ class TTOmniPlatform(OmniPlatform, TTPlatform):
         """
         return len(glob.glob("/dev/tenstorrent/[0-9]*"))
 
+    # vLLM's platform forwards a name it lacks to `torch.<device_type>`, and returns
+    # None when torch has none; vLLM-Omni calls these three, so None would be called.
+    @classmethod
+    def device_count(cls) -> int:
+        return cls.get_device_count()
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return cls.get_device_count() > 0
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Nothing torch-side to free; ttnn owns device memory."""
+
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         # Torch tensors in the TT path live on the host; ttnn owns the device.

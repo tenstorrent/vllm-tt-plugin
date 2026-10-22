@@ -74,6 +74,22 @@ def test_devices_are_counted_from_the_driver_nodes(monkeypatch: pytest.MonkeyPat
     assert TTOmniPlatform.get_device_count() == 2
 
 
+@pytest.mark.parametrize("count", [0, 2])
+def test_the_torch_device_queries_vllm_omni_calls_are_answered(
+    monkeypatch: pytest.MonkeyPatch, count
+):
+    """An Omni platform instance forwards a missing name to `torch.tt` and gets None."""
+    import vllm_tt_plugin.omni.platform as omni_platform
+
+    nodes = [f"/dev/tenstorrent/{index}" for index in range(count)]
+    monkeypatch.setattr(omni_platform.glob, "glob", lambda pattern: nodes)
+    platform = TTOmniPlatform()
+
+    assert platform.device_count() == count
+    assert platform.is_available() is (count > 0)
+    assert platform.empty_cache() is None
+
+
 def test_the_tts_stage_architectures_are_registered(monkeypatch: pytest.MonkeyPatch):
     from vllm.model_executor.models.registry import ModelRegistry
 
