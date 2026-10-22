@@ -122,6 +122,9 @@ class LaneDeviceTarget:
     hold_reads = False
     # Report this offset on every chained row's p0, to test the runner's check.
     misreport_p0 = 0
+    # False: answer defer_read with host tensors, as a model that does not
+    # chain yet may.
+    honor_defer_read = True
 
     def __init__(self) -> None:
         # slot -> (last committed token, its position), what a traced decode
@@ -399,7 +402,7 @@ class LaneDeviceTarget:
             for row in range(rows)
             if live[row]
         }
-        if not call["defer_read"]:
+        if not call["defer_read"] or not self.honor_defer_read:
             self.tip = None
             return VerifyOutput(
                 spec_mode=ACCEPT_MODE_FUSED_SAMPLE,

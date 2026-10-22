@@ -831,6 +831,29 @@ def test_sampled_chained_verifies_draw_from_each_request_s_own_generator():
     assert all(len(engine.outputs[r]) > 20 for r in ("s", "k"))
 
 
+def test_a_model_that_answers_defer_read_with_host_tensors_is_drained():
+    """Declaring ``supports_async_spec_decode`` with ``fused_sample`` does not
+    oblige a model to chain: one that answers ``defer_read`` with host tensors
+    has each fused verify read at once and drained, ordinary steps still
+    overlap, and the run emits the argmax chain."""
+    model = lane_device_target(honor_defer_read=False)()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {"a": engine.add("a", 0, 1), "b": engine.add("b", 2, 9)}
+    engine.run(12)
+    engine.drain()
+    assert model.chained_calls == []
+    assert chain_counters(runner)[0] == 0
+    verifies = [c for c in model.calls if c["spec_mode"] is not None]
+    assert verifies and all(c["defer_read"] for c in verifies)
+    _, unsafe = overlap_counters(runner)
+    assert unsafe == 0
+    for req_id, tokens in prompts.items():
+        produced = engine.outputs[req_id]
+        assert produced == expected_greedy(tokens, len(produced))
+        assert len(produced) > 20
+
+
 def test_a_lane_with_two_requests_keeps_the_step_from_chaining():
     """All or nothing for now: lane 0's two requests draft nothing (the solo
     drafter), so no step chains, each verify drains, and every request still
