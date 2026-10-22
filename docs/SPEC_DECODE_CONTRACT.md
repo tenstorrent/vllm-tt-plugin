@@ -31,7 +31,9 @@ serve speculative decoding within the following execution limits:
   must offer `argmax_ids` or `logits`; `fused_sample`, acceptance on the
   device with uniforms the runner draws, serves a synchronous step whose
   sampled rows need nothing but temperature, top-k and top-p, and the step
-  falls back to `logits` otherwise. An ordinary narrow decode does not send
+  falls back to `logits` otherwise. Under asynchronous scheduling in lane
+  mode a `fused_sample` verify is deferred and the next one chained onto it on
+  the device (section 4j). An ordinary narrow decode does not send
   `spec_mode`.
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
@@ -128,7 +130,7 @@ launches without `speculative_config`.
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when `speculative_config.method` needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
-| `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
+| `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. On a plan offering `fused_sample`, in lane mode, it also declares the deferred and chained fused verify of section 4j. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -1089,7 +1091,8 @@ advances once however many callers race to resolve it.
 step that `argmax_ids` cannot serve (a live row
 `TTModelRunner._request_is_argmax_certifiable` rejects, or a plan without
 `argmax_ids`) when `TTModelRunner._step_is_fused_servable` holds: scheduling
-is synchronous, every live row passes
+is synchronous or the launch chains lane verifies (section 4j), every live row
+passes
 `TTModelRunner._request_is_fused_servable`, and no seeded sampled row carries
 zero valid drafts. A row is fused-servable when it is greedy, or when it
 samples with nothing but its temperature, top-k and top-p, inside the bounds
@@ -1101,7 +1104,9 @@ top-k with top-p below 1 on a model declaring
 `logits`, and so does a seeded row without drafts: the `logits` walk draws its
 bonus by the ordinary sampler's exponential race over the request's own
 generator, which no uniform stands in for. An all-greedy step stays
-`argmax_ids`. Lane mode and front-packed execution choose alike, the lane
+`argmax_ids`, except on a launch that chains lane verifies, where it takes
+`fused_sample` so that the next verify can chain onto it. Lane mode and
+front-packed execution choose alike, the lane
 builder over the scheduled slots. The runner reports the count of
 `fused_sample` verifies in its `TT submissions:` log line.
 
@@ -1162,6 +1167,93 @@ placeholder pattern (`AcceptResult`), and that every committed token before a
 row's last is that row's draft at its column, and raises naming the rows
 otherwise; then the step commits and proposes as for any mode (section 5,
 steps 7 and 8). It carries no logprobs.
+
+## 4j. Chained lane verifies under asynchronous scheduling
+
+**When.** `TTAsyncDecodeController.chain_enabled`: lane mode, asynchronous
+scheduling, a speculating launch, a model declaring
+`supports_async_spec_decode`, and a plan offering `fused_sample`. Then every
+`fused_sample` verify is submitted deferred, and a verify may be built and
+submitted while the previous one is still on the device, from that verify's
+own acceptance and drafts. The host reads each verify one step behind. Without
+any of these the runner never sends the arguments below and every verify
+drains the previous one (section 4c).
+
+**The deferred verify.** Every `fused_sample` verify of such a launch also
+carries `defer_read=True`. The model enqueues the step and returns
+`VerifyOutput(spec_mode="fused_sample", handle=<handle>)` with no host
+tensors. The handle is opaque except for an int `tip_id`, which names the step
+and grows with each deferred verify. Inside the step the model accepts on the
+device (section 4i) and then drafts the next step's drafts on the device,
+from the tokens it just accepted, and keeps them with the step. A model may
+answer `defer_read` with host tensors instead; that verify is then read
+synchronously and nothing chains onto it. A deferred answer to a call without
+`defer_read`, and a host answer to a chained call, are refused by name.
+
+**The read.** Where the deferred output resolves, which may be a thread other
+than the engine thread, the runner calls `model.read_decode_output(handle)`
+(no other argument). It blocks on the step's device event, touches no engine
+state, and returns `spec_decode.FusedReadout(accepted_token_ids,
+accepted_counts, p0)`, host tensors: `[B, 1+K]` int32 and `[B]` int32 as in
+section 4i, and `p0` `[B]` int32, the position the device gave each row's
+column 0. The runner checks `p0`: a row built from host state reports exactly
+its submitted position, a chained row a position between 0 and the submitted
+upper bound (`TTModelRunner.check_fused_positions`), and the walk's prefix
+cap uses `p0`. A row no request owns is not read.
+
+**The proposal.** On the engine thread, when the step commits (at the build
+of a later step), the runner calls `propose_draft_tokens(K, committed,
+positions, counts, hidden=handle)` once per deferred verify, after its read,
+with positions from `p0` (`p0 + 1 + j`) and -1 on every row whose request is
+gone or never was. The model returns the drafts it made inside the step and
+their `num_valid`; it must not wait for later steps, so the drafts belong in
+the step's readback. When a chained verify already took those drafts on the
+device the runner checks the return and publishes nothing; otherwise the next
+verify is built from host state with them, as on any step. Commits apply in
+submission order, so a row the commit writes must start one past the host's
+last token: `p0` equal to the request's length minus one. A mismatch raises.
+
+**The chained verify.** A verify built over the deferred one in flight also
+carries:
+
+- `chain_rows`: bool `[B]`, the rows whose block the device builds from the
+  pending step: column 0 its last accepted token at `p0 + count`, then the
+  drafts it made for the row, at the positions that follow. For these rows
+  `tokens` is `PLACEHOLDER_TOKEN_ID` in every column and `accepted_counts` is
+  -1; `start_pos` is laid out as any block from a provisional column 0, the
+  row's applied length plus `1+K` for the verify in flight minus one, an upper
+  bound of the real position, never below it; `num_valid_drafts` is exact:
+  the device verifies exactly that many of its drafts, and raises if it made
+  fewer. A seeded row's uniforms are drawn for that count.
+- `chain_tip`: the `tip_id` of the pending step. The model raises unless it is
+  the newest deferred verify it enqueued.
+
+Every other row of a chained verify is a gap: position -1, no request. The
+drafts of a chained-onto step are consumed on the device, so its proposal
+(above) publishes nothing. Both the deferred and the chained verify carry
+`spec_sampling` as section 4i describes, drawn at submission in step order, so
+a seeded request's generator advances exactly as on a synchronous launch. The
+device state behind a handle, the accepted tokens, `p0` and the drafts, must
+stay valid until the step's proposal returns, across any number of later
+steps.
+
+**When a step chains** (`TTAsyncDecodeController.chain_evaluate`). Exactly one
+step is unresolved and it is the newest deferred verify; the step is all decode
+with no prefill, preemption, forced reset, pending grammar or active logits
+processor; and every lane it schedules chains: the lane holds the same
+requests at the same slots as the pending step, less those finished, and each
+of them is `fused_sample`-servable, verified the full draft count
+(`min(K, draft_cap)`) in the pending step and is offered that many
+placeholders now, and stays `2 * (1+K)` positions under `max_model_len` from
+its optimistic length. For now one lane that cannot chain keeps the whole
+step from chaining: it drains, and the step is built from host state. A
+request that finished at step n has already been scheduled into n+1; that
+output is published and vLLM drops it, and its slot is a gap from n+2. A
+drafter that drafts only for a lane holding one request therefore chains a
+step while every busy lane holds one request.
+
+The `TT submissions:` log line adds the count of chained verifies and of the
+chains refused, by reason, once chaining is enabled.
 
 ## 5. One request, from prefill to release
 

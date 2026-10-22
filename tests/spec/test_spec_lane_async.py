@@ -47,13 +47,15 @@ from vllm_tt_plugin.lane_scheduler import (
 )
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.scheduler import TTScheduler, get_tt_verified_drafts
+from vllm_tt_plugin.spec_accept import accept_speculated_tokens
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_LOGITS,
     PLACEHOLDER_TOKEN_ID,
 )
 
 from .lane_device_target import LaneDeviceTarget, greedy_chain, lane_device_target
-from .sampled_target import SAMPLED_VOCAB_SIZE
+from .sampled_target import SAMPLED_VOCAB_SIZE, rule_logits
 
 BLOCK_SIZE = 16
 MAX_MODEL_LEN = 256
@@ -114,9 +116,10 @@ def lane_runner(model: LaneDeviceTarget, *, async_scheduling: bool = True):
             max_model_len=MAX_MODEL_LEN,
             logits_processors=None,
         ),
-        # An ordinary lane decode samples on the device; a verify that needs
-        # logits or accepts on the device turns it off in the builder.
-        check_perform_device_sampling=lambda **_: True,
+        # Set below: an ordinary lane decode samples on the device unless a
+        # request needs its logits; a verify that needs logits or accepts on
+        # the device turns it off in the builder.
+        check_perform_device_sampling=None,
         host_sampler=Sampler(),
         _block_tables_per_layer=lambda _: None,
         _decode_layout_changed_since_last_decode=False,
@@ -138,6 +141,9 @@ def lane_runner(model: LaneDeviceTarget, *, async_scheduling: bool = True):
         runner._decode_layout_changed_since_last_decode = False
 
     runner.note_decode_layout_consumed = note_layout_consumed
+    runner.check_perform_device_sampling = lambda **_: not any(
+        runner._request_has_host_only_controls(req_id) for req_id in runner.requests
+    )
     for name, member in vars(TTModelRunner).items():
         if hasattr(runner, name):
             continue
@@ -197,6 +203,8 @@ class LaneEngine:
         self.depth = depth
         self.drafts: dict[str, list[int]] = {}
         self.stats = stats_scheduler(runner.async_decode_scheduling)
+        # Resolve each output on a reader thread, releasing held reads.
+        self.resolve_on_thread = False
         self.live: dict[str, int] = {}
         self.outputs: dict[str, list[int]] = {}
         self.stop_after: dict[str, int] = {}
@@ -259,7 +267,15 @@ class LaneEngine:
         return so
 
     def iterate(self) -> None:
+        if not self.live and not self.finished_pending:
+            # Nothing left to schedule: the engine only drains its queue.
+            self.drain()
+            return
         so = self.schedule()
+        if not so.total_num_scheduled_tokens:
+            # The runner still applies the finishes; no sampler is enqueued.
+            self.runner.execute_model(so)
+            return
         assert self.runner.execute_model(so) is None
         wrapper = self.runner.sample_tokens(None)
         self.wrappers.append(wrapper)
@@ -269,7 +285,19 @@ class LaneEngine:
 
     def resolve_oldest(self) -> None:
         wrapper, so = self.inflight.popleft()
-        out = wrapper.get_output() if hasattr(wrapper, "get_output") else wrapper
+        if self.resolve_on_thread and hasattr(wrapper, "get_output"):
+            box: list = []
+            reader = threading.Thread(target=lambda: box.append(wrapper.get_output()))
+            reader.start()
+            for handle in getattr(self.runner.model, "handles", ()):
+                handle.release()
+            reader.join(timeout=30)
+            assert box, "the reader thread did not finish"
+            out = box[0]
+        else:
+            for handle in getattr(self.runner.model, "handles", ()):
+                handle.release()
+            out = wrapper.get_output() if hasattr(wrapper, "get_output") else wrapper
         if not self.runner.async_decode_scheduling:
             handed = self.runner.take_draft_token_ids()
             if handed is not None:
@@ -535,3 +563,301 @@ def test_an_unverified_offer_is_no_draft():
 
 
 # endregion Speculative metrics
+
+
+# region Chained fused verifies
+
+
+def chain_counters(runner) -> tuple[int, dict[str, int]]:
+    controller = runner.async_decode
+    return controller._chained_submissions, dict(controller._chain_breaks)
+
+
+def test_greedy_lanes_chain_and_emit_the_synchronous_tokens():
+    """One request per lane: after the first verify every verify is submitted
+    over the one in flight, built by the device from that verify's own
+    acceptance and drafts, and the run emits exactly the synchronous tokens."""
+
+    def run(async_scheduling: bool):
+        model = lane_device_target()()
+        runner = lane_runner(model, async_scheduling=async_scheduling)
+        engine = LaneEngine(runner, depth=2 if async_scheduling else 1)
+        prompts = {"a": engine.add("a", 0, 1), "b": engine.add("b", 2, 9)}
+        engine.run(20)
+        engine.drain()
+        return model, runner, engine, prompts
+
+    _, _, sync_engine, _ = run(False)
+    model, runner, engine, prompts = run(True)
+
+    chained, breaks = chain_counters(runner)
+    assert chained >= 15
+    assert breaks == {}
+    calls = model.chained_calls
+    assert len(calls) == chained
+    for call in calls:
+        assert call["defer_read"]
+        assert call["chain_rows"].tolist() == [True, False, True, False]
+        assert (call["tokens"] == PLACEHOLDER_TOKEN_ID).all()
+        assert call["accepted_counts"].tolist()[0] == PLACEHOLDER_TOKEN_ID
+        assert call["accepted_counts"].tolist()[2] == PLACEHOLDER_TOKEN_ID
+        assert call["num_valid_drafts"].tolist() == [K, 0, K, 0]
+        # A chained row's provisional position is an upper bound of the
+        # device's, never below it; the gaps carry none.
+        for row in (0, 2):
+            assert int(call["positions"][row, 0]) >= int(
+                call["device_positions"][row, 0]
+            )
+        assert (call["positions"][[1, 3]] == -1).all()
+    # Every deferred verify was read back before it was proposed, once; the
+    # last ones commit at a step the run never takes.
+    assert all(handle.proposed for handle in model.handles[:-2])
+    _, unsafe = overlap_counters(runner)
+    assert unsafe == 0
+    for req_id, tokens in prompts.items():
+        produced = engine.outputs[req_id]
+        assert produced == expected_greedy(tokens, len(produced))
+        n = min(len(produced), len(sync_engine.outputs[req_id]))
+        assert n > 30
+        assert produced[:n] == sync_engine.outputs[req_id][:n]
+        assert len(produced) > 3 * 20 / 2, "chaining lost the accepted drafts"
+
+
+def test_a_chained_commit_publishes_no_proposal():
+    """The device took a chained-onto verify's drafts already: its commit
+    still hands the drafter the handle, from the device's positions, but
+    publishes nothing for the host to verify."""
+    model = lane_device_target()()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    engine.add("a", 0, 1)
+    engine.run(8)
+    proposals_after_chained_commit = []
+    original = runner.commit_spec_acceptance
+
+    def commit(model_input, *args, **kwargs):
+        result = original(model_input, *args, **kwargs)
+        proposals_after_chained_commit.append(dict(runner._proposed_draft_token_ids))
+        return result
+
+    runner.commit_spec_acceptance = commit
+    engine.run(6)
+    assert proposals_after_chained_commit
+    assert all(not p for p in proposals_after_chained_commit)
+    handle_calls = [c for c in model.propose_calls if c["hidden"] is not None]
+    assert len(handle_calls) >= 10
+    assert len({id(c["hidden"]) for c in handle_calls}) == len(handle_calls)
+
+
+def test_sampled_chained_verifies_draw_from_each_request_s_own_generator():
+    """A chained fused verify of seeded and unseeded sampled requests commits
+    exactly what the logits walk would commit over the block the device built,
+    from the generator states before the step, and leaves each seeded
+    generator where that walk leaves it."""
+    seeded = SamplingParams(temperature=1.0, top_p=0.95, seed=7, ignore_eos=True)
+    top_k = SamplingParams(temperature=0.8, top_k=3, seed=11, ignore_eos=True)
+    model = lane_device_target()()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    engine.add("s", 0, 5, params=seeded)
+    engine.add("k", 2, 9, params=top_k)
+    snapshots: list[dict[int, torch.Tensor]] = []
+    original = runner.async_decode.submit_decode
+
+    def submit(model_input, **kwargs):
+        snapshots.append(
+            {
+                slot: generator.get_state()
+                for slot, generator in runner.lane_batch.sampling.generators.items()
+            }
+        )
+        return original(model_input, **kwargs)
+
+    runner.async_decode.submit_decode = submit
+    engine.run(16)
+    engine.drain()
+
+    chained = model.chained_calls
+    assert len(chained) >= 8
+    checked = 0
+    for index, call in enumerate(model.calls):
+        if call.get("chain_rows") is None:
+            continue
+        sampling = call["spec_sampling"]
+        assert sampling is not None
+        assert sampling["greedy"].tolist() == [False, True, False, True]
+        handle = next(h for h in model.handles if h.tip_id == call["chain_tip"] + 1)
+        states = snapshots[index]
+        for row, params in ((0, seeded), (2, top_k)):
+            generator = torch.Generator(device="cpu")
+            generator.set_state(states[row])
+            tokens = call["device_tokens"][row : row + 1]
+            positions = call["device_positions"][row : row + 1]
+            result = accept_speculated_tokens(
+                target_logits=rule_logits(tokens, positions),
+                draft_token_ids=tokens[:, 1:],
+                num_valid_drafts=call["num_valid_drafts"][row : row + 1],
+                temperature=torch.tensor([params.temperature]),
+                top_k=torch.tensor([params.top_k if params.top_k > 0 else 64]),
+                top_p=torch.tensor([params.top_p]),
+                generators={0: generator},
+            )
+            count = int(result.accepted_counts[0])
+            readout = handle.readout
+            assert int(readout.accepted_counts[row]) == count
+            assert (
+                readout.accepted_token_ids[row, :count].tolist()
+                == result.committed_token_ids[0, :count].tolist()
+            )
+            if index + 1 < len(snapshots):
+                assert generator.get_state().equal(snapshots[index + 1][row])
+            checked += 1
+    assert checked >= 16
+    assert all(len(engine.outputs[r]) > 20 for r in ("s", "k"))
+
+
+def test_a_lane_with_two_requests_keeps_the_step_from_chaining():
+    """All or nothing for now: lane 0's two requests draft nothing (the solo
+    drafter), so no step chains, each verify drains, and every request still
+    emits the argmax chain."""
+    model = lane_device_target(draft_policy="solo")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {
+        "a": engine.add("a", 0, 1),
+        "b": engine.add("b", 1, 9),
+        "c": engine.add("c", 3, 17),
+    }
+    engine.run(12)
+    engine.drain()
+    chained, breaks = chain_counters(runner)
+    assert chained == 0
+    assert set(breaks) == {"draft_count"}
+    assert model.chained_calls == []
+    for req_id, tokens in prompts.items():
+        produced = engine.outputs[req_id]
+        assert produced == expected_greedy(tokens, len(produced))
+
+
+def test_a_request_that_stops_mid_chain_leaves_the_others_chaining():
+    """``b`` stops after 9 tokens. Its stop reaches the runner a step late, so
+    one more chained verify carries it; that output is discarded and from the
+    next step ``a`` chains alone."""
+    model = lane_device_target()()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {"a": engine.add("a", 0, 1), "b": engine.add("b", 2, 9, stop_after=9)}
+    engine.run(18)
+    engine.drain()
+    assert engine.outputs["b"] == expected_greedy(prompts["b"], 9)
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompts["a"], len(produced))
+    late = [c for c in model.chained_calls if c["chain_rows"].tolist()[2]]
+    alone = [
+        c
+        for c in model.chained_calls
+        if c["chain_rows"].tolist() == [True, False, False, False]
+    ]
+    assert late and alone
+    assert "b" not in runner.requests
+    assert int(runner.lane_batch.num_tokens[2]) == 0
+
+
+@pytest.mark.parametrize(
+    "params, reason",
+    [
+        (SamplingParams(temperature=0.0, logprobs=1, ignore_eos=True), "not_fused"),
+        (
+            SamplingParams(temperature=1.0, top_k=3, presence_penalty=0.5),
+            "not_fused",
+        ),
+    ],
+    ids=["logprobs", "penalty"],
+)
+def test_a_request_the_device_cannot_accept_keeps_the_step_unchained(params, reason):
+    model = lane_device_target()()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {"a": engine.add("a", 0, 1), "x": engine.add("x", 2, 9, params=params)}
+    engine.run(10)
+    engine.drain()
+    assert model.chained_calls == []
+    assert chain_counters(runner)[0] == 0
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompts["a"], len(produced))
+    assert ACCEPT_MODE_LOGITS in model.verify_modes
+
+
+def test_chaining_stops_short_of_max_model_len():
+    """Two blocks of headroom or no chain: near the end the verifies drain, and
+    the request still emits the argmax chain up to the length cap."""
+    model = lane_device_target()()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    # The scheduler finishes a request at max_model_len (FINISHED_LENGTH_CAPPED).
+    room = MAX_MODEL_LEN - (PROMPT_LEN + 1)
+    tokens = engine.add("a", 0, 1, stop_after=room)
+    engine.run(120)
+    engine.drain()
+    produced = engine.outputs["a"]
+    assert len(tokens) + len(produced) == MAX_MODEL_LEN
+    assert produced == expected_greedy(tokens, len(produced))
+    chained, breaks = chain_counters(runner)
+    assert chained > 10
+    assert "max_len" in breaks
+
+
+def test_the_readback_runs_on_another_thread():
+    """The engine resolves outputs on whatever thread it likes: the handle is
+    read there, the commit and the proposal stay on the engine thread."""
+    model = lane_device_target(hold_reads=True)()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {"a": engine.add("a", 0, 1)}
+    engine.resolve_on_thread = True
+    engine.run(12)
+    engine.drain()
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompts["a"], len(produced))
+    readers = {t for h in model.handles for t in h.read_threads}
+    assert readers and model.engine_thread not in readers
+    assert chain_counters(runner)[0] >= 6
+
+
+@pytest.mark.parametrize(
+    "offset, error, match",
+    [
+        # Past the provisional upper bound: refused where the handle is read.
+        (100, ValueError, "column-0 position"),
+        # Under it, but not where the host's history ends: refused at the commit.
+        (-1, RuntimeError, "history ends at"),
+    ],
+)
+def test_a_misreported_chained_position_is_refused(offset, error, match):
+    model = lane_device_target(misreport_p0=offset)()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    engine.add("a", 0, 1)
+    with pytest.raises(error, match=match):
+        engine.run(10)
+
+
+def test_a_deferred_verify_nobody_asked_for_is_refused():
+    """A model that answers a fused verify with a handle when the runner did
+    not send ``defer_read`` (a synchronous launch) is refused by name."""
+    model = lane_device_target()()
+    runner = lane_runner(model, async_scheduling=False)
+    original = model._fused
+
+    def always_deferred(tokens, start_pos, kwargs, call):
+        call["defer_read"] = True
+        return original(tokens, start_pos, kwargs, call)
+
+    model._fused = always_deferred
+    engine = LaneEngine(runner, depth=1)
+    engine.add("s", 0, 5, params=SamplingParams(temperature=1.0, top_k=3, seed=3))
+    with pytest.raises(ValueError, match="did not send defer_read"):
+        engine.run(6)
+
+
+# endregion Chained fused verifies

@@ -96,9 +96,11 @@ The [decode reload contract](DECODE_RELOAD_CONTRACT.md) specifies
 commands even when host token tensors lag resident device state.
 
 The [speculative contract](SPEC_DECODE_CONTRACT.md) defines wide verification
-inputs, `num_valid_drafts`, `accepted_counts`, `spec_mode`, `VerifyOutput`, and
-`propose_draft_tokens`. An ordinary decode receives no `spec_mode` and must
-not return `VerifyOutput`.
+inputs, `num_valid_drafts`, `accepted_counts`, `spec_mode`, `spec_sampling`,
+`VerifyOutput`, and `propose_draft_tokens`, and for chained lane verifies
+`defer_read`, `chain_rows`, `chain_tip` and `read_decode_output(handle)`
+(section 4j). An ordinary decode receives no `spec_mode` and must not return
+`VerifyOutput`.
 
 ### Stage outputs
 

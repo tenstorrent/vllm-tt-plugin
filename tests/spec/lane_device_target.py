@@ -14,7 +14,12 @@ lane decode on a device, which is what the asynchronous lane path relies on:
   does not depend on when the host read it.
 - A verify answers ``argmax_ids``, ``logits`` or ``fused_sample``
   (``accept_speculated_tokens`` with the runner's uniforms, as a device accept
-  computes it) over the whole slot grid.
+  computes it) over the whole slot grid. After a ``fused_sample`` verify the
+  device drafts for the next step itself, from the tokens it just accepted.
+- The chain contract (SPEC_DECODE_CONTRACT.md section 4j): a fused verify sent
+  ``defer_read=True`` returns a ``LaneFusedHandle`` and no host tensors; a
+  verify sent ``chain_rows`` builds those rows from the device's own last
+  token, position and drafts, and raises on every input the contract forbids.
 - The drafter proposes the rule's argmax chain from each row's last committed
   token, except at a position where ``position % miss_every == miss_at``,
   where it drafts the wrong token, so acceptance varies along a request.
@@ -23,7 +28,8 @@ lane decode on a device, which is what the asynchronous lane path relies on:
 
 ``read_decode_output`` hands back host output with no events, so a step
 completes only when the runner resolves its deferred output: exactly where the
-engine's batch queue would.
+engine's batch queue would. A handle can be held (``hold_reads``) until the
+test releases it.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from vllm_tt_plugin.spec_decode import (
     DRAFTER_STATE_INTERNAL,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     DraftOutput,
+    FusedReadout,
     SpecPlan,
     VerifyOutput,
     check_spec_side_tensors,
@@ -66,6 +73,29 @@ def greedy_chain(token: int, position: int, count: int) -> list[int]:
     return chain
 
 
+class LaneFusedHandle:
+    """What a deferred fused verify returns: readable only once waited on."""
+
+    def __init__(self, tip_id: int, readout: FusedReadout, drafts, offered, *, hold):
+        self.tip_id = tip_id
+        self.readout = readout
+        self.drafts = drafts
+        self.offered = offered
+        self._ready = threading.Event()
+        if not hold:
+            self._ready.set()
+        self.read_threads: list[int] = []
+        self.proposed = False
+
+    def release(self) -> None:
+        self._ready.set()
+
+    def wait(self) -> FusedReadout:
+        assert self._ready.wait(timeout=30), "a held fused verify was never released"
+        self.read_threads.append(threading.get_ident())
+        return self.readout
+
+
 class LaneDeviceTarget:
     vocab_size = SAMPLED_VOCAB_SIZE
     accept_modes: tuple[str, ...] = (
@@ -88,11 +118,20 @@ class LaneDeviceTarget:
     draft_policy = "always"
     miss_every = 5
     miss_at = 2
+    # Hold every deferred read until the test releases its handle.
+    hold_reads = False
+    # Report this offset on every chained row's p0, to test the runner's check.
+    misreport_p0 = 0
 
     def __init__(self) -> None:
         # slot -> (last committed token, its position), what a traced decode
         # keeps on the device between steps.
         self.resident: dict[int, tuple[int, int]] = {}
+        # slot -> (drafts, count) the device drafted after the last fused verify.
+        self.device_drafts: dict[int, tuple[list[int], int]] = {}
+        self.tip: int | None = None
+        self.next_tip = 0
+        self.handles: list[LaneFusedHandle] = []
         self.calls: list[dict] = []
         self.propose_calls: list[dict] = []
         self.engine_thread: int | None = None
@@ -127,6 +166,10 @@ class LaneDeviceTarget:
     def plain_steps(self) -> int:
         return sum(1 for call in self.calls if call["spec_mode"] is None)
 
+    @property
+    def chained_calls(self) -> list[dict]:
+        return [call for call in self.calls if call.get("chain_rows") is not None]
+
     def _device_sample(self, params, row: int, token: int, position: int) -> int:
         """One device-sampled token: argmax for a greedy row, else a draw from
         a stream keyed by the row's seed (or slot) and the absolute position."""
@@ -140,18 +183,12 @@ class LaneDeviceTarget:
         probs = torch.softmax(logits / temperature, dim=-1)
         return int(torch.multinomial(probs, 1, generator=generator))
 
-    def _lane_rows(self, live: list[bool]) -> dict[int, int]:
-        """Live rows per lane."""
-        counts: dict[int, int] = {}
-        for row, alive in enumerate(live):
-            if alive:
-                lane = row // self.per_lane
-                counts[lane] = counts.get(lane, 0) + 1
-        return counts
-
     def _drafts_for(self, live: list[bool], last, position, num_drafts: int):
         rows = len(live)
-        lanes = self._lane_rows(live)
+        lanes: dict[int, int] = {}
+        for row, alive in enumerate(live):
+            if alive:
+                lanes[row // self.per_lane] = lanes.get(row // self.per_lane, 0) + 1
         drafts = torch.full((rows, num_drafts), -1, dtype=torch.int32)
         offered = torch.zeros(rows, dtype=torch.int32)
         for row in range(rows):
@@ -167,6 +204,11 @@ class LaneDeviceTarget:
             offered[row] = num_drafts
         return drafts, offered
 
+    def _invalidate_chain(self) -> None:
+        """A step that is not a deferred fused verify: nothing may chain on."""
+        self.tip = None
+        self.device_drafts = {}
+
     # ---- the contract ----------------------------------------------------
 
     def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):
@@ -181,38 +223,44 @@ class LaneDeviceTarget:
             "num_valid_drafts": kwargs.get("num_valid_drafts"),
             "accepted_counts": kwargs.get("accepted_counts"),
             "spec_sampling": kwargs.get("spec_sampling"),
+            "defer_read": kwargs.get("defer_read", False),
+            "chain_rows": kwargs.get("chain_rows"),
+            "chain_tip": kwargs.get("chain_tip"),
         }
         self.calls.append(call)
         if spec_mode is None:
+            self._invalidate_chain()
             return self._plain(tokens, start_pos, kwargs)
-        width = int(tokens.shape[1])
-        check_spec_side_tensors(
-            kwargs["num_valid_drafts"], kwargs["accepted_counts"], rows, width - 1
-        )
-        logits = rule_logits(tokens, start_pos)
-        if spec_mode == ACCEPT_MODE_LOGITS:
+        if spec_mode not in self.accept_modes:
+            raise ValueError(f"LaneDeviceTarget does not serve {spec_mode!r}")
+        if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+            if call["defer_read"] or call["chain_rows"] is not None:
+                raise ValueError("defer_read and chain_rows come with fused_sample")
+            check_spec_side_tensors(
+                kwargs["num_valid_drafts"],
+                kwargs["accepted_counts"],
+                rows,
+                int(tokens.shape[1]) - 1,
+            )
+            self._invalidate_chain()
             self.resident = {}
-            return VerifyOutput(spec_mode=spec_mode, logits=logits)
-        if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
-            self.resident = {}
+            logits = rule_logits(tokens, start_pos)
+            if spec_mode == ACCEPT_MODE_LOGITS:
+                return VerifyOutput(spec_mode=spec_mode, logits=logits)
             return VerifyOutput(
                 spec_mode=spec_mode,
                 argmax_ids=logits.argmax(dim=-1).to(torch.int32),
             )
-        if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
-            raise ValueError(f"LaneDeviceTarget does not serve {spec_mode!r}")
-        committed, counts = self._accept(
-            tokens, start_pos, kwargs["num_valid_drafts"], kwargs.get("spec_sampling")
-        )
-        self._settle(committed, counts, start_pos[:, 0])
-        return VerifyOutput(
-            spec_mode=spec_mode, accepted_token_ids=committed, accepted_counts=counts
-        )
+        return self._fused(tokens, start_pos, kwargs, call)
 
     def _plain(self, tokens, start_pos, kwargs):
-        if "sampling_params" not in kwargs:
-            raise AssertionError("an ordinary lane decode samples on the device here")
         rows = int(tokens.shape[0])
+        if "sampling_params" not in kwargs:
+            # Host sampling: the rule's logits for the host's inputs, which a
+            # host-sampled step always reloads.
+            self.resident = {}
+            positions = start_pos.reshape(rows, -1)[:, :1]
+            return rule_logits(tokens.reshape(rows, -1)[:, :1], positions)
         params = kwargs["sampling_params"]
         if kwargs.get("reload_inputs", True):
             inputs = {
@@ -239,6 +287,101 @@ class LaneDeviceTarget:
             resident[row] = (sampled, position + 1)
         self.resident = resident
         return out
+
+    def _chain_inputs(self, tokens, start_pos, num_valid, counts, call):
+        """The block the device verifies: chained rows from its own state."""
+        chain_rows = call["chain_rows"]
+        rows, width = (int(size) for size in tokens.shape)
+        tokens, positions = tokens.clone(), start_pos.clone()
+        counts = counts.clone()
+        if chain_rows is None:
+            if call["chain_tip"] is not None:
+                raise ValueError("chain_tip without chain_rows")
+            return tokens, positions, counts
+        if not call["defer_read"]:
+            raise ValueError("chain_rows needs defer_read=True")
+        if chain_rows.dtype != torch.bool or tuple(chain_rows.shape) != (rows,):
+            raise ValueError(f"chain_rows must be bool [{rows}], got {chain_rows}")
+        if self.tip is None or call["chain_tip"] != self.tip:
+            raise ValueError(
+                f"chain_tip {call['chain_tip']} is not the last deferred fused "
+                f"verify {self.tip}"
+            )
+        for row in range(rows):
+            if not bool(chain_rows[row]):
+                continue
+            if row not in self.resident or row not in self.device_drafts:
+                raise ValueError(f"chain row {row} has no device state")
+            if not bool((tokens[row] == -1).all()):
+                raise ValueError(f"chain row {row} carries host tokens")
+            if int(counts[row]) != -1:
+                raise ValueError(f"chain row {row} must carry accepted_counts -1")
+            last, position = self.resident[row]
+            if int(start_pos[row, 0]) < position:
+                raise ValueError(
+                    f"chain row {row}: provisional position {int(start_pos[row, 0])} "
+                    f"below the device's {position}"
+                )
+            drafts, offered = self.device_drafts[row]
+            hint = int(num_valid[row])
+            if hint > offered:
+                raise ValueError(
+                    f"chain row {row} asks to verify {hint} drafts and the "
+                    f"device drafted {offered}"
+                )
+            tokens[row] = -1
+            tokens[row, 0] = last
+            tokens[row, 1 : 1 + hint] = torch.tensor(drafts[:hint], dtype=torch.int32)
+            positions[row] = -1
+            positions[row, : 1 + hint] = torch.arange(position, position + 1 + hint)
+            counts[row] = 1
+        return tokens, positions, counts
+
+    def _fused(self, tokens, start_pos, kwargs, call):
+        rows, width = (int(size) for size in tokens.shape)
+        num_valid = kwargs["num_valid_drafts"]
+        tokens, positions, counts = self._chain_inputs(
+            tokens, start_pos, num_valid, kwargs["accepted_counts"], call
+        )
+        check_spec_side_tensors(num_valid, counts, rows, width - 1)
+        call["device_tokens"] = tokens.clone()
+        call["device_positions"] = positions.clone()
+        committed, accepted = self._accept(
+            tokens, positions, num_valid, kwargs.get("spec_sampling")
+        )
+        first = positions[:, 0].to(torch.int32)
+        self._settle(committed, accepted, first)
+        live = [int(first[row]) >= 0 for row in range(rows)]
+        last = torch.tensor(
+            [int(committed[row, int(accepted[row]) - 1]) for row in range(rows)]
+        )
+        drafts, offered = self._drafts_for(live, last, first + accepted, width - 1)
+        self.device_drafts = {
+            row: (drafts[row].tolist(), int(offered[row]))
+            for row in range(rows)
+            if live[row]
+        }
+        if not call["defer_read"]:
+            self.tip = None
+            return VerifyOutput(
+                spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+                accepted_token_ids=committed,
+                accepted_counts=accepted,
+            )
+        reported = first.clone()
+        if call["chain_rows"] is not None and self.misreport_p0:
+            reported[call["chain_rows"]] += self.misreport_p0
+        self.next_tip += 1
+        self.tip = self.next_tip
+        handle = LaneFusedHandle(
+            self.tip,
+            FusedReadout(committed.to(torch.int32), accepted.to(torch.int32), reported),
+            drafts,
+            offered,
+            hold=self.hold_reads,
+        )
+        self.handles.append(handle)
+        return VerifyOutput(spec_mode=ACCEPT_MODE_FUSED_SAMPLE, handle=handle)
 
     def _accept(self, tokens, start_pos, num_valid, sampling):
         rows, width = (int(size) for size in tokens.shape)
@@ -276,6 +419,10 @@ class LaneDeviceTarget:
 
     def read_decode_output(self, tt_out, async_read: bool = False, **kwargs):
         del kwargs
+        if isinstance(tt_out, LaneFusedHandle):
+            if async_read:
+                raise AssertionError("a handle is read with read_decode_output(handle)")
+            return tt_out.wait()
         if not async_read:
             raise AssertionError("only the asynchronous read is expected here")
         return tt_out, []
@@ -297,18 +444,34 @@ class LaneDeviceTarget:
             num_drafts,
             call="propose",
         )
-        index = (accepted_counts.to(torch.int64) - 1).unsqueeze(1)
-        last = committed_tokens.to(torch.int64).gather(1, index).squeeze(1)
-        position = committed_positions.to(torch.int64).gather(1, index).squeeze(1)
-        live = [int(position[row]) >= 0 for row in range(rows)]
         self.propose_calls.append(
             {
                 "rows": rows,
                 "hidden": hidden,
                 "positions": committed_positions.clone(),
-                "live": live,
             }
         )
+        if isinstance(hidden, LaneFusedHandle):
+            # The device drafted already; this reads the drafts back once, on
+            # the engine thread, after the step was read.
+            if not hidden.read_threads:
+                raise AssertionError("a deferred verify was proposed before its read")
+            if hidden.proposed:
+                raise AssertionError("a deferred verify is proposed once")
+            hidden.proposed = True
+            p0 = hidden.readout.p0
+            sent = committed_positions[:, 0]
+            for row in range(rows):
+                if int(sent[row]) >= 0 and int(sent[row]) != int(p0[row]) + 1:
+                    raise AssertionError(
+                        f"row {row} proposed from position {int(sent[row])}, "
+                        f"the device committed from {int(p0[row]) + 1}"
+                    )
+            return DraftOutput(draft_token_ids=hidden.drafts, num_valid=hidden.offered)
+        index = (accepted_counts.to(torch.int64) - 1).unsqueeze(1)
+        last = committed_tokens.to(torch.int64).gather(1, index).squeeze(1)
+        position = committed_positions.to(torch.int64).gather(1, index).squeeze(1)
+        live = [int(position[row]) >= 0 for row in range(rows)]
         drafts, offered = self._drafts_for(live, last, position, num_drafts)
         return DraftOutput(draft_token_ids=drafts, num_valid=offered)
 

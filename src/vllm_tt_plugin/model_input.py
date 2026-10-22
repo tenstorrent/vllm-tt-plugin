@@ -237,3 +237,15 @@ class TTModelInput:
     # at build time, because the walk may run on the readback thread after the
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+    # Lane mode, a ``fused_sample`` verify chained onto the deferred one still
+    # in flight (``TTAsyncDecodeController.chain_evaluate``). ``chain_rows`` is
+    # bool ``[total_B]``: the rows whose inputs the device builds from that
+    # step's own acceptance and drafts. For them ``input_tokens`` is
+    # ``PLACEHOLDER_TOKEN_ID`` in every column, ``input_positions`` an upper
+    # bound of the real positions, ``accepted_counts`` -1 and
+    # ``draft_token_ids`` placeholders; ``num_valid_drafts`` is exact.
+    # ``chain_tip`` is the ``tip_id`` of the step chained onto. Both ``None``
+    # on every other step.
+    chain_rows: torch.Tensor | None = None
+    chain_tip: int | None = None

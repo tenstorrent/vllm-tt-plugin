@@ -948,7 +948,9 @@ def test_a_greedy_lane_step_stays_argmax_ids_on_a_fused_model():
     assert torch.get_rng_state().equal(rng)
 
 
-def test_fused_acceptance_is_synchronous_only():
+def test_fused_acceptance_is_synchronous_only_on_a_launch_that_does_not_chain():
+    """Asynchronously only a chaining launch (``test_spec_lane_async.py``)
+    reads a fused verify back, through its handle."""
     model = _fused_target()
     runner = _runner(model)
     _add_request(runner, "s", row=1, first_token=5, params=SAMPLED)

@@ -31,7 +31,11 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_FUSED_SAMPLE,
+    ACCEPT_MODE_LOGITS,
+    PLACEHOLDER_TOKEN_ID,
+)
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -42,6 +46,7 @@ from vllm_tt_plugin.structured_output import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+    from vllm_tt_plugin.async_decode import ChainPlan
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
     from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -1382,6 +1387,8 @@ class TTLaneInputBatch(InputBatch):
             spec_mode=spec["spec_mode"],
             grammar_rows_per_request=spec["grammar_rows_per_request"],
             spec_min_tokens=walk_inputs.get("spec_min_tokens"),
+            chain_rows=spec["chain_rows"],
+            chain_tip=spec["chain_tip"],
         )
 
     def _logits_walk_inputs(
@@ -1458,6 +1465,8 @@ class TTLaneInputBatch(InputBatch):
             "draft_token_ids": None,
             "spec_mode": None,
             "grammar_rows_per_request": None,
+            "chain_rows": None,
+            "chain_tip": None,
         }
         num_drafts = int(getattr(runner, "_num_speculative_tokens", 0) or 0)
         if not num_drafts:
@@ -1480,6 +1489,19 @@ class TTLaneInputBatch(InputBatch):
         ]
         live_rows = list(plan.scheduled_rows)
         live_req_ids = [self.req_ids[row] for row in live_rows]
+        if runner._chains_fused_verifies():
+            chain = runner.async_decode.chain_plan_for_build(scheduler_output)
+            if chain is not None:
+                return self._build_chained_block(
+                    runner,
+                    chain,
+                    row_req_ids,
+                    live_rows,
+                    live_req_ids,
+                    input_tokens,
+                    input_positions,
+                    grammar_rows_per_request,
+                )
         spec_plan = getattr(runner, "_spec_plan", None)
         drafts, num_valid, counts = runner._spec_row_state(
             runner._req_accepted_counts,
@@ -1512,6 +1534,8 @@ class TTLaneInputBatch(InputBatch):
                     live_req_ids, num_valid[live_rows]
                 ),
                 "grammar_rows_per_request": grammar_rows_per_request,
+                "chain_rows": None,
+                "chain_tip": None,
             }
         # The ordinary decode inside a speculating launch, as in the
         # front-packed builder: every row commits one token, so the counts reset
@@ -1524,6 +1548,77 @@ class TTLaneInputBatch(InputBatch):
         for req_id in live_req_ids:
             runner._req_accepted_counts.pop(req_id, None)
         return out
+
+    def _build_chained_block(
+        self,
+        runner: "TTModelRunner",
+        chain: "ChainPlan",
+        row_req_ids: list[str | None],
+        live_rows: list[int],
+        live_req_ids: list[str],
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+        grammar_rows_per_request: dict[str, int],
+    ) -> dict[str, Any]:
+        """A ``fused_sample`` verify chained onto the one still in flight.
+
+        The host has not applied that verify, so it knows neither the token
+        each row continues from nor the drafts the device's drafter made for
+        it: a chained row carries ``PLACEHOLDER_TOKEN_ID`` in every column and
+        -1 for its count, and the device builds the block from the pending
+        step. Its positions are the plan's upper bound, laid out as any block
+        is; ``num_valid_drafts`` is the exact count the device verifies. Every
+        scheduled slot chains; a slot the step does not schedule is sent as a
+        gap, because its host position is a step behind the device's. Any
+        proposal held for a chained request is dropped unread: it is either
+        spent or what the device already holds.
+        """
+        if sorted(chain.hints) != live_rows:
+            raise RuntimeError(
+                f"the chain plan's slots {sorted(chain.hints)} are not the "
+                f"build's scheduled slots {live_rows}"
+            )
+        num_drafts = int(runner._num_speculative_tokens)
+        total = len(row_req_ids)
+        positions = torch.full_like(input_positions, -1)
+        num_valid = torch.zeros(total, dtype=torch.int32)
+        for row in live_rows:
+            positions[row] = chain.positions[row]
+            num_valid[row] = chain.hints[row]
+        for req_id in live_req_ids:
+            runner._proposed_draft_token_ids.pop(req_id, None)
+        drafts = torch.full(
+            (total, num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+        )
+        tokens, positions = runner._spec_candidate_block(
+            drafts,
+            num_valid,
+            torch.full_like(input_tokens, PLACEHOLDER_TOKEN_ID),
+            positions,
+        )
+        chain_rows = torch.zeros(total, dtype=torch.bool)
+        chain_rows[live_rows] = True
+        counts = torch.ones(total, dtype=torch.int32)
+        counts[chain_rows] = PLACEHOLDER_TOKEN_ID
+        spec_mode = runner._spec_mode_for_step(live_req_ids, num_valid[live_rows])
+        if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+            raise RuntimeError(
+                "a chained lane verify must be fused_sample, and the step "
+                f"resolved {spec_mode!r}; the chain plan admits only "
+                "fused_sample-servable requests"
+            )
+        return {
+            "input_tokens": tokens,
+            "input_positions": positions,
+            "row_req_ids": row_req_ids,
+            "num_valid_drafts": num_valid,
+            "accepted_counts": counts,
+            "draft_token_ids": drafts,
+            "spec_mode": spec_mode,
+            "grammar_rows_per_request": grammar_rows_per_request,
+            "chain_rows": chain_rows,
+            "chain_tip": chain.tip,
+        }
 
     def _build_prefill_input(
         self,

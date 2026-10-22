@@ -1736,6 +1736,10 @@ class TTModelRunner:
         reads back the committed ids and counts. ``num_valid_drafts`` is
         row-aligned with ``row_req_ids``; without it no seeded row is assumed
         to carry a draft.
+
+        On a launch that chains lane verifies (``_chains_fused_verifies``) an
+        all-greedy step takes ``fused_sample`` too: only a verify the device
+        accepted can be chained onto.
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
         certifiable = all(
@@ -1743,7 +1747,11 @@ class TTModelRunner:
         )
         if (
             ACCEPT_MODE_FUSED_SAMPLE in modes
-            and (not certifiable or ACCEPT_MODE_ARGMAX_IDS not in modes)
+            and (
+                not certifiable
+                or ACCEPT_MODE_ARGMAX_IDS not in modes
+                or self._chains_fused_verifies()
+            )
             and self._step_is_fused_servable(row_req_ids, num_valid_drafts)
         ):
             return ACCEPT_MODE_FUSED_SAMPLE
@@ -1760,13 +1768,18 @@ class TTModelRunner:
     ) -> bool:
         """True when a ``fused_sample`` verify can accept every row of the step.
 
-        Synchronous scheduling only: the deferred readback has no fused path.
-        Every row must be ``_request_is_fused_servable``, and no seeded sampled
-        row may arrive without drafts, because its bonus is the ordinary
-        sampler's exponential race over its own generator
-        (``predraw_uniforms``), which the device cannot run.
+        Under asynchronous scheduling only on a launch that chains lane
+        verifies, whose fused verifies are read back through their handle;
+        the other deferred readbacks have no fused path. Every row must be
+        ``_request_is_fused_servable``, and no seeded sampled row may arrive
+        without drafts, because its bonus is the ordinary sampler's
+        exponential race over its own generator (``predraw_uniforms``), which
+        the device cannot run.
         """
-        if getattr(self, "async_decode_scheduling", False):
+        if (
+            getattr(self, "async_decode_scheduling", False)
+            and not self._chains_fused_verifies()
+        ):
             return False
         random_reqs = getattr(self.input_batch, "random_reqs", ())
         requests = getattr(self, "requests", {})
@@ -1780,6 +1793,12 @@ class TTModelRunner:
             if seeded and (num_valid_drafts is None or int(num_valid_drafts[row]) == 0):
                 return False
         return True
+
+    def _chains_fused_verifies(self) -> bool:
+        """Whether this launch submits lane fused verifies deferred and chained
+        (``TTAsyncDecodeController.chain_enabled``)."""
+        controller = getattr(self, "async_decode", None)
+        return controller is not None and controller.chain_enabled()
 
     def _request_is_fused_servable(self, req_id: str) -> bool:
         """True when a ``fused_sample`` verify can accept this request.
@@ -1961,6 +1980,8 @@ class TTModelRunner:
         row_req_ids: list[str],
         *,
         skip_req_ids: set[str] | None = None,
+        first_positions: torch.Tensor | None = None,
+        publish: bool = True,
     ) -> None:
         """Ask the model's own drafter for the next step's drafts.
 
@@ -1975,6 +1996,12 @@ class TTModelRunner:
         does not interpret it, and a drafter that needs none is handed whatever
         its verify returned, which for a model that returns nothing is
         ``None``.
+
+        ``first_positions`` replaces a verify's submitted column-0 positions
+        with the device-reported ones (a deferred fused verify). With
+        ``publish`` false the drafts are checked but not published, and every
+        proposal held for the step's requests is erased: a chained verify
+        already took them on the device.
         """
         num_drafts = self._num_speculative_tokens
         width = num_drafts + 1
@@ -2007,7 +2034,13 @@ class TTModelRunner:
         else:
             # A verify has authoritative submitted positions. Its physical
             # acceptance count can exceed the prefix retained at max_model_len.
-            positions = self._committed_positions(model_input.input_positions, width)
+            # A deferred fused verify reports its own.
+            positions = self._committed_positions(
+                model_input.input_positions
+                if first_positions is None
+                else first_positions,
+                width,
+            )
         drafted = self.model.propose_draft_tokens(
             num_drafts,
             committed,
@@ -2092,6 +2125,10 @@ class TTModelRunner:
             # a draft of what followed them would be verified against the
             # history vLLM replays instead.
             if req_id in skipped:
+                continue
+            if not publish:
+                if req_id is not None:
+                    self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             # A row that committed nothing this step proposes nothing: there is
             # no continuation to draft from.
@@ -3519,6 +3556,11 @@ class TTModelRunner:
             )
         columns = torch.arange(width - 1).unsqueeze(0)
         accepted = columns < (counts.to(torch.int64) - 1).unsqueeze(1)
+        chain_rows = getattr(model_input, "chain_rows", None)
+        if chain_rows is not None:
+            # A chained row's drafts came from the device's own drafter and
+            # never reached the host, so its prefix has nothing to match.
+            accepted &= ~chain_rows.unsqueeze(1)
         wrong = (accepted & (committed[:, :-1] != drafts)).any(dim=1).nonzero()
         if wrong.numel():
             raise ValueError(
@@ -3612,11 +3654,42 @@ class TTModelRunner:
             cu_num_generated_tokens=cut,
         ).tolists()
 
+    @staticmethod
+    def check_fused_positions(model_input: TTModelInput, p0: torch.Tensor) -> None:
+        """Check a deferred fused verify's reported column-0 positions.
+
+        A row the step built from host state was given its real position, so
+        the device reports exactly that; a chained row was given an upper
+        bound, so the device reports a position at or below it. A wrong
+        position would cap and commit the row against another length, so a
+        mismatch raises. Rows no request owns are not read.
+        """
+        rows = int(model_input.input_tokens.shape[0])
+        if tuple(p0.shape) != (rows,):
+            raise ValueError(
+                f"a deferred fused verify's p0 must be [{rows}], got {tuple(p0.shape)}"
+            )
+        positions = model_input.input_positions
+        submitted = positions if positions.dim() == 1 else positions[:, 0]
+        chained = model_input.chain_rows
+        for row in _spec_live_rows(model_input):
+            real, sent = int(p0[row]), int(submitted[row])
+            is_chained = chained is not None and bool(chained[row])
+            if (is_chained and not 0 <= real <= sent) or (
+                not is_chained and real != sent
+            ):
+                raise ValueError(
+                    f"a deferred fused verify reported column-0 position {real} "
+                    f"for row {row}, submitted at {sent} "
+                    f"({'chained, an upper bound' if is_chained else 'exact'})"
+                )
+
     def spec_committed_prefixes(
         self,
         model_input: TTModelInput,
         committed: torch.Tensor,
         counts: torch.Tensor,
+        first_positions: torch.Tensor | None = None,
     ) -> list[list[int]]:
         """Each live row's accepted prefix, as the step's published output.
 
@@ -3630,10 +3703,16 @@ class TTModelRunner:
         still the row's length when the commit runs. Publishing more than fits
         would report tokens the commit then refuses to write, and the request's
         own history and the engine's would disagree about its text.
+
+        ``first_positions`` is a deferred fused verify's device-reported
+        column-0 position per row, which replaces the submitted one: a chained
+        row was submitted at an upper bound.
         """
         rows = len(model_input.row_req_ids)
         max_model_len = int(self.model_config.max_model_len)
-        positions = model_input.input_positions
+        positions = (
+            model_input.input_positions if first_positions is None else first_positions
+        )
         first = positions if positions.dim() == 1 else positions[:, 0]
         block = committed[:rows].tolist()
         prefixes: list[list[int]] = []
@@ -3653,6 +3732,7 @@ class TTModelRunner:
         spec_hidden: Any,
         *,
         skip_req_ids: set[str] | None = None,
+        first_positions: torch.Tensor | None = None,
     ) -> dict[str, list[int]]:
         """Apply the accepted prefixes and publish the next proposal.
 
@@ -3660,14 +3740,30 @@ class TTModelRunner:
         synchronous path inside the sampling tail, and on the asynchronous path
         when the next step drains this one. ``skip_req_ids`` is how a forced
         prefix-cache reset drops a frame it has already accounted for.
+
+        ``first_positions`` (a deferred fused verify) are the device-reported
+        column-0 positions. Commits apply in submission order, so each row the
+        commit writes must continue exactly where the host's history ends, and
+        a row whose request is gone is handed to the drafter without a
+        position. When a chained verify already took this step's drafts on
+        the device (``take_consumed_tip``) the drafter is still called, on the
+        engine thread after the read, but nothing it returns is published.
         """
         row_req_ids = model_input.row_req_ids
         rows = len(row_req_ids)
+        skipped = set(skip_req_ids or ())
+        if first_positions is not None:
+            first_positions = self._checked_fused_first_positions(
+                row_req_ids, first_positions, skipped
+            )
         committed_by_req = self._apply_committed_spec_tokens_to_state(
             row_req_ids,
             committed[:rows],
             counts[:rows],
             skip_req_ids=skip_req_ids,
+        )
+        consumed = first_positions is not None and self.async_decode.take_consumed_tip(
+            spec_hidden
         )
         if getattr(self, "_spec_drafts_from_model", False):
             self._propose_model_drafts(
@@ -3677,10 +3773,44 @@ class TTModelRunner:
                 spec_hidden,
                 row_req_ids,
                 skip_req_ids=skip_req_ids,
+                first_positions=first_positions,
+                publish=not consumed,
             )
         else:
             self._propose_ngram_drafts(committed_by_req)
         return committed_by_req
+
+    def _checked_fused_first_positions(
+        self,
+        row_req_ids: list[str | None],
+        first_positions: torch.Tensor,
+        skipped: set[str],
+    ) -> torch.Tensor:
+        """The device-reported positions a deferred fused commit proposes from.
+
+        Before the commit writes: a row whose request still holds its batch
+        row must start one past the host's last token, or the device and the
+        host disagree about the request's length, which raises. A row no live
+        request owns, a gap, a skipped frame or a request that finished since
+        the step was submitted, gets -1, the drafter's no-request marker, so a
+        slot a later request already took is not drafted for from the old one.
+        """
+        positions = first_positions.clone()
+        batch = self.input_batch
+        for row, req_id in enumerate(row_req_ids):
+            batch_row = batch.req_id_to_index.get(req_id) if req_id else None
+            if req_id is None or req_id in skipped or batch_row is None:
+                positions[row] = -1
+                continue
+            expected = int(batch.num_tokens[batch_row]) - 1
+            if int(positions[row]) != expected:
+                raise RuntimeError(
+                    f"the device placed request {req_id}'s fused verify at "
+                    f"position {int(positions[row])}, but its history ends at "
+                    f"{expected}"
+                )
+        positions[len(row_req_ids) :] = -1
+        return positions
 
     def propose_after_plain_step(
         self,
