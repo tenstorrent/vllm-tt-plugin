@@ -1027,9 +1027,9 @@ class TTAsyncDecodeController:
 
         Runs on whichever thread resolved the deferred output, so it reads the
         step's own tensors and the immutable model config and nothing else. A
-        ``logits`` walk also advances the step's request generators, which is
-        why ``DeferredDecodeOutput`` resolves a step once. The commit and the
-        next proposal are left for the engine thread.
+        ``logits`` walk also advances the step's request generators, so it
+        relies on ``DeferredDecodeOutput`` resolving a step exactly once. The
+        commit and the next proposal are left for the engine thread.
         """
         finalized = self.finalize_decode(submission)
         if finalized is None:

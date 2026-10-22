@@ -29,11 +29,9 @@ deliberately so a kernel or a test ported from upstream needs no adjustment:
 A drafter that reports no probabilities, such as an n-gram proposer, is handled
 as a point mass at the drafted id: ``q`` is 1, so the accept test reduces to
 ``p >= u``, and the residual is ``p`` with the drafted id removed. That is
-lossless for any draft the walk's own random draws did not choose: the drafted
-id commits with probability ``p(d)`` and any other id ``x`` with
-``(1 - p(d)) * p(x) / (1 - p(d)) = p(x)``. So a drafter that samples its
-proposals stays correct without reporting probabilities; reporting them would
-only raise the acceptance probability from ``p(d)`` to ``min(1, p(d) / q(d))``.
+lossless for any drafter, sampling ones included, whose choice does not read
+the walk's own random draws: the drafted id ``d`` commits with probability
+``p(d)`` and any other id ``x`` with ``(1 - p(d)) * p(x) / (1 - p(d)) = p(x)``.
 
 The target distribution is the one vLLM's ordinary sampler would use, built in
 the ordinary sampler's order: the grammar bitmask, which the runner applies to
@@ -41,11 +39,8 @@ the logits before the sampler sees them; then allowed_token_ids, bad_words and
 min_tokens; then the penalties; then temperature and top-k/top-p. min_p is
 absent because vLLM refuses a min_p above 1e-5 on a speculating launch and
 builds no min_p processor for it. ``accept_sampled_drafts`` applies everything
-up to the penalties per candidate column against that column's own state, and
-hands the rest to ``accept_speculated_tokens``. Column ``j``'s state is the
-committed output plus the first ``j`` drafts: that is the history bad_words and
-the penalties read, the output length min_tokens compares, and the grammar
-state the scheduler filled column ``j``'s bitmask row from.
+up to the penalties per candidate column, against column ``j``'s own state: the
+committed output plus the first ``j`` drafts.
 
 One place differs from upstream's rejection sampler, towards the ordinary
 sampler. Upstream masks the stop tokens at the bonus position whenever the
@@ -58,11 +53,10 @@ control, of each committed token at its own column. That is what the plugin's
 ordinary host sampler returns, because it runs vLLM's ``Sampler`` in its
 default ``raw_logprobs`` mode on logits the grammar has already masked.
 
-The accept walk uses host PyTorch and the plugin's placeholder constant.
-Top-k/top-p filtering and the penalties lazily import vLLM's PyTorch helpers.
-This module reads no ``model_capabilities`` key and admits no configuration,
-so synthetic distributions are sufficient to exercise the acceptance
-arithmetic.
+The accept walk uses host PyTorch and the plugin's placeholder constant. Every
+vLLM helper is imported inside the function that uses it. This module reads no
+``model_capabilities`` key and admits no configuration, so synthetic
+distributions are sufficient to exercise the acceptance arithmetic.
 """
 
 from dataclasses import dataclass, field
@@ -81,21 +75,21 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class AcceptResult:
-    """One accept walk's committed tokens and their counts.
+    """One accept walk's committed tokens, their counts and optional logprobs.
 
     ``committed_token_ids`` is ``[B, 1+K]`` int32. Row ``i`` holds
     ``accepted_counts[i]`` committed ids followed by ``PLACEHOLDER_TOKEN_ID``,
     so a consumer can either truncate at the count or stop at the first
     placeholder and get the same answer. ``accepted_counts`` is ``[B]`` int32.
+    ``committed_token_ids`` and ``accepted_counts`` are validated against each
+    other on construction. An off-by-one in a walk corrupts output tokens
+    rather than raising anywhere, so the pairing is checked where it is
+    produced and not where it is consumed.
 
     ``logprobs``, when the walk was asked for them, has one row per committed
     token, row 0's tokens first, and ``cu_num_generated_tokens`` gives where
     each row's tokens start: vLLM's layout for a step that commits a different
     number of tokens per request.
-
-    The two are validated against each other on construction. An off-by-one in
-    a walk corrupts output tokens rather than raising anywhere, so the pairing
-    is checked where it is produced and not where it is consumed.
     """
 
     committed_token_ids: torch.Tensor
@@ -189,12 +183,8 @@ class SpecTokenFilters:
 class SpecSamplingInputs:
     """One verify step's sampling controls, row-aligned with its block.
 
-    Captured when the step is built, because the asynchronous path walks
-    acceptance on whichever thread resolves the readback, after the persistent
-    batch may have moved on. ``generators`` maps a verify row to its request's
-    own generator, which the walk advances; a row without one draws from the
-    global stream.
-
+    ``generators`` maps a verify row to its request's own generator, which the
+    walk advances; a row without one draws from the global stream.
     ``num_logprobs`` is the batch's largest logprobs request, vLLM's
     ``max_num_logprobs``: ``None`` computes none, 0 the committed token's own,
     and ``n`` adds the top ``n``.
@@ -741,9 +731,9 @@ def _sample_per_row(
     row rather than per position, matching upstream, so a seeded request draws
     the same number of values however many positions it carries.
 
-    Divided rather than multiplied by a reciprocal, because that is the
-    ordinary sampler's arithmetic: a seeded row with no drafts then draws
-    exactly the token the ordinary sampler draws from the same distribution.
+    The weights are divided by the race, as vLLM's ``random_sample`` does, so a
+    seeded row with no drafts draws exactly the token the ordinary sampler
+    draws from the same distribution.
     """
     race = torch.empty((rows, vocab), dtype=torch.float32)
     race.exponential_()

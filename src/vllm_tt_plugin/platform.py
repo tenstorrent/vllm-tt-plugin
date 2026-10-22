@@ -2594,31 +2594,25 @@ class TTPlatform(Platform):
         """Refuse a request this launch cannot serve faithfully at all.
 
         A model serving ``logits`` speculates for every request admission lets
-        through: the runner rejection-samples each verify row on the host
-        against the target distribution under the row's temperature, top-k,
-        top-p, penalties, logprobs, grammar, allowed_token_ids, bad_words and
-        min_tokens, which is what upstream's rejection sampler applies too. A
-        model serving only ``argmax_ids`` certifies plain greedy decoding and
-        nothing else. Where such a model declares ``supports_narrow_decode``,
-        ``TTModelRunner._publish_draft`` offers a sampled or penalized request
-        no drafts, and every step it shares runs as the ordinary decode, which
-        applies its full sampling (``_step_verifies`` in the runner). Refusing
-        these controls would fail every ordinary sampled client with HTTP 400,
-        so they are served. A model serving only ``argmax_ids`` without
-        ``supports_narrow_decode`` sends every decode step as a verify, which
-        commits the target argmax on every row, so there the request is
-        refused. vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
-        speculating launch before this runs.
+        through: the runner rejection-samples each verify row on the host under
+        the row's temperature, top-k, top-p, penalties, logprobs, grammar,
+        allowed_token_ids, bad_words and min_tokens. On a model serving only
+        ``argmax_ids``, which certifies greedy decoding only:
 
-        What remains here is what this launch does not serve. On an
-        ``argmax_ids``-only launch those are the controls that need logits or
-        a token filter: the greedy walk cannot apply them, so a verify would
-        answer such a request without them, silently -- a grammar or token
-        filter unapplied, requested logprobs arriving empty.
+        - logprobs, structured output, allowed_token_ids, bad_words and
+          min_tokens are refused, because the greedy walk cannot apply them and
+          a verify would answer the request without them, silently;
+        - a sampled or penalized request decodes without speculation when the
+          model declares ``supports_narrow_decode``
+          (``TTModelRunner._publish_draft`` offers it no drafts, and
+          ``_step_verifies`` runs the step as the ordinary decode), and is
+          refused when it does not, because then every decode step is a verify
+          that commits the target argmax.
 
-        Refused per request rather than at config time because these are
-        per-request controls, and a launch may legitimately mix requests that
-        speculate with requests that cannot.
+        vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
+        speculating launch before this runs. Refused per request rather than at
+        config time because a launch may mix requests that speculate with
+        requests that cannot.
         """
         from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingType

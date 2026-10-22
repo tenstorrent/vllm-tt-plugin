@@ -1556,8 +1556,9 @@ class TTModelRunner:
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
         or a pending ``min_tokens`` rules out the token the unfiltered argmax
         might be, and logprobs need the logits themselves. Admission refuses
-        all of these on a launch without ``logits``, so there they only decide
-        the mode.
+        all of these on a launch without ``logits``, so in practice they only
+        make ``_spec_mode_for_step`` pick ``logits`` on a launch that serves
+        both modes.
         """
         batch = self.input_batch
         # getattr rather than attribute access: the gate has to stay total for
@@ -1823,12 +1824,6 @@ class TTModelRunner:
             batch_row = self.input_batch.req_id_to_index.get(req_id)
             if batch_row is None:
                 continue
-            # A request whose sampling no accept walk on this launch can
-            # arbitrate is served WITHOUT speculation rather than refused:
-            # ``_publish_draft`` offers nothing for it, which routes it down the
-            # ordinary decode path and its full sampling. On a model that does
-            # not serve ``logits`` that is every sampled or penalized request.
-
             # Trimmed to what the request can still hold, the way the host
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
