@@ -57,6 +57,14 @@ min_tokens, even where the drafts before it reach min_tokens; this walk masks
 column ``j`` only while the output plus ``j`` drafts is below it, which is
 where the ordinary sampler would mask that token.
 
+The random walk can also be handed its uniforms instead of drawing them
+(``accept_speculated_tokens(uniforms=...)``). ``predraw_uniforms`` makes that
+table from the requests' generators and the global stream in exactly the order
+the walk itself would draw, so a walk on the table commits what the drawing
+walk would have committed and leaves every stream where it would have. That is
+how a ``fused_sample`` model, which accepts on the device, consumes the
+runner's randomness: the runner draws, the device walks.
+
 Logprobs are the raw logprobs, after the grammar bitmask and before any other
 control, of each committed token at its own column. That is what the plugin's
 ordinary host sampler returns, because it runs vLLM's ``Sampler`` in its
@@ -408,6 +416,7 @@ def accept_speculated_tokens(
     draft_probs: torch.Tensor | None = None,
     generators: dict[int, torch.Generator] | None = None,
     min_p: torch.Tensor | None = None,
+    uniforms: torch.Tensor | None = None,
 ) -> AcceptResult:
     """Walk acceptance over one ``[B, 1+K]`` candidate block.
 
@@ -439,6 +448,14 @@ def accept_speculated_tokens(
         generators: row index to a seeded ``torch.Generator``. A row named here
             draws its randomness from that generator, so a seeded request is
             reproducible; the rest draw from the global stream.
+        uniforms: ``[B, K+2]`` or None. Every draw the random walk would make,
+            already made (``predraw_uniforms``): column 0 the bonus, columns
+            1..K the accept tests of draft columns 0..K-1, column K+1 the
+            correction. Given, the walk draws nothing, ``generators`` is not
+            read, and every random row's bonus is an inverse-CDF draw from
+            column 0, including a seeded row without drafts, whose drawing
+            walk races its generator over the vocabulary instead. Point-mass
+            drafts only: ``draft_probs`` must be None.
 
     Returns:
         An :class:`AcceptResult`.
@@ -478,6 +495,7 @@ def accept_speculated_tokens(
             rows,
             num_drafts,
             vocab,
+            uniforms,
         )
         select = (~is_greedy).unsqueeze(1)
         accepted = torch.where(select, random_accepted, accepted)
@@ -520,9 +538,15 @@ def _random_walk(
     rows: int,
     num_drafts: int,
     vocab: int,
+    uniforms: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
-    if draft_probs is None and _fast_enabled():
+    if uniforms is not None and draft_probs is not None:
+        raise ValueError(
+            "accept_speculated_tokens takes given uniforms for point-mass drafts "
+            "only; draft_probs must be None"
+        )
+    if draft_probs is None and (_fast_enabled() or uniforms is not None):
         return _point_mass_walk(
             target_logits,
             draft_token_ids,
@@ -535,6 +559,7 @@ def _random_walk(
             rows,
             num_drafts,
             vocab,
+            uniforms,
         )
     probs = _constrained_probs(target_logits, temperature, top_k, top_p, min_p)
     # Replaced inside the vocabulary before any gather, because a draft column
@@ -1120,6 +1145,7 @@ def _point_mass_walk(
     rows: int,
     num_drafts: int,
     vocab: int,
+    uniforms: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The random walk for a point-mass draft, drawing over supports only.
 
@@ -1134,36 +1160,49 @@ def _point_mass_walk(
     with no drafts keeps the old full-vocabulary exponential race for its
     bonus, so that it reads exactly what an ordinary sampled step reads and
     leaves the generator where that step does; every other seeded draw is a
-    uniform.
+    uniform. With ``uniforms`` (``predraw_uniforms``' table) nothing is drawn:
+    every row's bonus is an inverse-CDF draw from its column 0.
     """
     width = num_drafts + 1
     table = _constrained_table(target_logits, temperature, top_k, top_p, min_p)
     valid = num_valid_drafts.to(torch.long)
     draft_ids = draft_token_ids.to(torch.long).clamp(0, vocab - 1)
     row_ids = torch.arange(rows)
-
-    # One batched draw for the unseeded rows: column 0 the bonus, column 1
-    # the correction. Seeded rows overwrite their own entries below.
-    draws = torch.rand((rows, 2), dtype=torch.float64)
     bonus_ids = row_ids * width + valid
-    # A seeded row with drafts draws its bonus as a uniform, first, from its own
-    # generator. A seeded row without drafts is an ordinary sampled step and
-    # draws what the ordinary sampler draws.
-    draftless = {row: g for row, g in generators.items() if int(valid[row]) == 0}
-    for row, generator in generators.items():
-        if row not in draftless:
-            uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
-            draws[row, 0] = uniform[0]
-    bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
-    for row, generator in draftless.items():
-        noise = torch.empty(vocab, dtype=torch.float32)
-        noise.exponential_(generator=generator)
-        bonus[row] = table.race_pick(int(bonus_ids[row]), noise)
-    accept_uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
-    for row, generator in generators.items():
-        if int(valid[row]):
-            uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
-            draws[row, 1] = uniform[0]
+
+    if uniforms is not None:
+        given = uniforms.to(torch.float64)
+        if tuple(given.shape) != (rows, num_drafts + 2):
+            raise ValueError(
+                f"uniforms must be [{rows}, {num_drafts + 2}] (bonus, one per "
+                f"draft column, correction), got {tuple(given.shape)}"
+            )
+        # Columns 0 and K+1 in the drawing walk's two-column layout.
+        draws = torch.stack([given[:, 0], given[:, num_drafts + 1]], dim=1)
+        bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
+        accept_uniform = given[:, 1 : num_drafts + 1]
+    else:
+        # One batched draw for the unseeded rows: column 0 the bonus, column 1
+        # the correction. Seeded rows overwrite their own entries below.
+        draws = torch.rand((rows, 2), dtype=torch.float64)
+        # A seeded row with drafts draws its bonus as a uniform, first, from its
+        # own generator. A seeded row without drafts is an ordinary sampled step
+        # and draws what the ordinary sampler draws.
+        draftless = {row: g for row, g in generators.items() if int(valid[row]) == 0}
+        for row, generator in generators.items():
+            if row not in draftless:
+                uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
+                draws[row, 0] = uniform[0]
+        bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
+        for row, generator in draftless.items():
+            noise = torch.empty(vocab, dtype=torch.float32)
+            noise.exponential_(generator=generator)
+            bonus[row] = table.race_pick(int(bonus_ids[row]), noise)
+        accept_uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
+        for row, generator in generators.items():
+            if int(valid[row]):
+                uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
+                draws[row, 1] = uniform[0]
 
     flat_ids = (row_ids.unsqueeze(1) * width + torch.arange(num_drafts)).reshape(-1)
     p_draft = table.prob_of(flat_ids, draft_ids.reshape(-1)).reshape(rows, num_drafts)
@@ -1191,6 +1230,52 @@ def _point_mass_walk(
         candidates[corr_rows, pos] = recovered
     candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
     return accepted, candidates
+
+
+def predraw_uniforms(
+    generators: dict[int, torch.Generator],
+    rows: int,
+    num_drafts: int,
+    num_valid_drafts: torch.Tensor,
+) -> torch.Tensor:
+    """Every uniform the point-mass walk would draw for ``rows`` rows, drawn now.
+
+    Returns the ``[rows, K+2]`` float64 table ``accept_speculated_tokens``
+    takes as ``uniforms``: column 0 the bonus, columns 1..K the accept tests of
+    draft columns 0..K-1, column K+1 the correction. The draws are made in
+    ``_point_mass_walk``'s order, so each seeded generator and the global
+    stream end where that walk leaves them, and a walk on this table commits
+    what the drawing walk would have:
+
+    1. the global ``torch.rand((rows, 2))``: the bonus and the correction of
+       every row, greedy rows included, as the drawing walk draws them;
+    2. each seeded row's bonus from its own generator;
+    3. the global ``torch.rand((rows, K))``: the accept tests of every row;
+    4. each seeded row's ``num_valid_drafts`` accept tests, then its
+       correction, from its own generator. The correction is drawn whether or
+       not a draft will be rejected, as the drawing walk draws it.
+
+    ``rows`` is the number of rows the walk is handed (the live rows), because
+    the global draws depend on it. A seeded row without drafts raises: the
+    drawing walk races its generator over the whole vocabulary for that bonus,
+    which no uniform can stand in for, so such a step keeps the drawing walk.
+    """
+    valid = num_valid_drafts.reshape(-1).to(torch.int64).tolist()
+    if len(valid) != rows:
+        raise ValueError(f"num_valid_drafts has {len(valid)} entries for {rows} rows")
+    draftless = sorted(row for row in generators if valid[row] == 0)
+    if draftless:
+        raise ValueError(
+            f"seeded rows {draftless} carry no drafts: their bonus is a "
+            "full-vocabulary exponential race, which a uniform cannot stand in for"
+        )
+    draws = torch.rand((rows, 2), dtype=torch.float64)
+    for row, generator in generators.items():
+        draws[row, 0] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+    accepts = _uniform(rows, num_drafts, num_valid_drafts, generators)
+    for row, generator in generators.items():
+        draws[row, 1] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+    return torch.cat([draws[:, :1], accepts, draws[:, 1:]], dim=1)
 
 
 def _sample_per_row(

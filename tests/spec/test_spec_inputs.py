@@ -134,6 +134,9 @@ def _fake_runner(
     runner._request_is_argmax_certifiable = (
         TTModelRunner._request_is_argmax_certifiable.__get__(runner)
     )
+    runner._request_has_host_only_controls = (
+        TTModelRunner._request_has_host_only_controls.__get__(runner)
+    )
     runner._spec_mode_for_step = TTModelRunner._spec_mode_for_step.__get__(runner)
     return runner
 

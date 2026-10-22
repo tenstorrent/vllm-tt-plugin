@@ -45,7 +45,9 @@ logger = init_tt_logger(__name__)
 #
 # ``argmax_ids`` certifies greedy rows only. ``logits`` certifies every row the
 # platform admits on a speculating launch, by rejection sampling on the host,
-# so a logits-only plan is runnable too. ``fused_sample`` has no runner path.
+# so a logits-only plan is runnable too. ``fused_sample`` serves only the steps
+# whose rows need nothing but temperature, top-k and top-p, and the runner
+# falls back to these two on every other step, so it never suffices alone.
 _RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
 
 # Upstream custom_class is a user-provided proposer extension that needs no

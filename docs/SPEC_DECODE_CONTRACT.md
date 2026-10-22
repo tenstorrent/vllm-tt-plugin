@@ -26,10 +26,13 @@ serve speculative decoding within the following execution limits:
   proposing on device through `propose_draft_tokens`. Every other method vLLM
   knows is refused at configuration time rather than admitted to draft
   nothing.
-- two accept modes, **`argmax_ids`** and **`logits`**, chosen per step from
-  what the model declares (section 4h). A plan must offer at least one of
-  them; `fused_sample` has no runner path. An ordinary narrow decode does not
-  send `spec_mode`.
+- three accept modes, **`argmax_ids`**, **`logits`** and **`fused_sample`**,
+  chosen per step from what the model declares (sections 4h and 4i). A plan
+  must offer `argmax_ids` or `logits`; `fused_sample`, acceptance on the
+  device with uniforms the runner draws, serves a synchronous step whose
+  sampled rows need nothing but temperature, top-k and top-p, and the step
+  falls back to `logits` otherwise. An ordinary narrow decode does not send
+  `spec_mode`.
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
@@ -81,10 +84,11 @@ serve speculative decoding within the following execution limits:
   cap of `SpecPlan.k_by_rows`, `_step_verifies` and the accept mode read the
   step's live rows across all lanes; a per-lane policy, such as drafting only
   for a lane with one live request, is the adapter's, through
-  `DraftOutput.num_valid`. Both accept modes serve lane mode as they serve
+  `DraftOutput.num_valid`. Every accept mode serves lane mode as it serves
   front-packed execution: a sampled request in any lane makes the whole step
-  a `logits` verify, the model answers every slot of the grid, gaps included,
-  and the host walk samples only the scheduled slots (section 4h). Lane mode
+  a `logits` verify, or a `fused_sample` one (section 4i), the model answers
+  every slot of the grid, gaps included, and only the scheduled slots are
+  sampled (section 4h). Lane mode
   refuses `ngram`, whose proposer indexes front-packed rows, and asynchronous
   scheduling, whose lane decode has no deferred speculative tail.
 
@@ -98,9 +102,8 @@ exception does not raise: on a model that does not serve `logits` but declares
 and keep every step they are part of an ordinary decode, which uses the
 selected model's normal sampling path (section 4d). Separately, `TTPlatform`
 can disable async scheduling when `supports_async_decode` is absent (section
-4c). `fused_sample`, use of `DraftOutput.draft_scores` and a scheduler-owned
-paged drafter cache each need their own execution path before the matching
-refusal can go.
+4c). Use of `DraftOutput.draft_scores` and a scheduler-owned paged drafter
+cache each need their own execution path before the matching refusal can go.
 
 The plugin's `logits` path is validated against tt-metal's
 `DummySpecDecodeModel` (host tests in `tests/spec/`, server tests in
@@ -235,8 +238,10 @@ model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids` or `logits`, the return formats the
-runner executes. A model may also declare `fused_sample`, but that declaration
-enables no execution path. Declaring `logits` enables sampled speculation for
+runner executes. A model may also declare `fused_sample`, which the runner
+asks for instead of `logits` on the steps section 4i describes; it never makes
+a request speculable by itself, because a step it cannot serve falls back to
+the other modes. Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
@@ -346,8 +351,9 @@ third shape, and section 4d explains which steps take which.
 | `num_valid_drafts` | `[B]` int32 | absent |
 | `accepted_counts` | `[B]` int32 | `[B]` int32 while a live row has an unresolved commit, otherwise absent |
 | `spec_mode` | present | absent |
-| `sampling_params` | present only on an `argmax_ids` verify of a launch that samples on device; absent on a `logits` verify | present when the step samples on device |
-| return | `VerifyOutput` in the requested `spec_mode`: `argmax_ids` `[B, 1+K]` or `logits` `[B, 1+K, V]` | whatever this model's decode already returns |
+| `sampling_params` | present only on an `argmax_ids` verify of a launch that samples on device; absent on a `logits` or `fused_sample` verify | present when the step samples on device |
+| `spec_sampling` | present only on a `fused_sample` verify with a sampled live row (section 4i) | absent |
+| return | `VerifyOutput` in the requested `spec_mode`: `argmax_ids` `[B, 1+K]`, `logits` `[B, 1+K, V]`, or `fused_sample` committed ids `[B, 1+K]` and counts `[B]` | whatever this model's decode already returns |
 
 `TTModelInput.draft_token_ids` is a separate `[B, K]` tensor retained by the
 runner for host acceptance. `submit_decode` does not pass
@@ -895,7 +901,8 @@ closed and must not touch the device.
 per verify step from `SpecPlan.accept_modes` and the step's live rows. A model
 offering only `logits` is always asked for `logits`. A model offering both is
 asked for `argmax_ids` while every live row is certifiable by id equality, and
-for `logits` as soon as one live row is not:
+for `logits` as soon as one live row is not, unless it also offers
+`fused_sample` and the step qualifies for it (section 4i):
 `TTModelRunner._request_is_argmax_certifiable` is false for a non-zero
 temperature, a penalty, logprobs (including `logprobs=0`), structured output,
 `allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not
@@ -1052,6 +1059,87 @@ persistent batch may have moved on, and reads nothing else. The walk draws
 from the requests' own generators, so it must run once per step;
 `DeferredDecodeOutput` resolves a step exactly once, so a request's generator
 advances once however many callers race to resolve it.
+
+## 4i. The `fused_sample` accept mode
+
+**When the runner asks for it.** On a model whose plan offers
+`fused_sample`, `TTModelRunner._spec_mode_for_step` asks for it on a verify
+step that `argmax_ids` cannot serve (a live row
+`TTModelRunner._request_is_argmax_certifiable` rejects, or a plan without
+`argmax_ids`) when `TTModelRunner._step_is_fused_servable` holds: scheduling
+is synchronous, every live row passes
+`TTModelRunner._request_is_fused_servable`, and no seeded sampled row carries
+zero valid drafts. A row is fused-servable when it is greedy, or when it
+samples with nothing but its temperature, top-k and top-p, inside the bounds
+the model's device sampler declares: top-k at most `max_device_top_k`, or no
+top-k with top-p below 1 on a model declaring
+`supports_device_top_p_without_top_k`; a model declaring no
+`max_device_top_k` bounds neither. Penalties, logprobs, structured output,
+`allowed_token_ids`, `bad_words` and a pending `min_tokens` keep the step in
+`logits`, and so does a seeded row without drafts: the `logits` walk draws its
+bonus by the ordinary sampler's exponential race over the request's own
+generator, which no uniform stands in for. An all-greedy step stays
+`argmax_ids`. Lane mode and front-packed execution choose alike, the lane
+builder over the scheduled slots. The runner reports the count of
+`fused_sample` verifies in its `TT submissions:` log line.
+
+**What the model receives.** The verify call of section 4a with
+`spec_mode="fused_sample"` and no `sampling_params`: the step runs with
+`perform_device_sampling=False`. When a live row samples, the call also
+carries `spec_sampling`, a dict of host tensors over the block's `B` rows,
+gaps and padding rows included:
+
+| Key | Shape and dtype | Meaning |
+| --- | --- | --- |
+| `temperature` | `[B]` float32 | 0 on a greedy row |
+| `top_k` | `[B]` int32 | 1 on a greedy row; on a sampled row, below 1 or at least the vocabulary means no top-k |
+| `top_p` | `[B]` float32 | 1.0 on a greedy row |
+| `greedy` | `[B]` bool | True on every row no request owns |
+| `uniforms` | `[B, K+2]` float32 in `[0, 1)` | column 0 the bonus, columns 1..K the accept tests of draft columns 0..K-1, column K+1 the correction; zero on a row no request owns |
+
+A step whose live rows are all greedy, which only a plan without `argmax_ids`
+sends, carries no `spec_sampling` and draws nothing.
+
+**Randomness.** `model_runner.fused_spec_sampling` draws the uniforms at
+submission, once per step, with `spec_accept.predraw_uniforms` over the live
+rows: the global `torch.rand((rows, 2))` (bonus and correction), each seeded
+row's bonus from its own generator, the global `torch.rand((rows, K))` (the
+accept tests), then each seeded row's `num_valid_drafts` accept tests and its
+correction. That is the order in which the `logits` walk draws
+(`spec_accept._point_mass_walk`), so every request's generator and the global
+stream end where a `logits` step would leave them, and a seeded request's
+output does not depend on which of the two modes a step ran in. Rounding the
+uniforms to float32 changes a decision only where a probability lies within
+about 6e-8 of its uniform. With `VLLM_TT_SPEC_FAST_TOPK=0` the `logits` walk
+draws an exponential race per row instead, so the two modes then draw
+different streams.
+
+**What the model computes.** For each live row, the point-mass walk of
+section 4h with those uniforms; `spec_accept.accept_speculated_tokens` with
+`uniforms=` is its host form. A greedy row accepts a draft while it equals
+the target argmax (the lowest id among tied maxima) and commits the argmax
+chain, as `argmax_ids` does. A sampled row accepts draft `j` when its
+probability under column `j`'s distribution (temperature, then top-k, then
+top-p) is positive and at least `uniforms[:, 1 + j]`; at the first rejection
+it commits a token drawn by inverse CDF from that distribution without the
+draft, with `uniforms[:, K + 1]`; after every valid draft is accepted it
+commits the bonus drawn from column `num_valid_drafts` with `uniforms[:, 0]`.
+The inverse CDF walks the support in the host table's order, logit
+descending then id ascending for a row with top-k and id ascending for a
+top-p row without, so the same uniform draws the same token. A model whose
+device sees only part of the distribution (a sampler's candidate lists)
+documents where it differs.
+
+**What the model returns.** `VerifyOutput(spec_mode="fused_sample",
+accepted_token_ids=..., accepted_counts=...)`, host tensors: `[B, 1+K]`
+int32, each row's committed tokens followed by `PLACEHOLDER_TOKEN_ID`, and
+`[B]` int32 counts in `[1, 1 + num_valid_drafts]`. A row no request owns
+commits one token, count 1. `TTModelRunner._walk_fused_acceptance` checks the
+dtypes and shapes against the submitted block, the count range, the
+placeholder pattern (`AcceptResult`), and that every committed token before a
+row's last is that row's draft at its column, and raises naming the rows
+otherwise; then the step commits and proposes as for any mode (section 5,
+steps 7 and 8). It carries no logprobs.
 
 ## 5. One request, from prefill to release
 

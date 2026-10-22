@@ -31,7 +31,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -1300,13 +1300,16 @@ class TTLaneInputBatch(InputBatch):
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
         logits_verify = spec["spec_mode"] == ACCEPT_MODE_LOGITS
-        if logits_verify:
-            # The host walk samples from the logits this verify returns, so the
+        fused_verify = spec["spec_mode"] == ACCEPT_MODE_FUSED_SAMPLE
+        if logits_verify or fused_verify:
+            # The host walk samples from the logits this verify returns, or the
+            # device accepts with the uniforms the runner draws for it, so the
             # model must not sample on device, as on the front-packed path.
             perform_device_sampling = False
 
         # The prompt/output token tensors feed device-side penalties, and the
-        # host walk of a logits verify. The ordinary host sampling tail
+        # host walk of a logits verify (never a fused one, which carries no
+        # penalized row). The ordinary host sampling tail
         # rebuilds them itself in ``build_merged_sampling_metadata``, so
         # building them for it would be dead work.
         prompt_tokens = output_tokens = None
@@ -1321,6 +1324,10 @@ class TTLaneInputBatch(InputBatch):
             if logits_verify
             else {}
         )
+        if fused_verify:
+            # The uniforms the device accepts with are drawn from these, by
+            # slot (``fused_spec_sampling``), as the logits walk draws.
+            walk_inputs["generators_list"] = [dict(self.sampling.generators)]
         if spec["spec_mode"] is not None and not logits_verify:
             # The mode was chosen over the scheduled slots, so the logprobs an
             # ids walk refuses are theirs too: a request a decode step leaves
@@ -1351,7 +1358,8 @@ class TTLaneInputBatch(InputBatch):
             # Host sampling reads the merged batch directly (see
             # ``extract_output``); the allowlist, bad-words and generator
             # sidecars are read only by the host walk of a logits verify
-            # (``_logits_walk_inputs``).
+            # (``_logits_walk_inputs``), the generators also by the uniform
+            # draw of a fused one.
             allowed_token_ids_mask_list=walk_inputs.get(
                 "allowed_token_ids_mask_list", [None]
             ),
@@ -1470,7 +1478,8 @@ class TTLaneInputBatch(InputBatch):
             req_id if row in scheduled else None
             for row, req_id in enumerate(self.req_ids[:total])
         ]
-        live_req_ids = [self.req_ids[row] for row in plan.scheduled_rows]
+        live_rows = list(plan.scheduled_rows)
+        live_req_ids = [self.req_ids[row] for row in live_rows]
         spec_plan = getattr(runner, "_spec_plan", None)
         drafts, num_valid, counts = runner._spec_row_state(
             runner._req_accepted_counts,
@@ -1499,7 +1508,9 @@ class TTLaneInputBatch(InputBatch):
                 # Over the scheduled requests only, as front-packed padding
                 # rows do not decide it: a gap or a left-out slot is greedy
                 # to the walk and commits nothing.
-                "spec_mode": runner._spec_mode_for_step(live_req_ids),
+                "spec_mode": runner._spec_mode_for_step(
+                    live_req_ids, num_valid[live_rows]
+                ),
                 "grammar_rows_per_request": grammar_rows_per_request,
             }
         # The ordinary decode inside a speculating launch, as in the

@@ -19,6 +19,7 @@ from vllm_tt_plugin.model_input import TTCompactedHostLogits
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
@@ -28,7 +29,9 @@ from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 
-def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
+def _verify_output_tensor(
+    tt_out: Any, model_name: str, spec_mode: str
+) -> torch.Tensor | VerifyOutput:
     """The one tensor a verify's mode returns, unwrapped from ``VerifyOutput``.
 
     A step that sent ``spec_mode`` asked the model to verify a candidate
@@ -46,6 +49,10 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
     vocabulary indices of float rows, and ``[B, 1+K]`` ids read as logits
     would be sampled over a block-width vocabulary. ``VerifyOutput`` has
     already checked that the field its mode declares is present.
+
+    ``fused_sample`` returns two fields, the committed ids and their counts,
+    which only mean something together, so its ``VerifyOutput`` is returned
+    whole.
     """
     if not isinstance(tt_out, VerifyOutput):
         raise TypeError(
@@ -66,6 +73,8 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
         return tt_out.argmax_ids
     if spec_mode == ACCEPT_MODE_LOGITS:
         return tt_out.logits
+    if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+        return tt_out
     raise NotImplementedError(
         f"the runner drives no accept walk for spec_mode {spec_mode!r}"
     )
@@ -122,6 +131,13 @@ def _is_host_decode_output(tt_out: Any) -> bool:
     if isinstance(tt_out, tuple):
         return all(
             tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        )
+    if isinstance(tt_out, VerifyOutput):
+        # A fused_sample verify reaches the walk whole; it is host output when
+        # the fields its mode carries already are.
+        return all(
+            isinstance(getattr(tt_out, name), torch.Tensor)
+            for name in MODE_REQUIRED_FIELDS[tt_out.spec_mode]
         )
     return False
 
@@ -389,8 +405,10 @@ class TTAsyncDecodeController:
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
         # The verifies among those that asked for logits, which is the one
-        # observable that says a launch serving both modes chose per step.
+        # observable that says a launch serving both modes chose per step, and
+        # those that asked for acceptance on the device.
         self._logits_verify_submissions = 0
+        self._fused_verify_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -731,17 +749,21 @@ class TTAsyncDecodeController:
             self._verify_submissions += 1
             if model_input.spec_mode == ACCEPT_MODE_LOGITS:
                 self._logits_verify_submissions += 1
+            elif model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+                self._fused_verify_submissions += 1
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
             # Parsed by tests/tt/spec/bench_spec_overhead.py and
             # tests/tt/spec/test_sampled_speculation.py; keep them in step.
             logger.info(
                 "TT submissions: %d ordinary decode, %d verify, "
-                "%d overlapped an outstanding step, %d verify in logits mode",
+                "%d overlapped an outstanding step, %d verify in logits mode, "
+                "%d verify in fused_sample mode",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
                 self._logits_verify_submissions,
+                self._fused_verify_submissions,
             )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
@@ -1291,6 +1313,15 @@ class TTAsyncDecodeController:
             kwargs["spec_mode"] = model_input.spec_mode
         if model_input.accepted_counts is not None:
             kwargs["accepted_counts"] = model_input.accepted_counts
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            # The device accepts with the uniforms drawn here, once per step,
+            # from the requests' own generators. None (nothing sent, nothing
+            # drawn) when every live row is greedy.
+            from vllm_tt_plugin.model_runner import fused_spec_sampling
+
+            spec_sampling = fused_spec_sampling(model_input)
+            if spec_sampling is not None:
+                kwargs["spec_sampling"] = spec_sampling
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (

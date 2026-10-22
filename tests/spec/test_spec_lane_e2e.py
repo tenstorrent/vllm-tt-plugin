@@ -14,13 +14,17 @@ other slots are gaps, so a defect that read a gap as a request, shifted a row
 onto a packed index, or let a gap's position turn into 0..K changes an
 assertion.
 
-The last region drives sampled requests through the same step against
+The last regions drive sampled requests through the same step against
 ``SampledTarget``, whose distribution does not depend on what was drafted:
 a lane verify asks for ``logits`` when a scheduled request needs its target
 distribution, and each request commits exactly what the host walk draws for
-its slot from its own generator.
+its slot from its own generator. On a model that also offers ``fused_sample``
+the device accepts instead, with uniforms the runner draws, and each request
+commits exactly what the ``logits`` walk would have drawn from the same
+generator states and global stream.
 """
 
+import dataclasses
 import inspect
 from types import SimpleNamespace
 
@@ -41,12 +45,18 @@ from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.spec_accept import accept_speculated_tokens
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
+    ACCEPT_MODE_LOGITS,
+    VerifyOutput,
+    check_spec_side_tensors,
+)
 
 from . import test_spec_sampled_controls_runner as controls
 from . import test_spec_sampled_runner as sync_harness
 from .fake_spec_model import FAKE_VOCAB_SIZE, FakeSpecModel, make_fake_spec_model
-from .sampled_target import rule_logits
+from .sampled_target import SAMPLED_VOCAB_SIZE, rule_logits
 
 BLOCK_SIZE = 16
 MAX_MODEL_LEN = 128
@@ -705,3 +715,247 @@ def test_a_lane_request_with_a_control_speculates_to_the_ordinary_output(case):
 
 
 # endregion Sampled requests (logits mode)
+
+
+# region Sampled requests (fused_sample mode)
+
+
+class _FusedTarget(sync_harness._DraftingTarget):
+    """``SampledTarget`` with its drafter, also accepting as a fused model does.
+
+    A ``fused_sample`` verify walks the rule's logits with the uniforms the
+    runner sent (``accept_speculated_tokens(uniforms=...)``, every row greedy
+    when none came) and returns the committed ids and counts, which is what a
+    device accept computes. Its sampler bounds are a small device sampler's.
+    """
+
+    accept_modes = (
+        ACCEPT_MODE_ARGMAX_IDS,
+        ACCEPT_MODE_LOGITS,
+        ACCEPT_MODE_FUSED_SAMPLE,
+    )
+    model_capabilities = {
+        **sync_harness._DraftingTarget.model_capabilities,
+        "max_device_top_k": 8,
+        "supports_device_top_p_without_top_k": True,
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spec_sampling: list = []
+
+    def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):
+        if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+            assert "spec_sampling" not in kwargs, "spec_sampling outside a fused verify"
+            return super().decode_forward(
+                tokens, start_pos, spec_mode=spec_mode, **kwargs
+            )
+        rows, width = (int(size) for size in tokens.shape)
+        num_valid = kwargs["num_valid_drafts"]
+        check_spec_side_tensors(num_valid, kwargs["accepted_counts"], rows, width - 1)
+        assert "sampling_params" not in kwargs, (
+            "a fused verify was sent device sampling"
+        )
+        self.verify_modes.append(spec_mode)
+        sampling = kwargs.get("spec_sampling")
+        self.spec_sampling.append(sampling)
+        if sampling is None:
+            temperature, top_k, top_p = torch.zeros(rows), None, None
+            uniforms = torch.zeros(rows, width + 1, dtype=torch.float64)
+        else:
+            temperature = sampling["temperature"]
+            top_k = sampling["top_k"].masked_fill(
+                sampling["top_k"] < 1, SAMPLED_VOCAB_SIZE
+            )
+            top_p, uniforms = sampling["top_p"], sampling["uniforms"].to(torch.float64)
+        result = accept_speculated_tokens(
+            target_logits=rule_logits(tokens, start_pos),
+            draft_token_ids=tokens[:, 1:],
+            num_valid_drafts=num_valid,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            uniforms=uniforms,
+        )
+        self.hidden = object()
+        return VerifyOutput(
+            spec_mode=spec_mode,
+            accepted_token_ids=result.committed_token_ids,
+            accepted_counts=result.accepted_counts,
+            hidden=self.hidden,
+        )
+
+
+def _fused_target(**knobs) -> _FusedTarget:
+    return type("LaneFusedTarget", (_FusedTarget,), knobs)()
+
+
+def _fused_step(runner, drafts):
+    """One lane step, checked against the ``logits`` walk it replaces.
+
+    The reference re-walks the step's block in ``logits`` mode
+    (``_walk_sampled_acceptance``) from copies of the seeded generators and
+    the global stream as they were before the step. A fused step must commit
+    the same tokens and leave every stream exactly where that walk leaves it.
+    """
+    generators = dict(runner.lane_batch.sampling.generators)
+    copies = {}
+    for slot, generator in generators.items():
+        copies[slot] = torch.Generator(device="cpu")
+        copies[slot].set_state(generator.get_state())
+    rng_before = torch.get_rng_state()
+    model_input, output = _step(runner, drafts=drafts)
+    if model_input.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+        return model_input, output
+    rng_after = torch.get_rng_state()
+    torch.set_rng_state(rng_before)
+    reference = TTModelRunner._walk_sampled_acceptance(
+        runner,
+        dataclasses.replace(
+            model_input, spec_mode=ACCEPT_MODE_LOGITS, generators_list=[copies]
+        ),
+        rule_logits(model_input.input_tokens, model_input.input_positions),
+    )
+    assert torch.get_rng_state().equal(rng_after), "the global stream moved differently"
+    for slot, generator in generators.items():
+        assert generator.get_state().equal(copies[slot].get_state()), slot
+    expected = {
+        req_id: reference.committed[row, : int(reference.counts[row])].tolist()
+        for row, req_id in enumerate(model_input.row_req_ids)
+        if req_id is not None
+    }
+    assert _committed(output) == expected
+    return model_input, output
+
+
+def test_a_sampled_lane_request_is_accepted_on_device():
+    """The verify asks for fused_sample once the seeded request carries drafts,
+    and each step commits what the logits walk would have drawn.
+
+    Its first verify carries no drafts, and a seeded row's draftless bonus is
+    the ordinary sampler's race over its generator, which no uniform stands in
+    for: that one step stays ``logits``.
+    """
+    model = _fused_target()
+    runner = _runner(model)
+    _add_request(runner, "s", row=3, first_token=5, params=SAMPLED)
+    drafts: dict[str, list[int]] = {}
+    widths = []
+    for _ in range(12):
+        model_input, output = _fused_step(runner, drafts)
+        assert not model_input.perform_device_sampling
+        widths.append(len(_committed(output)["s"]))
+        drafts = _proposals(runner)
+
+    assert model.verify_modes[0] == ACCEPT_MODE_LOGITS
+    assert set(model.verify_modes[1:]) == {ACCEPT_MODE_FUSED_SAMPLE}
+    assert max(widths) > 1, "no draft was ever accepted"
+    assert min(widths[1:]) < DRAFT_LEN + 1, "no draft was ever rejected"
+    sampling = model.spec_sampling[-1]
+    # Over every slot of the grid; the three gaps are greedy and draw nothing.
+    assert sampling["greedy"].tolist() == [True, True, True, False]
+    assert sampling["uniforms"].shape == (CAPACITY, DRAFT_LEN + 2)
+    assert not sampling["uniforms"][:3].any()
+    assert sampling["temperature"].tolist() == [0.0, 0.0, 0.0, 1.0]
+
+
+def test_mixed_lanes_are_accepted_on_device_together():
+    """A greedy lane, an unseeded top-k lane and a seeded nucleus request share
+    one fused verify: the greedy lane commits its argmax chain, the others what
+    the logits walk draws from the same streams."""
+    model = _fused_target()
+    runner = _runner(model)
+    _add_request(runner, "g", row=0, first_token=1)
+    _add_request(
+        runner,
+        "k",
+        row=1,
+        first_token=9,
+        params=SamplingParams(temperature=0.8, top_k=3),
+    )
+    _add_request(runner, "s", row=2, first_token=5, params=SAMPLED)
+    _step(runner)
+    drafts = _proposals(runner)
+    for _ in range(6):
+        tail = _tail(runner, "g")
+        model_input, output = _fused_step(runner, drafts)
+        assert model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE
+        assert model_input.num_valid_drafts.tolist() == [DRAFT_LEN] * 3 + [0]
+        assert _committed(output)["g"] == sync_harness._base_chain(*tail, DRAFT_LEN + 1)
+        drafts = _proposals(runner)
+    assert model.spec_sampling[-1]["top_k"].tolist()[:3] == [1, 3, SAMPLED_VOCAB_SIZE]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        SamplingParams(temperature=1.0, top_p=0.9, presence_penalty=0.5),
+        SamplingParams(temperature=1.0, top_p=0.9, logprobs=1),
+        SamplingParams(temperature=1.0, top_k=20),  # past max_device_top_k
+        SamplingParams(temperature=1.0),  # pure temperature: the whole vocabulary
+        controls._params("bad-words", temperature=0.0),
+    ],
+    ids=[
+        "penalty",
+        "logprobs",
+        "top-k-past-the-device",
+        "no-nucleus",
+        "greedy-bad-words",
+    ],
+)
+def test_one_request_the_device_cannot_accept_keeps_the_step_in_logits(params):
+    model = _fused_target()
+    runner = _runner(model)
+    _add_request(runner, "s", row=0, first_token=5, params=SAMPLED)
+    _add_request(runner, "x", row=2, first_token=9, params=params)
+    _step(runner)
+
+    model_input, _ = _step(runner, drafts=_proposals(runner))
+
+    assert model_input.spec_mode == ACCEPT_MODE_LOGITS
+    assert model.spec_sampling == []
+
+
+def test_a_nucleus_row_needs_the_device_top_p_declaration():
+    """Without ``supports_device_top_p_without_top_k`` a nucleus row without
+    top-k is not one the device sampler serves, so it is not accepted there."""
+    model = _fused_target(
+        model_capabilities={
+            **_FusedTarget.model_capabilities,
+            "supports_device_top_p_without_top_k": False,
+        }
+    )
+    runner = _runner(model)
+    _add_request(runner, "s", row=3, first_token=5, params=SAMPLED)
+    _step(runner)
+    model_input, _ = _step(runner, drafts=_proposals(runner))
+    assert model_input.spec_mode == ACCEPT_MODE_LOGITS
+
+
+def test_a_greedy_lane_step_stays_argmax_ids_on_a_fused_model():
+    """All-greedy steps keep the ids readback and draw nothing."""
+    model = _fused_target()
+    runner = _runner(model)
+    _add_request(runner, "g", row=0, first_token=1)
+    _add_request(runner, "h", row=3, first_token=9)
+    _step(runner)
+    rng = torch.get_rng_state()
+
+    model_input, _ = _step(runner, drafts=_proposals(runner))
+
+    assert model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
+    assert model.spec_sampling == []
+    assert torch.get_rng_state().equal(rng)
+
+
+def test_fused_acceptance_is_synchronous_only():
+    model = _fused_target()
+    runner = _runner(model)
+    _add_request(runner, "s", row=1, first_token=5, params=SAMPLED)
+    drafts = torch.tensor([DRAFT_LEN], dtype=torch.int32)
+    assert runner._spec_mode_for_step(["s"], drafts) == ACCEPT_MODE_FUSED_SAMPLE
+    runner.async_decode_scheduling = True
+    assert runner._spec_mode_for_step(["s"], drafts) == ACCEPT_MODE_LOGITS
+
+
+# endregion Sampled requests (fused_sample mode)

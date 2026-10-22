@@ -661,9 +661,13 @@ repetition penalties and seed, and under structured output, `allowed_token_ids`,
 `bad_words` and `min_tokens`, with logprobs returned for every committed token.
 No production tt-metal adapter declares `logits`
 yet; tt-metal's `DummySpecDecodeModel` validates the path.
-`docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`. `fused_sample`
-execution, scheduler-owned paged drafter caches and `TTLaneCoordinator`
-execution are not implemented for this contract.
+A model may also offer `fused_sample`: on a synchronous step whose sampled
+requests need only temperature, top-k and top-p, the runner draws the walk's
+uniforms from the requests' generators and the model accepts on the device,
+returning the committed tokens and counts instead of the logits.
+`docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`.
+Scheduler-owned paged drafter caches and `TTLaneCoordinator` execution are not
+implemented for this contract.
 
 ### Model selection and launch settings
 

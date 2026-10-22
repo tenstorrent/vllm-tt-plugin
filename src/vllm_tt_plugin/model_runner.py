@@ -76,18 +76,22 @@ from vllm_tt_plugin.model_input import (
 )
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.spec_accept import (
+    AcceptResult,
     SpecPenalties,
     SpecSamplingInputs,
     SpecTokenFilters,
     accept_sampled_drafts,
+    predraw_uniforms,
 )
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     DraftOutput,
+    VerifyOutput,
     accept_greedy_drafts,
 )
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
@@ -323,6 +327,65 @@ def _spec_sampling_inputs(
         filters=_spec_token_filters(model_input, rows),
         num_logprobs=model_input.max_num_logprobs[0],
     )
+
+
+def fused_spec_sampling(model_input: TTModelInput) -> dict[str, torch.Tensor] | None:
+    """The ``spec_sampling`` keyword of a ``fused_sample`` verify, or None.
+
+    None, and nothing drawn, when no live row samples: the host walk draws
+    nothing for an all-greedy step either. Otherwise host tensors over the
+    block's ``B`` rows, gaps and padding included: ``temperature`` float32
+    ``[B]`` (0 on a greedy row), ``top_k`` int32 ``[B]`` (1 on a greedy row; on
+    a sampled row below 1 or at least the vocabulary means none), ``top_p``
+    float32 ``[B]`` (1.0 on a greedy row), ``greedy`` bool ``[B]`` (True on every
+    row no request owns), and ``uniforms`` float32 ``[B, K+2]`` in ``[0, 1)``:
+    every uniform the host walk would draw for the step, drawn here by
+    ``predraw_uniforms`` over the live rows from the requests' own generators
+    and the global stream, in that walk's order, so each stream ends where a
+    ``logits`` step would leave it. Zero on rows no request owns.
+
+    Called once per step, at submission, because the draws advance the
+    requests' generators.
+    """
+    rows = _spec_live_rows(model_input)
+    total, width = (int(size) for size in model_input.input_tokens.shape)
+    live = torch.as_tensor(rows, dtype=torch.long)
+    params = model_input.tt_sampling_params
+
+    def per_row(values: Any, dtype: torch.dtype) -> torch.Tensor:
+        tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
+        return tensor.expand(len(rows)).clone() if tensor.numel() == 1 else tensor[live]
+
+    # The walk's own reading of the batch's raw temperature (_spec_sampling_inputs).
+    temperature = per_row(params.temperature, torch.float32)
+    temperature = temperature.masked_fill(temperature < _SAMPLING_EPS, 0.0)
+    sampled = temperature > 0.0
+    if not bool(sampled.any()):
+        return None
+    top_k = per_row(params.top_k, torch.int32)
+    top_p = per_row(params.top_p, torch.float32)
+    uniforms = predraw_uniforms(
+        _by_live_row(model_input.generators_list[0], rows),
+        len(rows),
+        width - 1,
+        model_input.num_valid_drafts[live],
+    )
+    # float32 for the device: rounded, and kept below 1.
+    below_one = float(torch.nextafter(torch.tensor(1.0), torch.tensor(0.0)))
+    uniforms = uniforms.to(torch.float32).clamp(max=below_one)
+
+    def padded(values: torch.Tensor, fill: Any, dtype: torch.dtype) -> torch.Tensor:
+        out = torch.full((total, *values.shape[1:]), fill, dtype=dtype)
+        out[live] = values.to(dtype)
+        return out
+
+    return {
+        "temperature": padded(temperature, 0.0, torch.float32),
+        "top_k": padded(torch.where(sampled, top_k, 1), 1, torch.int32),
+        "top_p": padded(torch.where(sampled, top_p, 1.0), 1.0, torch.float32),
+        "greedy": padded(~sampled, True, torch.bool),
+        "uniforms": padded(uniforms, 0.0, torch.float32),
+    }
 
 
 def _by_live_row(per_row: dict[int, Any], rows: list[int]) -> dict[int, Any]:
@@ -1655,7 +1718,9 @@ class TTModelRunner:
             return True
         return self._request_is_argmax_certifiable(req_id)
 
-    def _spec_mode_for_step(self, row_req_ids: list[str]) -> str:
+    def _spec_mode_for_step(
+        self, row_req_ids: list[str], num_valid_drafts: torch.Tensor | None = None
+    ) -> str:
         """The accept mode one verify asks for, from the rows it carries.
 
         ``argmax_ids`` while every row is certifiable by id equality
@@ -1664,15 +1729,91 @@ class TTModelRunner:
         distribution makes the whole step ``logits``: the mode is per step, and
         that row would otherwise commit the argmax even with no draft of its
         own.
+
+        ``fused_sample`` takes such a step instead, on a model offering it,
+        when the device can accept every row (``_step_is_fused_servable``):
+        the model accepts on the device with the uniforms the runner draws, and
+        reads back the committed ids and counts. ``num_valid_drafts`` is
+        row-aligned with ``row_req_ids``; without it no seeded row is assumed
+        to carry a draft.
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
+        certifiable = all(
+            self._request_is_argmax_certifiable(req_id) for req_id in row_req_ids
+        )
+        if (
+            ACCEPT_MODE_FUSED_SAMPLE in modes
+            and (not certifiable or ACCEPT_MODE_ARGMAX_IDS not in modes)
+            and self._step_is_fused_servable(row_req_ids, num_valid_drafts)
+        ):
+            return ACCEPT_MODE_FUSED_SAMPLE
         if ACCEPT_MODE_LOGITS not in modes:
             return ACCEPT_MODE_ARGMAX_IDS
         if ACCEPT_MODE_ARGMAX_IDS not in modes:
             return ACCEPT_MODE_LOGITS
-        if all(self._request_is_argmax_certifiable(req_id) for req_id in row_req_ids):
+        if certifiable:
             return ACCEPT_MODE_ARGMAX_IDS
         return ACCEPT_MODE_LOGITS
+
+    def _step_is_fused_servable(
+        self, row_req_ids: list[str], num_valid_drafts: torch.Tensor | None
+    ) -> bool:
+        """True when a ``fused_sample`` verify can accept every row of the step.
+
+        Synchronous scheduling only: the deferred readback has no fused path.
+        Every row must be ``_request_is_fused_servable``, and no seeded sampled
+        row may arrive without drafts, because its bonus is the ordinary
+        sampler's exponential race over its own generator
+        (``predraw_uniforms``), which the device cannot run.
+        """
+        if getattr(self, "async_decode_scheduling", False):
+            return False
+        random_reqs = getattr(self.input_batch, "random_reqs", ())
+        requests = getattr(self, "requests", {})
+        for row, req_id in enumerate(row_req_ids):
+            if not self._request_is_fused_servable(req_id):
+                return False
+            seeded = (
+                req_id in random_reqs
+                and getattr(requests.get(req_id), "generator", None) is not None
+            )
+            if seeded and (num_valid_drafts is None or int(num_valid_drafts[row]) == 0):
+                return False
+        return True
+
+    def _request_is_fused_servable(self, req_id: str) -> bool:
+        """True when a ``fused_sample`` verify can accept this request.
+
+        A greedy request is, as it is for ``argmax_ids``. A sampled one needs
+        nothing but its temperature, top-k and top-p, and those within what the
+        model's device sampler serves, which is how the model bounds its fused
+        acceptance too: top-k at most ``max_device_top_k``, or no top-k with
+        top-p below 1 on a model declaring
+        ``supports_device_top_p_without_top_k``. A model without
+        ``max_device_top_k`` bounds neither. Penalties, logprobs, structured
+        output, ``allowed_token_ids``, ``bad_words`` and a pending
+        ``min_tokens`` need the logits: such a request keeps the step in
+        ``logits``.
+        """
+        if self._request_has_host_only_controls(req_id):
+            return False
+        if req_id not in getattr(self.input_batch, "random_reqs", ()):
+            return True
+        params = getattr(
+            getattr(self, "requests", {}).get(req_id), "sampling_params", None
+        )
+        if params is None:
+            return False
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        max_top_k = capabilities.get("max_device_top_k")
+        if max_top_k is None:
+            return True
+        top_k = int(params.top_k)
+        if 1 <= top_k < int(self.vocab_size):
+            return top_k <= int(max_top_k)
+        return params.top_p < 1.0 and bool(
+            capabilities.get("supports_device_top_p_without_top_k", False)
+        )
 
     def _request_is_argmax_certifiable(self, req_id: str) -> bool:
         """False when this request's sampling cannot be certified by id equality.
@@ -1693,24 +1834,34 @@ class TTModelRunner:
         all of these on a launch without ``logits``, so there they only decide
         the mode.
         """
-        batch = self.input_batch
         # getattr rather than attribute access: the gate has to stay total for
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
+        if req_id in getattr(self.input_batch, "random_reqs", ()):
+            return False
+        return not self._request_has_host_only_controls(req_id)
+
+    def _request_has_host_only_controls(self, req_id: str) -> bool:
+        """True when a control of this request needs the target's logits.
+
+        A penalty reshapes the logits; a grammar, an allowlist, a bad word or a
+        pending ``min_tokens`` rules tokens out; logprobs need the logits
+        themselves. Only the host walk over ``logits`` applies them.
+        """
+        batch = self.input_batch
         for attr in (
-            "random_reqs",
             "presence_penalties_reqs",
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
             if req_id in getattr(batch, attr, ()):
-                return False
+                return True
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
         if params is None:
-            return True
-        return not (
+            return False
+        return (
             params.logprobs is not None
             or params.structured_outputs is not None
             or bool(params.allowed_token_ids)
@@ -2263,7 +2414,7 @@ class TTModelRunner:
                     accepted_counts,
                     len(row_req_ids),
                 ):
-                    spec_mode = self._spec_mode_for_step(row_req_ids)
+                    spec_mode = self._spec_mode_for_step(row_req_ids, num_valid_drafts)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
@@ -2444,10 +2595,11 @@ class TTModelRunner:
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
             perform_device_sampling = False
-        if spec_mode == ACCEPT_MODE_LOGITS:
-            # The host walk samples from the logits this verify returns, so the
-            # model must not sample on device, and the rows' generators have
-            # to be the requests' own.
+        if spec_mode in (ACCEPT_MODE_LOGITS, ACCEPT_MODE_FUSED_SAMPLE):
+            # The host walk samples from the logits this verify returns, or the
+            # device accepts with the uniforms the runner draws for it
+            # (``fused_spec_sampling``), so the model must not sample on device,
+            # and the rows' generators have to be the requests' own.
             perform_device_sampling = False
         defer_device_sampling = (
             perform_device_sampling and has_scheduled_structured and not is_prompt
@@ -3267,6 +3419,8 @@ class TTModelRunner:
 
         if model_input.spec_mode == ACCEPT_MODE_LOGITS:
             return self._walk_sampled_acceptance(model_input, tt_out)
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            return self._walk_fused_acceptance(model_input, tt_out)
         if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
             raise NotImplementedError(
                 f"the runner drives no accept walk for spec_mode "
@@ -3301,6 +3455,73 @@ class TTModelRunner:
                 model_input.num_valid_drafts,
             )
         )
+
+    @staticmethod
+    def _walk_fused_acceptance(model_input: TTModelInput, out: Any) -> SpecWalk:
+        """Take one ``fused_sample`` verify's committed ids and counts as given.
+
+        The device accepted already, so there is nothing to walk: the two
+        fields are checked against the submitted block and passed on. A count
+        is in ``[1, 1 + num_valid_drafts]``, the ids carry
+        ``PLACEHOLDER_TOKEN_ID`` exactly past it (``AcceptResult``), and every
+        committed id before a row's last is that row's draft at its column,
+        because only the last committed token can be the model's own
+        (correction or bonus). A row no request owns comes back with count 1,
+        as the ``argmax_ids`` walk commits it. No logprobs: a row asking for
+        them keeps its step in ``logits``.
+        """
+        if (
+            not isinstance(out, VerifyOutput)
+            or out.spec_mode != ACCEPT_MODE_FUSED_SAMPLE
+        ):
+            raise TypeError(
+                "a verify in fused_sample mode must reach the walk as its "
+                f"VerifyOutput, got {type(out).__name__}"
+            )
+        if model_input.max_num_logprobs[0] is not None:
+            raise RuntimeError(
+                "a fused_sample verify carries a row that asked for logprobs, "
+                "which ids cannot answer; _spec_mode_for_step asks for logits "
+                "for such a row"
+            )
+        rows, width = (int(size) for size in model_input.input_tokens.shape)
+        committed, counts = out.accepted_token_ids, out.accepted_counts
+        for name, tensor in (
+            ("accepted_token_ids", committed),
+            ("accepted_counts", counts),
+        ):
+            if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.int32:
+                raise TypeError(
+                    f"a fused_sample verify must return {name} as an int32 host "
+                    f"tensor, got {getattr(tensor, 'dtype', type(tensor).__name__)}"
+                )
+        if tuple(committed.shape) != (rows, width) or tuple(counts.shape) != (rows,):
+            raise ValueError(
+                "a fused_sample verify must return accepted_token_ids "
+                f"[{rows}, {width}] and accepted_counts [{rows}], every submitted "
+                f"row, got {tuple(committed.shape)} and {tuple(counts.shape)}"
+            )
+        result = AcceptResult(committed, counts)
+        valid = model_input.num_valid_drafts.to(torch.int64)
+        drafts = model_input.draft_token_ids.to(torch.int32)
+        over = (counts.to(torch.int64) > valid + 1).nonzero().reshape(-1)
+        if over.numel():
+            raise ValueError(
+                f"a fused_sample verify committed more than 1 + num_valid_drafts "
+                f"tokens on rows {over.tolist()}: counts {counts.tolist()}, "
+                f"num_valid_drafts {valid.tolist()}"
+            )
+        columns = torch.arange(width - 1).unsqueeze(0)
+        accepted = columns < (counts.to(torch.int64) - 1).unsqueeze(1)
+        wrong = (accepted & (committed[:, :-1] != drafts)).any(dim=1).nonzero()
+        if wrong.numel():
+            raise ValueError(
+                "a fused_sample verify committed a token other than the draft "
+                f"before a row's last committed column on rows "
+                f"{wrong.reshape(-1).tolist()}: committed {committed.tolist()}, "
+                f"drafts {drafts.tolist()}"
+            )
+        return SpecWalk(result.committed_token_ids, result.accepted_counts, None)
 
     def _walk_sampled_acceptance(
         self, model_input: TTModelInput, logits: Any
