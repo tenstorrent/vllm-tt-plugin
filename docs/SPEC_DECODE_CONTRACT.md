@@ -78,11 +78,15 @@ serve speculative decoding within the following execution limits:
   such as a partial prefill held through an interleaved decode step, also
   carries request id `None`. The drafter and the accept walk run over every
   slot, and only scheduled slots are committed. `num_valid_drafts`, the draft
-  cap of `SpecPlan.k_by_rows` and `_step_verifies` read the step's live rows
-  across all lanes; a per-lane policy, such as drafting only for a lane with
-  one live request, is the adapter's, through `DraftOutput.num_valid`. Lane
-  mode refuses `ngram`, whose proposer indexes front-packed rows, and
-  asynchronous scheduling, whose lane decode has no deferred speculative tail.
+  cap of `SpecPlan.k_by_rows`, `_step_verifies` and the accept mode read the
+  step's live rows across all lanes; a per-lane policy, such as drafting only
+  for a lane with one live request, is the adapter's, through
+  `DraftOutput.num_valid`. Both accept modes serve lane mode as they serve
+  front-packed execution: a sampled request in any lane makes the whole step
+  a `logits` verify, the model answers every slot of the grid, gaps included,
+  and the host walk samples only the scheduled slots (section 4h). Lane mode
+  refuses `ngram`, whose proposer indexes front-packed rows, and asynchronous
+  scheduling, whose lane decode has no deferred speculative tail.
 
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative
@@ -997,13 +1001,17 @@ is the grammar after the request's first `j` scheduled drafts, the last row is
 the bonus, and the grammar is rolled back afterwards.
 `vllm_tt_plugin.structured_output.spec_grammar_bitmask_for_tt_batch` unpacks
 that into `[B, 1+K, W]`, column `j` from row `j`, using the per-request row
-counts `TTModelRunner._prepare_model_inputs` recorded in
+counts `TTModelRunner._prepare_model_inputs`, or in lane mode
+`TTLaneInputBatch._build_spec_block`, recorded in
 `TTModelInput.grammar_rows_per_request` from the step's scheduler output. It
 raises if those counts do not account for the bitmask exactly, because one
 wrong count shifts every later request's mask. Every step of a speculating
 launch reads its bitmask this way, prefill and ordinary decode included,
 because an asynchronous scheduler reserves `[-1] * K` for every scheduled
 request; a step that commits one token per row reads each request's row 0.
+Lane mode, which schedules synchronously only, reads it this way on every
+decode step; a lane prefill step schedules no drafts, so there each
+structured request owns its one row.
 
 Synchronously the drafts a verify carries are the scheduler's, and
 `Scheduler.update_draft_token_ids` has already cut them to the longest prefix
@@ -1023,12 +1031,16 @@ bitmask filled from placeholders and only row 0 is the grammar:
 `TTModelRunner._grammar_validated_drafts` sets its `num_valid_drafts` to 0 for
 the walk, which then commits one token drawn from column 0.
 
-**Live rows only.** The walk samples the live rows. A padding row commits its
-column 0 argmax with a count of 1, as the greedy walk gives it, because the
-drafter is called with every row; no request reads it.
+**Live rows only.** The walk samples the live rows, the rows whose
+`row_req_ids` entry names a request. Front-packed those are a prefix; in lane
+mode they are the scheduled slots, interleaved with gaps and with slots the
+step left out. A row no request owns commits its column 0 argmax with a count
+of 1, as the greedy walk gives it, because the drafter is called with every
+row; no request reads it, and it draws from no generator.
 
 **Capture.** The walk reads only the step's own `TTModelInput`, which
-`TTModelRunner._prepare_model_inputs` built with copies of the rows: the
+`TTModelRunner._prepare_model_inputs` built with copies of the rows, or in
+lane mode `TTLaneInputBatch._build_decode_input`, keyed by slot: the
 sampling tensors, each row's prompt and committed output for the penalties and
 `bad_words`, the allowlist rows, each row's remaining `min_tokens` and stop
 ids (`TTModelInput.spec_min_tokens`), the batch's `max_num_logprobs`, and the

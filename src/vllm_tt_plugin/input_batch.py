@@ -31,7 +31,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -1299,14 +1299,33 @@ class TTLaneInputBatch(InputBatch):
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
+        logits_verify = spec["spec_mode"] == ACCEPT_MODE_LOGITS
+        if logits_verify:
+            # The host walk samples from the logits this verify returns, so the
+            # model must not sample on device, as on the front-packed path.
+            perform_device_sampling = False
 
-        # The prompt/output token tensors feed device-side penalties only. Host
-        # sampling rebuilds them itself in ``build_merged_sampling_metadata``, so
-        # building them here too would be dead work on the host path.
+        # The prompt/output token tensors feed device-side penalties, and the
+        # host walk of a logits verify. The ordinary host sampling tail
+        # rebuilds them itself in ``build_merged_sampling_metadata``, so
+        # building them for it would be dead work.
         prompt_tokens = output_tokens = None
-        if perform_device_sampling and not lane_batch.no_penalties:
+        if (perform_device_sampling or logits_verify) and not lane_batch.no_penalties:
             prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
+        elif logits_verify and lane_batch.sampling.bad_words_token_ids:
+            # A multi-token bad word matches against the output history.
+            output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
+        walk_inputs = (
+            self._logits_walk_inputs(runner, plan, spec["row_req_ids"], total)
+            if logits_verify
+            else {}
+        )
+        if spec["spec_mode"] is not None and not logits_verify:
+            # The mode was chosen over the scheduled slots, so the logprobs an
+            # ids walk refuses are theirs too: a request a decode step leaves
+            # out may have asked for logprobs, and it reads none of this step.
+            walk_inputs["max_num_logprobs"] = [None]
         decode_layout_changed = runner._decode_layout_changed_since_last_decode
         slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
 
@@ -1330,12 +1349,18 @@ class TTLaneInputBatch(InputBatch):
             decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host sampling reads the merged batch directly (see
-            # ``extract_output``); the per-rank sidecars are unused here.
-            allowed_token_ids_mask_list=[None],
-            bad_words_token_ids_list=[{}],
-            max_num_logprobs=[lane_batch.max_num_logprobs],
+            # ``extract_output``); the allowlist, bad-words and generator
+            # sidecars are read only by the host walk of a logits verify
+            # (``_logits_walk_inputs``).
+            allowed_token_ids_mask_list=walk_inputs.get(
+                "allowed_token_ids_mask_list", [None]
+            ),
+            bad_words_token_ids_list=walk_inputs.get("bad_words_token_ids_list", [{}]),
+            max_num_logprobs=walk_inputs.get(
+                "max_num_logprobs", [lane_batch.max_num_logprobs]
+            ),
             logitsprocs_list=[None],
-            generators_list=[{}],
+            generators_list=walk_inputs.get("generators_list", [{}]),
             prefill_empty_slots=None,
             defer_device_sampling=(
                 perform_device_sampling and has_scheduled_structured
@@ -1347,7 +1372,43 @@ class TTLaneInputBatch(InputBatch):
             accepted_counts=spec["accepted_counts"],
             draft_token_ids=spec["draft_token_ids"],
             spec_mode=spec["spec_mode"],
+            grammar_rows_per_request=spec["grammar_rows_per_request"],
+            spec_min_tokens=walk_inputs.get("spec_min_tokens"),
         )
+
+    def _logits_walk_inputs(
+        self,
+        runner: "TTModelRunner",
+        plan: "TTStepPlan",
+        row_req_ids: list[str | None],
+        total: int,
+    ) -> dict[str, Any]:
+        """The per-row controls a logits verify's host walk reads, by slot.
+
+        What ``_prepare_model_inputs`` captures for a front-packed logits
+        verify, keyed by device slot rather than by packed row: the requests'
+        own generators, which the walk advances, their bad words, the
+        allowlist rows, each scheduled request's remaining ``min_tokens`` and
+        the largest logprobs request among them. ``_spec_sampling_inputs``
+        keeps only the rows with a request id, which are the scheduled slots,
+        so a gap or a slot the step left out neither draws from a generator
+        nor reads a filter.
+        """
+        sampling = self.sampling
+        allowed = None
+        if (
+            not self.no_allowed_token_ids
+            and sampling.allowed_token_ids_mask is not None
+        ):
+            allowed = sampling.allowed_token_ids_mask[:total].clone()
+        num_logprobs = int(sampling.num_logprobs[list(plan.scheduled_rows)].max())
+        return {
+            "max_num_logprobs": [num_logprobs if num_logprobs >= 0 else None],
+            "generators_list": [dict(sampling.generators)],
+            "bad_words_token_ids_list": [dict(sampling.bad_words_token_ids)],
+            "allowed_token_ids_mask_list": [allowed],
+            "spec_min_tokens": runner._pending_min_tokens(row_req_ids),
+        }
 
     def _build_spec_block(
         self,
@@ -1388,10 +1449,19 @@ class TTLaneInputBatch(InputBatch):
             "accepted_counts": None,
             "draft_token_ids": None,
             "spec_mode": None,
+            "grammar_rows_per_request": None,
         }
         num_drafts = int(getattr(runner, "_num_speculative_tokens", 0) or 0)
         if not num_drafts:
             return none
+        # On a speculating launch vLLM writes each structured request
+        # 1 + len(drafts) bitmask rows, so the sample-time reorder has to know
+        # how many each owns, on a verify and on an ordinary decode alike.
+        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+        grammar_rows_per_request = {
+            req_id: 1 + len(scheduled_drafts.get(req_id) or ())
+            for req_id in scheduler_output.num_scheduled_tokens
+        }
         # Imported here: model_runner imports this module.
         from vllm_tt_plugin.model_runner import _has_unresolved_commit, _step_verifies
 
@@ -1426,13 +1496,18 @@ class TTLaneInputBatch(InputBatch):
                 "num_valid_drafts": num_valid,
                 "accepted_counts": counts,
                 "draft_token_ids": drafts,
-                "spec_mode": ACCEPT_MODE_ARGMAX_IDS,
+                # Over the scheduled requests only, as front-packed padding
+                # rows do not decide it: a gap or a left-out slot is greedy
+                # to the walk and commits nothing.
+                "spec_mode": runner._spec_mode_for_step(live_req_ids),
+                "grammar_rows_per_request": grammar_rows_per_request,
             }
         # The ordinary decode inside a speculating launch, as in the
         # front-packed builder: every row commits one token, so the counts reset
         # here, and an unresolved commit reaches the model as ``accepted_counts``.
         out = dict(none)
         out["row_req_ids"] = row_req_ids
+        out["grammar_rows_per_request"] = grammar_rows_per_request
         if _has_unresolved_commit(counts, total):
             out["accepted_counts"] = counts
         for req_id in live_req_ids:

@@ -165,9 +165,9 @@ def _has_unresolved_commit(accepted_counts: torch.Tensor, num_rows: int) -> bool
 class SpecWalk(NamedTuple):
     """One verify's accept walk: ``[B, 1+K]`` committed ids and ``[B]`` counts.
 
-    ``logprobs`` has one row per committed token of the live rows, in row
-    order, with ``cu_num_generated_tokens`` marking where each row starts;
-    ``None`` when no row asked for logprobs.
+    ``logprobs`` has one row per committed token of the live rows
+    (``_spec_live_rows``), in row order, with ``cu_num_generated_tokens``
+    marking where each row starts; ``None`` when no row asked for logprobs.
     """
 
     committed: torch.Tensor
@@ -250,16 +250,29 @@ def _penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.T
     return ids.masked_fill(ids == -1, vocab_size)
 
 
+def _spec_live_rows(model_input: TTModelInput) -> list[int]:
+    """The verify rows a request owns, in row order.
+
+    Front-packed, the prefix ``row_req_ids`` covers. In lane mode
+    ``row_req_ids`` spans the slot grid with ``None`` at every slot the step
+    does not schedule, so the live rows are interleaved with unowned ones.
+    """
+    return [
+        row for row, req_id in enumerate(model_input.row_req_ids) if req_id is not None
+    ]
+
+
 def _spec_sampling_inputs(
     model_input: TTModelInput, vocab_size: int
 ) -> SpecSamplingInputs:
     """The sampling a ``logits`` verify walks under, for the step's live rows.
 
-    Every field is read off what ``_prepare_model_inputs`` copied when it built
-    the step, and copied again here, so a walk on the readback thread reads
-    nothing the persistent batch can have changed since. Padding rows are left
-    out: they own no request, and sampling them would cost a vocabulary's work
-    per row for tokens nothing reads.
+    Every field is read off what the step's builder copied when it built the
+    step, and copied again here, so a walk on the readback thread reads
+    nothing the persistent batch can have changed since. Rows that own no
+    request, padding and lane gaps, are left out: sampling them would cost a
+    vocabulary's work per row for tokens nothing reads. The result is indexed
+    by live row (``_spec_live_rows``), so per-row maps are re-keyed to it.
 
     min_p is not carried: vLLM refuses a min_p above 1e-5 on a speculating
     launch and builds no min_p processor there, so the ordinary sampler ignores
@@ -269,16 +282,13 @@ def _spec_sampling_inputs(
     scheduler computes it while the verify runs, and ``sample_tokens``
     attaches it to this step's input before any walk can read it.
     """
-    live = len(model_input.row_req_ids)
+    rows = _spec_live_rows(model_input)
+    live = torch.as_tensor(rows, dtype=torch.long)
     params = model_input.tt_sampling_params
 
     def per_row(values: Any, dtype: torch.dtype) -> torch.Tensor:
         tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
-        return (
-            tensor.expand(live).clone()
-            if tensor.numel() == 1
-            else tensor[:live].clone()
-        )
+        return tensor.expand(len(rows)).clone() if tensor.numel() == 1 else tensor[live]
 
     # vLLM's sampler samples a row below this temperature greedily, and the
     # persistent batch keeps the raw value, so the walk is told the same.
@@ -291,9 +301,9 @@ def _spec_sampling_inputs(
     if model_input.prompt_tokens is not None and model_input.output_tokens is not None:
         penalties = SpecPenalties(
             prompt_token_ids=_penalty_prompt_ids(
-                model_input.prompt_tokens[:live], vocab_size
+                model_input.prompt_tokens[live], vocab_size
             ),
-            output_token_ids=_penalty_history(model_input.output_tokens[:live]),
+            output_token_ids=_penalty_history(model_input.output_tokens[live]),
             presence=per_row(params.presence_penalty, torch.float32),
             frequency=per_row(params.frequency_penalty, torch.float32),
             repetition=per_row(params.repetition_penalty, torch.float32),
@@ -305,17 +315,23 @@ def _spec_sampling_inputs(
         # vocabulary per candidate column and changes no probability.
         top_k=top_k if bool((top_k < vocab_size).any()) else None,
         top_p=top_p if bool((top_p < 1.0).any()) else None,
-        # ``_build_host_generators`` keys only live rows. The generators are
-        # the requests' own, so the walk advances them.
-        generators=dict(model_input.generators_list[0]),
+        # Re-keyed to the live rows, which drops any other row's generator a
+        # builder passed. The generators are the requests' own, so the walk
+        # advances them.
+        generators=_by_live_row(model_input.generators_list[0], rows),
         penalties=penalties,
-        filters=_spec_token_filters(model_input, live),
+        filters=_spec_token_filters(model_input, rows),
         num_logprobs=model_input.max_num_logprobs[0],
     )
 
 
+def _by_live_row(per_row: dict[int, Any], rows: list[int]) -> dict[int, Any]:
+    """``per_row``, keyed by verify row, re-keyed to the walk's live-row index."""
+    return {index: per_row[row] for index, row in enumerate(rows) if row in per_row}
+
+
 def _spec_token_filters(
-    model_input: TTModelInput, live: int
+    model_input: TTModelInput, rows: list[int]
 ) -> SpecTokenFilters | None:
     """The step's token filters for its live rows, or ``None`` when it has none."""
     bitmask = model_input.grammar_bitmask[0]
@@ -327,12 +343,8 @@ def _spec_token_filters(
             "spec_grammar_bitmask_for_tt_batch builds"
         )
     allowed = model_input.allowed_token_ids_mask_list[0]
-    bad_words = {
-        row: words
-        for row, words in model_input.bad_words_token_ids_list[0].items()
-        if row < live
-    }
-    min_tokens = dict(model_input.spec_min_tokens or {})
+    bad_words = _by_live_row(model_input.bad_words_token_ids_list[0], rows)
+    min_tokens = _by_live_row(model_input.spec_min_tokens or {}, rows)
     if bitmask is None and allowed is None and not bad_words and not min_tokens:
         return None
     if bad_words and model_input.output_tokens is None:
@@ -341,12 +353,13 @@ def _spec_token_filters(
             "_prepare_model_inputs builds output_tokens for every decode with "
             "bad words, because a word's prefix is matched against it"
         )
+    live = torch.as_tensor(rows, dtype=torch.long)
     return SpecTokenFilters(
-        grammar_bitmask=None if bitmask is None else bitmask[:live],
-        allowed_token_ids_mask=None if allowed is None else allowed[:live],
+        grammar_bitmask=None if bitmask is None else bitmask[live],
+        allowed_token_ids_mask=None if allowed is None else allowed[live],
         bad_words_token_ids=bad_words,
         output_token_ids=(
-            _penalty_history(model_input.output_tokens[:live]) if bad_words else None
+            _penalty_history(model_input.output_tokens[live]) if bad_words else None
         ),
         min_tokens=min_tokens,
     )
@@ -2742,8 +2755,9 @@ class TTModelRunner:
                     )
                 )
                 return None
-            # A verify answers every slot with its argmax block, so it reads no
-            # selected rows back: the accept walk runs over the whole grid.
+            # A verify answers every slot with its whole candidate block, ids
+            # or logits, so it reads no selected rows back: the accept walk
+            # runs over the whole grid.
             sampling_rows = scheduled_rows if model_input.spec_mode is None else None
             submission = self.async_decode.submit_decode(
                 model_input,
@@ -2932,32 +2946,42 @@ class TTModelRunner:
     def _finish_lane_spec_decode(
         self,
         model_input: TTModelInput,
-        argmax_ids: Any,
+        verified: Any,
         spec_hidden: Any,
         scheduled_rows: list[int],
     ) -> ModelRunnerOutput:
         """Accept, commit and re-propose for one synchronous lane verify.
 
-        ``_finish_spec_decode`` over the slot grid. The walk, the commit and the
-        drafter run over every slot, gaps included, because the drafter's rows
-        are the verify's; a gap's request id is ``None``, so it reaches no
+        ``_finish_spec_decode`` over the slot grid. ``verified`` is the tensor
+        the step's mode returns, ``[B, 1+K]`` ids or ``[B, 1+K, V]`` logits,
+        already unwrapped from its ``VerifyOutput``. The walk, the commit and
+        the drafter run over every slot, gaps included, because the drafter's
+        rows are the verify's; a gap's request id is ``None``, so it reaches no
         request state. Only the scheduled slots are published.
+
+        A ``logits`` walk returns logprobs for its live rows, the slots with a
+        request id, and the published rows are the scheduled slots. The lane
+        builder names exactly the scheduled slots, so the two are the same
+        rows in the same order; a mismatch would publish a slot with no request
+        or hand one request another's logprobs, so it raises.
         """
-        walk = self.walk_spec_acceptance(model_input, argmax_ids)
+        walk = self.walk_spec_acceptance(model_input, verified)
         prefixes = self.spec_committed_prefixes(
             model_input, walk.committed, walk.counts
         )
         self.commit_spec_acceptance(
             model_input, walk.committed, walk.counts, spec_hidden
         )
-        req_ids = [model_input.row_req_ids[row] for row in scheduled_rows]
-        if any(req_id is None for req_id in req_ids):
+        if _spec_live_rows(model_input) != list(scheduled_rows):
             raise RuntimeError(
-                "a scheduled lane slot has no request in the verify's row identity: "
-                f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+                "a lane verify's row identity does not name exactly the "
+                f"scheduled slots: scheduled_rows={list(scheduled_rows)}, "
+                f"row_req_ids={model_input.row_req_ids}"
             )
+        req_ids = [model_input.row_req_ids[row] for row in scheduled_rows]
+        published = [prefixes[row] for row in scheduled_rows]
         return self.build_spec_runner_output(
-            req_ids, [prefixes[row] for row in scheduled_rows]
+            req_ids, published, self.spec_committed_logprobs(walk.logprobs, published)
         )
 
     @torch.no_grad()
@@ -3281,21 +3305,22 @@ class TTModelRunner:
                 "dimension is a truncated or row-folded readback, which cannot "
                 "be sampled as the vocabulary"
             )
-        live = len(model_input.row_req_ids)
+        live = torch.as_tensor(_spec_live_rows(model_input), dtype=torch.long)
         result = accept_sampled_drafts(
-            logits[:live],
-            model_input.draft_token_ids[:live],
-            model_input.num_valid_drafts[:live],
+            logits[live],
+            model_input.draft_token_ids[live],
+            model_input.num_valid_drafts[live],
             sampling,
         )
-        # A padding row carries no draft and is greedy, so it commits its own
-        # column 0 argmax, which is what the greedy walk gives it too; the
-        # drafter is called with every row, and no request reads these.
+        # A row no request owns, padding or a lane gap, carries no draft and is
+        # greedy, so it commits its own column 0 argmax, which is what the
+        # greedy walk gives it too; the drafter is called with every row, and
+        # no request reads these.
         committed = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
-        committed[:live] = result.committed_token_ids
-        committed[live:, 0] = logits[live:, 0].argmax(dim=-1).to(torch.int32)
+        committed[:, 0] = logits[:, 0].argmax(dim=-1).to(torch.int32)
+        committed[live] = result.committed_token_ids
         counts = torch.ones(rows, dtype=torch.int32)
-        counts[:live] = result.accepted_counts
+        counts[live] = result.accepted_counts
         return SpecWalk(committed, counts, result.logprobs)
 
     @staticmethod
