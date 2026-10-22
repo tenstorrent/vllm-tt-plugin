@@ -1367,10 +1367,18 @@ class TTLaneInputBatch(InputBatch):
         input position is -1, and ``_spec_candidate_block`` pads every draft
         column of a row with no valid drafts to -1, so a gap stays positionless
         across the whole block. ``row_req_ids`` is slot-ordered with ``None``
-        at the gaps; the accept walk and the drafter run over every slot, as
-        they run over every padded row of a front-packed verify, and only the
-        scheduled rows reach a request. The draft cap counts the step's live
-        rows, the global count ``SpecPlan.k_by_rows`` is declared against.
+        at every slot this step does not schedule; the accept walk and the
+        drafter run over every slot, as they run over every padded row of a
+        front-packed verify, and only the scheduled rows reach a request. The
+        draft cap counts the step's live rows, the global count
+        ``SpecPlan.k_by_rows`` is declared against.
+
+        A slot can hold a request the step leaves out: a decode step that the
+        coordinator interleaves into a run of prefills leaves a partial
+        prefill holding its row. That slot is ``None`` here too. Its request
+        has no token to commit, and the commit, the recorded count and the
+        proposal all key on this identity, so naming it would append a token
+        to a prompt that is still being prefilled.
         """
         none = {
             "input_tokens": input_tokens,
@@ -1387,7 +1395,11 @@ class TTLaneInputBatch(InputBatch):
         # Imported here: model_runner imports this module.
         from vllm_tt_plugin.model_runner import _has_unresolved_commit, _step_verifies
 
-        row_req_ids = list(self.req_ids[:total])
+        scheduled = set(plan.scheduled_rows)
+        row_req_ids = [
+            req_id if row in scheduled else None
+            for row, req_id in enumerate(self.req_ids[:total])
+        ]
         live_req_ids = [self.req_ids[row] for row in plan.scheduled_rows]
         spec_plan = getattr(runner, "_spec_plan", None)
         drafts, num_valid, counts = runner._spec_row_state(

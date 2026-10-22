@@ -132,10 +132,17 @@ def _last_token(runner: SimpleNamespace, req_id: str) -> int:
     return int(batch.token_ids_cpu[row, batch.num_tokens[row] - 1])
 
 
-def _step(runner: SimpleNamespace, drafts: dict[str, list[int]] | None = None):
-    """One synchronous lane decode step over every live request."""
+def _step(
+    runner: SimpleNamespace,
+    drafts: dict[str, list[int]] | None = None,
+    scheduled: list[str] | None = None,
+):
+    """One synchronous lane decode step over ``scheduled``, every live request
+    by default."""
     batch = runner.lane_batch
     rows = {batch.req_ids[r]: r for r in batch.occupied_rows()}
+    if scheduled is not None:
+        rows = {req_id: rows[req_id] for req_id in scheduled}
     for req_id, row in rows.items():
         # Stands in for ``_update_states``: the computed count covers what the
         # previous step committed.
@@ -293,6 +300,34 @@ def test_a_draftless_lane_step_runs_the_ordinary_decode_and_proposes():
     for gap in (0, 3):
         assert int(call["committed_positions"][gap, 0]) == -1
     assert set(runner._proposed_draft_token_ids) == {"a", "b"}
+
+
+@pytest.mark.parametrize("narrow", [False, True], ids=["verify", "ordinary"])
+def test_a_slot_the_step_leaves_out_takes_nothing(narrow):
+    """A request holding its slot through a step that skips it gets no token.
+
+    A decode step the coordinator interleaves into a run of prefills leaves a
+    partial prefill in its slot. The device still runs that slot, but the
+    commit, the recorded count and the proposal key on the verify's row
+    identity, so that slot must read as unowned there, as a gap does.
+    """
+    model = make_fake_spec_model(supports_narrow_decode=narrow)()
+    runner = _runner(model, narrow=narrow)
+    _add_request(runner, "a", row=0, first_token=1)
+    _add_request(runner, "p", row=2, first_token=40)
+    batch = runner.lane_batch
+    length = int(batch.num_tokens[2])
+    last = _last_token(runner, "a")
+    drafts = {} if narrow else {"a": [last + 1 + j for j in range(DRAFT_LEN)]}
+
+    model_input, output = _step(runner, drafts=drafts, scheduled=["a"])
+
+    assert int(batch.num_tokens[2]) == length
+    assert runner.requests["p"].output_token_ids == []
+    assert "p" not in runner._req_accepted_counts
+    assert set(runner._proposed_draft_token_ids) == {"a"}
+    assert list(_committed(output)) == ["a"]
+    assert model_input.row_req_ids == ["a", None, None, None]
 
 
 def _run_loop(model: FakeSpecModel, steps: int):

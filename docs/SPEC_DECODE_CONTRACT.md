@@ -74,7 +74,9 @@ serve speculative decoding within the following execution limits:
   (`custom_class`) under synchronous scheduling. `TTLaneInputBatch` builds the
   candidate block over its stable slots: a row is a device slot, and a gap
   carries request id `None`, position -1 in every column, no drafts and count
-  1, as a padding row does. The drafter and the accept walk run over every
+  1, as a padding row does. A slot whose request the step does not schedule,
+  such as a partial prefill held through an interleaved decode step, also
+  carries request id `None`. The drafter and the accept walk run over every
   slot, and only scheduled slots are committed. `num_valid_drafts`, the draft
   cap of `SpecPlan.k_by_rows` and `_step_verifies` read the step's live rows
   across all lanes; a per-lane policy, such as drafting only for a lane with
