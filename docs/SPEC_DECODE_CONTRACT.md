@@ -132,6 +132,7 @@ launches without `speculative_config`.
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. On a plan offering `fused_sample`, in lane mode, it also declares the deferred and chained fused verify of section 4j. |
 | `supports_finishing_slots` | `False` | Lane mode under async scheduling: `decode_forward` accepts `finishing_slots`, the slots of requests left out because the step in flight reaches their `max_tokens`: see section 4j. |
+| `supports_prefill_over_pending_spec` | `False` | Lane mode, chaining launch: `prefill_forward` may run while one deferred fused verify is in flight: see section 4j. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -1266,8 +1267,23 @@ vLLM's two-deep batch queue is one step. The request still holds the slot
 until the scheduler reports it finished, is never scheduled again, and its
 slot's state may be freed at once; a chained verify sends the slot as a gap.
 
-The `TT submissions:` log line adds the count of chained verifies and of the
-chains refused, by reason, once chaining is enabled.
+**A prefill over the verify in flight.** A prefill step cannot chain, and by
+default it drains the deferred verify before it is built. A model declaring
+`supports_prefill_over_pending_spec` promises that `prefill_forward` may run
+while one deferred fused verify is in flight: the prefill writes only the
+slots it is given (`empty_slots`), touches nothing that verify's read and
+proposal use, and the device runs the two in submission order. The runner then
+submits an all-prefill step with no resumed and no multimodal request behind
+the verify (`TTAsyncDecodeController.prefill_overlap_allowed`), and reads and
+commits the verify later, before the next decode is built; vLLM's batch queue
+returns the verify's output first. The proposal of that verify comes after the
+prefill, and a row whose request finished meanwhile, whose slot the prefill may
+have taken, is passed position -1. The next decode never chains onto the
+verify the prefill overtook: it is built from host state.
+
+The `TT submissions:` log line adds the count of chained verifies, of the
+chains refused, by reason, and of prefills submitted over a verify in flight,
+once chaining is enabled.
 
 ## 5. One request, from prefill to release
 

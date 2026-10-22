@@ -29,7 +29,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams, SamplingType
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
@@ -221,6 +225,9 @@ class LaneEngine:
         self.placeholders: dict[str, int] = {}
         self.max_tokens: dict[str, int] = {}
         self.finishing_log: list[tuple[str, ...]] = []
+        # Requests admitted by ``prefill``, whose first output is the prefill's.
+        self.prefilled: set[str] = set()
+        self.first: dict[str, int] = {}
         self.inflight: deque = deque()
         self.wrappers: list = []
 
@@ -238,6 +245,76 @@ class LaneEngine:
         if stop_after is not None:
             self.stop_after[req_id] = stop_after
         return tokens
+
+    def prefill(self, req_id, row, first_token, params=GREEDY):
+        """Admit a request through a lane prefill step, submitted like any
+        step and queued behind the steps in flight. Returns its prompt; the
+        first token is the prefill's output."""
+        prompt = [(first_token + i) % SAMPLED_VOCAB_SIZE for i in range(PROMPT_LEN)]
+        so = SchedulerOutput.make_empty()
+        so.scheduled_new_reqs = [
+            NewRequestData(
+                req_id=req_id,
+                prompt_token_ids=prompt,
+                mm_features=[],
+                sampling_params=params,
+                pooling_params=None,
+                block_ids=([row + 1],),
+                num_computed_tokens=0,
+                lora_request=None,
+            )
+        ]
+        so.num_scheduled_tokens = {req_id: PROMPT_LEN}
+        so.total_num_scheduled_tokens = PROMPT_LEN
+        so.finished_req_ids, self.finished_pending = self.finished_pending, set()
+        for done in so.finished_req_ids:
+            self.live.pop(done, None)
+        lanes = [0] * NUM_LANES
+        lanes[row // PER_LANE] = 1
+        plan = TTStepPlan(
+            is_decode=False,
+            capacity=CAPACITY,
+            scheduled_req_ids=(req_id,),
+            scheduled_rows=(row,),
+            input_rows=(row,),
+            req_id_to_row={**self.live, req_id: row},
+            batch_size_per_dp=tuple(lanes),
+            prefill_empty_slots=(row,),
+            decode_layout_changed=True,
+        )
+        _set_tt_step_state(so, _LaneStepState(lane_outputs=[], plan=plan))
+        assert self.runner.execute_model(so) is None
+        out = self.runner.sample_tokens(None)
+        self.prefilled.add(req_id)
+        self.live[req_id] = row
+        self.outputs[req_id] = []
+        self.computed[req_id] = PROMPT_LEN
+        self.placeholders[req_id] = 1
+        self.inflight.append((out, so))
+        if len(self.inflight) >= self.depth:
+            self.resolve_oldest()
+        return prompt
+
+    def schedule_preview(self) -> SchedulerOutput:
+        """The next decode's scheduler output, without consuming the step."""
+        state = (
+            dict(self.live),
+            set(self.finished_pending),
+            dict(self.computed),
+            dict(self.placeholders),
+            list(self.finishing_log),
+            dict(self.drafts),
+        )
+        so = self.schedule()
+        (
+            self.live,
+            self.finished_pending,
+            self.computed,
+            self.placeholders,
+            self.finishing_log,
+            self.drafts,
+        ) = state
+        return so
 
     def _reaches_max_tokens(self, req_id: str) -> bool:
         """``request_will_reach_max_tokens`` on this scheduler's books."""
@@ -341,6 +418,12 @@ class LaneEngine:
                 continue
             tokens = list(out.sampled_token_ids[index])
             if not tokens:
+                continue
+            if req_id in self.prefilled and so.scheduled_new_reqs:
+                # The prefill's own token: the request's first, not an output
+                # of its decode steps.
+                self.placeholders[req_id] -= 1
+                self.first[req_id] = tokens[0]
                 continue
             self.computed[req_id] -= so.num_scheduled_tokens[req_id] - len(tokens)
             self.placeholders[req_id] -= so.num_scheduled_tokens[req_id]
@@ -931,4 +1014,70 @@ def test_a_request_finishing_at_max_tokens_frees_its_slot_and_the_chain_goes_on(
     )
 
 
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
+def test_a_prefill_is_submitted_over_the_fused_verify_in_flight(declared):
+    """``b`` joins lane 1 while ``a`` chains in lane 0. A model declaring
+    ``supports_prefill_over_pending_spec`` gets the prefill behind the verify
+    in flight, which commits before the next decode is built, from host
+    state, and the decodes after it chain again, over both lanes. Without
+    the declaration the prefill drains the verify first. Either way both
+    requests emit their argmax chains."""
+    capabilities = dict(LaneDeviceTarget.model_capabilities)
+    if declared:
+        capabilities["supports_prefill_over_pending_spec"] = True
+    model = lane_device_target(model_capabilities=capabilities)()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompt_a = engine.add("a", 0, 1)
+    engine.run(6)
+    assert chain_counters(runner)[0] >= 3
+    prompt_b = engine.prefill("b", 2, 9)
+    chained_before = chain_counters(runner)[0]
+    engine.run(10)
+    engine.drain()
+
+    assert model.unresolved_at_prefill == ([1] if declared else [0])
+    controller = runner.async_decode
+    assert controller._prefill_overlap_steps == (1 if declared else 0)
+    # Without the declaration the prefill is what refused the chain.
+    assert ("prefill" in chain_counters(runner)[1]) != declared
+    assert chain_counters(runner)[0] >= chained_before + 6
+    assert any(
+        c["chain_rows"].tolist() == [True, False, True, False]
+        for c in model.chained_calls
+    )
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompt_a, len(produced))
+    first = engine.first["b"]
+    assert first == greedy_chain(prompt_b[-1], PROMPT_LEN - 1, 1)[0]
+    produced = engine.outputs["b"]
+    assert produced == expected_greedy(prompt_b + [first], len(produced))
+    assert len(produced) > 10
+
+
 # endregion Chained fused verifies
+
+
+def test_a_decode_never_chains_onto_a_verify_a_prefill_overtook():
+    """Held reads keep the overtaken verify in flight through the decode after
+    the prefill: that decode drains it rather than chaining onto it."""
+    capabilities = {
+        **LaneDeviceTarget.model_capabilities,
+        "supports_prefill_over_pending_spec": True,
+    }
+    model = lane_device_target(model_capabilities=capabilities)()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner, depth=3)
+    prompt_a = engine.add("a", 0, 1)
+    engine.run(6)
+    engine.prefill("b", 2, 9)
+    pending = runner.async_decode._last_fused_step
+    assert pending is runner.async_decode._prefill_overlapped_step
+    assert not pending.is_resolved()
+    assert runner.async_decode.chain_blocker(engine.schedule_preview()) == (
+        "prefill_overlap"
+    )
+    engine.run(8)
+    engine.drain()
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompt_a, len(produced))

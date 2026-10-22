@@ -136,6 +136,7 @@ class LaneDeviceTarget:
         self.propose_calls: list[dict] = []
         self.engine_thread: int | None = None
         self.freed: list[int] = []
+        self.unresolved_at_prefill: list[int] = []
 
     @classmethod
     def spec_plan(cls, vllm_config, max_num_seqs: int, requested_k: int):
@@ -211,6 +212,33 @@ class LaneDeviceTarget:
         self.device_drafts = {}
 
     # ---- the contract ----------------------------------------------------
+
+    def prefill_forward(
+        self, tokens, page_table, kv_cache, prompt_lens, start_pos, **kwargs
+    ):
+        """One full prefill per row into its slot (``empty_slots``): the first
+        token is sampled on the device, and the slot's state starts over.
+
+        ``unresolved_at_prefill`` records how many deferred verifies were still
+        unread when the prefill was submitted.
+        """
+        self._on_engine_thread()
+        del page_table, kv_cache
+        self.unresolved_at_prefill.append(
+            sum(1 for handle in self.handles if not handle.read_threads)
+        )
+        params = kwargs["sampling_params"]
+        out = torch.zeros(int(tokens.shape[0]), dtype=torch.int32)
+        for i, slot in enumerate(kwargs["empty_slots"]):
+            if int(start_pos[i]) != 0:
+                raise AssertionError("this stand-in prefills whole prompts")
+            length = int(prompt_lens[i])
+            last = int(tokens[i, length - 1])
+            first = self._device_sample(params, i, last, length - 1)
+            out[i] = first
+            self.resident[slot] = (first, length)
+            self.device_drafts.pop(slot, None)
+        return out
 
     def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):
         self._on_engine_thread()
