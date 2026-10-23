@@ -414,13 +414,16 @@ def test_a_draft_the_grammar_forbids_is_rejected_even_on_a_zero_draw(monkeypatch
     a draft the target gives no probability, and a grammar-forbidden draft
     reaches the walk whenever the scheduler did not validate it.
     """
-    monkeypatch.setattr(
-        spec_accept,
-        "_uniform",
-        lambda rows, num_drafts, num_valid, generators: torch.zeros(
-            rows, num_drafts, dtype=torch.float64
-        ),
-    )
+    draw_noise = spec_accept._start_walk_noise
+
+    def zero_uniforms(*args):
+        noise, pending = draw_noise(*args)
+        for future in pending:
+            future.result()
+        noise.uniform.zero_()
+        return noise, []
+
+    monkeypatch.setattr(spec_accept, "_start_walk_noise", zero_uniforms)
     width = 3
     logits = torch.zeros(1, width, 8)
     allowed = torch.ones(1, width, 8, dtype=torch.bool)
