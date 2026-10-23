@@ -60,12 +60,32 @@ hook. `TTModelRunner` suppresses output for intermediate prefill chunks and
 selects host sampling when a submitted prefill contains intermediate chunks,
 so intermediate chunks must not advance a device sampler.
 
-### Image inputs and request-specific RoPE
+### Multimodal inputs and request-specific RoPE
 
-For multimodal prefill, `_gather_multi_modal_inputs` adds `pixel_values` and
-`image_grid_thw`. Each value is a list in submitted request order. A text-only
-request has `None`; an image request has a list per image, with `None` for
-missing payloads. The plugin currently accepts image features only.
+For multimodal prefill, `_gather_multi_modal_inputs` forwards every field the
+model's multimodal processor put on an item under its own name: `pixel_values`
+and `image_grid_thw` are always present (as `None` entries when a processor
+does not emit them), and any further field is forwarded without the runner
+knowing the model's contract (for example `pixel_position_ids`,
+`pixel_values_videos` / `pixel_position_ids_videos` for video and
+`input_features` / `input_features_mask` for audio). Image, video and audio
+items are accepted; any other item kind raises `NotImplementedError`.
+
+The return value is a dict keyed by field name. Each value is a list in
+submitted request order (the persistent batch order the model input tensors
+use). A text-only request has `None`; a request with items has a list in
+that request's multimodal-item order, one entry per item. An item whose
+payload is absent (a prefix-cached item arrives with its tensors stripped) or
+that lacks the field contributes `None` for that field.
+
+Two integer metadata fields are appended after the processor fields, so
+positional readers of the processor fields are unchanged:
+`mm_placeholder_offsets` and `mm_placeholder_lengths`. Both are in absolute
+prompt-token coordinates: the offset is the index of the item's first
+placeholder token in the request's prompt and the length is its placeholder
+count, so a model that prefills in chunks can tell which items the current
+chunk covers (an item whose placeholders lie past the chunk end has no slots
+yet). They are `None` when the item carries no placeholder position.
 
 When `model_config.uses_mrope` enables request-specific RoPE, `prefill_forward`
 returns `(output, rope_deltas)`, with one delta per request. On decode,

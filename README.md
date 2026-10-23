@@ -501,10 +501,14 @@ The execution model matches TT hardware characteristics:
   not establish chunked-prefill support.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
-- For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
-  `--data_parallel_size N` runs as `N` in-process TT lanes scheduled by
-  `TTLaneCoordinator` (one engine, one device mesh); see
-  [Single-Process Galaxy Serving](#single-process-galaxy-serving).
+- For models that declare `model_capabilities["folds_dp_into_lanes"]`
+  (see [MODEL_CAPABILITIES.md](docs/MODEL_CAPABILITIES.md)), and for the
+  legacy Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS, which
+  fold without declaring it, `--data_parallel_size N` runs as `N` in-process
+  TT lanes scheduled by `TTLaneCoordinator`: one engine process owns the one
+  device mesh and submits one merged batch; see
+  [Single-Process Galaxy Serving](#single-process-galaxy-serving). A model
+  whose declaration is absent or `False` keeps standard multi-process DP.
 - For other models, `--data_parallel_size N` uses standard multi-process DP:
   each DP rank runs an independent engine core with its own TT submesh,
   scheduler, and KV cache. Device groups are discovered at startup and assigned

@@ -102,7 +102,11 @@ The scheduler runs in one of three topologies:
 
 1. Single-process non-DP: one engine, one scheduler, and one TT worker.
 2. Single-process lane-DP: one engine coordinates multiple lane schedulers and
-   submits one merged TT batch.
+   submits one merged TT batch. A model selects this mode by declaring
+   `model_capabilities["folds_dp_into_lanes"]`; the legacy Galaxy generators
+   (Llama3 70B, Qwen3-32B) and GPT-OSS fold without declaring it. With the
+   declaration absent or `False`, `--data_parallel_size N` is standard
+   multi-process DP.
 3. Standard multi-process DP: each rank has an independent engine, scheduler,
    KV cache, TT worker, and TT submesh.
 
@@ -644,7 +648,11 @@ and requirements for declaring `supports_async_decode` are specified in
 
 ## Queueing in Single-Process Lane TT
 
-Single-process lane-DP uses one vLLM engine process and one TT worker.
+Single-process lane-DP uses one vLLM engine process and one TT worker: that
+process owns the whole device mesh, so the `N` lanes of
+`--data_parallel_size N` share one mesh instead of one submesh per rank
+(`folds_dp_into_lanes` in [MODEL_CAPABILITIES.md](MODEL_CAPABILITIES.md); the
+legacy Galaxy generators and GPT-OSS fold without declaring it).
 `TTLaneCoordinator` owns one independent `TTScheduler` per lane. Each lane has
 its own `waiting` and `running` queues, admission decisions, KV cache manager,
 and lane-local block ID space.
