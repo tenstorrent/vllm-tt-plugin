@@ -867,6 +867,46 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+def _install_tt_harmony_after_stop_patch() -> None:
+    """Let a streamed GPT-OSS response continue past its stop token.
+
+    ``ignore_eos`` keeps generating after the model's ``<|return|>`` (or
+    ``<|call|>``). The streaming ``HarmonyParser`` then feeds the next token to
+    openai_harmony, which raises ``HarmonyError: Unexpected token ... while
+    expecting start token``; the chat stream ends without its finish chunk or
+    usage. ``vllm bench serve`` sets ``ignore_eos`` for its random dataset, so
+    every GPT-OSS benchmark request that reaches ``<|return|>`` early lost its
+    token count, and the client fell back to counting the visible answer
+    tokens: per-user throughput read about half the real value.
+
+    Tokens after the stop token are not part of the assistant message, so the
+    parser drops them; they still count in usage.
+
+    TODO: remove this once fixed in vLLM core.
+    """
+    import vllm.parser.harmony as harmony_module
+
+    parser_cls = harmony_module.HarmonyParser
+    if hasattr(parser_cls, "_tt_original_process_chunk"):
+        return
+    from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+
+    stop_token_ids = frozenset(get_encoding().stop_tokens_for_assistant_actions())
+    original = parser_cls.process_chunk
+    parser_cls._tt_original_process_chunk = original
+
+    def process_chunk_tt(self, token_ids):
+        if getattr(self, "_tt_after_stop", False):
+            return harmony_module.ChunkResult(segments=[], reasoning_token_count=0)
+        for i, token_id in enumerate(token_ids):
+            if token_id in stop_token_ids:
+                self._tt_after_stop = True
+                return original(self, token_ids[: i + 1])
+        return original(self, token_ids)
+
+    parser_cls.process_chunk = process_chunk_tt
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 
@@ -1711,6 +1751,7 @@ class TTPlatform(Platform):
         _install_api_lifespan_gc_patch()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
+        _install_tt_harmony_after_stop_patch()
         # Before ``EngineArgs.create_engine_config`` builds the VllmConfig,
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
@@ -1793,6 +1834,7 @@ class TTPlatform(Platform):
         _install_api_lifespan_gc_patch()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
+        _install_tt_harmony_after_stop_patch()
         # Too late to change this config's asynchronous setting, which upstream
         # resolved before calling this hook. Installed anyway, for a process
         # that reaches configuration without the CLI path: a second engine, or
