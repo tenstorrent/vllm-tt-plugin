@@ -273,8 +273,6 @@ class LaneDeviceTarget:
             "chain_rows": kwargs.get("chain_rows"),
             "chain_tip": kwargs.get("chain_tip"),
         }
-        if "finishing_slots" in kwargs:
-            raise ValueError("decode_forward takes no finishing_slots")
         self.calls.append(call)
         if spec_mode is None:
             self._invalidate_chain()
