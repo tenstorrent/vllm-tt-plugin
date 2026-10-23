@@ -893,6 +893,8 @@ class TTLaneInputBatch(InputBatch):
         num_drafts: int,
         carried: dict[int, int],
         riders: Collection[int] = (),
+        *,
+        all_or_none: bool = False,
     ) -> dict[int, int]:
         """How many drafts each scheduled slot verifies this step, by lane load.
 
@@ -914,6 +916,17 @@ class TTLaneInputBatch(InputBatch):
           (the higher slot among equals), off the end of its proposal. A lane
           holds at most ``per_lane`` slots, so it always fits once it carries
           no drafts.
+
+        With ``all_or_none`` (a launch that chains lane verifies) and a plan
+        that sizes drafts by lane load (``k_by_rows``), a step where some
+        scheduled slot is left no draft while another keeps one verifies none:
+        it runs as the ordinary decode. Such a verify cannot be chained onto
+        (``TTAsyncDecodeController._lane_chain_blockers`` wants a draft on
+        every slot), so it drains, and under such a plan the crowded lanes
+        beside the draftless ones verify few drafts each, too few to pay for
+        the drain; a lane of three requests beside lanes of two would make
+        every step one. A plan without ``k_by_rows`` drafts the full K where
+        it drafts at all, and keeps the mixed verify.
 
         A trimmed draft is not verified. It is a rejected draft to vLLM, whose
         rollback reads the committed count, and no draft to the speculative
@@ -948,6 +961,13 @@ class TTLaneInputBatch(InputBatch):
                         )
                     lane[row] -= 1
             budget.update(lane)
+        if (
+            all_or_none
+            and spec_plan is not None
+            and spec_plan.k_by_rows
+            and not all(budget.values())
+        ):
+            budget = dict.fromkeys(budget, 0)
         return budget
 
     # ------------------------------------------------------------------
@@ -1640,6 +1660,7 @@ class TTLaneInputBatch(InputBatch):
             num_drafts,
             {row: int(num_valid[row]) for row in live_rows},
             riders=[row for row in self.occupied_rows() if row not in scheduled],
+            all_or_none=runner._chains_fused_verifies(),
         )
         for row, allowed in budget.items():
             # Only the suffix past the budget goes, so the verified drafts stay

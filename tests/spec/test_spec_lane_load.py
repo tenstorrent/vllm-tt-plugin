@@ -151,6 +151,44 @@ def test_a_slot_the_step_leaves_out_still_fills_a_row():
     assert batch.lane_draft_budget(plan, K, {0: K}, riders=[5]) == {0: K}
 
 
+THREE_BESIDE_A_PAIR = {0: 0, 1: 0, 2: 0, 4: 1, 5: 1}
+
+
+@pytest.mark.parametrize(
+    "k_by_rows, all_or_none, carried, expected",
+    [
+        # Lane 0 holds three requests the drafter drafted nothing for, lane 1
+        # a pair with one draft each: on a chaining launch nobody verifies.
+        (
+            MIMO_K_BY_ROWS,
+            True,
+            THREE_BESIDE_A_PAIR,
+            dict.fromkeys(THREE_BESIDE_A_PAIR, 0),
+        ),
+        # A lane of three keeping one draft still leaves two slots without.
+        (
+            MIMO_K_BY_ROWS,
+            True,
+            {0: 1, 1: 1, 2: 1, 4: 1, 5: 1},
+            dict.fromkeys(THREE_BESIDE_A_PAIR, 0),
+        ),
+        # Every slot keeps a draft: the step verifies.
+        (MIMO_K_BY_ROWS, True, {0: 1, 1: 1, 4: K}, {0: 1, 1: 1, 4: K}),
+        # Without chaining, or without a load-sized plan, the mixed verify stays.
+        (MIMO_K_BY_ROWS, False, THREE_BESIDE_A_PAIR, THREE_BESIDE_A_PAIR),
+        ((), True, {0: 0, 1: 0, 4: K}, {0: 0, 1: 0, 4: K}),
+    ],
+)
+def test_a_chaining_launch_verifies_only_when_every_slot_keeps_a_draft(
+    k_by_rows, all_or_none, carried, expected
+):
+    plan = lane_device_target(k_by_rows=k_by_rows, lanes_per_request=1 + K).spec_plan(
+        None, NUM_LANES * PER_LANE, K
+    )
+    budget = lane_batch().lane_draft_budget(plan, K, carried, all_or_none=all_or_none)
+    assert budget == expected
+
+
 # endregion The lane budget
 
 
@@ -165,7 +203,9 @@ def test_a_request_joining_a_speculating_lane_keeps_its_verify_one_pass(
     """``a`` speculates alone in lane 0 with K drafts; ``b`` joins it. The K
     drafts ``a`` carried into the first shared step are trimmed so the lane
     fits its four rows, rather than five rows verified in two passes, and
-    both requests emit the argmax chain."""
+    both requests emit the argmax chain. A chaining launch whose plan sizes
+    drafts by load runs that step, where ``b`` carries none, as the ordinary
+    decode instead (``TTLaneInputBatch.lane_draft_budget``)."""
     model = mimo_target(k_by_rows=k_by_rows)
     engine = mimo_engine(model, async_scheduling=async_scheduling)
     prompt_a = engine.add("a", 0, 1)
@@ -184,7 +224,11 @@ def test_a_request_joining_a_speculating_lane_keeps_its_verify_one_pass(
     ]
     assert shared, "no verify carried both requests"
     # The first shared verify: what ``a`` carried in, trimmed to fit.
-    assert shared[0] == {0: 1 if k_by_rows else 2, 1: 0}
+    trimmed = {0: 1 if k_by_rows else 2, 1: 0}
+    if async_scheduling and k_by_rows:
+        assert trimmed not in shared
+    else:
+        assert shared[0] == trimmed
     # Then the drafter drafts one each for the pair.
     assert {0: 1, 1: 1} in shared
     produced = engine.outputs["a"]
@@ -225,8 +269,10 @@ def test_two_requests_in_a_lane_speculate_one_draft_each_and_chain():
 @pytest.mark.parametrize("async_scheduling", [True, False], ids=["async", "sync"])
 def test_a_lane_of_three_runs_plain(async_scheduling):
     """Three requests in lane 0: the drafter drafts nothing for them. Alone,
-    every step is the ordinary decode; beside ``d`` speculating alone in lane
-    1, they ride its verifies with nothing to verify, three rows in one pass."""
+    every step is the ordinary decode. Beside ``d`` speculating alone in lane
+    1, they ride its verifies with nothing to verify, three rows in one pass;
+    on a chaining launch such a verify could not be chained onto, and the
+    step stays the ordinary decode (``TTLaneInputBatch.lane_draft_budget``)."""
     model = mimo_target()
     engine = mimo_engine(model, async_scheduling=async_scheduling)
     prompts = {
@@ -241,12 +287,14 @@ def test_a_lane_of_three_runs_plain(async_scheduling):
     engine.drain()
 
     assert_one_pass(model)
-    assert model.verify_calls
+    if async_scheduling:
+        assert model.verify_calls == []
+    else:
+        assert any(live_valid(call).get(4) == K for call in model.verify_calls)
     for call in model.verify_calls:
         valid = live_valid(call)
         assert [valid[row] for row in (0, 1, 2)] == [0, 0, 0]
         assert call["lane_rows"][0] == 3
-    assert any(live_valid(call).get(4) == K for call in model.verify_calls)
     for req_id in "abc":
         produced = engine.outputs[req_id]
         assert produced == expected_greedy(prompts[req_id], len(produced))

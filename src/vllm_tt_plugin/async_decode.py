@@ -929,6 +929,7 @@ class TTAsyncDecodeController:
                 row: min(len(offered.get(req_id) or ()), num_drafts)
                 for row, req_id in scheduled.items()
             },
+            all_or_none=True,
         )
         reasons: dict[int, str | None] = {}
         hints: dict[int, int] = {}
