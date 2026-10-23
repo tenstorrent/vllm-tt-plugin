@@ -2648,10 +2648,9 @@ class TTModelRunner:
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only). Bad words need the output history too: a word longer
-        # than one token bans its last token only after the rest of it, and
-        # vLLM's bad-words op reads that from the output history it is handed,
-        # so an empty history would silently skip every multi-token word.
+        # (decode only). Bad words need output_tokens too: vLLM's bad-words op
+        # bans a word's last token only when this history ends with the rest of
+        # the word.
         prompt_tokens = None
         output_tokens = None
         if input_batch.sampling.bad_words_token_ids and not is_prompt:
