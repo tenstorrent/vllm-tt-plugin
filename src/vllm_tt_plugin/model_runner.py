@@ -40,6 +40,7 @@ from vllm_tt_plugin.async_decode import (
     SubmittedStepContext,
     TTAsyncDecodeController,
     TTDecodeSubmission,
+    verified_drafts_by_request,
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
@@ -76,6 +77,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import set_tt_verified_drafts
 from vllm_tt_plugin.spec_accept import (
     AcceptResult,
     SpecPenalties,
@@ -3146,6 +3148,10 @@ class TTModelRunner:
             )
         output = self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
         if is_decode and getattr(self, "_num_speculative_tokens", 0):
+            # Drafts offered to a step that verified none (a lane trimmed them
+            # all, or a request that cannot speculate shared the step) are no
+            # drafts to the speculative metrics.
+            set_tt_verified_drafts(output, {})
             self.propose_after_lane_plain_step(model_input, sampled, scheduled_rows)
         return output
 
@@ -3176,9 +3182,13 @@ class TTModelRunner:
         req_ids, published = self.lane_spec_published(
             model_input, prefixes, scheduled_rows
         )
-        return self.build_spec_runner_output(
+        output = self.build_spec_runner_output(
             req_ids, published, self.spec_committed_logprobs(walk.logprobs, published)
         )
+        # The scheduler offered the proposals untrimmed; the lane verified
+        # what its load allows (``TTLaneInputBatch.lane_draft_budget``).
+        set_tt_verified_drafts(output, verified_drafts_by_request(model_input))
+        return output
 
     @staticmethod
     def lane_spec_published(

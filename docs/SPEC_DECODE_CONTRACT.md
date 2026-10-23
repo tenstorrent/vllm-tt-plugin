@@ -82,11 +82,16 @@ serve speculative decoding within the following execution limits:
   1, as a padding row does. A slot whose request the step does not schedule,
   such as a partial prefill held through an interleaved decode step, also
   carries request id `None`. The drafter and the accept walk run over every
-  slot, and only scheduled slots are committed. `num_valid_drafts`, the draft
-  cap of `SpecPlan.k_by_rows`, `_step_verifies` and the accept mode read the
-  step's live rows across all lanes; a per-lane policy, such as drafting only
-  for a lane with one live request, is the adapter's, through
-  `DraftOutput.num_valid`. Every accept mode serves lane mode as it serves
+  slot, and only scheduled slots are committed. `_step_verifies` and the
+  accept mode read the step's live rows across all lanes. The draft cap of
+  `SpecPlan.k_by_rows` is read per lane, for the requests the step schedules
+  in that lane, and a plan laying one candidate token per decode row
+  (`lanes_per_request == 1 + effective_k`) also has each lane's drafts
+  trimmed to fit the lane's rows in one pass (section 4, "Lane mode"). The
+  drafter's own per-lane policy, such as K drafts for a request alone in its
+  lane and one each for two, is the adapter's, through `DraftOutput.num_valid`;
+  the runner enforces the cap and the fit whatever was proposed. Every accept
+  mode serves lane mode as it serves
   front-packed execution: a sampled request in any lane makes the whole step
   a `logits` verify, or a `fused_sample` one (section 4i), the model answers
   every slot of the grid, gaps included, and only the scheduled slots are
@@ -251,7 +256,11 @@ the other modes. Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
-every live batch size the launch admits has a draft cap.
+every live batch size the launch admits has a draft cap. In lane mode a cap is
+read for one lane's requests, so the mapping must reach the per-lane
+`max_num_seqs` instead (the plan is still called with the global value), and
+`lanes_per_request` must be 1 or `1 + effective_k`, the two layouts the lane
+budget of section 4 reads.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -268,7 +277,7 @@ returns; `drafter_state` says where the drafter's own state lives;
 `drafter_target_cache_requires` carries what a drafter sharing the target's
 caches needs to stay true of them; `supports_narrow_decode` is the
 second-call-shape promise of section 1a; and `k_by_rows` caps the drafts per
-row by the number of live rows.
+row by the number of live rows, which in lane mode are the row's lane's.
 
 `k_by_rows` is optional. It is a tuple of `(max_rows, k)` entries in strictly
 ascending `max_rows` order. `SpecPlan.draft_cap(R)` returns the `k` of the
@@ -278,13 +287,17 @@ has `k` equal to `effective_k`, because the platform publishes `effective_k` as
 `num_speculative_tokens` and the scheduler reserves lookahead for that many
 drafts. A model uses `k_by_rows` when its verify cost grows with rows times
 columns: for example, `((4, 7), (8, 3))` gives up to 7 drafts per row to 1 to 4
-live rows, and up to 3 drafts per row to 5 to 8 live rows. `k_by_rows` changes
-only how many columns of a row are real. It does not change the call shape, so
+live rows, and up to 3 drafts per row to 5 to 8 live rows. In lane mode `R` is
+the number of requests the step schedules in the row's lane: MiMo-V2.6-Flash's
+`((1, 3), (2, 1), (4, 1))`, on four slots per lane, gives 3 drafts to a request
+alone in its lane and 1 each to two or more, whatever the other lanes hold.
+`k_by_rows` changes only how many columns of a row are real. It does not change the call shape, so
 it is not one of the static declarations of section 1a. Section 4 says how the
 runner applies it.
 
 `lanes_per_request`, `extra_bytes_per_seq` and `extra_bytes_per_token` are
-declared but not yet budgeted against. The byte fields need a bytes-per-KV-token
+declared but not yet budgeted against, except `lanes_per_request` in lane mode
+(section 4, "Lane mode"). The byte fields need a bytes-per-KV-token
 conversion the block-count function does not have, and the row check needs the
 runner. Declare them accurately anyway: they are what the budgeting will read.
 
@@ -298,7 +311,7 @@ decode. `TTModelInput` carries the verification inputs as four values.
 | --- | --- | --- |
 | `input_tokens` | `[B, 1+K]` int32 | Column 0 is the row's last committed token; columns 1..K are its pending drafts |
 | `input_positions` | `[B, 1+K]` int32 | Column j is that row's position for column j's token |
-| `num_valid_drafts` | `[B]` int32 | How many of a row's K draft columns are real, in `[0, K]`, and never above `SpecPlan.draft_cap` for the step's live rows |
+| `num_valid_drafts` | `[B]` int32 | How many of a row's K draft columns are real, in `[0, K]`, and never above `SpecPlan.draft_cap` for the step's live rows (in lane mode, for its lane's, and within its lane's rows) |
 | `accepted_counts` | `[B]` int32 | How many tokens that row's previous step committed, in `[1, 1+K]` |
 
 `B` is the padded decode batch, the same capacity a plain decode is padded to,
@@ -322,6 +335,35 @@ cap are padded as on any other short row. With `k_by_rows=((4, 7), (8, 3))`, a
 step with five live rows sends a `[B, 8]` block in which no row has a
 `num_valid_drafts` entry above 3. The runner does not send the cap as a
 separate argument: `num_valid_drafts` is the per-step signal.
+
+**Lane mode.** `TTLaneInputBatch.lane_draft_budget` decides each scheduled
+slot's `num_valid_drafts`, one lane at a time. First the cap:
+`SpecPlan.draft_cap` for the number of requests the step schedules in that
+lane. Then, for a plan with `lanes_per_request == 1 + effective_k`, the fit: such
+a model verifies one candidate token per decode row of the lane, so a lane's
+scheduled requests fill `sum(1 + drafts)` of its `per_lane` rows, plus one row
+for each slot the block carries with a position but no scheduled request (a
+partial prefill or a request finishing at `max_tokens` that still holds its
+slot), and a lane past `per_lane` rows would be verified in several passes.
+The runner trims drafts until the lane fits: one at a time, from the slot
+carrying the most (the higher slot among equals), off the end of its
+proposal. A plan with `lanes_per_request == 1` keeps its block on its
+request's slot and is only capped. With MiMo-V2.6-Flash's `k_by_rows` above
+and four slots per lane:
+
+| Lane holds | Each request verifies | Rows |
+| --- | --- | --- |
+| 1 request | up to 3 drafts | up to 4 |
+| 2 requests | up to 1 draft each | up to 4 |
+| 3 requests | 1 draft in total, on the lowest slot | 4 |
+| 4 requests | none | 4 |
+
+A request joining a lane whose request carried 3 drafts trims them to the cap
+for two, 1, and the verify takes 3 rows in one pass; with no `k_by_rows` the
+fit alone keeps 2. A trimmed draft is not verified: vLLM counts it rejected
+and rolls `num_computed_tokens` back over it, and the speculative metrics do
+not count it (section 4e). The same budget applies to the synchronous and the
+asynchronous lane builders and to a chained verify's `hints` (section 4j).
 
 `accepted_counts` is a count and not an index. It is never 0, it is 1 after a
 prefill and after a non-speculating step, and a model selecting a per-candidate
@@ -573,7 +615,10 @@ every decode, so vLLM alone would count every ordinary step as K rejected
 drafts. A deferred verify's `ModelRunnerOutput` therefore reports each
 request's `num_valid_drafts` (`set_tt_verified_drafts`), and
 `TTScheduler.update_from_output` marks the rest of the offer, and the whole
-offer of a request no verify reported, in `num_invalid_spec_tokens`. vLLM
+offer of a request no verify reported, in `num_invalid_spec_tokens`. A
+synchronous lane decode step reports the same, because a lane trims the real
+drafts it was offered to its load (section 4, "Lane mode"); a synchronous
+output without a report is left as vLLM counts it. vLLM
 subtracts that from the drafted count only; its rollback of
 `num_computed_tokens` still covers the whole reservation. A step left with
 nothing drafted is not counted as a draft.
@@ -791,7 +836,9 @@ rejection), the scheduler budgets a prefix into
 `scheduled_spec_decode_tokens`, under asynchronous scheduling
 `TTModelRunner._drafts_to_verify` trims the retained proposal to the reserved
 placeholder count, and `TTModelRunner._spec_row_state` copies the first
-`SpecPlan.draft_cap` scheduled ids into the block unchanged. The verify block's
+`SpecPlan.draft_cap` scheduled ids into the block unchanged; in lane mode
+`TTLaneInputBatch.lane_draft_budget` may keep a shorter prefix still (section
+4, "Lane mode"). The verify block's
 draft columns are therefore always a prefix of what the model proposed, which
 is what makes a result computed at proposal time (section 4a) valid for the
 block as sent.
@@ -805,10 +852,13 @@ four proposals. The drafter is still asked for `effective_k` drafts on every
 step, because the next step's row count is not known when it proposes. vLLM's
 `Scheduler.update_from_output` counts each dropped draft as a rejected draft:
 it subtracts the drafts that did not commit from `num_computed_tokens`, so the
-KV accounting stays correct. Under synchronous scheduling vLLM's speculative
-decoding metrics count the dropped drafts as proposed and rejected; under
-asynchronous scheduling they count only the drafts a verify carried (section
-4c).
+KV accounting stays correct. In lane mode the same happens per lane: a
+request joining a lane trims what its lane's requests carried to the cap for
+the larger lane and to the lane's rows. Under synchronous scheduling vLLM's
+speculative decoding metrics count the dropped drafts as proposed and rejected,
+except on a lane decode step, which reports what it verified (none on an
+ordinary step) as an asynchronous verify does; under asynchronous scheduling
+they count only the drafts a verify carried (section 4c).
 
 **Returning to drafting is a model obligation.** The plugin keeps asking:
 `TTModelRunner.propose_after_plain_step` calls `propose_draft_tokens` after an
@@ -1247,15 +1297,21 @@ step is unresolved and it is the newest deferred verify; the step is all decode
 with no prefill, preemption, forced reset, pending grammar or active logits
 processor; and every lane it schedules chains: the lane holds the same
 requests at the same slots as the pending step, less those finished, and each
-of them is `fused_sample`-servable, verified the full draft count
-(`min(K, draft_cap)`) in the pending step and is offered that many
-placeholders now, and stays `2 * (1+K)` positions under `max_model_len` from
-its optimistic length. For now one lane that cannot chain keeps the whole
+of them is `fused_sample`-servable, verified in the pending step exactly the
+count its lane's budget gives it now (`lane_draft_budget` over the
+placeholders it is offered: the lane's cap for its request count, fitted to
+its rows), at least one, and stays `2 * (1+K)` positions under
+`max_model_len` from its optimistic length. Both requests of a lane of two
+are chain rows. For now one lane that cannot chain keeps the whole
 step from chaining: it drains, and the step is built from host state. A
 request that finished at step n has already been scheduled into n+1; that
 output is published and vLLM drops it, and its slot is a gap from n+2. A
 drafter that drafts only for a lane holding one request therefore chains a
-step while every busy lane holds one request.
+step while every busy lane holds one request. One that drafts one each for a
+lane of two (MiMo-V2.6-Flash) chains that lane too, a step after its request
+count settles: the step a request joins or leaves is refused on the lane's
+layout, and the one after it on `draft_count` when the joining step verified
+another count (the newcomer carried none, the incumbent its trimmed drafts).
 
 **Requests finishing at `max_tokens`.** Under async scheduling vLLM leaves a
 running request out of a step once the step in flight is sure to reach its

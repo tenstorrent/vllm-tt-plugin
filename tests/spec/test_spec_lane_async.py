@@ -84,19 +84,27 @@ STRUCTURED = SamplingParams(
 # region Harness
 
 
-def lane_runner(model: LaneDeviceTarget, *, async_scheduling: bool = True):
-    """A runner fake over a real lane batch whose methods are the real ones."""
-    model.per_lane = PER_LANE
+def lane_runner(
+    model: LaneDeviceTarget,
+    *,
+    async_scheduling: bool = True,
+    num_lanes: int = NUM_LANES,
+    per_lane: int = PER_LANE,
+):
+    """A runner fake over a real lane batch whose methods are the real ones.
+
+    ``LaneEngine`` reads the layout back off the batch."""
+    model.per_lane = per_lane
     batch = TTLaneInputBatch(
-        num_lanes=NUM_LANES,
-        per_lane=PER_LANE,
+        num_lanes=num_lanes,
+        per_lane=per_lane,
         max_model_len=MAX_MODEL_LEN,
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=model.vocab_size,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],
     )
-    plan = type(model).spec_plan(None, CAPACITY, K)
+    plan = type(model).spec_plan(None, num_lanes * per_lane, K)
     runner = SimpleNamespace(
         model=model,
         input_batch=batch,
@@ -120,8 +128,8 @@ def lane_runner(model: LaneDeviceTarget, *, async_scheduling: bool = True):
         _proposed_draft_token_ids={},
         _req_state_slot={},
         _ngram_proposer=None,
-        tt_per_lane_max_num_seqs=PER_LANE,
-        tt_data_parallel_size=NUM_LANES,
+        tt_per_lane_max_num_seqs=per_lane,
+        tt_data_parallel_size=num_lanes,
         vocab_size=model.vocab_size,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         supports_stage_inputs=False,
@@ -244,6 +252,15 @@ class LaneEngine:
         self.inflight: deque = deque()
         self.wrappers: list = []
         self.structured: set[str] = set()
+        # Per decode output in resolution order, the tokens each request
+        # generated when the metrics observed it.
+        self.observed: list[dict[str, int]] = []
+
+    @property
+    def layout(self) -> tuple[int, int]:
+        """``(num_lanes, per_lane)`` of the runner's lane batch."""
+        batch = self.runner.lane_batch
+        return batch.num_lanes, batch.per_lane
 
     def add(
         self, req_id, row, first_token, params=GREEDY, stop_after=None, max_tokens=None
@@ -299,11 +316,12 @@ class LaneEngine:
         so.finished_req_ids, self.finished_pending = self.finished_pending, set()
         for done in so.finished_req_ids:
             self.live.pop(done, None)
-        lanes = [0] * NUM_LANES
-        lanes[row // PER_LANE] = 1
+        num_lanes, per_lane = self.layout
+        lanes = [0] * num_lanes
+        lanes[row // per_lane] = 1
         plan = TTStepPlan(
             is_decode=False,
-            capacity=CAPACITY,
+            capacity=num_lanes * per_lane,
             scheduled_req_ids=(req_id,),
             scheduled_rows=(row,),
             input_rows=(row,),
@@ -430,14 +448,15 @@ class LaneEngine:
         )
         so.finished_req_ids = set(finished)
         rows = tuple(sorted(self.live[r] for r in live))
+        num_lanes, per_lane = self.layout
         plan = TTStepPlan(
             is_decode=True,
-            capacity=CAPACITY,
+            capacity=num_lanes * per_lane,
             scheduled_req_ids=tuple(live),
             scheduled_rows=rows,
-            input_rows=tuple(range(CAPACITY)),
+            input_rows=tuple(range(num_lanes * per_lane)),
             req_id_to_row=dict(self.live),
-            batch_size_per_dp=(PER_LANE,) * NUM_LANES,
+            batch_size_per_dp=(per_lane,) * num_lanes,
             prefill_empty_slots=None,
             # A finish frees a slot (``apply_step_plan``); a join is placed
             # by ``add`` directly and marks the runner's layout itself.
@@ -488,6 +507,13 @@ class LaneEngine:
                     zip(handed.req_ids, handed.draft_token_ids, strict=True)
                 )
         observe_spec_stats(self.stats, so, out)
+        if not so.scheduled_new_reqs:
+            self.observed.append(
+                {
+                    req_id: len(out.sampled_token_ids[index])
+                    for req_id, index in out.req_id_to_index.items()
+                }
+            )
         for req_id, index in out.req_id_to_index.items():
             if req_id in self.done or req_id not in self.outputs:
                 continue
@@ -537,8 +563,7 @@ def stats_scheduler(async_scheduling: bool) -> TTScheduler:
 def observe_spec_stats(scheduler: TTScheduler, so, out) -> None:
     """What ``TTScheduler.update_from_output`` does for the metrics: mark the
     unverified offer invalid, then vLLM's per-request observation."""
-    if scheduler.scheduler_config.async_scheduling:
-        scheduler._mark_unverified_drafts_invalid(so, out)
+    scheduler._mark_unverified_drafts_invalid(so, out)
     for req_id, index in out.req_id_to_index.items():
         offered = so.scheduled_spec_decode_tokens.get(req_id)
         generated = out.sampled_token_ids[index]

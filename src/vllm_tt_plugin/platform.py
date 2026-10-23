@@ -24,6 +24,7 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
+    get_tt_per_lane_max_num_seqs,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
@@ -2474,6 +2475,11 @@ class TTPlatform(Platform):
             model_class,
             model_capabilities,
             get_tt_max_batch_size(vllm_config),
+            lane_max_num_seqs=(
+                get_tt_per_lane_max_num_seqs(vllm_config)
+                if uses_tt_lane_coordinator(vllm_config)
+                else None
+            ),
         )
         if spec_plan is not None:
             # The Rust frontend handles HTTP outside Python, so nothing runs

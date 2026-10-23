@@ -139,6 +139,8 @@ def resolve_speculative_plan(
     model_class: type,
     model_capabilities: dict | None,
     max_num_seqs: int,
+    *,
+    lane_max_num_seqs: int | None = None,
 ) -> SpecPlan | None:
     """Resolve a speculative configuration at config time, or refuse it.
 
@@ -150,6 +152,12 @@ def resolve_speculative_plan(
     in rather than read off ``vllm_config`` because the platform rewrites
     ``scheduler_config.max_num_seqs`` when it folds data parallelism into lanes.
     Pass the value that is final for the launch.
+
+    ``lane_max_num_seqs`` is the per-lane concurrency in lane mode, and None
+    outside it. A lane's draft cap is read for that lane's requests
+    (``TTLaneInputBatch.lane_draft_budget``), so ``k_by_rows`` has to cover
+    the per-lane count rather than ``max_num_seqs``, and ``lanes_per_request``
+    must be one of the two layouts the lane budget knows.
 
     The model's ``spec_plan`` classmethod is called with a ``vllm_config`` on
     which no Tenstorrent platform state is guaranteed to be stored, so a
@@ -281,12 +289,29 @@ def resolve_speculative_plan(
         )
     # Checked here rather than in SpecPlan, which does not know the launch's
     # concurrency. Without it the first step with more live rows than the
-    # mapping covers would raise inside the runner.
-    if outcome.k_by_rows and outcome.k_by_rows[-1][0] < max_num_seqs:
+    # mapping covers would raise inside the runner. In lane mode the rows are
+    # one lane's.
+    cap_rows, cap_rows_name = max_num_seqs, "max_num_seqs"
+    if lane_max_num_seqs is not None:
+        cap_rows, cap_rows_name = lane_max_num_seqs, "the per-lane max_num_seqs"
+    if outcome.k_by_rows and outcome.k_by_rows[-1][0] < cap_rows:
         raise ValueError(
             f"{model_class.__name__}.spec_plan k_by_rows ends at max_rows="
-            f"{outcome.k_by_rows[-1][0]}, below max_num_seqs={max_num_seqs}; "
+            f"{outcome.k_by_rows[-1][0]}, below {cap_rows_name}={cap_rows}; "
             "every live batch size the launch admits needs a draft cap"
+        )
+    # Lane mode budgets a lane's verify by its decode rows: a block that rides
+    # its request's slot (1), or one candidate token per row (1 + effective_k),
+    # which a lane's requests share. Any other count says neither.
+    if lane_max_num_seqs is not None and outcome.lanes_per_request not in (
+        1,
+        1 + outcome.effective_k,
+    ):
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan declares lanes_per_request="
+            f"{outcome.lanes_per_request} with effective_k={outcome.effective_k}; "
+            "lane mode budgets a verify of 1 decode row per request, or of "
+            f"1 + effective_k = {1 + outcome.effective_k}, one per candidate token"
         )
     if outcome.drafter_state == DRAFTER_STATE_PAGED:
         raise ValueError(

@@ -8,6 +8,7 @@ call site, storing the result under the wrong key, or resolving the plan before
 the lane fold rewrites the concurrency all fail here.
 """
 
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from threading import Barrier
@@ -260,6 +261,26 @@ def test_lane_mode_speculates_through_the_model_owned_drafter(monkeypatch, vllm_
     plan = get_tt_spec_plan(vllm_config)
     assert plan is not None
     assert plan.effective_k == 7
+
+
+def test_lane_mode_resolves_the_draft_cap_against_one_lane(monkeypatch, vllm_config):
+    # MiMo-V2.6-Flash's shape: a cap per lane load, ending at the per-lane
+    # batch, admitted for a launch whose global batch is twice that.
+    class _PerLaneCapModel(make_fake_spec_model(max_supported_num_seqs=1024)):
+        @classmethod
+        def spec_plan(cls, config, max_num_seqs, requested_k):
+            plan = super().spec_plan(config, max_num_seqs, requested_k)
+            return dataclasses.replace(
+                plan, k_by_rows=((1, plan.effective_k), (2, 1), (per_lane, 1))
+            )
+
+    vllm_config = _model_owned(_lane_mode(vllm_config))
+    vllm_config.scheduler_config.max_num_seqs = 8
+    per_lane = 4
+    _run_hook(monkeypatch, vllm_config, _PerLaneCapModel)
+    assert vllm_config.scheduler_config.max_num_seqs == 2 * per_lane
+    plan = get_tt_spec_plan(vllm_config)
+    assert plan.k_by_rows == ((1, 7), (2, 1), (4, 1))
 
 
 def test_lane_mode_cannot_speculate_with_ngram(monkeypatch, vllm_config):

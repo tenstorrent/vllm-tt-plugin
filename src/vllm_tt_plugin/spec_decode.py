@@ -167,8 +167,12 @@ class SpecPlan:
     effective_k: int
     # Decode rows one speculating request occupies while verifying its
     # [B, 1+K] block. Unrelated to a lane-DP lane: this counts rows of the
-    # model's decode batch, not TT lanes in an engine. The plugin validates
-    # this declaration but does not yet check it against a row budget.
+    # model's decode batch, not TT lanes in an engine. Outside lane mode the
+    # plugin validates this declaration but does not check it against a row
+    # budget. Lane mode admits 1 (the block rides its request's slot) or
+    # 1 + effective_k (one candidate token per decode row), and for the latter
+    # trims a lane's drafts until its requests fit the lane's rows
+    # (``TTLaneInputBatch.lane_draft_budget``).
     lanes_per_request: int
     # Fixed device bytes per speculating request, independent of sequence
     # length: candidate state slots, a conv stash, retained hidden rows.
@@ -196,7 +200,8 @@ class SpecPlan:
     # model whose verify cost grows with rows times columns can serve a long
     # draft to a small batch and a short one to a large batch. The call shape
     # stays ``1 + effective_k`` wide either way. Empty means ``effective_k`` at
-    # every batch size.
+    # every batch size. In lane mode R counts the requests a step schedules in
+    # the row's lane, and the mapping covers the per-lane batch.
     k_by_rows: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
@@ -305,10 +310,11 @@ class SpecPlan:
     def draft_cap(self, live_rows: int) -> int:
         """The most drafts one row may verify on a step with ``live_rows`` rows.
 
-        ``live_rows`` counts the step's requests, not its padding rows.
-        Admission refuses a ``k_by_rows`` that does not reach the launch's
-        ``max_num_seqs``, so an admitted launch never asks for a row count the
-        mapping lacks.
+        ``live_rows`` counts the step's requests, not its padding rows; in lane
+        mode, the requests the step schedules in the row's lane. Admission
+        refuses a ``k_by_rows`` that does not reach the launch's
+        ``max_num_seqs`` (the per-lane one in lane mode), so an admitted launch
+        never asks for a row count the mapping lacks.
         """
         if not _is_int(live_rows) or live_rows < 1:
             raise ValueError(f"live_rows must be a positive integer, got {live_rows!r}")

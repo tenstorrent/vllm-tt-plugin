@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from vllm_tt_plugin.async_decode import ChainPlan
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
     from vllm_tt_plugin.model_runner import TTModelRunner
+    from vllm_tt_plugin.spec_decode import SpecPlan
 
 # Sentinel value for None seed. vLLM treats -1 as equivalent to None
 # (see SamplingParams.__post_init__), so we use -1 as the sentinel.
@@ -886,6 +887,69 @@ class TTLaneInputBatch(InputBatch):
         slot) order. This is the canonical merged order used for output."""
         return [row for row, rid in enumerate(self._req_ids) if rid is not None]
 
+    def lane_draft_budget(
+        self,
+        spec_plan: "SpecPlan | None",
+        num_drafts: int,
+        carried: dict[int, int],
+        riders: Collection[int] = (),
+    ) -> dict[int, int]:
+        """How many drafts each scheduled slot verifies this step, by lane load.
+
+        ``carried`` maps every slot the step schedules to the drafts its
+        request brings, at most ``num_drafts``. ``riders`` are the slots the
+        block carries with a position but no request of the step: a request
+        the step leaves out while it holds its slot (a partial prefill, or one
+        finishing at ``max_tokens``), which the device decodes all the same.
+        Each lane is budgeted on its own:
+
+        - the cap is ``SpecPlan.draft_cap`` for the number of the lane's slots
+          in ``carried``, so ``k_by_rows`` is read per lane in lane mode;
+        - a plan with ``lanes_per_request > 1`` verifies one candidate token
+          per decode row (admission holds it to ``1 + effective_k``), so a
+          lane fills ``sum(1 + drafts)`` of its ``per_lane`` rows over its
+          scheduled slots, plus one row per rider, and a lane that would
+          overflow them is verified in more than one pass. Drafts are trimmed
+          until the lane fits: one at a time, from the slot carrying the most
+          (the higher slot among equals), off the end of its proposal. A lane
+          holds at most ``per_lane`` slots, so it always fits once it carries
+          no drafts.
+
+        A trimmed draft is not verified. It is a rejected draft to vLLM, whose
+        rollback reads the committed count, and no draft to the speculative
+        metrics, which read the verified one (``set_tt_verified_drafts``).
+        """
+        by_lane: dict[int, list[int]] = {}
+        for row in sorted(carried):
+            by_lane.setdefault(row // self.per_lane, []).append(row)
+        riding: dict[int, int] = {}
+        for row in riders:
+            riding[row // self.per_lane] = riding.get(row // self.per_lane, 0) + 1
+        packs = spec_plan is not None and spec_plan.lanes_per_request > 1
+        budget: dict[int, int] = {}
+        for lane_index, rows in by_lane.items():
+            cap = num_drafts
+            if spec_plan is not None:
+                cap = min(cap, spec_plan.draft_cap(len(rows)))
+            lane = {row: min(carried[row], cap) for row in rows}
+            if packs:
+                excess = (
+                    sum(1 + drafts for drafts in lane.values())
+                    + riding.get(lane_index, 0)
+                    - self.per_lane
+                )
+                for _ in range(max(excess, 0)):
+                    row = max(rows, key=lambda r: (lane[r], r))
+                    if not lane[row]:
+                        raise RuntimeError(
+                            f"lane {lane_index} carries slots {rows} and "
+                            f"{riding.get(lane_index, 0)} riders, more than its "
+                            f"{self.per_lane} rows"
+                        )
+                    lane[row] -= 1
+            budget.update(lane)
+        return budget
+
     # ------------------------------------------------------------------
     # Placement (stable lane-local slots)
     # ------------------------------------------------------------------
@@ -1516,9 +1580,11 @@ class TTLaneInputBatch(InputBatch):
         across the whole block. ``row_req_ids`` is slot-ordered with ``None``
         at every slot this step does not schedule; the accept walk and the
         drafter run over every slot, as they run over every padded row of a
-        front-packed verify, and only the scheduled rows reach a request. The
-        draft cap counts the step's live rows, the global count
-        ``SpecPlan.k_by_rows`` is declared against.
+        front-packed verify, and only the scheduled rows reach a request. Each
+        row verifies what ``lane_draft_budget`` leaves it: its lane's cap,
+        read off ``SpecPlan.k_by_rows`` for that lane's scheduled requests,
+        and for a plan laying one candidate token per decode row, no more than
+        fit the lane's rows in one pass.
 
         A slot can hold a request the step leaves out: a decode step that the
         coordinator interleaves into a run of prefills leaves a partial
@@ -1563,14 +1629,23 @@ class TTLaneInputBatch(InputBatch):
                     input_tokens,
                     input_positions,
                 )
-        spec_plan = getattr(runner, "_spec_plan", None)
         drafts, num_valid, counts = runner._spec_row_state(
             runner._req_accepted_counts,
             runner._drafts_to_verify(scheduler_output, live_req_ids),
             row_req_ids,
             num_drafts,
-            spec_plan.draft_cap(len(live_req_ids)) if spec_plan is not None else None,
         )
+        budget = self.lane_draft_budget(
+            getattr(runner, "_spec_plan", None),
+            num_drafts,
+            {row: int(num_valid[row]) for row in live_rows},
+            riders=[row for row in self.occupied_rows() if row not in scheduled],
+        )
+        for row, allowed in budget.items():
+            # Only the suffix past the budget goes, so the verified drafts stay
+            # a prefix of the proposal.
+            num_valid[row] = allowed
+            drafts[row, allowed:] = PLACEHOLDER_TOKEN_ID
         if _step_verifies(
             runner._spec_supports_narrow_decode,
             all(runner._request_is_speculable(req_id) for req_id in live_req_ids),

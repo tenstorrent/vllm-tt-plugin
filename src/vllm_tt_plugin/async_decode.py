@@ -151,6 +151,16 @@ class ChainPlan:
     positions: dict[int, int]
 
 
+def verified_drafts_by_request(model_input: TTModelInput) -> dict[str, int]:
+    """Per request a verify names, the drafts it verified (``num_valid_drafts``)."""
+    valid = model_input.num_valid_drafts
+    return {
+        req_id: int(valid[row])
+        for row, req_id in enumerate(model_input.row_req_ids)
+        if req_id is not None
+    }
+
+
 def _is_host_decode_output(tt_out: Any) -> bool:
     if isinstance(tt_out, torch.Tensor):
         return True
@@ -419,14 +429,8 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         )
         # What the verify really carried, per request, for vLLM's speculative
         # metrics: the scheduler only ever offered placeholders.
-        valid = self._model_input.num_valid_drafts
         set_tt_verified_drafts(
-            runner_output,
-            {
-                req_id: int(valid[row])
-                for row, req_id in enumerate(self._model_input.row_req_ids)
-                if req_id is not None
-            },
+            runner_output, verified_drafts_by_request(self._model_input)
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
@@ -877,10 +881,16 @@ class TTAsyncDecodeController:
         - is ``fused_sample``-servable (``_request_is_fused_servable``: no
           penalties, logprobs, grammar, allowlist, bad words or pending
           ``min_tokens``, sampling inside the device sampler's bounds);
-        - verified the full draft count in step n, which is the count the
-          device's drafter left it, and is offered that many placeholders now:
-          the device verifies exactly ``hints[slot]`` drafts, and a seeded row's
-          uniforms are drawn for that many;
+        - verified in step n exactly what its lane's budget gives it now
+          (``TTLaneInputBatch.lane_draft_budget`` over the placeholders it is
+          offered: the lane's ``k_by_rows`` cap for its request count, fitted
+          to the lane's rows), at least one, which is the count the device's
+          drafter left it: the device verifies exactly ``hints[slot]`` drafts,
+          and a seeded row's uniforms are drawn for that many. A lane whose
+          request count changed since step n is refused on its layout, and
+          one whose step n verified a different count (say the step a request
+          joined, which trimmed what the earlier one carried) on
+          ``draft_count``;
         - stays ``2 * (1+K)`` positions under ``max_model_len`` from its
           optimistic length (applied length plus ``1+K`` per step not yet
           applied), so neither step can be cut by the length cap.
@@ -911,13 +921,15 @@ class TTAsyncDecodeController:
             if req_id is not None and req_id in gone
         }
         scheduled = dict(zip(plan.scheduled_rows, plan.scheduled_req_ids, strict=True))
-        spec_plan = getattr(runner, "_spec_plan", None)
-        full = (
-            num_drafts
-            if spec_plan is None
-            else min(num_drafts, spec_plan.draft_cap(len(scheduled)))
-        )
         offered = scheduler_output.scheduled_spec_decode_tokens
+        budget = batch.lane_draft_budget(
+            getattr(runner, "_spec_plan", None),
+            num_drafts,
+            {
+                row: min(len(offered.get(req_id) or ()), num_drafts)
+                for row, req_id in scheduled.items()
+            },
+        )
         reasons: dict[int, str | None] = {}
         hints: dict[int, int] = {}
         positions: dict[int, int] = {}
@@ -940,7 +952,7 @@ class TTAsyncDecodeController:
             reason = None
             for row, req_id in lane_scheduled.items():
                 tokens = list(offered.get(req_id) or ())
-                hint = min(len(tokens), full)
+                hint = budget[row]
                 length = int(batch.num_tokens[row]) + width * inflight
                 if req_id not in runner.requests:
                     reason = "layout"

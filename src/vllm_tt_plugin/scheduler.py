@@ -46,6 +46,8 @@ _TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
 # that step's ModelRunnerOutput (``set_tt_verified_drafts``). Under async
 # scheduling the scheduler offers placeholders, not drafts, so this is the only
 # record of what a verify carried; ``TTScheduler.update_from_output`` reads it.
+# A synchronous lane decode step reports it too, because a lane trims the
+# drafts it was offered to its load (``TTLaneInputBatch.lane_draft_budget``).
 _TT_VERIFIED_DRAFTS_ATTR = "_tt_verified_drafts"
 
 
@@ -57,6 +59,10 @@ def set_tt_verified_drafts(
 
 def get_tt_verified_drafts(runner_output: ModelRunnerOutput) -> dict[str, int]:
     return dict(getattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, {}))
+
+
+def has_tt_verified_drafts(runner_output: ModelRunnerOutput) -> bool:
+    return hasattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR)
 
 
 def set_tt_forced_reset_discard_counts(
@@ -1287,7 +1293,7 @@ class TTScheduler(AsyncScheduler):
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
             )
-        if self.num_spec_tokens and self.scheduler_config.async_scheduling:
+        if self.num_spec_tokens:
             self._mark_unverified_drafts_invalid(scheduler_output, model_runner_output)
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
@@ -1315,7 +1321,7 @@ class TTScheduler(AsyncScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> None:
-        """Keep vLLM's speculative metrics from counting unverified placeholders.
+        """Keep vLLM's speculative metrics from counting unverified drafts.
 
         ``AsyncScheduler`` offers ``[-1] * K`` to every scheduled decode, and
         vLLM's update counts the offer as drafted and everything past the
@@ -1326,9 +1332,17 @@ class TTScheduler(AsyncScheduler):
         none. The excess goes to ``num_invalid_spec_tokens``, which vLLM
         subtracts from the drafted count and nothing else reads: the rollback
         of ``num_computed_tokens`` still counts the whole reservation.
+
+        Synchronously the offer is the real proposal, and only a lane decode
+        step reports what it verified: it trims the offer to its lane's load.
+        An output without a report is left as vLLM counts it.
         """
         offered = scheduler_output.scheduled_spec_decode_tokens
         if not offered:
+            return
+        if not self.scheduler_config.async_scheduling and not has_tt_verified_drafts(
+            model_runner_output
+        ):
             return
         verified = get_tt_verified_drafts(model_runner_output)
         invalid = dict(scheduler_output.num_invalid_spec_tokens or {})

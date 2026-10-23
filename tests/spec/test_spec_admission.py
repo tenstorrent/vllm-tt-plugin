@@ -70,12 +70,15 @@ def _config(
     )
 
 
-def _admit(config, model_class=FakeSpecModel, capabilities=_SENTINEL):
+def _admit(
+    config, model_class=FakeSpecModel, capabilities=_SENTINEL, lane_max_num_seqs=None
+):
     return resolve_speculative_plan(
         config,
         model_class,
         model_class.model_capabilities if capabilities is _SENTINEL else capabilities,
         int(config.scheduler_config.max_num_seqs),
+        lane_max_num_seqs=lane_max_num_seqs,
     )
 
 
@@ -507,6 +510,56 @@ def test_a_draft_cap_mapping_short_of_the_concurrency_is_refused():
             _config(requested_k=7, max_num_seqs=9),
             model_class=_DraftCapByRowsModel,
         )
+
+
+def test_in_lane_mode_a_draft_cap_mapping_covers_one_lane():
+    """A lane's cap is read for that lane's requests: 16 requests over two
+    lanes of 8 are covered by a mapping that ends at 8."""
+    plan = _admit(
+        _config(requested_k=7, max_num_seqs=16),
+        model_class=_DraftCapByRowsModel,
+        lane_max_num_seqs=8,
+    )
+    assert plan.k_by_rows == ((4, 7), (8, 3))
+    with pytest.raises(ValueError, match="below the per-lane max_num_seqs=9"):
+        _admit(
+            _config(requested_k=7, max_num_seqs=18),
+            model_class=_DraftCapByRowsModel,
+            lane_max_num_seqs=9,
+        )
+
+
+class _RowsPerRequestModel(FakeSpecModel):
+    lanes_per_request = 1
+
+    @classmethod
+    def spec_plan(cls, vllm_config, max_num_seqs, requested_k):
+        del vllm_config, max_num_seqs
+        return SpecPlan(
+            effective_k=requested_k,
+            lanes_per_request=cls.lanes_per_request,
+            extra_bytes_per_seq=0,
+            extra_bytes_per_token=0,
+            accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+            drafter_state="internal",
+        )
+
+
+@pytest.mark.parametrize("lanes_per_request", [1, 8])
+def test_lane_mode_admits_a_block_per_slot_or_a_row_per_candidate(lanes_per_request):
+    model = type(
+        "_Model", (_RowsPerRequestModel,), {"lanes_per_request": lanes_per_request}
+    )
+    plan = _admit(_config(requested_k=7, max_num_seqs=8), model, lane_max_num_seqs=4)
+    assert plan.lanes_per_request == lanes_per_request
+
+
+def test_lane_mode_refuses_a_row_count_its_budget_cannot_read():
+    model = type("_Model", (_RowsPerRequestModel,), {"lanes_per_request": 3})
+    # Outside lane mode the declaration is not budgeted against.
+    assert _admit(_config(requested_k=7, max_num_seqs=8), model) is not None
+    with pytest.raises(ValueError, match="lanes_per_request=3 with effective_k=7"):
+        _admit(_config(requested_k=7, max_num_seqs=8), model, lane_max_num_seqs=4)
 
 
 def test_a_plan_of_the_wrong_type_is_refused():

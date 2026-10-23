@@ -24,7 +24,14 @@ lane decode on a device, which is what the asynchronous lane path relies on:
   token, except at a position where ``position % miss_every == miss_at``,
   where it drafts the wrong token, so acceptance varies along a request.
   ``draft_policy="solo"`` drafts only for a lane holding one request, as
-  MiMo-V2.6-Flash's drafter does.
+  MiMo-V2.6-Flash's drafter did before it drafted for two; ``"lane_load"``
+  drafts by the lane's load as MiMo's does now: the full K for a request
+  alone, one draft each for two, none for three or more.
+- ``lanes_per_request`` and ``k_by_rows`` go into the plan. A verify records
+  ``lane_rows``, each lane's ``sum(1 + num_valid_drafts)`` over its live
+  rows, which is how many decode rows a model laying one candidate token per
+  row (MiMo, ``lanes_per_request == 1 + K``) fills, and so how many passes of
+  its ``per_lane`` rows the verify takes (``passes``).
 
 ``read_decode_output`` hands back host output with no events, so a step
 completes only when the runner resolves its deferred output: exactly where the
@@ -116,6 +123,8 @@ class LaneDeviceTarget:
     # Lanes are ``per_lane`` consecutive rows; set by the harness.
     per_lane = 2
     draft_policy = "always"
+    lanes_per_request = 1
+    k_by_rows: tuple[tuple[int, int], ...] = ()
     miss_every = 5
     miss_at = 2
     # Hold every deferred read until the test releases its handle.
@@ -147,12 +156,13 @@ class LaneDeviceTarget:
         del vllm_config, max_num_seqs
         return SpecPlan(
             effective_k=requested_k,
-            lanes_per_request=1,
+            lanes_per_request=cls.lanes_per_request,
             extra_bytes_per_seq=0,
             extra_bytes_per_token=0,
             accept_modes=cls.accept_modes,
             drafter_state=DRAFTER_STATE_INTERNAL,
             supports_narrow_decode=cls.supports_narrow_decode,
+            k_by_rows=cls.k_by_rows,
         )
 
     # ---- helpers ---------------------------------------------------------
@@ -171,6 +181,24 @@ class LaneDeviceTarget:
     @property
     def plain_steps(self) -> int:
         return sum(1 for call in self.calls if call["spec_mode"] is None)
+
+    @property
+    def verify_calls(self) -> list[dict]:
+        return [call for call in self.calls if call["spec_mode"] is not None]
+
+    def passes(self, call: dict) -> dict[int, int]:
+        """Per lane, the passes of ``per_lane`` rows a packing verify takes."""
+        return {
+            lane: -(-rows // self.per_lane) for lane, rows in call["lane_rows"].items()
+        }
+
+    def _lane_rows(self, start_pos, num_valid) -> dict[int, int]:
+        rows: dict[int, int] = {}
+        for row in range(int(start_pos.shape[0])):
+            if int(start_pos[row, 0]) >= 0:
+                lane = row // self.per_lane
+                rows[lane] = rows.get(lane, 0) + 1 + int(num_valid[row])
+        return rows
 
     @property
     def chained_calls(self) -> list[dict]:
@@ -200,14 +228,20 @@ class LaneDeviceTarget:
         for row in range(rows):
             if not live[row]:
                 continue
-            if self.draft_policy == "solo" and lanes[row // self.per_lane] != 1:
+            load = lanes[row // self.per_lane]
+            if self.draft_policy == "solo" and load != 1:
+                continue
+            count = num_drafts
+            if self.draft_policy == "lane_load":
+                count = {1: num_drafts, 2: 1}.get(load, 0)
+            if not count:
                 continue
             token, pos = int(last[row]), int(position[row])
-            for j in range(num_drafts):
+            for j in range(count):
                 token = drafter_token(token, pos, self.miss_every, self.miss_at)
                 pos += 1
                 drafts[row, j] = token
-            offered[row] = num_drafts
+            offered[row] = count
         return drafts, offered
 
     def _invalidate_chain(self) -> None:
@@ -287,6 +321,7 @@ class LaneDeviceTarget:
         if spec_mode is None:
             self._invalidate_chain()
             return self._plain(tokens, start_pos, kwargs)
+        call["lane_rows"] = self._lane_rows(start_pos, kwargs["num_valid_drafts"])
         if spec_mode not in self.accept_modes:
             raise ValueError(f"LaneDeviceTarget does not serve {spec_mode!r}")
         if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
@@ -405,6 +440,7 @@ class LaneDeviceTarget:
         committed, accepted = self._accept(
             tokens, positions, num_valid, kwargs.get("spec_sampling")
         )
+        call["committed"], call["accepted"] = committed, accepted
         first = positions[:, 0].to(torch.int32)
         self._settle(committed, accepted, first)
         live = [int(first[row]) >= 0 for row in range(rows)]
