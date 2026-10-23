@@ -535,9 +535,10 @@ def accept_speculated_tokens(
     is_greedy = temperature <= 0.0
 
     # Two paths, because the greedy one needs no softmax and no randomness and
-    # a batch is usually entirely one or the other. A mixed batch computes both
-    # and selects per row, which is what upstream's two kernels do by
-    # early-exiting on the row's own flag.
+    # a batch is usually entirely one or the other. A mixed batch selects the
+    # greedy result per row and walks only its random rows on the random path,
+    # whose softmax, top-k/top-p pass and full-vocabulary races a greedy row
+    # never reads.
     accepted = torch.zeros((rows, num_drafts), dtype=torch.bool)
     candidates = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
 
@@ -548,23 +549,33 @@ def accept_speculated_tokens(
         accepted = torch.where(is_greedy.unsqueeze(1), greedy_accepted, accepted)
         candidates = torch.where(is_greedy.unsqueeze(1), greedy_candidates, candidates)
 
-    if bool((~is_greedy).any()):
+    random_rows = (~is_greedy).nonzero().view(-1).tolist()
+    if random_rows:
+
+        def pick(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None or len(random_rows) == rows:
+                return tensor
+            return tensor[random_rows]
+
         random_accepted, random_candidates = _random_walk(
-            target_logits,
-            draft_token_ids,
-            num_valid_drafts,
-            temperature,
-            top_k,
-            top_p,
-            draft_probs,
-            generators,
-            rows,
+            pick(target_logits),
+            pick(draft_token_ids),
+            pick(num_valid_drafts),
+            pick(temperature),
+            pick(top_k),
+            pick(top_p),
+            pick(draft_probs),
+            {
+                index: generators[row]
+                for index, row in enumerate(random_rows)
+                if row in generators
+            },
+            len(random_rows),
             num_drafts,
             vocab,
         )
-        select = (~is_greedy).unsqueeze(1)
-        accepted = torch.where(select, random_accepted, accepted)
-        candidates = torch.where(select, random_candidates, candidates)
+        accepted[random_rows] = random_accepted
+        candidates[random_rows] = random_candidates
 
     accepted_counts = _counts_from_accepted(accepted, num_valid_drafts, num_drafts)
     committed = torch.where(
@@ -685,18 +696,14 @@ def _constrained_probs(
 
     The distribution the accept walk must preserve is the one the operator
     asked for, so the constraints belong before the accept test rather than
-    after it. A mixed batch also computes probabilities for greedy rows using
-    a safe temperature of 1. The caller discards those random-path results and
-    selects the raw-logit argmax results for greedy rows.
+    after it. Every row is a random row: ``accept_speculated_tokens`` keeps
+    greedy rows off this path.
 
     The caller's tensor is not modified: a caller that also wants logprobs
     needs the raw logits afterwards.
     """
     rows, width, vocab = target_logits.shape
-    safe_temperature = torch.where(
-        temperature <= 0.0, torch.ones_like(temperature), temperature
-    )
-    logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
+    logits = target_logits.to(torch.float32) / temperature.view(rows, 1, 1)
 
     if top_k is not None or top_p is not None:
         # Deferred: vllm.v1.sample.ops resolves current_platform at import

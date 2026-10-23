@@ -163,6 +163,37 @@ def test_a_mixed_batch_walks_each_row_by_its_own_temperature():
     assert result.committed_token_ids.tolist() == [[1, 2, 7], [1, 2, 7]]
 
 
+def test_a_mixed_batch_walks_only_its_random_rows_on_the_random_path():
+    """A greedy row takes no part in the random path's draws.
+
+    The random path's softmax, top-k/top-p pass and full-vocabulary races are
+    the costly part of the walk, and a greedy row reads none of them. With the
+    only random row seeded, a draw made for the greedy row could come only from
+    the global stream. The random row still walks with its own generator, so
+    it commits what it commits when walked alone.
+    """
+    logits = torch.randn(2, 3, VOCAB)
+    drafts = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    before = torch.get_rng_state()
+    mixed = accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=drafts,
+        num_valid_drafts=torch.tensor([2, 2], dtype=torch.int32),
+        temperature=torch.tensor([0.0, 1.0]),
+        generators={1: torch.Generator().manual_seed(5)},
+    )
+    assert torch.equal(torch.get_rng_state(), before)
+
+    alone = accept_speculated_tokens(
+        target_logits=logits[1:],
+        draft_token_ids=drafts[1:],
+        num_valid_drafts=torch.tensor([2], dtype=torch.int32),
+        temperature=torch.tensor([1.0]),
+        generators={0: torch.Generator().manual_seed(5)},
+    )
+    assert torch.equal(mixed.committed_token_ids[1], alone.committed_token_ids[0])
+
+
 @pytest.mark.parametrize("temperature_of", [_greedy, _random])
 def test_a_draft_past_a_row_s_count_cannot_commit(temperature_of):
     """Columns past ``num_valid_drafts`` hold no candidate, whatever they hold.
