@@ -2215,9 +2215,13 @@ class TTModelRunner:
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only).
+        # (decode only). Bad words need output_tokens too: vLLM's bad-words op
+        # bans a word's last token only when this history ends with the rest of
+        # the word.
         prompt_tokens = None
         output_tokens = None
+        if input_batch.sampling.bad_words_token_ids and not is_prompt:
+            output_tokens = input_batch.make_output_token_ids_tensor(req_indices)
         if (not input_batch.no_penalties) and not is_prompt:
             # Restrict to this build's requests. For lane builds ``req_indices``
             # selects one lane's rows out of the merged batch; passing them

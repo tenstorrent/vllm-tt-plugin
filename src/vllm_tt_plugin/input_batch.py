@@ -395,8 +395,14 @@ class InputBatch:
             if sampling_params.max_tokens != fitted:
                 sampling_params.max_tokens = fitted
 
-        # Register with batch update builder for logits processors
-        self.sampling.batch_update_builder.added.append(
+        # Register with batch update builder for logits processors. A row
+        # freed earlier in the same step is still in ``removed``, and vLLM's
+        # builtin processors apply ``added`` before ``removed``, so the row must
+        # leave ``removed`` or the new request's per-row state is cleared.
+        builder = self.sampling.batch_update_builder
+        if req_index in builder._removed:
+            builder._removed.remove(req_index)
+        builder.added.append(
             (
                 req_index,
                 sampling_params,
@@ -858,15 +864,6 @@ class TTLaneInputBatch(InputBatch):
             raise ValueError(f"row {row} out of range [0, {self.max_num_reqs})")
         if self._req_ids[row] is not None and self._req_ids[row] != request.req_id:
             raise ValueError(f"row {row} is already occupied")
-        # If this row was freed earlier in the same step it is still in the
-        # logitsproc batch-update ``removed`` list. Drop it so the reused row is
-        # recorded only as an ``added`` update, not both -- mirroring upstream
-        # ``gpu_input_batch._register_add_request``'s ``pop_removed()`` so the
-        # builtin logits processors do not first set then clear the new
-        # request's per-row state.
-        builder = self.sampling.batch_update_builder
-        if row in builder._removed:
-            builder._removed.remove(row)
         super().add_request(request, row)
         return row
 
