@@ -131,7 +131,6 @@ launches without `speculative_config`.
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. On a plan offering `fused_sample`, in lane mode, it also declares the deferred and chained fused verify of section 4j. |
-| `supports_finishing_slots` | `False` | Lane mode under async scheduling: `decode_forward` accepts `finishing_slots`, the slots of requests left out because the step in flight reaches their `max_tokens`: see section 4j. |
 | `supports_prefill_over_pending_spec` | `False` | Lane mode, chaining launch: `prefill_forward` may run while one deferred fused verify is in flight: see section 4j. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
@@ -1263,12 +1262,10 @@ running request out of a step once the step in flight is sure to reach its
 output yet. `TTScheduler` names such requests per lane
 (`request_will_reach_max_tokens`, `get_tt_finishing_req_ids`) and
 `merge_lane_scheduler_outputs` merges them. A chain treats them as finished:
-their lane chains without them. A model declaring `supports_finishing_slots`
-receives `finishing_slots`, a sorted list of their slots, on every lane decode
-step (ordinary or verify) that leaves them out for that reason, which under
-vLLM's two-deep batch queue is one step. The request still holds the slot
-until the scheduler reports it finished, is never scheduled again, and its
-slot's state may be freed at once; a chained verify sends the slot as a gap.
+their lane chains without them. The request still holds its slot until the
+scheduler reports it finished and is never scheduled again; a chained verify
+sends the slot as a gap. The model is not told: it frees a slot's state when
+the request finishes, as for any other request.
 
 **A prefill over the verify in flight.** A prefill step cannot chain, and by
 default it drains the deferred verify before it is built. A model declaring
