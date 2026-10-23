@@ -273,7 +273,7 @@ def test_the_committed_token_is_distributed_as_the_target(with_draft_probs):
 
 
 def test_a_point_mass_drafter_matches_withholding_the_drafter_entirely():
-    """Supplying a point-mass ``draft_probs`` equals supplying none.
+    """Supplying a point-mass ``draft_probs`` matches supplying none.
 
     Both reduce the accept test to ``p >= u`` and the residual to the target
     with the drafted id removed, so a drafter that reports a degenerate
@@ -299,8 +299,22 @@ def test_a_point_mass_drafter_matches_withholding_the_drafter_entirely():
     torch.manual_seed(1)
     without = accept_speculated_tokens(**common, draft_probs=None)
 
-    assert torch.equal(with_mass.accepted_counts, without.accepted_counts)
-    assert torch.equal(with_mass.committed_token_ids, without.committed_token_ids)
+    # The two take different code paths (the general walk and the point-mass
+    # walk that draws over supports), so they agree in distribution, not in
+    # the random stream.
+    def histogram(result, column):
+        ids = result.committed_token_ids[:, column]
+        return torch.bincount(ids[ids >= 0].to(torch.int64), minlength=VOCAB) / trials
+
+    assert torch.allclose(
+        with_mass.accepted_counts.float().mean(),
+        without.accepted_counts.float().mean(),
+        atol=0.02,
+    )
+    for column in (0, 1):
+        assert torch.allclose(
+            histogram(with_mass, column), histogram(without, column), atol=0.02
+        )
 
 
 def test_a_short_row_s_bonus_comes_from_the_target_not_the_residual():

@@ -35,11 +35,14 @@ if TYPE_CHECKING:
 # device argmax followed by a host walk, which is what both existing tt-metal
 # implementations do.
 #
-#   "logits"       returns logits [B, 1+K, V]. The host walks acceptance, so
-#                  this is the only mode that can serve a request needing host
-#                  arbitration: structured output, host logits processors,
-#                  min_p, logit_bias, bad_words, allowed_token_ids, min_tokens
-#                  or logprobs. It pays a [B, 1+K, V] readback.
+#   "logits"       returns logits [B, 1+K, V]. The host rejection-samples
+#                  acceptance, which serves greedy and sampled rows under
+#                  temperature, top-k, top-p and the penalties, and applies
+#                  structured output, the token filters (allowed_token_ids,
+#                  bad_words, min_tokens) and logprobs at every candidate
+#                  column. It is the only mode that serves those controls, so
+#                  a greedy row carrying one also needs it; a launch without
+#                  it refuses them. It pays a [B, 1+K, V] readback.
 #   "argmax_ids"   returns the verify argmax ids [B, 1+K]. The host walks
 #                  acceptance greedily, comparing ids, so no logits cross. This
 #                  mode is greedy only.
@@ -367,8 +370,13 @@ class DraftOutput:
 
     ``draft_scores`` is ``[B, K, q]``, the drafter's top ``q`` scores per
     drafted position, for a drafter that produces them and ``None`` otherwise.
-    An accept rule that needs the drafter distribution reads them; a runner
-    that does not must not require them.
+    No accept walk reads them.
+
+    A ``logits`` verify treats every draft as a point mass at its id. That is
+    lossless for any drafter, deterministic or sampling, whose choice does not
+    read the accept walk's own random draws: the committed token is
+    distributed as the target whatever was drafted. A drafter's real
+    ``[B, K, V]`` distribution would only raise the acceptance rate.
     """
 
     draft_token_ids: "torch.Tensor"
@@ -401,6 +409,13 @@ class VerifyOutput:
     # handed back to propose_draft_tokens uninterpreted. None when the model
     # retains it on device.
     hidden: HiddenHandle = None
+    # A deferred "fused_sample" verify only (``decode_forward(defer_read=True)``):
+    # an opaque handle to a step whose result is still on the device, with an
+    # int ``tip_id`` naming the step. Such a return carries no host tensors;
+    # the runner reads it with ``read_decode_output(handle)``, which returns a
+    # ``FusedReadout``, and later hands the same handle to
+    # ``propose_draft_tokens`` as ``hidden``.
+    handle: Any = None
 
     def __post_init__(self) -> None:
         required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
@@ -409,12 +424,48 @@ class VerifyOutput:
                 f"VerifyOutput.spec_mode {self.spec_mode!r} is not one of "
                 f"{sorted(ACCEPT_MODES)}"
             )
+        if self.handle is not None:
+            if self.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+                raise ValueError(
+                    "VerifyOutput.handle is only defined for spec_mode "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r}, got {self.spec_mode!r}"
+                )
+            if not isinstance(getattr(self.handle, "tip_id", None), int):
+                raise ValueError(
+                    "a deferred fused_sample verify's handle must carry an int "
+                    f"tip_id, got {getattr(self.handle, 'tip_id', None)!r}"
+                )
+            present = [name for name in required if getattr(self, name) is not None]
+            if not present:
+                return
+            if len(present) != len(required):
+                raise ValueError(
+                    "a fused_sample VerifyOutput with a handle carries "
+                    f"{list(required)} together or not at all, got {present}"
+                )
         missing = [name for name in required if getattr(self, name) is None]
         if missing:
             raise ValueError(
                 f"VerifyOutput for spec_mode {self.spec_mode!r} must carry "
                 f"{list(required)}, missing {missing}"
             )
+
+
+@dataclass(frozen=True)
+class FusedReadout:
+    """What ``read_decode_output(handle)`` returns for a deferred fused verify.
+
+    ``accepted_token_ids`` is ``[B, 1+K]`` int32 (``PLACEHOLDER_TOKEN_ID`` past
+    each row's count), ``accepted_counts`` ``[B]`` int32 in ``[1, 1+K]``, and
+    ``p0`` ``[B]`` int32: the position the device actually gave each row's
+    column 0. For a row the step chained (``chain_rows``) that differs from
+    the provisional position the runner sent, which is only an upper bound.
+    All three are host tensors.
+    """
+
+    accepted_token_ids: "torch.Tensor"
+    accepted_counts: "torch.Tensor"
+    p0: "torch.Tensor"
 
 
 def normalize_declared_values(
@@ -603,6 +654,7 @@ __all__ = [
     "SPEC_REQUIREMENT_HIDDEN_FEED",
     "SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE",
     "DraftOutput",
+    "FusedReadout",
     "MODE_REQUIRED_FIELDS",
     "PLACEHOLDER_TOKEN_ID",
     "HiddenHandle",

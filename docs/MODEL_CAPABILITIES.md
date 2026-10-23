@@ -87,7 +87,9 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `supports_device_logprobs` | `True` | Permits device sampling for requests that ask for logprobs. When this declaration is false and any request asks for logprobs (`InputBatch.max_num_logprobs` is not `None`), `TTModelRunner.check_perform_device_sampling` selects host sampling, which computes them from the logits. For a device sampler that returns only tokens. |
 | `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, with async scheduling, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. The [device grammar contract](DEVICE_GRAMMAR_CONTRACT.md) lists what the model must implement. |
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
-| `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
+| `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. On a plan offering `fused_sample` it also declares, in lane mode, the deferred fused verify (`defer_read`, `read_decode_output(handle)` returning a `FusedReadout`) and the verify chained onto it (`chain_rows`, `chain_tip`): section 4j of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
+| `supports_finishing_slots` | `False` | Lane mode under async scheduling. Declares that `decode_forward` accepts `finishing_slots`: the slots of requests a decode step leaves out only because the step in flight is sure to reach their `max_tokens` (vLLM's running-loop skip, which `TTScheduler` reports per lane and `merge_lane_scheduler_outputs` merges). The model may free those slots' state at once; their requests are not scheduled again. Read by `TTLaneInputBatch._finishing_slots`; without it the kwarg is never sent. See section 4j of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
+| `supports_prefill_over_pending_spec` | `False` | Lane mode, on a launch that chains fused verifies. Declares that `prefill_forward` may run while one deferred fused verify is in flight, leaving the state that verify's read and proposal use intact. `TTAsyncDecodeController.prefill_overlap_allowed` then submits an all-prefill step with no resumed or multimodal request without draining the verify first. See section 4j of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
 | `supports_compact_host_logits` | `False` | Permits `process_decode_output_host(..., sample_rows=...)` to return only selected lane-DP host-sampling rows in the supplied order. Active or custom logits processors can require full-slot output instead. |
 | `supports_selective_host_readback` | `False` | Permits `read_decode_output(..., async_read=True, sample_rows=...)` to read only selected lane-DP host-sampling rows. The adapter must also declare `supports_compact_host_logits` and retain an output handle for host processing. |
 
@@ -106,8 +108,11 @@ Device sampling also falls back to the host for supported host-only sampling
 controls, structured output without an eligible `supports_device_grammar`
 decode, and unsupported logprob requests. These runtime
 restrictions remain in force when `supports_sample_on_device=True`. Generic
-speculative request restrictions remain separate from ordinary sampling:
-the current speculative acceptance path requires greedy requests. See
+speculative request restrictions remain separate from ordinary sampling: a
+model whose `spec_plan` offers only `argmax_ids` speculates for greedy
+requests only and refuses logprobs, structured output and token filters on a
+speculating launch, while a model that also offers `logits` speculates for
+sampled requests and applies all of those on the host. See
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
 
 Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
@@ -128,7 +133,7 @@ Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
-| `folds_dp_into_lanes` | `False` | Declares that the model drives every data-parallel replica from one process on one mesh. With `data_parallel_size > 1`, `TTPlatform.check_and_update_config` then runs the launch as in-process TT lanes (`TTLaneCoordinator`) instead of standard multi-process DP: `initialize_vllm_model` receives the whole mesh and `tt_data_parallel` equal to the requested DP size, and `--max_num_seqs` stays the per-lane capacity. Standard DP refuses MoE models, so a MoE model needs this declaration to serve with `data_parallel_size > 1`. The platform rejects a non-boolean value. Lane-DP restrictions apply, including the refusal of speculative decoding and request-specific RoPE. |
+| `folds_dp_into_lanes` | `False` | Declares that the model drives every data-parallel replica from one process on one mesh. With `data_parallel_size > 1`, `TTPlatform.check_and_update_config` then runs the launch as in-process TT lanes (`TTLaneCoordinator`) instead of standard multi-process DP: `initialize_vllm_model` receives the whole mesh and `tt_data_parallel` equal to the requested DP size, and `--max_num_seqs` stays the per-lane capacity. Standard DP refuses MoE models, so a MoE model needs this declaration to serve with `data_parallel_size > 1`. The platform rejects a non-boolean value. Lane-DP restrictions apply: request-specific RoPE is refused, and speculative decoding is admitted only for the model-owned drafter (`custom_class`) with synchronous scheduling. |
 
 The Galaxy generators and GPT-OSS fold into lanes without this declaration,
 through an older identity check. New models declare the capability.
@@ -177,9 +182,10 @@ engine. Admission is not device validation for a particular DP deployment.
 `spec_hidden_handoff` at configuration time. If a model-owned drafter declares
 `hidden_feed` and includes `roundtrip`, the resolved plan comes back without
 `supports_narrow_decode`, so every decode supplies a verify hidden handle. This
-applies even if the model also declares `on_device`. Per-request admission
-then refuses a request with a non-zero temperature or a penalty on that
-launch, because every decode step is a verify.
+applies even if the model also declares `on_device`. Every decode step of
+that launch is a verify, so unless the model also serves `logits`,
+per-request admission refuses a request with a non-zero temperature or a
+penalty.
 
 Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py), and
@@ -199,7 +205,7 @@ speculative admission does not guarantee that state exists yet.
 | `lanes_per_request` | Required | Model decode rows consumed by one speculative request, at least 1. This value does not mean lane-DP lanes. The plugin validates the lower bound but does not enforce a row budget. |
 | `extra_bytes_per_seq` | Required | Nonnegative fixed device bytes per speculative request. The plugin does not reserve or enforce this byte budget. |
 | `extra_bytes_per_token` | Required | Nonnegative device bytes per KV token beyond target KV storage. The plugin does not reserve or enforce this byte budget. |
-| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission currently requires `argmax_ids` among the offered modes because the runner implements greedy acceptance only. |
+| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission requires `argmax_ids` or `logits` among the offered modes. `fused_sample` (acceptance on the device with runner-drawn uniforms) replaces `logits` on a synchronous step whose live rows are greedy or sample with only temperature, top-k and top-p inside `max_device_top_k` and `supports_device_top_p_without_top_k`, and with no seeded row lacking drafts; see section 4i of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). With both offered, the runner asks for `logits` on a step with at least one live row that `TTModelRunner._request_is_argmax_certifiable` rejects: a non-zero temperature, a penalty, logprobs (including `logprobs=0`), structured output, `allowed_token_ids`, `bad_words`, or a `min_tokens` the output has not reached yet. Otherwise it asks for `argmax_ids`. Without `logits`, `TTPlatform.validate_request` refuses logprobs, structured output, `allowed_token_ids`, `bad_words`, and `min_tokens` on a speculative launch. See section 4h of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
 | `drafter_state` | Required | One of `internal`, `paged`, or `shared_with_target`. Admission rejects `paged` because the plugin has no scheduler-owned drafter-cache allocation. |
 | `drafter_target_cache_requires` | `()` | Sequence using `named_layer_caches` and `absolute_positions`. `SpecPlan` rejects strings, unknown names, duplicates, and a nonempty sequence unless `drafter_state="shared_with_target"`. The plugin does not verify that the target cache satisfies these requirements. |
 | `supports_narrow_decode` | `False` | Declares ordinary `[B, 1]` decode support alongside wide `[B, 1+K]` verification. The runner uses this permission for draftless steps when the drafter's hidden-state requirements allow narrow decode. This value is a `SpecPlan` field, not a `model_capabilities` key. |

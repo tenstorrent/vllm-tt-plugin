@@ -88,6 +88,7 @@ request-specific RoPE.
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
 | `prompt_tokens`, `output_tokens` | Supplied together when device sampling needs token history for penalties. Histories use `-1` padding. |
+| `finishing_slots` | Lane mode, a model declaring `supports_finishing_slots` only: slots of requests left out because the step in flight reaches their `max_tokens`. See [the speculative contract](SPEC_DECODE_CONTRACT.md), section 4j. |
 
 The [decode reload contract](DECODE_RELOAD_CONTRACT.md) specifies
 `decode_input_update_contract`, `reload_inputs`, `reload_page_table`,
@@ -96,9 +97,11 @@ The [decode reload contract](DECODE_RELOAD_CONTRACT.md) specifies
 commands even when host token tensors lag resident device state.
 
 The [speculative contract](SPEC_DECODE_CONTRACT.md) defines wide verification
-inputs, `num_valid_drafts`, `accepted_counts`, `spec_mode`, `VerifyOutput`, and
-`propose_draft_tokens`. An ordinary decode receives no `spec_mode` and must
-not return `VerifyOutput`.
+inputs, `num_valid_drafts`, `accepted_counts`, `spec_mode`, `spec_sampling`,
+`VerifyOutput`, and `propose_draft_tokens`, and for chained lane verifies
+`defer_read`, `chain_rows`, `chain_tip` and `read_decode_output(handle)`
+(section 4j). An ordinary decode receives no `spec_mode` and must not return
+`VerifyOutput`.
 
 ### Stage outputs
 
@@ -304,7 +307,9 @@ class MyLaneModel:
         return concat(outs)  # [L * per_lane, 1, V] in slot order
 ```
 
-Lane-DP rejects request-specific RoPE and speculative decode. Lane-DP output
+Lane-DP rejects request-specific RoPE. It speculates only through the
+model-owned drafter (`custom_class`) with synchronous scheduling; see the
+[speculative decoding contract](SPEC_DECODE_CONTRACT.md#status). Lane-DP output
 handling is in
 [Decode readback and output conversion](#decode-readback-and-output-conversion).
 

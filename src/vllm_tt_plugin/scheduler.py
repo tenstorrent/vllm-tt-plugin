@@ -13,6 +13,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
@@ -41,6 +42,21 @@ logger = init_tt_logger(__name__)
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
 _TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
+# Per request, how many real drafts the runner verified on a step, attached to
+# that step's ModelRunnerOutput (``set_tt_verified_drafts``). Under async
+# scheduling the scheduler offers placeholders, not drafts, so this is the only
+# record of what a verify carried; ``TTScheduler.update_from_output`` reads it.
+_TT_VERIFIED_DRAFTS_ATTR = "_tt_verified_drafts"
+
+
+def set_tt_verified_drafts(
+    runner_output: ModelRunnerOutput, verified: dict[str, int]
+) -> None:
+    setattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, dict(verified))
+
+
+def get_tt_verified_drafts(runner_output: ModelRunnerOutput) -> dict[str, int]:
+    return dict(getattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, {}))
 
 
 def set_tt_forced_reset_discard_counts(
@@ -88,6 +104,32 @@ def get_tt_block_step_decisions(
 # The lane coordinator's per-step state; see ``lane_scheduler.py``.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
 
+# Requests a decode step left out only because the step in flight is sure to
+# reach their ``max_tokens`` (``request_will_reach_max_tokens``).
+_TT_FINISHING_REQ_IDS_ATTR = "_tt_finishing_req_ids"
+
+
+def get_tt_finishing_req_ids(scheduler_output: SchedulerOutput) -> tuple[str, ...]:
+    return tuple(getattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, ()))
+
+
+def request_will_reach_max_tokens(request: Request) -> bool:
+    """vLLM 0.30's running-loop skip condition, verbatim.
+
+    ``Scheduler.schedule`` (vllm/v1/core/sched/scheduler.py, the first check of
+    the RUNNING loop): an async step is in flight
+    (``num_output_placeholders > 0``) and, even if every draft it carries is
+    rejected, it commits the request's last allowed token. The base loop then
+    does not schedule the request again, although the scheduler has not seen
+    that output yet and the request is still running.
+    """
+    return (
+        request.num_output_placeholders > 0
+        and request.num_computed_tokens + 2 - request.num_output_placeholders
+        >= request.num_prompt_tokens + request.max_tokens
+    )
+
+
 # Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
 # Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
 # carries them over with ``carry_tt_scheduler_output_fields``.
@@ -96,6 +138,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
     _TT_STEP_STATE_ATTR,
+    _TT_FINISHING_REQ_IDS_ATTR,
 )
 
 
@@ -347,11 +390,19 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # Set by TTLaneCoordinator on its lanes. A lane runs with log_stats off
+        # (the coordinator owns the stats), so the base scheduler would drop its
+        # drafts; the lane observes them here and the coordinator drains them.
+        self.collect_spec_decoding_stats = False
+        self.pending_spec_decoding_stats: SpecDecodingStats | None = None
         # Request id that owns the adaptive model's SINGLE speculative
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
+        # Running requests the base loop is about to skip because the step in
+        # flight reaches their max_tokens; read at each schedule().
+        self._finishing_candidates: list[str] = []
         self._widest_decode_batch_size = 0
         self._prefill_chunk_alignment = (
             get_tt_prefill_chunk_alignment(self.vllm_config)
@@ -802,6 +853,15 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
+        # Read on the state the base running loop is about to see: the skip is
+        # a pure function of request state, and the loop advances the
+        # computed-token counts of the requests it schedules.
+        self._finishing_candidates = [
+            request.request_id
+            for request in self.running
+            if getattr(request, "num_output_placeholders", 0) > 0
+            and request_will_reach_max_tokens(request)
+        ]
         has_pending_prefill = self._has_pending_prefill()
         # A partial prefill occupies ``running`` but cannot produce a decode
         # token, so it must not make the decode fallback below look viable.
@@ -882,6 +942,7 @@ class TTScheduler(AsyncScheduler):
                     "TT scheduler: widest decode batch reached %d request row(s)",
                     rows,
                 )
+            self._record_finishing_requests(scheduler_output)
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -889,6 +950,36 @@ class TTScheduler(AsyncScheduler):
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
         return scheduler_output
+
+    def _record_finishing_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Name the requests this decode step left out because they finish.
+
+        A candidate (``request_will_reach_max_tokens`` before the schedule)
+        counts only if the step really left it out and it is still running:
+        not preempted or finished by this very schedule, since a preempted
+        request resumes and is scheduled again. ``TTModelRunner`` reads the
+        result (``get_tt_finishing_req_ids``) for a model declaring
+        ``supports_finishing_slots``.
+        """
+        candidates = getattr(self, "_finishing_candidates", ())
+        self._finishing_candidates = []
+        if not candidates:
+            return
+        gone = set(scheduler_output.preempted_req_ids or ()) | set(
+            scheduler_output.finished_req_ids
+        )
+        finishing = tuple(
+            req_id
+            for req_id in candidates
+            if req_id not in scheduler_output.num_scheduled_tokens
+            and req_id not in gone
+            and req_id in self.requests
+            and self.requests[req_id].status == RequestStatus.RUNNING
+        )
+        if finishing:
+            set_tt_scheduler_output_field(
+                scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, finishing
+            )
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.
@@ -1196,6 +1287,8 @@ class TTScheduler(AsyncScheduler):
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
             )
+        if self.num_spec_tokens and self.scheduler_config.async_scheduling:
+            self._mark_unverified_drafts_invalid(scheduler_output, model_runner_output)
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
@@ -1216,6 +1309,70 @@ class TTScheduler(AsyncScheduler):
                 pending.pop(req_id, None)
             else:
                 pending[req_id] = count - 1
+
+    def _mark_unverified_drafts_invalid(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Keep vLLM's speculative metrics from counting unverified placeholders.
+
+        ``AsyncScheduler`` offers ``[-1] * K`` to every scheduled decode, and
+        vLLM's update counts the offer as drafted and everything past the
+        accepted ones as rejected (``make_spec_decoding_stats``), so an ordinary
+        decode or a verify of fewer real drafts would read as rejections. The
+        runner reports each row's real draft count on the output
+        (``set_tt_verified_drafts``); a request it did not report verified
+        none. The excess goes to ``num_invalid_spec_tokens``, which vLLM
+        subtracts from the drafted count and nothing else reads: the rollback
+        of ``num_computed_tokens`` still counts the whole reservation.
+        """
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        if not offered:
+            return
+        verified = get_tt_verified_drafts(model_runner_output)
+        invalid = dict(scheduler_output.num_invalid_spec_tokens or {})
+        for req_id, tokens in offered.items():
+            unverified = len(tokens) - min(len(tokens), verified.get(req_id, 0))
+            if unverified > invalid.get(req_id, 0):
+                invalid[req_id] = unverified
+        scheduler_output.num_invalid_spec_tokens = invalid or None
+
+    def make_spec_decoding_stats(
+        self,
+        spec_decoding_stats: SpecDecodingStats | None,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        num_invalid_spec_tokens: dict[str, int] | None,
+        request_id: str,
+    ) -> SpecDecodingStats | None:
+        """Observe a step that verified at least one draft; on a lane, into
+        ``pending_spec_decoding_stats`` for the coordinator.
+
+        A step whose offer was all invalid verified nothing, and is not a draft:
+        the base scheduler would count it in ``num_drafts`` with zero tokens.
+        """
+        if num_invalid_spec_tokens:
+            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+        if num_draft_tokens <= 0:
+            return spec_decoding_stats
+        if not self.collect_spec_decoding_stats:
+            return super().make_spec_decoding_stats(
+                spec_decoding_stats,
+                num_draft_tokens,
+                num_accepted_tokens,
+                None,
+                request_id,
+            )
+        if self.pending_spec_decoding_stats is None:
+            self.pending_spec_decoding_stats = SpecDecodingStats.new(
+                self.num_spec_tokens
+            )
+        self.pending_spec_decoding_stats.observe_draft(
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+        )
+        return None
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False

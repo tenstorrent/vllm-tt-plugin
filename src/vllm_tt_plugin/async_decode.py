@@ -13,21 +13,31 @@ import torch
 import ttnn
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
 
-from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
+from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL, TTLaneInputBatch
+from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_finishing_req_ids,
+    get_tt_forced_reset_discard_counts,
+    set_tt_verified_drafts,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
+    ACCEPT_MODE_LOGITS,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
+    FusedReadout,
     VerifyOutput,
 )
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 
-def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
+def _verify_output_tensor(
+    tt_out: Any, model_name: str, spec_mode: str
+) -> torch.Tensor | VerifyOutput:
     """The one tensor a verify's mode returns, unwrapped from ``VerifyOutput``.
 
     A step that sent ``spec_mode`` asked the model to verify a candidate
@@ -39,10 +49,16 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
     token per row, so the run commits one token per step for its whole life
     and reports nothing. Refused by type here, where the answer arrives.
 
-    Only ``argmax_ids`` is driven today, so a model that answers in another
-    mode is refused by name rather than having its tensor read as ids.
-    ``VerifyOutput`` has already checked that the field its mode declares is
-    present.
+    The answer must be in the mode that was asked for. A model that answers in
+    another one is refused by name rather than having its tensor read as the
+    requested mode's: ``[B, 1+K, V]`` logits read as ids would commit
+    vocabulary indices of float rows, and ``[B, 1+K]`` ids read as logits
+    would be sampled over a block-width vocabulary. ``VerifyOutput`` has
+    already checked that the field its mode declares is present.
+
+    ``fused_sample`` returns two fields, the committed ids and their counts,
+    which only mean something together, so its ``VerifyOutput`` is returned
+    whole.
     """
     if not isinstance(tt_out, VerifyOutput):
         raise TypeError(
@@ -52,19 +68,28 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
             "vllm_tt_plugin.spec_decode, so a model whose decode_forward "
             "serves no verify must not declare supports_spec_decode"
         )
-    if tt_out.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
+    if tt_out.spec_mode != spec_mode:
         raise NotImplementedError(
-            f"TT decode asked for spec_mode {ACCEPT_MODE_ARGMAX_IDS!r} and the "
-            f"model answered in {tt_out.spec_mode!r}, which carries "
-            f"{list(MODE_REQUIRED_FIELDS[tt_out.spec_mode])}; the runner drives "
-            "no accept walk for that mode yet"
+            f"TT decode asked for spec_mode {spec_mode!r} and the model "
+            f"answered in {tt_out.spec_mode!r}, which carries "
+            f"{list(MODE_REQUIRED_FIELDS[tt_out.spec_mode])}; a verify answers "
+            "in the mode it was asked for"
         )
-    return tt_out.argmax_ids
+    if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+        return tt_out.argmax_ids
+    if spec_mode == ACCEPT_MODE_LOGITS:
+        return tt_out.logits
+    if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+        return tt_out
+    raise NotImplementedError(
+        f"the runner drives no accept walk for spec_mode {spec_mode!r}"
+    )
 
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
     from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTModelInput
     from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -103,8 +128,27 @@ class TTDecodeSubmission:
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor | TTCompactedHostLogits
+    tt_out: torch.Tensor | TTCompactedHostLogits | VerifyOutput
     tt_log_probs: torch.Tensor | None
+    # A deferred fused verify only: the position the device gave each row's
+    # column 0 (``FusedReadout.p0``). None for every other step.
+    p0: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class ChainPlan:
+    """How the lane step about to be built chains onto the fused verify in flight.
+
+    ``tip`` is that verify's ``tip_id``. ``hints`` maps each chained slot to
+    the drafts its block carries, and ``positions`` to the provisional
+    position of its column 0: the row's applied length plus ``1+K`` for the
+    verify in flight, minus one, an upper bound of the position the device
+    gives it.
+    """
+
+    tip: int
+    hints: dict[int, int]
+    positions: dict[int, int]
 
 
 def _is_host_decode_output(tt_out: Any) -> bool:
@@ -113,6 +157,13 @@ def _is_host_decode_output(tt_out: Any) -> bool:
     if isinstance(tt_out, tuple):
         return all(
             tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        )
+    if isinstance(tt_out, VerifyOutput):
+        # A fused_sample verify reaches the walk whole; it is host output when
+        # the fields its mode carries already are.
+        return all(
+            isinstance(getattr(tt_out, name), torch.Tensor)
+            for name in MODE_REQUIRED_FIELDS[tt_out.spec_mode]
         )
     return False
 
@@ -144,6 +195,10 @@ class CompletedDecodeStep:
     # next proposal at their commit: the drafter is called with this step's own
     # rows and positions, and the commit runs a step later than the build.
     model_input: TTModelInput | None = None
+    # Lane-DP only: the slots ``sampled_token_ids`` was read from, in its row
+    # order. The drafter's rows are the slot grid, so a lane step's proposal
+    # puts each token back at its slot.
+    scheduled_rows: list[int] | None = None
 
 
 @dataclass
@@ -168,12 +223,21 @@ class CompletedSpecDecodeStep:
 
     committed: torch.Tensor
     counts: torch.Tensor
+    # The published rows' requests and accepted prefixes, in output order: the
+    # verify's rows front-packed, the scheduled slots in lane mode.
+    published_req_ids: list[str]
     prefixes: list[list[int]]
     model_input: TTModelInput
     spec_hidden: Any | None
     context: SubmittedStepContext
     completion_time_ns: int
     runner_output: ModelRunnerOutput | None = None
+    # The published prefixes' logprobs, when the step's rows asked for them.
+    logprobs: LogprobsLists | None = None
+    # A deferred fused verify only: each row's device-reported column-0
+    # position, which the commit and the proposal use instead of the
+    # submitted, provisional one.
+    p0: torch.Tensor | None = None
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
@@ -297,6 +361,9 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
 
     It never mutates runner state. The walk reads only this step's own tensors,
     and the commit waits in the completed queue for the engine thread.
+
+    ``scheduled_rows`` marks a lane-DP verify: the walk runs over the whole slot
+    grid and only the scheduled slots are published, in slot order.
     """
 
     def __init__(
@@ -306,24 +373,38 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         model_input: TTModelInput,
         completion_event: threading.Event,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ):
         self._controller = controller
         self._submission = submission
         self._model_input = model_input
         self._completion_event = completion_event
         self._context = context
+        self._scheduled_rows = scheduled_rows
         self._init_deferred()
 
-    def set_grammar_bitmask(self, bitmask: torch.Tensor) -> None:
-        """Refused: a grammar needs the logits a verify in this mode never returns.
+    def set_grammar_bitmask(
+        self, bitmask: torch.Tensor, *, num_valid_drafts: torch.Tensor
+    ) -> None:
+        """Attach the per-column bitmask and the drafts it can constrain.
 
-        Reachable only through a launch admission should have refused, so it
-        raises rather than dropping the mask and serving ungrammatical text.
+        ``bitmask`` is ``[rows, 1+K, W]``. ``num_valid_drafts`` is the
+        submitted count with every structured row whose drafts the bitmask was
+        not computed from set to 0, which
+        ``TTModelRunner._grammar_validated_drafts`` decides; the walk reads
+        both off ``model_input``. Only an ``argmax_ids`` verify has no use for
+        a grammar, and no structured row reaches one.
         """
-        raise NotImplementedError(
-            "structured output and speculative decoding cannot be combined on "
-            "this path: acceptance compares token ids and never sees the "
-            "logits a grammar bitmask applies to"
+        if self._model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+            raise RuntimeError(
+                "a grammar bitmask reached an argmax_ids verify, whose ids "
+                "cannot be masked; a structured-output row makes its verify "
+                "ask for logits"
+            )
+        self._model_input = replace(
+            self._model_input,
+            grammar_bitmask=[bitmask],
+            num_valid_drafts=num_valid_drafts,
         )
 
     def _get_output_impl(self) -> ModelRunnerOutput:
@@ -331,9 +412,21 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
             submission=self._submission,
             model_input=self._model_input,
             context=self._context,
+            scheduled_rows=self._scheduled_rows,
         )
         runner_output = self._controller.runner.build_spec_runner_output(
-            self._model_input.row_req_ids, completed.prefixes
+            completed.published_req_ids, completed.prefixes, completed.logprobs
+        )
+        # What the verify really carried, per request, for vLLM's speculative
+        # metrics: the scheduler only ever offered placeholders.
+        valid = self._model_input.num_valid_drafts
+        set_tt_verified_drafts(
+            runner_output,
+            {
+                req_id: int(valid[row])
+                for row, req_id in enumerate(self._model_input.row_req_ids)
+                if req_id is not None
+            },
         )
         completed.runner_output = runner_output
         self._controller.enqueue_completed_decode_step(completed)
@@ -365,6 +458,32 @@ class TTAsyncDecodeController:
         # count the scheduler's lookahead reservation rather than a verify.
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
+        # The verifies among those that asked for logits, which is the one
+        # observable that says a launch serving both modes chose per step, and
+        # those that asked for acceptance on the device.
+        self._logits_verify_submissions = 0
+        self._fused_verify_submissions = 0
+        # Chained lane verifies (``chain_enabled``). The newest fused verify
+        # submitted with a deferred handle, its input and its tip: the only
+        # step a following verify may chain onto. Cleared by any later step
+        # that cannot be chained onto.
+        self._last_fused_step: DeferredDecodeOutput | None = None
+        self._last_fused_input: TTModelInput | None = None
+        self._last_fused_tip: int | None = None
+        # Tips of fused verifies whose drafts a chained verify already took on
+        # the device: their commit publishes no proposal.
+        self._consumed_tips: set[int] = set()
+        # Verifies submitted chained, and the chains a step refused by reason.
+        # A refusal is counted when the next fused verify is submitted, so a
+        # refusal that did not cost a chained verify is not counted.
+        self._chained_submissions = 0
+        self._chain_breaks: Counter[str] = Counter()
+        self._pending_break_reason: str | None = None
+        # Prefill steps submitted over a deferred fused verify in flight
+        # (``prefill_overlap_allowed``), and the verify the last one overtook:
+        # its rows were built before that prefill, so nothing chains onto it.
+        self._prefill_overlap_steps = 0
+        self._prefill_overlapped_step: DeferredDecodeOutput | None = None
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -640,6 +759,315 @@ class TTAsyncDecodeController:
             return True
         return self.plan_decode_reload(model_input).overlap_safe
 
+    # region Chained lane verifies
+
+    def chain_enabled(self) -> bool:
+        """Whether a lane fused verify may be submitted over the one in flight.
+
+        Lane mode under asynchronous scheduling, on a speculating launch whose
+        model declares ``supports_async_spec_decode`` and offers
+        ``fused_sample``: such a model accepts ``defer_read``, ``chain_rows``
+        and ``chain_tip`` (SPEC_DECODE_CONTRACT.md section 4j). Every fused
+        verify is then submitted deferred, chained or not, so that the next
+        one can chain onto it.
+        """
+        runner = self.runner
+        if not getattr(runner, "async_decode_scheduling", False):
+            return False
+        if not getattr(runner, "_num_speculative_tokens", 0):
+            return False
+        if not isinstance(runner.input_batch, TTLaneInputBatch):
+            return False
+        capabilities = getattr(runner.model, "model_capabilities", None) or {}
+        if not capabilities.get("supports_async_spec_decode", False):
+            return False
+        return ACCEPT_MODE_FUSED_SAMPLE in getattr(runner, "_spec_accept_modes", ())
+
+    def _chain_candidate_pending(self) -> bool:
+        """Whether the newest deferred fused verify is still in flight."""
+        step = self._last_fused_step
+        if step is None or step.is_resolved():
+            return False
+        with self.runner._steady_decode_lock:
+            return step in self.runner._pending_async_steps
+
+    def _forget_fused_step(self) -> None:
+        self._last_fused_step = None
+        self._last_fused_input = None
+        self._last_fused_tip = None
+
+    def chain_evaluate(
+        self, scheduler_output: SchedulerOutput | None
+    ) -> tuple[str | None, ChainPlan | None]:
+        """Decide whether the lane step about to be built chains onto step n.
+
+        ``(None, plan)`` when it does, else ``(reason, None)``. It does when
+        exactly one step is unresolved and it is the newest deferred fused
+        verify; the step is an all-decode step with no forced reset,
+        preemption or pending grammar; and every lane it schedules chains
+        (``_lane_chain_blockers``). Lanes decide separately, and for now one
+        lane that cannot chain keeps the whole step from chaining.
+
+        Asked twice per step on the same scheduler output, before the lifecycle
+        update (whether to drain) and at the build, and both must agree; the
+        second only has fewer completed steps left to apply, which can only
+        relax the room check.
+        """
+        if not self.chain_enabled():
+            return "disabled", None
+        if scheduler_output is None:
+            return "no_scheduler_output", None
+        runner = self.runner
+        with runner._steady_decode_lock:
+            unresolved = [
+                step for step in runner._pending_async_steps if not step.is_resolved()
+            ]
+            completed = len(runner._completed_decode_steps)
+        if not unresolved:
+            return "no_pending", None
+        if len(unresolved) > 1:
+            return "multi_pending", None
+        if unresolved[0] is not self._last_fused_step:
+            return "pending_not_fused", None
+        if get_tt_forced_reset_discard_counts(scheduler_output):
+            return "forced_reset", None
+        if self.scheduler_output_has_prefill_work(scheduler_output):
+            return "prefill", None
+        if unresolved[0] is self._prefill_overlapped_step:
+            return "prefill_overlap", None
+        if scheduler_output.preempted_req_ids:
+            return "preempted", None
+        if scheduler_output.pending_structured_output_tokens:
+            return "grammar", None
+        plan = get_tt_step_plan(scheduler_output)
+        if plan is None or not plan.is_decode:
+            return "prefill", None
+        if not plan.scheduled_rows:
+            return "idle", None
+        if (
+            runner.input_batch.sampling.has_active_logitsprocs()
+            or runner.model_config.logits_processors
+        ):
+            return "logitsprocs", None
+        reasons, chain = self._lane_chain_blockers(
+            scheduler_output, plan, inflight=len(unresolved) + completed
+        )
+        for lane in sorted(reasons):
+            if reasons[lane] is not None:
+                return reasons[lane], None
+        return None, chain
+
+    def _lane_chain_blockers(
+        self,
+        scheduler_output: SchedulerOutput,
+        plan: TTStepPlan,
+        *,
+        inflight: int,
+    ) -> tuple[dict[int, str | None], ChainPlan]:
+        """Each scheduled lane's reason not to chain (None: it chains), and the plan.
+
+        A lane chains when its layout is unchanged since step n (the same
+        requests at the same slots, with nothing joined, preempted or otherwise
+        left out; a lane whose only request finished, or is left out because
+        it finishes at ``max_tokens``, has nothing to chain and does not hold
+        the others back, but a lane that also held a request now gone does not
+        chain: its drafter may have drafted nothing for a lane of several) and
+        every one of its requests:
+
+        - is ``fused_sample``-servable (``_request_is_fused_servable``: no
+          penalties, logprobs, grammar, allowlist, bad words or pending
+          ``min_tokens``, sampling inside the device sampler's bounds);
+        - verified the full draft count in step n, which is the count the
+          device's drafter left it, and is offered that many placeholders now:
+          the device verifies exactly ``hints[slot]`` drafts, and a seeded row's
+          uniforms are drawn for that many;
+        - stays ``2 * (1+K)`` positions under ``max_model_len`` from its
+          optimistic length (applied length plus ``1+K`` per step not yet
+          applied), so neither step can be cut by the length cap.
+        """
+        runner = self.runner
+        batch = runner.lane_batch
+        per_lane = batch.per_lane
+        pending = self._last_fused_input
+        num_drafts = int(runner._num_speculative_tokens)
+        width = num_drafts + 1
+        max_model_len = int(runner.model_config.max_model_len)
+        # A request left out because the step in flight reaches its max_tokens
+        # is as good as finished: it is not scheduled again.
+        gone = set(scheduler_output.finished_req_ids) | set(
+            get_tt_finishing_req_ids(scheduler_output)
+        )
+        pending_rows = {
+            row: req_id
+            for row, req_id in enumerate(pending.row_req_ids)
+            if req_id is not None and req_id not in gone
+        }
+        # Lanes whose step n also held a request that is gone now: step n ran
+        # that lane with several requests, and a drafter may draft only for a
+        # lane that held one (MiMo's), so the survivors' drafts may not exist.
+        shared_lanes = {
+            row // per_lane
+            for row, req_id in enumerate(pending.row_req_ids)
+            if req_id is not None and req_id in gone
+        }
+        scheduled = dict(zip(plan.scheduled_rows, plan.scheduled_req_ids, strict=True))
+        spec_plan = getattr(runner, "_spec_plan", None)
+        full = (
+            num_drafts
+            if spec_plan is None
+            else min(num_drafts, spec_plan.draft_cap(len(scheduled)))
+        )
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        reasons: dict[int, str | None] = {}
+        hints: dict[int, int] = {}
+        positions: dict[int, int] = {}
+        for lane in sorted({row // per_lane for row in (*pending_rows, *scheduled)}):
+            lane_pending = {
+                row: req_id
+                for row, req_id in pending_rows.items()
+                if row // per_lane == lane
+            }
+            lane_scheduled = {
+                row: req_id
+                for row, req_id in scheduled.items()
+                if row // per_lane == lane
+            }
+            if lane_scheduled != lane_pending or (
+                lane_scheduled and lane in shared_lanes
+            ):
+                reasons[lane] = "layout"
+                continue
+            reason = None
+            for row, req_id in lane_scheduled.items():
+                tokens = list(offered.get(req_id) or ())
+                hint = min(len(tokens), full)
+                length = int(batch.num_tokens[row]) + width * inflight
+                if req_id not in runner.requests:
+                    reason = "layout"
+                elif not runner._request_is_fused_servable(req_id):
+                    reason = "not_fused"
+                elif any(token != PLACEHOLDER_TOKEN_ID for token in tokens):
+                    reason = "real_drafts"
+                elif hint < 1 or int(pending.num_valid_drafts[row]) != hint:
+                    reason = "draft_count"
+                elif length - 1 + 2 * width > max_model_len:
+                    reason = "max_len"
+                if reason is not None:
+                    break
+                hints[row] = hint
+                positions[row] = length - 1
+            reasons[lane] = reason
+        return reasons, ChainPlan(
+            tip=int(self._last_fused_tip or 0), hints=hints, positions=positions
+        )
+
+    def chain_blocker(self, scheduler_output: SchedulerOutput | None) -> str | None:
+        """The reason the next step cannot chain, or None when it can."""
+        return self.chain_evaluate(scheduler_output)[0]
+
+    def prefill_overlap_allowed(self, scheduler_output: SchedulerOutput) -> bool:
+        """Whether a prefill step may be submitted over the fused verify in flight.
+
+        Asked once the chain blocker has answered ``"prefill"``. The model
+        must declare ``supports_prefill_over_pending_spec``, and the step must
+        be all prefill with no resumed request and no multimodal input. A
+        resumed request still drains: ``apply_ready_completed_decode_steps``
+        orders the completed steps oldest first for the forced-reset discard
+        counts, and the prefill's own output would be queued ahead of the
+        verify's.
+        """
+        runner = self.runner
+        capabilities = getattr(runner.model, "model_capabilities", None) or {}
+        if not capabilities.get("supports_prefill_over_pending_spec", False):
+            return False
+        plan = get_tt_step_plan(scheduler_output)
+        if plan is None or plan.is_decode:
+            return False
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        if cached_reqs.resumed_req_ids:
+            return False
+        if not all(
+            cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids
+        ):
+            return False
+        if any(new_req.mm_features for new_req in scheduler_output.scheduled_new_reqs):
+            return False
+        return not any(
+            getattr(runner.requests.get(req_id), "mm_features", None)
+            for req_id in cached_reqs.req_ids
+        )
+
+    def chain_plan_for_build(
+        self, scheduler_output: SchedulerOutput
+    ) -> ChainPlan | None:
+        """The ``ChainPlan`` this lane decode build chains with, or None.
+
+        Asked by the lane builder after the lifecycle update and the apply, on
+        the same scheduler output the drain decision read. A verify still in
+        flight at this point must be chained onto: building host-staged over
+        it would start every row one step behind, so a disagreement raises.
+        When the verify the decision saw in flight has resolved since, its
+        commit is applied first and the step builds from host state.
+        """
+        reason, plan = self.chain_evaluate(scheduler_output)
+        if reason == "no_pending":
+            self.apply_resolved_before_build(scheduler_output)
+        if plan is None and self._chain_candidate_pending():
+            raise RuntimeError(
+                "a lane step is about to be built from host state while the "
+                f"fused verify tip {self._last_fused_tip} is still in flight, "
+                f"and it cannot chain onto it ({reason}); the drain decision "
+                "on the same scheduler output should have drained it"
+            )
+        return plan
+
+    def apply_resolved_before_build(self, scheduler_output: SchedulerOutput) -> None:
+        """Apply what resolved after the pre-build apply, before a host build."""
+        with self.runner._steady_decode_lock:
+            queued = bool(self.runner._completed_decode_steps)
+        if queued:
+            self.apply_ready_completed_decode_steps(
+                suppress_output_req_ids=self.suppressed_output_req_ids(
+                    scheduler_output
+                ),
+                forced_reset_discard_counts=get_tt_forced_reset_discard_counts(
+                    scheduler_output
+                ),
+            )
+
+    def _note_break(self, reason: str | None) -> None:
+        """Remember why a chain was refused; counted at the next fused verify."""
+        if reason not in (None, "disabled", "no_pending", "no_scheduler_output"):
+            self._pending_break_reason = reason
+
+    def take_consumed_tip(self, hidden: Any) -> bool:
+        """Whether a chained verify took this fused verify's drafts on the device.
+
+        Asked once, at the step's commit: its proposal is then the device's to
+        keep, and nothing is published for it.
+        """
+        tip = getattr(hidden, "tip_id", None)
+        if tip is None or tip not in self._consumed_tips:
+            return False
+        self._consumed_tips.discard(tip)
+        return True
+
+    def _chain_report(self) -> str:
+        """The chain counters for the submission line, empty with chaining off."""
+        if not self.chain_enabled():
+            return ""
+        breaks = ", ".join(
+            f"{reason}={count}" for reason, count in sorted(self._chain_breaks.items())
+        )
+        return (
+            f"; {self._chained_submissions} verify chained, "
+            f"{sum(self._chain_breaks.values())} chain refused"
+            + (f" ({breaks})" if breaks else "")
+            + f", {self._prefill_overlap_steps} prefill over a verify in flight"
+        )
+
+    # endregion
+
     def enqueue_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
         with self.runner._steady_decode_lock:
             self.runner._completed_decode_steps.append(completed)
@@ -703,14 +1131,24 @@ class TTAsyncDecodeController:
             self._ordinary_decode_submissions += 1
         else:
             self._verify_submissions += 1
+            if model_input.spec_mode == ACCEPT_MODE_LOGITS:
+                self._logits_verify_submissions += 1
+            elif model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+                self._fused_verify_submissions += 1
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
+            # Parsed by tests/tt/spec/bench_spec_overhead.py and
+            # tests/tt/spec/test_sampled_speculation.py; keep them in step.
             logger.info(
                 "TT submissions: %d ordinary decode, %d verify, "
-                "%d overlapped an outstanding step",
+                "%d overlapped an outstanding step, %d verify in logits mode, "
+                "%d verify in fused_sample mode%s",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
+                self._logits_verify_submissions,
+                self._fused_verify_submissions,
+                self._chain_report(),
             )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
@@ -861,6 +1299,22 @@ class TTAsyncDecodeController:
                 scheduler_output
             ),
         )
+        if self._chain_candidate_pending():
+            # The drain decision was taken before the lifecycle update and the
+            # apply; with a fused verify still in flight the answer must hold
+            # now, or the build would stack a host-staged step over it.
+            reason = self.chain_blocker(scheduler_output)
+            if reason is None:
+                return
+            if reason == "prefill" and self.prefill_overlap_allowed(scheduler_output):
+                # The completed steps are applied above; the verify stays in
+                # flight and commits before the next decode is built.
+                self._prefill_overlapped_step = self._last_fused_step
+                return
+            self._note_break(reason)
+            self.wait_for_all_pending_async_steps()
+            self.apply_ready_completed_decode_steps(suppress_output_req_ids=suppressed)
+            return
         if not self._next_step_verifies(scheduler_output):
             return
         self.wait_for_all_pending_async_steps()
@@ -886,12 +1340,30 @@ class TTAsyncDecodeController:
         with self.runner._steady_decode_lock:
             if not self.runner._pending_async_steps:
                 return False
-            # A wholesale reset marks the already-submitted frames stale. They
-            # must all be present before suffix discard counts are applied.
-            if scheduler_output is not None and get_tt_forced_reset_discard_counts(
-                scheduler_output
-            ):
-                return True
+        # A wholesale reset marks the already-submitted frames stale. They
+        # must all be present before suffix discard counts are applied.
+        if scheduler_output is not None and get_tt_forced_reset_discard_counts(
+            scheduler_output
+        ):
+            if self._chain_candidate_pending():
+                self._note_break("forced_reset")
+            return True
+        if self._chain_candidate_pending():
+            # A fused verify is in flight on a launch that chains. Either the
+            # next step chains onto it, which overlaps whatever else is true of
+            # it, or nothing may be built over a verify and everything drains.
+            reason = self.chain_blocker(scheduler_output)
+            if reason is None:
+                return False
+            if reason == "prefill" and self.prefill_overlap_allowed(scheduler_output):
+                # The prefill reads nothing the verify produces and the device
+                # queue is in order: it is submitted behind the verify.
+                self._prefill_overlap_steps += 1
+                self._prefill_overlapped_step = self._last_fused_step
+                return False
+            self._note_break(reason)
+            return True
+        with self.runner._steady_decode_lock:
             if not steady_decode_candidate:
                 return True
             if any(
@@ -992,6 +1464,7 @@ class TTAsyncDecodeController:
             context=context,
             completion_time_ns=time.perf_counter_ns(),
             model_input=model_input,
+            scheduled_rows=scheduled_rows,
         )
 
     def complete_spec_decode_step(
@@ -999,12 +1472,18 @@ class TTAsyncDecodeController:
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
         context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
     ) -> CompletedSpecDecodeStep:
         """Finalize a speculative read and walk acceptance over what came back.
 
         Runs on whichever thread resolved the deferred output, so it reads the
-        step's own tensors and the immutable model config and nothing else. The
-        commit and the next proposal are left for the engine thread.
+        step's own tensors and the immutable model config and nothing else. A
+        ``logits`` walk also advances the step's request generators, which is
+        why ``DeferredDecodeOutput`` resolves a step once. The commit and the
+        next proposal are left for the engine thread.
+
+        ``scheduled_rows`` (lane DP) publishes the scheduled slots only, as the
+        synchronous lane tail does (``TTModelRunner.lane_spec_published``).
         """
         finalized = self.finalize_decode(submission)
         if finalized is None:
@@ -1012,25 +1491,35 @@ class TTAsyncDecodeController:
             return CompletedSpecDecodeStep(
                 committed=torch.empty((0, 0), dtype=torch.int32),
                 counts=torch.empty((0,), dtype=torch.int32),
+                published_req_ids=list(model_input.row_req_ids),
                 prefixes=[[] for _ in range(rows)],
                 model_input=model_input,
                 spec_hidden=submission.spec_hidden,
                 context=context,
                 completion_time_ns=time.perf_counter_ns(),
             )
-        committed, counts = self.runner.walk_spec_acceptance(
-            model_input, finalized.tt_out
+        walk = self.runner.walk_spec_acceptance(model_input, finalized.tt_out)
+        if finalized.p0 is not None:
+            self.runner.check_fused_positions(model_input, finalized.p0)
+        prefixes = self.runner.spec_committed_prefixes(
+            model_input, walk.committed, walk.counts, finalized.p0
         )
+        published_req_ids = list(model_input.row_req_ids)
+        if scheduled_rows is not None:
+            published_req_ids, prefixes = self.runner.lane_spec_published(
+                model_input, prefixes, scheduled_rows
+            )
         return CompletedSpecDecodeStep(
-            committed=committed,
-            counts=counts,
-            prefixes=self.runner.spec_committed_prefixes(
-                model_input, committed, counts
-            ),
+            committed=walk.committed,
+            counts=walk.counts,
+            published_req_ids=published_req_ids,
+            prefixes=prefixes,
             model_input=model_input,
             spec_hidden=submission.spec_hidden,
             context=context,
             completion_time_ns=time.perf_counter_ns(),
+            logprobs=self.runner.spec_committed_logprobs(walk.logprobs, prefixes),
+            p0=finalized.p0,
         )
 
     def build_runner_output_from_completed_step(
@@ -1081,6 +1570,7 @@ class TTAsyncDecodeController:
                 completed.counts,
                 completed.spec_hidden,
                 skip_req_ids=skipped_state,
+                first_positions=completed.p0,
             )
             return
         self.runner._apply_sampled_tokens_to_state(
@@ -1094,6 +1584,14 @@ class TTAsyncDecodeController:
             # this step owes the next proposal or the launch never drafts
             # again. It runs here, a step after the submission, because the
             # drafts continue the token that just came back.
+            if completed.scheduled_rows is not None:
+                self.runner.propose_after_lane_plain_step(
+                    completed.model_input,
+                    completed.sampled_token_ids,
+                    completed.scheduled_rows,
+                    skip_req_ids=skipped_state,
+                )
+                return
             self.runner.propose_after_plain_step(
                 completed.model_input,
                 completed.sampled_token_ids,
@@ -1150,10 +1648,52 @@ class TTAsyncDecodeController:
         model_input: TTModelInput,
         context: SubmittedStepContext,
         scheduled_rows: list[int],
-    ) -> AsyncTTModelRunnerOutput:
-        """Submit a non-blocking single-process multi-lane decode step."""
-        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+    ) -> DeferredDecodeOutput:
+        """Submit a non-blocking single-process multi-lane decode step.
+
+        A verify reads back the whole slot grid, which its accept walk runs
+        over, and resolves through ``AsyncTTSpecDecodeOutput``. It is never
+        overlap-safe, for the reason ``submit_async_decode`` gives: the next
+        candidate block starts from this step's committed tokens.
+        """
         completion_event = threading.Event()
+        if model_input.spec_mode is not None:
+            submission = self.submit_decode(
+                model_input, read_from_device=False, async_read=True
+            )
+            if submission.tt_out is None:
+                completion_event.set()
+            spec_step = AsyncTTSpecDecodeOutput(
+                controller=self,
+                submission=submission,
+                model_input=model_input,
+                completion_event=completion_event,
+                context=context,
+                scheduled_rows=scheduled_rows,
+            )
+            handle = self._deferred_handle(submission)
+            if handle is None:
+                self._forget_fused_step()
+                self.register_pending_async_step(spec_step, overlap_ok=False)
+                return spec_step
+            # A deferred fused verify, which the next verify may chain onto.
+            # It may itself overlap the step in flight only when it was built
+            # chained onto it.
+            chained = model_input.chain_rows is not None
+            self.register_pending_async_step(spec_step, overlap_ok=chained)
+            if chained:
+                self._chained_submissions += 1
+                self._consumed_tips.add(int(model_input.chain_tip))
+                self._pending_break_reason = None
+            elif self._pending_break_reason is not None:
+                self._chain_breaks[self._pending_break_reason] += 1
+                self._pending_break_reason = None
+            self._last_fused_step = spec_step
+            self._last_fused_input = model_input
+            self._last_fused_tip = int(handle.tip_id)
+            return spec_step
+        self._forget_fused_step()
+        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         submission = self.submit_decode(
             model_input,
             read_from_device=False,
@@ -1258,6 +1798,23 @@ class TTAsyncDecodeController:
             kwargs["spec_mode"] = model_input.spec_mode
         if model_input.accepted_counts is not None:
             kwargs["accepted_counts"] = model_input.accepted_counts
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            # The device accepts with the uniforms drawn here, once per step,
+            # from the requests' own generators. None (nothing sent, nothing
+            # drawn) when every live row is greedy.
+            from vllm_tt_plugin.model_runner import fused_spec_sampling
+
+            spec_sampling = fused_spec_sampling(model_input)
+            if spec_sampling is not None:
+                kwargs["spec_sampling"] = spec_sampling
+            if async_read and self.chain_enabled():
+                # Enqueue only: the readback resolves the returned handle. Sent
+                # on every fused verify, chained or not, because the verify
+                # after it may chain onto it.
+                kwargs["defer_read"] = True
+                if model_input.chain_rows is not None:
+                    kwargs["chain_rows"] = model_input.chain_rows
+                    kwargs["chain_tip"] = model_input.chain_tip
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -1284,6 +1841,9 @@ class TTAsyncDecodeController:
         # sampling modes. Preserve that behavior for legacy adapters too.
         if model_input.slot_remap is not None:
             kwargs["slot_remap"] = model_input.slot_remap
+        finishing_slots = getattr(model_input, "finishing_slots", None)
+        if finishing_slots:
+            kwargs["finishing_slots"] = list(finishing_slots)
 
         # Versioned compatibility seam. Refactored tt-metal adapters opt into
         # the four explicit commands; legacy adapters keep their old call shape.
@@ -1339,6 +1899,7 @@ class TTAsyncDecodeController:
             read_from_device=read_from_device,
         )
         spec_hidden = None
+        deferred = False
         requested_spec_mode = kwargs.get("spec_mode")
         if requested_spec_mode is not None:
             # A verify returns its mode's tensor inside a VerifyOutput, which
@@ -1350,7 +1911,21 @@ class TTAsyncDecodeController:
                 tt_out, type(runner.model).__name__, requested_spec_mode
             )
             # Safe after the unwrap, which refuses anything but a VerifyOutput.
-            spec_hidden = verify.hidden
+            deferred = verify.handle is not None and verify.accepted_token_ids is None
+            if deferred and not kwargs.get("defer_read"):
+                raise ValueError(
+                    f"TT model {type(runner.model).__name__} returned a deferred "
+                    "fused_sample verify (a handle and no host tensors) to a "
+                    "call that did not send defer_read"
+                )
+            if kwargs.get("chain_rows") is not None and not deferred:
+                raise ValueError(
+                    f"TT model {type(runner.model).__name__} answered a chained "
+                    "verify with host tensors; a chained verify is enqueued "
+                    "only and returns its handle"
+                )
+            # A deferred verify's handle is what its proposal is handed back.
+            spec_hidden = verify.handle if deferred else verify.hidden
         elif isinstance(tt_out, VerifyOutput):
             raise TypeError(
                 f"TT model {type(runner.model).__name__} returned a "
@@ -1376,7 +1951,10 @@ class TTAsyncDecodeController:
             self._decode_chain_valid = True
             self._previous_device_sampling = perform_device_sampling
         read_events = None
-        if async_read:
+        if deferred:
+            # Nothing to read now: ``finalize_decode`` resolves the handle.
+            pass
+        elif async_read:
             if hasattr(runner.model, "read_decode_output"):
                 tt_out, read_events = cast(
                     tuple[Any, list[Any]],
@@ -1481,6 +2059,55 @@ class TTAsyncDecodeController:
         )
         return finalized
 
+    @staticmethod
+    def _deferred_handle(submission: TTDecodeSubmission) -> Any | None:
+        """The handle of a fused verify submitted with ``defer_read``, else None."""
+        out = submission.tt_out
+        if (
+            isinstance(out, VerifyOutput)
+            and out.handle is not None
+            and out.accepted_token_ids is None
+        ):
+            return out.handle
+        return None
+
+    def _finalize_fused_handle(
+        self, submission: TTDecodeSubmission
+    ) -> TTFinalizedDecode:
+        """Read a deferred fused verify through its handle.
+
+        ``read_decode_output(handle)`` blocks on the step's device event and
+        returns a ``FusedReadout``. Runs on whichever thread resolves the
+        deferred output and touches no runner state. The result is the
+        verify's ``VerifyOutput`` with its host fields filled in, which the
+        fused walk reads as it reads a synchronous one, and the device's
+        column-0 positions.
+        """
+        model = self.runner.model
+        verify = cast(VerifyOutput, submission.tt_out)
+        readout = model.read_decode_output(verify.handle)
+        if not isinstance(readout, FusedReadout):
+            raise TypeError(
+                f"TT model {type(model).__name__} read a deferred fused verify's "
+                f"handle and returned {type(readout).__name__}; it returns a "
+                "FusedReadout from vllm_tt_plugin.spec_decode"
+            )
+        p0 = readout.p0
+        if not isinstance(p0, torch.Tensor) or p0.dtype != torch.int32 or p0.dim() != 1:
+            raise ValueError(
+                "a deferred fused verify's p0 must be a 1-D int32 host tensor, "
+                f"got {type(p0).__name__} {getattr(p0, 'dtype', None)} "
+                f"{tuple(getattr(p0, 'shape', ()))}"
+            )
+        out = VerifyOutput(
+            spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+            accepted_token_ids=readout.accepted_token_ids,
+            accepted_counts=readout.accepted_counts,
+            hidden=verify.hidden,
+            handle=verify.handle,
+        )
+        return TTFinalizedDecode(tt_out=out, tt_log_probs=None, p0=p0)
+
     def finalize_decode(
         self,
         submission: TTDecodeSubmission,
@@ -1494,6 +2121,8 @@ class TTAsyncDecodeController:
             raise RuntimeError(
                 "cannot finalize decode logits before deferred device sampling"
             )
+        if self._deferred_handle(submission) is not None:
+            return self._finalize_fused_handle(submission)
 
         if submission.readback_rows is not None and (
             sampling_rows is None or tuple(sampling_rows) != submission.readback_rows

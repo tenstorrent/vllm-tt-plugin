@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -31,8 +31,15 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin.scheduler import get_tt_finishing_req_ids
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_FUSED_SAMPLE,
+    ACCEPT_MODE_LOGITS,
+    PLACEHOLDER_TOKEN_ID,
+)
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
+    grammar_rows_per_request,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
     scheduled_structured_output_request_ids,
@@ -41,6 +48,7 @@ from vllm_tt_plugin.structured_output import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
+    from vllm_tt_plugin.async_decode import ChainPlan
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
     from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -143,6 +151,35 @@ def apply_cached_req_state_update(
     elif new_block_ids is not None:
         for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
             block_ids.extend(new_ids)
+
+
+def prefill_chunk_lens(
+    scheduler_output: "SchedulerOutput",
+    req_ids: list[str],
+    num_computed_tokens: np.ndarray,
+    num_tokens: np.ndarray,
+) -> np.ndarray:
+    """The tokens each prefill row computes this step, row-aligned with ``req_ids``.
+
+    The scheduled count, except that a prefill never runs past the end of
+    its sequence: ``Scheduler.schedule`` pads a new request's one-token
+    prefill to ``1 + num_spec_tokens`` with ``-1`` placeholder drafts
+    (``pad_spec_decode``), as it pads a new decode, whenever the prefix
+    cache holds all of the prompt but its last token. Those positions are no
+    prompt: the step samples one token at the last prompt position, which is
+    what vLLM's runner commits there too, and ``update_from_output`` rolls
+    the placeholders back as rejected drafts. Prefilling them would run the
+    model over tokens past the end of the sequence and sample the first
+    token from there.
+    """
+    scheduled = np.asarray(
+        [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
+        dtype=np.int64,
+    )
+    remaining = np.asarray(num_tokens, dtype=np.int64) - np.asarray(
+        num_computed_tokens, dtype=np.int64
+    )
+    return np.minimum(scheduled, remaining)
 
 
 def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
@@ -1230,12 +1267,29 @@ class TTLaneInputBatch(InputBatch):
         grammar_output: "GrammarOutput | None",
         plan: "TTStepPlan",
     ) -> TTModelInput:
-        """Build the merged device input for one lane step (decode or prefill)."""
+        """Build the merged device input for one lane step (decode or prefill).
+
+        Every lane build on a speculating launch records how many grammar
+        bitmask rows each scheduled request owns, here rather than in each
+        builder, because the scheduler writes ``1 + len(drafts)`` rows on
+        every such step: a verify, a plain decode, a chained verify, and a
+        prefill the scheduler padded with placeholder drafts alike. A build
+        without it would read that bitmask as one row per request.
+        """
         if plan.is_decode:
-            return self._build_decode_input(
+            model_input = self._build_decode_input(
                 runner, scheduler_output, grammar_output, plan
             )
-        return self._build_prefill_input(runner, scheduler_output, grammar_output, plan)
+        else:
+            model_input = self._build_prefill_input(
+                runner, scheduler_output, grammar_output, plan
+            )
+        if not getattr(runner, "_num_speculative_tokens", 0):
+            return model_input
+        return replace(
+            model_input,
+            grammar_rows_per_request=grammar_rows_per_request(scheduler_output),
+        )
 
     def _build_decode_input(
         self,
@@ -1260,6 +1314,11 @@ class TTLaneInputBatch(InputBatch):
         for row in occupied:
             tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
         input_tokens = torch.from_numpy(tokens_np)
+
+        spec = self._build_spec_block(
+            runner, scheduler_output, plan, input_tokens, input_positions, total
+        )
+        input_tokens, input_positions = spec["input_tokens"], spec["input_positions"]
 
         block_tables_per_group = lane_batch.slot_block_tables(
             occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
@@ -1287,16 +1346,43 @@ class TTLaneInputBatch(InputBatch):
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
+        logits_verify = spec["spec_mode"] == ACCEPT_MODE_LOGITS
+        fused_verify = spec["spec_mode"] == ACCEPT_MODE_FUSED_SAMPLE
+        if logits_verify or fused_verify:
+            # The host walk samples from the logits this verify returns, or the
+            # device accepts with the uniforms the runner draws for it, so the
+            # model must not sample on device, as on the front-packed path.
+            perform_device_sampling = False
 
-        # The prompt/output token tensors feed device-side penalties only. Host
-        # sampling rebuilds them itself in ``build_merged_sampling_metadata``, so
-        # building them here too would be dead work on the host path.
+        # The prompt/output token tensors feed device-side penalties, and the
+        # host walk of a logits verify (never a fused one, which carries no
+        # penalized row). The ordinary host sampling tail
+        # rebuilds them itself in ``build_merged_sampling_metadata``, so
+        # building them for it would be dead work.
         prompt_tokens = output_tokens = None
-        if perform_device_sampling and not lane_batch.no_penalties:
+        if (perform_device_sampling or logits_verify) and not lane_batch.no_penalties:
             prompt_tokens = lane_batch.make_prompt_token_ids_tensor(rows_all)
             output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
+        elif logits_verify and lane_batch.sampling.bad_words_token_ids:
+            # A multi-token bad word matches against the output history.
+            output_tokens = lane_batch.make_output_token_ids_tensor(rows_all)
+        walk_inputs = (
+            self._logits_walk_inputs(runner, plan, spec["row_req_ids"], total)
+            if logits_verify
+            else {}
+        )
+        if fused_verify:
+            # The uniforms the device accepts with are drawn from these, by
+            # slot (``fused_spec_sampling``), as the logits walk draws.
+            walk_inputs["generators_list"] = [dict(self.sampling.generators)]
+        if spec["spec_mode"] is not None and not logits_verify:
+            # The mode was chosen over the scheduled slots, so the logprobs an
+            # ids walk refuses are theirs too: a request a decode step leaves
+            # out may have asked for logprobs, and it reads none of this step.
+            walk_inputs["max_num_logprobs"] = [None]
         decode_layout_changed = runner._decode_layout_changed_since_last_decode
         slot_remap = lane_batch.pop_slot_remap()  # identity for stable slots
+        finishing_slots = self._finishing_slots(runner, scheduler_output)
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -1318,19 +1404,278 @@ class TTLaneInputBatch(InputBatch):
             decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
             # Host sampling reads the merged batch directly (see
-            # ``extract_output``); the per-rank sidecars are unused here.
-            allowed_token_ids_mask_list=[None],
-            bad_words_token_ids_list=[{}],
-            max_num_logprobs=[lane_batch.max_num_logprobs],
+            # ``extract_output``); the allowlist, bad-words and generator
+            # sidecars are read only by the host walk of a logits verify
+            # (``_logits_walk_inputs``), the generators also by the uniform
+            # draw of a fused one.
+            allowed_token_ids_mask_list=walk_inputs.get(
+                "allowed_token_ids_mask_list", [None]
+            ),
+            bad_words_token_ids_list=walk_inputs.get("bad_words_token_ids_list", [{}]),
+            max_num_logprobs=walk_inputs.get(
+                "max_num_logprobs", [lane_batch.max_num_logprobs]
+            ),
             logitsprocs_list=[None],
-            generators_list=[{}],
+            generators_list=walk_inputs.get("generators_list", [{}]),
             prefill_empty_slots=None,
             defer_device_sampling=(
                 perform_device_sampling and has_scheduled_structured
             ),
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(lane_batch.req_ids[:total]),
+            row_req_ids=spec["row_req_ids"],
+            num_valid_drafts=spec["num_valid_drafts"],
+            accepted_counts=spec["accepted_counts"],
+            draft_token_ids=spec["draft_token_ids"],
+            spec_mode=spec["spec_mode"],
+            spec_min_tokens=walk_inputs.get("spec_min_tokens"),
+            chain_rows=spec["chain_rows"],
+            chain_tip=spec["chain_tip"],
+            finishing_slots=finishing_slots,
         )
+
+    def _finishing_slots(
+        self, runner: "TTModelRunner", scheduler_output: "SchedulerOutput"
+    ) -> list[int] | None:
+        """The slots of the requests this decode leaves out because they finish.
+
+        ``TTScheduler`` names the running requests the base loop skipped since
+        the step in flight reaches their ``max_tokens``. They still hold their
+        slots until the scheduler reports them finished, and are never
+        scheduled again; a model declaring ``supports_finishing_slots`` is told
+        it may free them now. None for any other model, or when there are none.
+        """
+        finishing = get_tt_finishing_req_ids(scheduler_output)
+        if not finishing:
+            return None
+        capabilities = getattr(runner.model, "model_capabilities", None) or {}
+        if not capabilities.get("supports_finishing_slots", False):
+            return None
+        slots = []
+        for req_id in finishing:
+            if req_id in scheduler_output.num_scheduled_tokens:
+                raise RuntimeError(
+                    f"request {req_id!r} is both scheduled and finishing"
+                )
+            row = self.req_id_to_index.get(req_id)
+            if row is not None:
+                slots.append(row)
+        return sorted(slots) or None
+
+    def _logits_walk_inputs(
+        self,
+        runner: "TTModelRunner",
+        plan: "TTStepPlan",
+        row_req_ids: list[str | None],
+        total: int,
+    ) -> dict[str, Any]:
+        """The per-row controls a logits verify's host walk reads, by slot.
+
+        What ``_prepare_model_inputs`` captures for a front-packed logits
+        verify, keyed by device slot rather than by packed row: the requests'
+        own generators, which the walk advances, their bad words, the
+        allowlist rows, each scheduled request's remaining ``min_tokens`` and
+        the largest logprobs request among them. ``_spec_sampling_inputs``
+        keeps only the rows with a request id, which are the scheduled slots,
+        so a gap or a slot the step left out neither draws from a generator
+        nor reads a filter.
+        """
+        sampling = self.sampling
+        allowed = None
+        if (
+            not self.no_allowed_token_ids
+            and sampling.allowed_token_ids_mask is not None
+        ):
+            allowed = sampling.allowed_token_ids_mask[:total].clone()
+        num_logprobs = int(sampling.num_logprobs[list(plan.scheduled_rows)].max())
+        return {
+            "max_num_logprobs": [num_logprobs if num_logprobs >= 0 else None],
+            "generators_list": [dict(sampling.generators)],
+            "bad_words_token_ids_list": [dict(sampling.bad_words_token_ids)],
+            "allowed_token_ids_mask_list": [allowed],
+            "spec_min_tokens": runner._pending_min_tokens(row_req_ids),
+        }
+
+    def _build_spec_block(
+        self,
+        runner: "TTModelRunner",
+        scheduler_output: "SchedulerOutput",
+        plan: "TTStepPlan",
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+        total: int,
+    ) -> dict[str, Any]:
+        """The speculative half of a lane decode, from the runner's own helpers.
+
+        The front-packed builder's rules, over the slot grid instead of a
+        packed prefix: a row is a device slot, and a gap is a row no request
+        owns, which ``_spec_row_state`` already reads as the post-prefill
+        default (no drafts, count 1) because its request id is ``None``. A gap's
+        input position is -1, and ``_spec_candidate_block`` pads every draft
+        column of a row with no valid drafts to -1, so a gap stays positionless
+        across the whole block. ``row_req_ids`` is slot-ordered with ``None``
+        at every slot this step does not schedule; the accept walk and the
+        drafter run over every slot, as they run over every padded row of a
+        front-packed verify, and only the scheduled rows reach a request. The
+        draft cap counts the step's live rows, the global count
+        ``SpecPlan.k_by_rows`` is declared against.
+
+        A slot can hold a request the step leaves out: a decode step that the
+        coordinator interleaves into a run of prefills leaves a partial
+        prefill holding its row. That slot is ``None`` here too. Its request
+        has no token to commit, and the commit, the recorded count and the
+        proposal all key on this identity, so naming it would append a token
+        to a prompt that is still being prefilled.
+        """
+        none = {
+            "input_tokens": input_tokens,
+            "input_positions": input_positions,
+            "row_req_ids": None,
+            "num_valid_drafts": None,
+            "accepted_counts": None,
+            "draft_token_ids": None,
+            "spec_mode": None,
+            "chain_rows": None,
+            "chain_tip": None,
+        }
+        num_drafts = int(getattr(runner, "_num_speculative_tokens", 0) or 0)
+        if not num_drafts:
+            return none
+        # Imported here: model_runner imports this module.
+        from vllm_tt_plugin.model_runner import _has_unresolved_commit, _step_verifies
+
+        scheduled = set(plan.scheduled_rows)
+        row_req_ids = [
+            req_id if row in scheduled else None
+            for row, req_id in enumerate(self.req_ids[:total])
+        ]
+        live_rows = list(plan.scheduled_rows)
+        live_req_ids = [self.req_ids[row] for row in live_rows]
+        if runner._chains_fused_verifies():
+            chain = runner.async_decode.chain_plan_for_build(scheduler_output)
+            if chain is not None:
+                return self._build_chained_block(
+                    runner,
+                    chain,
+                    row_req_ids,
+                    live_rows,
+                    live_req_ids,
+                    input_tokens,
+                    input_positions,
+                )
+        spec_plan = getattr(runner, "_spec_plan", None)
+        drafts, num_valid, counts = runner._spec_row_state(
+            runner._req_accepted_counts,
+            runner._drafts_to_verify(scheduler_output, live_req_ids),
+            row_req_ids,
+            num_drafts,
+            spec_plan.draft_cap(len(live_req_ids)) if spec_plan is not None else None,
+        )
+        if _step_verifies(
+            runner._spec_supports_narrow_decode,
+            all(runner._request_is_speculable(req_id) for req_id in live_req_ids),
+            num_valid,
+            counts,
+            total,
+        ):
+            tokens, positions = runner._spec_candidate_block(
+                drafts, num_valid, input_tokens, input_positions
+            )
+            return {
+                "input_tokens": tokens,
+                "input_positions": positions,
+                "row_req_ids": row_req_ids,
+                "num_valid_drafts": num_valid,
+                "accepted_counts": counts,
+                "draft_token_ids": drafts,
+                # Over the scheduled requests only, as front-packed padding
+                # rows do not decide it: a gap or a left-out slot is greedy
+                # to the walk and commits nothing.
+                "spec_mode": runner._spec_mode_for_step(
+                    live_req_ids, num_valid[live_rows]
+                ),
+                "chain_rows": None,
+                "chain_tip": None,
+            }
+        # The ordinary decode inside a speculating launch, as in the
+        # front-packed builder: every row commits one token, so the counts reset
+        # here, and an unresolved commit reaches the model as ``accepted_counts``.
+        out = dict(none)
+        out["row_req_ids"] = row_req_ids
+        if _has_unresolved_commit(counts, total):
+            out["accepted_counts"] = counts
+        for req_id in live_req_ids:
+            runner._req_accepted_counts.pop(req_id, None)
+        return out
+
+    def _build_chained_block(
+        self,
+        runner: "TTModelRunner",
+        chain: "ChainPlan",
+        row_req_ids: list[str | None],
+        live_rows: list[int],
+        live_req_ids: list[str],
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+    ) -> dict[str, Any]:
+        """A ``fused_sample`` verify chained onto the one still in flight.
+
+        The host has not applied that verify, so it knows neither the token
+        each row continues from nor the drafts the device's drafter made for
+        it: a chained row carries ``PLACEHOLDER_TOKEN_ID`` in every column and
+        -1 for its count, and the device builds the block from the pending
+        step. Its positions are the plan's upper bound, laid out as any block
+        is; ``num_valid_drafts`` is the exact count the device verifies. Every
+        scheduled slot chains; a slot the step does not schedule is sent as a
+        gap, because its host position is a step behind the device's. Any
+        proposal held for a chained request is dropped unread: it is either
+        spent or what the device already holds.
+        """
+        if sorted(chain.hints) != live_rows:
+            raise RuntimeError(
+                f"the chain plan's slots {sorted(chain.hints)} are not the "
+                f"build's scheduled slots {live_rows}"
+            )
+        num_drafts = int(runner._num_speculative_tokens)
+        total = len(row_req_ids)
+        positions = torch.full_like(input_positions, -1)
+        num_valid = torch.zeros(total, dtype=torch.int32)
+        for row in live_rows:
+            positions[row] = chain.positions[row]
+            num_valid[row] = chain.hints[row]
+        for req_id in live_req_ids:
+            runner._proposed_draft_token_ids.pop(req_id, None)
+        drafts = torch.full(
+            (total, num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+        )
+        tokens, positions = runner._spec_candidate_block(
+            drafts,
+            num_valid,
+            torch.full_like(input_tokens, PLACEHOLDER_TOKEN_ID),
+            positions,
+        )
+        chain_rows = torch.zeros(total, dtype=torch.bool)
+        chain_rows[live_rows] = True
+        counts = torch.ones(total, dtype=torch.int32)
+        counts[chain_rows] = PLACEHOLDER_TOKEN_ID
+        spec_mode = runner._spec_mode_for_step(live_req_ids, num_valid[live_rows])
+        if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+            raise RuntimeError(
+                "a chained lane verify must be fused_sample, and the step "
+                f"resolved {spec_mode!r}; the chain plan admits only "
+                "fused_sample-servable requests"
+            )
+        return {
+            "input_tokens": tokens,
+            "input_positions": positions,
+            "row_req_ids": row_req_ids,
+            "num_valid_drafts": num_valid,
+            "accepted_counts": counts,
+            "draft_token_ids": drafts,
+            "spec_mode": spec_mode,
+            "chain_rows": chain_rows,
+            "chain_tip": chain.tip,
+        }
 
     def _build_prefill_input(
         self,
@@ -1354,12 +1699,11 @@ class TTLaneInputBatch(InputBatch):
         # The generator processes ``tokens[start_pos:prompt_lens]``, so
         # ``prompt_lens`` is the end position of the chunk scheduled this step,
         # not the full sequence length. They coincide for an unchunked prefill.
-        chunk_lens = np.asarray(
-            [
-                scheduler_output.num_scheduled_tokens[lane_batch.req_ids[row]]
-                for row in rows
-            ],
-            dtype=np.int64,
+        chunk_lens = prefill_chunk_lens(
+            scheduler_output,
+            [lane_batch.req_ids[row] for row in rows],
+            input_positions_np,
+            lane_batch.num_tokens[rows_np],
         )
         prompt_lens = input_positions_np + chunk_lens
         intermediate_prefill_mask = torch.from_numpy(
@@ -1367,6 +1711,11 @@ class TTLaneInputBatch(InputBatch):
         )
         max_prefill = int(prompt_lens.max())
         input_tokens = lane_batch.token_ids_cpu_tensor[rows_np, :max_prefill]
+        if getattr(runner, "_num_speculative_tokens", 0):
+            # A prefill commits one token, so the next verify reads the
+            # post-prefill count of 1, as in the front-packed builder.
+            for row in rows:
+                runner._req_accepted_counts.pop(lane_batch.req_ids[row], None)
 
         block_tables_per_group = lane_batch.slot_block_tables(
             rows, zero_gaps=False, total=0, width=runner.max_num_blocks_per_req

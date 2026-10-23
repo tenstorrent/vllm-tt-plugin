@@ -28,19 +28,65 @@ deliberately so a kernel or a test ported from upstream needs no adjustment:
 
 A drafter that reports no probabilities, such as an n-gram proposer, is handled
 as a point mass at the drafted id: ``q`` is 1, so the accept test reduces to
-``p >= u``, and the residual is ``p`` with the drafted id removed.
+``p >= u``, and the residual is ``p`` with the drafted id removed. That is
+lossless for any draft the walk's own random draws did not choose: the drafted
+id commits with probability ``p(d)`` and any other id ``x`` with
+``(1 - p(d)) * p(x) / (1 - p(d)) = p(x)``. So a drafter that samples its
+proposals stays correct without reporting probabilities; reporting them would
+only raise the acceptance probability from ``p(d)`` to ``min(1, p(d) / q(d))``.
+
+The target distribution is the one vLLM's ordinary sampler would use, built in
+the ordinary sampler's order: the grammar bitmask, which the runner applies to
+the logits before the sampler sees them; then allowed_token_ids, bad_words and
+min_tokens; then the penalties; then temperature, min_p and top-k/top-p.
+``accept_sampled_drafts`` applies everything up to the penalties per candidate
+column against that column's own state, and hands the rest to
+``accept_speculated_tokens``. Column ``j``'s state is the committed output plus
+the first ``j`` drafts: that is the history bad_words and the penalties read,
+the output length min_tokens compares, and the grammar state the scheduler
+filled column ``j``'s bitmask row from.
+
+Two places differ from upstream's rejection sampler, both towards the ordinary
+sampler. Upstream skips min_p at the drafted positions; this walk does not,
+because the ordinary sampler applies it at every position. vLLM 0.26 refuses a
+min_p above 1e-5 on a speculating launch and builds no min_p processor there,
+so the ordinary sampler ignores a smaller one and the runner never passes it;
+the parameter is there for when vLLM applies it. Upstream masks the stop
+tokens at the bonus position whenever the committed output is below
+min_tokens, even where the drafts before it reach min_tokens; this walk masks
+column ``j`` only while the output plus ``j`` drafts is below it, which is
+where the ordinary sampler would mask that token.
+
+The random walk can also be handed its uniforms instead of drawing them
+(``accept_speculated_tokens(uniforms=...)``). ``predraw_uniforms`` makes that
+table from the requests' generators and the global stream in exactly the order
+the walk itself would draw, so a walk on the table commits what the drawing
+walk would have committed and leaves every stream where it would have. That is
+how a ``fused_sample`` model, which accepts on the device, consumes the
+runner's randomness: the runner draws, the device walks.
+
+Logprobs are the raw logprobs, after the grammar bitmask and before any other
+control, of each committed token at its own column. That is what the plugin's
+ordinary host sampler returns, because it runs vLLM's ``Sampler`` in its
+default ``raw_logprobs`` mode on logits the grammar has already masked.
 
 The accept walk uses host PyTorch and the plugin's placeholder constant.
-Top-k/top-p filtering lazily imports vLLM's PyTorch helper. This module reads
-no ``model_capabilities`` key and admits no configuration, so synthetic
-distributions are sufficient to exercise the acceptance arithmetic.
+Top-k/top-p filtering and the penalties lazily import vLLM's PyTorch helpers.
+This module reads no ``model_capabilities`` key and admits no configuration,
+so synthetic distributions are sufficient to exercise the acceptance
+arithmetic.
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
+
+if TYPE_CHECKING:
+    from vllm.v1.outputs import LogprobsTensors
 
 
 @dataclass(frozen=True)
@@ -52,6 +98,11 @@ class AcceptResult:
     so a consumer can either truncate at the count or stop at the first
     placeholder and get the same answer. ``accepted_counts`` is ``[B]`` int32.
 
+    ``logprobs``, when the walk was asked for them, has one row per committed
+    token, row 0's tokens first, and ``cu_num_generated_tokens`` gives where
+    each row's tokens start: vLLM's layout for a step that commits a different
+    number of tokens per request.
+
     The two are validated against each other on construction. An off-by-one in
     a walk corrupts output tokens rather than raising anywhere, so the pairing
     is checked where it is produced and not where it is consumed.
@@ -59,6 +110,7 @@ class AcceptResult:
 
     committed_token_ids: torch.Tensor
     accepted_counts: torch.Tensor
+    logprobs: "LogprobsTensors | None" = None
 
     def __post_init__(self) -> None:
         if self.committed_token_ids.dim() != 2:
@@ -96,6 +148,264 @@ class AcceptResult:
             )
 
 
+@dataclass(frozen=True)
+class SpecPenalties:
+    """The history-dependent controls of one verify, per row.
+
+    ``prompt_token_ids`` is ``[B, P]`` int64 padded with the vocabulary size,
+    which is the padding vLLM's penalty op ignores. ``output_token_ids`` holds
+    each row's committed output before this step's candidate block; a draft
+    joins the history only for the columns after it.
+    """
+
+    prompt_token_ids: torch.Tensor
+    output_token_ids: list[list[int]]
+    presence: torch.Tensor
+    frequency: torch.Tensor
+    repetition: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SpecTokenFilters:
+    """The controls of one verify that rule tokens out, per row.
+
+    Each one sets a token's logit to ``-inf`` at a column, and none of them
+    reads a probability, so a greedy row and a random row are filtered alike.
+
+    - ``grammar_bitmask`` is ``[B, 1+K, W]`` int32, xgrammar's packed layout:
+      bit ``v % 32`` of word ``v // 32`` is 1 where column ``j`` allows token
+      ``v``. Row ``i`` column ``j`` is the bitmask the scheduler filled after
+      the request's committed output and its first ``j`` drafts. A row or
+      column the scheduler sent nothing for is all ones, which is -1.
+    - ``allowed_token_ids_mask`` is ``[B, V]`` bool, True where a token is NOT
+      allowed, which is vLLM's convention. It applies to every column.
+    - ``bad_words_token_ids`` maps a row to its banned token sequences. A
+      sequence bans its last token at a column whose history ends with the
+      sequence's other tokens, and ``output_token_ids`` is each row's
+      committed output, which that history starts from.
+    - ``min_tokens`` maps a row to ``(remaining, stop_token_ids)``:
+      ``remaining`` is ``min_tokens`` minus the committed output length, and
+      column ``j`` may not commit a stop token while ``j < remaining``.
+    """
+
+    grammar_bitmask: torch.Tensor | None = None
+    allowed_token_ids_mask: torch.Tensor | None = None
+    bad_words_token_ids: dict[int, list[list[int]]] = field(default_factory=dict)
+    output_token_ids: list[list[int]] | None = None
+    min_tokens: dict[int, tuple[int, tuple[int, ...]]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SpecSamplingInputs:
+    """One verify step's sampling controls, row-aligned with its block.
+
+    Captured when the step is built, because the asynchronous path walks
+    acceptance on whichever thread resolves the readback, after the persistent
+    batch may have moved on. ``generators`` maps a verify row to its request's
+    own generator, which the walk advances; a row without one draws from the
+    global stream.
+
+    ``num_logprobs`` is the batch's largest logprobs request, vLLM's
+    ``max_num_logprobs``: ``None`` computes none, 0 the committed token's own,
+    and ``n`` adds the top ``n``.
+    """
+
+    vocab_size: int
+    temperature: torch.Tensor
+    top_k: torch.Tensor | None = None
+    top_p: torch.Tensor | None = None
+    min_p: torch.Tensor | None = None
+    generators: dict[int, torch.Generator] = field(default_factory=dict)
+    penalties: SpecPenalties | None = None
+    filters: SpecTokenFilters | None = None
+    num_logprobs: int | None = None
+
+
+def accept_sampled_drafts(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    sampling: SpecSamplingInputs,
+) -> AcceptResult:
+    """Walk acceptance under every control the ordinary sampler applies.
+
+    The token filters and the penalties are applied here, per candidate
+    column, because they read a column's own state: column ``j``'s history is
+    the committed output plus the first ``j`` drafts. The remaining controls
+    read no history and are applied by ``accept_speculated_tokens``.
+    """
+    if target_logits.dim() != 3 or int(target_logits.shape[-1]) != sampling.vocab_size:
+        raise ValueError(
+            "accept_sampled_drafts target_logits must be [B, 1+K, "
+            f"{sampling.vocab_size}], the whole vocabulary at every candidate "
+            f"column, got {tuple(target_logits.shape)}"
+        )
+    # Before the penalties, which index by draft id and would fail on a bad
+    # one inside vLLM's op rather than here, by name.
+    _check_inputs(
+        target_logits, draft_token_ids, num_valid_drafts, sampling.temperature
+    )
+    _check_sampling(sampling, *target_logits.shape)
+    logits = target_logits.to(torch.float32)
+    filters = sampling.filters
+    if filters is not None and filters.grammar_bitmask is not None:
+        logits = _apply_grammar_bitmask(logits, filters.grammar_bitmask)
+    # What logprobs are taken from: after the grammar, before everything else.
+    raw_logits = logits
+    if filters is not None:
+        logits = apply_speculative_token_filters(
+            logits, draft_token_ids, num_valid_drafts, filters
+        )
+    if sampling.penalties is not None:
+        logits = apply_speculative_penalties(
+            logits, draft_token_ids, num_valid_drafts, sampling.penalties
+        )
+    result = accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=draft_token_ids,
+        num_valid_drafts=num_valid_drafts,
+        temperature=sampling.temperature,
+        top_k=sampling.top_k,
+        top_p=sampling.top_p,
+        min_p=sampling.min_p,
+        generators=sampling.generators,
+    )
+    if sampling.num_logprobs is None:
+        return result
+    return AcceptResult(
+        committed_token_ids=result.committed_token_ids,
+        accepted_counts=result.accepted_counts,
+        logprobs=committed_logprobs(
+            raw_logits,
+            result.committed_token_ids,
+            result.accepted_counts,
+            sampling.num_logprobs,
+        ),
+    )
+
+
+def apply_speculative_token_filters(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    filters: SpecTokenFilters,
+) -> torch.Tensor:
+    """allowed_token_ids, bad_words and min_tokens, column by column.
+
+    In the ordinary sampler's order, although each only writes ``-inf`` and
+    the order cannot change what they rule out. The grammar bitmask is not
+    applied here: it comes before the raw logprobs, so the caller applies it.
+
+    Returns a new tensor; the caller's logits are not modified.
+    """
+    rows, width, vocab = target_logits.shape
+    # Contiguous whatever the caller's strides: the contract does not require
+    # contiguous logits, and apply_bad_words writes in place through a flat
+    # view below, which a transposed layout cannot give.
+    logits = target_logits.clone(memory_format=torch.contiguous_format)
+    if filters.allowed_token_ids_mask is not None:
+        logits.masked_fill_(filters.allowed_token_ids_mask.unsqueeze(1), float("-inf"))
+
+    if filters.bad_words_token_ids:
+        # Deferred for the same import cycle as the top-k/top-p helper below.
+        # vLLM's own op, so a multi-token word matches exactly as it does in
+        # the ordinary sampler, which hands the same op a single column.
+        from vllm.v1.sample.ops.bad_words import apply_bad_words
+
+        if filters.output_token_ids is None:
+            raise ValueError(
+                "accept_sampled_drafts filters.bad_words_token_ids needs "
+                "filters.output_token_ids, the history a word's prefix is "
+                "matched against"
+            )
+        flat_words: dict[int, list[list[int]]] = {}
+        flat_histories: list[list[int]] = [[] for _ in range(rows * width)]
+        for row, words in filters.bad_words_token_ids.items():
+            committed = list(filters.output_token_ids[row])
+            valid = int(num_valid_drafts[row])
+            drafts = [int(token) for token in draft_token_ids[row, :valid].tolist()]
+            for column in range(width):
+                flat_words[row * width + column] = words
+                flat_histories[row * width + column] = (
+                    committed + drafts[: min(column, valid)]
+                )
+        apply_bad_words(logits.view(rows * width, vocab), flat_words, flat_histories)
+
+    for row, (remaining, stop_token_ids) in filters.min_tokens.items():
+        columns = min(max(int(remaining), 0), width)
+        if columns and stop_token_ids:
+            logits[row, :columns, list(stop_token_ids)] = float("-inf")
+    return logits
+
+
+def committed_logprobs(
+    raw_logits: torch.Tensor,
+    committed_token_ids: torch.Tensor,
+    accepted_counts: torch.Tensor,
+    num_logprobs: int,
+) -> "LogprobsTensors":
+    """Each committed token's logprob, rank and top ``num_logprobs``, at its column.
+
+    Only the committed columns are read, so a rejected draft's column costs no
+    log-softmax. vLLM's ``Sampler`` does the arithmetic, which is what the
+    ordinary host sampler calls for one column.
+    """
+    # Deferred for the same import cycle as the top-k/top-p helper below.
+    from vllm.v1.outputs import LogprobsTensors
+    from vllm.v1.sample.sampler import Sampler
+
+    rows, width, _ = raw_logits.shape
+    committed = _within_count(rows, width, accepted_counts)
+    # Boolean indexing reads row-major, so row 0's committed columns come first.
+    logprobs = Sampler.compute_logprobs(raw_logits[committed])
+    gathered = Sampler.gather_logprobs(
+        logprobs, num_logprobs, committed_token_ids[committed].to(torch.int64)
+    )
+    starts = [0, *accepted_counts.to(torch.int64).cumsum(0).tolist()]
+    return LogprobsTensors(*gathered[:3], cu_num_generated_tokens=starts)
+
+
+def apply_speculative_penalties(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    penalties: SpecPenalties,
+) -> torch.Tensor:
+    """Presence, frequency and repetition penalties, column by column.
+
+    Column ``j`` is scored after the row's committed output and its first
+    ``min(j, num_valid_drafts)`` drafts, so the bonus column reads every valid
+    draft and a padding column reads no padding. vLLM's own penalty op does
+    the arithmetic, which keeps it identical to the ordinary sampler's.
+
+    Returns a new tensor; the caller's logits are not modified.
+    """
+    # Deferred for the same import cycle as the top-k/top-p helper below.
+    from vllm.v1.sample.ops.penalties import apply_all_penalties
+
+    rows, width, vocab = target_logits.shape
+    histories: list[list[int]] = []
+    for row in range(rows):
+        committed = list(penalties.output_token_ids[row])
+        valid = int(num_valid_drafts[row])
+        drafts = [int(token) for token in draft_token_ids[row, :valid].tolist()]
+        for column in range(width):
+            histories.append(committed + drafts[: min(column, valid)])
+
+    def per_column(per_row: torch.Tensor) -> torch.Tensor:
+        return per_row.repeat_interleave(width, dim=0)
+
+    flat = apply_all_penalties(
+        target_logits.reshape(rows * width, vocab).clone(),
+        per_column(penalties.prompt_token_ids),
+        per_column(penalties.presence),
+        per_column(penalties.frequency),
+        per_column(penalties.repetition),
+        histories,
+    )
+    return flat.reshape(rows, width, vocab)
+
+
 def accept_speculated_tokens(
     target_logits: torch.Tensor,
     draft_token_ids: torch.Tensor,
@@ -105,6 +415,8 @@ def accept_speculated_tokens(
     top_p: torch.Tensor | None = None,
     draft_probs: torch.Tensor | None = None,
     generators: dict[int, torch.Generator] | None = None,
+    min_p: torch.Tensor | None = None,
+    uniforms: torch.Tensor | None = None,
 ) -> AcceptResult:
     """Walk acceptance over one ``[B, 1+K]`` candidate block.
 
@@ -124,20 +436,32 @@ def accept_speculated_tokens(
             real. A row with 0 commits exactly its bonus token.
         temperature: ``[B]``. A value of 0 selects greedy acceptance for that
             row, matching what the HTTP sampling parameter means. Greedy rows
-            read the raw logits; only random rows are rescaled.
+            read ``target_logits`` as given; only random rows are rescaled.
         top_k: ``[B]`` or None. Applied to random rows before the softmax.
         top_p: ``[B]`` or None. Applied to random rows before the softmax.
+        min_p: ``[B]`` or None. Applied to random rows after temperature and
+            before top-k/top-p, the ordinary sampler's order. 0 disables it.
         draft_probs: ``[B, K, V]`` or None. The drafter's own distribution per
-            drafted position. None means a deterministic drafter.
+            drafted position. None treats each draft as a point mass at its
+            id, which is lossless for any drafter whose choice does not read
+            this walk's random draws.
         generators: row index to a seeded ``torch.Generator``. A row named here
             draws its randomness from that generator, so a seeded request is
             reproducible; the rest draw from the global stream.
+        uniforms: ``[B, K+2]`` or None. Every draw the random walk would make,
+            already made (``predraw_uniforms``): column 0 the bonus, columns
+            1..K the accept tests of draft columns 0..K-1, column K+1 the
+            correction. Given, the walk draws nothing, ``generators`` is not
+            read, and every random row's bonus is an inverse-CDF draw from
+            column 0, including a seeded row without drafts, whose drawing
+            walk races its generator over the vocabulary instead. Point-mass
+            drafts only: ``draft_probs`` must be None.
 
     Returns:
         An :class:`AcceptResult`.
     """
     rows, width, vocab = _check_inputs(
-        target_logits, draft_token_ids, num_valid_drafts, temperature
+        target_logits, draft_token_ids, num_valid_drafts, temperature, min_p
     )
     num_drafts = width - 1
     generators = generators or {}
@@ -165,11 +489,13 @@ def accept_speculated_tokens(
             temperature,
             top_k,
             top_p,
+            min_p,
             draft_probs,
             generators,
             rows,
             num_drafts,
             vocab,
+            uniforms,
         )
         select = (~is_greedy).unsqueeze(1)
         accepted = torch.where(select, random_accepted, accepted)
@@ -206,14 +532,36 @@ def _random_walk(
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
     draft_probs: torch.Tensor | None,
     generators: dict[int, torch.Generator],
     rows: int,
     num_drafts: int,
     vocab: int,
+    uniforms: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample each position, correcting a rejection from the residual."""
-    probs = _constrained_probs(target_logits, temperature, top_k, top_p)
+    if uniforms is not None and draft_probs is not None:
+        raise ValueError(
+            "accept_speculated_tokens takes given uniforms for point-mass drafts "
+            "only; draft_probs must be None"
+        )
+    if draft_probs is None and (_fast_enabled() or uniforms is not None):
+        return _point_mass_walk(
+            target_logits,
+            draft_token_ids,
+            num_valid_drafts,
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            generators,
+            rows,
+            num_drafts,
+            vocab,
+            uniforms,
+        )
+    probs = _constrained_probs(target_logits, temperature, top_k, top_p, min_p)
     # Replaced inside the vocabulary before any gather, because a draft column
     # past its row's count holds padding, the runner pads with
     # PLACEHOLDER_TOKEN_ID, and torch.gather refuses a negative index rather
@@ -239,7 +587,10 @@ def _random_walk(
     # drafter that proposed a token its own distribution rules out, which is a
     # drafter bug. The division is evaluated for those entries too and yields a
     # NaN or an infinity; the q > 0 term is what forces them to reject, rather
-    # than the division being avoided.
+    # than the division being avoided. The p > 0 term rejects a draft the
+    # filters ruled out even on the uniform draw of exactly 0: a draft the
+    # grammar forbids reaches the walk whenever the scheduler did not validate
+    # it, and only this test keeps it out of the output.
     target_of_draft = _gather_ids(probs[:, :num_drafts], draft_ids)
     if draft_probs is None:
         draft_of_draft = torch.ones_like(target_of_draft)
@@ -247,8 +598,10 @@ def _random_walk(
         _check_draft_probs(draft_probs, rows, num_drafts, vocab)
         draft_of_draft = _gather_ids(draft_probs, draft_ids)
     uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
-    accepted = (draft_of_draft > 0) & (
-        target_of_draft.to(torch.float64) / draft_of_draft >= uniform
+    accepted = (
+        (draft_of_draft > 0)
+        & (target_of_draft > 0)
+        & (target_of_draft.to(torch.float64) / draft_of_draft >= uniform)
     )
 
     # The correction for a rejected position, drawn from the positive part of
@@ -279,13 +632,32 @@ def _random_walk(
     return accepted, candidates
 
 
+def _fast_enabled() -> bool:
+    return os.environ.get("VLLM_TT_SPEC_FAST_TOPK", "1") != "0"
+
+
+def _tie_exact() -> bool:
+    """True when a top-p cut inside a tie group must follow the reference sort.
+
+    The reference sort is unstable, so which members of a tie group survive a
+    top-p cut is an accident of the sort. Matching it needs a full-vocabulary
+    sort (about 20 ms per position on the host), and bf16 logits tie often
+    enough that most live steps paid it. Off by default: the cut then keeps
+    the lowest token ids of the group. The kept probabilities are the same
+    values as the reference's, and only which of the equal-logit tokens holds
+    them can differ. Set VLLM_TT_SPEC_TIE_EXACT=1 for the reference's choice.
+    """
+    return os.environ.get("VLLM_TT_SPEC_TIE_EXACT", "0") == "1"
+
+
 def _constrained_probs(
     target_logits: torch.Tensor,
     temperature: torch.Tensor,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Target probabilities after temperature, top-k and top-p.
+    """Target probabilities after temperature, min_p, top-k and top-p.
 
     The distribution the accept walk must preserve is the one the operator
     asked for, so the constraints belong before the accept test rather than
@@ -297,29 +669,613 @@ def _constrained_probs(
     needs the raw logits afterwards.
     """
     rows, width, vocab = target_logits.shape
-    safe_temperature = torch.where(
-        temperature <= 0.0, torch.ones_like(temperature), temperature
-    )
-    logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
-
-    if top_k is not None or top_p is not None:
-        # Deferred: vllm.v1.sample.ops resolves current_platform at import
-        # time, which loads this plugin, so importing it at module scope from
-        # inside the plugin is a cycle. The pytorch entry point is named
-        # directly rather than the dispatching apply_top_k_top_p, which would
-        # route to Triton on a machine that has it and to torch here, and
-        # the two are not required to break ties identically.
-        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
-
-        flat = logits.reshape(rows * width, vocab)
-        flat = apply_top_k_top_p_pytorch(
-            flat,
-            None if top_k is None else _expand_to_columns(top_k, width),
-            None if top_p is None else _expand_to_columns(top_p, width),
+    if _fast_enabled():
+        return (
+            _constrained_table(target_logits, temperature, top_k, top_p, min_p)
+            .to_dense()
+            .reshape(rows, width, vocab)
         )
-        logits = flat.reshape(rows, width, vocab)
 
-    return logits.softmax(dim=-1, dtype=torch.float32)
+    safe_temperature = _safe_temperature(temperature)
+    logits = target_logits.to(torch.float32) / safe_temperature.view(rows, 1, 1)
+    logits = _apply_min_p(logits, min_p)
+    if top_k is None and top_p is None:
+        return logits.softmax(dim=-1, dtype=torch.float32)
+
+    flat = logits.reshape(rows * width, vocab)
+    flat = _reference_top_k_top_p(
+        flat,
+        None if top_k is None else _expand_to_columns(top_k, width),
+        None if top_p is None else _expand_to_columns(top_p, width),
+    )
+    return flat.reshape(rows, width, vocab).softmax(dim=-1, dtype=torch.float32)
+
+
+def _safe_temperature(temperature: torch.Tensor) -> torch.Tensor:
+    return torch.where(temperature <= 0.0, torch.ones_like(temperature), temperature)
+
+
+def _apply_min_p(logits: torch.Tensor, min_p: torch.Tensor | None) -> torch.Tensor:
+    if min_p is None or not bool((min_p > 0).any()):
+        return logits
+    # vLLM's MinPLogitsProcessor arithmetic, on the tempered logits. A row
+    # at 0 has a threshold of 0, which nothing falls below.
+    probs = logits.softmax(dim=-1)
+    threshold = probs.amax(dim=-1, keepdim=True) * min_p.to(torch.float32).view(
+        logits.shape[0], 1, 1
+    )
+    return logits.masked_fill(probs < threshold, float("-inf"))
+
+
+def _reference_top_k_top_p(
+    flat: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    # Deferred: vllm.v1.sample.ops resolves current_platform at import
+    # time, which loads this plugin, so importing it at module scope from
+    # inside the plugin is a cycle. The pytorch entry point is named
+    # directly rather than the dispatching apply_top_k_top_p, which would
+    # route to Triton on a machine that has it and to torch here, and
+    # the two are not required to break ties identically.
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    return apply_top_k_top_p_pytorch(flat, k, p)
+
+
+# Largest top_k the fast path serves, and the extra candidates it keeps so
+# that ties at the k-th value are seen. A row whose ties overflow the margin
+# takes the reference path.
+_FAST_TOPK_MAX = 1024
+_FAST_TOPK_MARGIN = 64
+
+# Candidates a top-p row without top-k is decided from, by default. A row whose
+# nucleus does not fit in them takes the reference path.
+_TOP_P_CANDIDATES = 2048
+# How close a candidate's tail may come to the reference's 1 - p threshold,
+# relative to 1 - p, before the row takes the reference path instead. The two
+# tails differ by rounding only: the reference's float32 softmax does not sum
+# to exactly 1, which scales its every tail by the same factor. Over 600 random
+# 152064-wide rows that factor stayed within 4e-6 of 1; the margin is ten
+# times that.
+_TOP_P_DECISION_MARGIN = 4e-5
+
+
+class _ProbTable:
+    """Per-position target probabilities, stored by support where it is small.
+
+    ``N = rows * width`` flat positions. A sparse position keeps its candidate
+    token ids and their probabilities (everything else is exactly 0). A dense
+    position keeps all ``vocab`` probabilities; those are rows with neither
+    top-k nor top-p, and rows the fast path cannot serve, which cost what the
+    old path cost.
+    """
+
+    def __init__(self, n: int, vocab: int):
+        self.n = n
+        self.vocab = vocab
+        self.is_sparse = torch.zeros(n, dtype=torch.bool)
+        self.slot = torch.zeros(n, dtype=torch.long)
+        self.sparse_ids = torch.empty(0, dtype=torch.long)
+        self.idx = torch.empty(0, 0, dtype=torch.long)
+        self.sp = torch.empty(0, 0, dtype=torch.float32)
+        self.dense_ids = torch.empty(0, dtype=torch.long)
+        self.dp = torch.empty(0, vocab, dtype=torch.float32)
+
+    def set_sparse(self, ids, idx, p):
+        self.sparse_ids, self.idx, self.sp = ids, idx, p
+        self.is_sparse[ids] = True
+        self.slot[ids] = torch.arange(ids.numel())
+
+    def set_dense(self, ids, p):
+        self.dense_ids, self.dp = ids, p
+        self.slot[ids] = torch.arange(ids.numel())
+
+    def to_dense(self) -> torch.Tensor:
+        out = torch.zeros(self.n, self.vocab, dtype=torch.float32)
+        if self.sparse_ids.numel():
+            # Added, not assigned: a padded support repeats a token id with
+            # probability 0, which an assignment could write over the real one.
+            out[self.sparse_ids] = torch.zeros(
+                self.sparse_ids.numel(), self.vocab
+            ).scatter_add_(1, self.idx, self.sp)
+        if self.dense_ids.numel():
+            out[self.dense_ids] = self.dp
+        return out
+
+    def _split(self, flat_ids):
+        sparse = self.is_sparse[flat_ids]
+        return sparse, ~sparse
+
+    def prob_of(self, flat_ids: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Probability each flat position gives its own token."""
+        out = torch.zeros(flat_ids.numel(), dtype=torch.float32)
+        sparse, dense = self._split(flat_ids)
+        if bool(sparse.any()):
+            slot = self.slot[flat_ids[sparse]]
+            hit = self.idx[slot] == tokens[sparse].unsqueeze(1)
+            out[sparse] = (self.sp[slot] * hit).sum(dim=1)
+        if bool(dense.any()):
+            slot = self.slot[flat_ids[dense]]
+            out[dense] = self.dp[slot, tokens[dense]]
+        return out
+
+    def sample(
+        self,
+        flat_ids: torch.Tensor,
+        u: torch.Tensor,
+        exclude: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Inverse-CDF draw per flat position from p (minus ``exclude``).
+
+        ``u`` is float64 in [0, 1). Scale free: ``exclude`` removes a token's
+        mass without renormalising, and the threshold is ``u * total``.
+        """
+        out = torch.zeros(flat_ids.numel(), dtype=torch.long)
+        sparse, dense = self._split(flat_ids)
+        if bool(sparse.any()):
+            slot = self.slot[flat_ids[sparse]]
+            idx = self.idx[slot]
+            w = self.sp[slot].to(torch.float64)
+            if exclude is not None:
+                w = w.masked_fill(idx == exclude[sparse].unsqueeze(1), 0.0)
+            pick = _inverse_cdf(w, u[sparse])
+            out[sparse] = idx.gather(1, pick.unsqueeze(1)).squeeze(1)
+        if bool(dense.any()):
+            slot = self.slot[flat_ids[dense]]
+            w = self.dp[slot].to(torch.float64)
+            if exclude is not None:
+                w.scatter_(1, exclude[dense].unsqueeze(1), 0.0)
+            out[dense] = _inverse_cdf(w, u[dense])
+        return out.to(torch.int32)
+
+    def race_pick(self, flat_id: int, noise: torch.Tensor) -> int:
+        """The old exponential race for one position, ``noise`` of size vocab.
+
+        Used for a seeded row's bonus so its generator advances exactly as the
+        ordinary sampler's does.
+        """
+        slot = int(self.slot[flat_id])
+        if bool(self.is_sparse[flat_id]):
+            idx = self.idx[slot]
+            scored = self.sp[slot] / noise[idx]
+            return int(idx[scored.argmax()])
+        return int((self.dp[slot] / noise).argmax())
+
+
+def _inverse_cdf(weights: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """Column index drawn from each row of non-negative ``weights`` (float64)."""
+    cdf = weights.cumsum(dim=1)
+    threshold = (u * cdf[:, -1]).unsqueeze(1)
+    pick = (cdf <= threshold).sum(dim=1)
+    # u * total can round up to total; stay on the last positive weight.
+    last_positive = (weights > 0).to(torch.int8).flip(1).argmax(dim=1)
+    last_positive = weights.shape[1] - 1 - last_positive
+    return torch.minimum(pick, last_positive)
+
+
+def _constrained_table(
+    target_logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
+) -> _ProbTable:
+    """The same probabilities as the reference path, without full-vocab work.
+
+    Same masks as ``apply_top_k_top_p_pytorch`` followed by a softmax: top-k
+    keeps every logit ``>=`` the k-th largest (ties kept), then top-p drops
+    the ascending-cumsum prefix ``<= 1 - p`` but always keeps the largest. With
+    top-k on, both are evaluated on the top ``k_max + margin`` candidates only,
+    which holds every survivor of top-k. Temperature is applied to the
+    candidates, which is the same division of the same values; it is monotone,
+    so the candidates of the raw logits are the candidates of the tempered
+    ones. A top-p row without top-k is decided by ``_top_p_only_support``. Rows
+    the candidates cannot decide (top-k above the cap with top-p active, tie
+    overflow, a nucleus wider than the top-p candidates, a top-p cut inside a
+    group of equal logits under VLLM_TT_SPEC_TIE_EXACT=1) use the reference
+    path.
+    """
+    rows, width, vocab = target_logits.shape
+    n = rows * width
+    flat = target_logits.reshape(n, vocab)
+    temp = _expand_to_columns(_safe_temperature(temperature), width).to(torch.float32)
+    k = None if top_k is None else _expand_to_columns(top_k, width)
+    p = None if top_p is None else _expand_to_columns(top_p, width)
+
+    if min_p is not None and bool((min_p > 0).any()):
+        # min_p reads the tempered softmax of the whole row, so it stays full.
+        flat = _apply_min_p(
+            flat.to(torch.float32).reshape(rows, width, vocab)
+            / _safe_temperature(temperature).view(rows, 1, 1),
+            min_p,
+        ).reshape(n, vocab)
+        temp = torch.ones_like(temp)
+
+    off = torch.zeros(n, dtype=torch.bool)
+    k_on = off if k is None else (k > 0) & (k < vocab)
+    p_on = off if p is None else p < 1.0
+    active = k_on | p_on
+    fast = off if k is None else k_on & (k <= _FAST_TOPK_MAX)
+    top_p_candidates = _top_p_candidates()
+    top_p_only = p_on & ~k_on if top_p_candidates else off
+    fallback = active & ~fast & ~top_p_only
+
+    table = _ProbTable(n, vocab)
+    dense_ids = (~active).nonzero().squeeze(1)
+    dense_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+    sparse_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if dense_ids.numel():
+        sub = flat[dense_ids].to(torch.float32) / temp[dense_ids].unsqueeze(1)
+        dense_rows.append((dense_ids, sub.softmax(dim=-1)))
+
+    if bool(fast.any()):
+        ids = fast.nonzero().squeeze(1)
+        sub = flat if ids.numel() == n else flat[ids]
+        k_f = k[ids].to(torch.long)
+        cand = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
+        vals, idx = torch.topk(sub, cand, dim=-1)
+        if not _tie_exact():
+            # The top-p cut below then drops the highest ids of a tie group
+            # first.
+            vals, idx = _by_value_then_id(vals, idx)
+        vals = vals.to(torch.float32) / temp[ids].unsqueeze(1)
+        kth = vals.gather(1, (k_f - 1).unsqueeze(1))
+        keep = vals >= kth
+        # Candidates cannot show how many logits tie with the k-th beyond
+        # the last one they hold, unless that tie is -inf (probability 0).
+        overflow = ((vals[:, -1:] >= kth) & (kth > float("-inf"))).squeeze(1)
+        overflow = overflow & (cand < vocab)
+        vals = vals.masked_fill(~keep, float("-inf"))
+        if p is not None:
+            p_f = p[ids]
+            # The reference's ascending cumsum is the reversed descending one.
+            cum = torch.cumsum(vals.softmax(dim=-1).flip(-1), dim=-1).flip(-1)
+            drop = cum <= (1 - p_f).unsqueeze(1)
+            drop[:, 0] = False
+            if _tie_exact():
+                # The reference sort is not stable, so when the cut falls
+                # inside a group of equal logits it keeps an arbitrary member
+                # of the group. Such a row takes the reference path to match.
+                kept = (~drop).sum(dim=1, keepdim=True)
+                nxt = vals.gather(1, kept.clamp(max=cand - 1))
+                last = vals.gather(1, kept - 1)
+                overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
+            vals = vals.masked_fill(drop, float("-inf"))
+        ok = ~overflow
+        if bool(ok.any()):
+            sparse_rows.append(
+                (ids[ok], idx[ok], vals[ok].softmax(dim=-1, dtype=torch.float32))
+            )
+        if bool(overflow.any()):
+            fallback = fallback.clone()
+            fallback[ids[overflow]] = True
+
+    if bool(top_p_only.any()):
+        ids = top_p_only.nonzero().squeeze(1)
+        # The division the reference makes, so the same tempered values.
+        sub = flat[ids].to(torch.float32) / temp[ids].unsqueeze(1)
+        ok, idx, probs = _top_p_only_support(sub, p[ids], top_p_candidates)
+        if bool(ok.any()):
+            sparse_rows.append((ids[ok], idx[ok], probs[ok]))
+        if not bool(ok.all()):
+            fallback = fallback.clone()
+            fallback[ids[~ok]] = True
+
+    if sparse_rows:
+        table.set_sparse(*_stack_supports(sparse_rows))
+
+    if bool(fallback.any()):
+        ids = fallback.nonzero().squeeze(1)
+        sub = flat[ids].to(torch.float32) / temp[ids].unsqueeze(1)
+        k_ref = None if k is None else torch.where(k_on, k, vocab)[ids]
+        out = _reference_top_k_top_p(sub, k_ref, None if p is None else p[ids])
+        dense_rows.append((ids, out.softmax(dim=-1, dtype=torch.float32)))
+
+    if dense_rows:
+        table.set_dense(
+            torch.cat([i for i, _ in dense_rows]), torch.cat([d for _, d in dense_rows])
+        )
+    return table
+
+
+def _top_p_candidates() -> int:
+    """How many candidates decide a top-p row without top-k; 0 disables that.
+
+    VLLM_TT_SPEC_TOPP_CANDIDATES overrides the default. With 0, such rows take
+    the reference path, as they did before the fast path served them.
+    """
+    raw = os.environ.get("VLLM_TT_SPEC_TOPP_CANDIDATES")
+    if raw is None:
+        return _TOP_P_CANDIDATES
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(
+            "VLLM_TT_SPEC_TOPP_CANDIDATES must be a non-negative integer (0 "
+            f"disables the top-p-only fast path), got {raw!r}"
+        )
+    return value
+
+
+def _by_value_then_id(
+    vals: torch.Tensor, idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Candidates reordered by value descending, then token id ascending.
+
+    A fixed tie order, so a top-p cut inside a group of equal values keeps the
+    group's lowest ids, whatever order ``torch.topk`` returned them in.
+    """
+    by_id = idx.argsort(dim=1)
+    idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
+    vals, by_value = vals.sort(dim=1, descending=True, stable=True)
+    return vals, idx.gather(1, by_value)
+
+
+def _top_p_only_support(
+    logits: torch.Tensor, top_p: torch.Tensor, candidates: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-p over the whole vocabulary without sorting it, where that is exact.
+
+    ``logits`` is ``[R, V]`` tempered, ``top_p`` is ``[R]`` below 1. Returns
+    ``(ok, idx, probs)``: where ``ok``, row ``r``'s support is ``idx[r]`` with
+    ``probs[r]`` (zero past the nucleus), in token id order; rows not ``ok``
+    must take the reference path.
+
+    The reference sorts the row ascending, takes the softmax and its cumulative
+    sum, and drops each token whose cumulative sum, the mass of that token and
+    of every smaller one, is ``<= 1 - p``; the largest token always stays. That
+    tail mass only shrinks down the descending order, so the nucleus is a
+    prefix of it, and the tail at a candidate is 1 minus the mass ranked ahead
+    of it. The float64 sum of every exponential, shifted by the row maximum
+    as the reference's softmax shifts it (a logsumexp without its
+    logarithm), gives that tail at every one of the top ``candidates`` with
+    no sort: the total, less the exponentials ranked ahead, over the total. The
+    candidates decide the nucleus when it ends before their last value,
+    strictly: every token outside them is then no larger than one already
+    dropped, so it is dropped too. A row is sent to the reference path when
+    the nucleus does not end inside the candidates, when a candidate's tail is
+    within ``_TOP_P_DECISION_MARGIN * (1 - p)`` of ``1 - p`` (where rounding
+    could decide differently), when its maximum or its normaliser is not
+    finite, and under VLLM_TT_SPEC_TIE_EXACT=1 when the cut falls inside a
+    group of equal values.
+
+    Ties at the cut are handled as the top-k fast path handles them: the
+    candidates are ordered by value, then token id, and the cut keeps the
+    lowest ids of the group. Members of a group are equally probable, so the
+    reference keeps as many of them; only which ones can differ.
+
+    The support is returned in token id order, which is the order the dense
+    reference table is walked in, so an inverse-CDF draw over it picks the
+    token the reference table picks for the same uniform.
+    """
+    rows, vocab = logits.shape
+    width = min(candidates, vocab)
+    whole = width == vocab
+    tie_exact = _tie_exact()
+
+    # The reference's float32 exponentials, shifted by the row maximum, rather
+    # than a float32 logsumexp, whose rounding grows with the logits'
+    # magnitude. Summed in float64, and the tail taken as the total less the
+    # exponentials ahead, so 1 - ahead's cancellation adds no float32 error.
+    top = logits.amax(dim=-1, keepdim=True)
+    shifted = torch.exp(logits - top)
+    total = shifted.sum(dim=-1, keepdim=True, dtype=torch.float64)
+    # The reference compares in top_p's own dtype, 1 - p included.
+    threshold = (1 - top_p).to(torch.float64).unsqueeze(1)
+    ok = (torch.isfinite(top) & torch.isfinite(total)).squeeze(1)
+    if not whole:
+        # To end the nucleus, the candidates ahead of the cut must hold p of
+        # the total, and they hold at most ``width`` of it: a shifted
+        # exponential is at most 1. A row that fails this cannot be served,
+        # so it skips the top-k and goes straight to the reference.
+        ok = ok & ((1 - threshold) * total <= width).squeeze(1)
+    live = ok.nonzero().squeeze(1)
+    if not live.numel():
+        return ok, torch.zeros(rows, 1, dtype=torch.long), torch.zeros(rows, 1)
+    if live.numel() < rows:
+        logits, shifted = logits[live], shifted[live]
+        total, threshold = total[live], threshold[live]
+
+    vals, idx = torch.topk(logits, width, dim=-1)
+    if not tie_exact:
+        vals, idx = _by_value_then_id(vals, idx)
+    ahead = torch.cumsum(shifted.gather(1, idx).to(torch.float64), dim=-1)
+    ahead = torch.nn.functional.pad(ahead[:, :-1], (1, 0))
+    tail = (total - ahead) / total
+    keep = tail > threshold
+    keep[:, 0] = True
+    kept = keep.sum(dim=1, keepdim=True)
+
+    near = (tail - threshold).abs() <= _TOP_P_DECISION_MARGIN * threshold
+    near[:, 0] = False
+    decided = ~near.any(dim=1)
+    last = vals.gather(1, kept - 1)
+    if not whole:
+        # The last candidate strictly below the last kept value: the nucleus
+        # ends inside the candidates, and no token outside them ties with it.
+        decided = decided & (vals[:, -1:] < last).squeeze(1)
+    if tie_exact:
+        nxt = vals.gather(1, kept.clamp(max=width - 1))
+        decided = decided & ~((kept < width) & (nxt == last)).squeeze(1)
+    ok[live] = decided
+
+    # Only as wide as the widest nucleus served, and in token id order.
+    served = int(kept[decided].max()) if bool(decided.any()) else 1
+    keep, vals, idx = keep[:, :served], vals[:, :served], idx[:, :served]
+    probs = vals.masked_fill(~keep, float("-inf")).softmax(dim=-1, dtype=torch.float32)
+    by_id = idx.argsort(dim=1)
+    support = torch.zeros(rows, served, dtype=torch.long)
+    support_probs = torch.zeros(rows, served, dtype=torch.float32)
+    support[live] = idx.gather(1, by_id)
+    support_probs[live] = probs.gather(1, by_id)
+    return ok, support, support_probs
+
+
+def _stack_supports(
+    parts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One sparse block from supports of different widths, padded with zeros.
+
+    A padding entry is token 0 with probability 0. No draw picks a zero, a
+    lookup sums over a token's entries, and ``to_dense`` adds them, so the
+    padding never changes a token's probability.
+    """
+    width = max(int(idx.shape[1]) for _, idx, _ in parts)
+
+    def pad(t: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.pad(t, (0, width - int(t.shape[1])))
+
+    return (
+        torch.cat([ids for ids, _, _ in parts]),
+        torch.cat([pad(idx) for _, idx, _ in parts]),
+        torch.cat([pad(probs) for _, _, probs in parts]),
+    )
+
+
+def _point_mass_walk(
+    target_logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    min_p: torch.Tensor | None,
+    generators: dict[int, torch.Generator],
+    rows: int,
+    num_drafts: int,
+    vocab: int,
+    uniforms: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The random walk for a point-mass draft, drawing over supports only.
+
+    Accept draft ``d`` with probability ``p(d)`` (q is a point mass), and on a
+    rejection draw from ``p`` with ``d`` removed, renormalised: exactly the
+    general walk with ``q = 1`` at ``d``. Only the first rejection of a row can
+    commit, so only that position's correction is drawn.
+
+    Unseeded rows draw their uniforms in batched calls. A seeded row draws
+    from its own generator in the old order (bonus, accept uniforms,
+    correction), so its values depend on nothing outside the row. A seeded row
+    with no drafts keeps the old full-vocabulary exponential race for its
+    bonus, so that it reads exactly what an ordinary sampled step reads and
+    leaves the generator where that step does; every other seeded draw is a
+    uniform. With ``uniforms`` (``predraw_uniforms``' table) nothing is drawn:
+    every row's bonus is an inverse-CDF draw from its column 0.
+    """
+    width = num_drafts + 1
+    table = _constrained_table(target_logits, temperature, top_k, top_p, min_p)
+    valid = num_valid_drafts.to(torch.long)
+    draft_ids = draft_token_ids.to(torch.long).clamp(0, vocab - 1)
+    row_ids = torch.arange(rows)
+    bonus_ids = row_ids * width + valid
+
+    if uniforms is not None:
+        given = uniforms.to(torch.float64)
+        if tuple(given.shape) != (rows, num_drafts + 2):
+            raise ValueError(
+                f"uniforms must be [{rows}, {num_drafts + 2}] (bonus, one per "
+                f"draft column, correction), got {tuple(given.shape)}"
+            )
+        # Columns 0 and K+1 in the drawing walk's two-column layout.
+        draws = torch.stack([given[:, 0], given[:, num_drafts + 1]], dim=1)
+        bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
+        accept_uniform = given[:, 1 : num_drafts + 1]
+    else:
+        # One batched draw for the unseeded rows: column 0 the bonus, column 1
+        # the correction. Seeded rows overwrite their own entries below.
+        draws = torch.rand((rows, 2), dtype=torch.float64)
+        # A seeded row with drafts draws its bonus as a uniform, first, from its
+        # own generator. A seeded row without drafts is an ordinary sampled step
+        # and draws what the ordinary sampler draws.
+        draftless = {row: g for row, g in generators.items() if int(valid[row]) == 0}
+        for row, generator in generators.items():
+            if row not in draftless:
+                uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
+                draws[row, 0] = uniform[0]
+        bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
+        for row, generator in draftless.items():
+            noise = torch.empty(vocab, dtype=torch.float32)
+            noise.exponential_(generator=generator)
+            bonus[row] = table.race_pick(int(bonus_ids[row]), noise)
+        accept_uniform = _uniform(rows, num_drafts, num_valid_drafts, generators)
+        for row, generator in generators.items():
+            if int(valid[row]):
+                uniform = torch.rand((1,), dtype=torch.float64, generator=generator)
+                draws[row, 1] = uniform[0]
+
+    flat_ids = (row_ids.unsqueeze(1) * width + torch.arange(num_drafts)).reshape(-1)
+    p_draft = table.prob_of(flat_ids, draft_ids.reshape(-1)).reshape(rows, num_drafts)
+    accepted = (p_draft > 0) & (p_draft.to(torch.float64) >= accept_uniform)
+
+    in_row = torch.arange(num_drafts).unsqueeze(0) < valid.unsqueeze(1)
+    rejected = in_row & ~accepted
+    needs = rejected.any(dim=1)
+    first = rejected.to(torch.int8).argmax(dim=1)
+    candidates = torch.cat(
+        [
+            draft_token_ids.to(torch.int32),
+            torch.full((rows, 1), PLACEHOLDER_TOKEN_ID, dtype=torch.int32),
+        ],
+        dim=1,
+    )
+    corr_rows = needs.nonzero().squeeze(1)
+    if corr_rows.numel():
+        pos = first[corr_rows]
+        recovered = table.sample(
+            corr_rows * width + pos,
+            draws[corr_rows, 1],
+            exclude=draft_ids[corr_rows, pos],
+        )
+        candidates[corr_rows, pos] = recovered
+    candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
+    return accepted, candidates
+
+
+def predraw_uniforms(
+    generators: dict[int, torch.Generator],
+    rows: int,
+    num_drafts: int,
+    num_valid_drafts: torch.Tensor,
+) -> torch.Tensor:
+    """Every uniform the point-mass walk would draw for ``rows`` rows, drawn now.
+
+    Returns the ``[rows, K+2]`` float64 table ``accept_speculated_tokens``
+    takes as ``uniforms``: column 0 the bonus, columns 1..K the accept tests of
+    draft columns 0..K-1, column K+1 the correction. The draws are made in
+    ``_point_mass_walk``'s order, so each seeded generator and the global
+    stream end where that walk leaves them, and a walk on this table commits
+    what the drawing walk would have:
+
+    1. the global ``torch.rand((rows, 2))``: the bonus and the correction of
+       every row, greedy rows included, as the drawing walk draws them;
+    2. each seeded row's bonus from its own generator;
+    3. the global ``torch.rand((rows, K))``: the accept tests of every row;
+    4. each seeded row's ``num_valid_drafts`` accept tests, then its
+       correction, from its own generator. The correction is drawn whether or
+       not a draft will be rejected, as the drawing walk draws it.
+
+    ``rows`` is the number of rows the walk is handed (the live rows), because
+    the global draws depend on it. A seeded row without drafts raises: the
+    drawing walk races its generator over the whole vocabulary for that bonus,
+    which no uniform can stand in for, so such a step keeps the drawing walk.
+    """
+    valid = num_valid_drafts.reshape(-1).to(torch.int64).tolist()
+    if len(valid) != rows:
+        raise ValueError(f"num_valid_drafts has {len(valid)} entries for {rows} rows")
+    draftless = sorted(row for row in generators if valid[row] == 0)
+    if draftless:
+        raise ValueError(
+            f"seeded rows {draftless} carry no drafts: their bonus is a "
+            "full-vocabulary exponential race, which a uniform cannot stand in for"
+        )
+    draws = torch.rand((rows, 2), dtype=torch.float64)
+    for row, generator in generators.items():
+        draws[row, 0] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+    accepts = _uniform(rows, num_drafts, num_valid_drafts, generators)
+    for row, generator in generators.items():
+        draws[row, 1] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+    return torch.cat([draws[:, :1], accepts, draws[:, 1:]], dim=1)
 
 
 def _sample_per_row(
@@ -334,12 +1290,16 @@ def _sample_per_row(
     argmax of ``w_v / e_v`` is distributed as ``w`` normalised. One race per
     row rather than per position, matching upstream, so a seeded request draws
     the same number of values however many positions it carries.
+
+    Divided rather than multiplied by a reciprocal, because that is the
+    ordinary sampler's arithmetic: a seeded row with no drafts then draws
+    exactly the token the ordinary sampler draws from the same distribution.
     """
     race = torch.empty((rows, vocab), dtype=torch.float32)
     race.exponential_()
     for row, generator in generators.items():
         race[row].exponential_(generator=generator)
-    scored = weights * race.reciprocal().unsqueeze(1)
+    scored = weights / race.unsqueeze(1)
     return scored.argmax(dim=-1).to(torch.int32)
 
 
@@ -413,6 +1373,42 @@ def _within_count(rows: int, width: int, accepted_counts: torch.Tensor) -> torch
     return columns < accepted_counts.to(torch.int64).unsqueeze(1)
 
 
+def _apply_grammar_bitmask(logits: torch.Tensor, bitmask: torch.Tensor) -> torch.Tensor:
+    """``logits`` with every token a row's column bitmask forbids set to ``-inf``.
+
+    Only rows with a constraint are unpacked: a row that is all ones, which is
+    every row without a structured request, would cost ``1+K`` columns of 32
+    integers per vocabulary word for nothing. Returns ``logits`` itself when
+    no row is constrained, and a new tensor otherwise.
+    """
+    constrained = (bitmask != -1).flatten(1).any(dim=1).nonzero().view(-1)
+    if not int(constrained.numel()):
+        return logits
+    masked = logits.clone()
+    masked[constrained] = masked[constrained].masked_fill(
+        _grammar_disallowed(bitmask[constrained], int(logits.shape[-1])),
+        float("-inf"),
+    )
+    return masked
+
+
+def _grammar_disallowed(bitmask: torch.Tensor, vocab: int) -> torch.Tensor:
+    """``[..., V]`` bool from a packed ``[..., W]`` bitmask, True where disallowed.
+
+    A bitmask narrower than the vocabulary covers the tokenizer's ids only, and
+    a token no grammar can name is disallowed, so the tail is padded with True.
+    """
+    bits = torch.arange(32, dtype=torch.int32)
+    allowed = ((bitmask.to(torch.int32).unsqueeze(-1) >> bits) & 1).bool()
+    allowed = allowed.reshape(*bitmask.shape[:-1], -1)
+    if int(allowed.shape[-1]) < vocab:
+        pad = torch.zeros(
+            (*allowed.shape[:-1], vocab - int(allowed.shape[-1])), dtype=torch.bool
+        )
+        allowed = torch.cat([allowed, pad], dim=-1)
+    return ~allowed[..., :vocab]
+
+
 def _gather_ids(probs: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     """``[B, S]`` probability that ``probs[b, s]`` assigns to ``ids[b, s]``."""
     return probs.gather(2, ids.unsqueeze(2)).squeeze(2)
@@ -428,6 +1424,7 @@ def _check_inputs(
     draft_token_ids: torch.Tensor,
     num_valid_drafts: torch.Tensor,
     temperature: torch.Tensor,
+    min_p: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if target_logits.dim() != 3:
         raise ValueError(
@@ -450,8 +1447,9 @@ def _check_inputs(
     for name, tensor in (
         ("num_valid_drafts", num_valid_drafts),
         ("temperature", temperature),
+        ("min_p", min_p),
     ):
-        if tensor.shape != (rows,):
+        if tensor is not None and tensor.shape != (rows,):
             raise ValueError(
                 f"accept_speculated_tokens {name} must be [{rows}], got "
                 f"{tuple(tensor.shape)}"
@@ -499,6 +1497,78 @@ def _check_draft_ids(
     )
 
 
+def _check_sampling(
+    sampling: SpecSamplingInputs, rows: int, width: int, vocab: int
+) -> None:
+    """Every per-row control must have one entry per row of the block.
+
+    Checked because a short tensor is not always refused further down: vLLM's
+    penalty op scatters a one-row prompt into the first row only, and the other
+    rows silently lose their repetition penalty, and a ``[1, V]`` allowlist
+    broadcasts one request's allowlist over every row.
+    """
+    filters = sampling.filters
+    if filters is not None:
+        mask = filters.allowed_token_ids_mask
+        if mask is not None and tuple(mask.shape) != (rows, vocab):
+            raise ValueError(
+                f"accept_sampled_drafts filters.allowed_token_ids_mask must be "
+                f"[{rows}, {vocab}], got {tuple(mask.shape)}"
+            )
+        bitmask = filters.grammar_bitmask
+        if bitmask is not None and (
+            bitmask.dim() != 3 or tuple(bitmask.shape[:2]) != (rows, width)
+        ):
+            raise ValueError(
+                f"accept_sampled_drafts filters.grammar_bitmask must be "
+                f"[{rows}, {width}, W], one packed row per candidate column, "
+                f"got {tuple(bitmask.shape)}"
+            )
+        if filters.output_token_ids is not None and (
+            len(filters.output_token_ids) != rows
+        ):
+            raise ValueError(
+                f"accept_sampled_drafts filters.output_token_ids must hold "
+                f"{rows} rows, got {len(filters.output_token_ids)}"
+            )
+        outside = [
+            row
+            for row in (*filters.bad_words_token_ids, *filters.min_tokens)
+            if not 0 <= int(row) < rows
+        ]
+        if outside:
+            raise ValueError(
+                f"accept_sampled_drafts filters name rows {sorted(set(outside))} "
+                f"outside the block's {rows}"
+            )
+    per_row = {"top_k": sampling.top_k, "top_p": sampling.top_p}
+    penalties = sampling.penalties
+    if penalties is not None:
+        per_row.update(
+            presence=penalties.presence,
+            frequency=penalties.frequency,
+            repetition=penalties.repetition,
+        )
+        if penalties.prompt_token_ids.dim() != 2 or (
+            int(penalties.prompt_token_ids.shape[0]) != rows
+        ):
+            raise ValueError(
+                f"accept_sampled_drafts penalties.prompt_token_ids must be "
+                f"[{rows}, P], got {tuple(penalties.prompt_token_ids.shape)}"
+            )
+        if len(penalties.output_token_ids) != rows:
+            raise ValueError(
+                f"accept_sampled_drafts penalties.output_token_ids must hold "
+                f"{rows} rows, got {len(penalties.output_token_ids)}"
+            )
+    for name, tensor in per_row.items():
+        if tensor is not None and tensor.shape != (rows,):
+            raise ValueError(
+                f"accept_sampled_drafts {name} must be [{rows}], got "
+                f"{tuple(tensor.shape)}"
+            )
+
+
 def _check_draft_probs(
     draft_probs: torch.Tensor, rows: int, num_drafts: int, vocab: int
 ) -> None:
@@ -509,4 +1579,14 @@ def _check_draft_probs(
         )
 
 
-__all__ = ["AcceptResult", "accept_speculated_tokens"]
+__all__ = [
+    "AcceptResult",
+    "SpecPenalties",
+    "SpecSamplingInputs",
+    "SpecTokenFilters",
+    "accept_sampled_drafts",
+    "accept_speculated_tokens",
+    "apply_speculative_penalties",
+    "apply_speculative_token_filters",
+    "committed_logprobs",
+]
