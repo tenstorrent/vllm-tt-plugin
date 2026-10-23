@@ -53,6 +53,7 @@ from vllm_tt_plugin.config import (
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
     store_tt_prefill_chunking,
+    store_tt_prefill_first_step_tokens,
     store_tt_prefix_hit_policy,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
@@ -322,6 +323,7 @@ def _store_prefill_chunking(
     if not vllm_config.scheduler_config.enable_chunked_prefill:
         alignment = max_partial = 0
     store_tt_prefill_chunking(vllm_config, alignment, max_partial)
+    store_tt_prefill_first_step_tokens(vllm_config, int(capabilities.get("prefill_first_step_tokens", 0)) if alignment else 0)
     store_tt_prefix_hit_policy(
         vllm_config, capabilities.get("prefix_cache_hit_policy", "") if alignment else ""
     )

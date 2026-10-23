@@ -21,6 +21,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_partial_prefills,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefill_first_step_tokens,
     get_tt_prefix_hit_policy,
     round_tt_prefix_hit,
     get_tt_spec_plan,
@@ -358,6 +359,7 @@ class TTScheduler(AsyncScheduler):
         self._pending_prefix_cache_reset = False
         self._max_partial_prefills = get_tt_max_partial_prefills(self.vllm_config)
         self._prefix_hit_policy = get_tt_prefix_hit_policy(self.vllm_config)
+        self._first_step_tokens = get_tt_prefill_first_step_tokens(self.vllm_config)
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
@@ -919,6 +921,14 @@ class TTScheduler(AsyncScheduler):
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
+        # First step of an IDLE engine: the step blocks the engine loop for its whole duration and requests that arrive meanwhile (a few ms apart) can only join the next one, so a lone request that
+        # takes the whole budget as its first step delays the others by that step (4 concurrent 32k prompts: the first one's 8192-token step = 5 s head start). Cap that one step
+        # (model capability ``prefill_first_step_tokens``, one chunk): everyone who arrives within it shares the next step. Never applies while anything runs.
+        first = int(getattr(self, "_first_step_tokens", 0) or 0)
+        saved_budget = self.max_num_scheduled_tokens
+        if first > 0 and not self.running and self.waiting:
+            self.max_num_scheduled_tokens = min(saved_budget, first)
+
         saved_max = self.max_num_running_reqs
         # vLLM >= 0.31 admits waiting requests against ``max_num_active_reqs`` (a copy of max_num_seqs made at construction), not ``max_num_running_reqs``: both have to shrink by the hidden
         # decodes, or a queue longer than max_num_seqs admits past the slot count and trips ``assert len(self.running) <= self.max_num_running_reqs`` (engine dead on the 5th concurrent
@@ -928,10 +938,12 @@ class TTScheduler(AsyncScheduler):
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         if saved_active is not None:
             self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
-        held_back = self._hold_back_partial_prefills(partial_prefills)
+        held_back: list = []
         try:
+            held_back = self._hold_back_partial_prefills(partial_prefills)
             result = super().schedule()
         finally:
+            self.max_num_scheduled_tokens = saved_budget
             for request in held_back:
                 self.waiting.add_request(request)
             self.running.extend(pure_decodes)

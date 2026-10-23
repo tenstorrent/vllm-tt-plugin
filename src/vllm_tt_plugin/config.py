@@ -280,6 +280,32 @@ def get_tt_supports_device_grammar(vllm_config: "VllmConfig") -> bool:
     return bool(additional.get(_SUPPORTS_DEVICE_GRAMMAR_KEY, False))
 
 
+_PREFILL_FIRST_STEP_KEY = "_tt_prefill_first_step_tokens"
+
+
+def get_tt_prefill_first_step_tokens(vllm_config: "VllmConfig") -> int:
+    """Token cap of the FIRST prefill step of an idle engine (0 = no cap).
+
+    ``TT_PREFILL_FIRST_STEP_TOKENS`` (environment of the server) wins over the model capability ``prefill_first_step_tokens``. See ``TTScheduler._schedule_prefill_only``."""
+    import os
+
+    env = os.environ.get("TT_PREFILL_FIRST_STEP_TOKENS")
+    if env is not None and env.strip() != "":
+        return max(int(env), 0)
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return max(int(additional.get(_PREFILL_FIRST_STEP_KEY, 0) or 0), 0)
+
+
+def store_tt_prefill_first_step_tokens(vllm_config: "VllmConfig", tokens: int) -> None:
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+        raise ValueError(f"model_capabilities['prefill_first_step_tokens'] must be an integer >= 0, got {tokens!r}")
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFILL_FIRST_STEP_KEY] = int(tokens)
+
+
 def is_tt_device_grammar_preload_eligible(
     vllm_config: "VllmConfig",
     *,
