@@ -957,9 +957,9 @@ class TTScheduler(AsyncScheduler):
         A candidate (``request_will_reach_max_tokens`` before the schedule)
         counts only if the step really left it out and it is still running:
         not preempted or finished by this very schedule, since a preempted
-        request resumes and is scheduled again. ``TTModelRunner`` reads the
-        result (``get_tt_finishing_req_ids``) for a model declaring
-        ``supports_finishing_slots``.
+        request resumes and is scheduled again. Lane chaining reads the result
+        (``get_tt_finishing_req_ids``): such a request no longer holds its lane
+        back.
         """
         candidates = getattr(self, "_finishing_candidates", ())
         self._finishing_candidates = []

@@ -88,7 +88,6 @@ request-specific RoPE.
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
 | `prompt_tokens`, `output_tokens` | Supplied together when device sampling needs token history for penalties. Histories use `-1` padding. |
-| `finishing_slots` | Lane mode, a model declaring `supports_finishing_slots` only: slots of requests left out because the step in flight reaches their `max_tokens`. See [the speculative contract](SPEC_DECODE_CONTRACT.md), section 4j. |
 
 The [decode reload contract](DECODE_RELOAD_CONTRACT.md) specifies
 `decode_input_update_contract`, `reload_inputs`, `reload_page_table`,

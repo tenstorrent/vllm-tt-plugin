@@ -1841,9 +1841,6 @@ class TTAsyncDecodeController:
         # sampling modes. Preserve that behavior for legacy adapters too.
         if model_input.slot_remap is not None:
             kwargs["slot_remap"] = model_input.slot_remap
-        finishing_slots = getattr(model_input, "finishing_slots", None)
-        if finishing_slots:
-            kwargs["finishing_slots"] = list(finishing_slots)
 
         # Versioned compatibility seam. Refactored tt-metal adapters opt into
         # the four explicit commands; legacy adapters keep their old call shape.
