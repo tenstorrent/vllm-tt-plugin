@@ -747,9 +747,15 @@ def _sampled_runner(capabilities, device_sampling=True, structured=False):
     runner.model = SimpleNamespace(model_capabilities=capabilities)
     runner.requests = {
         "r0": SimpleNamespace(
+            output_token_ids=[],
             sampling_params=SimpleNamespace(
-                structured_outputs=object() if structured else None
-            )
+                structured_outputs=object() if structured else None,
+                logprobs=None,
+                allowed_token_ids=None,
+                bad_words_token_ids=None,
+                min_tokens=0,
+                all_stop_token_ids=set(),
+            ),
         )
     }
     runner.check_perform_device_sampling = lambda **_: device_sampling

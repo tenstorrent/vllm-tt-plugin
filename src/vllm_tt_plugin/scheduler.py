@@ -109,6 +109,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
     _TT_STEP_STATE_ATTR,
+    _TT_PREFIX_CACHE_RESET_ATTR,
 )
 
 
@@ -900,7 +901,9 @@ class TTScheduler(AsyncScheduler):
                     rows,
                 )
         if getattr(self, "_pending_prefix_cache_reset", False):
-            setattr(scheduler_output, _TT_PREFIX_CACHE_RESET_ATTR, True)
+            set_tt_scheduler_output_field(
+                scheduler_output, _TT_PREFIX_CACHE_RESET_ATTR, True
+            )
             self._pending_prefix_cache_reset = False
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
@@ -925,8 +928,8 @@ class TTScheduler(AsyncScheduler):
         # takes the whole budget as its first step delays the others by that step (4 concurrent 32k prompts: the first one's 8192-token step = 5 s head start). Cap that one step
         # (model capability ``prefill_first_step_tokens``, one chunk): everyone who arrives within it shares the next step. Never applies while anything runs.
         first = int(getattr(self, "_first_step_tokens", 0) or 0)
-        saved_budget = self.max_num_scheduled_tokens
-        if first > 0 and not self.running and self.waiting:
+        saved_budget = getattr(self, "max_num_scheduled_tokens", None)
+        if first > 0 and saved_budget is not None and not self.running and self.waiting:
             self.max_num_scheduled_tokens = min(saved_budget, first)
 
         saved_max = self.max_num_running_reqs
@@ -943,7 +946,8 @@ class TTScheduler(AsyncScheduler):
             held_back = self._hold_back_partial_prefills(partial_prefills)
             result = super().schedule()
         finally:
-            self.max_num_scheduled_tokens = saved_budget
+            if saved_budget is not None:
+                self.max_num_scheduled_tokens = saved_budget
             for request in held_back:
                 self.waiting.add_request(request)
             self.running.extend(pure_decodes)
@@ -990,7 +994,7 @@ class TTScheduler(AsyncScheduler):
         request); the rest wait for the next prefill step. -> the held back
         requests, in order (the caller puts them back behind what is left of the
         admitted prefix)."""
-        if not self.waiting:
+        if not self.waiting or getattr(self, "max_num_scheduled_tokens", None) is None:
             return []
         if self.max_num_scheduled_tokens < int(
             self.vllm_config.model_config.max_model_len
