@@ -29,7 +29,7 @@ from dataclasses import replace
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
-from vllm.v1.core.sched.output import GrammarOutput
+from vllm.v1.core.sched.output import GrammarOutput, NewRequestData, SchedulerOutput
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
@@ -594,6 +594,56 @@ def test_an_ordinary_decode_on_a_speculating_launch_reads_each_request_s_row_0()
         GrammarOutput(["a", "b"], marks.numpy()), plain_input, lane_total=None
     )
     assert bitmask.shape[0] == plain_input.input_tokens.shape[0]
+    assert bitmask[:2, 0].tolist() == [0, DRAFT_LEN + 1]
+
+
+def test_a_prefill_padded_with_placeholder_drafts_prefills_only_the_prompt():
+    """A prefix-cache hit on all of each prompt but its last token.
+
+    ``Scheduler.schedule`` pads such a one-token prefill to ``1 + K`` with
+    placeholder drafts, as it pads a new decode, and the grammar output then
+    holds ``1 + K`` rows for each structured request. The prefill runs the
+    last prompt token alone, and samples it under the request's row 0.
+    """
+    runner = _runner()
+    params = SamplingParams(temperature=0.0, structured_outputs=_structured())
+    scheduler_output = SchedulerOutput.make_empty()
+    for req_id, first in (("a", 1), ("b", 9)):
+        sync_harness._add_request(runner, req_id, params, first_token=first)
+        row = runner.input_batch.req_id_to_index[req_id]
+        runner.input_batch.num_computed_tokens_cpu[row] = sync_harness.PROMPT_LEN - 1
+        request = runner.requests[req_id]
+        scheduler_output.scheduled_new_reqs.append(
+            NewRequestData(
+                req_id=req_id,
+                prompt_token_ids=request.prompt_token_ids,
+                mm_features=[],
+                sampling_params=params,
+                pooling_params=None,
+                block_ids=request.block_ids,
+                num_computed_tokens=sync_harness.PROMPT_LEN - 1,
+                lora_request=None,
+            )
+        )
+        scheduler_output.num_scheduled_tokens[req_id] = 1 + DRAFT_LEN
+        scheduler_output.scheduled_spec_decode_tokens[req_id] = [
+            PLACEHOLDER_TOKEN_ID
+        ] * DRAFT_LEN
+    scheduler_output.total_num_scheduled_tokens = 2 * (1 + DRAFT_LEN)
+
+    model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
+
+    assert model_input.prompt_lens.tolist() == [sync_harness.PROMPT_LEN] * 2
+    assert model_input.input_positions.tolist() == [sync_harness.PROMPT_LEN - 1] * 2
+    assert not model_input.intermediate_prefill_mask.any()
+    assert model_input.grammar_rows_per_request == {
+        "a": DRAFT_LEN + 1,
+        "b": DRAFT_LEN + 1,
+    }
+    marks = torch.arange(2 * (DRAFT_LEN + 1), dtype=torch.int32).unsqueeze(1)
+    bitmask = runner._reorder_grammar_bitmask(
+        GrammarOutput(["a", "b"], marks.numpy()), model_input, lane_total=None
+    )
     assert bitmask[:2, 0].tolist() == [0, DRAFT_LEN + 1]
 
 

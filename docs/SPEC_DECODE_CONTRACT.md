@@ -1034,17 +1034,20 @@ is the grammar after the request's first `j` scheduled drafts, the last row is
 the bonus, and the grammar is rolled back afterwards.
 `vllm_tt_plugin.structured_output.spec_grammar_bitmask_for_tt_batch` unpacks
 that into `[B, 1+K, W]`, column `j` from row `j`, using the per-request row
-counts `TTModelRunner._prepare_model_inputs`, or in lane mode
-`TTLaneInputBatch._build_spec_block`, recorded in
+counts (`structured_output.grammar_rows_per_request`) that
+`TTModelRunner._prepare_model_inputs`, or in lane mode
+`TTLaneInputBatch.build_model_input` for every lane build, records in
 `TTModelInput.grammar_rows_per_request` from the step's scheduler output. It
 raises if those counts do not account for the bitmask exactly, because one
 wrong count shifts every later request's mask. Every step of a speculating
 launch reads its bitmask this way, prefill and ordinary decode included,
 because an asynchronous scheduler reserves `[-1] * K` for every scheduled
-request; a step that commits one token per row reads each request's row 0.
-Lane mode, which schedules synchronously only, reads it this way on every
-decode step; a lane prefill step schedules no drafts, so there each
-structured request owns its one row.
+request, and `Scheduler.schedule` pads a new request's one-token prefill (a
+prefix-cache hit on all of the prompt but its last token) to `1 + K` with
+placeholder drafts on any speculating launch; a step that commits one token
+per row reads each request's row 0. Such a padded prefill computes the last
+prompt token alone (`input_batch.prefill_chunk_lens`): the placeholders
+are no prompt, and the scheduler rolls them back as rejected drafts.
 
 Synchronously the drafts a verify carries are the scheduler's, and
 `Scheduler.update_draft_token_ids` has already cut them to the longest prefix

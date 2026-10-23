@@ -31,6 +31,7 @@ import torch
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.core.sched.output import (
     CachedRequestData,
+    GrammarOutput,
     NewRequestData,
     SchedulerOutput,
 )
@@ -63,8 +64,9 @@ from vllm_tt_plugin.spec_decode import (
     PLACEHOLDER_TOKEN_ID,
 )
 
+from . import test_spec_sampled_controls_runner as controls
 from .lane_device_target import LaneDeviceTarget, greedy_chain, lane_device_target
-from .sampled_target import SAMPLED_VOCAB_SIZE, rule_logits
+from .sampled_target import SAMPLED_VOCAB_SIZE, rule_logits, support
 
 BLOCK_SIZE = 16
 MAX_MODEL_LEN = 256
@@ -75,6 +77,9 @@ PROMPT_LEN = 4
 K = 3
 
 GREEDY = SamplingParams(temperature=0.0, ignore_eos=True)
+STRUCTURED = SamplingParams(
+    temperature=0.0, ignore_eos=True, structured_outputs=controls._structured()
+)
 
 # region Harness
 
@@ -130,6 +135,7 @@ def lane_runner(model: LaneDeviceTarget, *, async_scheduling: bool = True):
         # the device turns it off in the builder.
         check_perform_device_sampling=None,
         host_sampler=Sampler(),
+        structured_output_arange=torch.arange(0, 32),
         _block_tables_per_layer=lambda _: None,
         _decode_layout_changed_since_last_decode=False,
         note_decode_layout_consumed=lambda: None,
@@ -205,6 +211,13 @@ class LaneEngine:
     On a synchronous runner (``depth`` 1) it is ``EngineCore.step`` instead:
     the proposals reach the next schedule through ``take_draft_token_ids``,
     as real draft ids.
+
+    A structured-output request samples under ``controls._grammar_allows``.
+    Its bitmask is what ``StructuredOutputManager.grammar_bitmask`` writes:
+    ``1 + len(scheduled drafts)`` rows per structured request. A step that
+    holds one with output still in flight defers its sampling until the
+    previous step's output has advanced the grammar, as
+    ``step_with_batch_queue`` does for ``pending_structured_output_tokens``.
     """
 
     def __init__(self, runner, *, depth: int = 2):
@@ -230,11 +243,15 @@ class LaneEngine:
         self.first: dict[str, int] = {}
         self.inflight: deque = deque()
         self.wrappers: list = []
+        self.structured: set[str] = set()
 
     def add(
         self, req_id, row, first_token, params=GREEDY, stop_after=None, max_tokens=None
     ):
         tokens = add_request(self.runner, req_id, row, first_token, params)
+        self.first[req_id] = tokens[-1]
+        if params.structured_outputs is not None:
+            self.structured.add(req_id)
         self.live[req_id] = row
         self.outputs[req_id] = []
         self.computed[req_id] = len(tokens) - 1
@@ -246,11 +263,21 @@ class LaneEngine:
             self.stop_after[req_id] = stop_after
         return tokens
 
-    def prefill(self, req_id, row, first_token, params=GREEDY):
+    def prefill(self, req_id, row, first_token, params=GREEDY, cached=False):
         """Admit a request through a lane prefill step, submitted like any
         step and queued behind the steps in flight. Returns its prompt; the
-        first token is the prefill's output."""
+        first token is the prefill's output.
+
+        ``cached``: the prefix cache holds all of the prompt but its last
+        token, so ``Scheduler.schedule`` pads the one-token prefill to
+        ``1 + K`` with ``K`` placeholder drafts (``pad_spec_decode``), as it
+        pads a new decode, and rolls the placeholders back when the output
+        lands.
+        """
         prompt = [(first_token + i) % SAMPLED_VOCAB_SIZE for i in range(PROMPT_LEN)]
+        if params.structured_outputs is not None:
+            self.structured.add(req_id)
+        computed = PROMPT_LEN - 1 if cached else 0
         so = SchedulerOutput.make_empty()
         so.scheduled_new_reqs = [
             NewRequestData(
@@ -260,12 +287,15 @@ class LaneEngine:
                 sampling_params=params,
                 pooling_params=None,
                 block_ids=([row + 1],),
-                num_computed_tokens=0,
+                num_computed_tokens=computed,
                 lora_request=None,
             )
         ]
-        so.num_scheduled_tokens = {req_id: PROMPT_LEN}
-        so.total_num_scheduled_tokens = PROMPT_LEN
+        so.num_scheduled_tokens = {req_id: PROMPT_LEN - computed}
+        if cached:
+            so.num_scheduled_tokens[req_id] += K
+            so.scheduled_spec_decode_tokens = {req_id: [PLACEHOLDER_TOKEN_ID] * K}
+        so.total_num_scheduled_tokens = so.num_scheduled_tokens[req_id]
         so.finished_req_ids, self.finished_pending = self.finished_pending, set()
         for done in so.finished_req_ids:
             self.live.pop(done, None)
@@ -284,16 +314,61 @@ class LaneEngine:
         )
         _set_tt_step_state(so, _LaneStepState(lane_outputs=[], plan=plan))
         assert self.runner.execute_model(so) is None
-        out = self.runner.sample_tokens(None)
+        self.outputs[req_id] = []
+        out = self.runner.sample_tokens(self.grammar_output(so))
         self.prefilled.add(req_id)
         self.live[req_id] = row
-        self.outputs[req_id] = []
-        self.computed[req_id] = PROMPT_LEN
-        self.placeholders[req_id] = 1
+        self.computed[req_id] = computed + so.num_scheduled_tokens[req_id]
+        self.placeholders[req_id] = 1 + len(
+            so.scheduled_spec_decode_tokens.get(req_id, ())
+        )
         self.inflight.append((out, so))
         if len(self.inflight) >= self.depth:
             self.resolve_oldest()
         return prompt
+
+    def history(self, req_id: str) -> list[int]:
+        """A request's output as the scheduler's grammar has consumed it."""
+        first = [self.first[req_id]] if req_id in self.first else []
+        return first + self.outputs[req_id]
+
+    def grammar_output(self, so: SchedulerOutput) -> GrammarOutput | None:
+        """``get_grammar_bitmask``: the scheduled structured requests in
+        scheduling order, each with a row per scheduled draft and the bonus."""
+        structured = [r for r in so.num_scheduled_tokens if r in self.structured]
+        if not structured:
+            return None
+        rows = [
+            controls._scheduler_rows(
+                self.history(r), list(so.scheduled_spec_decode_tokens.get(r, ()))
+            )
+            for r in structured
+        ]
+        return GrammarOutput(structured, torch.cat(rows).numpy())
+
+    def sample(self, so: SchedulerOutput):
+        """``sample_tokens`` for a submitted step, deferred as the engine
+        defers a structured step whose request has output in flight."""
+        structured = [r for r in so.num_scheduled_tokens if r in self.structured]
+        in_flight = any(
+            self.placeholders[r] > so.num_scheduled_tokens[r] for r in structured
+        )
+        if in_flight and self.inflight:
+            self.resolve_oldest()
+            handed = self.runner.take_draft_token_ids()
+            if handed is not None:
+                # ``update_draft_token_ids_in_output``: the grammar validates
+                # the drafts, and the invalid tail is padded with -1.
+                for r, drafts in zip(handed.req_ids, handed.draft_token_ids):
+                    offered = so.scheduled_spec_decode_tokens.get(r)
+                    if not offered:
+                        continue
+                    valid = controls._validated(self.history(r), drafts)
+                    valid = valid[: len(offered)]
+                    so.scheduled_spec_decode_tokens[r] = valid + [
+                        PLACEHOLDER_TOKEN_ID
+                    ] * (len(offered) - len(valid))
+        return self.runner.sample_tokens(self.grammar_output(so))
 
     def schedule_preview(self) -> SchedulerOutput:
         """The next decode's scheduler output, without consuming the step."""
@@ -385,7 +460,7 @@ class LaneEngine:
             self.runner.execute_model(so)
             return
         assert self.runner.execute_model(so) is None
-        wrapper = self.runner.sample_tokens(None)
+        wrapper = self.sample(so)
         self.wrappers.append(wrapper)
         self.inflight.append((wrapper, so))
         if len(self.inflight) >= self.depth:
@@ -421,8 +496,12 @@ class LaneEngine:
                 continue
             if req_id in self.prefilled and so.scheduled_new_reqs:
                 # The prefill's own token: the request's first, not an output
-                # of its decode steps.
-                self.placeholders[req_id] -= 1
+                # of its decode steps. A padded prefill's placeholders are
+                # rejected drafts, rolled back.
+                assert len(tokens) == 1, tokens
+                padded = len(so.scheduled_spec_decode_tokens.get(req_id, ()))
+                self.placeholders[req_id] -= 1 + padded
+                self.computed[req_id] -= padded
                 self.first[req_id] = tokens[0]
                 continue
             self.computed[req_id] -= so.num_scheduled_tokens[req_id] - len(tokens)
@@ -1130,3 +1209,136 @@ def test_a_decode_never_chains_onto_a_verify_a_prefill_overtook():
     engine.drain()
     produced = engine.outputs["a"]
     assert produced == expected_greedy(prompt_a, len(produced))
+
+
+# region Structured requests
+
+
+def grammar_chain(token: int, position: int, count: int, history=()) -> list[int]:
+    """The greedy continuation under ``controls._grammar_allows``: the most
+    likely support token the grammar admits after ``history``."""
+    history = list(history)
+    chain = []
+    for _ in range(count):
+        token = next(
+            t for t in support(token, position) if controls._grammar_allows(history, t)
+        )
+        position += 1
+        history.append(token)
+        chain.append(token)
+    return chain
+
+
+def assert_follows_grammar(engine, req_id: str, tokens: list[int]) -> None:
+    """``tokens`` is the prompt the request was admitted with; its output,
+    the prefill's token included, is exactly the grammar-masked argmax."""
+    produced = engine.history(req_id)
+    if req_id in engine.prefilled:
+        expected = grammar_chain(tokens[-1], PROMPT_LEN - 1, len(produced))
+    else:
+        # Admitted already prefilled: the first token is the unmasked argmax.
+        expected = produced[:1] + grammar_chain(
+            tokens[-1], len(tokens) - 1, len(produced) - 1, produced[:1]
+        )
+    assert produced == expected
+    for i, token in enumerate(produced):
+        assert controls._grammar_allows(produced[:i], token) or (
+            i == 0 and req_id not in engine.prefilled
+        )
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["prefill", "cached-prefix"])
+@pytest.mark.parametrize("params", [GREEDY, STRUCTURED], ids=["greedy", "structured"])
+def test_a_request_joins_a_speculating_launch_through_a_prefill(params, cached):
+    """``s`` joins lane 1 while ``a`` speculates alone in lane 0, then leaves.
+
+    On a prefix-cache hit the scheduler pads ``s``'s one-token prefill to
+    ``1 + K`` with placeholder drafts, so a structured ``s`` has ``1 + K``
+    grammar rows, and the prefill must cover only the uncached last prompt
+    token. A structured ``s`` emits the grammar-masked argmax throughout, a
+    greedy one the argmax chain, as does ``a``, which chains again once a
+    structured ``s`` has left.
+    """
+    model = lane_device_target(draft_policy="solo")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompt_a = engine.add("a", 0, 1)
+    engine.run(4)
+    prompt_s = engine.prefill("s", 2, 9, params=params, cached=cached)
+    engine.stop_after["s"] = 10
+    engine.run(14)
+    chained_while_s = chain_counters(runner)[0]
+    engine.run(8)
+    engine.drain()
+
+    start = PROMPT_LEN - 1 if cached else 0
+    assert model.prefill_spans == [(2, start, PROMPT_LEN)]
+    assert len(engine.outputs["s"]) == 10
+    if params.structured_outputs is not None:
+        assert_follows_grammar(engine, "s", prompt_s)
+    else:
+        produced = engine.history("s")
+        assert produced == greedy_chain(prompt_s[-1], PROMPT_LEN - 1, len(produced))
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompt_a, len(produced))
+    assert "s" not in runner.requests
+    assert chain_counters(runner)[0] > chained_while_s
+
+
+@pytest.mark.parametrize("neighbor", [None, "speculating"])
+def test_a_structured_request_on_ordinary_lane_steps_follows_its_grammar(neighbor):
+    """``s`` shares lane 0 with ``b``, so the solo drafter offers their lane
+    nothing and every step of theirs is the ordinary decode, sampled under
+    row 0 of the ``1 + K`` rows the scheduler writes for ``s``. With a
+    neighbor speculating alone in lane 1 the steps verify it, carrying lane
+    0's rows with nothing to verify."""
+    model = lane_device_target(draft_policy="solo")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {
+        "s": engine.add("s", 0, 1, params=STRUCTURED),
+        "b": engine.add("b", 1, 9),
+    }
+    if neighbor:
+        prompts["c"] = engine.add("c", 3, 17)
+    engine.run(14)
+    engine.drain()
+
+    if neighbor:
+        assert model.verify_modes
+        assert len(engine.outputs["c"]) > len(engine.outputs["s"])
+    else:
+        assert model.verify_modes == []
+    assert len(engine.outputs["s"]) >= 12
+    assert_follows_grammar(engine, "s", prompts["s"])
+    for req_id in ("b", "c") if neighbor else ("b",):
+        produced = engine.outputs[req_id]
+        assert produced == expected_greedy(prompts[req_id], len(produced))
+
+
+def test_a_structured_request_alone_in_its_lane_speculates_under_its_grammar():
+    """Alone in lane 1, ``s`` is drafted for, and each verify carrying it is a
+    ``logits`` verify (the device cannot apply a grammar) that is never
+    chained. Its drafts were not handed to the scheduler, so its bitmask
+    rows past row 0 came from placeholders, and the walk commits it one
+    grammar-masked token per step."""
+    model = lane_device_target()()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {
+        "a": engine.add("a", 0, 1),
+        "s": engine.add("s", 2, 9, params=STRUCTURED),
+    }
+    engine.run(12)
+    engine.drain()
+
+    assert model.chained_calls == []
+    assert set(model.verify_modes) == {ACCEPT_MODE_LOGITS}
+    assert len(engine.outputs["s"]) >= 10
+    assert len(engine.outputs["a"]) > len(engine.outputs["s"])
+    assert_follows_grammar(engine, "s", prompts["s"])
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompts["a"], len(produced))
+
+
+# endregion Structured requests

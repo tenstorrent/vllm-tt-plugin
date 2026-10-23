@@ -64,6 +64,7 @@ from vllm_tt_plugin.input_batch import (
     apply_cached_req_state_update,
     build_cached_request_state,
     clone_torch_generator,
+    prefill_chunk_lens,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -97,6 +98,7 @@ from vllm_tt_plugin.spec_decode import (
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
+    grammar_rows_per_request,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
     scheduled_structured_output_request_ids,
@@ -2337,7 +2339,6 @@ class TTModelRunner:
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        num_scheduled = scheduler_output.num_scheduled_tokens
 
         def _is_still_prefilling(req_id: str) -> bool:
             # Any uncomputed PROMPT token is prefill work, including a final
@@ -2396,9 +2397,13 @@ class TTModelRunner:
             #   tokens too, so the full sequence is replayed to rebuild KV.
             # - Chunked continuation: start_pos=computed, chunk=budget =>
             #   computed + budget, i.e. this chunk's end.
-            chunk_lens = np.array(
-                [num_scheduled[input_batch.req_ids[i]] for i in req_indices],
-                dtype=np.int64,
+            # Placeholder drafts the scheduler padded a prefill with are not
+            # part of the chunk (``prefill_chunk_lens``).
+            chunk_lens = prefill_chunk_lens(
+                scheduler_output,
+                row_req_ids,
+                input_positions,
+                input_batch.num_tokens[req_indices],
             )
             prompt_lens = input_positions + chunk_lens
             intermediate_prefill_mask = torch.from_numpy(
@@ -2740,16 +2745,10 @@ class TTModelRunner:
             # a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
-        grammar_rows_per_request = None
+        grammar_rows = None
         spec_min_tokens = None
         if self._num_speculative_tokens:
-            # Every scheduled request, not only this build's rows, because the
-            # bitmask is laid out over every structured request scheduled.
-            scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
-            grammar_rows_per_request = {
-                req_id: 1 + len(scheduled_drafts.get(req_id) or ())
-                for req_id in scheduler_output.num_scheduled_tokens
-            }
+            grammar_rows = grammar_rows_per_request(scheduler_output)
             self._grammar_draft_handoff = {}
             self._grammar_handed_over_req_ids = set()
             if spec_drafts is not None and self.async_decode_scheduling:
@@ -2799,7 +2798,7 @@ class TTModelRunner:
             accepted_counts=accepted_counts,
             draft_token_ids=spec_drafts,
             spec_mode=spec_mode if spec_drafts is not None else None,
-            grammar_rows_per_request=grammar_rows_per_request,
+            grammar_rows_per_request=grammar_rows,
             spec_min_tokens=spec_min_tokens,
         )
 

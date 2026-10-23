@@ -140,6 +140,7 @@ class LaneDeviceTarget:
         self.engine_thread: int | None = None
         self.freed: list[int] = []
         self.unresolved_at_prefill: list[int] = []
+        self.prefill_spans: list[tuple[int, int, int]] = []
 
     @classmethod
     def spec_plan(cls, vllm_config, max_num_seqs: int, requested_k: int):
@@ -219,28 +220,42 @@ class LaneDeviceTarget:
     def prefill_forward(
         self, tokens, page_table, kv_cache, prompt_lens, start_pos, **kwargs
     ):
-        """One full prefill per row into its slot (``empty_slots``): the first
-        token is sampled on the device, and the slot's state starts over.
+        """One prefill per row into its slot (``empty_slots``): the first
+        token is sampled on the device, or its logits returned for the host to
+        sample, and the slot's state starts over.
 
-        ``unresolved_at_prefill`` records how many deferred verifies were still
-        unread when the prefill was submitted.
+        A row may start past 0, where the prefix cache already holds the prompt
+        head. ``prefill_spans`` records each row's ``(slot, start, end)``, and
+        ``unresolved_at_prefill`` how many deferred verifies were still unread
+        when the prefill was submitted.
         """
         self._on_engine_thread()
         del page_table, kv_cache
         self.unresolved_at_prefill.append(
             sum(1 for handle in self.handles if not handle.read_threads)
         )
-        params = kwargs["sampling_params"]
-        out = torch.zeros(int(tokens.shape[0]), dtype=torch.int32)
+        params = kwargs.get("sampling_params")
+        rows = int(tokens.shape[0])
+        if params is None:
+            out = torch.zeros(rows, self.vocab_size)
+        else:
+            out = torch.zeros(rows, dtype=torch.int32)
         for i, slot in enumerate(kwargs["empty_slots"]):
-            if int(start_pos[i]) != 0:
-                raise AssertionError("this stand-in prefills whole prompts")
-            length = int(prompt_lens[i])
+            start, length = int(start_pos[i]), int(prompt_lens[i])
+            if not 0 <= start < length:
+                raise AssertionError(f"row {i} prefills [{start}, {length})")
+            self.prefill_spans.append((slot, start, length))
             last = int(tokens[i, length - 1])
+            self.device_drafts.pop(slot, None)
+            if params is None:
+                position = torch.tensor([length - 1])
+                out[i] = rule_logits(torch.tensor([last]), position)[0]
+                # The host samples the first token; the device never sees it.
+                self.resident.pop(slot, None)
+                continue
             first = self._device_sample(params, i, last, length - 1)
             out[i] = first
             self.resident[slot] = (first, length)
-            self.device_drafts.pop(slot, None)
         return out
 
     def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):

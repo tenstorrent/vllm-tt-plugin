@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -39,6 +39,7 @@ from vllm_tt_plugin.spec_decode import (
 )
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
+    grammar_rows_per_request,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
     scheduled_structured_output_request_ids,
@@ -150,6 +151,35 @@ def apply_cached_req_state_update(
     elif new_block_ids is not None:
         for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
             block_ids.extend(new_ids)
+
+
+def prefill_chunk_lens(
+    scheduler_output: "SchedulerOutput",
+    req_ids: list[str],
+    num_computed_tokens: np.ndarray,
+    num_tokens: np.ndarray,
+) -> np.ndarray:
+    """The tokens each prefill row computes this step, row-aligned with ``req_ids``.
+
+    The scheduled count, except that a prefill never runs past the end of
+    its sequence: ``Scheduler.schedule`` pads a new request's one-token
+    prefill to ``1 + num_spec_tokens`` with ``-1`` placeholder drafts
+    (``pad_spec_decode``), as it pads a new decode, whenever the prefix
+    cache holds all of the prompt but its last token. Those positions are no
+    prompt: the step samples one token at the last prompt position, which is
+    what vLLM's runner commits there too, and ``update_from_output`` rolls
+    the placeholders back as rejected drafts. Prefilling them would run the
+    model over tokens past the end of the sequence and sample the first
+    token from there.
+    """
+    scheduled = np.asarray(
+        [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
+        dtype=np.int64,
+    )
+    remaining = np.asarray(num_tokens, dtype=np.int64) - np.asarray(
+        num_computed_tokens, dtype=np.int64
+    )
+    return np.minimum(scheduled, remaining)
 
 
 def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
@@ -1243,12 +1273,29 @@ class TTLaneInputBatch(InputBatch):
         grammar_output: "GrammarOutput | None",
         plan: "TTStepPlan",
     ) -> TTModelInput:
-        """Build the merged device input for one lane step (decode or prefill)."""
+        """Build the merged device input for one lane step (decode or prefill).
+
+        Every lane build on a speculating launch records how many grammar
+        bitmask rows each scheduled request owns, here rather than in each
+        builder, because the scheduler writes ``1 + len(drafts)`` rows on
+        every such step: a verify, a plain decode, a chained verify, and a
+        prefill the scheduler padded with placeholder drafts alike. A build
+        without it would read that bitmask as one row per request.
+        """
         if plan.is_decode:
-            return self._build_decode_input(
+            model_input = self._build_decode_input(
                 runner, scheduler_output, grammar_output, plan
             )
-        return self._build_prefill_input(runner, scheduler_output, grammar_output, plan)
+        else:
+            model_input = self._build_prefill_input(
+                runner, scheduler_output, grammar_output, plan
+            )
+        if not getattr(runner, "_num_speculative_tokens", 0):
+            return model_input
+        return replace(
+            model_input,
+            grammar_rows_per_request=grammar_rows_per_request(scheduler_output),
+        )
 
     def _build_decode_input(
         self,
@@ -1387,7 +1434,6 @@ class TTLaneInputBatch(InputBatch):
             accepted_counts=spec["accepted_counts"],
             draft_token_ids=spec["draft_token_ids"],
             spec_mode=spec["spec_mode"],
-            grammar_rows_per_request=spec["grammar_rows_per_request"],
             spec_min_tokens=walk_inputs.get("spec_min_tokens"),
             chain_rows=spec["chain_rows"],
             chain_tip=spec["chain_tip"],
@@ -1495,21 +1541,12 @@ class TTLaneInputBatch(InputBatch):
             "accepted_counts": None,
             "draft_token_ids": None,
             "spec_mode": None,
-            "grammar_rows_per_request": None,
             "chain_rows": None,
             "chain_tip": None,
         }
         num_drafts = int(getattr(runner, "_num_speculative_tokens", 0) or 0)
         if not num_drafts:
             return none
-        # On a speculating launch vLLM writes each structured request
-        # 1 + len(drafts) bitmask rows, so the sample-time reorder has to know
-        # how many each owns, on a verify and on an ordinary decode alike.
-        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
-        grammar_rows_per_request = {
-            req_id: 1 + len(scheduled_drafts.get(req_id) or ())
-            for req_id in scheduler_output.num_scheduled_tokens
-        }
         # Imported here: model_runner imports this module.
         from vllm_tt_plugin.model_runner import _has_unresolved_commit, _step_verifies
 
@@ -1531,7 +1568,6 @@ class TTLaneInputBatch(InputBatch):
                     live_req_ids,
                     input_tokens,
                     input_positions,
-                    grammar_rows_per_request,
                 )
         spec_plan = getattr(runner, "_spec_plan", None)
         drafts, num_valid, counts = runner._spec_row_state(
@@ -1564,7 +1600,6 @@ class TTLaneInputBatch(InputBatch):
                 "spec_mode": runner._spec_mode_for_step(
                     live_req_ids, num_valid[live_rows]
                 ),
-                "grammar_rows_per_request": grammar_rows_per_request,
                 "chain_rows": None,
                 "chain_tip": None,
             }
@@ -1573,7 +1608,6 @@ class TTLaneInputBatch(InputBatch):
         # here, and an unresolved commit reaches the model as ``accepted_counts``.
         out = dict(none)
         out["row_req_ids"] = row_req_ids
-        out["grammar_rows_per_request"] = grammar_rows_per_request
         if _has_unresolved_commit(counts, total):
             out["accepted_counts"] = counts
         for req_id in live_req_ids:
@@ -1589,7 +1623,6 @@ class TTLaneInputBatch(InputBatch):
         live_req_ids: list[str],
         input_tokens: torch.Tensor,
         input_positions: torch.Tensor,
-        grammar_rows_per_request: dict[str, int],
     ) -> dict[str, Any]:
         """A ``fused_sample`` verify chained onto the one still in flight.
 
@@ -1646,7 +1679,6 @@ class TTLaneInputBatch(InputBatch):
             "accepted_counts": counts,
             "draft_token_ids": drafts,
             "spec_mode": spec_mode,
-            "grammar_rows_per_request": grammar_rows_per_request,
             "chain_rows": chain_rows,
             "chain_tip": chain.tip,
         }
@@ -1673,12 +1705,11 @@ class TTLaneInputBatch(InputBatch):
         # The generator processes ``tokens[start_pos:prompt_lens]``, so
         # ``prompt_lens`` is the end position of the chunk scheduled this step,
         # not the full sequence length. They coincide for an unchunked prefill.
-        chunk_lens = np.asarray(
-            [
-                scheduler_output.num_scheduled_tokens[lane_batch.req_ids[row]]
-                for row in rows
-            ],
-            dtype=np.int64,
+        chunk_lens = prefill_chunk_lens(
+            scheduler_output,
+            [lane_batch.req_ids[row] for row in rows],
+            input_positions_np,
+            lane_batch.num_tokens[rows_np],
         )
         prompt_lens = input_positions_np + chunk_lens
         intermediate_prefill_mask = torch.from_numpy(

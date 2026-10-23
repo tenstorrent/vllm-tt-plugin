@@ -32,6 +32,25 @@ def scheduled_structured_output_request_ids(
     )
 
 
+def grammar_rows_per_request(scheduler_output: SchedulerOutput) -> dict[str, int]:
+    """The grammar bitmask rows each scheduled request owns on a speculating launch.
+
+    With ``num_speculative_tokens`` set, ``StructuredOutputManager.grammar_bitmask``
+    writes a structured request ``1 + len(scheduled_spec_decode_tokens[req])``
+    rows whatever the step does with them. An asynchronous launch reserves
+    ``-1`` placeholders on every step, verify and plain decode alike, and
+    ``Scheduler.schedule`` pads a one-token prefill (a prefix-cache hit on all
+    of the prompt but its last token) the same way. Keyed over every
+    scheduled request, not only one build's rows, because the bitmask is laid
+    out over every structured request scheduled.
+    """
+    scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+    return {
+        req_id: 1 + len(scheduled_drafts.get(req_id) or ())
+        for req_id in scheduler_output.num_scheduled_tokens
+    }
+
+
 def has_scheduled_structured_outputs(
     requests: Mapping[str, CachedRequestState],
     scheduler_output: SchedulerOutput,
