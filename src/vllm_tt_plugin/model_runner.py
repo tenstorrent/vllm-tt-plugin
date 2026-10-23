@@ -3278,6 +3278,14 @@ class TTModelRunner:
             needs_unbounded_or_larger_k = (temperature != 0) & (
                 (top_k < 1) | (top_k > max_top_k)
             )
+            if self.model.model_capabilities.get(
+                "supports_device_top_p_without_top_k", False
+            ):
+                # The input batch stores "no top_k" as the vocabulary size. A
+                # nucleus row (top_p < 1) without top_k fits a bounded sampler
+                # that declares it; pure temperature sampling does not.
+                no_top_k = (top_k < 1) | (top_k >= input_batch.vocab_size)
+                needs_unbounded_or_larger_k &= ~(no_top_k & (sampling.top_p[rows] < 1))
             if needs_unbounded_or_larger_k.any():
                 return False
         if not input_batch.no_penalties and not self.model.model_capabilities.get(
