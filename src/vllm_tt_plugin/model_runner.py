@@ -45,6 +45,7 @@ from vllm_tt_plugin.config import (
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
+    get_tt_prefill_lookahead,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
@@ -2157,6 +2158,14 @@ class TTModelRunner:
                 prompt_lens < input_batch.num_tokens[req_indices]
             )
             max_prefill_tokens = int(prompt_lens.max())
+            if getattr(self, "vllm_config", None) is not None and get_tt_prefill_lookahead(
+                self.vllm_config
+            ):
+                # model capability ``prefill_lookahead``: every row carries its whole sequence (the
+                # model prepares the next piece of a request during this one and knows a piece is
+                # the last when its end equals the row's length); ``prompt_lens`` still marks the
+                # end of the piece scheduled now
+                max_prefill_tokens = int(input_batch.num_tokens[req_indices].max())
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]

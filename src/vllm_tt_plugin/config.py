@@ -748,6 +748,30 @@ def store_tt_prefill_chunking(
         tt.setdefault(_PREFILL_CHUNK_ALIGNMENT_KEY, int(alignment))
 
 
+_PREFILL_LOOKAHEAD_KEY = "_tt_prefill_lookahead"
+
+
+def get_tt_prefill_lookahead(vllm_config: "VllmConfig") -> bool:
+    """True when the model declared ``prefill_lookahead`` (model capability): a prefill step then passes the tokens of every request up to the end of its WHOLE sequence, not only up to the end of
+    the piece scheduled in this step (``prompt_lens`` still marks the end of the piece). The model uses the tokens after the piece to prepare the next piece of the request while the device works,
+    and knows that a piece is the last one when its end equals the sequence length. ``TT_PREFILL_LOOKAHEAD=0|1`` (environment of the server) wins."""
+    import os
+
+    env = os.environ.get("TT_PREFILL_LOOKAHEAD")
+    if env is not None and env.strip() != "":
+        return env.strip() not in ("0", "false", "False")
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_PREFILL_LOOKAHEAD_KEY, False))
+
+
+def store_tt_prefill_lookahead(vllm_config: "VllmConfig", enabled: bool) -> None:
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFILL_LOOKAHEAD_KEY] = bool(enabled)
+
+
 _PREFIX_HIT_POLICY_KEY = "_tt_prefix_hit_policy"
 
 
