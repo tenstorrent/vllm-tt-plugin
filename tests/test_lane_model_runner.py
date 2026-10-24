@@ -373,6 +373,45 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
     assert captured["empty_slots"] == [4]
 
 
+def test_submit_prefill_passes_prefill_final_only_with_the_lookahead_capability():
+    from vllm_tt_plugin.config import store_tt_prefill_lookahead
+
+    captured: dict = {}
+
+    class FakeModel:
+        def prefill_forward(self, **kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return object()
+
+    cfg = SimpleNamespace(additional_config={})
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+        vllm_config=cfg,
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        prompt_lens=[1, 1],
+        input_positions=torch.zeros((2,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        multi_modal_kwargs={},
+        perform_device_sampling=False,
+        prefill_empty_slots=None,
+        intermediate_prefill_mask=torch.tensor([True, False]),
+        stage_inputs=None,
+    )
+    TTModelRunner.submit_prefill(runner, model_input, [2])
+    assert "prefill_final" not in captured  # capability not declared: the model sees the old call
+    store_tt_prefill_lookahead(cfg, True)
+    TTModelRunner.submit_prefill(runner, model_input, [2])
+    assert captured["prefill_final"] == [False, True]  # row 0 is an intermediate piece, row 1 ends its sequence
+
+
 def _sampling_params(rows=2):
     """Every field a per-row tensor, as ``submit_decode``'s ``.tolist()`` expects."""
     return TTSamplingParams(

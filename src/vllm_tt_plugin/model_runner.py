@@ -3787,6 +3787,16 @@ class TTModelRunner:
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
+        mask = getattr(model_input, "intermediate_prefill_mask", None)
+        if (
+            mask is not None
+            and getattr(self, "vllm_config", None) is not None
+            and get_tt_prefill_lookahead(self.vllm_config)
+        ):
+            # model capability ``prefill_lookahead``: which rows END their sequence in this step
+            # (the token of every other row is discarded by the scheduler), so the model can return
+            # as soon as the step is enqueued when no row is final
+            kwargs["prefill_final"] = [not bool(x) for x in mask.tolist()]
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
