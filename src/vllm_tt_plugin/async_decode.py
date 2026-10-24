@@ -1415,6 +1415,7 @@ class TTAsyncDecodeController:
             # towards True below.
             return False
         drafts = scheduler_output.scheduled_spec_decode_tokens
+        proposed = draftless = False
         for req_id in scheduled:
             offered = drafts.get(req_id) or ()
             # Read the way ``TTModelRunner._drafts_to_verify`` reads it, and
@@ -1426,11 +1427,23 @@ class TTAsyncDecodeController:
             # overlap gone for a launch that drafts nothing.
             if any(token != PLACEHOLDER_TOKEN_ID for token in offered):
                 return True
-            if runner._proposed_draft_token_ids.get(req_id):
-                return True
             if runner._req_accepted_counts.get(req_id, 1) > 1:
                 return True
-        return False
+            if runner._proposed_draft_token_ids.get(req_id):
+                proposed = True
+            else:
+                draftless = True
+        # A request with no proposal verifies no draft, and where the lane
+        # budget is all or none (``TTLaneInputBatch.lane_draft_budget``) neither
+        # does any other: the step is the ordinary decode, and overlaps.
+        return proposed and not (draftless and self._drafts_all_or_none())
+
+    def _drafts_all_or_none(self) -> bool:
+        """Whether a lane step verifies drafts only when every slot keeps one
+        (``TTLaneInputBatch.lane_draft_budget``'s ``all_or_none``, under a plan
+        with ``k_by_rows``)."""
+        plan = getattr(self.runner, "_spec_plan", None)
+        return self.chain_enabled() and plan is not None and bool(plan.k_by_rows)
 
     def complete_decode_step(
         self,

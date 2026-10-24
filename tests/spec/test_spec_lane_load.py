@@ -36,6 +36,7 @@ from .test_spec_lane_async import (
     chain_counters,
     expected_greedy,
     lane_runner,
+    overlap_counters,
 )
 
 NUM_LANES = 2
@@ -295,6 +296,35 @@ def test_a_lane_of_three_runs_plain(async_scheduling):
         valid = live_valid(call)
         assert [valid[row] for row in (0, 1, 2)] == [0, 0, 0]
         assert call["lane_rows"][0] == 3
+    for req_id in "abc":
+        produced = engine.outputs[req_id]
+        assert produced == expected_greedy(prompts[req_id], len(produced))
+    produced_d = first_output(engine, "d")
+    assert produced_d == greedy_chain(prompts["d"][-1], PROMPT_LEN - 1, len(produced_d))
+
+
+def test_plain_steps_beside_a_drafting_lane_overlap():
+    """Lane 0 holds three requests, lane 1 ``d`` alone, which the drafter
+    keeps drafting for. Every step is the ordinary decode (the lane budget is
+    all or none), and ``d``'s proposals must not drain the step in flight as if
+    the next step verified: each ordinary step overlaps the one before."""
+    model = mimo_target()
+    engine = mimo_engine(model)
+    prompts = {
+        "a": engine.add("a", 0, 1),
+        "b": engine.add("b", 1, 9),
+        "c": engine.add("c", 2, 17),
+    }
+    prompts["d"] = engine.prefill("d", 4, 25)
+    engine.run(4)
+    before, _ = overlap_counters(engine.runner)
+    engine.run(12)
+    engine.drain()
+
+    overlapped, unsafe = overlap_counters(engine.runner)
+    assert model.verify_calls == []
+    assert overlapped - before >= 11
+    assert unsafe == 0
     for req_id in "abc":
         produced = engine.outputs[req_id]
         assert produced == expected_greedy(prompts[req_id], len(produced))
