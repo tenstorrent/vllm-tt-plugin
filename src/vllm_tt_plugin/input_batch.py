@@ -1520,11 +1520,11 @@ class TTLaneInputBatch(InputBatch):
             where="lane decode" if is_decode else "lane prefill",
         )
         bitmask = model_input.grammar_bitmask[0]
+        # Stateful processors index persistent slot rows. Keep their existing
+        # full-slot path; compact only when the known builtins have no work.
+        compact = self.can_compact_host_sampling()
         if precompacted:
-            if (
-                tt_out.rows != tuple(scheduled_rows)
-                or not self.can_compact_host_sampling()
-            ):
+            if tt_out.rows != tuple(scheduled_rows) or not compact:
                 raise ValueError(
                     f"Compact host logits do not match scheduled slots: "
                     f"output={tt_out.rows}, scheduled={scheduled_rows}"
@@ -1533,20 +1533,24 @@ class TTLaneInputBatch(InputBatch):
             logits = logits[:, -1, :] if logits.dim() == 3 else logits
             if logits.shape[0] != n:
                 raise ValueError(f"Expected {n} compact rows, got {logits.shape}")
-            if bitmask is not None:
-                bitmask = bitmask[scheduled_rows]
+        elif compact:
+            # The sampler only reads the scheduled rows, so take them straight
+            # from the model output: prefill logits are front-packed in
+            # scheduled order, decode logits are slot-indexed. Scattering them
+            # onto a ``[max_num_reqs, vocab]`` zero tensor first and gathering
+            # them back is the same rows at the cost of filling the whole slot
+            # batch (128 MB of float32 for 128 slots of a 262K vocabulary,
+            # ~19 ms of host time on the TTFT path of every lane prefill step).
+            logits = self._compact_logits(tt_out, rows_t, is_decode)
         else:
             logits = self._host_logits(tt_out, scheduled_rows, is_decode, total)
         if bitmask is not None:
+            if compact:
+                bitmask = bitmask[rows_t]
             runner.apply_grammar_bitmask(logits, bitmask)
-        # Stateful processors index persistent slot rows. Keep their existing
-        # full-slot path; compact only when the known builtins have no work.
-        compact = self.can_compact_host_sampling()
         sampling_metadata = self.build_merged_sampling_metadata(
             scheduled_rows, non_sampling_rows=intermediate_rows, compact=compact
         )
-        if compact and not precompacted:
-            logits = logits[rows_t]
         sampler_output = runner.host_sampler(
             logits=logits, sampling_metadata=sampling_metadata
         )
@@ -1556,6 +1560,22 @@ class TTLaneInputBatch(InputBatch):
         )
         logprobs = self._host_logprobs(sampler_output.logprobs_tensors, output_rows)
         return sampled.to(torch.int32), logprobs
+
+    @staticmethod
+    def _compact_logits(
+        tt_out: Any, rows_t: torch.Tensor, is_decode: bool
+    ) -> torch.Tensor:
+        """``[n, vocab]`` logits of the ``n`` scheduled rows, in scheduled order.
+
+        Decode logits cover every slot, so the scheduled slots are gathered.
+        Prefill logits cover only the scheduled requests, front-packed in
+        scheduled order, so the first ``n`` rows are the scheduled rows. Both
+        are copies: the host sampler scales logits in place.
+        """
+        logits = tt_out[:, -1, :] if tt_out.dim() == 3 else tt_out
+        if is_decode:
+            return logits[rows_t]
+        return logits[torch.arange(rows_t.numel(), dtype=torch.long)]
 
     def _host_logits(
         self, tt_out: Any, scheduled_rows: list[int], is_decode: bool, total: int
