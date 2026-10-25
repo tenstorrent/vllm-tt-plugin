@@ -659,9 +659,19 @@ legacy Galaxy generators and GPT-OSS fold without declaring it).
 its own `waiting` and `running` queues, admission decisions, KV cache manager,
 and lane-local block ID space.
 
-New requests are assigned to the least-loaded lane and remain bound to that
-lane. Because the device executes all lanes together, the coordinator selects
-one shared mode for each step:
+New requests are assigned to the least-loaded lane (score `waiting * 4 +
+running`, the weighting vLLM's DP load balancer uses) and remain bound to that
+lane. Each lane's prefix cache is separate, so a request whose prompt prefix
+an earlier request computed only hits the cache on the lane that holds it.
+With `lane_prefix_cache_routing` (default `true`) such a request goes to the
+lane holding the most of its prompt instead, unless that lane has no free
+running slot while the least-loaded lane has one, or the prefill queued ahead
+on it exceeds the least-loaded lane's queue by more than the prefill the hit
+saves; so a long shared prefix draws its followers to one lane while a short
+one (a common system prompt) spills to the other lanes as their queues grow.
+The lookup is the KV cache manager's own longest-hit search and allocates
+nothing. Because the device executes all lanes together, the coordinator
+selects one shared mode for each step:
 
 - if any lane can admit prefill, all lanes run a prefill step
 - otherwise, all lanes run a decode step

@@ -655,6 +655,24 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+_LANE_PREFIX_CACHE_ROUTING_KEY = "lane_prefix_cache_routing"
+_LANE_PREFIX_CACHE_ROUTING_DEFAULT = True
+
+
+def get_tt_lane_prefix_cache_routing(vllm_config: "VllmConfig") -> bool:
+    """Whether lane mode routes a request to the lane holding its cached prefix.
+
+    Lanes keep separate prefix caches, so a prompt only hits the cache if it
+    lands on the lane that computed its prefix; ``False`` keeps plain
+    least-loaded routing (see ``TTLaneCoordinator._pick_lane``).
+    """
+    return _read_tt_bool(
+        get_tt_config(vllm_config),
+        _LANE_PREFIX_CACHE_ROUTING_KEY,
+        _LANE_PREFIX_CACHE_ROUTING_DEFAULT,
+    )
+
+
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
 # that starts off that grid is realigned down by the model and the whole

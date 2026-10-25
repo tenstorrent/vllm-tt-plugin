@@ -45,6 +45,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
+    get_tt_lane_prefix_cache_routing,
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -278,6 +279,11 @@ class TTLaneCoordinator(SchedulerInterface):
         self._per_lane_max = get_tt_per_lane_max_num_seqs(vllm_config)
         self._req_to_lane: dict[str, int] = {}
         self._req_to_row: dict[str, int] = {}
+        # Prompt tokens a request still had to prefill when it was routed (its
+        # prompt length less the prefix its lane already held): the queued
+        # prefill cost that prefix-cache routing weighs a lane's waiting queue by.
+        self._uncached_tokens: dict[str, int] = {}
+        self._prefix_cache_routing = get_tt_lane_prefix_cache_routing(vllm_config)
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
@@ -342,8 +348,8 @@ class TTLaneCoordinator(SchedulerInterface):
     # Lane selection / mode negotiation
     # ------------------------------------------------------------------
 
-    def _pick_lane(self) -> int:
-        """Choose the least-loaded lane for a newly arriving request.
+    def _pick_lane(self, request: Request | None = None) -> int:
+        """Choose the lane for a newly arriving request.
 
         Scores each lane ``waiting * 4 + running`` and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
@@ -354,6 +360,21 @@ class TTLaneCoordinator(SchedulerInterface):
         lane coordinator stands in for vLLM's multi-process DP load balancer, so
         it keeps the same policy.
 
+        Prefix-cache routing (``lane_prefix_cache_routing``): each lane owns
+        its own KV cache manager, so a prompt whose prefix an earlier request
+        computed only hits the prefix cache on the lane holding it; the
+        least-loaded rule would send it elsewhere and prefill the prefix again.
+        When some lane holds part of the prompt, the lane holding the most of
+        it is chosen instead, unless (a) that lane has no free running slot
+        while the least-loaded lane has one (an open-ended wait for a slot
+        costs more than a bounded prefill), or (b) the prefill queued ahead on
+        that lane exceeds the least-loaded lane's queue by more than the
+        prefill the hit saves. Rule (b) is what keeps a hot prefix from piling
+        every request onto one lane: requests that reuse a long prefix queue
+        almost nothing, so they all follow it; requests sharing only a short
+        prefix spill as soon as the queue ahead outweighs the saving. The
+        lookup is the KV cache manager's own longest-hit search, read-only.
+
         Assignment is static: a request is bound to one lane at admission
         (recorded in the coordinator's maps) and never migrates,
         exactly as vLLM DP binds each request to one engine at intake with no
@@ -361,14 +382,53 @@ class TTLaneCoordinator(SchedulerInterface):
         the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
         is a possible future follow-up.
         """
-        best_lane = 0
-        best_score: int | None = None
-        for lane, sched in enumerate(self.lanes):
-            score = len(sched.waiting) * 4 + len(sched.running)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_lane = lane
-        return best_lane
+        scores = [len(sched.waiting) * 4 + len(sched.running) for sched in self.lanes]
+        least_lane = min(range(len(scores)), key=lambda lane: (scores[lane], lane))
+        if request is None or not self._prefix_cache_routing:
+            return least_lane
+        hits = [self._cached_prefix_tokens(sched, request) for sched in self.lanes]
+        cached_lane = max(range(len(hits)), key=lambda lane: (hits[lane], -lane))
+        lane = least_lane
+        if hits[cached_lane] > 0 and cached_lane != least_lane:
+            cached_full = len(self.lanes[cached_lane].running) >= self._per_lane_max
+            least_full = len(self.lanes[least_lane].running) >= self._per_lane_max
+            queued_ahead = self._queued_prefill_tokens(
+                cached_lane
+            ) - self._queued_prefill_tokens(least_lane)
+            if (
+                not (cached_full and not least_full)
+                and queued_ahead <= hits[cached_lane]
+            ):
+                lane = cached_lane
+        self._uncached_tokens[request.request_id] = max(
+            request.num_tokens - hits[lane], 0
+        )
+        return lane
+
+    @staticmethod
+    def _cached_prefix_tokens(sched: TTScheduler, request: Request) -> int:
+        """Prompt tokens of ``request`` already held in ``sched``'s prefix cache.
+
+        0 when prefix caching is off or the request skips the cache read. Uses
+        the KV cache manager's own longest-hit search on the request's block
+        hashes, which neither allocates nor touches blocks.
+        """
+        manager = sched.kv_cache_manager
+        if not manager.prefix_cache_lookup_enabled(request):
+            return 0
+        hit = manager.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return int(hit[1])
+
+    def _queued_prefill_tokens(self, lane: int) -> int:
+        """Prefill tokens queued on ``lane``: each waiting request's uncached
+        prompt tokens as recorded when it was routed (its whole prompt when it
+        was not routed here, e.g. after a preemption)."""
+        return sum(
+            self._uncached_tokens.get(req.request_id, req.num_tokens)
+            for req in self.lanes[lane].waiting
+        )
 
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
@@ -502,6 +562,7 @@ class TTLaneCoordinator(SchedulerInterface):
             decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
+            self._uncached_tokens.pop(req_id, None)
 
         # A preempted request gives its row back at once, because its running
         # slot is already back: ``Scheduler._preempt_request`` pops it from
@@ -738,7 +799,7 @@ class TTLaneCoordinator(SchedulerInterface):
         # coordinator-owned state; the shared vLLM Request object stays generic.
         lane = self._req_to_lane.get(request.request_id)
         if lane is None:
-            lane = self._pick_lane()
+            lane = self._pick_lane(request)
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
 
