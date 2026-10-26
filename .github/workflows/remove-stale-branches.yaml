@@ -1,0 +1,33 @@
+name: Remove stale branches
+
+# Comments on the last commit of a branch idle for 60 days to tag its author,
+# then deletes the branch 7 days later unless it gets new commits.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # Weekdays, 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  remove-stale-branches:
+    if: github.repository == 'tenstorrent/vllm-tt-plugin'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: fpicalausa/remove-stale-branches@68ab5e762e74b8c055007c62e5e85afdf0ec54be
+        with:
+          # Reports what it would do without commenting or deleting. Set to
+          # false once a run log shows the expected branches.
+          dry-run: true
+          days-before-branch-stale: 60
+          days-before-branch-delete: 7
+          # The branch ruleset protects only the default branch, so stable and
+          # release branches are not covered by exempt-protected-branches.
+          exempt-branches-regex: "^(main|stable|release/.*)$"
+          # Deleting the head branch of an open pull request closes it.
+          ignore-branches-with-open-prs: true
+          ignore-unknown-authors: true
+          default-recipient: viktorpusTT
+          operations-per-run: 30
