@@ -352,7 +352,8 @@ class TTLaneCoordinator(SchedulerInterface):
     def _pick_lane(self, request: Request | None = None) -> int:
         """Choose the lane for a newly arriving request.
 
-        Scores each lane ``waiting * 4 + running`` and picks the lowest
+        Scores each lane ``waiting * 4 + running`` (waiting = ``waiting`` plus
+        ``skipped_waiting``, vLLM's ``num_waiting_reqs``) and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
         load score vLLM uses to route requests across DP engines
         (``DPLBAsyncMPClient.get_core_engine_for_request`` in
@@ -391,7 +392,11 @@ class TTLaneCoordinator(SchedulerInterface):
         the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
         is a possible future follow-up.
         """
-        scores = [len(sched.waiting) * 4 + len(sched.running) for sched in self.lanes]
+        # waiting counts skipped_waiting too, as vLLM's num_waiting_reqs does
+        scores = [
+            (len(sched.waiting) + len(sched.skipped_waiting)) * 4 + len(sched.running)
+            for sched in self.lanes
+        ]
         least_lane = min(range(len(scores)), key=lambda lane: (scores[lane], lane))
         if request is None or not self._prefix_cache_routing:
             return least_lane

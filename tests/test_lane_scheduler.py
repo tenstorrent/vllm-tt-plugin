@@ -941,13 +941,13 @@ def test_equal_cached_prefixes_resolve_by_load_among_the_cached_lanes():
     # the least loaded overall: the tie between the cached lanes goes to the less
     # loaded lane 1, not to the lower index.
     lanes = [
-        _lane_with_cache(waiting=2, doc=3968),
+        _lane_with_cache(doc=3968),
         _lane_with_cache(running=1, doc=3968),
         _lane_with_cache(),
     ]
     coordinator = _routing_coordinator(lanes)
-    for req in lanes[0].waiting:
-        req.request_id = f"ahead-{id(req)}"
+    for i in range(2):
+        lanes[0].waiting.append(_request(f"ahead{i}", num_tokens=256))
     assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
 
 
