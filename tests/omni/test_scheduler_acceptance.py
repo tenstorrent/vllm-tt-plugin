@@ -325,8 +325,15 @@ class _Engine:
 # --- Batch purity -----------------------------------------------------------
 
 
+# The talker's pool holds a request at full length, as a stage-output model's must;
+# the batched one is small enough to run short.
 _TALKER = {}
-_BATCHED = {"stage_outputs": False, "max_num_seqs": 3, "chunked": True}
+_BATCHED = {
+    "stage_outputs": False,
+    "max_num_seqs": 3,
+    "chunked": True,
+    "num_blocks": 30,
+}
 
 
 @pytest.mark.parametrize("config", [_TALKER, _BATCHED], ids=["talker", "batched"])
@@ -334,7 +341,7 @@ _BATCHED = {"stage_outputs": False, "max_num_seqs": 3, "chunked": True}
 @pytest.mark.parametrize("seed", range(4))
 def test_batch_purity_under_arrivals_aborts_and_gated_requests(seed, depth, config):
     rng = random.Random(seed)
-    scheduler = _omni_scheduler(num_blocks=30, async_scheduling=depth > 1, **config)
+    scheduler = _omni_scheduler(async_scheduling=depth > 1, **config)
     adapter = _ChunkAdapter()
     scheduler.chunk_transfer_adapter = adapter
     engine = _Engine(scheduler, depth)
