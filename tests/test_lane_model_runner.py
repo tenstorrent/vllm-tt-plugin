@@ -211,6 +211,86 @@ def test_extract_output_host_prefill_scatters_logits_to_stable_rows():
     assert sampled.tolist() == [[3], [6]]
 
 
+def _compact_host_batch_and_runner(captured: dict):
+    """A lane batch whose host sampling can compact (no logits processors
+    have per-request state), with the slot-sized scatter forbidden: compact
+    sampling must read the scheduled rows straight from the model output."""
+    batch = _lane_batch()
+    assert batch.can_compact_host_sampling()
+    batch.build_merged_sampling_metadata = (
+        lambda rows, non_sampling_rows=None, compact=False: None
+    )
+    batch._host_logits = lambda *args, **kwargs: pytest.fail(
+        "compact host sampling must not build [max_num_reqs, vocab] slot logits"
+    )
+    return batch, _host_runner(captured)
+
+
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_extract_output_compact_host_sampling_skips_slot_scatter(is_decode):
+    captured: dict = {}
+    batch, runner = _compact_host_batch_and_runner(captured)
+    if is_decode:
+        # Full slot logits: row r's argmax is token r.
+        logits = torch.full((5, VOCAB), -10.0)
+        for r in range(5):
+            logits[r, r] = 5.0
+    else:
+        # Prefill logits: one row per scheduled request, in plan order.
+        logits = torch.full((2, 1, VOCAB), -10.0)
+        logits[0, 0, 3] = 5.0
+        logits[1, 0, 6] = 5.0
+    model_input = SimpleNamespace(
+        perform_device_sampling=False,
+        grammar_bitmask=[None],
+        intermediate_prefill_mask=None,
+    )
+
+    sampled, _ = batch.extract_output(
+        runner, logits, None, model_input, scheduled_rows=[4, 1], is_decode=is_decode
+    )
+
+    assert captured["logits"].shape == (2, VOCAB)
+    assert sampled.tolist() == ([[4], [1]] if is_decode else [[3], [6]])
+    # The sampler received a copy: scaling it in place must not reach the
+    # model output the next read-back may reuse.
+    captured["logits"].fill_(0.0)
+    assert not torch.equal(
+        captured["logits"], logits[[4, 1]] if is_decode else logits[:, -1, :]
+    )
+
+
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_extract_output_compact_grammar_bitmask_follows_scheduled_rows(is_decode):
+    """The slot-batch bitmask is sliced to the scheduled rows before it masks the
+    compacted logits, so each request keeps its own grammar row."""
+    captured: dict = {}
+    batch, runner = _compact_host_batch_and_runner(captured)
+    runner.apply_grammar_bitmask = MethodType(
+        TTModelRunner.apply_grammar_bitmask, runner
+    )
+    runner.structured_output_arange = torch.arange(0, 32)
+    rows = [4, 1]
+    # Every row's raw argmax is token 7; the grammar of slot 4 allows only token
+    # 2, the grammar of slot 1 only token 5, every other slot allows everything.
+    logits = torch.full((5 if is_decode else 2, VOCAB), -10.0)
+    logits[:, 7] = 5.0
+    allow = torch.full((5, 1), -1, dtype=torch.int32)  # all bits set: allowed
+    allow[4, 0] = 1 << 2
+    allow[1, 0] = 1 << 5
+    model_input = SimpleNamespace(
+        perform_device_sampling=False,
+        grammar_bitmask=[allow],
+        intermediate_prefill_mask=None,
+    )
+
+    sampled, _ = batch.extract_output(
+        runner, logits, None, model_input, scheduled_rows=rows, is_decode=is_decode
+    )
+
+    assert sampled.tolist() == [[2], [5]]
+
+
 # --------------------------------------------------------------------------
 # Chunked prefill: intermediate chunks emit no token
 # --------------------------------------------------------------------------

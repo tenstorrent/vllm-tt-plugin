@@ -55,7 +55,11 @@ class FakeLane:
         self.skipped_waiting = [object()] * skipped_waiting
         self.running = [
             SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
-        ] + [SimpleNamespace(is_prefill_chunk=True) for _ in range(partial_prefills)]
+        ] + [
+            SimpleNamespace(is_prefill_chunk=True, num_tokens=0, num_computed_tokens=0)
+            for _ in range(partial_prefills)
+        ]
+        self.reset_calls: list[tuple[bool, bool]] = []
         self._pending_finished = set(pending_finished)
         self.requests: dict[str, SimpleNamespace] = {}
         self._mode = TTSchedulingMode.DEFAULT
@@ -68,6 +72,10 @@ class FakeLane:
 
     def set_forced_mode(self, mode):
         self._mode = mode
+
+    def reset_prefix_cache(self, reset_running_requests=False, reset_connector=False):
+        self.reset_calls.append((reset_running_requests, reset_connector))
+        return True
 
     def schedule(self):
         self.scheduled_modes.append(self._mode)
@@ -118,6 +126,8 @@ def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False, **interleave_k
     coordinator.connector = None
     coordinator._req_to_lane = {}
     coordinator._req_to_row = {}
+    coordinator._uncached_tokens = {}
+    coordinator._prefix_cache_routing = True
     coordinator._free_slots_by_lane = [
         list(range(per_lane_max)) for _ in range(len(lanes))
     ]
@@ -931,3 +941,314 @@ def test_merge_carries_every_lanes_finishing_requests():
     merged = merge_lane_scheduler_outputs(outs)
     assert get_tt_finishing_req_ids(merged) == ("a", "c", "d")
     assert get_tt_finishing_req_ids(merge_lane_scheduler_outputs(outs[1:2])) == ()
+
+
+# ---------------------------------------------------------------------------
+# Prefix-cache lane routing
+# ---------------------------------------------------------------------------
+
+
+class FakeKVCacheManager:
+    """Prefix cache of one lane: the tokens it holds per request hash."""
+
+    def __init__(self, cached_tokens_by_hash=None, enable_caching=True):
+        self.enable_caching = enable_caching
+        self._cached = dict(cached_tokens_by_hash or {})
+        self.coordinator = self
+        self.lookups = 0
+
+    def prefix_cache_lookup_enabled(self, request):
+        return self.enable_caching and not request.skip_reading_prefix_cache
+
+    def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+        self.lookups += 1
+        hit = min(self._cached.get(block_hashes, 0), max_cache_hit_length)
+        return ((), hit, 0)
+
+
+def _lane_with_cache(waiting=0, running=0, **cached):
+    """A lane whose ``add_request`` queues the request, as a real lane does."""
+    lane = FakeLane(waiting=waiting, running=running)
+    lane.kv_cache_manager = FakeKVCacheManager(cached)
+    lane.add_request = lane.waiting.append
+    return lane
+
+
+def _request(request_id, num_tokens=4096, prefix="", skip_reading_prefix_cache=False):
+    # ``block_hashes`` stands in for the prompt's block-hash list; the fake
+    # manager keys its cache on it.
+    return SimpleNamespace(
+        request_id=request_id,
+        block_hashes=prefix or request_id,
+        num_tokens=num_tokens,
+        skip_reading_prefix_cache=skip_reading_prefix_cache,
+    )
+
+
+def _routing_coordinator(lanes, routing=True, per_lane_max=32):
+    coordinator = _make_coordinator(lanes, per_lane_max=per_lane_max)
+    coordinator._prefix_cache_routing = routing
+    return coordinator
+
+
+def _lane_of(coordinator, request):
+    coordinator.add_request(request)
+    return coordinator._req_to_lane[request.request_id]
+
+
+def test_request_is_routed_to_the_lane_holding_its_cached_prefix():
+    lanes = [_lane_with_cache(), _lane_with_cache(), _lane_with_cache(doc=3968)]
+    coordinator = _routing_coordinator(lanes)
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 2
+    assert [len(lane.waiting) for lane in lanes] == [0, 0, 1]
+
+
+def test_the_lane_holding_the_longest_prefix_wins():
+    lanes = [_lane_with_cache(doc=1024), _lane_with_cache(doc=3072), _lane_with_cache()]
+    coordinator = _routing_coordinator(lanes)
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+
+
+def test_uncached_prompt_goes_to_the_least_loaded_lane():
+    lanes = [
+        _lane_with_cache(waiting=1),
+        _lane_with_cache(running=2),
+        _lane_with_cache(running=3),
+    ]
+    coordinator = _routing_coordinator(lanes)
+    assert _lane_of(coordinator, _request("cold")) == 1
+    assert coordinator._uncached_tokens["cold"] == 4096
+
+
+def test_a_burst_of_followers_of_a_long_prefix_all_join_its_lane():
+    # 20 questions on one cached 3968-token document: each queues only its 128
+    # uncached tokens, far below the prefix they reuse, so none spills.
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache(), _lane_with_cache()]
+    coordinator = _routing_coordinator(lanes)
+    picks = [_lane_of(coordinator, _request(f"q{i}", prefix="doc")) for i in range(20)]
+    assert picks == [0] * 20
+    assert coordinator._uncached_tokens["q19"] == 128
+
+
+def test_followers_of_a_short_prefix_spill_once_the_queue_outweighs_the_hit():
+    # A 256-token shared system prompt in 1024-token prompts: the first follower
+    # queues 768 uncached tokens on lane 0, more than the 256 the next one would
+    # save, so the next one takes the least-loaded lane.
+    lanes = [_lane_with_cache(sys=256), _lane_with_cache(), _lane_with_cache()]
+    coordinator = _routing_coordinator(lanes)
+    picks = [
+        _lane_of(coordinator, _request(f"q{i}", num_tokens=1024, prefix="sys"))
+        for i in range(3)
+    ]
+    assert picks == [0, 1, 2]
+
+
+def test_a_queue_of_uncached_work_ahead_sends_the_follower_elsewhere():
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache()]
+    coordinator = _routing_coordinator(lanes)
+    # Two cold 8K prompts queued on lane 0 (routed there as the least-loaded).
+    for i in range(2):
+        lanes[0].waiting.append(_request(f"cold{i}", num_tokens=8192))
+        coordinator._uncached_tokens[f"cold{i}"] = 8192
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+
+
+def test_a_full_cached_lane_loses_to_a_lane_with_a_free_slot():
+    lanes = [_lane_with_cache(running=2, doc=3968), _lane_with_cache(running=1)]
+    coordinator = _routing_coordinator(lanes, per_lane_max=2)
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+    # Both full: the cached lane still wins (the wait is the same either way).
+    lanes = [_lane_with_cache(running=2, doc=3968), _lane_with_cache(running=2)]
+    coordinator = _routing_coordinator(lanes, per_lane_max=2)
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 0
+
+
+def test_routing_off_restores_least_loaded_routing_without_lookups():
+    lanes = [_lane_with_cache(), _lane_with_cache(doc=3968)]
+    coordinator = _routing_coordinator(lanes, routing=False)
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 0
+    assert all(lane.kv_cache_manager.lookups == 0 for lane in lanes)
+
+
+def test_requests_that_skip_the_prefix_cache_read_are_load_routed():
+    lanes = [_lane_with_cache(), _lane_with_cache(doc=3968)]
+    coordinator = _routing_coordinator(lanes)
+    request = _request("q", prefix="doc", skip_reading_prefix_cache=True)
+    assert _lane_of(coordinator, request) == 0
+
+
+def test_finished_requests_drop_their_queued_prefill_record():
+    finishing = FakeLane(pending_finished={"q"})
+    finishing.kv_cache_manager = FakeKVCacheManager()
+    coordinator = _routing_coordinator([finishing, _lane_with_cache()])
+    coordinator._req_to_lane["q"] = 0
+    coordinator._uncached_tokens["q"] = 128
+    coordinator.schedule()
+    assert "q" not in coordinator._uncached_tokens
+
+
+def _partial_prefill(request_id, num_tokens, num_computed_tokens):
+    """A running request still inside its prompt (a chunked prefill between steps)."""
+    return SimpleNamespace(
+        request_id=request_id,
+        is_prefill_chunk=True,
+        num_tokens=num_tokens,
+        num_computed_tokens=num_computed_tokens,
+    )
+
+
+def test_equal_cache_hits_resolve_on_load_not_on_the_lower_lane_index():
+    # Both lanes hold the same 3968-token prefix: neither saves anything over
+    # the other, so the 512 tokens queued on lane 0 decide against it.
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache(doc=3968)]
+    coordinator = _routing_coordinator(lanes)
+    lanes[0].waiting.append(_request("earlier", num_tokens=512))
+    coordinator._uncached_tokens["earlier"] = 512
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+    assert coordinator._uncached_tokens["q"] == 128
+
+
+def test_a_slightly_longer_hit_must_outweigh_the_queue_ahead():
+    # Lane 0 holds 3968 of the prompt, lane 1 3840: lane 0 saves only the 128
+    # tokens between them, less than the 512 queued ahead on it.
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache(doc=3840)]
+    coordinator = _routing_coordinator(lanes)
+    lanes[0].waiting.append(_request("earlier", num_tokens=512))
+    coordinator._uncached_tokens["earlier"] = 512
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+    assert coordinator._uncached_tokens["q"] == 4096 - 3840
+    # A queue of 100 is within the 128 the longer hit saves: lane 0 wins.
+    coordinator._uncached_tokens["earlier"] = 100
+    assert _lane_of(coordinator, _request("q2", prefix="doc")) == 0
+
+
+def test_a_running_partial_prefill_counts_as_work_ahead():
+    # Lane 0 is 1024 tokens into an 8192-token prompt and holds a 1024-token
+    # prefix of the newcomer; the 7168 tokens it still owes come first.
+    lanes = [_lane_with_cache(doc=1024), _lane_with_cache()]
+    lanes[0].running.append(_partial_prefill("long", 8192, 1024))
+    coordinator = _routing_coordinator(lanes)
+    assert coordinator._queued_prefill_tokens(0) == 7168
+    assert _lane_of(coordinator, _request("q", num_tokens=2048, prefix="doc")) == 1
+    # Once the partial prefill is through its prompt the hit draws the next one.
+    lanes[0].running[-1].num_computed_tokens = 8192
+    assert _lane_of(coordinator, _request("q2", num_tokens=2048, prefix="doc")) == 0
+
+
+def test_a_prefix_cache_reset_drops_the_admission_time_estimates():
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache()]
+    coordinator = _routing_coordinator(lanes)
+    victim = _request("victim", num_tokens=4096, prefix="doc")
+    assert _lane_of(coordinator, victim) == 0
+    assert coordinator._uncached_tokens["victim"] == 128
+    victim.num_tokens = 4097  # one generated token before the reset
+    assert coordinator.reset_prefix_cache(reset_running_requests=True) is True
+    assert all(lane.reset_calls == [(True, False)] for lane in lanes)
+    # The victim recomputes its whole prompt: 4097 tokens ahead, not 128.
+    assert coordinator._uncached_tokens == {}
+    assert coordinator._queued_prefill_tokens(0) == 4097
+    # A newcomer with a 1024-token hit on lane 0 now finds 4097 ahead of it.
+    lanes[0].kv_cache_manager._cached = {"sys": 1024}
+    assert _lane_of(coordinator, _request("q", num_tokens=2048, prefix="sys")) == 1
+
+
+def test_a_preempted_request_drops_its_admission_time_estimate():
+    lane = FakeLane()
+    lane.kv_cache_manager = FakeKVCacheManager()
+    coordinator = _routing_coordinator([lane, _lane_with_cache()])
+    coordinator._req_to_lane["victim"] = 0
+    coordinator._uncached_tokens["victim"] = 128
+    lane.schedule = lambda: _preempting_output(preempted=["victim"])
+    coordinator.schedule()
+    assert "victim" not in coordinator._uncached_tokens
+
+
+def test_a_burst_above_the_lane_capacity_spills_once_its_slots_are_promised():
+    # 64 followers of an 8064-token prefix on 32-slot lanes: the first 32 fill
+    # lane 0's slots (queued requests count), the rest take the empty lane.
+    lanes = [_lane_with_cache(doc=8064), _lane_with_cache()]
+    coordinator = _routing_coordinator(lanes, per_lane_max=32)
+    picks = [
+        _lane_of(coordinator, _request(f"q{i}", num_tokens=8192, prefix="doc"))
+        for i in range(64)
+    ]
+    assert picks == [0] * 32 + [1] * 32
+    assert [len(lane.waiting) for lane in lanes] == [32, 32]
+
+
+def test_equal_cached_prefixes_resolve_by_load_among_the_cached_lanes():
+    # Lanes 0 and 1 both hold the 3968-token prefix, lane 2 holds nothing and is
+    # the least loaded overall: the tie between the cached lanes goes to the less
+    # loaded lane 1, not to the lower index.
+    lanes = [
+        _lane_with_cache(doc=3968),
+        _lane_with_cache(running=1, doc=3968),
+        _lane_with_cache(),
+    ]
+    coordinator = _routing_coordinator(lanes)
+    for i in range(2):
+        lanes[0].waiting.append(_request(f"ahead{i}", num_tokens=256))
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+
+
+def _skipped(request_id, status, *, grammar=None, num_tokens=8192):
+    structured = (
+        None
+        if grammar is None
+        else SimpleNamespace(grammar=grammar if grammar != "pending" else None)
+    )
+    return SimpleNamespace(
+        request_id=request_id,
+        num_tokens=num_tokens,
+        status=status,
+        structured_output_request=structured,
+    )
+
+
+def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
+    # A grammar-blocked request whose grammar has compiled goes first at the next
+    # prefill step: its 8192 tokens outweigh the 3968-token hit on lane 0.
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache()]
+    lanes[0].skipped_waiting.append(
+        _skipped(
+            "ready",
+            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+            grammar=object(),
+        )
+    )
+    coordinator = _routing_coordinator(lanes)
+    assert coordinator._queued_prefill_tokens(0) == 8192
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+    # Still compiling: not ahead of the newcomer, the hit draws it to lane 0.
+    lanes[0].skipped_waiting[0] = _skipped(
+        "pending",
+        RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+        grammar="pending",
+    )
+    assert coordinator._queued_prefill_tokens(0) == 0
+    assert _lane_of(coordinator, _request("q2", prefix="doc")) == 0
+    # q2 now waits on lane 0 with its 128 uncached tokens. Remote KVs that have
+    # arrived count on top of it; a streaming-input request does not.
+    lanes[0].finished_recving_kv_req_ids = {"kv"}
+    lanes[0].skipped_waiting[0] = _skipped("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    assert coordinator._queued_prefill_tokens(0) == 8192 + 128
+    lanes[0].skipped_waiting[0] = _skipped(
+        "stream", RequestStatus.WAITING_FOR_STREAMING_REQ
+    )
+    assert coordinator._queued_prefill_tokens(0) == 128
+
+
+def test_lane_prefix_cache_routing_config_key():
+    from vllm_tt_plugin.config import get_tt_lane_prefix_cache_routing
+
+    assert (
+        get_tt_lane_prefix_cache_routing(SimpleNamespace(additional_config={})) is True
+    )
+    off = SimpleNamespace(
+        additional_config={"tt": {"lane_prefix_cache_routing": False}}
+    )
+    assert get_tt_lane_prefix_cache_routing(off) is False
+    with pytest.raises(ValueError):
+        get_tt_lane_prefix_cache_routing(
+            SimpleNamespace(additional_config={"tt": {"lane_prefix_cache_routing": 1}})
+        )

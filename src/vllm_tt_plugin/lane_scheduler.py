@@ -43,10 +43,12 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.request import RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
+    get_tt_lane_prefix_cache_routing,
     get_tt_per_lane_max_num_seqs,
     get_tt_prefill_gather_ms,
     get_tt_prefill_gather_quiet_ms,
@@ -290,6 +292,11 @@ class TTLaneCoordinator(SchedulerInterface):
         self._per_lane_max = get_tt_per_lane_max_num_seqs(vllm_config)
         self._req_to_lane: dict[str, int] = {}
         self._req_to_row: dict[str, int] = {}
+        # Prompt tokens a request still had to prefill when it was routed (its
+        # prompt length less the prefix its lane already held): the queued
+        # prefill cost that prefix-cache routing weighs a lane's waiting queue by.
+        self._uncached_tokens: dict[str, int] = {}
+        self._prefix_cache_routing = get_tt_lane_prefix_cache_routing(vllm_config)
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
@@ -362,10 +369,11 @@ class TTLaneCoordinator(SchedulerInterface):
     # Lane selection / mode negotiation
     # ------------------------------------------------------------------
 
-    def _pick_lane(self) -> int:
-        """Choose the least-loaded lane for a newly arriving request.
+    def _pick_lane(self, request: Request | None = None) -> int:
+        """Choose the lane for a newly arriving request.
 
-        Scores each lane ``waiting * 4 + running`` and picks the lowest
+        Scores each lane ``waiting * 4 + running`` (waiting = ``waiting`` plus
+        ``skipped_waiting``, vLLM's ``num_waiting_reqs``) and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
         load score vLLM uses to route requests across DP engines
         (``DPLBAsyncMPClient.get_core_engine_for_request`` in
@@ -374,6 +382,29 @@ class TTLaneCoordinator(SchedulerInterface):
         lane coordinator stands in for vLLM's multi-process DP load balancer, so
         it keeps the same policy.
 
+        Prefix-cache routing (``lane_prefix_cache_routing``): each lane owns
+        its own KV cache manager, so a prompt whose prefix an earlier request
+        computed only hits the prefix cache on the lane holding it; the
+        least-loaded rule would send it elsewhere and prefill the prefix again.
+        When some lane holds more of the prompt than the least-loaded lane
+        does, the lane holding the most of it is chosen instead, unless (a)
+        that lane has no free slot once its queued requests are admitted while
+        the least-loaded lane has one (an open-ended wait for a slot costs more
+        than a bounded prefill), or (b) the prefill queued ahead on that lane
+        exceeds the least-loaded lane's queue by more than the *extra* prefill
+        the hit saves over the least-loaded lane's own hit (equal hits save
+        nothing and resolve on load; among lanes holding the same prefix the
+        less loaded one is the candidate). Queued prefill counts the waiting
+        requests' uncached tokens, the ready requests parked in
+        ``skipped_waiting`` (vLLM schedules those first once their grammar or
+        remote KVs arrive) and the running partial prefills' remaining prompt
+        tokens, which vLLM processes before admitting anything new.
+        Rule (b) is what keeps a hot prefix from piling every request onto one
+        lane: requests that reuse a long prefix queue almost nothing, so they
+        all follow it; requests sharing only a short prefix spill as soon as
+        the queue ahead outweighs the saving. The lookup is the KV cache
+        manager's own longest-hit search, read-only.
+
         Assignment is static: a request is bound to one lane at admission
         (recorded in the coordinator's maps) and never migrates,
         exactly as vLLM DP binds each request to one engine at intake with no
@@ -381,14 +412,103 @@ class TTLaneCoordinator(SchedulerInterface):
         the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
         is a possible future follow-up.
         """
-        best_lane = 0
-        best_score: int | None = None
-        for lane, sched in enumerate(self.lanes):
-            score = len(sched.waiting) * 4 + len(sched.running)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_lane = lane
-        return best_lane
+        # waiting counts skipped_waiting too, as vLLM's num_waiting_reqs does
+        scores = [
+            (len(sched.waiting) + len(sched.skipped_waiting)) * 4 + len(sched.running)
+            for sched in self.lanes
+        ]
+        least_lane = min(range(len(scores)), key=lambda lane: (scores[lane], lane))
+        if request is None or not self._prefix_cache_routing:
+            return least_lane
+        hits = [self._cached_prefix_tokens(sched, request) for sched in self.lanes]
+        # Among lanes holding the same prefix: the less loaded, then the lower index.
+        cached_lane = max(
+            range(len(hits)), key=lambda lane: (hits[lane], -scores[lane], -lane)
+        )
+        lane = least_lane
+        # The saving is only the hit beyond what the least-loaded lane holds.
+        extra_hit = hits[cached_lane] - hits[least_lane]
+        if extra_hit > 0 and cached_lane != least_lane:
+            cached_full = self._lane_occupancy(cached_lane) >= self._per_lane_max
+            least_full = self._lane_occupancy(least_lane) >= self._per_lane_max
+            queued_ahead = self._queued_prefill_tokens(
+                cached_lane
+            ) - self._queued_prefill_tokens(least_lane)
+            if not (cached_full and not least_full) and queued_ahead <= extra_hit:
+                lane = cached_lane
+        self._uncached_tokens[request.request_id] = max(
+            request.num_tokens - hits[lane], 0
+        )
+        return lane
+
+    @staticmethod
+    def _cached_prefix_tokens(sched: TTScheduler, request: Request) -> int:
+        """Prompt tokens of ``request`` already held in ``sched``'s prefix cache.
+
+        0 when prefix caching is off or the request skips the cache read. Uses
+        the KV cache manager's own longest-hit search on the request's block
+        hashes, which neither allocates nor touches blocks.
+        """
+        manager = sched.kv_cache_manager
+        if not manager.prefix_cache_lookup_enabled(request):
+            return 0
+        hit = manager.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        return int(hit[1])
+
+    def _queued_prefill_tokens(self, lane: int) -> int:
+        """Prefill tokens ``lane`` must process before it admits a new request.
+
+        Each waiting request counts its uncached prompt tokens as recorded when
+        it was routed (its whole prompt when it holds no record: routed before
+        a cache reset, or re-queued by a preemption). A request parked in
+        ``skipped_waiting`` counts the same way once it is ready: vLLM's FCFS
+        scheduler takes ``skipped_waiting`` before ``waiting`` and promotes a
+        ready request there ahead of every ordinary waiting one. Each running
+        partial prefill counts the prompt tokens it has not computed yet: vLLM
+        advances running partial prefills before it admits waiting requests,
+        so that work is ahead of a newcomer too.
+        """
+        sched = self.lanes[lane]
+        waiting = sum(
+            self._uncached_tokens.get(req.request_id, req.num_tokens)
+            for req in sched.waiting
+        )
+        ready_skipped = sum(
+            self._uncached_tokens.get(req.request_id, req.num_tokens)
+            for req in sched.skipped_waiting
+            if self._skipped_request_is_ready(sched, req)
+        )
+        partial = sum(
+            max(req.num_tokens - req.num_computed_tokens, 0)
+            for req in sched.running
+            if req.is_prefill_chunk
+        )
+        return waiting + ready_skipped + partial
+
+    @staticmethod
+    def _skipped_request_is_ready(sched: TTScheduler, request: Request) -> bool:
+        """Whether a ``skipped_waiting`` request is promoted at the next prefill
+        step (vLLM ``Scheduler._try_promote_blocked_waiting_request``): its
+        structured-output grammar has compiled, its remote KVs have arrived, or
+        it no longer carries a blocked status. A streaming-input request stays
+        blocked until the scheduler itself sees its input."""
+        status = request.status
+        if status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            structured = request.structured_output_request
+            return structured is not None and structured.grammar is not None
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return request.request_id in sched.finished_recving_kv_req_ids
+        return status != RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def _lane_occupancy(self, lane: int) -> int:
+        """Running slots ``lane`` holds or has promised: its running requests
+        plus the queued ones (waiting and grammar-blocked) that take a slot
+        when admitted, so a burst routed before any scheduling step sees the
+        slots its earlier members will occupy."""
+        sched = self.lanes[lane]
+        return len(sched.running) + len(sched.waiting) + len(sched.skipped_waiting)
 
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
@@ -522,6 +642,7 @@ class TTLaneCoordinator(SchedulerInterface):
             decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
             self._req_to_lane.pop(req_id, None)
+            self._uncached_tokens.pop(req_id, None)
 
         # A preempted request gives its row back at once, because its running
         # slot is already back: ``Scheduler._preempt_request`` pops it from
@@ -537,6 +658,9 @@ class TTLaneCoordinator(SchedulerInterface):
         for req_id in merged.preempted_req_ids or ():
             decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
+            # The resume recomputes the whole prompt: its queued-prefill
+            # estimate is the prompt again, not the admission-time remainder.
+            self._uncached_tokens.pop(req_id, None)
 
         resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
         for req_id in resumed_req_ids:
@@ -791,7 +915,7 @@ class TTLaneCoordinator(SchedulerInterface):
         # coordinator-owned state; the shared vLLM Request object stays generic.
         lane = self._req_to_lane.get(request.request_id)
         if lane is None:
-            lane = self._pick_lane()
+            lane = self._pick_lane(request)
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
 
@@ -833,6 +957,11 @@ class TTLaneCoordinator(SchedulerInterface):
             sched.reset_prefix_cache(reset_running_requests, reset_connector)
             for sched in self.lanes
         ]
+        # Every cached prefix is gone and every preempted request recomputes
+        # its whole prompt: the admission-time remainders are stale, and the
+        # next add_request may consult them before any scheduler output
+        # reports the preemption.
+        self._uncached_tokens.clear()
         return all(results)
 
     def reset_encoder_cache(self) -> None:
