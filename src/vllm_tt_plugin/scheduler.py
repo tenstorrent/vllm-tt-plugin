@@ -21,6 +21,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
+    get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     tt_requests_cannot_resume,
@@ -282,6 +283,32 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+def _require_kv_for_every_sequence(
+    kv_cache_config, max_num_seqs: int, max_model_len: int
+) -> None:
+    """Refuse a KV pool that could make vLLM preempt a stage-output request.
+
+    vLLM preempts a running request when a step finds no free block, and a request
+    of a model with ``supports_stage_outputs`` cannot resume. While ``max_num_seqs``
+    requests at ``max_model_len`` fit in every KV cache group at once, no step runs
+    short.
+    """
+    needed = max_num_seqs * sum(
+        -(-max_model_len // group.kv_cache_spec.block_size)
+        for group in kv_cache_config.kv_cache_groups
+    )
+    # Block 0 is vLLM's null block, never handed to a request.
+    usable = kv_cache_config.num_blocks - 1
+    if usable < needed:
+        raise ValueError(
+            "a model with supports_stage_outputs cannot resume a preempted request, "
+            f"so its KV pool must hold max_num_seqs={max_num_seqs} requests at "
+            f"max_model_len={max_model_len}: {needed} blocks across "
+            f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), but only "
+            f"{usable} are usable. Lower max_num_seqs or max_model_len."
+        )
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -369,6 +396,12 @@ class TTScheduler(AsyncScheduler):
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
+        if get_tt_supports_stage_outputs(self.vllm_config):
+            _require_kv_for_every_sequence(
+                self.kv_cache_config,
+                self.scheduler_config.max_num_seqs,
+                self.max_model_len,
+            )
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
         # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
         self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)

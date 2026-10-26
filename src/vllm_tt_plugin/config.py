@@ -377,11 +377,14 @@ def resolve_tt_supports_stage_outputs(
     A stage output is one stage frame per request per one-token decode step,
     tagged through the front-packed build's row request IDs and decode positions.
 
+    The scheduler checks the remaining condition once it knows the KV pool: a
+    stage model's request cannot be preempted and resumed, so the pool must hold
+    every sequence at full length.
+
     Raises:
         ValueError: the declaration is not a boolean, or it is declared with lane
-            mode, block output, speculative decoding, async decode (whose overlapped
-            steps build from host positions one step behind) or more than one
-            sequence (a stage model's request cannot be preempted and resumed).
+            mode, block output, speculative decoding or async decode (whose
+            overlapped steps build from host positions one step behind).
     """
     supported = (model_capabilities or {}).get("supports_stage_outputs", False)
     name = f"{model_class.__module__}.{model_class.__name__}"
@@ -403,14 +406,11 @@ def resolve_tt_supports_stage_outputs(
             conflicts.append("speculative decoding")
         if (model_capabilities or {}).get("supports_async_decode", False):
             conflicts.append("supports_async_decode")
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        if max_num_seqs != 1:
-            conflicts.append(f"max_num_seqs={max_num_seqs}")
         if conflicts:
             raise ValueError(
                 f"Model {name} declares model_capabilities['supports_stage_outputs']"
-                "=True, which needs one-token front-packed decode steps of one "
-                "sequence at a time; got " + ", ".join(conflicts)
+                "=True, which needs one-token front-packed decode steps; got "
+                + ", ".join(conflicts)
             )
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, dict):
