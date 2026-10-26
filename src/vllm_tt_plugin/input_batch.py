@@ -1445,6 +1445,9 @@ class TTLaneInputBatch(InputBatch):
                 else None
             ),
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_total_lens=torch.from_numpy(
+                np.asarray(lane_batch.num_tokens[rows_np], dtype=np.int64)
+            ),
             defer_device_sampling=False,
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(

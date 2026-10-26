@@ -201,6 +201,12 @@ class TTModelInput:
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
 
+    # Prefill only: the whole sequence length of every row (``input_batch.num_tokens``): the end of
+    # the last piece, whatever piece is scheduled now. Passed to models with the
+    # ``prefill_lookahead`` capability as ``prefill_total`` (bounded prefill replay needs the
+    # position of the last tokens while an earlier piece runs). ``None`` for decode.
+    prefill_total_lens: torch.Tensor | None = None
+
     # Request id per forward row. A prefill build can drop rows, so forward row
     # order is not recoverable from the persistent batch; sample-time consumers
     # must resolve rows through this. ``None`` for lane builds, whose rows are

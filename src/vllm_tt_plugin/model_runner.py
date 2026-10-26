@@ -2547,6 +2547,13 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_total_lens=(
+                torch.from_numpy(
+                    np.asarray(input_batch.num_tokens[req_indices], dtype=np.int64)
+                )
+                if intermediate_prefill_mask is not None
+                else None
+            ),
             defer_device_sampling=defer_device_sampling,
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(row_req_ids)
@@ -3797,6 +3804,9 @@ class TTModelRunner:
             # (the token of every other row is discarded by the scheduler), so the model can return
             # as soon as the step is enqueued when no row is final
             kwargs["prefill_final"] = [not bool(x) for x in mask.tolist()]
+            totals = getattr(model_input, "prefill_total_lens", None)
+            if totals is not None:
+                kwargs["prefill_total"] = [int(x) for x in totals.tolist()]
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
