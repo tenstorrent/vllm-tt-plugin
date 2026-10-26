@@ -10,6 +10,9 @@ output. Per request:
          gap between a chunk's arrival and the audio already received before it
   RTR    audio seconds / seconds from submit to the last output
 
+``--concurrency N`` submits N copies of each prompt at once instead, and reports the
+worst TTFA and start across them and the audio all N made per second of wall time.
+
 ``--log-stats`` adds Omni's per-stage tables (stage 0 TTFT and TPOT: the talker's
 per-frame step time on the host clock).
 
@@ -90,6 +93,37 @@ def run(omni, params, args, text, out=None):
     return first - submitted, start, last - submitted, samples / rate, outputs
 
 
+def run_together(omni, params, args, texts):
+    """Submit every text at once. Returns (TTFA, start, audio seconds) per text, in
+    order, and the seconds until the last one finished."""
+    prompts = []
+    for text in texts:
+        args.text = text
+        info = tts_params(args)
+        prompts.append(
+            {
+                "prompt_token_ids": [1] * prompt_len(args, info),
+                "additional_information": info,
+            }
+        )
+    submitted = time.perf_counter()
+    first, start, samples, rate = {}, {}, {}, None
+    for output in omni.generate(prompts, params, py_generator=True, use_tqdm=False):
+        chunks, output_rate = _audio(output)
+        count = sum(chunk.numel() for chunk in chunks)
+        if not count:
+            continue
+        # Omni names the i-th prompt's request "i_<uuid>".
+        index = int(str(output.request_id).split("_", 1)[0])
+        now = time.perf_counter() - submitted
+        rate = output_rate
+        first.setdefault(index, now)
+        start[index] = max(start.get(index, 0.0), now - samples.get(index, 0) / rate)
+        samples[index] = samples.get(index, 0) + count
+    total = time.perf_counter() - submitted
+    return [(first[i], start[i], samples[i] / rate) for i in range(len(texts))], total
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -98,6 +132,7 @@ def main():
     parser.add_argument("--language", default="English")
     parser.add_argument("--log-stats", action="store_true")
     parser.add_argument("--out-dir", help="write each prompt's streamed audio here")
+    parser.add_argument("--concurrency", type=int, default=1)
     args = parser.parse_args()
 
     omni = Omni(
@@ -111,6 +146,19 @@ def main():
     params = copy.deepcopy(omni.default_sampling_params_list)
     params[-1].output_kind = RequestOutputKind.DELTA
     run(omni, params, args, PROMPTS["short"])
+    if args.concurrency > 1:
+        for name, text in PROMPTS.items():
+            rows, total = run_together(omni, params, args, [text] * args.concurrency)
+            audio_s = sum(row[2] for row in rows)
+            print(
+                f"MEASURE prompt={name} concurrency={args.concurrency} "
+                f"ttfa_s={max(row[0] for row in rows):.3f} "
+                f"start_s={max(row[1] for row in rows):.3f} total_s={total:.2f} "
+                f"audio_s={audio_s:.2f} rtr_total={audio_s / total:.3f}",
+                flush=True,
+            )
+        omni.close()
+        return
     for name, text in PROMPTS.items():
         out = args.out_dir and os.path.join(args.out_dir, f"{name}.wav")
         ttfa, start, total, audio_s, outputs = run(omni, params, args, text, out)
