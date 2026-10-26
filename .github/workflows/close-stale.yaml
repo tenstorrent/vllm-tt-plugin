@@ -39,7 +39,7 @@ jobs:
           days-before-issue-stale: 90
           days-before-issue-close: 14
           stale-issue-label: stale
-          exempt-issue-labels: keep-open,bug
+          exempt-issue-labels: keep-open,type:bug
           stale-issue-message: >
             **AUTOMATION**: This issue has had no activity for 90 days. It will
             be closed in 14 days unless it is updated or labeled `keep-open`.

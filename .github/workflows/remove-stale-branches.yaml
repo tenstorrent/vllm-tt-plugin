@@ -1,7 +1,9 @@
 name: Remove stale branches
 
-# Comments on the last commit of a branch idle for 60 days to tag its author,
-# then deletes the branch 7 days later unless it gets new commits.
+# Comments on the head commit of a branch whose author date is 60 or more days
+# old to tag its author, then deletes the branch 7 days later unless it gets a
+# newly authored commit. Rebasing or amending keeps the old author date, so the
+# branch stays stale.
 
 on:
   schedule:
@@ -10,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  # ignore-branches-with-open-prs reads each branch's open pull requests.
+  pull-requests: read
 
 jobs:
   remove-stale-branches:
