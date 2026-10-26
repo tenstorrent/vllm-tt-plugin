@@ -667,10 +667,12 @@ With `lane_prefix_cache_routing` (default `true`) such a request goes to the
 lane holding more of its prompt than the least-loaded lane does, unless that
 lane has no free slot once its queued requests are admitted while the
 least-loaded lane has one, or the prefill queued ahead on it (waiting
-requests' uncached tokens plus running partial prefills' remaining prompt
-tokens) exceeds the least-loaded lane's queue by more than the extra prefill
-the hit saves over the least-loaded lane's own hit; equal hits resolve on
-load. So a long shared prefix draws its followers to one lane, up to its
+requests' uncached tokens, ready requests parked in `skipped_waiting`, plus
+running partial prefills' remaining prompt tokens) exceeds the least-loaded
+lane's queue by more than the extra prefill the hit saves over the
+least-loaded lane's own hit; among lanes holding the same prefix the less
+loaded one is the candidate, and equal hits resolve on load. So a long shared
+prefix draws its followers to one lane, up to its
 capacity, while a short one (a common system prompt) spills to the other lanes
 as their queues grow. A preemption or a prefix-cache reset drops the
 admission-time estimates, since the affected requests recompute their whole

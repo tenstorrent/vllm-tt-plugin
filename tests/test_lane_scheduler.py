@@ -936,6 +936,67 @@ def test_a_burst_above_the_lane_capacity_spills_once_its_slots_are_promised():
     assert [len(lane.waiting) for lane in lanes] == [32, 32]
 
 
+def test_equal_cached_prefixes_resolve_by_load_among_the_cached_lanes():
+    # Lanes 0 and 1 both hold the 3968-token prefix, lane 2 holds nothing and is
+    # the least loaded overall: the tie between the cached lanes goes to the less
+    # loaded lane 1, not to the lower index.
+    lanes = [
+        _lane_with_cache(waiting=2, doc=3968),
+        _lane_with_cache(running=1, doc=3968),
+        _lane_with_cache(),
+    ]
+    coordinator = _routing_coordinator(lanes)
+    for req in lanes[0].waiting:
+        req.request_id = f"ahead-{id(req)}"
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+
+
+def _skipped(request_id, status, *, grammar=None, num_tokens=8192):
+    structured = (
+        None
+        if grammar is None
+        else SimpleNamespace(grammar=grammar if grammar != "pending" else None)
+    )
+    return SimpleNamespace(
+        request_id=request_id,
+        num_tokens=num_tokens,
+        status=status,
+        structured_output_request=structured,
+    )
+
+
+def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
+    # A grammar-blocked request whose grammar has compiled goes first at the next
+    # prefill step: its 8192 tokens outweigh the 3968-token hit on lane 0.
+    lanes = [_lane_with_cache(doc=3968), _lane_with_cache()]
+    lanes[0].skipped_waiting.append(
+        _skipped(
+            "ready",
+            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+            grammar=object(),
+        )
+    )
+    coordinator = _routing_coordinator(lanes)
+    assert coordinator._queued_prefill_tokens(0) == 8192
+    assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
+    # Still compiling: not ahead of the newcomer, the hit draws it to lane 0.
+    lanes[0].skipped_waiting[0] = _skipped(
+        "pending",
+        RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+        grammar="pending",
+    )
+    assert coordinator._queued_prefill_tokens(0) == 0
+    assert _lane_of(coordinator, _request("q2", prefix="doc")) == 0
+    # Remote KVs that have arrived count; a streaming-input request does not.
+    lanes[0].finished_recving_kv_req_ids = {"kv"}
+    lanes[0].skipped_waiting[0] = _skipped("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    assert coordinator._queued_prefill_tokens(0) == 8192
+    lanes[0].skipped_waiting[0] = _skipped(
+        "stream", RequestStatus.WAITING_FOR_STREAMING_REQ
+    )
+    assert coordinator._queued_prefill_tokens(0) == 0
+
+
 def test_lane_prefix_cache_routing_config_key():
     from vllm_tt_plugin.config import get_tt_lane_prefix_cache_routing
 
