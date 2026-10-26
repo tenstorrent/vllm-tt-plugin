@@ -987,14 +987,15 @@ def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
     )
     assert coordinator._queued_prefill_tokens(0) == 0
     assert _lane_of(coordinator, _request("q2", prefix="doc")) == 0
-    # Remote KVs that have arrived count; a streaming-input request does not.
+    # q2 now waits on lane 0 with its 128 uncached tokens. Remote KVs that have
+    # arrived count on top of it; a streaming-input request does not.
     lanes[0].finished_recving_kv_req_ids = {"kv"}
     lanes[0].skipped_waiting[0] = _skipped("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
-    assert coordinator._queued_prefill_tokens(0) == 8192
+    assert coordinator._queued_prefill_tokens(0) == 8192 + 128
     lanes[0].skipped_waiting[0] = _skipped(
         "stream", RequestStatus.WAITING_FOR_STREAMING_REQ
     )
-    assert coordinator._queued_prefill_tokens(0) == 0
+    assert coordinator._queued_prefill_tokens(0) == 128
 
 
 def test_lane_prefix_cache_routing_config_key():
