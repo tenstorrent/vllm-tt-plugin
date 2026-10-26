@@ -14,7 +14,10 @@ payload, as vLLM-Omni's ``GPUGenerationModelRunner`` (v1) does:
   * Finished or aborted requests reach the model's ``on_requests_finished``, which
     frees their decoder state.
 
-The model is the class registered for the stage's architecture, built on the host.
+The model is the class registered for the stage's architecture. A TT stage class, one
+with ``initialize_vllm_model``, is built on the stage's mesh as the AR runner builds its
+model; any other class is built on the host, which is how a stage is brought up before
+its TT class exists.
 """
 
 import copy
@@ -31,6 +34,8 @@ from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
+
+from vllm_tt_plugin.loader import TTModelLoader
 
 
 def merge_info(merged: dict, update: dict) -> None:
@@ -101,6 +106,12 @@ class TTOmniGenerationModelRunner(OmniConnectorModelRunnerMixin):
 
     def load_model(self) -> None:
         model_class, _ = get_model_architecture(self.model_config)
+        if hasattr(model_class, "initialize_vllm_model"):
+            with set_current_vllm_config(self.vllm_config):
+                self.model = TTModelLoader(self.vllm_config.load_config).load_model(
+                    vllm_config=self.vllm_config, model_config=self.model_config
+                )
+            return
         # The worker points device_config at the mesh; the model's tensors live on
         # the host.
         host_config = copy.copy(self.vllm_config)
@@ -124,7 +135,7 @@ class TTOmniGenerationModelRunner(OmniConnectorModelRunnerMixin):
             )
 
     def warmup_model(self) -> None:
-        """Nothing to capture: the stage model runs on the host."""
+        """Nothing to capture: a TT stage class compiles while it is built."""
 
     def _update_states(self, scheduler_output) -> None:
         for req_id in scheduler_output.finished_req_ids:

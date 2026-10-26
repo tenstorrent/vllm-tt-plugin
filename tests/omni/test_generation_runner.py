@@ -309,6 +309,55 @@ def test_the_model_is_built_on_the_host_from_the_stage_architecture(
     assert runner.vllm_config.device_config.device is mesh_device
 
 
+def test_a_tt_stage_class_is_built_on_the_mesh_by_the_tt_loader(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    built = {}
+
+    class _TTModel:
+        @classmethod
+        def initialize_vllm_model(cls, *args, **kwargs):
+            raise AssertionError("the TT loader calls this, not the runner")
+
+    class _Loader:
+        def __init__(self, load_config):
+            built["load_config"] = load_config
+
+        def load_model(self, *, vllm_config, model_config):
+            built["configs"] = (vllm_config, model_config, built.get("current"))
+            return "tt model"
+
+    class _Current:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def __enter__(self):
+            built["current"] = self.cfg
+
+        def __exit__(self, *exc):
+            built["current"] = None
+
+    monkeypatch.setattr(
+        generation_model_runner,
+        "get_model_architecture",
+        lambda _cfg: (_TTModel, "TTQwen3TTSCode2Wav"),
+    )
+    monkeypatch.setattr(generation_model_runner, "TTModelLoader", _Loader)
+    monkeypatch.setattr(generation_model_runner, "set_current_vllm_config", _Current)
+    runner = _runner()
+    runner.vllm_config.load_config = "load config"
+
+    runner.load_model()
+
+    assert runner.model == "tt model"
+    assert built["load_config"] == "load config"
+    assert built["configs"] == (
+        runner.vllm_config,
+        runner.model_config,
+        runner.vllm_config,
+    )
+
+
 QWEN3_TTS_MODEL = os.environ.get("QWEN3_TTS_MODEL")
 
 

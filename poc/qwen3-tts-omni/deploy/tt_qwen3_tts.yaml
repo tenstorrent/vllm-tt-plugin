@@ -1,6 +1,5 @@
 # Qwen3-TTS on TT: the talker on device 0 streams codec chunks to Code2Wav on
-# device 1. Code2Wav runs vLLM-Omni's PyTorch decoder on the host until a TT
-# decoder exists; its stage still holds device 1.
+# device 1, which decodes them on that device.
 #
 # The TT generation stage needs the v1 runner with async_chunk: Omni's scheduler
 # then receives the chunks, and the stage runner opens no connector.
@@ -56,8 +55,6 @@ stages:
 
   - stage_id: 1
     devices: "1"
-    # The decoder runs on the host CPU, where bfloat16 convolutions are slow.
-    dtype: float32
     max_num_seqs: 1
     enforce_eager: true
     trust_remote_code: true
@@ -68,6 +65,11 @@ stages:
     max_model_len: 65536
     input_connectors:
       from_stage_0: connector_of_shared_memory
+    # The codec's convolutions need the larger L1_SMALL region. Its traces, one per
+    # decode length, fit the default trace region.
+    additional_config:
+      tt:
+        l1_small_size: 65536
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

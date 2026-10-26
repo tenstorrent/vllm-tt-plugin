@@ -1322,11 +1322,9 @@ TT_QWEN3_TTS_TALKER_TARGET = (
     "models.demos.audio.qwen3_tts.tt.generator_vllm:"
     "Qwen3TTSTalkerForConditionalGeneration"
 )
-# Qwen3-TTS Code2Wav runs vLLM-Omni's PyTorch decoder on the host until a TT
-# decoder exists.
 TT_QWEN3_TTS_CODE2WAV_ARCH = "TTQwen3TTSCode2Wav"
 TT_QWEN3_TTS_CODE2WAV_TARGET = (
-    "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav:Qwen3TTSCode2Wav"
+    "models.demos.audio.qwen3_tts.tt.code2wav_vllm:Qwen3TTSCode2WavForTT"
 )
 
 

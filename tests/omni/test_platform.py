@@ -112,7 +112,7 @@ def test_the_tts_stage_architectures_are_registered(monkeypatch: pytest.MonkeyPa
         "Qwen3TTSTalkerForConditionalGeneration"
     )
     assert registered["TTQwen3TTSCode2Wav"] == (
-        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav:Qwen3TTSCode2Wav"
+        "models.demos.audio.qwen3_tts.tt.code2wav_vllm:Qwen3TTSCode2WavForTT"
     )
 
 
