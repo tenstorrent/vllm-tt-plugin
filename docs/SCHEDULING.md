@@ -664,13 +664,18 @@ running`, the weighting vLLM's DP load balancer uses) and remain bound to that
 lane. Each lane's prefix cache is separate, so a request whose prompt prefix
 an earlier request computed only hits the cache on the lane that holds it.
 With `lane_prefix_cache_routing` (default `true`) such a request goes to the
-lane holding the most of its prompt instead, unless that lane has no free
-running slot while the least-loaded lane has one, or the prefill queued ahead
-on it exceeds the least-loaded lane's queue by more than the prefill the hit
-saves; so a long shared prefix draws its followers to one lane while a short
-one (a common system prompt) spills to the other lanes as their queues grow.
-The lookup is the KV cache manager's own longest-hit search and allocates
-nothing. Because the device executes all lanes together, the coordinator
+lane holding more of its prompt than the least-loaded lane does, unless that
+lane has no free slot once its queued requests are admitted while the
+least-loaded lane has one, or the prefill queued ahead on it (waiting
+requests' uncached tokens plus running partial prefills' remaining prompt
+tokens) exceeds the least-loaded lane's queue by more than the extra prefill
+the hit saves over the least-loaded lane's own hit; equal hits resolve on
+load. So a long shared prefix draws its followers to one lane, up to its
+capacity, while a short one (a common system prompt) spills to the other lanes
+as their queues grow. A preemption or a prefix-cache reset drops the
+admission-time estimates, since the affected requests recompute their whole
+prompt. The lookup is the KV cache manager's own longest-hit search and
+allocates nothing. Because the device executes all lanes together, the coordinator
 selects one shared mode for each step:
 
 - if any lane can admit prefill, all lanes run a prefill step
