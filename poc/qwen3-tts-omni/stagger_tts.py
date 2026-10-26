@@ -13,7 +13,10 @@ async engine, streaming each. Per request, with playback starting at its first a
     python poc/qwen3-tts-omni/stagger_tts.py \
         --model <Qwen3-TTS-12Hz-1.7B-Base snapshot> \
         --deploy-config <deploy yaml with max_num_seqs >= --requests> \
-        --ref-audio <clip.wav> [--requests 4] [--gap 1.5]
+        --ref-audio <clip.wav> [<clip.wav> ...] [--requests 4] [--gap 1.5]
+
+With several `--ref-audio` clips, request i clones clip i modulo their number, so new
+clip lengths arrive while others speak.
 """
 
 import argparse
@@ -59,7 +62,7 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--deploy-config", required=True)
-    parser.add_argument("--ref-audio", required=True)
+    parser.add_argument("--ref-audio", required=True, nargs="+")
     parser.add_argument("--language", default="English")
     parser.add_argument("--prompt", default="long", choices=sorted(PROMPTS))
     parser.add_argument("--requests", type=int, default=4)
@@ -72,16 +75,22 @@ async def main():
     params = copy.deepcopy(omni.default_sampling_params_list)
     params[-1].output_kind = RequestOutputKind.DELTA
     args.text = PROMPTS[args.prompt]
-    info = tts_params(args)
-    prompt = {
-        "prompt_token_ids": [1] * prompt_len(args, info),
-        "additional_information": info,
-    }
+    clips = args.ref_audio
+    prompts = []
+    for clip in clips:
+        args.ref_audio = clip
+        info = tts_params(args)
+        prompts.append(
+            {
+                "prompt_token_ids": [1] * prompt_len(args, info),
+                "additional_information": info,
+            }
+        )
     rate = [None]
-    await speak(omni, params, prompt, "warmup", 0.0, rate)
+    await speak(omni, params, prompts[0], "warmup", 0.0, rate)
     results = await asyncio.gather(
         *(
-            speak(omni, params, prompt, f"r{i}", i * args.gap, rate)
+            speak(omni, params, prompts[i % len(prompts)], f"r{i}", i * args.gap, rate)
             for i in range(args.requests)
         )
     )
