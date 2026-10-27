@@ -386,7 +386,9 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
             max_num_seqs=batch, disable_hybrid_kv_cache_manager=False
         ),
         parallel_config=SimpleNamespace(
-            data_parallel_size=1, decode_context_parallel_size=1
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
         ),
         # As at init_device on vLLM 0.29+: the engine core resolves the KV
         # cache layout only afterwards, so the real config still raises here.
@@ -394,6 +396,7 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
         attention_config=SimpleNamespace(hisparse_config=None),
         additional_config={},
         speculative_config=None,
+        num_prefill_lookahead_tokens=0,
         kv_transfer_config=None,
         max_in_flight_tokens=in_flight,
     )
