@@ -129,6 +129,10 @@ class TestDPModes:
         vllm_config.model_config.multimodal_config = SimpleNamespace(
             mm_device_do_normalize=True
         )
+        # A TT vision model: a text-only class drops the multimodal config.
+        monkeypatch.setattr(
+            dummy_model_class, "supports_multimodal", True, raising=False
+        )
 
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
