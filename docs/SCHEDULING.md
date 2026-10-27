@@ -626,16 +626,19 @@ structured decode keeps logits on device until `sample_tokens()` supplies and
 remaps the packed grammar mask. Sampling-path eligibility is batch-wide: one
 ineligible request moves the whole submitted TT batch to host sampling. The
 runner drains pending async work before that forward and completes device
-sampling synchronously after the mask arrives. This initial path also requires
-`async_scheduling=False`, because upstream's batch queue can otherwise submit
-another forward before the current grammar arrives. Structured prefill and
+sampling synchronously after the mask arrives. Upstream's batch queue samples
+each forward before it submits the next, so the single deferred logits payload
+works with and without async scheduling. Structured prefill and
 ineligible structured decode retain host sampling. Block-output models reject
 structured outputs.
 
 That choice is made before forward submission. A deferred decode that later
 receives no mask, an incomplete request-to-mask mapping, or a device-sampling
 failure invalidates the runner; it cannot safely retry the already-submitted
-step on host.
+step on host. Under async scheduling, a request that finished while the step
+was in flight is the exception: vLLM gives it no mask row, its row samples
+unrestricted, and vLLM drops the token. If every structured request in the step
+finished, the step samples without a mask.
 
 So the TT async path is best understood as a fast path for steady decode, not as a universal async execution model.
 
