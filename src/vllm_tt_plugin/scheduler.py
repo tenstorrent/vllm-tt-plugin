@@ -7,8 +7,10 @@ from typing import cast
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 
+from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.logger import init_tt_logger
 
 logger = init_tt_logger(__name__)
@@ -116,6 +118,35 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
+        if not sched_events.enabled():
+            return self._schedule(throttle_prefills)
+        result = self._schedule(throttle_prefills)
+        self._log_schedule(result)
+        return result
+
+    def _log_schedule(self, result: SchedulerOutput) -> None:
+        """One ``admit`` line per newly admitted request, one ``preempt`` line per preempted one, and one
+        ``chunk`` line per prefill row (a new request or a partial prefill) with the chunk it was given
+        (``TT_SCHED_EVENT_LOG``, see ``sched_events``)."""
+        for new in result.scheduled_new_reqs:
+            sched_events.emit("admit", id=new.req_id)
+        for req_id in result.preempted_req_ids or ():
+            sched_events.emit("preempt", id=req_id)
+        for req_id, n in result.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            # ``_update_after_schedule`` has already advanced the computed
+            # count by this step's tokens: the chunk is [end - n, end). A
+            # decode row schedules one token past the prompt; a prefill chunk
+            # ends within the prompt (a resumed preemption may replay
+            # past it, in more than one token).
+            end = request.num_computed_tokens
+            if n == 1 and end > request.num_prompt_tokens:
+                continue  # a decode row
+            sched_events.emit("chunk", id=req_id, start=end - n, end=end)
+
+    def _schedule(self, throttle_prefills: bool) -> SchedulerOutput:
         has_pending_prefill = self._has_pending_prefill()
         # A partial prefill occupies ``running`` but cannot produce a decode
         # token, so it must not make the decode fallback below look viable.
@@ -239,3 +270,44 @@ class TTScheduler(AsyncScheduler):
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
+
+    # --- the event log (TT_SCHED_EVENT_LOG; sched_events) ------------------
+
+    def add_request(self, request: Request) -> None:
+        super().add_request(request)
+        if sched_events.enabled():
+            sched_events.emit(
+                "arrive",
+                id=request.request_id,
+                prompt=request.num_prompt_tokens,
+                max_tokens=request.max_tokens,
+            )
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> dict:
+        if not sched_events.enabled():
+            return super().update_from_output(scheduler_output, model_runner_output)
+        before = [
+            request
+            for req_id in scheduler_output.num_scheduled_tokens
+            if (request := self.requests.get(req_id)) is not None
+            and request.num_output_tokens == 0
+        ]
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        for request in before:
+            if request.num_output_tokens > 0:
+                sched_events.emit("first_token", id=request.request_id)
+        return outputs
+
+    def _free_request(self, request: Request, *args, **kwargs):
+        if sched_events.enabled():
+            sched_events.emit(
+                "finish",
+                id=request.request_id,
+                status=request.status.name,
+                output=request.num_output_tokens,
+            )
+        return super()._free_request(request, *args, **kwargs)

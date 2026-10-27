@@ -53,6 +53,7 @@ from vllm_tt_plugin.input_batch import (
     build_cached_request_state,
     clone_torch_generator,
 )
+from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
@@ -1643,7 +1644,21 @@ class TTModelRunner:
 
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
-        fwd = self._forward_with_model_input(model_input)
+        if not sched_events.enabled():
+            fwd = self._forward_with_model_input(model_input)
+        else:
+            kind = "decode" if is_decode else "prefill"
+            rows = model_input.input_tokens.shape[0]
+            num_reqs = self.input_batch.num_reqs
+            sched_events.emit(
+                "forward_start",
+                kind=kind,
+                b=num_reqs,
+                reqs=sched_events.ids(self.input_batch.req_ids[:num_reqs]),
+                rows=rows,
+            )
+            fwd = self._forward_with_model_input(model_input)
+            sched_events.emit("forward_end", kind=kind, b=num_reqs)
         self._pending_samples.append(partial(self._finish_nondp_sync, fwd=fwd))
         return None
 
