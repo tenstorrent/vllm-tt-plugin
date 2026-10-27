@@ -12,6 +12,7 @@ from vllm.v1.request import Request
 
 from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.sched_interleave import InterleavePolicy
 
 logger = init_tt_logger(__name__)
 
@@ -94,6 +95,22 @@ class TTScheduler(AsyncScheduler):
         model_config = getattr(self.vllm_config, "model_config", None)
         model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
         self._aligned_chunks = model_type in ALIGNED_CHUNK_MODEL_TYPES
+        # TT_SCHED_INTERLEAVE (sched_interleave): decode bursts between
+        # prefills in default mode; None unless the variable is set.
+        self._interleave = InterleavePolicy.from_env()
+        if self._interleave is not None:
+            logger.info(
+                "TT scheduler interleaving: every %d completed prefill(s), "
+                "burst %d, ready >= %d, max_prompt %s, queue %s, split %s, "
+                "work_ms %s",
+                self._interleave.every,
+                self._interleave.burst,
+                self._interleave.ready,
+                self._interleave.max_prompt,
+                self._interleave.queue,
+                self._interleave.split,
+                self._interleave.work_ms,
+            )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -173,8 +190,17 @@ class TTScheduler(AsyncScheduler):
 
         # Default mode:
         # Prefer prefill whenever prefill work is pending, so new requests are
-        # admitted and partial prefills advance.
+        # admitted and partial prefills advance, unless a policy asks for a
+        # decode step first (TT_SCHED_INTERLEAVE: a bounded burst of the
+        # running decodes between prefills).
         if has_pending_prefill:
+            if self._prefer_decode(has_running_decode):
+                result = self._schedule_decode_only()
+                if result.total_num_scheduled_tokens > 0:
+                    return self._finalize_scheduler_output(result)
+                # nothing to decode after all (KV pressure): end the burst
+                # and prefill as before
+                self._finalize_scheduler_output(result)
             prefill_result = self._schedule_prefill_only()
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
@@ -188,9 +214,35 @@ class TTScheduler(AsyncScheduler):
         result = super().schedule()
         return self._finalize_scheduler_output(result)
 
+    def _prefer_decode(self, has_running_decode: bool) -> bool:
+        """Default mode only: run a decode step although prefill work is
+        pending. Each policy adds one clause; the first true clause wins; an
+        absent policy adds nothing. ``has_running_decode`` false means there
+        is nothing to decode and the answer is no whatever the policies say.
+        """
+        if not has_running_decode:
+            return False
+        policy = self._interleave
+        if policy is not None:
+            ready = sum(1 for r in self.running if not r.is_prefill_chunk)
+            partial = next((r for r in self.running if r.is_prefill_chunk), None)
+            if partial is not None:
+                next_prompt = partial.num_prompt_tokens
+            elif self.waiting:
+                next_prompt = self.waiting.peek_request().num_prompt_tokens
+            else:
+                next_prompt = None
+            if policy.burst_due(ready, len(self.waiting), next_prompt):
+                policy.start_burst()
+                return True
+        return False
+
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput
     ) -> SchedulerOutput:
+        # Count scheduled work, not schedule() calls: every path ends here.
+        if self._interleave is not None:
+            self._interleave.observe(scheduler_output, self.requests, len(self.waiting))
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
@@ -259,6 +311,13 @@ class TTScheduler(AsyncScheduler):
             self.running = [r for r in self.running if not r.is_prefill_chunk]
         try:
             result = super().schedule()
+            # A partial prefill in a decode batch would join its decode slot
+            # with the prefix computed so far and answer on a truncated
+            # context with no error (the generator joins ``pending`` rows at
+            # their first decode step): it must never be scheduled here.
+            hidden = {r.request_id for r in partial_prefills}
+            leaked = hidden.intersection(result.num_scheduled_tokens)
+            assert not leaked, f"partial prefill(s) in a decode step: {leaked}"
         finally:
             if self.waiting:
                 saved_waiting.prepend_requests(self.waiting)

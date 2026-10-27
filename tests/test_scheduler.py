@@ -10,9 +10,14 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
 
+_ids = iter(range(10**6))
+
+
 def _running(is_prefill_chunk=False):
     """A stand-in for a running request, seen only through the fields TT reads."""
-    return SimpleNamespace(is_prefill_chunk=is_prefill_chunk)
+    return SimpleNamespace(
+        is_prefill_chunk=is_prefill_chunk, request_id=f"r{next(_ids)}"
+    )
 
 
 def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
@@ -27,6 +32,8 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
     scheduler._forced_mode = mode
+    scheduler._aligned_chunks = False
+    scheduler._interleave = None  # TT_SCHED_INTERLEAVE unset
     return scheduler
 
 
