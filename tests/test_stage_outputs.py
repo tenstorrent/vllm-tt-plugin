@@ -288,7 +288,6 @@ def test_the_resolved_capability_is_stored_on_the_config():
         (_config(), True, "lane mode"),
         (_config(output_tokens_per_step=4), False, "output_tokens_per_step=4"),
         (_config(speculative_config=object()), False, "speculative decoding"),
-        (_config(max_num_seqs=2), False, "max_num_seqs=2"),
     ],
 )
 def test_stage_outputs_need_one_token_front_packed_steps(config, is_lane_mode, message):
@@ -296,6 +295,16 @@ def test_stage_outputs_need_one_token_front_packed_steps(config, is_lane_mode, m
         resolve_tt_supports_stage_outputs(
             config, {"supports_stage_outputs": True}, _Model, is_lane_mode
         )
+
+
+def test_more_than_one_sequence_is_left_to_the_scheduler_kv_check():
+    config = _config(max_num_seqs=4)
+
+    resolve_tt_supports_stage_outputs(
+        config, {"supports_stage_outputs": True}, _Model, False
+    )
+
+    assert get_tt_supports_stage_outputs(config) is True
 
 
 def test_stage_outputs_refuse_async_decode():
