@@ -231,9 +231,10 @@ def _scheduler(*, running=(), waiting=0, mode=TTSchedulingMode.DEFAULT, **tt_key
         scheduler.waiting.add_request(
             SimpleNamespace(status=RequestStatus.WAITING, num_output_placeholders=0)
         )
-    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
+    scheduler.max_num_active_reqs = 8
     scheduler._forced_mode = mode
     scheduler._decode_interleave = _policy(**tt_keys)
     return scheduler

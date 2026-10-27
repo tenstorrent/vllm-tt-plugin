@@ -26,6 +26,7 @@ below is a real point in the step, not a sleep.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import io
 import logging
@@ -1940,6 +1941,26 @@ def test_overlapping_submissions_are_counted_and_unsafe_ones_are_not():
     assert controller._overlapped_unsafe_submissions == 0
 
 
+@contextlib.contextmanager
+def _captured_async_decode_log():
+    """Capture the async-decode logger's records, INFO included.
+
+    vLLM applies its logging configuration at engine start, so in a bare test
+    process the logger inherits the root logger's WARNING level.
+    """
+    logger = async_decode_module.logger
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    saved_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield stream
+    finally:
+        logger.setLevel(saved_level)
+        logger.removeHandler(handler)
+
+
 def test_an_unsafe_overlap_is_logged_at_its_exact_counter_value(tmp_path):
     """The device parser must observe an unsafe non-power-of-two overlap."""
     from tests.tt.spec.test_async_transitions import _overlap_counts
@@ -1948,14 +1969,9 @@ def test_an_unsafe_overlap_is_logged_at_its_exact_counter_value(tmp_path):
     runner = _baseline_runner(model)
     controller = runner.async_decode
 
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    async_decode_module.logger.addHandler(handler)
-    try:
+    with _captured_async_decode_log() as stream:
         for overlap_ok in (True, True, True, False):
             controller.register_pending_async_step(object(), overlap_ok=overlap_ok)
-    finally:
-        async_decode_module.logger.removeHandler(handler)
 
     server_log = tmp_path / "server.log"
     server_log.write_text(stream.getvalue())
@@ -2069,14 +2085,9 @@ def test_the_submission_report_is_the_line_the_benchmark_parses():
     controller._overlapped_submissions = 9
     ordinary = SimpleNamespace(spec_mode=None)
 
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    async_decode_module.logger.addHandler(handler)
-    try:
+    with _captured_async_decode_log() as stream:
         controller.count_decode_submission(ordinary)
         controller.count_decode_submission(ordinary)
-    finally:
-        async_decode_module.logger.removeHandler(handler)
 
     lines = stream.getvalue().splitlines()
     reported = [found.groups() for line in lines if (found := SUBMISSIONS.search(line))]

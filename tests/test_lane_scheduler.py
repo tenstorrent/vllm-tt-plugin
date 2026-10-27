@@ -4,8 +4,9 @@
 
 The coordinator is exercised over lightweight fake lane schedulers: a real
 ``TTScheduler`` needs a device KV cache config, but the coordinator only relies
-on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
-length, forced-mode scheduling, and ``update_from_output``).
+on a small surface of each lane (``waiting`` / ``kv_holding_waiting`` /
+``running``, ``get_request_counts``, forced-mode scheduling, and
+``update_from_output``).
 """
 
 import collections
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.request import RequestStatus
 
@@ -40,17 +42,20 @@ class FakeLane:
     fallback.
     """
 
+    # Upstream's own count, so the fake fails loudly if vLLM moves the queues.
+    get_request_counts = Scheduler.get_request_counts
+
     def __init__(
         self,
         waiting=0,
         running=0,
-        skipped_waiting=0,
+        kv_holding_waiting=0,
         partial_prefills=0,
         pending_finished=(),
         owns=(),
     ):
         self.waiting = [object()] * waiting
-        self.skipped_waiting = [object()] * skipped_waiting
+        self.kv_holding_waiting = [object()] * kv_holding_waiting
         self.running = [
             SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
         ] + [
@@ -153,11 +158,13 @@ def test_negotiate_decode_when_no_lane_wants_prefill():
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.DECODE_ONLY
 
 
-def test_negotiate_prefill_when_lane_has_only_grammar_blocked_request():
-    # Lane 1's only pending work is a grammar-blocked structured-output request
-    # held in skipped_waiting (waiting is empty). It must still force prefill so
-    # the base scheduler can revisit and promote it after the grammar is ready.
-    coordinator = _make_coordinator([FakeLane(running=2), FakeLane(skipped_waiting=1)])
+def test_negotiate_prefill_when_lane_has_only_kv_holding_request():
+    # Lane 1's only pending work holds KV blocks while it waits (for example a
+    # streaming-input session that received its next chunk), so it sits in
+    # kv_holding_waiting and waiting is empty. It must still force prefill.
+    coordinator = _make_coordinator(
+        [FakeLane(running=2), FakeLane(kv_holding_waiting=1)]
+    )
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
@@ -742,6 +749,7 @@ def _request(request_id, num_tokens=4096, prefix="", skip_reading_prefix_cache=F
         block_hashes=prefix or request_id,
         num_tokens=num_tokens,
         skip_reading_prefix_cache=skip_reading_prefix_cache,
+        status=RequestStatus.WAITING,
     )
 
 
@@ -951,7 +959,7 @@ def test_equal_cached_prefixes_resolve_by_load_among_the_cached_lanes():
     assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
 
 
-def _skipped(request_id, status, *, grammar=None, num_tokens=8192):
+def _blocked(request_id, status, *, grammar=None, num_tokens=8192):
     structured = (
         None
         if grammar is None
@@ -965,12 +973,13 @@ def _skipped(request_id, status, *, grammar=None, num_tokens=8192):
     )
 
 
-def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
-    # A grammar-blocked request whose grammar has compiled goes first at the next
-    # prefill step: its 8192 tokens outweigh the 3968-token hit on lane 0.
+def test_only_ready_waiting_requests_count_as_prefill_work_ahead():
+    # A grammar-blocked request stays in ``waiting``. Once its grammar has
+    # compiled it is scheduled at the next prefill step: its 8192 tokens
+    # outweigh the 3968-token hit on lane 0.
     lanes = [_lane_with_cache(doc=3968), _lane_with_cache()]
-    lanes[0].skipped_waiting.append(
-        _skipped(
+    lanes[0].waiting.append(
+        _blocked(
             "ready",
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             grammar=object(),
@@ -980,19 +989,23 @@ def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
     assert coordinator._queued_prefill_tokens(0) == 8192
     assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
     # Still compiling: not ahead of the newcomer, the hit draws it to lane 0.
-    lanes[0].skipped_waiting[0] = _skipped(
+    lanes[0].waiting[0] = _blocked(
         "pending",
         RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
         grammar="pending",
     )
     assert coordinator._queued_prefill_tokens(0) == 0
     assert _lane_of(coordinator, _request("q2", prefix="doc")) == 0
-    # q2 now waits on lane 0 with its 128 uncached tokens. Remote KVs that have
-    # arrived count on top of it; a streaming-input request does not.
+    # q2 now waits on lane 0 with its 128 uncached tokens. A request holding KV
+    # blocks waits in ``kv_holding_waiting``: remote KVs that have arrived count
+    # on top of q2; a streaming-input request does not.
+    del lanes[0].waiting[0]
     lanes[0].finished_recving_kv_req_ids = {"kv"}
-    lanes[0].skipped_waiting[0] = _skipped("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    lanes[0].kv_holding_waiting.append(
+        _blocked("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    )
     assert coordinator._queued_prefill_tokens(0) == 8192 + 128
-    lanes[0].skipped_waiting[0] = _skipped(
+    lanes[0].kv_holding_waiting[0] = _blocked(
         "stream", RequestStatus.WAITING_FOR_STREAMING_REQ
     )
     assert coordinator._queued_prefill_tokens(0) == 128
@@ -1012,3 +1025,19 @@ def test_lane_prefix_cache_routing_config_key():
         get_tt_lane_prefix_cache_routing(
             SimpleNamespace(additional_config={"tt": {"lane_prefix_cache_routing": 1}})
         )
+
+
+def test_coordinator_reads_the_queues_of_real_lane_schedulers():
+    # The fakes above mirror a lane's queues; this drives the same reads on real
+    # lane schedulers, so a change to vLLM's waiting-queue layout fails here.
+    from tests.test_block_scheduler import _request as _real_request
+    from tests.test_block_scheduler import _scheduler as _real_scheduler
+
+    lanes = [_real_scheduler(output_width=1, max_num_seqs=2) for _ in range(2)]
+    lanes[0].add_request(_real_request(4, request_id="A", prompt_length=32))
+    coordinator = _make_coordinator(lanes, per_lane_max=2)
+
+    assert coordinator._pick_lane() == 1
+    assert coordinator._lane_occupancy(0) == 1
+    assert coordinator._queued_prefill_tokens(0) == 32
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY

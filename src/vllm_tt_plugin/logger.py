@@ -71,11 +71,12 @@ def init_tt_logger(name: str) -> logging.Logger:
 
     Records keep vLLM's own format and stream-e.g., `vllm.tt.engine` renders as::
 
-        INFO 08-12 15:28:15 [tt/engine.py:167] DP device ranks: [0, 1]
+        (EngineCore pid=4242) INFO 08-12 15:28:15 [tt/engine.py:167] DP ranks: [0]
 
-    NOTE: a ``VLLM_LOGGING_CONFIG_PATH`` config that omits the ``vllm`` logger
-          disables every logger created before vLLM applies it, so calling this
-          ahead of ``import vllm`` silences TT records entirely.
+    NOTE: vLLM applies its logging configuration at CLI or engine start, after
+          the plugin has created its loggers. A ``VLLM_LOGGING_CONFIG_PATH``
+          config that omits the ``vllm`` logger disables every logger that
+          exists at that point, so it silences TT records entirely.
     """
     logger = logging.getLogger(
         f"{_TT_LOGGER_ROOT}.{name.removeprefix(_PACKAGE_PREFIX)}"

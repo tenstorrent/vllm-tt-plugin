@@ -1155,7 +1155,7 @@ def _install_block_output_reset_abort_patch() -> None:
     fall through to the scheduler guard's raise instead.
     ``pause_generation(mode="keep")`` reaches the same method from its deferred
     idle callback while intentionally retaining live requests; that path is
-    left to the scheduler guard, which refuses the reset without raising.
+    left to the scheduler guard, which refuses the reset by returning False.
     """
     import vllm.v1.engine.core as engine_core
     from vllm.v1.core.sched.interface import PauseState
@@ -1206,11 +1206,11 @@ def _install_block_output_pause_guard_patch() -> None:
     block requests.
 
     The keep-mode cache reset runs from the engine's deferred idle callback,
-    whose result upstream discards: ``EngineCore._reset_caches`` ignores the
-    scheduler's ``False`` and the pause Future resolves regardless, so the
-    caller would be told the pause succeeded with a cleared cache while the
-    retained canvases kept their state. Refusing here, before any pause state
-    changes, surfaces the conflict synchronously — the raise is caught by
+    after the scheduler is already paused. ``EngineCore._reset_caches`` turns
+    the scheduler's ``False`` into a generic "Failed to reset the KV connector
+    cache" error on the pause Future, which does not name the live request
+    that blocked the reset. Refusing here, before any pause state changes,
+    surfaces the conflict synchronously and names it: the raise is caught by
     ``_invoke_utility_method`` and returned to the client as a failed call.
     ``EngineCoreProc`` overrides ``pause_scheduler``, so both classes are
     wrapped.
@@ -1937,6 +1937,13 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+        # ModelConfig caches whether the model takes multimodal input, and
+        # ModelConfig.__post_init__ fills that cache while the architecture
+        # still names the upstream class. Drop it so the next read resolves the
+        # TT class: a text-only TT class behind a multimodal upstream
+        # architecture (Gemma4) otherwise keeps the upstream True, and the
+        # renderer builds a multimodal processor the TT class does not have.
+        vars(model_config).pop("_supports_multimodal_inputs_cache", None)
 
         # Verify that the TT architecture is registered in the model registry
         from vllm.model_executor.models.registry import ModelRegistry
