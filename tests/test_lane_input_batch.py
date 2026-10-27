@@ -565,6 +565,90 @@ def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
     assert requests["a"].block_ids == ([7],)
 
 
+def test_apply_step_plan_releases_a_freed_slot_to_the_model_first():
+    """Finish and preemption hand the model the request's row before freeing it.
+
+    The row is the device state slot, and a model-owned drafter keeps a
+    session per slot, so the model has to hear of the release while the slot
+    mapping still names the request, exactly as the front-packed path does
+    through ``_release_model_request``.
+    """
+    released: list[tuple[int, dict]] = []
+    b = _lane_batch(num_lanes=2, per_lane=2)
+    requests: dict = {}
+
+    def release(slot):
+        # Captured with the batch's occupancy at the time of the call.
+        released.append((slot, dict(b.req_id_to_index)))
+
+    b.apply_step_plan(
+        _step_output(
+            new_reqs=[_new_req("a", [1]), _new_req("b", [2]), _new_req("c", [3])]
+        ),
+        _plan({"a": 0, "b": 1, "c": 3}, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released == []
+
+    # "c" finishes in lane 1's last slot: released while it still holds row 3.
+    b.apply_step_plan(
+        _step_output(finished=["c"]),
+        _plan({"a": 0, "b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released == [(3, {"a": 0, "b": 1, "c": 3})]
+    assert b.occupied_rows() == [0, 1]
+
+    # "a" is preempted: its slot is released the same way, and its request
+    # state is kept for the resume.
+    b.apply_step_plan(
+        _step_output(preempted=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released[-1] == (0, {"a": 0, "b": 1})
+    assert "a" in requests and "a" not in b.req_id_to_index
+
+    # "a" is aborted before it resumes: it holds no row and its slot was
+    # already released, so the model hears nothing more.
+    b.apply_step_plan(
+        _step_output(finished=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert len(released) == 2
+    assert "a" not in requests
+
+
+def test_apply_step_plan_refuses_a_preemption_of_a_request_without_a_row():
+    b = _lane_batch(num_lanes=1, per_lane=2)
+    requests: dict = {}
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("b", [2])]),
+        _plan({"b": 1}, capacity=2),
+        requests,
+        {},
+    )
+    with pytest.raises(
+        RuntimeError, match="'ghost' was preempted but holds no lane row"
+    ):
+        b.apply_step_plan(
+            _step_output(preempted=["ghost"]),
+            _plan({"b": 1}, is_decode=True, capacity=2),
+            requests,
+            {},
+            release_request=lambda slot: None,
+        )
+
+
 def test_lane_full_raises():
     b = _lane_batch(num_lanes=1, per_lane=2)
     _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)

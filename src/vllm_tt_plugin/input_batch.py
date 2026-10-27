@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -959,6 +959,8 @@ class TTLaneInputBatch(InputBatch):
         plan: "TTStepPlan",
         requests: dict[str, TTCachedRequestState],
         encoder_cache: dict,
+        *,
+        release_request: Callable[[int], None] | None = None,
     ) -> bool:
         """Apply one lane step plan to this batch and the runner's request map.
 
@@ -972,6 +974,15 @@ class TTLaneInputBatch(InputBatch):
         A preempted request's ``CachedRequestState`` stays in ``requests`` for
         that resume.
 
+        ``release_request`` is the model's hook of that name, or ``None`` when
+        the model defines none. It is called with the row of every request
+        whose row this step frees, while the request still holds it, which is
+        what ``TTModelRunner._update_states`` does through
+        ``_release_model_request`` for the front-packed batch (the contract's
+        lifecycle hooks). A lane row never moves (``condense`` is a no-op and
+        ``slot_remap`` the identity), so the row a request was prefilled into
+        is its current slot for its whole life and there is no move to notify.
+
         ``requests`` (the runner's canonical ``req_id -> CachedRequestState``
         map) and ``encoder_cache`` are mutated in place. Placement rows come
         from ``plan.req_id_to_row`` -- the scheduler owns slot allocation, this
@@ -981,11 +992,12 @@ class TTLaneInputBatch(InputBatch):
         """
         layout_changed = False
 
-        # Finished requests release their slot.
+        # Finished requests release their slot. One that holds no row was never
+        # placed (aborted while queued) or was preempted and aborted before its
+        # resume, and the preemption already released its slot.
         for req_id in scheduler_output.finished_req_ids:
             requests.pop(req_id, None)
-            if self.remove_request(req_id) is not None:
-                layout_changed = True
+            layout_changed |= self._free_row(req_id, release_request)
 
         # Preempted requests release their row, in the same step as the
         # coordinator returns it to the lane's free list
@@ -994,8 +1006,7 @@ class TTLaneInputBatch(InputBatch):
         # of the occupant still sitting here. ``preempted_req_ids`` is typed
         # optional, hence the ``or ()``.
         for req_id in scheduler_output.preempted_req_ids or ():
-            if self.remove_request(req_id) is not None:
-                layout_changed = True
+            layout_changed |= self._free_row(req_id, release_request, must_hold=True)
 
         # Free cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -1027,8 +1038,7 @@ class TTLaneInputBatch(InputBatch):
                 # back when the preemption was reported, so this removal only
                 # covers a resume whose preemption never was, keeping the
                 # request off two rows at once.
-                if self.remove_request(req_id) is not None:
-                    layout_changed = True
+                layout_changed |= self._free_row(req_id, release_request)
                 req_ids_to_add.append(req_id)
                 continue
             req_index = self.req_id_to_index.get(req_id)
@@ -1046,6 +1056,43 @@ class TTLaneInputBatch(InputBatch):
 
         self.refresh_logitsprocs()
         return layout_changed
+
+    def _free_row(
+        self,
+        req_id: str,
+        release_request: Callable[[int], None] | None,
+        *,
+        must_hold: bool = False,
+    ) -> bool:
+        """Give ``req_id``'s row back, telling the model first.
+
+        The row is the request's device state slot, so the model's
+        ``release_request`` is handed it while the request still holds it, and
+        the row is freed after. The model has to hear of it before the row is
+        reused: a model-owned drafter keeps a session per slot, and a newcomer
+        placed on a slot nobody released inherits a stale one.
+
+        Returns whether a row was freed. ``must_hold`` says the request has to
+        hold one: a preempted request was running, so it was placed, and one
+        without a row is a bookkeeping fault reported with the occupancy rather
+        than a slot left unreleased.
+        """
+        row = self.req_id_to_index.get(req_id)
+        if row is None:
+            if must_hold:
+                occupancy = {
+                    rid: row for row, rid in enumerate(self._req_ids) if rid is not None
+                }
+                raise RuntimeError(
+                    f"request {req_id!r} was preempted but holds no lane row, so "
+                    "its device state slot cannot be released; occupied rows: "
+                    f"{occupancy}"
+                )
+            return False
+        if release_request is not None:
+            release_request(row)
+        self.remove_request(req_id)
+        return True
 
     # ------------------------------------------------------------------
     # Sampling layout (merged, over the full slot batch)

@@ -200,9 +200,16 @@ def _agreed_drafts(runner: SimpleNamespace, req_id: str) -> list[int]:
 
 
 def _lane_step(
-    runner: SimpleNamespace, *req_ids: str, drafts: dict[str, list[int]] | None = None
+    runner: SimpleNamespace,
+    *req_ids: str,
+    drafts: dict[str, list[int]] | None = None,
+    finished: tuple[str, ...] = (),
 ):
-    """One lane decode step over the scheduled requests, as the coordinator plans it."""
+    """One lane decode step over the scheduled requests, as the coordinator plans it.
+
+    ``finished`` names requests this step reports finished; the plan records
+    the layout change their freed rows make, as the coordinator would.
+    """
     batch = runner.lane_batch
     rows = sorted(batch.req_id_to_index[req_id] for req_id in req_ids)
     ordered = [batch.req_ids[row] for row in rows]
@@ -211,6 +218,7 @@ def _lane_step(
         # cover whatever the previous step committed.
         batch.num_computed_tokens_cpu[row] = batch.num_tokens[row]
     scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.finished_req_ids = set(finished)
     scheduler_output.scheduled_spec_decode_tokens = dict(drafts or {})
     scheduler_output.num_scheduled_tokens = dict.fromkeys(ordered, 1)
     scheduler_output.total_num_scheduled_tokens = len(ordered)
@@ -234,6 +242,7 @@ def _lane_step(
         req_id_to_row=dict(batch.req_id_to_index),
         batch_size_per_dp=(PER_LANE,) * NUM_LANES,
         prefill_empty_slots=None,
+        decode_layout_changed=any(r in batch.req_id_to_index for r in finished),
     )
     scheduler_output._tt_step_state = SimpleNamespace(plan=plan)
     assert runner.execute_model(scheduler_output) is None, (
@@ -408,6 +417,33 @@ def test_the_draft_cap_follows_the_live_rows_of_the_whole_lane_batch():
     output = _lane_step(runner, "a", drafts=drafts)
     assert model.verify_calls[-1]["num_valid_drafts"].tolist() == [DRAFT_LEN, 0, 0, 0]
     assert len(_by_request(output)["a"]) == DRAFT_LEN + 1
+
+
+def test_a_finished_lane_request_is_released_to_the_drafter():
+    """The model's ``release_request`` hears a finished request's slot.
+
+    A model-owned drafter keeps a session per state slot, and nothing else
+    tells it a request is gone (contract section 4g); the lane step hands it
+    the slot before the row is reused, as the front-packed step does.
+    """
+    model = FakeSpecModel()
+    released: list[int] = []
+    model.release_request = released.append
+    runner = _lane_runner(model)
+    _place(runner, "a", 0, first_token=1)
+    _place(runner, "b", 3, first_token=21)
+    drafts = {"a": _agreed_drafts(runner, "a"), "b": _agreed_drafts(runner, "b")}
+    _lane_step(runner, "a", "b", drafts=drafts)
+    assert released == []
+
+    # "b" finishes and "a" decodes on: slot 3 is released, slot 0 is not.
+    _lane_step(runner, "a", drafts={"a": _agreed_drafts(runner, "a")}, finished=("b",))
+
+    assert released == [3]
+    assert "b" not in runner.requests
+    assert runner.lane_batch.occupied_rows() == [0]
+    assert model.verify_calls[-1]["num_valid_drafts"].tolist() == [DRAFT_LEN, 0, 0, 0]
+    assert "b" not in runner._req_accepted_counts
 
 
 # endregion The slot layout

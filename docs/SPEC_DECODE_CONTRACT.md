@@ -818,8 +818,10 @@ the adapter implements `release_request`,
 `TTModelRunner._release_model_request` calls `release_request(current_slot)`.
 The adapter releases the model-owned state associated with that current slot.
 `TTModelRunner._release_dead_state_slots` then removes those requests from
-`TTModelRunner._req_state_slot`. A preempted request re-prefills its history
-when the scheduler resumes it.
+`TTModelRunner._req_state_slot`. In lane mode the row is the slot and
+`TTLaneInputBatch.apply_step_plan` calls `release_request(row)` for every
+request whose row the step frees, before the row is reused. A preempted
+request re-prefills its history when the scheduler resumes it.
 `TTModelRunner._prepare_model_inputs` drops a request's
 `TTModelRunner._req_accepted_counts` entry once the request is gone from
 `TTModelRunner.requests`, and drops it for every request of a prefill step, so
@@ -876,7 +878,9 @@ adaptive block-output gather (#118), and a contract implementer must know them.
 `TTModelRunner._release_model_request(req_id)` for every id in
 `SchedulerOutput.finished_req_ids` and `SchedulerOutput.preempted_req_ids`,
 before it drops the id from `TTModelRunner._req_state_slot`; the model receives
-the request's current state slot. A model-owned drafter that keeps per-request
+the request's current state slot. In lane mode `TTLaneInputBatch.apply_step_plan`
+makes the same call with the request's row, which is its slot, before the row
+is freed. A model-owned drafter that keeps per-request
 state (a committed prefix, an outstanding proposal, a session) must implement
 it. The runner asks for a proposal after every step (section 4b), and the
 scheduler decides a request's finish after `execute_model` returns, so a

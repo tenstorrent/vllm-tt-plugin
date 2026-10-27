@@ -2779,8 +2779,16 @@ class TTModelRunner:
         ):
             self.async_decode.wait_for_all_pending_async_steps()
 
+        # The model hears of every slot this step frees before the row is
+        # reused, as ``_update_states`` does for the front-packed batch; here
+        # the row is the slot, so the batch resolves it.
+        release = getattr(self.model, "release_request", None)
         layout_changed = lane_batch.apply_step_plan(
-            scheduler_output, plan, self.requests, self.encoder_cache
+            scheduler_output,
+            plan,
+            self.requests,
+            self.encoder_cache,
+            release_request=release if callable(release) else None,
         )
         assert layout_changed == plan.decode_layout_changed, (
             "lane scheduler and runner disagreed about decode layout change: "
