@@ -1588,6 +1588,7 @@ class TTModelRunner:
         return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
 
     @torch.no_grad()
+    @sched_events.guarded
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1827,6 +1828,7 @@ class TTModelRunner:
             pooler_output=[],
         )
 
+    @sched_events.guarded
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput | None:

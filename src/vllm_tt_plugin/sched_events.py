@@ -27,10 +27,15 @@ of vLLM's request id (``chatcmpl-<X-Request-ID>``).
 
 from __future__ import annotations
 
+import functools
 import os
+import sys
 import time
-from collections.abc import Iterable
-from typing import IO
+import traceback
+from collections.abc import Callable, Iterable
+from typing import IO, Any, TypeVar, cast
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 _PATH: str | None = os.environ.get("TT_SCHED_EVENT_LOG")
 _FILE: IO[str] | None = None
@@ -54,3 +59,29 @@ def emit(kind: str, **fields: object) -> None:
 
 def ids(req_ids: Iterable[str]) -> str:
     return ",".join(req_ids)
+
+
+def guarded(fn: F) -> F:
+    """Decorator: with the event log enabled, an exception escaping ``fn`` is
+    written to the log and to stderr (synchronously) before it propagates. The
+    engine's own ``logger.exception`` goes through an asynchronous file
+    handler that a dying process does not flush, so a step's traceback was
+    lost. Disabled, ``fn`` is called as is."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _PATH is None:
+            return fn(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            text = traceback.format_exc()
+            emit("exception", where=fn.__qualname__)
+            if _FILE is not None:
+                _FILE.write(text if text.endswith("\n") else text + "\n")
+                _FILE.flush()
+            sys.stderr.write(f"[sched_events] exception in {fn.__qualname__}:\n{text}")
+            sys.stderr.flush()
+            raise
+
+    return cast(F, wrapper)

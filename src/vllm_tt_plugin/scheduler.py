@@ -132,6 +132,7 @@ class TTScheduler(AsyncScheduler):
             or any(request.is_prefill_chunk for request in self.running)
         )
 
+    @sched_events.guarded
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
@@ -342,6 +343,7 @@ class TTScheduler(AsyncScheduler):
                 max_tokens=request.max_tokens,
             )
 
+    @sched_events.guarded
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
