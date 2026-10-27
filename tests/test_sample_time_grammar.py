@@ -91,6 +91,18 @@ def _device_sampling_runner(*, supports_device_grammar: bool):
     )
 
 
+def _sync_forward(model_input: TTModelInput) -> _SyncForward:
+    return _SyncForward(
+        tt_out=object(),
+        tt_log_probs=None,
+        sampling_params=object(),
+        model_input=model_input,
+        batch_size_per_dp=[1],
+        perform_device_sampling=False,
+        is_decode=True,
+    )
+
+
 # --------------------------------------------------------------------------
 # sample_tokens FIFO pairing
 # --------------------------------------------------------------------------
@@ -119,7 +131,7 @@ def test_sample_tokens_pops_fifo_and_passes_grammar_through():
     assert len(runner._pending_samples) == 0
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
 def test_execute_model_defers_structured_device_sampling_until_sample_tokens(
     async_scheduling,
 ):
@@ -497,12 +509,16 @@ def test_apply_grammar_to_input_wraps_bitmask_in_single_element_list():
 # --------------------------------------------------------------------------
 
 
-def _deferred_structured_input(*req_ids: str) -> TTModelInput:
-    """A deferred device decode where every row is structured."""
+def _deferred_decode_input(
+    structured: tuple[str, ...],
+    plain: tuple[str, ...] = (),
+) -> TTModelInput:
+    """A deferred device decode: structured rows first, then plain rows."""
+    req_ids = [*structured, *plain]
     return _model_input(
         input_tokens=torch.zeros((len(req_ids), 1), dtype=torch.int32),
-        row_req_ids=list(req_ids),
-        structured_output_req_ids=frozenset(req_ids),
+        row_req_ids=req_ids,
+        structured_output_req_ids=frozenset(structured),
         perform_device_sampling=True,
         defer_device_sampling=True,
     )
@@ -528,41 +544,133 @@ def _grammar_runner(*, async_scheduling: bool = True, **overrides):
     return runner
 
 
-def test_async_deferred_grammar_leaves_request_finished_in_flight_unrestricted():
-    """A request with no grammar row samples unrestricted and stops counting."""
-    result = TTModelRunner._apply_grammar_to_input(
-        _grammar_runner(),
-        _deferred_structured_input("req-done", "req-live"),
-        _live_grammar(),
-        lane_total=None,
+def _deferred_submission(num_rows: int) -> TTDecodeSubmission:
+    """A decode submitted with deferred device sampling."""
+    return TTDecodeSubmission(
+        tt_out=object(),
+        read_events=None,
+        batch_size_per_dp=[num_rows],
+        sampling_params=SimpleNamespace(enable_log_probs=torch.tensor([False])),
+        perform_device_sampling=True,
+        device_sampling_params=object(),
+        deferred_device_sampling=True,
     )
 
-    assert result.grammar_bitmask[0].tolist() == [[-1, -1], [7, 8]]
-    assert result.structured_output_req_ids == {"req-live"}
 
+def _real_deferred_grammar_tail(
+    runner,
+    num_rows: int,
+) -> tuple[list, TTAsyncDecodeController]:
+    """Wire the real grammar tail into ``runner``; record masks the model gets."""
+    received: list = []
 
-def test_async_deferred_grammar_absent_leaves_no_structured_request():
-    """With no grammar output, nothing is masked and nothing stays structured."""
-    result = TTModelRunner._apply_grammar_to_input(
-        _grammar_runner(),
-        _deferred_structured_input("req-done-a", "req-done-b"),
-        None,
-        lane_total=None,
+    def sample_deferred_decode(_tt_out, *, sampling_params, grammar_bitmask):
+        received.append(grammar_bitmask)
+        return torch.zeros((num_rows, 1), dtype=torch.int32)
+
+    runner.model = SimpleNamespace(sample_deferred_decode=sample_deferred_decode)
+    runner._apply_grammar_to_input = partial(
+        TTModelRunner._apply_grammar_to_input, runner
     )
+    controller = TTAsyncDecodeController(runner)
+    runner.async_decode = SimpleNamespace(
+        can_attempt_steady_decode_from_scheduler=lambda _output: False,
+        must_drain_pending_async_steps=lambda *_args: False,
+        wait_for_all_pending_async_steps=lambda: None,
+        complete_deferred_device_sampling=controller.complete_deferred_device_sampling,
+    )
+    return received, controller
 
-    assert result.grammar_bitmask == [None]
-    assert result.structured_output_req_ids == frozenset()
+
+def _sample_front_packed(runner, model_input, grammar_output) -> None:
+    """Run ``execute_model`` then ``sample_tokens`` on the front-packed path."""
+    num_rows = len(model_input.row_req_ids)
+    runner.async_decode_scheduling = True
+    runner.input_batch = SimpleNamespace(
+        req_ids=list(model_input.row_req_ids), num_reqs=num_rows
+    )
+    runner._pending_samples = deque()
+    runner._num_speculative_tokens = 0
+    runner.build_model_input = lambda _scheduler_output, _grammar: model_input
+    runner._forward_with_model_input = lambda received_input: replace(
+        _sync_forward(received_input),
+        perform_device_sampling=True,
+        decode_submission=_deferred_submission(num_rows),
+    )
+    runner._get_output_tokens = lambda **kwargs: ([kwargs["tt_out"]], [None])
+    runner._finish_front_packed_sync = partial(
+        TTModelRunner._finish_front_packed_sync, runner
+    )
+    runner._sample_sync_forward = partial(TTModelRunner._sample_sync_forward, runner)
+
+    assert TTModelRunner.execute_model(runner, SimpleNamespace()) is None
+    TTModelRunner.sample_tokens(runner, grammar_output)
+
+
+def _sample_lane(runner, model_input, grammar_output) -> None:
+    """Run the lane-DP sample tail for a deferred decode."""
+    num_rows = len(model_input.row_req_ids)
+    runner.lane_batch = SimpleNamespace(
+        extract_output=lambda _runner, tt_out, *_args, **_kwargs: (tt_out, None)
+    )
+    TTModelRunner._finish_lane_sync(
+        runner,
+        grammar_output,
+        tt_out=None,
+        tt_log_probs=None,
+        model_input=model_input,
+        scheduled_rows=list(range(num_rows)),
+        is_decode=True,
+        lane_total=num_rows,
+        decode_submission=_deferred_submission(num_rows),
+    )
 
 
 @pytest.mark.parametrize(
-    ("async_scheduling", "defer_device_sampling"), [(False, True), (True, False)]
+    "sample", [_sample_front_packed, _sample_lane], ids=["front-packed", "lane"]
+)
+@pytest.mark.parametrize(
+    ("structured", "grammar_output", "expected_bitmask"),
+    [
+        (("req-done", "req-live"), _live_grammar(), [[-1, -1], [7, 8], [-1, -1]]),
+        (("req-done",), None, None),
+    ],
+    ids=["one-finished", "all-finished"],
+)
+def test_async_device_grammar_samples_finished_in_flight_rows_unmasked(
+    sample, structured, grammar_output, expected_bitmask
+):
+    """Under async, a request finished in flight samples unmasked on device."""
+    model_input = _deferred_decode_input(structured, plain=("req-plain",))
+    runner = _grammar_runner(
+        defer_state_apply_and_build_runner_output=(
+            lambda sampled, _logprobs, **_kwargs: sampled
+        ),
+    )
+    received, controller = _real_deferred_grammar_tail(
+        runner, num_rows=len(model_input.row_req_ids)
+    )
+
+    sample(runner, model_input, grammar_output)
+
+    assert controller.device_grammar_sample_count == 1
+    if expected_bitmask is None:
+        assert received == [None]
+    else:
+        assert [mask.tolist() for mask in received] == [expected_bitmask]
+
+
+@pytest.mark.parametrize(
+    ("async_scheduling", "defer_device_sampling"),
+    [(False, True), (True, False)],
+    ids=["sync-deferred", "async-not-deferred"],
 )
 def test_grammar_rows_stay_required_outside_async_deferred_sampling(
     async_scheduling, defer_device_sampling
 ):
     """Sync steps and non-deferred steps still need every grammar row."""
     model_input = replace(
-        _deferred_structured_input("req-done", "req-live"),
+        _deferred_decode_input(("req-done", "req-live")),
         defer_device_sampling=defer_device_sampling,
     )
 
@@ -667,18 +775,6 @@ def test_finish_async_decode_allows_all_structured_rows_to_be_stale():
 # --------------------------------------------------------------------------
 
 
-def _sync_forward(model_input: TTModelInput) -> _SyncForward:
-    return _SyncForward(
-        tt_out=object(),
-        tt_log_probs=None,
-        sampling_params=object(),
-        model_input=model_input,
-        batch_size_per_dp=[1],
-        perform_device_sampling=False,
-        is_decode=True,
-    )
-
-
 def test_sample_sync_forward_consumes_deferred_grammar_before_extraction():
     bitmask = torch.tensor([[3, 4]], dtype=torch.int32)
     model_input = _model_input(
@@ -719,18 +815,8 @@ def test_sample_sync_forward_consumes_deferred_grammar_before_extraction():
     assert sampled[0].tolist() == [[42]]
 
 
-@pytest.mark.parametrize(
-    ("bitmask", "structured_req_ids"),
-    [
-        (torch.tensor([[5, 6]], dtype=torch.int32), frozenset({"req-0"})),
-        # Every structured request finished in flight: sample without grammar.
-        (None, frozenset()),
-    ],
-)
-def test_deferred_device_sampling_transports_sample_time_grammar(
-    bitmask, structured_req_ids
-):
-    """The deferred sample passes the step's bitmask, or ``None``, to the model."""
+def test_deferred_device_sampling_transports_sample_time_grammar():
+    """The deferred sample passes the step's bitmask to the model."""
     calls: list[tuple] = []
     device_params = object()
     raw_logits = object()
@@ -754,11 +840,11 @@ def test_deferred_device_sampling_transports_sample_time_grammar(
         device_sampling_params=device_params,
         deferred_device_sampling=True,
     )
+    bitmask = torch.tensor([[5, 6]], dtype=torch.int32)
     model_input = _model_input(
         perform_device_sampling=True,
         grammar_bitmask=[bitmask],
         defer_device_sampling=True,
-        structured_output_req_ids=structured_req_ids,
     )
 
     finalized = controller.complete_deferred_device_sampling(
