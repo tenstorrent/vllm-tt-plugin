@@ -352,8 +352,8 @@ class TTLaneCoordinator(SchedulerInterface):
     def _pick_lane(self, request: Request | None = None) -> int:
         """Choose the lane for a newly arriving request.
 
-        Scores each lane ``waiting * 4 + running`` (waiting = ``waiting`` plus
-        ``skipped_waiting``, vLLM's ``num_waiting_reqs``) and picks the lowest
+        Scores each lane ``waiting * 4 + running`` (both from vLLM's
+        ``Scheduler.get_request_counts``) and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
         load score vLLM uses to route requests across DP engines
         (``DPLBAsyncMPClient.get_core_engine_for_request`` in
@@ -374,11 +374,11 @@ class TTLaneCoordinator(SchedulerInterface):
         exceeds the least-loaded lane's queue by more than the *extra* prefill
         the hit saves over the least-loaded lane's own hit (equal hits save
         nothing and resolve on load; among lanes holding the same prefix the
-        less loaded one is the candidate). Queued prefill counts the waiting
-        requests' uncached tokens, the ready requests parked in
-        ``skipped_waiting`` (vLLM schedules those first once their grammar or
-        remote KVs arrive) and the running partial prefills' remaining prompt
-        tokens, which vLLM processes before admitting anything new.
+        less loaded one is the candidate). Queued prefill counts the uncached
+        tokens of the waiting requests that are ready to schedule (a request
+        blocked on its grammar or its streaming input is skipped) and the
+        running partial prefills' remaining prompt tokens, which vLLM processes
+        before admitting anything new.
         Rule (b) is what keeps a hot prefix from piling every request onto one
         lane: requests that reuse a long prefix queue almost nothing, so they
         all follow it; requests sharing only a short prefix spill as soon as
@@ -392,11 +392,10 @@ class TTLaneCoordinator(SchedulerInterface):
         the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
         is a possible future follow-up.
         """
-        # waiting counts skipped_waiting too, as vLLM's num_waiting_reqs does
-        scores = [
-            (len(sched.waiting) + len(sched.skipped_waiting)) * 4 + len(sched.running)
-            for sched in self.lanes
-        ]
+        scores = []
+        for sched in self.lanes:
+            num_running, num_waiting = sched.get_request_counts()
+            scores.append(num_waiting * 4 + num_running)
         least_lane = min(range(len(scores)), key=lambda lane: (scores[lane], lane))
         if request is None or not self._prefix_cache_routing:
             return least_lane
@@ -440,40 +439,36 @@ class TTLaneCoordinator(SchedulerInterface):
     def _queued_prefill_tokens(self, lane: int) -> int:
         """Prefill tokens ``lane`` must process before it admits a new request.
 
-        Each waiting request counts its uncached prompt tokens as recorded when
-        it was routed (its whole prompt when it holds no record: routed before
-        a cache reset, or re-queued by a preemption). A request parked in
-        ``skipped_waiting`` counts the same way once it is ready: vLLM's FCFS
-        scheduler takes ``skipped_waiting`` before ``waiting`` and promotes a
-        ready request there ahead of every ordinary waiting one. Each running
-        partial prefill counts the prompt tokens it has not computed yet: vLLM
-        advances running partial prefills before it admits waiting requests,
-        so that work is ahead of a newcomer too.
+        Each ready request in ``kv_holding_waiting`` or ``waiting`` counts its
+        uncached prompt tokens as recorded when it was routed (its whole prompt
+        when it holds no record: routed before a cache reset, or re-queued by a
+        preemption). A blocked request counts nothing until it is ready, because
+        vLLM's prefill loop skips it until then. Each running partial prefill
+        counts the prompt tokens it has not computed yet: vLLM advances running
+        partial prefills before it admits waiting requests, so that work is
+        ahead of a newcomer too.
         """
         sched = self.lanes[lane]
         waiting = sum(
             self._uncached_tokens.get(req.request_id, req.num_tokens)
-            for req in sched.waiting
-        )
-        ready_skipped = sum(
-            self._uncached_tokens.get(req.request_id, req.num_tokens)
-            for req in sched.skipped_waiting
-            if self._skipped_request_is_ready(sched, req)
+            for queue in (sched.kv_holding_waiting, sched.waiting)
+            for req in queue
+            if self._waiting_request_is_ready(sched, req)
         )
         partial = sum(
             max(req.num_tokens - req.num_computed_tokens, 0)
             for req in sched.running
             if req.is_prefill_chunk
         )
-        return waiting + ready_skipped + partial
+        return waiting + partial
 
     @staticmethod
-    def _skipped_request_is_ready(sched: TTScheduler, request: Request) -> bool:
-        """Whether a ``skipped_waiting`` request is promoted at the next prefill
-        step (vLLM ``Scheduler._try_promote_blocked_waiting_request``): its
+    def _waiting_request_is_ready(sched: TTScheduler, request: Request) -> bool:
+        """Whether a waiting request is scheduled at the next prefill step if
+        budget allows (vLLM ``Scheduler._handle_blocked_waiting_request``): its
         structured-output grammar has compiled, its remote KVs have arrived, or
-        it no longer carries a blocked status. A streaming-input request stays
-        blocked until the scheduler itself sees its input."""
+        it carries no blocked status. A streaming-input request stays blocked
+        until the scheduler itself sees its input."""
         status = request.status
         if status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
             structured = request.structured_output_request
@@ -487,8 +482,7 @@ class TTLaneCoordinator(SchedulerInterface):
         plus the queued ones (waiting and grammar-blocked) that take a slot
         when admitted, so a burst routed before any scheduling step sees the
         slots its earlier members will occupy."""
-        sched = self.lanes[lane]
-        return len(sched.running) + len(sched.waiting) + len(sched.skipped_waiting)
+        return sum(self.lanes[lane].get_request_counts())
 
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
@@ -501,12 +495,12 @@ class TTLaneCoordinator(SchedulerInterface):
         lane at capacity: it already holds one of those slots and only a
         prefill step can advance it.
 
-        ``skipped_waiting`` holds prefill requests blocked on grammar
-        compilation. We want to try to schedule them, because otherwise the
-        base scheduler won't revisit and promote them - decode intent hides
-        that queue.
+        A request blocked on grammar compilation still counts as waiting. We
+        want to try to schedule it, because only the base scheduler's prefill
+        loop checks whether the grammar is ready, and decode intent hides the
+        waiting queues from that loop.
         """
-        has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
+        has_waiting = sched.get_request_counts()[1] > 0
         has_running = bool(sched.running)
         has_partial_prefill = any(r.is_prefill_chunk for r in sched.running)
         has_capacity = len(sched.running) < self._per_lane_max

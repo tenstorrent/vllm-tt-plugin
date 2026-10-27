@@ -664,7 +664,7 @@ def _upstream_admission_blocks(
     """Smallest pool, in blocks, that upstream ``get_kv_cache_configs`` admits.
 
     Mirrors its steps for one worker: tag sliding-window specs with
-    ``extra_retained_tokens`` (multi-module MTP only), group the specs, take
+    ``extra_retained_tokens`` (nonzero for multi-module MTP), group the specs, take
     the memory one request at ``max_model_len`` needs, and add BlockPool's
     null block, which the admission check subtracts from the pool before
     comparing. The private helpers are imported here, not at module scope,
@@ -675,12 +675,7 @@ def _upstream_admission_blocks(
         _pool_bytes_per_block,
     )
 
-    spec_config = vllm_config.speculative_config
-    extra_retained_tokens = (
-        spec_config.num_speculative_tokens - 1
-        if spec_config is not None and spec_config.use_multi_module_mtp()
-        else 0
-    )
+    extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
     if extra_retained_tokens:
         kv_cache_specs = {
             name: (
