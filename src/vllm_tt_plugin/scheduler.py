@@ -283,20 +283,30 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
-def _require_kv_for_every_sequence(
-    kv_cache_config, max_num_seqs: int, max_model_len: int
-) -> None:
+def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
     """Refuse a KV pool that could make vLLM preempt a stage-output request.
 
     vLLM preempts a running request when a step finds no free block, and a request
     of a model with ``supports_stage_outputs`` cannot resume. While ``max_num_seqs``
-    requests at ``max_model_len`` fit in every KV cache group at once, no step runs
-    short.
+    requests at their peak fit in the pool at once, no step runs short. One
+    request's peak is upstream's admission bound: the full context for a
+    full-attention group, the window plus in-flight tokens for a sliding one.
+    Every request is charged the whole in-flight budget, an over-count when
+    several share it.
     """
-    needed = max_num_seqs * sum(
-        -(-max_model_len // group.kv_cache_spec.block_size)
-        for group in kv_cache_config.kv_cache_groups
+    from vllm.v1.core.kv_cache_utils import (
+        _max_memory_usage_bytes_from_groups,
+        _pool_bytes_per_block,
     )
+
+    groups = kv_cache_config.kv_cache_groups
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = vllm_config.model_config.max_model_len
+    per_request = -(
+        -_max_memory_usage_bytes_from_groups(vllm_config, groups)
+        // _pool_bytes_per_block(groups)
+    )
+    needed = max_num_seqs * per_request
     # Block 0 is vLLM's null block, never handed to a request.
     usable = kv_cache_config.num_blocks - 1
     if usable < needed:
@@ -304,7 +314,7 @@ def _require_kv_for_every_sequence(
             "a model with supports_stage_outputs cannot resume a preempted request, "
             f"so its KV pool must hold max_num_seqs={max_num_seqs} requests at "
             f"max_model_len={max_model_len}: {needed} blocks across "
-            f"{len(kv_cache_config.kv_cache_groups)} KV cache group(s), but only "
+            f"{len(groups)} KV cache group(s), but only "
             f"{usable} are usable. Lower max_num_seqs or max_model_len."
         )
 
@@ -397,11 +407,7 @@ class TTScheduler(AsyncScheduler):
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
         if get_tt_supports_stage_outputs(self.vllm_config):
-            _require_kv_for_every_sequence(
-                self.kv_cache_config,
-                self.scheduler_config.max_num_seqs,
-                self.max_model_len,
-            )
+            _require_kv_for_every_sequence(self.vllm_config, self.kv_cache_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
         # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
         self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)

@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -44,6 +45,7 @@ from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
+    _require_kv_for_every_sequence,
     get_tt_block_step_decisions,
     get_tt_forced_reset_discard_counts,
 )
@@ -1054,6 +1056,42 @@ def test_a_stage_output_model_needs_kv_for_every_sequence_at_full_length(
         )
     # Other models may still run short and preempt.
     _scheduler(1, max_num_seqs=max_num_seqs, num_blocks=enough - 1)
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 2])
+def test_a_stage_output_model_counts_sliding_groups_by_their_window(max_num_seqs):
+    """A sliding-window group frees blocks behind its window, so a hybrid pool
+    sized for full context in one group and the window in the rest suffices."""
+    block_size, window, in_flight, max_model_len = 32, 513, 1024, 1 << 20
+    common = dict(
+        block_size=block_size, num_kv_heads=4, head_size=128, dtype=torch.bfloat16
+    )
+    specs = [FullAttentionSpec(**common)] + [
+        SlidingWindowSpec(**common, sliding_window=window) for _ in range(4)
+    ]
+    groups = [
+        KVCacheGroupSpec([f"layer.{g}.{i}" for i in range(10)], spec)
+        for g, spec in enumerate(specs)
+    ]
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        max_in_flight_tokens=in_flight,
+    )
+    full = max_model_len // block_size
+    sliding = -(-(window - 1 + in_flight) // block_size) + 1
+    enough = max_num_seqs * (full + 4 * sliding) + 1  # plus vLLM's null block
+
+    def pool(num_blocks):
+        return KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+
+    _require_kv_for_every_sequence(config, pool(enough))
+    with pytest.raises(ValueError, match=f"max_num_seqs={max_num_seqs} requests"):
+        _require_kv_for_every_sequence(config, pool(enough - 1))
 
 
 def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
