@@ -240,6 +240,17 @@ the latest stable tag's pin. The two lookups are independent:
 `host-tests-ttnn`, so a newer or requested tag that cannot be resolved fails
 only the advisory job. Both test jobs install pytest through the `dev` extra.
 
+Two scheduled workflows close inactive work. `close-stale.yaml` runs
+`actions/stale`: a pull request idle for 30 days, or an issue idle for 90 days,
+gets the `stale` label and a warning comment, and is closed 7 days (pull
+request) or 14 days (issue) later unless it is updated. The `keep-open` label
+exempts both, and the `type:bug` label exempts issues.
+`remove-stale-branches.yaml` comments on the head commit of a branch whose
+author date is 60 or more days old and deletes the branch 7 days later unless
+it gets a newly authored commit. Rebasing or amending keeps the old author
+date, so it does not reset the timer. It skips `main`, `stable`, `release/*`,
+and branches with an open pull request.
+
 **There is no hardware CI in this repository.** Plugin pull requests do not
 dispatch tt-metal `vllm-model-tests`. That workflow is workflow_dispatch, and
 its plugin ref defaults to `main`. Device-affecting plugin changes still need a
