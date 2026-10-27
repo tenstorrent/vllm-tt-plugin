@@ -708,8 +708,9 @@ def _constrained_probs(
 
     - Top-k without top-p uses vLLM's ``apply_top_k_only``, which keeps every
       logit at least the k-th largest, the same set the sort keeps.
-    - Top-k with top-p, for rows in ``seeded_rows``' complement, uses
-      ``_top_k_top_p_without_sort``. Its top-p cut can differ from the sort's
+    - Top-k with top-p, for a row outside ``seeded_rows`` whose top-k is at
+      most ``_MAX_UNSORTED_TOP_K``, uses ``_top_k_top_p_without_sort``
+      whatever the other rows carry. Its top-p cut can differ from the sort's
       where two logits tie at the cut or where a cumulative sum lands within
       rounding of ``1 - p``. A seeded row keeps the sort, so it commits
       exactly what the ordinary host sampler, which uses the same sort,
@@ -739,10 +740,16 @@ def _constrained_probs(
         if p is None:
             flat = apply_top_k_only(flat, k)
         else:
+            # Per row, so a seeded row, or a row without a top-k (the input
+            # batch stores the vocabulary size), puts only itself on the sort.
             unsorted = (
-                [row for row in range(rows) if row not in seeded_rows]
-                if k is not None and int(top_k.max()) <= _MAX_UNSORTED_TOP_K
-                else []
+                []
+                if top_k is None
+                else [
+                    row
+                    for row, row_k in enumerate(top_k.tolist())
+                    if row not in seeded_rows and row_k <= _MAX_UNSORTED_TOP_K
+                ]
             )
             unsorted_set = set(unsorted)
             sorted_rows = [row for row in range(rows) if row not in unsorted_set]

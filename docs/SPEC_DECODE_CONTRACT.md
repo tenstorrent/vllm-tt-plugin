@@ -912,13 +912,13 @@ on an ordinary step; then `allowed_token_ids`, `bad_words` and `min_tokens`;
 then presence, frequency and repetition penalties; then temperature, then
 top-k and top-p. Each control reads column `j`'s own state, which is the row's
 committed output plus its first `min(j, num_valid_drafts)` drafts, so the
-bonus column reads every valid draft and a padding column reads none. When
-every random row of the verify carries a top-k of at most 1024, a row without
-a seed has its top-k with top-p cut from the k largest logits rather than from
-a sort of the vocabulary; that cut equals the ordinary sampler's except where
-two logits tie at it or a cumulative probability lands within rounding of
-`1 - p`. A seeded row uses the ordinary sampler's sort, so it stays
-reproducible against an ordinary step:
+bonus column reads every valid draft and a padding column reads none. A
+random row without a seed whose top-k is at most 1024 has its top-k with top-p
+cut from the k largest logits rather than from a sort of the vocabulary,
+whatever the other rows of the verify carry; that cut equals the ordinary
+sampler's except where two logits tie at it or a cumulative probability lands
+within rounding of `1 - p`. A seeded row uses the ordinary sampler's sort, so
+it stays reproducible against an ordinary step:
 
 - the grammar bitmask of column `j` is the scheduler's bitmask row for that
   state (see **Structured output** below);
