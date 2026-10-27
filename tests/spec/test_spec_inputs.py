@@ -135,6 +135,15 @@ def _fake_runner(
         TTModelRunner._request_is_argmax_certifiable.__get__(runner)
     )
     runner._spec_mode_for_step = TTModelRunner._spec_mode_for_step.__get__(runner)
+    for name in (
+        "_spec_decode_rows",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+        "_forget_finished_spec_state",
+        "_structured_drafts",
+        "_pending_min_tokens",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
     return runner
 
 

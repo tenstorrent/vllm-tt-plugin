@@ -119,6 +119,21 @@ def _host_runner(host_sampler=None, *, vocab=VOCAB, **attrs):
     return runner
 
 
+def _without_speculation(runner):
+    """Bind the speculative row helpers a lane build calls on every step.
+
+    On a launch that does not speculate they return the rows unchanged.
+    """
+    runner._num_speculative_tokens = 0
+    for name in (
+        "_spec_decode_rows",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
+    return runner
+
+
 def _add_to_lane(batch, req, lane):
     """Place ``req`` at the lowest free row in ``lane``'s chunk.
 
@@ -317,13 +332,15 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
         batch_size_per_dp=(1,),
         prefill_empty_slots=(row,),
     )
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _output_tokens_per_step=1,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests={"request": request},
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _output_tokens_per_step=1,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={"request": request},
+        )
     )
 
     logged: list[str] = []
@@ -362,13 +379,15 @@ def test_lane_structured_decode_captures_expected_grammar_request_ids():
     scheduler_output.num_scheduled_tokens = {"request": 1}
     scheduler_output.total_num_scheduled_tokens = 1
     plan = _plan({"request": row}, is_decode=True, capacity=2)
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _decode_layout_changed_since_last_decode=False,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests={"request": request},
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={"request": request},
+        )
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -439,13 +458,15 @@ def test_sparse_two_lane_grammar_uses_submitted_row_snapshot():
         capacity=4,
         num_lanes=2,
     )
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _decode_layout_changed_since_last_decode=False,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests=requests,
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests=requests,
+        )
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -966,6 +987,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         _block_tables_per_layer=lambda _: None,
         requests={"prompt": prompt, "waiting": waiting},
     )
+    _without_speculation(runner)
     runner.check_perform_device_sampling = (
         lambda **kwargs: TTModelRunner.check_perform_device_sampling(runner, **kwargs)
     )

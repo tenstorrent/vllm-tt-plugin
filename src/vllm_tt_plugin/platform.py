@@ -2426,21 +2426,14 @@ class TTPlatform(Platform):
             # method check. These capability checks determine whether the
             # selected model can serve the combined async speculative path.
 
-        if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
-            raise ValueError(
-                "TT lane mode and speculative decoding cannot be combined. "
-                "Lane mode builds its device input from TTLaneInputBatch, "
-                "which has no candidate-block builder, so a speculating lane "
-                "launch would send plain single-token decodes and silently "
-                "serve no speculation. Drop the speculative flags, or set "
-                "--data-parallel-size 1 to leave lane mode"
-            )
-
         # After the lane fold: _convert_dp_to_lanes rewrites
         # scheduler_config.max_num_seqs and stores the lane count, and a plan is
         # dimensioned against the concurrency it was resolved for. Admitting
         # earlier would resolve a plan for the per-lane batch and then have the
-        # engine-core re-run resolve it for the global one.
+        # engine-core re-run resolve it for the global one. The folded total is
+        # the right concurrency for a lane launch: one device launch verifies
+        # every lane's rows together, so that is the batch the verify cost and
+        # SpecPlan.k_by_rows are dimensioned against.
         spec_plan = resolve_speculative_plan(
             vllm_config,
             model_class,

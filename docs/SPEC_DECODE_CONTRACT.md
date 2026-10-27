@@ -69,8 +69,12 @@ serve speculative decoding within the following execution limits:
   `supports_async_spec_decode`, which is about the model's readback and hidden
   handle rather than about step order: a speculative step never overlaps the
   next one, so verify, accept and propose stay ordered per request.
-- **front-packed** execution. Lane mode is refused: it builds its device input
-  from `TTLaneInputBatch`, which has no candidate-block builder.
+- **both batch layouts**: the front-packed batch of single-process and
+  standard-DP execution, and the slot batch of single-process lane-DP. A lane
+  verify is the slot batch widened, with the scheduled slots as its live rows
+  and every other slot a padding row between them (section 4), so a lane
+  adapter sees the `[B, 1+K]` block in the slot order its plain lane decode
+  already uses.
 
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative
@@ -200,7 +204,10 @@ plugin calls it positionally, so parameter names are not part of the contract.
 
 **Arguments.** `max_num_seqs` is the concurrency the plan is dimensioned
 against, and it is the value that is final for the launch, after the platform
-has folded data parallelism into lanes. `requested_k` is the operator's
+has folded data parallelism into lanes: in lane mode the folded total across
+lanes, not one lane's share, because one device launch verifies every lane's
+rows together. `k_by_rows` is read against the live rows of the whole lane
+batch for the same reason. `requested_k` is the operator's
 `num_speculative_tokens`.
 
 **Tenstorrent platform state on `vllm_config` is not guaranteed during
@@ -278,6 +285,15 @@ decode. `TTModelInput` carries the verification inputs as four values.
 so the block carries rows for requests that do not exist. A padding row holds
 token 0 and position -1 in every column, `num_valid_drafts` 0, and
 `accepted_counts` 1.
+
+In lane mode `B` is the slot batch, `lanes x per_lane` rows in slot order,
+exactly as the plain lane decode submits it: a scheduled request's row is its
+slot, and a slot holding no scheduled request is a padding row, which sits
+between live rows rather than after them. Its column 0 is what the plain lane
+decode sends for that slot (token 0 at position -1 for an empty slot) and its
+draft columns are padded like any other short row's. Nothing else differs
+between the layouts: the side tensors, `spec_mode`, the return layout of
+section 6 and the proposal's rows are all the slot batch's.
 
 A row with fewer than K valid drafts pads its own tail columns, and the cap is
 per row: one request whose drafter ran short never shortens another request's
@@ -530,7 +546,11 @@ registered as not overlap-safe, so the runner drains it before it builds the
 next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
 unapplied, and verify, accept and propose stay serialized per request. What
-this path defers is the readback and the commit, not the order of the steps.
+this path defers is the readback and the commit, not the order of the steps. A
+lane verify takes this same deferred path
+(`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step
+to it), and is read back whole rather than by scheduled slot, because the walk
+reads every row of the mode's return.
 
 Two demands nevertheless reach the model, and they are what
 `supports_async_spec_decode` declares:
@@ -648,7 +668,8 @@ Three obligations come with the declaration.
 **The drafter is still asked, after an ordinary decode too.** The proposer is
 called once per step, so a launch that skipped it on these steps would never
 draft again whatever the batch did afterwards.
-`TTModelRunner.propose_after_plain_step` is the call site. The committed block
+`TTModelRunner.propose_after_plain_step` is the call site, after a
+front-packed and after a lane ordinary decode alike. The committed block
 is one column wide, that column being the token the step committed, every
 `accepted_counts` is 1, and `TTModelRunner._propose_model_drafts` pads the
 block to the uniform `1+K` before the call, so the drafter sees one shape. On
@@ -818,7 +839,9 @@ plugin and its target verifies them inside the step's own allocation, so
 `spec_lookahead_tokens` returns zero for `ngram`. `TTScheduler.__init__` uses
 `max` to preserve any upstream reservation while adding the model-owned
 drafter's requirement. Lookahead slots reserve KV block space past the tokens
-the step itself computes.
+the step itself computes. Each lane of `TTLaneCoordinator` is a `TTScheduler`
+over its own KV cache manager, so the reservation is per lane and per request
+and the lane fold does not change it.
 
 The reason is where a model-owned drafter writes. Such a drafter proposes for
 the next step from inside the current one: after the accept walk commits, the

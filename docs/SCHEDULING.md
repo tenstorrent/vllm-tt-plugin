@@ -352,8 +352,10 @@ each rank runs the policy on its own scheduler state.
 
 The generic speculative path uses `speculative_config` and a model's
 `spec_plan` admission result. `TTPlatform.check_and_update_config` rejects
-speculation for lane-DP and for models with `output_tokens_per_step > 1`.
-Standard multi-process DP keeps speculation local to each independent rank.
+speculation for models with `output_tokens_per_step > 1`. Standard
+multi-process DP keeps speculation local to each independent rank.
+Single-process lane-DP speculates over its one merged lane batch; see
+"Speculation in lane mode" below.
 The [speculative decoding contract](SPEC_DECODE_CONTRACT.md) defines supported
 methods, model hooks, request controls, and acceptance semantics.
 
@@ -707,6 +709,44 @@ lane, so the engine's global capacity becomes `N * M`.
 
 Lane-DP does not currently support request-specific RoPE state, including mRoPE
 vision models.
+
+### Speculation in lane mode
+
+A speculating lane launch runs the generic speculative path over the merged
+lane batch, with one difference from the front-packed path: where the padding
+rows sit. The lane decode batch is the slot batch, `lanes x per_lane` rows in
+slot order, and a verify's candidate block is that batch widened to
+`[lanes x per_lane, 1+K]`. The scheduled slots are its live rows and every
+other slot is a padding row (no drafts, `accepted_counts` 1, draft columns
+padded), so the padding rows sit between the live rows rather than after
+them. `TTLaneInputBatch._build_decode_input` builds the block through the
+same `TTModelRunner._spec_decode_rows` the front-packed builder uses, and
+records the scheduled slots on `TTModelInput.live_rows`; the accept walk,
+the commit, the proposal and the sampling capture read rows through it and
+assume nothing front-packed.
+
+What follows from the layout:
+
+- `spec_plan` is called with the folded `max_num_seqs`, the total across
+  lanes, not one lane's share: one device launch verifies every lane's rows
+  together, so that is the batch the verify cost is dimensioned against.
+  `SpecPlan.k_by_rows` and `SpecPlan.draft_cap` read the live rows of the
+  whole lane batch for the same reason.
+- KV reservation is unchanged. Each lane's `TTScheduler` reserves the
+  `K+1` lookahead positions per request for a model-owned drafter, as
+  "Generic speculative decoding" above describes.
+- A lane verify is submitted and read back exactly as a front-packed verify
+  is, through `TTAsyncDecodeController.submit_decode` with no selective
+  readback of the scheduled slots, because the walk reads the mode's whole
+  `[B, 1+K]` return. Synchronously it finishes through the speculative tail
+  of `_finish_front_packed_sync`; asynchronously
+  `TTAsyncDecodeController.submit_async_lane_decode` routes it to the same
+  deferred speculative path as a front-packed verify, which never overlaps
+  the next step. A lane step with nothing to verify, on a model declaring
+  `supports_narrow_decode`, is the ordinary lane decode and still asks the
+  proposer afterwards, over the slot batch.
+- The `supports_async_spec_decode` requirement for a launch that keeps async
+  scheduling applies unchanged.
 
 ## Standard Multi-Process DP
 
