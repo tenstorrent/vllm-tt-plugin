@@ -1362,8 +1362,11 @@ class TTLaneInputBatch(InputBatch):
         input_tokens = torch.from_numpy(tokens_np)
 
         # The shared speculative row builder, over the whole slot batch: the
-        # scheduled slots are its live rows and every other slot a padding row,
-        # so a verify's block keeps the slot layout the device decodes.
+        # scheduled slots are its live rows and every other slot a padding row
+        # (an occupied slot the step did not schedule included: on a
+        # speculating launch it is sent inactive rather than with the real
+        # last token ``occupied`` filled in above), so a verify's block keeps
+        # the slot layout the device decodes.
         spec = runner._spec_decode_rows(
             scheduler_output,
             row_req_ids,

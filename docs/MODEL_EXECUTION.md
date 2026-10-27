@@ -326,7 +326,8 @@ class MyLaneModel:
 
 Lane-DP rejects request-specific RoPE. A speculating lane launch submits a
 verify as this same slot batch widened to `[L * per_lane, 1+K]`, with the
-scheduled slots live and every other slot a padding row; see the
+scheduled slots live and every other slot, an occupied one the step did not
+schedule included, a padding row with `start_pos=-1`; see the
 [speculative contract](SPEC_DECODE_CONTRACT.md). Lane-DP output
 handling is in
 [Decode readback and output conversion](#decode-readback-and-output-conversion).

@@ -2066,12 +2066,21 @@ class TTModelRunner:
         rows alone and pads afterwards; the lane builder passes its whole slot
         batch, whose padding rows sit between the live ones.
 
-        A row no live request owns is a padding row whichever layout built it:
-        no drafts, a count of 1, and ``PLACEHOLDER_TOKEN_ID`` at position -1 in
-        every draft column. ``SpecPlan.draft_cap`` and ``_step_verifies`` read
-        the live rows alone, so a padding row never decides the cap or the
-        call shape. On an ordinary decode inside a speculating launch the rows
-        stay narrow and only an unresolved ``accepted_counts`` is kept.
+        A row no live request owns is a padding row whichever layout built it,
+        in every column: token 0 and position -1, no drafts, a count of 1. That
+        covers a lane slot holding a request the step did not schedule, whose
+        plain decode would carry its real last token: a plain decode of such a
+        row is idempotent (the same token at the same position), but a verify
+        or a proposal is not, because a drafter keeping a session per slot
+        would advance a request the step commits nothing for, and the position
+        is the one thing that marks a row as owned by no request. So on a
+        speculating launch such a row is sent inactive on every decode step,
+        verify and ordinary decode alike, and the request's next scheduled
+        step rebuilds its row from host state. ``SpecPlan.draft_cap`` and
+        ``_step_verifies`` read the live rows alone, so a padding row never
+        decides the cap or the call shape. On an ordinary decode inside a
+        speculating launch the rows stay narrow and only an unresolved
+        ``accepted_counts`` is kept.
         """
         if not self._num_speculative_tokens:
             return SpecDecodeRows(input_tokens, input_positions)
@@ -2088,6 +2097,11 @@ class TTModelRunner:
                 f"live_rows {rows.tolist()} do not place {num_live} live "
                 f"requests {row_req_ids} inside a block of {num_rows} rows"
             )
+        padding = torch.ones(num_rows, dtype=torch.bool)
+        padding[rows] = False
+        if bool(padding.any()):
+            input_tokens = input_tokens.masked_fill(padding.unsqueeze(1), 0)
+            input_positions = input_positions.masked_fill(padding, -1)
         num_drafts = self._num_speculative_tokens
         spec_plan = getattr(self, "_spec_plan", None)
         live_drafts, live_num_valid, live_counts = self._spec_row_state(
@@ -2124,6 +2138,9 @@ class TTModelRunner:
             input_tokens, input_positions = self._spec_candidate_block(
                 drafts, num_valid_drafts, input_tokens, input_positions
             )
+            # A padding row's draft columns carry token 0 like its column 0,
+            # not the short-row marker of a live row's unused columns.
+            input_tokens = input_tokens.masked_fill(padding.unsqueeze(1), 0)
             if self.async_decode_scheduling:
                 self._grammar_draft_handoff = self._structured_drafts(
                     row_req_ids, live_drafts, live_num_valid

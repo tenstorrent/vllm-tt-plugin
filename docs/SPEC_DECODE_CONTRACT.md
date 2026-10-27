@@ -288,12 +288,20 @@ token 0 and position -1 in every column, `num_valid_drafts` 0, and
 
 In lane mode `B` is the slot batch, `lanes x per_lane` rows in slot order,
 exactly as the plain lane decode submits it: a scheduled request's row is its
-slot, and a slot holding no scheduled request is a padding row, which sits
-between live rows rather than after them. Its column 0 is what the plain lane
-decode sends for that slot (token 0 at position -1 for an empty slot) and its
-draft columns are padded like any other short row's. Nothing else differs
-between the layouts: the side tensors, `spec_mode`, the return layout of
-section 6 and the proposal's rows are all the slot batch's.
+slot, and every other slot is the padding row described above, which sits
+between live rows rather than after them. That holds for an occupied slot the
+step did not schedule as much as for an empty one. The plain lane decode of a
+launch that does not speculate fills such a slot with its real last token at
+its real position, which is harmless there: decoding that row again is
+idempotent. A verify or a proposal is not: a drafter keeping a session per
+slot would advance a request the step commits nothing for, and the position
+is the one thing that marks a row as owned by no request. So a speculating
+launch sends the row inactive on every decode step, the ordinary decode of
+section 4d included, and the request's next scheduled step rebuilds its row
+from host state. The slot's page table stays its own; the row is inactive by
+position. Nothing else differs between the layouts: the side tensors,
+`spec_mode`, the return layout of section 6 and the proposal's rows are all
+the slot batch's.
 
 A row with fewer than K valid drafts pads its own tail columns, and the cap is
 per row: one request whose drafter ran short never shortens another request's

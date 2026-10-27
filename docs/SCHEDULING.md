@@ -717,9 +717,13 @@ lane batch, with one difference from the front-packed path: where the padding
 rows sit. The lane decode batch is the slot batch, `lanes x per_lane` rows in
 slot order, and a verify's candidate block is that batch widened to
 `[lanes x per_lane, 1+K]`. The scheduled slots are its live rows and every
-other slot is a padding row (no drafts, `accepted_counts` 1, draft columns
-padded), so the padding rows sit between the live rows rather than after
-them. `TTLaneInputBatch._build_decode_input` builds the block through the
+other slot, empty or holding a request the step did not schedule, is a
+padding row (token 0 and position -1 in every column, no drafts,
+`accepted_counts` 1), so the padding rows sit between the live rows rather
+than after them. On a speculating launch an unscheduled occupied slot is
+sent inactive on ordinary decode steps too, so a drafter's per-slot session
+never advances for a request the step commits nothing for.
+`TTLaneInputBatch._build_decode_input` builds the block through the
 same `TTModelRunner._spec_decode_rows` the front-packed builder uses, and
 records the scheduled slots on `TTModelInput.live_rows`; the accept walk,
 the commit, the proposal and the sampling capture read rows through it and

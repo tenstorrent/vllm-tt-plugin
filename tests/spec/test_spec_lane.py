@@ -339,12 +339,93 @@ def test_the_candidate_block_pads_the_empty_slots():
     assert positions[1].tolist() == [PROMPT_LEN - 1 + j for j in range(1 + DRAFT_LEN)]
     for row in (0, 2, 3):
         assert positions[row].tolist() == [-1] * (1 + DRAFT_LEN)
-        assert tokens[row].tolist() == [0] + [PLACEHOLDER_TOKEN_ID] * DRAFT_LEN
+        assert tokens[row].tolist() == [0] * (1 + DRAFT_LEN)
 
 
 def _tail_before(runner: SimpleNamespace, req_id: str) -> int:
     """The prompt's last token, which the step above continued from."""
     return runner.requests[req_id].prompt_token_ids[PROMPT_LEN - 1]
+
+
+def _capture_decode_inputs(model, captured: dict):
+    """Record the tokens and positions the next ``decode_forward`` is handed."""
+    original = model.decode_forward
+
+    def capture(tokens, start_pos, **kwargs):
+        captured["tokens"] = tokens.clone()
+        captured["start_pos"] = start_pos.clone()
+        return original(tokens, start_pos, **kwargs)
+
+    model.decode_forward = capture
+
+
+def test_an_occupied_but_unscheduled_slot_is_a_padding_row_on_a_verify():
+    """A slot the step did not schedule is sent inactive, and resumes intact.
+
+    The plain lane decode fills an occupied slot with its real last token
+    whether or not the step scheduled it. A verify must not: a drafter keeping
+    a session per slot would advance a request the step commits nothing for.
+    So the row is the padding row in every column, the request's state is
+    untouched by the step, and its next scheduled step verifies from where it
+    was.
+    """
+    model = FakeSpecModel()
+    runner = _lane_runner(model)
+    _place(runner, "a", 0, first_token=1)
+    _place(runner, "b", 3, first_token=21)
+    captured: dict = {}
+    _capture_decode_inputs(model, captured)
+
+    # Only "a" is scheduled; "b" keeps its slot but sits the step out.
+    _lane_step(runner, "a", drafts={"a": _agreed_drafts(runner, "a")})
+
+    assert captured["tokens"][3].tolist() == [0] * (1 + DRAFT_LEN)
+    assert captured["start_pos"][3].tolist() == [-1] * (1 + DRAFT_LEN)
+    call = model.verify_calls[-1]
+    assert call["num_valid_drafts"].tolist() == [DRAFT_LEN, 0, 0, 0]
+    assert call["accepted_counts"].tolist() == [1, 1, 1, 1]
+    # The drafter sees the row as owned by no request, and nothing of "b"
+    # moved: no commit, no count, no proposal.
+    assert bool((model.propose_calls[-1]["committed_positions"][3] < 0).all())
+    assert runner.lane_batch.num_tokens[3] == PROMPT_LEN
+    assert runner.requests["b"].output_token_ids == []
+    assert "b" not in runner._req_accepted_counts
+    assert "b" not in runner._proposed_draft_token_ids
+
+    # Scheduled next: its row is rebuilt from its untouched state.
+    drafts = {"a": _agreed_drafts(runner, "a"), "b": _agreed_drafts(runner, "b")}
+    output = _lane_step(runner, "a", "b", drafts=drafts)
+
+    assert captured["tokens"][3, 0].item() == _tail_before(runner, "b")
+    assert captured["start_pos"][3, 0].item() == PROMPT_LEN - 1
+    committed = _by_request(output)
+    assert committed["b"] == drafts["b"] + [(drafts["b"][-1] + 1) % FAKE_VOCAB_SIZE]
+    assert runner.lane_batch.num_tokens[3] == PROMPT_LEN + DRAFT_LEN + 1
+
+
+def test_an_occupied_but_unscheduled_slot_is_inactive_on_a_narrow_lane_step():
+    """The ordinary decode of a speculating launch sends the row inactive too.
+
+    The proposal after a plain step reads the step's positions to tell a live
+    row from one owned by no request, so a real position on an unscheduled
+    slot would have the drafter propose for it.
+    """
+    model = make_fake_spec_model(supports_narrow_decode=True)()
+    runner = _lane_runner(model)
+    _place(runner, "a", 0, first_token=1)
+    _place(runner, "b", 3, first_token=21)
+    captured: dict = {}
+    _capture_decode_inputs(model, captured)
+
+    _lane_step(runner, "a")
+
+    assert model.verify_calls == []
+    assert captured["tokens"][3].tolist() == [0]
+    assert captured["start_pos"][3].item() == -1
+    proposal = model.propose_calls[-1]
+    assert bool((proposal["committed_positions"][3] < 0).all())
+    assert set(runner._proposed_draft_token_ids) == {"a"}
+    assert runner.lane_batch.num_tokens[3] == PROMPT_LEN
 
 
 def test_a_lane_step_with_nothing_to_verify_is_the_narrow_decode_and_still_proposes():
