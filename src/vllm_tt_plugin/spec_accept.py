@@ -708,13 +708,14 @@ def _constrained_probs(
 
     - Top-k without top-p uses vLLM's ``apply_top_k_only``, which keeps every
       logit at least the k-th largest, the same set the sort keeps.
-    - Top-k with top-p, for a row outside ``seeded_rows`` whose top-k is at
-      most ``_MAX_UNSORTED_TOP_K``, uses ``_top_k_top_p_without_sort``
-      whatever the other rows carry. Its top-p cut can differ from the sort's
-      where two logits tie at the cut or where a cumulative sum lands within
-      rounding of ``1 - p``. A seeded row keeps the sort, so it commits
-      exactly what the ordinary host sampler, which uses the same sort,
-      commits.
+    - Top-k with top-p, for a row outside ``seeded_rows`` whose top-k is
+      below the vocabulary size and at most ``_MAX_UNSORTED_TOP_K``, uses
+      ``_top_k_top_p_without_sort`` whatever the other rows carry. Its top-p
+      cut can differ from the sort's where two logits tie at the cut or where
+      a cumulative sum lands within rounding of ``1 - p``. A seeded row keeps
+      the sort, so it commits exactly what the ordinary host sampler, which
+      uses the same sort, commits. A row with top-p but no top-k also keeps
+      the sort.
 
     The caller's tensor is not modified: a caller that also wants logprobs
     needs the raw logits afterwards.
@@ -748,7 +749,9 @@ def _constrained_probs(
                 else [
                     row
                     for row, row_k in enumerate(top_k.tolist())
-                    if row not in seeded_rows and row_k <= _MAX_UNSORTED_TOP_K
+                    if row not in seeded_rows
+                    and row_k < vocab
+                    and row_k <= _MAX_UNSORTED_TOP_K
                 ]
             )
             unsorted_set = set(unsorted)
@@ -789,13 +792,17 @@ def _top_k_top_p_without_sort(
     keeps a token while the probability strictly above it, summed in
     descending order, is below ``p``. That is the same cut unless two logits
     tie at it or a sum lands within rounding of the boundary. The largest
-    token always stays, as in vLLM. Modifies ``logits`` in place.
+    token always stays, and a top-p of 1 keeps the whole top-k, as in vLLM.
+    Modifies ``logits`` in place.
     """
     values = logits.topk(int(k.max()), dim=-1).values
     kth = values.gather(1, (k.to(torch.int64) - 1).unsqueeze(1))
     probs = values.masked_fill(values < kth, float("-inf")).softmax(dim=-1)
     above = probs.cumsum(dim=-1) - probs
-    kept = (above < p.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp(min=1)
+    # At a top-p of 1 the descending sum can round to 1 before a top-k token
+    # whose probability is below float32 rounding of 1, which vLLM keeps.
+    within_p = (above < p.unsqueeze(1)) | (p.unsqueeze(1) >= 1.0)
+    kept = within_p.sum(dim=-1, keepdim=True).clamp(min=1)
     cut = torch.maximum(kth, values.gather(1, kept - 1))
     return logits.masked_fill_(logits < cut, float("-inf"))
 

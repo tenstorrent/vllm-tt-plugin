@@ -654,10 +654,13 @@ def test_the_unsorted_top_k_top_p_cut_matches_the_sorted_one(case: str):
     The cases mix rows that each lean on one part of the unsorted cut or of
     the per-row split. A top-p of 1 keeps the zero-probability tail of a row
     whose k is below the largest k it is cut with, which only the floor at
-    the k-th logit removes. A top-k of 1, which the input batch pairs with a
-    top-p of 0, keeps no token before the floor of one. Seeded rows, and rows
-    whose top-k is the vocabulary size, take the sort while their neighbours
-    do not, so their results are written back into a shared batch.
+    the k-th logit removes; those rows' logits are also spread so far that
+    their smallest top-k probabilities lie below float32 rounding of 1, where
+    a descending sum reaches 1 before them but vLLM still keeps them. A top-k
+    of 1, which the input batch pairs with a top-p of 0, keeps no token before
+    the floor of one. Seeded rows, and rows whose top-k is the vocabulary
+    size, take the sort while their neighbours do not, so their results are
+    written back into a shared batch.
     """
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
@@ -672,6 +675,7 @@ def test_the_unsorted_top_k_top_p_cut_matches_the_sorted_one(case: str):
     seeded_rows: frozenset[int] = frozenset()
     if case == "top-p of 1 on some rows":
         p[::3] = 1.0
+        logits[::3] *= 4.0
     elif case == "top-k of 1 with top-p of 0 on some rows":
         k[::3] = 1
         p[::3] = 0.0
@@ -690,13 +694,17 @@ def test_the_unsorted_top_k_top_p_cut_matches_the_sorted_one(case: str):
     assert torch.equal(probs, sorted_cut.softmax(dim=-1).reshape(rows, width, vocab))
 
 
-def test_a_row_that_needs_the_sort_does_not_send_its_neighbours_to_it(monkeypatch):
-    """Only seeded rows and rows with a top-k above the unsorted limit sort.
+@pytest.mark.parametrize("vocab", [8, 2048])
+def test_a_row_that_needs_the_sort_does_not_send_its_neighbours_to_it(
+    monkeypatch, vocab: int
+):
+    """Only seeded rows and rows without a top-k sort.
 
     The input batch stores a row without a top-k as the vocabulary size, and a
-    seeded row keeps the ordinary sampler's sort. An unseeded row with a small
-    top-k next to either still takes the unsorted cut, so the sort receives
-    only the columns of the rows that need it.
+    seeded row keeps the ordinary sampler's sort. A vocabulary below the
+    unsorted limit must still send a row without a top-k to the sort. An
+    unseeded row with a small top-k next to either still takes the unsorted
+    cut, so the sort receives only the columns of the rows that need it.
     """
     from vllm.v1.sample.ops import topk_topp_sampler
 
@@ -710,12 +718,12 @@ def test_a_row_that_needs_the_sort_does_not_send_its_neighbours_to_it(monkeypatc
         return sort(logits, *args, **kwargs)
 
     monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_pytorch", recording_sort)
-    rows, width, vocab = 4, 3, 2048
+    rows, width = 4, 3
 
     _constrained_probs(
         torch.randn(rows, width, vocab),
         torch.ones(rows),
-        top_k=torch.tensor([20, vocab, 20, 20], dtype=torch.int32),
+        top_k=torch.tensor([2, vocab, 2, 2], dtype=torch.int32),
         top_p=torch.full((rows,), 0.9),
         seeded_rows=frozenset({2}),
     )
