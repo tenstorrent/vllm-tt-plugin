@@ -277,6 +277,7 @@ class TTModelRunner:
         enable_model_warmup: bool,
         num_devices: int,
     ):
+        """Set up runner state from the config; ``load_model`` loads the model."""
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -362,15 +363,10 @@ class TTModelRunner:
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
         self.seeded_sampling_policy = get_tt_seeded_sampling_policy(vllm_config)
-        if self.supports_device_grammar and (
-            self.sample_on_device_mode is None or self.scheduler_config.async_scheduling
-        ):
+        if self.supports_device_grammar and self.sample_on_device_mode is None:
             logger.info(
                 "TT device grammar runtime activation is disabled "
-                "(sample_on_device_mode=%s, async_scheduling=%s); retaining "
-                "host grammar sampling",
-                self.sample_on_device_mode,
-                self.scheduler_config.async_scheduling,
+                "(sample_on_device_mode=None); retaining host grammar sampling"
             )
             self.supports_device_grammar = False
         # Whether the model supports top-K logprobs on device.
@@ -2996,10 +2992,34 @@ class TTModelRunner:
         *,
         lane_total: int | None,
     ) -> TTModelInput:
-        """Return ``model_input`` with the sample-time grammar bitmask attached."""
-        bitmask = self._reorder_grammar_bitmask(
-            grammar_output, model_input, lane_total=lane_total
+        """Attach the bitmask; async deferred steps keep only masked structured IDs.
+
+        Under async scheduling vLLM may build the grammar after applying the
+        previous step's output. A request that finished there has no grammar
+        row: its row samples unrestricted and vLLM drops the token. Every other
+        step requires a row for each structured request.
+        """
+        allow_finished_rows = (
+            model_input.defer_device_sampling and self.scheduler_config.async_scheduling
         )
+        bitmask = self._reorder_grammar_bitmask(
+            grammar_output,
+            model_input,
+            lane_total=lane_total,
+            require_complete=not allow_finished_rows,
+        )
+        if allow_finished_rows:
+            grammar_req_ids = (
+                grammar_output.structured_output_request_ids
+                if grammar_output is not None
+                else ()
+            )
+            model_input = replace(
+                model_input,
+                structured_output_req_ids=(
+                    model_input.structured_output_req_ids.intersection(grammar_req_ids)
+                ),
+            )
         if bitmask is None:
             return model_input
         return replace(model_input, grammar_bitmask=[bitmask])
@@ -3631,6 +3651,13 @@ class TTModelRunner:
         *,
         sampling_rows: list[int] | None = None,
     ) -> bool:
+        """Return whether this step's rows can be sampled on device.
+
+        Structured outputs use the device only for decode. Async scheduling
+        keeps the single traced logits buffer safe: the engine samples each
+        forward before submitting the next, and a deferred forward first drains
+        pending async steps.
+        """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
         )
@@ -3689,16 +3716,9 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # The initial model contract covers decode only. Prefill keeps the
-        # established host path so its first token remains grammar-safe.
-        # Upstream async scheduling can queue another forward before the
-        # current sample-time grammar arrives; the traced TT logits buffer is
-        # single-owner, so structured decode stays on host until that overlap
-        # has a dedicated multi-buffer contract.
+        # Prefill stays on host so its first token is grammar-safe.
         if has_structured_outputs and (
-            not is_decode
-            or not self.supports_device_grammar
-            or self.scheduler_config.async_scheduling
+            not is_decode or not self.supports_device_grammar
         ):
             return False
 

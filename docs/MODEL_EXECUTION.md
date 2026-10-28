@@ -217,9 +217,12 @@ Each bit in `grammar_bitmask` names one vocabulary token; a one bit permits
 that token. The model adapter must apply the submitted row order.
 
 Structured prefill uses host sampling. Deferred grammar sampling requires
-synchronous scheduling and effective runtime support. A missing mask or a
+effective runtime support. A missing mask or a
 failure after deferred submission invalidates the runner's grammar path;
 the plugin raises instead of resampling an already advanced step on the host.
+Under async scheduling, a request that finished while the step was in flight
+has no mask row and samples unrestricted; when no structured request is left,
+`grammar_bitmask` is `None`.
 
 Sources: `submit_prefill`, `check_perform_device_sampling`, and
 `_get_output_tokens` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);

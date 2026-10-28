@@ -28,7 +28,7 @@ may instead be rejected, and failures after deferred submission are terminal.
 | --- | --- |
 | Plugin | Merged in tenstorrent/vllm-tt-plugin#123. |
 | tt-metal reference implementation | Merged in tenstorrent/tt-metal#55892: tt_transformers `LlamaForCausalLM`, `QwenForCausalLM`, `MistralForCausalLM`. |
-| Scope | Decode only, one sampler per data-parallel replica, no logprobs, synchronous scheduling. |
+| Scope | Decode only, one sampler per data-parallel replica, no logprobs. |
 | Follow-up work | tenstorrent/tt-metal#60370. |
 
 Without this contract, structured-output requests keep vLLM's host sampling
@@ -66,7 +66,7 @@ The startup gates and per-step routing are in the README section
 [Structured Output Sampling](../README.md#structured-output-sampling), the
 [capability reference](MODEL_CAPABILITIES.md#sampling-and-async-capabilities)
 and [scheduling](SCHEDULING.md#when-steady-async-decode-is-allowed). In
-short: decode steps only, synchronous scheduling, and one ineligible request
+short: decode steps only, and one ineligible request
 moves the whole step to host sampling. Random-sampling requests without
 `top_k` stay on device only with a server
 [default top-k](../README.md#default-top-k-for-device-sampling).
@@ -172,6 +172,7 @@ entry points cannot be mixed.
 | Row count | One sampler: at most `max_batch_size` rows; the adapter pads the rest as all-allowed. Several replicas in one adapter (`data_parallel > 1`): the sum of the replicas' `max_batch_size`, split in replica order. |
 | Empty rows | A row that allows no token is invalid and must raise during validation. |
 | Lifetime | Each call replaces the whole mask. Nothing carries over between steps. |
+| Absent mask | Under async scheduling, `grammar_bitmask` is `None` when every structured request in the step finished while it was in flight. Sample as without grammar. |
 
 Apply the mask after penalties and before temperature, top-k, top-p and
 argmax. Disallowed logits become `-inf`. Padded vocabulary entries beyond
@@ -204,7 +205,6 @@ device:
 - structured prefill;
 - logprobs, including `logprobs=0`;
 - row-sharded sampling (`sampling_dp > 1`);
-- upstream async scheduling;
 - speculative decoding: a `logits` verify applies the grammar on the host, and
   a launch whose model serves only `argmax_ids` rejects structured requests at
   admission;
@@ -249,8 +249,8 @@ Host tests, mirroring the reference PR:
 
 On device, through the plugin:
 
-1. Start the server with `--no-async-scheduling` and
-   `sample_on_device_mode: decode_only`, and set `VLLM_LOGGING_LEVEL=DEBUG`.
+1. Start the server with `sample_on_device_mode: decode_only` and set
+   `VLLM_LOGGING_LEVEL=DEBUG`.
 2. Run `tests/tt/test_structured_output_dp1.py`. The server log must contain
    `TT device grammar sampling active` lines; zero means the path silently
    fell back to host.

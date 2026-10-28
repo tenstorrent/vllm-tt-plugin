@@ -371,22 +371,20 @@ Some model classes do not declare `max_device_top_k`, for example the tt-metal `
 
 Structured-output decode can use TT device sampling on models that declare
 `supports_device_grammar`. It is off by default. To enable it, set a
-`sample_on_device_mode` and turn off async scheduling. The example also sets
+`sample_on_device_mode`. The example also sets
 the [default top-k](#default-top-k-for-device-sampling), because requests
 without `top_k` to the default Llama model would otherwise sample on host:
 
 ```bash
 MESH_DEVICE=T3K \
 python examples/server_example_tt.py \
-  --no-async-scheduling \
   --override-generation-config '{"top_k": 32}' \
   --additional-config '{"tt": {"sample_on_device_mode": "decode_only"}}'
 ```
 
-vLLM enables async scheduling by default, and the platform disables it only
-for models without `supports_async_decode`. On models that declare it,
-structured requests keep host sampling unless the server is started with
-`--no-async-scheduling`.
+Device grammar works with and without async scheduling. Under async scheduling
+a structured decode step does not overlap with the next forward: the runner
+drains pending async work before it and samples after the mask arrives.
 
 | Step | Sampling path |
 | --- | --- |
@@ -406,7 +404,9 @@ Fallback is selected before forward submission. Once an eligible decode is
 submitted with deferred device sampling, its sample-time grammar mask must be
 present and valid. A missing mask or a device-sampling failure is terminal for
 that runner and requires recovery/restart; it is not retried on host, because
-the device decode and sampler state may already have advanced.
+the device decode and sampler state may already have advanced. One exception:
+under async scheduling, a request that finished while the step was in flight
+has no mask row. Its row samples unrestricted and vLLM drops the token.
 
 With `VLLM_LOGGING_LEVEL=DEBUG`, each device-grammar step logs
 `TT device grammar sampling active`. See

@@ -1445,7 +1445,11 @@ class TTAsyncDecodeController:
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
     ) -> TTFinalizedDecode:
-        """Apply sample-time grammar on device, then finalize sampled tokens."""
+        """Sample on device with the step's bitmask, if any; finalize the tokens.
+
+        A step with no structured request left, such as when every one finished
+        in flight, samples without a bitmask.
+        """
 
         def fail_deferred() -> None:
             self._decode_chain_valid = False
@@ -1467,11 +1471,12 @@ class TTAsyncDecodeController:
                 f"{len(model_input.grammar_bitmask)}"
             )
         grammar_bitmask = model_input.grammar_bitmask[0]
-        if grammar_bitmask is None:
+        if grammar_bitmask is None and model_input.structured_output_req_ids:
             fail_deferred()
             raise RuntimeError(
                 "structured decode reached deferred device sampling without "
-                "a sample-time grammar bitmask"
+                "a sample-time grammar bitmask: "
+                f"{sorted(model_input.structured_output_req_ids)}"
             )
 
         sample_deferred = getattr(self.runner.model, "sample_deferred_decode", None)
