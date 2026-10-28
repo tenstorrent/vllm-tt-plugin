@@ -40,12 +40,14 @@ from vllm_tt_plugin.async_decode import (
     TTAsyncDecodeController,
     TTDecodeSubmission,
 )
+from vllm_tt_plugin.prefill_rows import set_prefill_capacity_provider
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
     get_tt_prefill_lookahead,
+    get_tt_prefill_row_aware,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
@@ -566,6 +568,10 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        # Row-aware prompt admission (default off): hand the model's row capacity to the scheduler.
+        if get_tt_prefill_row_aware(self.vllm_config):
+            capacity = getattr(self.model, "prefill_row_capacity", None)
+            set_prefill_capacity_provider(capacity if callable(capacity) else None)
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
             if callable(activate):

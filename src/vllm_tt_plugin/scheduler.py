@@ -22,6 +22,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_prefill_first_step_tokens,
+    get_tt_prefill_row_aware,
     get_tt_prefix_hit_policy,
     round_tt_prefix_hit,
     get_tt_spec_plan,
@@ -30,6 +31,7 @@ from vllm_tt_plugin.config import (
     tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefill_rows import prefill_row_capacity
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 
 if TYPE_CHECKING:
@@ -359,6 +361,7 @@ class TTScheduler(AsyncScheduler):
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         self._pending_prefix_cache_reset = False
         self._max_partial_prefills = get_tt_max_partial_prefills(self.vllm_config)
+        self._prefill_row_aware = get_tt_prefill_row_aware(self.vllm_config)
         self._prefix_hit_policy = get_tt_prefix_hit_policy(self.vllm_config)
         self._first_step_tokens = get_tt_prefill_first_step_tokens(self.vllm_config)
         # Block-step decisions for the step currently being committed, read off
@@ -1044,20 +1047,31 @@ class TTScheduler(AsyncScheduler):
         left = self.max_num_scheduled_tokens - sum(
             r.num_tokens - r.num_computed_tokens for r in partial_prefills
         )
+        # Row-aware admission (``prefill_rows``, default off): the model reports the mesh rows
+        # that can still take a prompt into prefill (no in-progress prompt there, a free user);
+        # every admitted prompt, a split one or one that fits the budget left, prefills in such a
+        # row, so no more than that many are admitted. None = no limit (the model does not say).
+        rows_left = (
+            prefill_row_capacity()
+            if getattr(self, "_prefill_row_aware", False)
+            else None
+        )
         admitted = create_request_queue(self.policy)
         held: list[Request] = []
         while self.waiting:
             request = self.waiting.pop_request()
             need = request.num_tokens - request.num_computed_tokens
-            if held:
+            if held or (rows_left is not None and rows_left <= 0):
                 held.append(request)
             elif need <= left:
                 admitted.add_request(request)
                 left -= need
+                rows_left = None if rows_left is None else rows_left - 1
             elif slots > 0:
                 admitted.add_request(request)
                 slots -= 1
                 left = 0
+                rows_left = None if rows_left is None else rows_left - 1
             else:
                 held.append(request)
         self.waiting = admitted

@@ -681,6 +681,17 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+def get_tt_prefill_row_aware(vllm_config: "VllmConfig") -> bool:
+    """Admit a waiting prompt into prefill only while the model reports a mesh row for it (``prefill_rows``). Default off; ``TT_PREFILL_ROW_AWARE=1`` or
+    ``additional_config['tt']['prefill_row_aware']`` turns it on (an explicit config value wins over the environment)."""
+    import os
+
+    tt_config = get_tt_config(vllm_config)
+    if "prefill_row_aware" in tt_config:
+        return _read_tt_bool(tt_config, "prefill_row_aware", False)
+    return os.environ.get("TT_PREFILL_ROW_AWARE", "0") == "1"
+
+
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
 # that starts off that grid is realigned down by the model and the whole
