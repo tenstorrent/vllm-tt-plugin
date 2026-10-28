@@ -104,10 +104,12 @@ transition are still represented by `slot_remap`.
   the selected token into the persistent token buffer for the next decode and
   advances its persistent position in the forward trace.
 - **Transition decode:** the first decode; the first decode after prefill; the
-  first ordinary decode after a speculative verification; a request-layout,
-  sampling-mode, or resume transition. Pending work is drained and applied
-  first, then host-authoritative inputs and required sampling state are
-  reloaded.
+  first ordinary decode after a speculative verification or after an ordinary
+  decode the model's drafter answered from the host
+  ([SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4d); a
+  request-layout, sampling-mode, or resume transition. Pending work is drained
+  and applied first, then host-authoritative inputs and required sampling
+  state are reloaded.
 - **Chunked-prefill continuation:** a later prompt chunk for a request already
   present in the persistent batch. Membership can remain unchanged, so the
   plugin classifies it using the scheduler's context-phase marker rather than
@@ -128,6 +130,7 @@ transition are still represented by `slot_remap`.
 | Request add/remove/reuse/condense, preemption, or resume | reload | no | reload on device | reset on device |
 | Chunked-prefill continuation | reload | no | reload on device | reset on device |
 | Speculative verification → ordinary decode | reload | no | reload on device | reset on device |
+| Drafter-answered ordinary decode → ordinary decode | reload | no | reload on device | reset on device |
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if allocation changed | keep | keep |
@@ -282,6 +285,13 @@ position must align its counter from `start_pos` on a reloading step and then
 advance its resident counter exactly once per sampled token. Re-reading stale
 `start_pos` on a steady step makes a seeded stream depend on async readback
 timing and batch composition.
+
+This holds after an ordinary decode the model answered from its drafter
+([SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4d) as after any
+other step. The runner makes the next ordinary decode a reloading transition
+(table above), so an adapter whose decode trace keeps tokens and positions
+resident refills them from that reload; it must not refill them from the
+`tokens` of a step sent `reload_inputs=False`.
 
 ## Correctness invariant
 
