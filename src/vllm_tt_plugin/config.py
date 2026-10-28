@@ -124,6 +124,31 @@ def validate_tt_lane_config(vllm_config: "VllmConfig") -> int:
     return per_lane
 
 
+# The model-owned speculative round: ``speculative_config`` of vLLM's ``custom_class``
+# method naming this
+# marker as the proposer. No proposer class is instantiated; the served model
+# proposes its drafts inside its own decode step and verifies the ones the
+# scheduler hands back (``decode_forward(tokens[B, 1 + K])`` returns
+# ``[B, 1 + K]`` token ids, ``-1`` past the emitted ones, and ``take_drafts``
+# the next drafts per row). vLLM's scheduler carries the rest: the scheduled
+# drafts, the ragged accepted counts, ``take_draft_token_ids``.
+MODEL_OWNED_SPEC = "vllm_tt_plugin.model_owned_spec"
+
+
+def is_model_owned_spec(vllm_config: "VllmConfig") -> bool:
+    spec = vllm_config.speculative_config
+    return (
+        spec is not None
+        and spec.method == "custom_class"
+        and spec.model == MODEL_OWNED_SPEC
+    )
+
+
+def num_model_owned_spec_tokens(vllm_config: "VllmConfig") -> int:
+    """``K`` of the model-owned round, 0 when speculative decoding is off."""
+    return vllm_config.num_speculative_tokens if is_model_owned_spec(vllm_config) else 0
+
+
 def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     return (
         vllm_config.parallel_config.data_parallel_size == 1

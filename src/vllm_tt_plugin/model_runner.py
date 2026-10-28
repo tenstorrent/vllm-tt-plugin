@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -41,6 +42,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
     get_tt_per_lane_max_num_seqs,
+    num_model_owned_spec_tokens,
 )
 from vllm_tt_plugin.input_batch import (
     SEED_NONE_SENTINEL,
@@ -96,6 +98,26 @@ def _parse_layer_index(layer_name: str) -> int:
             "TT spec hooks must use the '...layers.<idx>...' naming convention."
         )
     return int(match.group(1))
+
+
+def _ragged_token_lists(sampled_token_ids: torch.Tensor, num_reqs: int) -> list[list[int]]:
+    """``[num_reqs, n]`` ids -> per request its tokens up to the first ``-1``
+    (``n == 1``: one each; the model-owned speculative round pads the emitted
+    tokens with -1)."""
+    ids = sampled_token_ids.view(num_reqs, -1)
+    if ids.dtype != torch.int32:
+        ids = ids.to(torch.int32)
+    if ids.shape[1] == 1:
+        return [[int(t)] for t in ids.view(num_reqs).tolist()]
+    out = []
+    for row in ids.tolist():
+        toks = []
+        for t in row:
+            if t < 0:
+                break
+            toks.append(int(t))
+        out.append(toks)
+    return out
 
 
 @dataclass(frozen=True)
@@ -217,6 +239,15 @@ class TTModelRunner:
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
+        # The model-owned speculative round (``config.MODEL_OWNED_SPEC``): a
+        # decode step's tokens are ``[rows, 1 + spec_k]`` (the last token, then
+        # the request's scheduled drafts, -1 past them), the model returns
+        # ``[rows, 1 + spec_k]`` ids (-1 past the emitted ones) and, through
+        # ``take_drafts``, the next drafts per row, which ``take_draft_token_ids``
+        # hands the scheduler after every step (every scheduled request gets an
+        # entry: an empty one clears the AsyncScheduler's -1 placeholders).
+        self.spec_k = num_model_owned_spec_tokens(vllm_config)
+        self._draft_token_ids: DraftTokenIds | None = None
 
         # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
@@ -1101,6 +1132,20 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, positions_np
             ].view(-1, 1)
+            if self.spec_k:
+                # column 0 the last token; columns 1.. the scheduled drafts
+                # (``scheduled_spec_decode_tokens``: what the model proposed
+                # last step, as the scheduler clipped it), -1 past them
+                drafts = torch.full(
+                    (input_tokens.shape[0], self.spec_k), -1, dtype=torch.int32
+                )
+                scheduled = scheduler_output.scheduled_spec_decode_tokens
+                for n, i in enumerate(req_indices):
+                    ids = scheduled.get(input_batch.req_ids[i])
+                    if ids:
+                        ids = [t for t in ids[: self.spec_k] if t >= 0]
+                        drafts[n, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
+                input_tokens = torch.cat([input_tokens.to(torch.int32), drafts], dim=1)
             prompt_lens = None
             # For on-device decode sampling, tell the backend if the padded
             # decode batch layout changed since the previous step.
@@ -1112,7 +1157,12 @@ class TTModelRunner:
             if input_tokens.shape[0] < decode_pad_to:
                 batch_pad = decode_pad_to - input_tokens.shape[0]
                 input_tokens = torch.cat(
-                    [input_tokens, torch.zeros(batch_pad, 1, dtype=torch.int32)]
+                    [
+                        input_tokens,
+                        torch.zeros(
+                            batch_pad, input_tokens.shape[1], dtype=torch.int32
+                        ),
+                    ]
                 )
                 # Pad positions with -1 to indicate no position
                 input_positions = torch.cat(
@@ -1657,6 +1707,8 @@ class TTModelRunner:
         sampled_token_ids = sampled_token_ids_per_dp[0]
         logprobs_tensors = logprobs_per_dp[0] if logprobs_per_dp else None
         logprobs = logprobs_tensors.tolists() if logprobs_tensors else None
+        if self.spec_k:
+            self._record_drafts(fwd.is_decode)
 
         if not fwd.is_decode and fwd.model_input.prompt_lens is not None:
             num_reqs = self.input_batch.num_reqs
@@ -1674,6 +1726,28 @@ class TTModelRunner:
                     )
 
         return self.apply_and_build_runner_output(sampled_token_ids, logprobs)
+
+    def _record_drafts(self, is_decode: bool) -> None:
+        """The next drafts of every request of the step just sampled, for
+        ``take_draft_token_ids``: the model's ``take_drafts()`` (row -> the
+        drafts after the accepted outcome) after a decode step, none after a
+        prefill; every scheduled request gets an entry (an empty list clears
+        the scheduler's placeholders for the requests that ran plain)."""
+        num_reqs = self.input_batch.num_reqs
+        req_ids = list(self.input_batch.req_ids[:num_reqs])
+        drafts: dict[int, list[int]] = {}
+        if is_decode:
+            take = getattr(self.model, "take_drafts", None)
+            drafts = take() if take is not None else {}
+        self._draft_token_ids = DraftTokenIds(
+            req_ids, [list(drafts.get(i, [])) for i in range(num_reqs)]
+        )
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """The engine's call after every step (``check_for_draft_tokens``):
+        the drafts recorded by the step's sampler, once."""
+        out, self._draft_token_ids = self._draft_token_ids, None
+        return out
 
     def _build_chunked_prefill_output(
         self,
@@ -2120,7 +2194,12 @@ class TTModelRunner:
                 # Normalize TT sampled tokens to 1D [sz]. Prefill can return [sz]
                 # while decode may return [sz, 1]; downstream logprobs packing
                 # expects a flat vector here.
-                next_token_ids = _take(tt_out).reshape(sz)
+                next_token_ids = _take(tt_out)
+                if is_decode and self.spec_k and next_token_ids.dim() == 2:
+                    # the round's emitted tokens per row, -1 past them
+                    next_token_ids = next_token_ids.reshape(sz, -1)
+                else:
+                    next_token_ids = next_token_ids.reshape(sz)
                 rank_max_num_logprobs = model_input.max_num_logprobs[dp_rank]
                 # Extract logprobs if available from device sampling
                 # Always tensors - turned into lists only when passing to model
@@ -2143,7 +2222,7 @@ class TTModelRunner:
                 else:
                     logprobs_per_dp.append(None)
 
-            sampled_token_ids_per_dp.append(next_token_ids.view(sz, 1))
+            sampled_token_ids_per_dp.append(next_token_ids.view(sz, -1))
 
             if is_decode:
                 # Fixed stride segments per DP rank for decode
@@ -2202,16 +2281,10 @@ class TTModelRunner:
             f"number of requests in input batch {num_reqs}"
         )
 
-        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
-        if sampled_token_ids_np.dtype != np.int32:
-            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
-
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
             (output_req_ids[i] for i in range(num_reqs)), None
         )
-        sampled_token_id_lists = [
-            [int(token_id)] for token_id in sampled_token_ids_np.tolist()
-        ]
+        sampled_token_id_lists = _ragged_token_lists(sampled_token_ids, num_reqs)
 
         return ModelRunnerOutput(
             req_ids=output_req_ids,
@@ -2241,16 +2314,18 @@ class TTModelRunner:
             f"number of requests in input batch {num_reqs}"
         )
         num_out_tokens = sampled_token_ids.shape[1]
-        assert num_out_tokens == 1, "Currently only supporting 1 output token"
-
-        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
-        if sampled_token_ids_np.dtype != np.int32:
-            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+        assert num_out_tokens == 1 or self.spec_k, (
+            "Currently only supporting 1 output token"
+        )
+        # per request the emitted tokens (one, or the round's 1 .. 1 + K: the
+        # accepted drafts and the bonus; every one appended exactly once)
+        token_lists = _ragged_token_lists(sampled_token_ids, num_reqs)
 
         if not use_captured_req_ids:
             rows = np.arange(num_reqs)
             start_idxs = self.input_batch.num_tokens[rows]
-            end_idxs = start_idxs + 1
+            counts = np.array([len(t) for t in token_lists], dtype=start_idxs.dtype)
+            end_idxs = start_idxs + counts
             max_end = int(end_idxs.max()) if num_reqs > 0 else 0
             assert max_end <= self.model_config.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
@@ -2258,13 +2333,15 @@ class TTModelRunner:
                 f"{self.model_config.max_model_len}"
             )
 
-            self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
-            self.input_batch.num_tokens[rows] = end_idxs
-
             for req_idx in range(num_reqs):
+                toks = token_lists[req_idx]
+                self.input_batch.token_ids_cpu[
+                    req_idx, start_idxs[req_idx] : end_idxs[req_idx]
+                ] = toks
                 output_token_ids = self.input_batch.req_output_token_ids[req_idx]
                 assert output_token_ids is not None
-                output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+                output_token_ids.extend(toks)
+            self.input_batch.num_tokens[rows] = end_idxs
             return
 
         assert req_ids is not None
@@ -2276,21 +2353,20 @@ class TTModelRunner:
             if request_states is not None and req_state is not request_states[req_idx]:
                 continue
 
+            toks = token_lists[req_idx]
             current_row = self.input_batch.req_id_to_index.get(req_id)
             if current_row is not None:
                 start_idx = int(self.input_batch.num_tokens[current_row])
-                end_idx = start_idx + 1
+                end_idx = start_idx + len(toks)
                 assert end_idx <= self.model_config.max_model_len, (
                     "Sampled token IDs exceed the max model length. "
                     f"Total number of tokens: {end_idx} > max_model_len: "
                     f"{self.model_config.max_model_len}"
                 )
-                self.input_batch.token_ids_cpu[current_row, start_idx] = (
-                    sampled_token_ids_np[req_idx]
-                )
+                self.input_batch.token_ids_cpu[current_row, start_idx:end_idx] = toks
                 self.input_batch.num_tokens[current_row] = end_idx
 
-            req_state.output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+            req_state.output_token_ids.extend(toks)
 
     def apply_and_build_runner_output(
         self,

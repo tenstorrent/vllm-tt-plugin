@@ -24,7 +24,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_tt_plugin.logger import init_tt_logger
@@ -476,6 +476,11 @@ class TTWorker(WorkerBase):
         """
         assert self.is_driver_worker, "There should only be one Worker for TT"
         return self.model_runner.sample_tokens(grammar_output)
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """The engine's call after every step under speculative decoding: the
+        drafts the model proposed for the next step (the model-owned round)."""
+        return self.model_runner.take_draft_token_ids()
 
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.

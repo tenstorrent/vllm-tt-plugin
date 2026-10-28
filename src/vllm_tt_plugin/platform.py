@@ -11,8 +11,10 @@ import torch
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_tt_plugin.config import (
+    MODEL_OWNED_SPEC,
     get_tt_config,
     get_tt_data_parallel_size,
+    is_model_owned_spec,
     store_tt_lane_count,
     uses_tt_lane_coordinator,
     validate_tt_lane_config,
@@ -861,9 +863,18 @@ class TTPlatform(Platform):
         cls._standard_dp_mesh_grids = {}
         _apply_chunked_prefill_policy(vllm_config)
 
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        # Speculative decoding: only the model-owned round (the served model
+        # proposes and verifies its own drafts; the plugin carries the
+        # scheduler's ragged contract, ``config.MODEL_OWNED_SPEC``). No draft
+        # model, no ngram proposer.
+        if vllm_config.speculative_config is not None:
+            assert is_model_owned_spec(vllm_config), (
+                "TT backend supports speculative decoding only as the model-"
+                f"owned round: speculative_config method 'custom_class' with "
+                f"model '{MODEL_OWNED_SPEC}' (got method "
+                f"{vllm_config.speculative_config.method!r}, model "
+                f"{vllm_config.speculative_config.model!r})"
+            )
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
