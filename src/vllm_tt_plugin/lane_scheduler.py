@@ -329,6 +329,11 @@ class TTLaneCoordinator(SchedulerInterface):
             for _ in range(self.num_lanes)
         ]
 
+    def set_prefix_hit_confirmer(self, confirmer) -> None:
+        """Install the model's hit confirmer on every lane scheduler."""
+        for sched in self.lanes:
+            sched.set_prefix_hit_confirmer(confirmer)
+
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
         """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
 

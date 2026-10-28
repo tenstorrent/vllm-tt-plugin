@@ -337,6 +337,14 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # A model that owns its prefix cache (device state per slot) confirms
+        # vLLM's longest hit before the scheduler commits it, so
+        # num_computed_tokens never exceeds what the device can serve and
+        # NewRequestData strips only the mm payload the model has resident.
+        self._prefix_hit_confirmer = None
+        manager = self.kv_cache_manager
+        self._orig_get_computed_blocks = manager.get_computed_blocks
+        manager.get_computed_blocks = self._confirmed_computed_blocks
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -430,6 +438,44 @@ class TTScheduler(AsyncScheduler):
                 "call made by AsyncScheduler._update_request_with_output and "
                 "must disable prefix caching"
             )
+
+    def set_prefix_hit_confirmer(self, confirmer) -> None:
+        """Install the model's hit confirmer (``prefix_cache_hit_confirmer``)."""
+        self._prefix_hit_confirmer = confirmer
+
+    def _confirmed_computed_blocks(self, request: Request):
+        """``get_computed_blocks`` trimmed to the hit the model confirms.
+
+        vLLM's longest block-hash hit is proposed to the model as
+        ``confirm(prompt_token_ids, mm_items, num_new_computed_tokens)``; the
+        model answers the number of cached tokens it will serve (0 = none).
+        The answer is clamped, floored to a block multiple, and the computed
+        blocks are cut to it. The junction pin (sparse retention boundary) is
+        dropped with a trimmed hit.
+        """
+        blocks, num_new, boundary = self._orig_get_computed_blocks(request)
+        confirm = self._prefix_hit_confirmer
+        if confirm is None or num_new <= 0:
+            return blocks, num_new, boundary
+        mm_items = [
+            (
+                getattr(f, "identifier", None),
+                int(f.mm_position.offset),
+                int(f.mm_position.length),
+                getattr(f, "modality", "image"),
+            )
+            for f in (request.mm_features or ())
+        ]
+        honoured = int(confirm(list(request.prompt_token_ids), mm_items, num_new))
+        block_size = self.kv_cache_manager.block_size
+        honoured = max(0, min(num_new, honoured)) // block_size * block_size
+        if honoured == num_new:
+            return blocks, num_new, boundary
+        keep = honoured // block_size
+        trimmed = self.kv_cache_manager.create_kv_cache_blocks(
+            tuple(list(group[:keep]) for group in blocks.blocks)
+        )
+        return trimmed, honoured, 0
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode

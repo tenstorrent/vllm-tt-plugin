@@ -146,7 +146,7 @@ def test_each_items_placeholder_range_is_forwarded_after_the_processor_fields():
         ["a", "b"],
     )
     out = TTModelRunner._gather_multi_modal_inputs(runner)
-    assert list(out)[-2:] == PLACEHOLDER_FIELDS
+    assert list(out)[-len(PLACEHOLDER_FIELDS) :] == PLACEHOLDER_FIELDS
     assert out["pixel_values"] == [[pv0, None, pv1], None]
     assert out["mm_placeholder_offsets"] == [[12, 300, None], None]
     assert out["mm_placeholder_lengths"] == [[270, 256, None], None]
