@@ -767,3 +767,25 @@ def test_release_names_the_slot_the_model_currently_holds():
         "release must name the slot the model currently holds; the gather moved "
         "both the plugin's record and the model's owner to 0"
     )
+
+
+def test_prefill_continuation_keeps_its_slot_when_a_new_request_joins_at_a_lower_row():
+    """Two 64K prompts chunked at 16K under a 32K step budget: B's chunks went to
+    slot 1 while A (slot 0) prefilled. A finishes its prompt and decodes (an
+    off-batch holder); the next prefill step batches a new request C at row 0
+    and B's final chunk at row 1. B must keep slot 1 (its recurrent state and
+    chunk cursor live there; no gather moves state between prefill steps), so C
+    takes the free slot 2 rather than B's, and the map stays request-bound."""
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.tt_per_lane_max_num_seqs = 4
+    runner.requests = {"req-a": object(), "req-b": object(), "req-c": object()}
+    runner._req_state_slot = {"req-a": 0, "req-b": 1}
+    assert runner._alloc_prefill_state_slots(["req-c", "req-b"]) == [2, 1]
+    assert runner._req_state_slot == {"req-a": 0, "req-b": 1, "req-c": 2}
+    # the same batch again (both requests' next chunks): nothing moves
+    assert runner._alloc_prefill_state_slots(["req-c", "req-b"]) == [2, 1]
+    # a continuing request whose recorded slot a decode holder now owns (a stale
+    # map) takes a free slot rather than aliasing the holder
+    runner.requests = {"req-a": object(), "req-b": object()}
+    runner._req_state_slot = {"req-a": 1, "req-b": 1}
+    assert runner._alloc_prefill_state_slots(["req-b"]) == [0]

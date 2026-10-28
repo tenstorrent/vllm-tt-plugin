@@ -1288,8 +1288,22 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        # A request mid-prefill keeps the slot its earlier chunks wrote: a
+        # stateful model (recurrent carries, per-slot chunk cursors) continues
+        # from that slot's state, and no gather moves state between prefill
+        # steps. Reserve those first so a request joining the batch at a lower
+        # row cannot take a continuing request's slot.
+        kept = {
+            req_id: slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in prefilling and slot not in held
+        }
+        held.update(kept.values())
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            if req_id in kept:
+                slots.append(kept[req_id])
+                continue
             if row not in held:
                 slot = row
             else:
