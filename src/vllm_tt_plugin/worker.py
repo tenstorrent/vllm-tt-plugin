@@ -322,6 +322,18 @@ class TTWorker(WorkerBase):
         """
         return self.model_runner.take_draft_token_ids()
 
+    def prefix_cache_hit_confirmer(self):
+        """The model's ``confirm_prefix_cache_hit(prompt_token_ids, mm_items,
+        num_computed_tokens) -> int`` when it declares
+        ``model_capabilities["confirms_prefix_cache_hits"]``, else None
+        (a ``collective_rpc`` target; in-process executors only, the bound
+        method crosses no process boundary)."""
+        model = getattr(self.model_runner, "model", None)
+        caps = getattr(type(model), "model_capabilities", None) or {}
+        if not caps.get("confirms_prefix_cache_hits", False):
+            return None
+        return getattr(model, "confirm_prefix_cache_hit", None)
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 

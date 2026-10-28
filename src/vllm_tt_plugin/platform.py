@@ -1201,6 +1201,39 @@ def _install_block_output_reset_abort_patch() -> None:
     engine_core.EngineCore.reset_prefix_cache = reset_prefix_cache_tt
 
 
+def _install_prefix_hit_confirmer_patch() -> None:
+    """Hand the scheduler the model's prefix-hit confirmer once the engine exists.
+
+    After ``EngineCore.__init__`` built the executor and the scheduler, the
+    worker's ``prefix_cache_hit_confirmer`` (the model's bound
+    ``confirm_prefix_cache_hit``, None for models without one) is installed
+    on the scheduler through ``set_prefix_hit_confirmer`` (a lane coordinator
+    fans it out to its lanes). In-process executors only: the bound method
+    crosses no process boundary. ``EngineCoreProc`` inherits the constructor.
+    """
+    import vllm.v1.engine.core as engine_core
+
+    if hasattr(engine_core, "_tt_original_engine_core_init"):
+        return
+    original = engine_core.EngineCore.__init__
+    engine_core._tt_original_engine_core_init = original
+
+    def init_tt(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        setter = getattr(self.scheduler, "set_prefix_hit_confirmer", None)
+        if setter is None:
+            return
+        confirmers = self.model_executor.collective_rpc("prefix_cache_hit_confirmer")
+        confirmer = next((c for c in confirmers if c is not None), None)
+        if confirmer is not None:
+            setter(confirmer)
+            logger.info(
+                "Prefix-cache hits are confirmed by the model before they are scheduled"
+            )
+
+    engine_core.EngineCore.__init__ = init_tt
+
+
 def _install_block_output_pause_guard_patch() -> None:
     """Refuse ``pause_generation(mode="keep", clear_cache=True)`` with live
     block requests.
@@ -2164,6 +2197,22 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+        # A model that keeps its own prefix records may confirm vLLM's hit before
+        # the scheduler commits it (confirms_prefix_cache_hits): only with the
+        # prefix cache declared, and only installed when the cache is on.
+        confirms_hits = (
+            bool(model_capabilities.get("confirms_prefix_cache_hits", False))
+            if model_capabilities
+            else False
+        )
+        if confirms_hits and not supports_prefix_caching:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} declares "
+                "model_capabilities['confirms_prefix_cache_hits']=True without "
+                "supports_prefix_caching=True"
+            )
+        if confirms_hits and vllm_config.cache_config.enable_prefix_caching:
+            _install_prefix_hit_confirmer_patch()
 
         if is_block_output_model:
             required_lifecycle_hooks = (
