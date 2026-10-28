@@ -654,7 +654,10 @@ is one column wide, that column being the token the step committed, every
 block to the uniform `1+K` before the call, so the drafter sees one shape. On
 an asynchronous launch this runs at the next step's drain, because the drafts
 continue a token that had to be read back first, so a drafter that starts
-offering again is acted on one step later.
+offering again is acted on one step later. Under overlap two ordinary decodes
+can be outstanding at once, so their drains can call `propose_draft_tokens`
+twice with no verify in between; `TTModelRunner._publish_draft` keeps only the
+later proposal, and the earlier one is discarded rather than verified.
 
 **The drafter must not need a fed hidden state.** An ordinary decode returns no
 `VerifyOutput`, so it produces no hidden handle, and `propose_draft_tokens`
@@ -681,21 +684,36 @@ device, a model may answer an ordinary decode step for some or all rows from
 its own drafter path and return the step's token ids as a host tensor in the
 flat form the device sampler's readback produces, instead of a device output.
 `_is_host_decode_output` in `vllm_tt_plugin.async_decode` recognises a host
-tensor, and the runner then skips `read_decode_output` and
-`process_decode_output_host` for that step. Rows the model did not compute
+tensor, and the runner then skips `process_decode_output_host` for that step;
+a model that implements `read_decode_output` passes the host tensor through it
+with no read event, there being nothing to read. Rows the model did not compute
 carry whatever id the model puts there; the runner reads only the live rows.
 This is how a drafter that starts a request from its prefill state serves the
 first step, which under narrow decode is an ordinary decode.
 
-The model then owns that row's device-resident decode inputs. The runner's
-reload plan ([DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md)) reloads
-host tokens and positions on layout changes and the other listed transitions,
-including the first ordinary decode after a verify, which the runner sees. It
-does not know that an ordinary decode's committed tokens came from the drafter
-rather than from the plain decode trace. A model whose plain decode keeps
-tokens and positions resident on the device must reload them itself on that
-row's first plain decode after a drafter-served step, or that decode continues
-from stale state.
+Such a step leaves the device-resident decode inputs the way a verify does.
+The decode trace ran for none of the rows the drafter answered, so it fed no
+token back, and the resident token and position still hold what the last
+trace-answered decode wrote. The runner sees this. `submit_decode` records an
+ordinary decode whose answer was host ids with nothing to read
+(`TTDecodeSubmission.host_answered`: on a speculating launch, on a submission
+whose device output the runner would otherwise have read itself), and
+`TTAsyncDecodeController.plan_decode_reload` then treats the next ordinary
+decode as the transition it makes of the one after a verify: `reload_inputs`
+with the sampling reset, whatever the layout did (the "drafter-answered
+ordinary decode → ordinary decode" row of the
+[DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md) transition table).
+Under asynchronous scheduling the served step is registered with
+`overlap_ok=False`, like a verify, so the next build drains it first; that
+drain waits on nothing, there being no read event, and the reload then carries
+the host's tokens with the served step's answer applied. The model does not
+reload for itself. `tokens` and `start_pos` are stale under
+`reload_inputs=False` after a drafter-served step as after any other, and a
+model that refilled its resident inputs from them there would break the host
+input authority rule. A submission with `read_from_device=True` is outside
+this: the model reads its own output, every answer to it arrives as host
+tensors, and the runner cannot tell a drafter-served step from a trace-answered
+one on that path.
 
 ## 4e. Batch changes while a proposal is outstanding
 

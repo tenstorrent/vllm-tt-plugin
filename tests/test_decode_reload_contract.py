@@ -59,9 +59,9 @@ def _decode_input(
     )
 
 
-def _commit(controller, model_input):
+def _commit(controller, model_input, *, host_answered=False):
     plan = controller.plan_decode_reload(model_input)
-    controller.commit_decode_submission(model_input, plan)
+    controller.commit_decode_submission(model_input, plan, host_answered=host_answered)
     return plan
 
 
@@ -337,6 +337,194 @@ def test_previous_submission_verified_commits_only_after_accepted_decode():
     # The refused plain decode did not consume the verify's transition.
     assert model.calls[-1]["reload_inputs"] is True
     assert model.calls[-1]["reset_sampling_state"] is True
+
+
+def test_the_plain_decode_after_a_host_answered_decode_reloads_its_inputs():
+    """A drafter-answered ordinary decode leaves the resident inputs like a verify.
+
+    SPEC_DECODE_CONTRACT.md section 4d lets a speculating model answer an
+    ordinary decode from its drafter and return host ids. The decode trace ran
+    for none of that step's rows, so it fed nothing back: the resident token
+    predates the answer exactly as it does after a verify, and the model
+    cannot refill it from ``tokens`` under ``reload_inputs=False``, which
+    declares them stale. The plain decode after such a step reloads, with the
+    sampling reset the verify transition carries, and the chain is steady
+    again from the step after: once, not from then on, and not after the
+    trace-answered steps around it.
+    """
+    controller = _controller()
+    _commit(controller, _decode_input())
+    served = _commit(controller, _decode_input(), host_answered=True)
+    after_served = _commit(controller, _decode_input())
+    steady = _commit(controller, _decode_input())
+
+    # The answer's form is known only after the forward, so the served step's
+    # own commands are the steady ones.
+    assert not served.reload_inputs
+    assert served.overlap_safe
+    assert after_served.reload_inputs
+    assert after_served.reload_sampling_params
+    assert after_served.reset_sampling_state
+    assert not after_served.overlap_safe
+    assert not steady.reload_inputs
+    assert steady.overlap_safe
+
+
+def test_a_verify_after_a_host_answered_decode_leaves_one_reload():
+    """The two transitions do not stack: the verify's commit replaces the flag,
+    and the plain decode after the verify reloads for the verify's reason."""
+    controller = _controller()
+    _commit(controller, _decode_input())
+    _commit(controller, _decode_input(), host_answered=True)
+    verify = _commit(controller, _decode_input(spec_mode="argmax_ids"))
+    after_verify = _commit(controller, _decode_input())
+    steady = _commit(controller, _decode_input())
+
+    assert verify.reload_inputs
+    assert not verify.reset_sampling_state
+    assert after_verify.reload_inputs
+    assert after_verify.reset_sampling_state
+    assert not steady.reload_inputs
+
+
+class _HostAnsweringModel(_VerifyingModel):
+    """A version-1 adapter whose drafter can answer an ordinary decode.
+
+    The model side of SPEC_DECODE_CONTRACT.md section 4d. A plain decode
+    returns a device output, which ``read_decode_output`` turns into a host
+    buffer and a read event; a step the drafter answered returns host ids,
+    which the same hook passes straight through with nothing to read.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.answer_next_from_host = False
+
+    def decode_forward(self, **kwargs):
+        if kwargs.get("spec_mode") is None and self.answer_next_from_host:
+            self.answer_next_from_host = False
+            self.calls.append(kwargs)
+            return torch.zeros((1,), dtype=torch.int32)
+        out = super().decode_forward(**kwargs)
+        if kwargs.get("spec_mode") is None:
+            return SimpleNamespace(device_output=out)
+        return out
+
+    def read_decode_output(self, tt_out, async_read=False):
+        if isinstance(tt_out, torch.Tensor):
+            return (tt_out, []) if async_read else tt_out
+        if async_read:
+            return tt_out.device_output, ["read"]
+        return tt_out.device_output
+
+
+def _host_answering_controller(*, speculative_tokens):
+    model = _HostAnsweringModel()
+    runner = _accepted_decode_hooks(
+        SimpleNamespace(
+            model=model,
+            trace_mode="decode_only",
+            kv_caches=object(),
+            request_specific_rope=False,
+            supports_stage_outputs=False,
+            _num_speculative_tokens=speculative_tokens,
+        )
+    )
+    return TTAsyncDecodeController(runner), model
+
+
+def _submit_async(controller, *, layout_changed=False):
+    return controller.submit_decode(
+        _submission_input(layout_changed=layout_changed),
+        read_from_device=False,
+        async_read=True,
+    )
+
+
+def _commands(model):
+    return [
+        (
+            call["reload_inputs"],
+            call["reload_sampling_params"],
+            call["reset_sampling_state"],
+        )
+        for call in model.calls
+    ]
+
+
+def test_submit_decode_reloads_the_plain_decode_after_a_host_answered_decode():
+    """``submit_decode`` reads the answer's form off the read it initiated.
+
+    A speculating model's drafter answers an ordinary decode with host ids and
+    nothing to read, on a submission whose device output the runner would
+    otherwise have read itself. That submission records ``host_answered``,
+    the next plain decode receives the reload commands, and the one after
+    that is steady again.
+    """
+    controller, model = _host_answering_controller(speculative_tokens=3)
+
+    _submit_async(controller, layout_changed=True)
+    steady = _submit_async(controller)
+    model.answer_next_from_host = True
+    served = _submit_async(controller)
+    after_served = _submit_async(controller)
+    steady_again = _submit_async(controller)
+
+    assert not steady.host_answered
+    assert served.host_answered
+    assert served.read_events == []
+    assert not after_served.host_answered
+    assert after_served.read_events == ["read"]
+    assert not steady_again.host_answered
+    assert _commands(model) == [
+        (True, True, True),
+        (False, False, False),
+        # The served step itself was planned before its answer was known.
+        (False, False, False),
+        (True, True, True),
+        (False, False, False),
+    ]
+
+
+def test_a_host_answer_is_a_transition_only_on_a_speculating_launch():
+    """Section 4d defines the drafter-answered step for a speculating launch.
+
+    A model that hands back host tensors on a decode of a launch that never
+    speculates answered from its trace, however it reads, so its resident
+    chain is kept.
+    """
+    controller, model = _host_answering_controller(speculative_tokens=0)
+
+    _submit_async(controller, layout_changed=True)
+    model.answer_next_from_host = True
+    served = _submit_async(controller)
+    after_served = _submit_async(controller)
+
+    assert not served.host_answered
+    assert not after_served.host_answered
+    assert _commands(model) == [
+        (True, True, True),
+        (False, False, False),
+        (False, False, False),
+    ]
+
+
+def test_a_model_that_reads_its_own_output_keeps_its_chain():
+    """``read_from_device=True`` makes every answer a host tensor.
+
+    The runner asked the model to read, so host tensors are that call's shape
+    rather than the drafter's answer, and the runner cannot see a
+    drafter-served step on that path. A speculating launch's steady decode
+    stays resident through it.
+    """
+    controller, model = _verifying_controller()
+    controller.runner._num_speculative_tokens = 3
+
+    _submit(controller, layout_changed=True)
+    _submit(controller)
+    _submit(controller)
+
+    assert [call["reload_inputs"] for call in model.calls] == [True, False, False]
 
 
 def test_submit_decode_delivers_page_table_only_refresh():
