@@ -199,3 +199,56 @@ def test_non_bool_declaration_is_rejected(monkeypatch):
         tt_platform._convert_dp_to_lanes(
             config, _declaring_model_class("MiMoV2ForCausalLM", "yes")
         )
+
+
+def test_declared_capability_single_engine_runs_one_lane(monkeypatch):
+    # At --data-parallel-size 1 a declaring model still takes the lane path,
+    # with one lane, so several engines can each serve one submesh.
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=1, max_num_seqs=8)
+    model = _declaring_model_class("MiMoV2ForCausalLM", True)
+
+    tt_platform._convert_dp_to_lanes(config, model)
+    tt_platform._convert_dp_to_lanes(config, model)
+
+    assert config.parallel_config.data_parallel_size == 1
+    assert tt_config.get_tt_data_parallel_size(config) == 1
+    assert tt_config.uses_tt_lane_coordinator(config)
+    assert config.scheduler_config.max_num_seqs == 8
+    assert tt_config.get_tt_per_lane_max_num_seqs(config) == 8
+
+
+def test_multi_lane_reentry_does_not_become_one_lane(monkeypatch):
+    # After a 4-lane fold data_parallel_size is 1; the re-run of the hook in
+    # the worker must keep the 4 lanes.
+    monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=4, max_num_seqs=4)
+    model = _declaring_model_class("MiMoV2ForCausalLM", True)
+
+    tt_platform._convert_dp_to_lanes(config, model)
+    tt_platform._convert_dp_to_lanes(config, model)
+
+    assert tt_config.get_tt_data_parallel_size(config) == 4
+    assert tt_config._SINGLE_LANE_KEY not in config.additional_config
+    assert config.scheduler_config.max_num_seqs == 16
+
+
+@pytest.mark.parametrize("galaxy_env", [False, True], ids=["gpt_oss", "galaxy"])
+def test_undeclared_single_engine_keeps_single_engine_path(monkeypatch, galaxy_env):
+    # GPT-OSS and the Galaxy generators fold DP without declaring it: at
+    # --data-parallel-size 1 they keep the single-engine path.
+    monkeypatch.delenv("TT_QWEN3_TEXT_VER", raising=False)
+    if galaxy_env:
+        monkeypatch.setenv("TT_LLAMA_TEXT_VER", "llama3_70b_galaxy")
+    else:
+        monkeypatch.delenv("TT_LLAMA_TEXT_VER", raising=False)
+    config = _vllm_config(data_parallel_size=1, max_num_seqs=8)
+
+    tt_platform._convert_dp_to_lanes(
+        config, None if galaxy_env else _model_class("GptOssForCausalLM")
+    )
+
+    assert not tt_config.uses_tt_lane_coordinator(config)
+    assert tt_config._RESOLVED_LANE_COUNT_KEY not in config.additional_config
