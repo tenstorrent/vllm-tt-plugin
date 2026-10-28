@@ -26,6 +26,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
+    has_tt_lane_count,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
@@ -36,6 +37,7 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_single_lane,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
@@ -593,10 +595,27 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     No-op unless ``data_parallel_size > 1`` and the model folds DP into lanes
     (``_model_folds_dp_into_lanes``). Idempotent: after conversion
     ``data_parallel_size == 1``, so re-entry short-circuits.
+
+    A model class that declares ``model_capabilities["folds_dp_into_lanes"]``
+    and is launched with ``--data-parallel-size 1`` runs one lane
+    (``store_tt_single_lane``), so several such engines can each serve one
+    submesh (``TT_VISIBLE_DEVICES``) of a larger machine.
     """
     parallel_config = vllm_config.parallel_config
     data_parallel_size = parallel_config.data_parallel_size
     if data_parallel_size <= 1:
+        capabilities = getattr(model_class, "model_capabilities", None) or {}
+        if (
+            data_parallel_size == 1
+            and capabilities.get("folds_dp_into_lanes", False) is True
+            and not has_tt_lane_count(vllm_config)
+        ):
+            store_tt_single_lane(vllm_config)
+            logger.info(
+                "Model %s folds DP into lanes and was launched with "
+                "--data-parallel-size 1: running one TT lane",
+                getattr(model_class, "__name__", model_class),
+            )
         return
     if not _model_folds_dp_into_lanes(model_class):
         return
