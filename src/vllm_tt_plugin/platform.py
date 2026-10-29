@@ -1211,9 +1211,10 @@ def _install_prefix_hit_confirmer_patch() -> None:
     fans it out to its lanes). In-process executors only: the bound method
     crosses no process boundary. ``EngineCoreProc`` inherits the constructor.
 
-    Installed from the platform's load hooks, before any engine exists: the
-    config-time install alone came too late in the engine-core process, whose
-    platform check runs inside ``EngineCore.__init__`` (the wrapper then
+    Installed from the general plugin entry point (``register_tt_models_from_plugin``,
+    which every vLLM process runs at import) and from the platform's load hooks:
+    the config-time install alone came too late in the engine-core process,
+    whose platform check runs inside ``EngineCore.__init__`` (the wrapper then
     missed that construction; served GLM-5.3-Flash 2026-10-29). The wrapper
     does nothing for an engine whose prefix cache is off, and the worker
     answers None for a model without the capability.
