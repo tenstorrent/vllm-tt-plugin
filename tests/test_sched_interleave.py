@@ -9,7 +9,12 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm_tt_plugin.sched_interleave import InterleavePolicy, parse_spec
-from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
+from vllm_tt_plugin.scheduler import (
+    KNOWN_SCHED_FLAGS,
+    TTScheduler,
+    TTSchedulingMode,
+    check_sched_flags,
+)
 
 # --- the spec -----------------------------------------------------------------
 
@@ -61,6 +66,24 @@ def test_max_prompt_chunk_is_the_token_budget():
         {"TT_SCHED_INTERLEAVE": "every=4,max_prompt=5120"}
     )
     assert explicit is not None and explicit.max_prompt == 5120
+
+
+# --- the TT_SCHED_* registry -----------------------------------------------------
+
+
+def test_known_flags_pass_and_unknown_ones_raise():
+    check_sched_flags({})
+    check_sched_flags({"TT_SCHED_INTERLEAVE": "every=4", "TT_SCHED_EVENT_LOG": "/x"})
+    check_sched_flags({"TT_SCHEDULER": "not ours", "TT_METAL_HOME": "/x"})  # no prefix
+    assert {"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG"} == KNOWN_SCHED_FLAGS
+    with pytest.raises(ValueError, match="TT_SCHED_ADMISSION_GROUP"):
+        check_sched_flags(
+            {"TT_SCHED_INTERLEAVE": "every=4", "TT_SCHED_ADMISSION_GROUP": "8"}
+        )
+    with pytest.raises(ValueError, match="TT_SCHED_INTERLAEVE"):
+        check_sched_flags({"TT_SCHED_INTERLAEVE": "every=4"})
+    with pytest.raises(ValueError, match="TT_SCHED_PACK"):
+        check_sched_flags({"TT_SCHED_PACK": "1"})  # not implemented in this tree
 
 
 # --- the policy's accounting ----------------------------------------------------

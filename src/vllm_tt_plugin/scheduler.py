@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import os
+from collections.abc import Mapping
 from enum import Enum
 from typing import cast
 
@@ -35,6 +37,28 @@ class TTSchedulingMode(Enum):
 # admits one new prefill a step and advances a partial prefill alone.
 ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
 
+# The ``TT_SCHED_*`` environment variables this tree implements. A scheduling
+# policy is one variable, parsed at ``TTScheduler.__init__`` into one
+# attribute (``None`` when unset), consulted in ``_prefer_decode`` and
+# accounted in ``_finalize_scheduler_output``; a tree that adds a policy
+# (``TT_SCHED_PACK``) adds its name here in the same change. Any other
+# ``TT_SCHED_*`` variable makes ``check_sched_flags`` raise, so a misspelt or
+# unimplemented flag (``TT_SCHED_ADMISSION_GROUP`` is not implemented) does
+# not serve the stock schedule under its name.
+KNOWN_SCHED_FLAGS = frozenset({"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG"})
+
+
+def check_sched_flags(environ: Mapping[str, str] | None = None) -> None:
+    """Raise ``ValueError`` on a ``TT_SCHED_*`` variable this tree does not know."""
+    env = os.environ if environ is None else environ
+    unknown = sorted(
+        k for k in env if k.startswith("TT_SCHED_") and k not in KNOWN_SCHED_FLAGS
+    )
+    if unknown:
+        raise ValueError(
+            f"unknown TT scheduler flag(s) {', '.join(unknown)}; "
+            f"this tree implements {', '.join(sorted(KNOWN_SCHED_FLAGS))}"
+        )
 
 
 class TTScheduler(AsyncScheduler):
@@ -95,6 +119,10 @@ class TTScheduler(AsyncScheduler):
         model_config = getattr(self.vllm_config, "model_config", None)
         model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
         self._aligned_chunks = model_type in ALIGNED_CHUNK_MODEL_TYPES
+        # The TT_SCHED_* flags this scheduler knows; any other one in the
+        # environment is a typo or another tree's policy and is refused at
+        # start-up rather than serving the stock schedule under its name.
+        check_sched_flags()
         # TT_SCHED_INTERLEAVE (sched_interleave): decode bursts between
         # prefills in default mode; None unless the variable is set. Its
         # max_prompt=chunk is the token budget (one chunk: 5,120 served).
@@ -209,9 +237,30 @@ class TTScheduler(AsyncScheduler):
 
     def _prefer_decode(self, has_running_decode: bool) -> bool:
         """Default mode only: run a decode step although prefill work is
-        pending. Each policy adds one clause; the first true clause wins; an
-        absent policy adds nothing. ``has_running_decode`` false means there
-        is nothing to decode and the answer is no whatever the policies say.
+        pending. ``has_running_decode`` false means there is nothing to
+        decode and the answer is no whatever the policies say.
+
+        The contract every scheduling policy keeps (``TT_SCHED_INTERLEAVE``
+        here; ``TT_SCHED_PACK`` and any later one conform to it):
+
+        - one clause per policy, in the order below; the first true clause
+          wins; a policy whose variable is unset is ``None`` and adds nothing,
+          so with every variable unset this returns ``False`` and
+          ``_schedule`` is the stock prefill-first path;
+        - a clause reads the scheduler's state (``self.running`` and its
+          requests' ``is_prefill_chunk`` / ``num_prompt_tokens``,
+          ``self.waiting``, ``self.requests``) and the policy's own, never the
+          device, the clock of the step or another policy's state;
+        - ``True`` means one ``_schedule_decode_only`` step (the waiting
+          queues and partial prefills hidden, restored after); a step that
+          schedules nothing falls through to the prefill step, so a clause
+          can never stall prefill;
+        - every scheduler output, from every path, reaches
+          ``_finalize_scheduler_output``, where each policy's ``observe``
+          accounts the scheduled work (rows, prompts completed) and never
+          ``schedule()`` calls; a policy that packs several prompts into one
+          prefill step completes several prompts in one output and the
+          interleave count sees them all.
         """
         if not has_running_decode:
             return False
