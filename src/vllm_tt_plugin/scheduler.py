@@ -6,6 +6,7 @@ import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
+from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -126,6 +127,64 @@ def get_tt_block_step_decisions(
     return dict(getattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, {}))
 
 
+# Per structured request, the reasoning phase as the scheduler sees it:
+# ``(ended, end_token_ids)``. ``ended`` is vLLM's ``reasoning_ended`` rule at
+# schedule time (True when the grammar already applies to the first token);
+# ``end_token_ids`` is the reasoning parser's end set. The worker has neither
+# the parser nor ``include_reasoning``, so it takes both from here. See
+# ``structured_output.ReasoningPhase``.
+_TT_REASONING_START_ATTR = "_tt_reasoning_start"
+
+
+def set_tt_reasoning_start(
+    scheduler_output: SchedulerOutput,
+    start: dict[str, tuple[bool, tuple[int, ...]]],
+) -> None:
+    set_tt_scheduler_output_field(
+        scheduler_output, _TT_REASONING_START_ATTR, dict(start)
+    )
+
+
+def get_tt_reasoning_start(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, tuple[bool, tuple[int, ...]]]:
+    value = getattr(scheduler_output, _TT_REASONING_START_ATTR, None)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def reasoning_start_for_request(
+    manager, request: Request
+) -> tuple[bool, tuple[int, ...]] | None:
+    """``(ended, end_ids)`` for a structured request, or None for any other.
+
+    Follows ``StructuredOutputManager._get_constraint_start`` up to the point
+    where it looks at drafts: ended when the grammar applies from the first
+    token (``enable_in_reasoning``, a latched ``reasoning_ended`` such as
+    ``include_reasoning=false``, no reasoning parser, or a prompt that already
+    closed reasoning, which is thinking off). An open phase whose parser has no
+    end ids is reported with an empty set, and the worker then keeps the row on
+    the logits path.
+    """
+    structured = getattr(request, "structured_output_request", None)
+    if structured is None or manager is None:
+        return None
+    if getattr(manager, "enable_in_reasoning", False) or structured.reasoning_ended:
+        return True, ()
+    reasoner = manager._get_reasoner(request)
+    if reasoner is None:
+        return True, ()
+    if structured.reasoning_ended is None and reasoner.is_reasoning_end(
+        request.prompt_token_ids or []
+    ):
+        return True, ()
+    end_ids = (
+        reasoner.reasoning_end_token_ids
+        if isinstance(reasoner, ParserEngineReasoningAdapter)
+        else ()
+    )
+    return False, tuple(sorted(int(t) for t in end_ids))
+
+
 # The lane coordinator's per-step state; see ``lane_scheduler.py``.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
 
@@ -136,6 +195,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_FORCED_RESET_DISCARD_COUNTS_ATTR,
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
+    _TT_REASONING_START_ATTR,
     _TT_STEP_STATE_ATTR,
 )
 
@@ -1472,6 +1532,18 @@ class TTScheduler(AsyncScheduler):
                         pending.get(request.request_id, 0) + frame_count
                     )
 
+    def _attach_reasoning_start(self, scheduler_output: SchedulerOutput) -> None:
+        """Tell the worker each scheduled structured request's reasoning phase."""
+        manager = getattr(self, "structured_output_manager", None)
+        start: dict[str, tuple[bool, tuple[int, ...]]] = {}
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.use_structured_output:
+                value = reasoning_start_for_request(manager, request)
+                if value is not None:
+                    start[req_id] = value
+        set_tt_reasoning_start(scheduler_output, start)
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Reserve the physical output each scheduled step will commit.
 
@@ -1496,6 +1568,7 @@ class TTScheduler(AsyncScheduler):
             scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids
         )
         self._track_spec_seed_steps(scheduler_output)
+        self._attach_reasoning_start(scheduler_output)
         pending = getattr(self, "_pending_async_output_frames", None)
         if pending is None:
             pending = self._pending_async_output_frames = {}

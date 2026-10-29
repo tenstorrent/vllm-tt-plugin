@@ -427,6 +427,77 @@ class DraftOutput:
     draft_scores: "torch.Tensor | None" = None
 
 
+# The largest ``num_logprobs`` (top-N) a ``fused_sample`` step serves from
+# ``SpecCandidates``: the candidates hold at least this many plus the sampled
+# token, so a request above it (or ``logprobs=-1``) takes the ``logits`` mode.
+MAX_DEVICE_LOGPROBS = 20
+
+
+@dataclass(frozen=True)
+class SpecCandidates:
+    """The top candidates of every verify position, for device logprobs.
+
+    A ``fused_sample`` model that declares ``supports_spec_device_logprobs``
+    returns this beside the committed ids when a row of the step asked for
+    logprobs (``spec_sampling["num_logprobs"] >= 0``). ``B`` rows, ``T = 1+K``
+    verify positions, ``M`` candidates per position:
+
+    - ``ids`` ``[B, T, M]`` integer: the ``M`` token ids with the largest raw
+      logits of the whole vocabulary, ordered by logit descending, then id
+      ascending.
+    - ``values`` ``[B, T, M]`` float32: the raw logits of those ids (the
+      logits the model's verify produced, before temperature, grammar and
+      penalties), in the same order.
+    - ``lse`` ``[B, T]`` float32: the raw ``logsumexp`` of the whole
+      vocabulary at each position.
+
+    A token's raw logprob is ``value - lse``. The plugin reads only the
+    positions a row committed. ``M`` is at least the largest ``num_logprobs``
+    plus 1 of the step; a model built on the top-64 gives ``M = 64``.
+    """
+
+    ids: "torch.Tensor"
+    values: "torch.Tensor"
+    lse: "torch.Tensor"
+
+    def __post_init__(self) -> None:
+        import torch
+
+        for name, tensor in (
+            ("ids", self.ids),
+            ("values", self.values),
+            ("lse", self.lse),
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"SpecCandidates.{name} must be a host tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+        if self.ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                f"SpecCandidates.ids must be int32 or int64, got {self.ids.dtype}"
+            )
+        for name, tensor in (("values", self.values), ("lse", self.lse)):
+            if tensor.dtype != torch.float32:
+                raise ValueError(
+                    f"SpecCandidates.{name} must be float32, got {tensor.dtype}"
+                )
+        if self.ids.dim() != 3:
+            raise ValueError(
+                f"SpecCandidates.ids must be [B, 1+K, M], got {tuple(self.ids.shape)}"
+            )
+        if self.values.shape != self.ids.shape:
+            raise ValueError(
+                f"SpecCandidates.values must match ids {tuple(self.ids.shape)}, "
+                f"got {tuple(self.values.shape)}"
+            )
+        if tuple(self.lse.shape) != tuple(self.ids.shape[:2]):
+            raise ValueError(
+                f"SpecCandidates.lse must be [B, 1+K] = {tuple(self.ids.shape[:2])}, "
+                f"got {tuple(self.lse.shape)}"
+            )
+
+
 @dataclass(frozen=True)
 class VerifyOutput:
     """What one verify call returns, and the mode that says which fields apply.
@@ -474,8 +545,24 @@ class VerifyOutput:
     # engine thread. ``tip_id`` (an int attribute) names the step for
     # ``chain_tip``.
     handle: Any = None
+    # For "fused_sample" on a model that declares supports_spec_device_logprobs:
+    # the candidates of every position, present exactly when a row of the step
+    # asked for logprobs (spec_sampling["num_logprobs"] >= 0). A deferred
+    # verify carries it in its FusedReadout instead. See SpecCandidates.
+    candidates: "SpecCandidates | None" = None
 
     def __post_init__(self) -> None:
+        if self.candidates is not None:
+            if not isinstance(self.candidates, SpecCandidates):
+                raise TypeError(
+                    "VerifyOutput.candidates must be a SpecCandidates, got "
+                    f"{type(self.candidates).__name__}"
+                )
+            if self.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+                raise ValueError(
+                    "VerifyOutput.candidates is only defined for spec_mode "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r}, got {self.spec_mode!r}"
+                )
         required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
         if required is None:
             raise ValueError(
@@ -512,12 +599,26 @@ class FusedReadout:
     count), ``accepted_counts`` ``[B]`` int32 in ``[1, 1+K]``, and ``p0`` ``[B]``
     int32: the ACTUAL position of each row's column 0, which differs from the
     runner's provisional one for a chained row. A padding row reports a
-    negative ``p0``. A model may return a 3-tuple in this order instead.
+    negative ``p0``. A model may return a 3-tuple in this order instead, which
+    carries no ``candidates``.
+
+    ``candidates`` is the step's ``SpecCandidates`` when a row of the step asked
+    for logprobs, else None.
     """
 
     accepted_token_ids: "torch.Tensor"
     accepted_counts: "torch.Tensor"
     p0: "torch.Tensor"
+    candidates: "SpecCandidates | None" = None
+
+    def __post_init__(self) -> None:
+        if self.candidates is not None and not isinstance(
+            self.candidates, SpecCandidates
+        ):
+            raise TypeError(
+                "FusedReadout.candidates must be a SpecCandidates, got "
+                f"{type(self.candidates).__name__}"
+            )
 
 
 def normalize_declared_values(
@@ -699,6 +800,7 @@ __all__ = [
     "DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES",
     "DRAFTER_TARGET_CACHE_REQUIREMENTS",
     "HIDDEN_HANDOFFS",
+    "MAX_DEVICE_LOGPROBS",
     "HIDDEN_HANDOFF_ON_DEVICE",
     "HIDDEN_HANDOFF_ROUNDTRIP",
     "SPEC_REQUIREMENTS",
@@ -711,6 +813,7 @@ __all__ = [
     "MODE_REQUIRED_FIELDS",
     "PLACEHOLDER_TOKEN_ID",
     "HiddenHandle",
+    "SpecCandidates",
     "SpecPlan",
     "SpecReject",
     "VerifyOutput",

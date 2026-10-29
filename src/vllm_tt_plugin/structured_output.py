@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -230,3 +231,84 @@ def spec_grammar_bitmask_for_tt_batch(
         columns = min(width, rows_per_request[req_id])
         unpacked[local_row, :columns] = bitmask[start : start + columns]
     return unpacked
+
+
+# A structured request whose reasoning phase is open is not constrained by
+# vLLM: ``StructuredOutputManager`` writes an all-ones bitmask row for every
+# token up to and including the first reasoning-end token. The tracker below
+# mirrors that rule on the worker so a step can tell, before it is built,
+# whether the grammar applies to any token it may commit.
+
+
+@dataclass
+class ReasoningPhase:
+    """Whether one structured request is still inside its reasoning phase.
+
+    ``ended`` starts as the scheduler's value (``TTScheduler`` computes it from
+    the same rules as vLLM's ``_get_constraint_start``) and latches True once a
+    committed token is a reasoning-end id. ``end_ids`` is the parser's whole
+    end set: for the Qwen3 parser it holds ``</think>`` and ``<tool_call>``,
+    and the first token from either ends the phase, as in vLLM's
+    ``find_reasoning_end_offset``. An open phase with no end ids cannot be
+    tracked, so it never reports itself as fused-safe.
+    """
+
+    end_ids: frozenset[int]
+    ended: bool
+    scanned: int = 0
+
+    @classmethod
+    def from_scheduler(cls, start: tuple[bool, Sequence[int]]) -> ReasoningPhase:
+        ended, end_ids = start
+        return cls(end_ids=frozenset(int(t) for t in end_ids), ended=bool(ended))
+
+    def observe(self, output_token_ids: Sequence[int]) -> None:
+        """Scan the committed tokens not yet seen, and latch on an end id."""
+        if self.ended:
+            return
+        if self.scanned > len(output_token_ids):
+            # The list shrank (a preempted request replays), so start over.
+            self.scanned = 0
+        end_ids = self.end_ids
+        for index in range(self.scanned, len(output_token_ids)):
+            if output_token_ids[index] in end_ids:
+                self.ended = True
+                break
+        self.scanned = len(output_token_ids)
+
+    def drafts_may_end_reasoning(self, drafts: Sequence[int]) -> bool:
+        """True when a draft is an end id: a token could then follow it."""
+        end_ids = self.end_ids
+        return any(int(token) in end_ids for token in drafts)
+
+    def fused_safe(self, drafts: Sequence[int]) -> bool:
+        """Whether a step with these drafts commits no token the grammar governs.
+
+        A reasoning-end id can be followed by a committed token only when it is
+        an accepted draft, because a commit is the accepted drafts plus one
+        final token. With no end id among the drafts, an end id can only be
+        that final token, so every committed token lies at or before it and
+        the grammar governs none of them.
+        """
+        return (
+            not self.ended
+            and bool(self.end_ids)
+            and not self.drafts_may_end_reasoning(drafts)
+        )
+
+
+def constrained_bitmask_rows(
+    bitmask: torch.Tensor, row_req_ids: Sequence[str | None]
+) -> list[str]:
+    """The requests whose rows of a per-row bitmask hold any cleared bit.
+
+    ``bitmask`` is ``[rows, ...]`` in TT batch layout, one leading entry per
+    ``row_req_ids`` item; all ones (-1) means no token is masked.
+    """
+    flat = bitmask.reshape(bitmask.shape[0], -1)
+    constrained = (flat != -1).any(dim=1)
+    return [
+        str(req_id)
+        for row, req_id in enumerate(row_req_ids)
+        if req_id is not None and row < flat.shape[0] and bool(constrained[row])
+    ]

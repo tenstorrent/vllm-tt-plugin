@@ -113,6 +113,8 @@ launches without `speculative_config`.
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 | `supports_prefill_over_pending_spec` | `False` | `prefill_forward` may run while one deferred fused verify is in flight, and that verify stays readable afterwards: see section 4j. Only used with `VLLM_TT_SPEC_CHAIN=1`. |
+| `supports_spec_device_logprobs` | `False` | A `fused_sample` verify returns `SpecCandidates` for a step with a logprobs row: see section 4k. |
+| `supports_spec_device_top_p` | `False` | A `fused_sample` verify serves a sampled row with `top_k` off and `top_p < 1` under a certificate: see section 4k. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -271,6 +273,8 @@ full logits with the same uniforms. The runner's walk is unchanged: it reads
 `accepted_token_ids` and `accepted_counts`. Float32 rounding of the uniforms and
 of the device arithmetic can flip a decision only when a draft probability lies
 within about 1e-6 of its uniform.
+
+Section 4k adds two optional capabilities to this stage: logprobs rows and `top_k` 0 rows.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -1191,7 +1195,7 @@ chained onto the pending one also carries:
 
 The reader thread calls `model.read_decode_output(handle)` (or `handle.wait()`),
 which blocks on a device event and returns `FusedReadout(accepted_token_ids,
-accepted_counts, p0)` or that 3-tuple. `p0` is `[B]` int32, the actual position
+accepted_counts, p0)` (plus `candidates` for a step with a logprobs row, section 4k) or the plain 3-tuple. `p0` is `[B]` int32, the actual position
 of each row's column 0; the committed-prefix length cap uses it, not the
 provisional position. `propose_draft_tokens(..., hidden=handle)` runs later on
 the engine thread, after the read, once per step, and returns `num_valid`; for
@@ -1200,7 +1204,7 @@ reads only `num_valid` and publishes a length hint, never ids.
 
 The runner chains only when exactly one verify is unresolved and it is the
 newest fused step; the scheduled requests are its rows less the finished ones;
-no prefill chunk, forced reset, grammar, logprobs, penalties or allowlist; every
+no prefill chunk, forced reset, grammar, penalties or allowlist, and no logprobs row the model cannot serve (section 4k); every
 row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
@@ -1217,6 +1221,76 @@ before the next decode build. A step after such a prefill does not chain onto
 the verify it overtook. `VLLM_TT_SPEC_PREFILL_OVERLAP=0` (default `1`) turns it
 off. A resumed request, a multimodal request or a model without the key still
 drains first.
+
+## 4k. Device logprobs and the device top-p certificate
+
+Two optional capabilities of a `fused_sample` model, both default `False`,
+both approved by a human on 2026-10-28. With neither declared nothing in this
+section applies and every step is built as before. They extend section 4i's
+support rule, `top_k` in `[1, topk_candidates - 1]`, to two more row types.
+
+**Logprobs, `supports_spec_device_logprobs`.** A request with `logprobs` of 0
+to 20 (`MAX_DEVICE_LOGPROBS`) is carried by a `fused_sample` step, greedy or
+sampled, when `logprobs_mode` is `raw_logprobs` and the row has no penalty,
+grammar (outside an open reasoning phase), allowlist, bad word or pending
+`min_tokens`. `logprobs=-1`, more than 20, and the other `logprobs_mode`
+values keep the `logits` mode. The step's `spec_sampling` then carries
+`num_logprobs` int32 `[B]`: `-2` for a row that asked for none and for a
+padding row, else its top-N. The key is absent when no row asked. A step whose
+rows are all greedy still carries `spec_sampling` (a dict with all rows
+greedy, zero `uniforms`, nothing drawn) when a row asked for logprobs.
+
+The model returns, in `VerifyOutput.candidates` (a synchronous step) or
+`FusedReadout.candidates` (a deferred step), a `SpecCandidates` for the whole
+block, exactly when `num_logprobs >= 0` on some row:
+
+- `ids` `[B, 1+K, M]` int32 or int64: the `M` token ids with the largest raw
+  logits at each position, ordered by logit descending, then id ascending;
+- `values` `[B, 1+K, M]` float32: those raw logits (the verify's own logits,
+  before temperature, penalties and grammar);
+- `lse` `[B, 1+K]` float32: the raw logsumexp over the whole vocabulary.
+
+`M` must be at least the largest `num_logprobs` of the step and at least 1; a
+model on the top-64 gives 64. The plugin builds, for every live row's committed
+columns, the row `LogprobsTensors` the `logits` mode builds
+(`spec_accept.committed_logprobs`): column 0 is the committed token with its
+logprob `value - lse` and its rank (the number of candidate values at or above
+its own, as vLLM counts), columns `1..N` the top-N ids and logprobs, `N` the
+largest `num_logprobs` of the step. The published-prefix cut is the existing
+one. A committed token must be among the candidates: this holds for a greedy
+row (its argmax is the first candidate) and for a sampled row inside the support
+rule or the certificate. If it is not, the plugin reports the last candidate's
+value as an upper bound and rank `M + 1` and counts it
+(`TTModelRunner.spec_logprobs_missing_id`, with a warning). When the chosen
+value equals the last candidate's value, tokens past `M` may tie with it: the
+rank is a lower bound and the plugin counts it
+(`spec_logprobs_rank_lower_bound`); the logprob is exact. Ties inside the top-N
+list resolve to the lower id. A step that asked for logprobs and returns no
+`candidates`, or `candidates` of another block shape, raises. Dtype and shape
+of `SpecCandidates` are checked at construction.
+
+**Top-p certificate, `supports_spec_device_top_p`.** A sampled request whose
+`top_k` is off (0, negative, or at least the vocabulary size) and whose `top_p`
+is below 1 is carried by a `fused_sample` step. The plugin sends it with
+`top_k` 0 in `spec_sampling` (the key is otherwise 1 for greedy rows and
+`1..M-1` for sampled rows). The model samples the full-vocabulary nucleus from
+its top `M` candidates when the candidates hold enough probability mass to
+decide the nucleus exactly (the certificate), and otherwise redoes that row
+itself from the full logits; it never returns an approximate result. A finite
+`top_k` of `topk_candidates` or more with `top_p < 1`, and `top_p == 1` with
+`top_k` off, are not served (`logits` mode). Because a failed certificate is
+redone before the next step is enqueued, a step with such a row is
+synchronous: the runner does not pass `defer_read`, and the chain blocker
+reason `device_top_p` stops chaining onto a step that has one. A model that
+receives `top_k` 0 on a deferred step may raise.
+
+**What the runner reads.** `TTModelRunner.load_model` reads both keys from the
+loaded model's `model_capabilities` into `_spec_device_logprobs` and
+`_spec_device_top_p` (absent is `False`). No environment variable and no
+`--additional-config` key is read for either. In chain mode a logprobs row
+chains as any sampled step does (it carries `spec_sampling`, so
+`VLLM_TT_SPEC_CHAIN_SAMPLED=1` is needed); only a logprobs row the model cannot
+serve keeps the `logprobs` chain blocker.
 
 ## 5. One request, from prefill to release
 

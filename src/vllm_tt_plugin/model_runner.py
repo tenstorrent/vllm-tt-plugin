@@ -33,7 +33,6 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 
-from vllm_tt_plugin.scheduler import get_tt_finishing_req_ids
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
@@ -76,16 +75,18 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import get_tt_finishing_req_ids, get_tt_reasoning_start
 from vllm_tt_plugin.spec_accept import (
+    AcceptResult,
     SpecPenalties,
     SpecSamplingInputs,
     SpecTokenFilters,
     accept_sampled_drafts,
-    AcceptResult,
     accept_sampled_support,
     device_topk_enabled,
     fused_sample_enabled,
     fused_sampled_enabled,
+    params_fused_servable,
     params_support_servable,
     predraw_uniforms,
     spec_chain_enabled,
@@ -100,12 +101,16 @@ from vllm_tt_plugin.spec_decode import (
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     DraftOutput,
+    SpecCandidates,
     VerifyOutput,
     accept_greedy_drafts,
 )
+from vllm_tt_plugin.spec_device_logprobs import device_spec_logprobs
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
+    ReasoningPhase,
     capture_structured_decode_request_ids,
+    constrained_bitmask_rows,
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
     scheduled_structured_output_request_ids,
@@ -292,26 +297,58 @@ def _spec_row_params(
 
 
 def fused_spec_sampling(
-    model_input: TTModelInput, plan: Any
+    model_input: TTModelInput,
+    plan: Any,
+    *,
+    vocab_size: int | None = None,
+    device_top_p: bool = False,
 ) -> dict[str, Any] | None:
-    """The ``spec_sampling`` kwarg of a ``fused_sample`` verify, or None for a greedy-only step.
+    """The ``spec_sampling`` kwarg of a ``fused_sample`` verify.
+
+    None for a step with no sampled row and no logprobs row.
 
     Host tensors over the PADDED rows ``B`` of the block (width ``1+K``):
     ``temperature`` fp32 [B] (0 = greedy), ``top_k`` int32 [B] (1 on a
-    greedy row, else 1..M-1), ``top_p`` fp32 [B] (1.0 = off), ``greedy``
+    greedy row, else 1..M-1; with ``device_top_p``, 0 on a sampled row whose
+    top_k is off), ``top_p`` fp32 [B] (1.0 = off), ``greedy``
     bool [B], ``uniforms`` fp32 [B, K+2] (``predraw_uniforms``: column 0
     bonus, 1..K accepts, K+1 correction; zero on padding rows).
     The uniforms are drawn here, from the step's generators and the global
     stream, in the order the host walk draws them, so the walk that
-    ``topk`` mode would have run leaves them where this leaves them."""
+    ``topk`` mode would have run leaves them where this leaves them. A step
+    with no sampled row draws none, as the host walk draws none.
+
+    A step with a logprobs row (``max_num_logprobs``) also carries
+    ``num_logprobs`` int32 [B]: -2 for a row that asked for none and for a
+    padding row, else the row's top-N. The key is absent otherwise, so a
+    step without one is built as before.
+
+    Top_k off is ``vocab_size``: the input batch normalises it. With
+    ``device_top_p`` a sampled row at ``vocab_size`` is sent as 0, the model's
+    "whole vocabulary" for the top-p certificate; ``_spec_mode_for_step`` admits
+    such a row only with top_p below 1, which is checked here again."""
     live = len(model_input.row_req_ids)
     rows, width = (int(size) for size in model_input.input_tokens.shape)
     temperature, top_k, top_p = _spec_row_params(model_input)
     sampled = temperature > 0.0
-    if not bool(sampled.any()):
+    wants_logprobs = model_input.max_num_logprobs[0] is not None
+    if not bool(sampled.any()) and not wants_logprobs:
         return None
     limit = None if plan is None or plan.topk_candidates is None else int(plan.topk_candidates)
-    if limit is None or bool((sampled & ((top_k < 1) | (top_k > limit - 1))).any()):
+    certificate = (
+        sampled & (top_k >= vocab_size)
+        if device_top_p and vocab_size is not None
+        else torch.zeros_like(sampled)
+    )
+    if bool((certificate & (top_p >= 1.0)).any()):
+        raise RuntimeError(
+            "a fused_sample verify carries a sampled row with top_k off and top_p 1; "
+            "_spec_mode_for_step admits such a row only with top_p below 1"
+        )
+    top_k = torch.where(certificate, torch.zeros_like(top_k), top_k)
+    if limit is None or bool(
+        (sampled & ~certificate & ((top_k < 1) | (top_k > limit - 1))).any()
+    ):
         raise RuntimeError(
             "a fused_sample verify carries a sampled row whose top_k is outside "
             f"[1, {limit and limit - 1}]; _spec_mode_for_step admits only support-servable rows"
@@ -321,22 +358,43 @@ def fused_spec_sampling(
         for row, gen in model_input.generators_list[0].items()
         if row < live
     }
-    uniforms = predraw_uniforms(
-        generators, live, width - 1, model_input.num_valid_drafts[:live]
-    )
+    if bool(sampled.any()):
+        uniforms = predraw_uniforms(
+            generators, live, width - 1, model_input.num_valid_drafts[:live]
+        )
+    else:
+        uniforms = torch.zeros((live, width + 1), dtype=torch.float32)
 
     def padded(values: torch.Tensor, fill: Any, dtype: torch.dtype) -> torch.Tensor:
         out = torch.full((rows, *values.shape[1:]), fill, dtype=dtype)
         out[:live] = values
         return out
 
-    return {
+    spec_sampling = {
         "temperature": padded(temperature, 0.0, torch.float32),
         "top_k": padded(torch.where(sampled, top_k, torch.ones_like(top_k)), 1, torch.int32),
         "top_p": padded(torch.where(sampled, top_p, torch.ones_like(top_p)), 1.0, torch.float32),
         "greedy": padded(~sampled, True, torch.bool),
         "uniforms": padded(uniforms, 0.0, torch.float32),
     }
+    if wants_logprobs:
+        per_row = torch.as_tensor(
+            model_input.tt_sampling_params.num_logprobs, dtype=torch.int32
+        ).reshape(-1)
+        if per_row.numel() == 1:
+            per_row = per_row.expand(live)
+        spec_sampling["num_logprobs"] = padded(per_row[:live], -2, torch.int32)
+    return spec_sampling
+
+
+def spec_sampling_has_certificate_row(spec_sampling: dict[str, Any] | None) -> bool:
+    """Whether a ``fused_spec_sampling`` dict carries a top-p certificate row.
+
+    A sampled row sent with ``top_k`` 0. The model decides such a step on a
+    synchronous verify (docs/SPEC_DECODE_CONTRACT.md), so it is never deferred."""
+    if spec_sampling is None:
+        return False
+    return bool(((~spec_sampling["greedy"]) & (spec_sampling["top_k"] <= 0)).any())
 
 
 def _spec_sampling_inputs(
@@ -550,6 +608,12 @@ class TTModelRunner:
         self._spec_accept_modes: tuple[str, ...] = (
             tuple(spec_plan.accept_modes) if spec_plan else ()
         )
+        # The two device capabilities of a ``fused_sample`` model, read from
+        # its ``model_capabilities`` once it is loaded (``load_model``). Absent
+        # means False, so a model that declares neither keeps every step on the
+        # modes it had.
+        self._spec_device_logprobs = False
+        self._spec_device_top_p = False
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -806,6 +870,13 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        self._spec_device_logprobs = bool(
+            capabilities.get("supports_spec_device_logprobs", False)
+        )
+        self._spec_device_top_p = bool(
+            capabilities.get("supports_spec_device_top_p", False)
         )
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
@@ -1213,6 +1284,14 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+        # The scheduler's reasoning start for every structured request this step
+        # schedules; a phase is created from it once, and dropped with its request.
+        starts = self.__dict__.setdefault("_reasoning_starts", {})
+        starts.update(get_tt_reasoning_start(scheduler_output))
+        phases = self.__dict__.setdefault("_reasoning_phases", {})
+        for req_id in scheduler_output.finished_req_ids:
+            starts.pop(req_id, None)
+            phases.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -1795,7 +1874,13 @@ class TTModelRunner:
             return "allowed_token_ids", None
         if batch.sampling.bad_words_token_ids:
             return "bad_words", None
-        if batch.max_num_logprobs is not None:
+        if batch.max_num_logprobs is not None and not all(
+            self._request_is_fused_servable(req_id)
+            for req_id in req_ids
+            if self._request_asks_logprobs(req_id)
+        ):
+            # A logprobs row the model's candidates can answer chains; any
+            # other needs the full logits of a ``logits`` step.
             return "logprobs", None
         if batch.sampling.has_active_logitsprocs():
             return "logitsprocs", None
@@ -1831,6 +1916,10 @@ class TTModelRunner:
         num_valid = torch.tensor([hints[r] for r in order], dtype=torch.int32)
         if self._spec_mode_for_step(order, num_valid) != ACCEPT_MODE_FUSED_SAMPLE:
             return "not_fused", None
+        if any(self._request_is_certificate_row(r) for r in order):
+            # The certificate can fail; the model redoes that step on the host
+            # before the next one is enqueued, so it runs synchronously.
+            return "device_top_p", None
         if not spec_chain_sampled_enabled() and not all(
             self._request_is_argmax_certifiable(r) for r in req_ids
         ):
@@ -1965,8 +2054,69 @@ class TTModelRunner:
             return True
         return self._request_is_argmax_certifiable(req_id)
 
+    def _reasoning_phase(self, req_id: str) -> ReasoningPhase | None:
+        """The up-to-date reasoning phase of a structured request, or None.
+
+        None when the scheduler sent no start for the request (a scheduler that
+        is not ``TTScheduler``, or a merged lane step): the caller then keeps
+        the request on the logits path, which is always exact. The phase is
+        created from the scheduler's start the first time it is asked for, and
+        scans the request's committed output on every ask, so it is exact as
+        long as the previous step's commit is applied before the build, which a
+        structured row guarantees (the ``grammar`` chain blocker keeps it out
+        of any chain, and a non-chained verify drains the one before it).
+        """
+        phases = self.__dict__.setdefault("_reasoning_phases", {})
+        phase = phases.get(req_id)
+        if phase is None:
+            start = self.__dict__.get("_reasoning_starts", {}).get(req_id)
+            if start is None:
+                return None
+            phase = phases[req_id] = ReasoningPhase.from_scheduler(start)
+        req_state = getattr(self, "requests", {}).get(req_id)
+        if req_state is not None:
+            phase.observe(req_state.output_token_ids)
+        return phase
+
+    def _grammar_fused_rows(
+        self, row_req_ids: list[str], spec_drafts: Any, num_valid_drafts: Any
+    ) -> frozenset[str]:
+        """Structured rows this step can serve like ordinary rows.
+
+        vLLM applies no grammar to a request until its reasoning ends: every
+        bitmask row up to and including the first reasoning-end token is all
+        ones. A commit is the accepted drafts plus one final token, so a token
+        can follow a reasoning-end token only if that end token is a draft.
+        A row whose phase is open and whose valid drafts hold no end id
+        therefore commits nothing the grammar governs, and the fused verify
+        (which applies no bitmask) is exact for it. Every other structured row
+        (phase ended, thinking off, ``include_reasoning=false``, an end id among
+        the drafts, drafts unknown) keeps today's rule: the step asks for
+        ``logits`` and the scheduler's bitmask applies. The end token can still
+        be the row's last committed token; the next build then sees the phase
+        ended.
+        """
+        if spec_drafts is None or num_valid_drafts is None:
+            return frozenset()
+        safe: set[str] = set()
+        for row, req_id in enumerate(row_req_ids):
+            req_state = getattr(self, "requests", {}).get(req_id)
+            params = getattr(req_state, "sampling_params", None)
+            if params is None or params.structured_outputs is None:
+                continue
+            phase = TTModelRunner._reasoning_phase(self, req_id)
+            if phase is None:
+                continue
+            valid = int(num_valid_drafts[row])
+            if phase.fused_safe([int(t) for t in spec_drafts[row, :valid]]):
+                safe.add(req_id)
+        return frozenset(safe)
+
     def _spec_mode_for_step(
-        self, row_req_ids: list[str], num_valid_drafts: Any = None
+        self,
+        row_req_ids: list[str],
+        num_valid_drafts: Any = None,
+        spec_drafts: Any = None,
     ) -> str:
         """The accept mode one verify asks for, from the rows it carries.
 
@@ -1979,16 +2129,38 @@ class TTModelRunner:
         VLLM_TT_SPEC_DEVICE_TOPK) when every row is either certifiable or
         support-servable (``_request_is_support_servable``): it reads back
         ``[B, 1+K, M]`` candidates and commits what ``logits`` would.
+
+        A structured row makes the step ``logits`` (the walk applies its
+        bitmask) except while its reasoning phase is open and none of this
+        step's drafts is a reasoning-end id (``_grammar_fused_rows``): vLLM
+        does not constrain such a row, and no token of the step can follow an
+        end token. ``spec_drafts`` and ``num_valid_drafts`` are what that test
+        reads; without them every structured row asks for logits.
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
-        certifiable = [self._request_is_argmax_certifiable(r) for r in row_req_ids]
-        support_ok = (
-            ACCEPT_MODE_TOPK in modes
-            and device_topk_enabled()
-            and all(
-                ok or self._request_is_support_servable(req_id)
-                for ok, req_id in zip(certifiable, row_req_ids)
+        # Called unbound: runner doubles in the host tests are namespaces.
+        grammar_ok = TTModelRunner._grammar_fused_rows(
+            self, row_req_ids, spec_drafts, num_valid_drafts
+        )
+        certifiable = [
+            self._request_is_argmax_certifiable(r, grammar_ok=r in grammar_ok)
+            for r in row_req_ids
+        ]
+        topk_offered = ACCEPT_MODE_TOPK in modes and device_topk_enabled()
+        support_ok = topk_offered and all(
+            ok
+            or self._request_is_support_servable(
+                req_id, grammar_ok=req_id in grammar_ok
             )
+            for ok, req_id in zip(certifiable, row_req_ids)
+        )
+        # What the fused mode can serve: the ``topk`` rule widened by the
+        # model's device logprobs and top-p capabilities. Both off, it is
+        # ``support_ok``.
+        fused_ok = topk_offered and all(
+            ok
+            or self._request_is_fused_servable(req_id, grammar_ok=req_id in grammar_ok)
+            for ok, req_id in zip(certifiable, row_req_ids)
         )
         if ACCEPT_MODE_FUSED_SAMPLE in modes and fused_sample_enabled():
             if all(certifiable):
@@ -1996,11 +2168,13 @@ class TTModelRunner:
                 # and the runner reads back ids and counts.
                 return ACCEPT_MODE_FUSED_SAMPLE
             if (
-                # Stage S2: sampled rows on the same support rule as ``topk``.
-                # The runner draws the uniforms (``fused_spec_sampling``); a
-                # seeded row with no draft needs the full-vocabulary race.
+                # Stage S2: sampled rows on the ``topk`` support rule, plus
+                # logprobs and top-p rows when the model declares them
+                # (``_request_is_fused_servable``). The runner draws the
+                # uniforms (``fused_spec_sampling``); a seeded row with no
+                # draft needs the full-vocabulary race.
                 fused_sampled_enabled()
-                and support_ok
+                and fused_ok
                 and not self._seeded_row_without_drafts(row_req_ids, num_valid_drafts)
             ):
                 return ACCEPT_MODE_FUSED_SAMPLE
@@ -2031,7 +2205,9 @@ class TTModelRunner:
                 return True
         return False
 
-    def _request_is_support_servable(self, req_id: str) -> bool:
+    def _request_is_support_servable(
+        self, req_id: str, *, grammar_ok: bool = False
+    ) -> bool:
         """True when a ``topk`` verify's candidates can sample this request.
 
         The penalties are read off the batch's sets, as the greedy gate reads
@@ -2055,10 +2231,78 @@ class TTModelRunner:
         if params is None:
             return False
         return params_support_servable(
-            params, len(req_state.output_token_ids), plan.topk_candidates
+            params,
+            len(req_state.output_token_ids),
+            plan.topk_candidates,
+            grammar_ok=grammar_ok,
         )
 
-    def _request_is_argmax_certifiable(self, req_id: str) -> bool:
+    def _request_is_fused_servable(
+        self, req_id: str, *, grammar_ok: bool = False
+    ) -> bool:
+        """True when a ``fused_sample`` step can carry this request.
+
+        ``_request_is_support_servable`` plus what the model declares:
+        logprobs of 0..``MAX_DEVICE_LOGPROBS`` with ``supports_spec_device_logprobs``
+        (and only under vLLM's ``raw_logprobs`` mode, the one the candidates
+        answer), and top_k off with top_p below 1 with
+        ``supports_spec_device_top_p``. The penalties are read off the batch
+        as for the other gates.
+        """
+        plan = getattr(self, "_spec_plan", None)
+        if plan is None or plan.topk_candidates is None:
+            return False
+        batch = self.input_batch
+        for attr in (
+            "presence_penalties_reqs",
+            "frequency_penalties_reqs",
+            "repetition_penalties_reqs",
+        ):
+            if req_id in getattr(batch, attr, ()):
+                return False
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        if params is None:
+            return False
+        device_logprobs = getattr(self, "_spec_device_logprobs", False) and (
+            getattr(self.model_config, "logprobs_mode", None) == "raw_logprobs"
+        )
+        return params_fused_servable(
+            params,
+            len(req_state.output_token_ids),
+            plan.topk_candidates,
+            int(self.vocab_size),
+            device_logprobs=device_logprobs,
+            device_top_p=getattr(self, "_spec_device_top_p", False),
+            grammar_ok=grammar_ok,
+        )
+
+    def _request_asks_logprobs(self, req_id: str) -> bool:
+        """True when this request asked for logprobs."""
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        return params is not None and params.logprobs is not None
+
+    def _request_is_certificate_row(self, req_id: str) -> bool:
+        """True when a ``fused_sample`` step samples this request by certificate.
+
+        A sampled request with top_k off and top_p below 1, on a model
+        declaring ``supports_spec_device_top_p``: ``fused_spec_sampling`` sends
+        it with top_k 0, and the step must be synchronous."""
+        if not getattr(self, "_spec_device_top_p", False):
+            return False
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        if params is None or float(params.temperature) < 1e-5:
+            return False
+        return (
+            not 0 < int(params.top_k) < int(self.vocab_size)
+            and float(params.top_p) < 1.0
+        )
+
+    def _request_is_argmax_certifiable(
+        self, req_id: str, *, grammar_ok: bool = False
+    ) -> bool:
         """False when this request's sampling cannot be certified by id equality.
 
         ``accept_greedy_drafts`` compares token ids, so it can only certify a
@@ -2096,7 +2340,7 @@ class TTModelRunner:
             return True
         return not (
             params.logprobs is not None
-            or params.structured_outputs is not None
+            or (params.structured_outputs is not None and not grammar_ok)
             or bool(params.allowed_token_ids)
             or bool(params.bad_words_token_ids)
             or (
@@ -2701,7 +2945,7 @@ class TTModelRunner:
                     len(row_req_ids),
                 ):
                     spec_mode = self._spec_mode_for_step(
-                        row_req_ids, num_valid_drafts
+                        row_req_ids, num_valid_drafts, spec_drafts
                     )
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
@@ -2902,6 +3146,27 @@ class TTModelRunner:
                 expected_structured_output_request_ids=structured_output_req_ids,
             )
 
+        # A fused verify applies no bitmask. It is chosen for a structured row
+        # only when the step commits no token the grammar governs
+        # (``_grammar_fused_rows``), so such a step is an ordinary step for
+        # the sampling-route decisions below: grammar must not push it to host
+        # sampling or to deferred device sampling, as it does a logits step.
+        grammar_free_step = False
+        grammar_fused_rows: frozenset[str] = frozenset()
+        if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            grammar_fused_rows = TTModelRunner._grammar_fused_rows(
+                self, row_req_ids, spec_drafts, num_valid_drafts
+            )
+        if spec_mode == ACCEPT_MODE_FUSED_SAMPLE and has_scheduled_structured:
+            unserved = scheduled_structured_req_ids - grammar_fused_rows
+            if unserved:
+                raise RuntimeError(
+                    "a fused_sample verify carries structured-output requests "
+                    f"{sorted(unserved)} whose reasoning phase does not allow it; "
+                    "_spec_mode_for_step asks for logits for such a row"
+                )
+            grammar_free_step = True
+            has_structured = False
         perform_device_sampling = self.check_perform_device_sampling(
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
@@ -2920,14 +3185,22 @@ class TTModelRunner:
         # from the rows' own generators, as the host walks do.
         if spec_mode in (ACCEPT_MODE_LOGITS, ACCEPT_MODE_TOPK) or (
             spec_mode == ACCEPT_MODE_FUSED_SAMPLE
-            and not all(self._request_is_argmax_certifiable(r) for r in row_req_ids)
+            and not all(
+                self._request_is_argmax_certifiable(
+                    r, grammar_ok=r in grammar_fused_rows
+                )
+                for r in row_req_ids
+            )
         ):
             # The host walk samples from the logits (or the top-k support)
             # this verify returns, so the model must not sample on device, and
             # the rows' generators have to be the requests' own.
             perform_device_sampling = False
         defer_device_sampling = (
-            perform_device_sampling and has_scheduled_structured and not is_prompt
+            perform_device_sampling
+            and has_scheduled_structured
+            and not is_prompt
+            and not grammar_free_step
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
@@ -3045,7 +3318,13 @@ class TTModelRunner:
             }
             self._grammar_draft_handoff = {}
             self._grammar_handed_over_req_ids = set()
-            if spec_drafts is not None and self.async_decode_scheduling:
+            if (
+                spec_drafts is not None
+                and self.async_decode_scheduling
+                # A fused step reads no bitmask, so the scheduler has no use
+                # for its drafts.
+                and spec_mode != ACCEPT_MODE_FUSED_SAMPLE
+            ):
                 self._grammar_draft_handoff = self._structured_drafts(
                     row_req_ids, spec_drafts, num_valid_drafts
                 )
@@ -3580,12 +3859,45 @@ class TTModelRunner:
         lane_total: int | None,
     ) -> TTModelInput:
         """Return ``model_input`` with the sample-time grammar bitmask attached."""
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            self._check_grammar_free_step(model_input, grammar_output, lane_total)
+            return model_input
         bitmask = self._reorder_grammar_bitmask(
             grammar_output, model_input, lane_total=lane_total
         )
         if bitmask is None:
             return model_input
         return replace(model_input, grammar_bitmask=[bitmask])
+
+    def _check_grammar_free_step(
+        self,
+        model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
+        lane_total: int | None,
+    ) -> None:
+        """Refuse a fused verify whose scheduler bitmask constrains any token.
+
+        A fused verify is built for a structured row only while the scheduler
+        also holds that row's reasoning phase open, and for such a row vLLM
+        writes all-ones bitmask rows. A cleared bit therefore means this
+        worker and the scheduler disagree about the phase, and the step has
+        already committed tokens without the mask. Raised rather than
+        ignored: the scheduler would fail the request on the first token the
+        grammar rejects, with no hint why.
+        """
+        bitmask = self._reorder_grammar_bitmask(
+            grammar_output, model_input, lane_total=lane_total, require_complete=False
+        )
+        if bitmask is None:
+            return
+        offenders = constrained_bitmask_rows(bitmask, model_input.grammar_row_req_ids)
+        if offenders:
+            raise RuntimeError(
+                "a fused_sample verify was built for structured-output requests "
+                f"{offenders}, but the scheduler's grammar bitmask constrains "
+                "their tokens: the worker held their reasoning phase open and the "
+                "scheduler did not"
+            )
 
     def _finish_async_decode(
         self,
@@ -3603,6 +3915,12 @@ class TTModelRunner:
         grammar output; it stays unrestricted here and late-output suppression
         discards its sampled token.
         """
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            # No bitmask is attached: the fused walk reads none, and attaching
+            # one would also zero the step's valid-draft counts
+            # (``_grammar_validated_drafts``), which the step's commit reads.
+            self._check_grammar_free_step(model_input, grammar_output, lane_total)
+            return wrapper
         bitmask = self._reorder_grammar_bitmask(
             grammar_output,
             model_input,
@@ -3748,18 +4066,27 @@ class TTModelRunner:
         passed on. A padding row comes back with count 1 and its column-0
         argmax, as the ``argmax_ids`` walk commits it. Sampled rows (stage S2)
         were accepted on the device from the uniforms ``fused_spec_sampling``
-        drew; neither stage serves logprobs.
+        drew.
+
+        A step with a logprobs row needs the model's ``SpecCandidates``
+        (``supports_spec_device_logprobs``): its logprobs are built from them
+        (``device_spec_logprobs``) for every live row's committed columns, the
+        layout ``accept_sampled_drafts`` gives, and cut to the published
+        prefixes by ``spec_committed_logprobs`` as any walk's. A step that
+        asked and got no candidates fails here; there is no silent fallback.
         """
         if not isinstance(out, VerifyOutput) or out.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
             raise TypeError(
                 "a verify in fused_sample mode must reach the walk as its "
                 f"VerifyOutput, got {type(out).__name__}"
             )
-        if model_input.max_num_logprobs[0] is not None:
+        num_logprobs = model_input.max_num_logprobs[0]
+        if num_logprobs is not None and out.candidates is None:
             raise RuntimeError(
-                "a fused_sample verify carries a row that asked for logprobs, "
-                "which it cannot answer; _spec_mode_for_step asks for fused_sample "
-                "only when every row is greedy-certifiable"
+                "a fused_sample verify carries a row that asked for logprobs but "
+                "the model returned no candidates; _spec_mode_for_step asks for "
+                "fused_sample with such a row only from a model declaring "
+                "supports_spec_device_logprobs, which returns them"
             )
         rows, max_width = (int(size) for size in model_input.input_tokens.shape)
         committed, counts = out.accepted_token_ids, out.accepted_counts
@@ -3793,7 +4120,40 @@ class TTModelRunner:
                 f"({rows},), got {tuple(counts.shape)}"
             )
         result = AcceptResult(committed, counts)
-        return SpecWalk(result.committed_token_ids, result.accepted_counts, None)
+        logprobs = None
+        if num_logprobs is not None:
+            candidates = out.candidates
+            if tuple(candidates.ids.shape[:2]) != tuple(committed.shape):
+                raise ValueError(
+                    "a fused_sample verify must return candidates of shape "
+                    f"[{rows}, {int(committed.shape[1])}, M]: every submitted row "
+                    "and every committed column. Got "
+                    f"{tuple(candidates.ids.shape)}"
+                )
+            live = len(model_input.row_req_ids)
+            logprobs = device_spec_logprobs(
+                SpecCandidates(
+                    ids=candidates.ids[:live],
+                    values=candidates.values[:live],
+                    lse=candidates.lse[:live],
+                ),
+                result.committed_token_ids[:live],
+                result.accepted_counts[:live],
+                num_logprobs,
+                self._rows_asking_logprobs(model_input),
+            )
+        return SpecWalk(result.committed_token_ids, result.accepted_counts, logprobs)
+
+    @staticmethod
+    def _rows_asking_logprobs(model_input: TTModelInput) -> torch.Tensor:
+        """``[live]`` bool: which live rows of the step asked for logprobs."""
+        live = len(model_input.row_req_ids)
+        per_row = torch.as_tensor(
+            model_input.tt_sampling_params.num_logprobs, dtype=torch.int32
+        ).reshape(-1)
+        if per_row.numel() == 1:
+            per_row = per_row.expand(live)
+        return per_row[:live] >= 0
 
     def _walk_sampled_acceptance(
         self, model_input: TTModelInput, logits: Any

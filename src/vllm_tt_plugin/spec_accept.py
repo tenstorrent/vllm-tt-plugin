@@ -77,7 +77,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.spec_decode import MAX_DEVICE_LOGPROBS, PLACEHOLDER_TOKEN_ID
 
 if TYPE_CHECKING:
     from vllm.v1.outputs import LogprobsTensors
@@ -600,7 +600,9 @@ def accept_sampled_support(
     return _commit_walks(is_greedy, greedy, random, num_valid_drafts, rows, width)
 
 
-def params_support_servable(params: Any, output_len: int, candidates: int) -> bool:
+def params_support_servable(
+    params: Any, output_len: int, candidates: int, *, grammar_ok: bool = False
+) -> bool:
     """Whether a request can be sampled from a top-``candidates`` support alone.
 
     Read off the request's vLLM ``SamplingParams`` and its committed output
@@ -617,19 +619,80 @@ def params_support_servable(params: Any, output_len: int, candidates: int) -> bo
     gate, before asking here. ``min_p`` is not read: vLLM refuses a min_p above
     1e-5 on a speculating launch and the ordinary sampler ignores a smaller
     one, so neither walk applies it (``_spec_sampling_inputs``).
+
+    ``grammar_ok`` says the step commits no token the grammar governs (a
+    structured row inside its open reasoning phase, with no reasoning-end id
+    among its drafts; ``TTModelRunner._grammar_fused_rows``), so structured
+    output no longer rules the row out.
     """
     # vLLM's SamplingParams resets top_k to 0 for a greedy request (temperature
     # below its _SAMPLING_EPS of 1e-5), and a greedy row needs no support.
     greedy = float(params.temperature) < 1e-5
     if not greedy and not 1 <= int(params.top_k) <= candidates - 1:
         return False
+    return params.logprobs is None and _controls_servable(
+        params, output_len, grammar_ok
+    )
+
+
+def _controls_servable(params: Any, output_len: int, grammar_ok: bool) -> bool:
+    """False for a control that masks tokens outside any top-candidates support:
+    structured output (unless ``grammar_ok``), ``allowed_token_ids``,
+    ``bad_words`` and a ``min_tokens`` the output has not reached yet."""
     return not (
-        params.logprobs is not None
-        or params.structured_outputs is not None
+        (params.structured_outputs is not None and not grammar_ok)
         or bool(params.allowed_token_ids)
         or bool(params.bad_words_token_ids)
         or (params.min_tokens > output_len and bool(params.all_stop_token_ids))
     )
+
+
+def params_fused_servable(
+    params: Any,
+    output_len: int,
+    candidates: int,
+    vocab_size: int,
+    *,
+    device_logprobs: bool = False,
+    device_top_p: bool = False,
+    grammar_ok: bool = False,
+) -> bool:
+    """Whether a ``fused_sample`` step can carry this sampled or logprobs request.
+
+    ``params_support_servable`` widened by the two model capabilities, for
+    ``TTModelRunner._spec_mode_for_step``. With both flags off it answers as
+    ``params_support_servable`` does. A request is servable when:
+
+    - it is greedy, or its top_k is in ``[1, candidates - 1]``, or (with
+      ``device_top_p``) its top_k is off and its top_p is below 1. Off means
+      ``top_k <= 0`` or ``top_k >= vocab_size``, which the input batch
+      normalises to ``vocab_size``. The model then samples the full-vocabulary
+      nucleus from the top ``candidates`` under its certificate
+      (docs/SPEC_DECODE_CONTRACT.md); a finite top_k of ``candidates`` or more
+      with top_p below 1 renormalises over a set the model cannot size, so it
+      is not served;
+    - ``logprobs`` is None, or (with ``device_logprobs``) in
+      ``[0, MAX_DEVICE_LOGPROBS]``: ``-1`` (the whole vocabulary) and larger
+      counts are not served;
+    - no other control masks tokens outside the candidates (``grammar_ok`` as
+      for ``params_support_servable``).
+
+    The penalties and the global ``logprobs_mode`` are not read here: the
+    runner reads them off its batch and its model config.
+    """
+    greedy = float(params.temperature) < 1e-5
+    if not greedy:
+        top_k = int(params.top_k)
+        if 0 < top_k < vocab_size:
+            if top_k > candidates - 1:
+                return False
+        elif not (device_top_p and float(params.top_p) < 1.0):
+            return False
+    if params.logprobs is not None and not (
+        device_logprobs and 0 <= int(params.logprobs) <= MAX_DEVICE_LOGPROBS
+    ):
+        return False
+    return _controls_servable(params, output_len, grammar_ok)
 
 
 def device_topk_enabled() -> bool:
@@ -1979,5 +2042,6 @@ __all__ = [
     "apply_speculative_token_filters",
     "committed_logprobs",
     "device_topk_enabled",
+    "params_fused_servable",
     "params_support_servable",
 ]

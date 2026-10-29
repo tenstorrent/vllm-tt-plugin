@@ -37,6 +37,7 @@ from vllm_tt_plugin.spec_decode import (
     FusedReadout,
     VerifyOutput,
 )
+from vllm_tt_plugin.spec_device_logprobs import device_logprob_stats
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
@@ -1029,7 +1030,7 @@ class TTAsyncDecodeController:
                 "%d verify in topk mode, %d verify in fused mode; "
                 "topk fallback: %d/%d positions overflow, %d fetches in %d support steps"
                 "; real drafts: %d valid, %d accepted over %d verify rows"
-                "%s",
+                "%s%s",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
@@ -1044,7 +1045,20 @@ class TTAsyncDecodeController:
                 self._accepted_drafts,
                 self._verify_rows,
                 self._chain_report(),
+                self._device_logprobs_report(),
             )
+
+    @staticmethod
+    def _device_logprobs_report() -> str:
+        """Device-logprob counters for the submission line (empty before step 1)."""
+        stats = device_logprob_stats()
+        if not stats["steps"]:
+            return ""
+        return (
+            f"; device logprobs: {stats['steps']} steps, "
+            f"{stats['rank_lower_bound']} rank lower bounds, "
+            f"{stats['missing_id']} missing ids"
+        )
 
     def _chain_report(self) -> str:
         """The chain counters for the submission line, empty when chaining is off."""
@@ -1752,10 +1766,16 @@ class TTAsyncDecodeController:
             # Stage S2: a fused step with a sampled row carries the controls and
             # the pre-drawn uniforms the device accepts with. None (nothing
             # sent) for a greedy-only step, which is stage S1.
-            from vllm_tt_plugin.model_runner import fused_spec_sampling
+            from vllm_tt_plugin.model_runner import (
+                fused_spec_sampling,
+                spec_sampling_has_certificate_row,
+            )
 
             spec_sampling = fused_spec_sampling(
-                model_input, getattr(runner, "_spec_plan", None)
+                model_input,
+                getattr(runner, "_spec_plan", None),
+                vocab_size=getattr(runner, "vocab_size", None),
+                device_top_p=getattr(runner, "_spec_device_top_p", False),
             )
             if spec_sampling is not None:
                 kwargs["spec_sampling"] = spec_sampling
@@ -1763,8 +1783,16 @@ class TTAsyncDecodeController:
                 async_read
                 and self.chain_enabled()
                 # A sampled step stays synchronous (stage S2, host overflow
-                # redo) until deferred steps handle sampled overflow.
-                and (spec_sampling is None or spec_chain_sampled_enabled())
+                # redo) until deferred steps handle sampled overflow. A
+                # certificate row (top_k 0) can fail and be redone on the
+                # host, so it stays synchronous even when sampled steps chain.
+                and (
+                    spec_sampling is None
+                    or (
+                        spec_chain_sampled_enabled()
+                        and not spec_sampling_has_certificate_row(spec_sampling)
+                    )
+                )
             ):
                 # Chain mode: enqueue only, the reader thread waits on the
                 # returned handle. Sent on every fused step, not only a chained
@@ -2013,7 +2041,8 @@ class TTAsyncDecodeController:
         the step's device event and returns ``FusedReadout`` (or the 3-tuple
         ``(accepted_token_ids, accepted_counts, p0)``). Touches no runner
         state. The result is the verify's ``VerifyOutput`` with its host fields
-        filled in, which the walk reads as it reads any fused verify, plus the
+        filled in (including the logprob ``candidates``, when the readout has
+        them), which the walk reads as it reads any fused verify, plus the
         device's ``p0``.
         """
         runner = self.runner
@@ -2021,8 +2050,10 @@ class TTAsyncDecodeController:
         handle = verify.handle
         reader = getattr(runner.model, "read_decode_output", None)
         raw = reader(handle) if reader is not None else handle.wait()
+        candidates = None
         if isinstance(raw, FusedReadout):
             ids, counts, p0 = raw.accepted_token_ids, raw.accepted_counts, raw.p0
+            candidates = raw.candidates
         elif isinstance(raw, (tuple, list)) and len(raw) == 3:
             ids, counts, p0 = raw
         else:
@@ -2042,6 +2073,7 @@ class TTAsyncDecodeController:
             accepted_counts=counts,
             hidden=verify.hidden,
             handle=handle,
+            candidates=candidates,
         )
         return TTFinalizedDecode(tt_out=out, tt_log_probs=None, p0=p0)
 
