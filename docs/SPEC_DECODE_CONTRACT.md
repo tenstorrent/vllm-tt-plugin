@@ -1,3 +1,52 @@
+**Chain mode.** A masked step chains like any fused step, and is a chain tip once
+its finish is called. A step chained on the step before it (`chain_rows` set) is
+begun before that step is read, so its drafts are on the device only. That adds two
+items to the `supports_spec_device_mask` contract, both optional elsewhere:
+
+- `decode_forward_begin(..., chain_rows=None, chain_tip=None)`, as above;
+- `FusedHandle.drafts()` -> int32 `[B, K]` in runner slots: the drafts the next
+  chained step verifies (the host view of the drafter output the reader already
+  parsed). The adapter puts it in `FusedReadout.drafts` (optional, int32 `[B, K]`,
+  rows equal to `accepted_counts` rows; a plain 3-tuple readout has none).
+
+The reader thread keeps, per tip, a record of the drafts and of each row's
+committed prefix (`ChainResolved`, written under a lock by whichever thread
+resolves the step, before its output is returned). A chained masked build:
+
+- makes every structured row a grammar row (no "reasoning row": the drafts are
+  unknown at build, and the scheduler's rows are all ones up to the end token), so
+  a thinking-only batch gives all-ones rows, `step_mask` returns None and
+  `decode_forward_finish(handle, None)` runs with no mask trace;
+- records `(chain_tip, {request: hint})` for the structured rows
+  (`runner._chain_handoff`); `take_draft_token_ids` then hands over
+  `drafts[row][:hint]` from the tip's record, waiting for the step when the reader
+  has not resolved it (exactly once). The scheduler cuts and pads them as for any
+  draft. A structured row with hint above 0 that the scheduler constrains and that
+  was not handed over raises at `sample_tokens`; a row the scheduler no longer
+  holds is unconstrained;
+- builds the non-grammar part at `sample_tokens` from the output as it is once the
+  step before has committed (`commit_view`: the applied output plus that step's
+  committed prefix; a pure read) and the device drafts. It waits for the step
+  before (`wait_resolved`) only when that part depends on its commit: a pending
+  `min_tokens`, or a bad word of more than one token. `allowed_token_ids` and
+  one-token bad words need no wait.
+
+Chain blockers with the capability: `grammar`, `allowed_token_ids`, `bad_words`
+and `min_tokens` are no blockers (the `min_tokens` processor is ignored in the
+`logitsprocs` check; `min_p` and `logit_bias` still block). Kept: penalties and
+their state rules, `logprobs`, `real_drafts`, `device_top_p` (a certificate step is
+synchronous), `grammar_with_controls` (a live grammar row with any other control)
+and `logprobs_with_controls` (reported as `logprobs`). New: `no_device_drafts`
+(until a fused readout carried `drafts`, and again after one that did not), and
+`mask_empty_risk` (the worst-case static row, with `min_tokens` pending at build,
+every one-token bad word and the last token of every longer one banned and the
+allowed ids applied, can allow no token). A row that is empty at sample time
+anyway raises, naming the request. With the capability absent every blocker is as
+it was. `device_mask_stats()` adds `chained` (chained masked steps), `late`
+(masks that reached the device after its forward ended, written by the server
+bench) and `waits`; the submission line prints them after "device masks" when one
+is above 0.
+
 # Speculative decoding: what a tt-metal model must implement
 
 This is the model-side contract the plugin admits against. A tt-metal model
@@ -1198,7 +1247,7 @@ chained onto the pending one also carries:
 
 The reader thread calls `model.read_decode_output(handle)` (or `handle.wait()`),
 which blocks on a device event and returns `FusedReadout(accepted_token_ids,
-accepted_counts, p0)` (plus `candidates` for a step with a logprobs row, section 4k) or the plain 3-tuple. `p0` is `[B]` int32, the actual position
+accepted_counts, p0)` (plus `candidates` for a step with a logprobs row, section 4k, and `drafts` for a model that declares `supports_spec_device_mask`, section 4m) or the plain 3-tuple. `p0` is `[B]` int32, the actual position
 of each row's column 0; the committed-prefix length cap uses it, not the
 provisional position. `propose_draft_tokens(..., hidden=handle)` runs later on
 the engine thread, after the read, once per step, and returns `num_valid`; for
@@ -1207,7 +1256,7 @@ reads only `num_valid` and publishes a length hint, never ids.
 
 The runner chains only when exactly one verify is unresolved and it is the
 newest fused step; the scheduled requests are its rows less the finished ones;
-no prefill chunk, forced reset, grammar, penalties or allowlist, and no logprobs row the model cannot serve (section 4k); every
+no prefill chunk, forced reset, grammar, penalties or allowlist (with `supports_spec_device_mask` the grammar, allowlist, bad words and `min_tokens` are served by the token mask, section 4m), and no logprobs row the model cannot serve (section 4k); every
 row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
@@ -1430,10 +1479,13 @@ one (it raises first, naming the request). A request the grammar output leaves o
 1. `execute_model` builds the step and calls `decode_forward_begin(**kwargs)`,
    with the arguments of a `fused_sample` `decode_forward`, except that
    `spec_sampling` is required (it is the sampled step's dict, with no `mask`
-   key; a greedy-only masked step sends greedy rows and no draws) and that
-   `chain_rows` and `chain_tip` are absent. It enqueues the forward and returns
-   `VerifyOutput(spec_mode="fused_sample", handle=<pending handle>)`. `defer_read`
-   means what it means for `decode_forward`.
+   key; a greedy-only masked step sends greedy rows and no draws). It enqueues
+   the forward and returns `VerifyOutput(spec_mode="fused_sample", handle=<pending
+   handle>)`. `defer_read` means what it means for `decode_forward`. `chain_rows`
+   and `chain_tip` mean what they mean for `decode_forward` (section 4j) and need
+   `defer_read=True`: a chained begin enqueues the chain trace and the forward
+   only, and `decode_forward_finish` enqueues the rest. The pending handle of a
+   deferred begin carries its `tip_id` (the forward is queued).
 2. `sample_tokens(grammar_output)` composes the mask and calls
    `decode_forward_finish(tt_out, mask)`, with the first call's return value. The
    model enqueues the rest of the step. With `defer_read` it returns
@@ -1442,7 +1494,8 @@ one (it raises first, naming the request). A request the grammar output leaves o
 
 A step with only `allowed_token_ids`, `bad_words` or `min_tokens` rows has no
 grammar output: vLLM calls `sample_tokens` at once and the finish follows the
-begin. Nothing else may reach the model between the two calls (no second begin,
+begin (a chained one waits there for the step before only when its static part
+depends on that step's commit, see Chain mode). Nothing else may reach the model between the two calls (no second begin,
 no `decode_forward`, no prefill), and the reader thread must not wait on the
 handle before the finish: the plugin keeps the step's submission pending
 (`TTDecodeSubmission.mask_pending`) and raises on any read of it. A step with no
@@ -1459,6 +1512,12 @@ execute_model                          sample_tokens(grammar_output)
   scheduler: bitmask from those drafts   return the wrapper (reader thread reads)
 ```
 
+The finish of step N+1 is called before the begin of step N+2: the chain trace of
+N+2 rewrites the token buffer and the packed aux that N+1's accept reads. The
+model raises on a begin while a split step is pending, and the plugin raises in
+`execute_model` while a masked submission is pending (`chain_evaluate` gives the
+reason `mask_pending` meanwhile).
+
 **Greedy rows.** A greedy row is sent greedy. The model rewrites a greedy row that
 has a constrained mask row as a sampled row (temperature 1, `top_k` 1, `top_p` 0)
 when it learns the mask, because the argmax of the main trace is not masked. The
@@ -1468,7 +1527,8 @@ sent as sampled, is the plugin's own and happens before).
 **Drafts and the scheduler.** The scheduler fills grammar rows `1..K` from the
 drafts the worker hands over (`take_draft_token_ids`, called while the step is
 pending). For a masked step with a grammar row the runner hands over the drafts
-the step verifies, which are the ones in the begin call; a draft the grammar
+the step verifies, which are the ones in the begin call (for a chained step, the
+device drafts of the step before it: see Chain mode); a draft the grammar
 refuses is cut by the scheduler, padded with -1, and the walk rejects it on the
 device (its row disallows it). Rows after it are all ones and never examined.
 

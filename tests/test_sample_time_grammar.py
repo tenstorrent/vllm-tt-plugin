@@ -151,6 +151,7 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens():
     async_decode = SimpleNamespace(
         can_attempt_steady_decode_from_scheduler=lambda _output: False,
         must_drain_pending_async_steps=lambda *_args: False,
+        mask_pending=lambda: False,
         wait_for_all_pending_async_steps=lambda: events.append("drain"),
         submit_async_decode=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("structured device sampling must not use async overlap")

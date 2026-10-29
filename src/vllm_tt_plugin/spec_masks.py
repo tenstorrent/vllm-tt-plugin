@@ -26,6 +26,12 @@ which only the sample-time ``GrammarOutput`` has) and ``compose_step_mask``
 (AND of the grammar rows into it) follows the step flow: ``execute_model``
 enqueues the forward, ``sample_tokens`` composes the mask and finishes the step.
 
+A step chained on the step before it (``deferred_mask_plan``) is begun before
+that step is read, so its non-grammar part cannot be built at build time:
+``resolve_deferred_plan`` builds it at sample time, from the output as it is
+once the step before has committed (``TTAsyncDecodeController.commit_view``) and
+the drafts that step reported.
+
 The counters are module-level, like ``spec_device_penalties``, because the
 submission line reads them from the controller.
 """
@@ -33,8 +39,8 @@ submission line reads them from the controller.
 from __future__ import annotations
 
 import threading
-from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -210,11 +216,24 @@ class SpecMaskPlan:
     are the live rows whose scheduler bitmask rows apply (a structured request
     whose grammar can constrain this step). ``reasoning_rows`` are structured
     rows that stay inside their open reasoning phase: the scheduler holds all
-    ones for them, which ``TTModelRunner._spec_step_mask`` checks."""
+    ones for them, which ``TTModelRunner._spec_step_mask`` checks.
 
-    static: StaticMasks
+    A step chained on the step before it has ``deferred`` True and ``static``
+    None (``deferred_mask_plan``): every structured row is a grammar row, and
+    ``resolve_deferred_plan`` builds ``static`` at sample time. ``tip`` is the
+    step chained on and ``hints`` each live row's draft count, in row order.
+    ``static_rows`` are the rows with a non-grammar control at build time, and
+    ``needs_wait`` says that building them needs the step before resolved (a
+    ``min_tokens`` still pending, or a bad word of more than one token)."""
+
+    static: StaticMasks | None
     grammar_rows: tuple[int, ...] = ()
     reasoning_rows: tuple[int, ...] = ()
+    deferred: bool = False
+    tip: int | None = None
+    hints: tuple[int, ...] = ()
+    static_rows: tuple[int, ...] = ()
+    needs_wait: bool = False
 
 
 def static_masks(
@@ -351,6 +370,144 @@ def mask_plan_for_step(
     return SpecMaskPlan(static, tuple(grammar_rows), tuple(reasoning_rows)), None
 
 
+def _min_pending(params: Any, output_len: int) -> bool:
+    """``min_tokens`` still holds the stop ids back after ``output_len`` tokens."""
+    return params.min_tokens > output_len and bool(params.all_stop_token_ids)
+
+
+def worst_case_row_empty(params: Any, output_len: int, vocab_size: int) -> bool:
+    """Whether the non-grammar controls of a request can leave a column with no token.
+
+    The worst case over every output the request can have by the time the step
+    is sampled: ``min_tokens`` counts as pending when it is pending at
+    ``output_len`` (the output only grows), every one-token bad word is banned,
+    and so is the LAST token of every longer bad word (some history ends with
+    the rest of the word). The allowed ids apply. When this row is not empty,
+    no column of the real mask can be (it bans a subset)."""
+    banned: set[int] = {
+        int(word[-1]) for word in params.bad_words_token_ids or () if word
+    }
+    if _min_pending(params, output_len):
+        banned.update(int(token) for token in params.all_stop_token_ids)
+    in_vocab = {token for token in banned if 0 <= token < vocab_size}
+    if params.allowed_token_ids:
+        allowed = {int(token) for token in params.allowed_token_ids}
+        return not any(
+            0 <= token < vocab_size and token not in banned for token in allowed
+        )
+    return len(in_vocab) >= vocab_size
+
+
+def deferred_mask_plan(
+    requests: Any,
+    row_req_ids: Sequence[str],
+    hints: dict[str, int],
+    tip: int,
+) -> SpecMaskPlan | None:
+    """The plan of a masked step chained on step ``tip``, or None for no control.
+
+    Every structured row is a grammar row (the drafts are not known at build, so
+    no row can be called safe inside its reasoning phase; the scheduler's rows
+    are all ones there). ``hints`` is each request's draft count. None when no
+    row is structured and none has a non-grammar control: the step stays a
+    one-call chained step."""
+    grammar_rows: list[int] = []
+    static_rows: list[int] = []
+    needs_wait = False
+    for row, req_id in enumerate(row_req_ids):
+        state = requests[req_id]
+        params = state.sampling_params
+        if params.structured_outputs is not None:
+            grammar_rows.append(row)
+        bad_words = params.bad_words_token_ids or ()
+        pending = _min_pending(params, len(state.output_token_ids))
+        if params.allowed_token_ids or bad_words or pending:
+            static_rows.append(row)
+            needs_wait = (
+                needs_wait or pending or any(len(word) > 1 for word in bad_words)
+            )
+    if not grammar_rows and not static_rows:
+        return None
+    return SpecMaskPlan(
+        None,
+        tuple(grammar_rows),
+        (),
+        deferred=True,
+        tip=int(tip),
+        hints=tuple(int(hints[req_id]) for req_id in row_req_ids),
+        static_rows=tuple(static_rows),
+        needs_wait=needs_wait,
+    )
+
+
+def resolve_deferred_plan(
+    plan: SpecMaskPlan,
+    requests: Any,
+    row_req_ids: Sequence[str],
+    cache: SpecMaskCache,
+    *,
+    view: Callable[[str], Sequence[int]] | None,
+    drafts: tuple[Any, Callable[[str], int]] | None,
+    width: int,
+    vocab_size: int,
+) -> SpecMaskPlan:
+    """The sample-time plan of a chained masked step: ``static`` filled in.
+
+    ``view(req_id)`` is the request's output once the step before has committed.
+    ``drafts`` is ``(tensor, row_of)``: that step's ``[B, K]`` drafts report and
+    the row of a request in it. Both are None when the plan needs no wait
+    (``needs_wait`` False: allowed ids and one-token bad words depend on nothing
+    the step before commits). A plan that needs a view and gets none, or a longer
+    bad word with no drafts, raises ``RuntimeError``: the step would be masked
+    from the wrong history. A row that no token is left for is caught by
+    ``step_mask``, which names the request."""
+    if not plan.deferred:
+        raise RuntimeError("resolve_deferred_plan: the plan is not a deferred one")
+    if plan.needs_wait and view is None:
+        raise RuntimeError(
+            "a chained masked step with a pending min_tokens or a multi-token bad "
+            "word needs the commit view of the step it is chained on"
+        )
+    static_rows = set(plan.static_rows)
+    specs: list[MaskRowSpec] = []
+    for row, req_id in enumerate(row_req_ids):
+        if row not in static_rows:
+            specs.append(MaskRowSpec(req_id=req_id))
+            continue
+        state = requests[req_id]
+        params = state.sampling_params
+        output = list(view(req_id) if view is not None else state.output_token_ids)
+        bad_words = params.bad_words_token_ids or ()
+        remaining = int(params.min_tokens) - len(output)
+        stop_ids = sorted(params.all_stop_token_ids) if remaining > 0 else []
+        longer = any(len(word) > 1 for word in bad_words)
+        row_drafts: list[int] = []
+        if longer:
+            if drafts is None:
+                raise RuntimeError(
+                    f"request {req_id!r} has a bad word of more than one token in "
+                    "a chained masked step, but the step it is chained on "
+                    "reported no drafts"
+                )
+            tensor, row_of = drafts
+            row_drafts = [
+                int(token) for token in tensor[row_of(req_id), : plan.hints[row]]
+            ]
+        specs.append(
+            MaskRowSpec(
+                req_id=req_id,
+                allowed_ids=params.allowed_token_ids or None,
+                bad_words=bad_words,
+                committed=output if longer else (),
+                min_remaining=remaining if stop_ids else 0,
+                stop_ids=stop_ids,
+                drafts=row_drafts,
+            )
+        )
+    static = static_masks(specs, cache, width=width, vocab_size=vocab_size)
+    return replace(plan, static=static, deferred=False)
+
+
 def step_mask(
     plan: SpecMaskPlan,
     grammar: torch.Tensor | None,
@@ -419,11 +576,25 @@ class _MaskStats:
             self.steps = 0
             self.rows = 0
             self.fallbacks: dict[str, int] = {}
+            self.chained = 0
+            self.late = 0
+            self.waits = 0
 
-    def add(self, *, steps: int = 0, rows: int = 0) -> None:
+    def add(
+        self,
+        *,
+        steps: int = 0,
+        rows: int = 0,
+        chained: int = 0,
+        late: int = 0,
+        waits: int = 0,
+    ) -> None:
         with self._lock:
             self.steps += int(steps)
             self.rows += int(rows)
+            self.chained += int(chained)
+            self.late += int(late)
+            self.waits += int(waits)
 
     def fallback(self, reason: str) -> None:
         with self._lock:
@@ -435,6 +606,9 @@ class _MaskStats:
                 "steps": self.steps,
                 "rows": self.rows,
                 "fallbacks": dict(self.fallbacks),
+                "chained": self.chained,
+                "late": self.late,
+                "waits": self.waits,
             }
 
 
@@ -442,7 +616,10 @@ _STATS = _MaskStats()
 
 
 def device_mask_stats() -> dict[str, Any]:
-    """A copy of the counters: ``steps``, ``rows``, ``fallbacks`` (reason to count)."""
+    """A copy of the counters: ``steps``, ``rows``, ``fallbacks`` (reason to count),
+    ``chained`` (masked steps built on the step before), ``late`` (masks that
+    reached the device after its forward ended) and ``waits`` (times the worker
+    waited for a step's record)."""
     return _STATS.snapshot()
 
 
@@ -458,3 +635,18 @@ def count_mask_step(rows: int) -> None:
 def count_mask_fallback(reason: str) -> None:
     """One step that would be a mask step but runs in logits mode, and why."""
     _STATS.fallback(reason)
+
+
+def count_mask_chained() -> None:
+    """One masked step that was built chained on the step before it."""
+    _STATS.add(chained=1)
+
+
+def count_mask_late() -> None:
+    """One masked step whose mask reached the device after its forward ended."""
+    _STATS.add(late=1)
+
+
+def count_mask_wait() -> None:
+    """One wait of the worker for the record of a step that was not resolved."""
+    _STATS.add(waits=1)

@@ -39,7 +39,7 @@ from vllm_tt_plugin.spec_decode import (
 )
 from vllm_tt_plugin.spec_device_logprobs import device_logprob_stats
 from vllm_tt_plugin.spec_device_penalties import device_penalty_stats
-from vllm_tt_plugin.spec_masks import device_mask_stats
+from vllm_tt_plugin.spec_masks import count_mask_wait, device_mask_stats
 from vllm_tt_plugin.spec_specials import count_step_specials, specials_report
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
@@ -158,6 +158,31 @@ class TTFinalizedDecode:
     # Chain mode: the device-reported position of each row's column 0, read
     # with the deferred fused verify's handle. None for every other step.
     p0: torch.Tensor | None = None
+    # The drafts the next chained step verifies (``FusedReadout.drafts``),
+    # ``[B, K]`` int32 in runner row order; None when the model reports none.
+    drafts: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class ChainResolved:
+    """What the reader thread knows about a resolved fused step, by its tip id.
+
+    A chained masked step needs it before the engine thread commits the step:
+    ``drafts`` go to the scheduler (``take_draft_token_ids``) and ``prefixes``
+    (the committed tokens of each row, in ``row_req_ids`` order) give the
+    output the request's min_tokens and bad words must see at sample time.
+    """
+
+    tip: int
+    row_req_ids: tuple[str, ...]
+    prefixes: list[list[int]]
+    drafts: torch.Tensor | None
+
+
+# How many resolved steps the controller remembers. A chained masked step reads
+# the record of the step before it, so one is enough; the rest is slack for a
+# step that is read late.
+_RESOLVED_KEEP = 4
 
 
 @dataclass(frozen=True)
@@ -486,6 +511,19 @@ class TTAsyncDecodeController:
         self._last_fused_step: DeferredDecodeOutput | None = None
         self._last_fused_rows: tuple[str, ...] = ()
         self._last_fused_tip: int | None = None
+        # The newest few fused steps by tip id, and what the reader thread
+        # learned when each resolved (``ChainResolved``). Both are written from
+        # two threads (the engine thread submits, the reader resolves), so one
+        # lock guards them; a record is stored before the output is returned.
+        self._resolved_lock = threading.Lock()
+        self._steps_by_tip: dict[int, DeferredDecodeOutput] = {}
+        self._resolved: dict[int, ChainResolved] = {}
+        # The fused step whose mask finish (``decode_forward_finish``) is still
+        # to come: nothing may be built, chained or read until it is done.
+        self._mask_pending_step: DeferredDecodeOutput | None = None
+        # Whether the newest fused readout the reader resolved carried
+        # ``FusedReadout.drafts`` (None: none resolved yet).
+        self._latest_readout_drafts: bool | None = None
         # Fused steps submitted while another was in flight (so chained), and
         # the drains of a possible chain by reason. A break is counted when the
         # step that follows it is submitted, so a drain that needed no verify
@@ -831,6 +869,8 @@ class TTAsyncDecodeController:
             return "disabled", None
         if scheduler_output is None:
             return "no_scheduler_output", None
+        if self._mask_pending_step is not None:
+            return "mask_pending", None
         runner = self.runner
         with runner._steady_decode_lock:
             unresolved = [
@@ -867,6 +907,19 @@ class TTAsyncDecodeController:
             return reason or "layout", None
         chain_len, hints = plan
         return None, ChainPlan(self._last_fused_tip, chain_len, hints)
+
+    def mask_pending(self) -> bool:
+        """Whether a masked step was begun and its finish has not been called."""
+        return self._mask_pending_step is not None
+
+    def latest_readout_has_drafts(self) -> bool:
+        """Whether the newest fused readout read carried ``FusedReadout.drafts``.
+
+        False until the first one is read (the first step of a request is never
+        chained, so that costs nothing in normal use) and again after a readout
+        with none: a chained masked step needs the drafts of the step before it,
+        and a model that declares ``supports_spec_device_mask`` returns them."""
+        return bool(self._latest_readout_drafts)
 
     def chain_blocker(self, scheduler_output: SchedulerOutput | None) -> str | None:
         """The reason the next step cannot chain, or None when it can."""
@@ -1113,10 +1166,17 @@ class TTAsyncDecodeController:
         reasons = ", ".join(
             f"{reason}={count}" for reason, count in sorted(stats["fallbacks"].items())
         )
+        chain = (
+            f", chained {stats['chained']}, late {stats['late']}, "
+            f"waits {stats['waits']}"
+            if stats["chained"] or stats["late"] or stats["waits"]
+            else ""
+        )
         return (
             f"; device masks: {stats['steps']} steps, {stats['rows']} masked rows, "
             f"{sum(stats['fallbacks'].values())} logits fallbacks"
             + (f" ({reasons})" if reasons else "")
+            + chain
         )
 
     @staticmethod
@@ -1528,6 +1588,7 @@ class TTAsyncDecodeController:
                 model_input, walk.committed, walk.counts, finalized.p0
             )
             prefixes = self._blank_late_finished(model_input, prefixes)
+        self._store_resolved(submission, model_input, prefixes, finalized.drafts)
         return CompletedSpecDecodeStep(
             committed=walk.committed,
             counts=walk.counts,
@@ -1539,6 +1600,126 @@ class TTAsyncDecodeController:
             logprobs=self.runner.spec_committed_logprobs(walk.logprobs, prefixes),
             p0=finalized.p0,
         )
+
+    def _remember_step(self, tip: int, step: DeferredDecodeOutput) -> None:
+        """Keep the newest fused steps by tip id, so ``wait_resolved`` can read one."""
+        with self._resolved_lock:
+            self._steps_by_tip[tip] = step
+            while len(self._steps_by_tip) > _RESOLVED_KEEP:
+                del self._steps_by_tip[min(self._steps_by_tip)]
+
+    def _store_resolved(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+        prefixes: list[list[int]],
+        drafts: torch.Tensor | None,
+    ) -> None:
+        """Record a resolved fused step for ``resolved_view``.
+
+        Runs on whichever thread resolved the step, before its output is
+        returned, so the engine core never sees an output whose record is
+        missing. A step with no deferred handle has no tip and no record.
+        """
+        tip = getattr(self._deferred_handle(submission), "tip_id", None)
+        if tip is None:
+            return
+        record = ChainResolved(
+            tip=int(tip),
+            row_req_ids=tuple(model_input.row_req_ids),
+            prefixes=[list(prefix) for prefix in prefixes],
+            drafts=drafts,
+        )
+        with self._resolved_lock:
+            self._resolved[record.tip] = record
+            while len(self._resolved) > _RESOLVED_KEEP:
+                del self._resolved[min(self._resolved)]
+
+    def resolved_view(self, tip: int) -> ChainResolved | None:
+        """The record of the fused step ``tip``, or None while it is unresolved.
+
+        A pure read: it never waits and changes nothing."""
+        with self._resolved_lock:
+            return self._resolved.get(tip)
+
+    def wait_resolved(self, tip: int) -> ChainResolved:
+        """The record of the fused step ``tip``, resolving the step if needed.
+
+        Resolution goes through ``ensure_finalized``, so the step is read
+        exactly once whoever gets there first (the reader thread or this one),
+        and a failed read raises here as it does there. Raises if the step is
+        not one this controller still remembers, or resolved without a record.
+        """
+        record = self.resolved_view(tip)
+        if record is not None:
+            return record
+        with self._resolved_lock:
+            step = self._steps_by_tip.get(tip)
+        if step is None:
+            raise RuntimeError(
+                f"cannot wait for fused step {tip}: it is not one of the "
+                f"newest {_RESOLVED_KEEP} submitted fused steps"
+            )
+        count_mask_wait()
+        step.ensure_finalized()
+        record = self.resolved_view(tip)
+        if record is None:
+            raise RuntimeError(f"fused step {tip} resolved without a record")
+        return record
+
+    def commit_view(self, req_id: str, tip: int) -> list[int]:
+        """The output of ``req_id`` as it is once the step ``tip`` is committed.
+
+        The runner is one step behind: the commit of ``tip`` is applied at the
+        next build. A pure read: the applied output plus the step's committed
+        prefix for the row, so min_tokens and multi-token bad words see what the
+        commit will give them. Valid only while that commit is not applied, and
+        only after the step is resolved (``wait_resolved``). A request that is
+        not a row of ``tip`` has nothing to add.
+        """
+        record = self.resolved_view(tip)
+        if record is None:
+            raise RuntimeError(
+                f"the commit view of fused step {tip} needs the step resolved "
+                "(wait_resolved first)"
+            )
+        state = self.runner.requests[req_id]
+        output = list(state.output_token_ids)
+        if req_id in record.row_req_ids:
+            output.extend(record.prefixes[record.row_req_ids.index(req_id)])
+        return output
+
+    def chain_handoff_drafts(
+        self, tip: int, hints: dict[str, int]
+    ) -> dict[str, list[int]]:
+        """The drafts of the step ``tip`` for each request with a hint above 0.
+
+        ``hints`` is how many drafts each structured row of the chained step
+        verifies. Waits for the step when it is not resolved. A request with a
+        hint and no drafts to give (the model returned none, or the request is
+        not a row of ``tip``) raises: a structured row whose drafts reach the
+        device but not the scheduler would walk them against an all-ones mask.
+        """
+        record = self.wait_resolved(tip)
+        wanted = {req_id: int(hint) for req_id, hint in hints.items() if hint > 0}
+        if not wanted:
+            return {}
+        if record.drafts is None:
+            raise RuntimeError(
+                f"fused step {tip} gave no drafts, but a chained masked step "
+                f"verifies drafts for {sorted(wanted)}: a model that declares "
+                "supports_spec_device_mask returns FusedReadout.drafts"
+            )
+        handed: dict[str, list[int]] = {}
+        for req_id, hint in wanted.items():
+            if req_id not in record.row_req_ids:
+                raise RuntimeError(
+                    f"request {req_id!r} verifies drafts in a step chained on "
+                    f"{tip}, but is not one of its rows {list(record.row_req_ids)}"
+                )
+            row = record.row_req_ids.index(req_id)
+            handed[req_id] = [int(token) for token in record.drafts[row, :hint]]
+        return handed
 
     def tag_valid_drafts(
         self, runner_output: ModelRunnerOutput, model_input: TTModelInput
@@ -1681,14 +1862,11 @@ class TTAsyncDecodeController:
             )
             handle = self._deferred_handle(submission)
             tip = getattr(handle, "tip_id", None)
+            if handle is not None and tip is not None:
+                self._remember_step(int(tip), step)
             chained = model_input.chain_rows is not None
-            if (
-                handle is None
-                or tip is None
-                or getattr(submission, "mask_pending", False)
-            ):
-                # Not chainable: nothing may be built over it, as before. A
-                # masked step is never chained, so it is not a chain tip.
+            if handle is None or tip is None:
+                # Not chainable: nothing may be built over it, as before.
                 self._last_fused_step = None
                 self._last_fused_tip = None
                 self._last_fused_rows = ()
@@ -1712,6 +1890,10 @@ class TTAsyncDecodeController:
             self._last_fused_step = step
             self._last_fused_tip = int(tip)
             self._last_fused_rows = tuple(model_input.row_req_ids)
+            if getattr(submission, "mask_pending", False):
+                # A masked step is a chain tip like any other once its finish
+                # has been called; until then ``chain_evaluate`` refuses.
+                self._mask_pending_step = step
             return step
         step = AsyncTTModelRunnerOutput(
             controller=self,
@@ -2084,6 +2266,7 @@ class TTAsyncDecodeController:
             )
         model = self.runner.model
         out = model.decode_forward_finish(submission.tt_out, mask)
+        self._mask_pending_step = None
         tt_out = _verify_output_tensor(
             out, type(model).__name__, ACCEPT_MODE_FUSED_SAMPLE
         )
@@ -2182,9 +2365,11 @@ class TTAsyncDecodeController:
         reader = getattr(runner.model, "read_decode_output", None)
         raw = reader(handle) if reader is not None else handle.wait()
         candidates = None
+        drafts = None
         if isinstance(raw, FusedReadout):
             ids, counts, p0 = raw.accepted_token_ids, raw.accepted_counts, raw.p0
             candidates = raw.candidates
+            drafts = raw.drafts
         elif isinstance(raw, (tuple, list)) and len(raw) == 3:
             ids, counts, p0 = raw
         else:
@@ -2193,6 +2378,7 @@ class TTAsyncDecodeController:
                 f"handle and returned {type(raw).__name__}; it returns a "
                 "FusedReadout or (accepted_token_ids, accepted_counts, p0)"
             )
+        self._latest_readout_drafts = drafts is not None
         if not isinstance(p0, torch.Tensor) or p0.dtype != torch.int32 or p0.dim() != 1:
             raise ValueError(
                 "a fused verify's p0 must be a 1-D int32 host tensor, got "
@@ -2206,7 +2392,7 @@ class TTAsyncDecodeController:
             handle=handle,
             candidates=candidates,
         )
-        return TTFinalizedDecode(tt_out=out, tt_log_probs=None, p0=p0)
+        return TTFinalizedDecode(tt_out=out, tt_log_probs=None, p0=p0, drafts=drafts)
 
     def finalize_decode(
         self,

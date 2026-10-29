@@ -120,10 +120,14 @@ from vllm_tt_plugin.spec_device_penalties import (
 from vllm_tt_plugin.spec_masks import (
     SpecMaskCache,
     SpecMaskPlan,
+    count_mask_chained,
     count_mask_fallback,
     count_mask_step,
+    deferred_mask_plan,
     mask_plan_for_step,
+    resolve_deferred_plan,
     step_mask,
+    worst_case_row_empty,
 )
 from vllm_tt_plugin.spec_specials import count_logits_reason, logits_reason
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
@@ -855,6 +859,11 @@ class TTModelRunner:
         # See _grammar_validated_drafts.
         self._grammar_draft_handoff: dict[str, list[int]] = {}
         self._grammar_handed_over_req_ids: set[str] = set()
+        # A chained masked step's drafts are not known when it is built: the
+        # step before it has not been read. It leaves ``(tip, {request id:
+        # drafts it verifies})`` here and ``take_draft_token_ids`` fills it from
+        # the record of the tip, then clears it.
+        self._chain_handoff: tuple[int, dict[str, int]] | None = None
         # Built on first use rather than here, because constructing it compiles
         # numba kernels and a launch that never speculates must not pay that.
         self._ngram_proposer: Any = None
@@ -1992,9 +2001,15 @@ class TTModelRunner:
             tracker = getattr(self, "_spec_penalty_tracker", None)
             if tracker is None or not all(tracker.is_current(r) for r in penalized):
                 return "pen_state", None
-        if not batch.no_allowed_token_ids:
+        masked = getattr(self, "_spec_device_mask", False)
+        if masked and not self.async_decode.latest_readout_has_drafts():
+            # A chained masked step takes the drafts of the step before it from
+            # that step's readout (``FusedReadout.drafts``); until the model has
+            # given some, a step chained on it could not be masked.
+            return "no_device_drafts", None
+        if not masked and not batch.no_allowed_token_ids:
             return "allowed_token_ids", None
-        if batch.sampling.bad_words_token_ids:
+        if not masked and batch.sampling.bad_words_token_ids:
             return "bad_words", None
         if batch.max_num_logprobs is not None and not all(
             self._request_is_fused_servable(req_id)
@@ -2004,16 +2019,17 @@ class TTModelRunner:
             # A logprobs row the model's candidates can answer chains; any
             # other needs the full logits of a ``logits`` step.
             return "logprobs", None
-        if batch.sampling.has_active_logitsprocs():
+        # With the device mask, ``min_tokens`` is the mask's too: its processor
+        # is no blocker, and the other processors (min_p, logit_bias) stay.
+        if batch.sampling.has_active_logitsprocs(ignore_min_tokens=masked):
             return "logitsprocs", None
-        if getattr(self, "_spec_device_mask", False) and any(
-            self._request_holds_back_stop_ids(req_id) for req_id in req_ids
-        ):
-            # ``min_tokens`` is a mask control now, so ``not_fused`` no longer
-            # keeps such a row out of a chain; a masked step is never chained.
-            return "min_tokens", None
-        if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
-            self.requests, scheduler_output, None
+        if masked:
+            reason = self._chain_mask_blocker(req_ids)
+            if reason is not None:
+                return reason, None
+        elif (
+            scheduler_output.pending_structured_output_tokens
+            or has_structured_outputs(self.requests, scheduler_output, None)
         ):
             return "grammar", None
         max_model_len = int(self.model_config.max_model_len)
@@ -2056,6 +2072,30 @@ class TTModelRunner:
         if self._spec_supports_narrow_decode and not any(hints.values()):
             return "no_drafts", None
         return None, (chain_len, hints)
+
+    def _chain_mask_blocker(self, req_ids: list[str]) -> str | None:
+        """The reason the controls of ``req_ids`` keep a masked chain from being built.
+
+        A structured row chains with the model's token mask (its rows come from
+        the scheduler at sample time), as do allowed ids, bad words and
+        ``min_tokens`` (``spec_masks.deferred_mask_plan``). Refused: a live
+        grammar row next to another control (``grammar_with_controls``: an
+        empty composed row cannot go to logits once the step is begun), and a
+        static row that the worst case of its own controls can leave with no
+        token (``mask_empty_risk``)."""
+        vocab_size = int(self.vocab_size)
+        for req_id in req_ids:
+            state = self.requests.get(req_id)
+            params = getattr(state, "sampling_params", None)
+            if params is None:
+                continue
+            output_len = len(state.output_token_ids)
+            refusal = mask_row_refusal(params, output_len, False)
+            if refusal is not None:
+                return refusal
+            if worst_case_row_empty(params, output_len, vocab_size):
+                return "mask_empty_risk"
+        return None
 
     def _chain_build_plan(
         self, scheduler_output: SchedulerOutput, row_req_ids: list[str]
@@ -2542,11 +2582,18 @@ class TTModelRunner:
         from them. The drafts that step verified are already on the device, so
         what is handed over is exactly those, for its structured rows, and the
         runner's retained proposals stay where ``_drafts_to_verify`` reads
-        them.
+        them. A chained masked step has no build-time drafts: its are the
+        drafts of the step it is chained on, taken from that step's record
+        (``_chain_handoff``), waiting for the step if the reader has not
+        resolved it.
         """
         if getattr(self, "async_decode_scheduling", False):
-            handoff = self.__dict__.get("_grammar_draft_handoff") or {}
+            handoff = dict(self.__dict__.get("_grammar_draft_handoff") or {})
             self._grammar_draft_handoff = {}
+            chain = self.__dict__.get("_chain_handoff")
+            if chain is not None:
+                self._chain_handoff = None
+                handoff.update(self.async_decode.chain_handoff_drafts(*chain))
             self._grammar_handed_over_req_ids = set(handoff)
             if not handoff:
                 return None
@@ -3128,6 +3175,13 @@ class TTModelRunner:
                         spec_mode, spec_mask = TTModelRunner._plan_spec_mask(
                             self, spec_mode, row_req_ids, spec_drafts, num_valid_drafts
                         )
+                    elif getattr(self, "_spec_device_mask", False):
+                        # Chained: the drafts are on the device, so every
+                        # structured row is a grammar row and the rest of the
+                        # mask is built at sample time (``resolve_deferred_plan``).
+                        spec_mask = deferred_mask_plan(
+                            self.requests, row_req_ids, chain.hints, chain.tip
+                        )
                     if spec_mode == ACCEPT_MODE_LOGITS:
                         TTModelRunner._count_logits_step_reason(
                             self, row_req_ids, num_valid_drafts, spec_drafts
@@ -3517,7 +3571,17 @@ class TTModelRunner:
             }
             self._grammar_draft_handoff = {}
             self._grammar_handed_over_req_ids = set()
-            if (
+            # A chained masked step hands over the drafts of the step it is
+            # chained on, from that step's record; every other build clears it.
+            self._chain_handoff = None
+            if spec_mask is not None and spec_mask.deferred:
+                structured = {
+                    row_req_ids[row]: spec_mask.hints[row]
+                    for row in spec_mask.grammar_rows
+                }
+                if any(structured.values()):
+                    self._chain_handoff = (spec_mask.tip, structured)
+            elif (
                 spec_drafts is not None
                 and self.async_decode_scheduling
                 # A fused step reads no bitmask, so the scheduler has no use
@@ -4041,6 +4105,13 @@ class TTModelRunner:
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
         TTModelRunner._raise_if_device_grammar_poisoned(self)
+        if self.async_decode.mask_pending():
+            raise RuntimeError(
+                "execute_model was called while a masked fused step is still "
+                "pending: sample_tokens (decode_forward_finish) was not called "
+                "for it, and a step cannot be built, chained or read before its "
+                "mask finish"
+            )
 
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
         # the scheduler output. When present, the step runs over the merged lane
@@ -4231,8 +4302,12 @@ class TTModelRunner:
             require_complete=complete,
         )
         rows, width = (int(size) for size in model_input.input_tokens.shape)
+        plan = model_input.spec_mask
+        if plan.deferred:
+            plan = self._resolve_chained_plan(plan, model_input, grammar_output)
+            count_mask_chained()
         mask, constrained = step_mask(
-            model_input.spec_mask,
+            plan,
             grammar,
             list(model_input.row_req_ids),
             rows=rows,
@@ -4242,6 +4317,62 @@ class TTModelRunner:
         if constrained:
             count_mask_step(constrained)
         return mask
+
+    def _resolve_chained_plan(
+        self,
+        plan: SpecMaskPlan,
+        model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
+    ) -> SpecMaskPlan:
+        """The plan of a chained masked step with its non-grammar part built.
+
+        Runs at sample time, before the next build applies the commit of the
+        step this one is chained on. Two jobs. First the handoff guard: a
+        structured row that the scheduler constrains and that verifies drafts
+        must have had them handed over (``take_draft_token_ids``), or the
+        scheduler's rows 1..K were made from placeholders and the drafts would
+        run against all-ones rows. A row the scheduler no longer holds (finished
+        or aborted in the window) is unconstrained and needs nothing. Then the
+        static part: it waits for the step before (``wait_resolved``) only when
+        it depends on that step's commit (``plan.needs_wait``).
+        """
+        controller = self.async_decode
+        rows = list(model_input.row_req_ids)
+        handed = self.__dict__.get("_grammar_handed_over_req_ids") or set()
+        self._grammar_handed_over_req_ids = set()
+        held = (
+            set(grammar_output.structured_output_request_ids)
+            if grammar_output is not None
+            else set()
+        )
+        missing = [
+            rows[row]
+            for row in plan.grammar_rows
+            if plan.hints[row] > 0 and rows[row] in held and rows[row] not in handed
+        ]
+        if missing:
+            raise RuntimeError(
+                f"structured-output requests {missing} verify drafts in a chained "
+                "masked step, but their drafts were not handed over to the "
+                "scheduler (take_draft_token_ids): its bitmask rows 1..K would "
+                "not match the drafts the device verifies"
+            )
+        view = drafts = None
+        if plan.needs_wait:
+            record = controller.wait_resolved(plan.tip)
+            view = partial(controller.commit_view, tip=plan.tip)
+            if record.drafts is not None:
+                drafts = (record.drafts, record.row_req_ids.index)
+        return resolve_deferred_plan(
+            plan,
+            self.requests,
+            rows,
+            self.__dict__.setdefault("_spec_mask_cache", SpecMaskCache()),
+            view=view,
+            drafts=drafts,
+            width=int(model_input.input_tokens.shape[1]),
+            vocab_size=int(self.vocab_size),
+        )
 
     def _finish_async_decode(
         self,

@@ -29,11 +29,13 @@ nothing changes (the rest of ``tests/spec`` is that regression).
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
@@ -89,7 +91,7 @@ from . import test_spec_sampled_controls_runner as ctl
 from . import test_spec_sampled_runner as sync_harness
 from .sampled_target import SAMPLED_VOCAB_SIZE, rule_logits
 from .test_spec_async import BLOCK_SIZE, MAX_MODEL_LEN, MAX_NUM_REQS
-from .test_spec_chain_async import Engine, _decode_so, _make_runner
+from .test_spec_chain_async import Engine, _make_runner
 from .test_spec_chain_async import K as CHAIN_K
 from .test_spec_device_logprobs_plugin import LogprobsTarget, _candidates, _load
 from .test_spec_device_topk import exact_support
@@ -472,6 +474,9 @@ def test_the_counters_report_steps_rows_and_fallbacks_by_reason():
         "steps": 2,
         "rows": 4,
         "fallbacks": {"empty_row": 2, "grammar_with_controls": 1},
+        "chained": 0,
+        "late": 0,
+        "waits": 0,
     }
 
 
@@ -964,6 +969,9 @@ class _PendingHandle:
 
     pending = True
 
+    def __init__(self, tip_id=None):
+        self.tip_id = tip_id
+
     def wait(self, *args, **kwargs):
         raise RuntimeError("a pending split step cannot be read before its finish")
 
@@ -983,6 +991,8 @@ class MaskTarget(LogprobsTarget):
         **LogprobsTarget.model_capabilities,
         "supports_spec_device_mask": True,
     }
+
+    with_drafts = True
 
     def __init__(self):
         super().__init__()
@@ -1045,6 +1055,25 @@ class MaskTarget(LogprobsTarget):
         self._cand = _candidates(logits) if self._wants(ss) else None
         return result.committed_token_ids, result.accepted_counts, argmax
 
+    def _chain_forward(self, *args, **kwargs):
+        """The chain forward, whose readout also carries ``FusedReadout.drafts``:
+        per row, what the next chained step verifies (``with_drafts=False``: a
+        model that reports none)."""
+        out = super()._chain_forward(*args, **kwargs)
+        if self.with_drafts:
+            handle = out.handle
+            readout = handle._readout
+            drafts = torch.zeros(
+                (int(readout.accepted_counts.shape[0]), self._num_drafts),
+                dtype=torch.int32,
+            )
+            for row, (last, next_p0) in self._dev_state.items():
+                drafts[row] = torch.tensor(
+                    self._chain_drafts(last, next_p0), dtype=torch.int32
+                )
+            handle._readout = dataclasses.replace(readout, drafts=drafts)
+        return out
+
     def _chain_accept(self, tokens, p0, num_valid, spec_sampling, kwargs):
         columns = torch.arange(tokens.shape[1], dtype=torch.int32).unsqueeze(0)
         positions = p0.unsqueeze(1) + columns
@@ -1089,8 +1118,11 @@ class MaskTarget(LogprobsTarget):
             )
         if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
             raise ValueError("decode_forward_begin needs spec_mode 'fused_sample'")
-        if kwargs.get("chain_rows") is not None or kwargs.get("chain_tip") is not None:
-            raise ValueError("a split step is not chained")
+        chained = kwargs.get("chain_rows") is not None
+        if chained and not kwargs.get("defer_read"):
+            raise ValueError("a chained begin needs defer_read")
+        if (kwargs.get("chain_tip") is not None) != chained:
+            raise ValueError("chain_rows and chain_tip come together")
         ss = kwargs.get("spec_sampling")
         if ss is None:
             raise ValueError("decode_forward_begin needs spec_sampling")
@@ -1103,10 +1135,14 @@ class MaskTarget(LogprobsTarget):
                 "num_valid_drafts": kwargs["num_valid_drafts"].clone(),
                 "spec_sampling": ss,
                 "defer_read": bool(kwargs.get("defer_read")),
+                "chain_rows": kwargs.get("chain_rows"),
+                "chain_tip": kwargs.get("chain_tip"),
             }
         )
         self._split = (tokens, start_pos, kwargs)
-        return VerifyOutput(spec_mode=spec_mode, handle=_PendingHandle())
+        # a deferred begin knows its tip (the forward is queued), as the engine's
+        tip = (self._tip_id or 0) + 1 if kwargs.get("defer_read") else None
+        return VerifyOutput(spec_mode=spec_mode, handle=_PendingHandle(tip))
 
     def decode_forward_finish(self, tt_out, mask=None):
         if self._split is None or not isinstance(tt_out.handle, _PendingHandle):
@@ -1500,30 +1536,45 @@ EVENS = list(range(0, SV, 2))
 class MaskEngine(Engine):
     """``EngineCore.step_with_batch_queue`` for steps with a structured row.
 
-    Between ``execute_model`` and ``sample_tokens`` it does what the core does
-    for a deferred structured step: take the runner's drafts, validate each
-    against its grammar (the invalid tail becomes -1 padding) and build the
-    bitmask from what survived. ``after_execute`` records the fake's calls right
-    after each ``execute_model``; ``handed`` the drafts the runner handed over."""
+    After ``execute_model`` a step with a structured row defers its sampling:
+    the core waits for the oldest step's output (the scheduler advances each
+    grammar by what that step committed), takes the runner's drafts, validates
+    each against its grammar (the invalid tail becomes -1 padding), builds the
+    bitmask from what survived and only then calls ``sample_tokens``. Any other
+    step is sampled at once with no grammar output. ``after_execute`` records
+    the fake's calls right after each ``execute_model``; ``handed`` the drafts
+    the runner handed over."""
 
     def __init__(self, runner, **kw):
         super().__init__(runner, **kw)
         self.after_execute: list[list[tuple]] = []
         self.handed: list[dict[str, list[int]]] = []
 
+    def _structured_rows(self):
+        runner = self.runner
+        return [
+            req_id
+            for req_id in runner.input_batch.req_ids[: runner.input_batch.num_reqs]
+            if runner.requests[req_id].sampling_params.structured_outputs is not None
+        ]
+
     def _grammar(self):
         runner = self.runner
         handed = runner.take_draft_token_ids()
         by_request = dict(zip(handed.req_ids, handed.draft_token_ids)) if handed else {}
         self.handed.append({r: list(d) for r, d in by_request.items()})
-        scheduled = {}
-        for req_id, drafts in by_request.items():
-            history = list(runner.requests[req_id].output_token_ids)
-            valid = ctl._validated(history, drafts)
-            scheduled[req_id] = valid + [-1] * (CHAIN_K - len(valid))
-        for req_id in runner.requests:
-            scheduled.setdefault(req_id, [-1] * CHAIN_K)
-        return ctl._grammar_output(runner, scheduled)
+        structured = self._structured_rows()
+        if not structured:
+            return None
+        rows = []
+        for req_id in structured:
+            # the scheduler's grammar state: every output it has been given
+            history = list(self.outputs.get(req_id, ()))
+            valid = ctl._validated(history, by_request.get(req_id, []))
+            rows.append(
+                ctl._scheduler_rows(history, valid + [-1] * (CHAIN_K - len(valid)))
+            )
+        return GrammarOutput(structured, torch.cat(rows).numpy())
 
     def iterate(self):
         so = self.schedule()
@@ -1532,6 +1583,9 @@ class MaskEngine(Engine):
         self.step_rows[k] = list(so.num_scheduled_tokens)
         assert self.runner.execute_model(so) is None
         self.after_execute.append(list(self.runner.model.calls))
+        if self.inflight and self._structured_rows():
+            # the structured step waits for the output of the one before it
+            self.resolve_oldest()
         wrapper = self.runner.sample_tokens(self._grammar())
         self.inflight.append((wrapper, k))
         if len(self.inflight) >= 2:
@@ -1626,85 +1680,30 @@ def test_a_masked_step_begins_at_execute_model_and_finishes_at_sample_tokens(
     assert len(model.begin_inputs) == len(engine.after_execute)
 
 
-def test_a_masked_step_is_never_chained_and_the_run_chains_again_after_it(monkeypatch):
-    model, runner, engine = _async_run(monkeypatch, mask=True, steps=20, stop_after=9)
-    controller = runner.async_decode
-    # the steps while the allowed row lives are never chained; after it finishes
-    # the run chains again
-    assert all(
-        not bool(log["chain_rows"].any())
-        for log in model.chain_log[: engine.finish_step["x"] + 1]
-    )
-    assert controller._chained_submissions > 0
-    assert any(bool(log["chain_rows"].any()) for log in model.chain_log[-4:])
-    # no step was a one-call masked step: the mask key never reaches decode_forward
-    assert all("mask" not in (c or {}) for c in model.spec_sampling_calls)
-
-
-def test_the_first_unmasked_step_after_a_masked_one_is_not_chained_onto_it(monkeypatch):
-    model, runner, engine = _async_run(monkeypatch, mask=True, steps=20, stop_after=6)
-    names = [c[0] for c in model.calls]
-    masked = names.count("finish")
-    assert masked >= 3 and names[-1] == "one_call"
-    # the log has one entry per deferred step, in order: the masked ones first
-    after = model.chain_log[masked:]
-    assert len(after) >= 4
-    assert not bool(after[0]["chain_rows"].any())
-    assert any(bool(entry["chain_rows"].any()) for entry in after[1:])
-
-
-def test_a_grammar_step_hands_its_build_time_drafts_to_the_scheduler(monkeypatch):
+def test_a_grammar_step_hands_the_drafts_it_verifies_to_the_scheduler(monkeypatch):
     """The scheduler makes grammar rows 1..K from the drafts the runner hands over,
-    so they must be the drafts the step verifies, which are on the begin call."""
+    so they must be the drafts the step verifies: the begin call's, for a step that
+    is not chained, and the drafts the step before it reported, for one that is
+    (the tip's readout; its own block holds placeholders)."""
     model, runner, engine = _async_run(monkeypatch, mask=True, case="structured")
-    steps = 0
+    plain = chained = 0
     for index, handed in enumerate(engine.handed):
         if "x" not in handed:
             continue
         verified = model.begin_inputs[index]
         row = engine.step_rows[index].index("x")
         valid = int(verified["num_valid_drafts"][row])
-        assert handed["x"] == verified["tokens"][row, 1 : 1 + valid].tolist()
-        steps += 1
-    assert steps > 4
+        if verified["chain_rows"] is None:
+            assert handed["x"] == verified["tokens"][row, 1 : 1 + valid].tolist()
+            plain += 1
+        else:
+            tip = next(h for h in model.handles if h.tip_id == verified["chain_tip"])
+            assert handed["x"] == tip._readout.drafts[row, :valid].tolist()
+            chained += 1
+    assert plain >= 1 and chained > 4
     # a step with no grammar row hands nothing over
     model, runner, engine = _async_run(monkeypatch, mask=True, case="allowed")
     assert all(not handed for handed in engine.handed)
-
-
-def _bad_words_params():
-    params = SamplingParams(temperature=0.0, ignore_eos=True)
-    params._bad_words_token_ids = [[4, 5]]  # what update_from_tokenizer leaves
-    return params
-
-
-@pytest.mark.parametrize(
-    "params, reason",
-    [
-        (
-            SamplingParams(temperature=0.0, allowed_token_ids=[2, 4], ignore_eos=True),
-            "allowed_token_ids",
-        ),
-        (_bad_words_params(), "bad_words"),
-        (_mask_params("structured"), "grammar"),
-        # no min_tokens processor in this batch: the capability's own blocker holds it
-        (_mask_params("min_tokens"), "min_tokens"),
-    ],
-)
-def test_a_row_with_a_mask_control_never_chains(monkeypatch, params, reason):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    model = MaskTarget()
-    runner = _make_runner(model)
-    runner._spec_device_mask = True
-    engine = Engine(runner)
-    engine.add("a", 1)
-    engine.add("x", 40, params)
-    so = _decode_so(runner, ("a", "x"))
-    assert runner._chain_rows_blocker(["a", "x"], so, 1)[0] == reason
-    # with the capability off the min_tokens row is held by the old rule instead
-    runner._spec_device_mask = False
-    assert runner._chain_rows_blocker(["a", "x"], so, 1)[0] != "min_tokens"
-    assert runner._chain_rows_blocker(["a", "x"], so, 1)[0] is not None
 
 
 def test_an_async_grammar_row_with_no_grammar_output_is_left_unconstrained(monkeypatch):

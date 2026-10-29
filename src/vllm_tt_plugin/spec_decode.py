@@ -604,12 +604,19 @@ class FusedReadout:
 
     ``candidates`` is the step's ``SpecCandidates`` when a row of the step asked
     for logprobs, else None.
+
+    ``drafts`` is ``[B, K]`` int32 in the runner's row order: the drafts the
+    NEXT chained step verifies as its columns 1..K, before the host's length
+    hint trims them. A model that declares ``supports_spec_device_mask`` returns
+    it, because a chained masked step hands them to the scheduler (the grammar
+    rows are made from them). None for a model that does not.
     """
 
     accepted_token_ids: "torch.Tensor"
     accepted_counts: "torch.Tensor"
     p0: "torch.Tensor"
     candidates: "SpecCandidates | None" = None
+    drafts: "torch.Tensor | None" = None
 
     def __post_init__(self) -> None:
         if self.candidates is not None and not isinstance(
@@ -619,6 +626,25 @@ class FusedReadout:
                 "FusedReadout.candidates must be a SpecCandidates, got "
                 f"{type(self.candidates).__name__}"
             )
+        if self.drafts is not None:
+            import torch
+
+            drafts = self.drafts
+            if (
+                not isinstance(drafts, torch.Tensor)
+                or drafts.dtype != torch.int32
+                or drafts.dim() != 2
+            ):
+                raise TypeError(
+                    "FusedReadout.drafts must be a 2-D int32 tensor [B, K], got "
+                    f"{type(drafts).__name__} {getattr(drafts, 'dtype', None)} "
+                    f"{tuple(getattr(drafts, 'shape', ()))}"
+                )
+            if int(drafts.shape[0]) != int(self.accepted_counts.shape[0]):
+                raise ValueError(
+                    f"FusedReadout.drafts has {int(drafts.shape[0])} rows but "
+                    f"accepted_counts has {int(self.accepted_counts.shape[0])}"
+                )
 
 
 def normalize_declared_values(

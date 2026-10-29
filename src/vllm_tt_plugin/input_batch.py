@@ -218,14 +218,21 @@ class SamplingInputBatch:
         # req_index -> bad_words_token_ids
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
-    def has_active_logitsprocs(self) -> bool:
-        """True if any logits processors have active per-request state."""
+    def has_active_logitsprocs(self, *, ignore_min_tokens: bool = False) -> bool:
+        """True if any logits processors have active per-request state.
+
+        ``ignore_min_tokens`` leaves the min_tokens processor out, for a model
+        whose device token mask applies ``min_tokens`` itself."""
         for proc in self.logitsprocs.all:
             if isinstance(proc, MinPLogitsProcessor) and proc.min_p_count:
                 return True
             if isinstance(proc, LogitBiasLogitsProcessor) and proc.biases:
                 return True
-            if isinstance(proc, MinTokensLogitsProcessor) and proc.min_toks:
+            if (
+                isinstance(proc, MinTokensLogitsProcessor)
+                and proc.min_toks
+                and not ignore_min_tokens
+            ):
                 return True
         return False
 
