@@ -640,9 +640,12 @@ class TTModelRunner:
         """
         persistent_batch_layout_changed = False
 
-        # Remove finished requests from the cached states.
+        # Remove finished requests from the cached states (the model told first:
+        # it keys its own slots by the request's first block id).
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._release_model_request(self.requests.get(req_id))
         for req_id in scheduler_output.finished_req_ids:
-            self.requests.pop(req_id, None)
+            self._release_model_request(self.requests.pop(req_id, None))
         self._release_dead_state_slots(scheduler_output)
 
         # Remove the finished requests from the persistent batch.
@@ -869,6 +872,19 @@ class TTModelRunner:
             self._req_state_slot.pop(req_id, None)
         for req_id in scheduler_output.preempted_req_ids or ():
             self._req_state_slot.pop(req_id, None)
+
+    def _release_model_request(self, req_state: CachedRequestState | None) -> None:
+        """Tell a model that keeps per-request state of its own (``release_request``,
+        keyed by the request's first KV block id, the key its ``prefill_forward``
+        and ``decode_forward`` read from the page table) that the request is gone:
+        finished, or preempted (its blocks freed; a resume re-prefills from zero
+        under whatever blocks it is given then). A model without the hook relies on
+        least-recently-used eviction at the next join, which is wrong when several
+        requests finish in one step and the joins run from a prefill step."""
+        release = getattr(self.model, "release_request", None)
+        if release is None or req_state is None or not req_state.block_ids or not req_state.block_ids[0]:
+            return
+        release(int(req_state.block_ids[0][0]))
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
@@ -1443,6 +1459,10 @@ class TTModelRunner:
         if self.async_decode.must_drain_pending_async_steps(steady_decode_candidate):
             self.async_decode.wait_for_all_pending_async_steps()
 
+        for req_id in scheduler_output.preempted_req_ids or ():
+            self._release_model_request(self.requests.get(req_id))
+        for req_id in scheduler_output.finished_req_ids:
+            self._release_model_request(self.requests.get(req_id))
         layout_changed = lane_batch.apply_step_plan(
             scheduler_output, plan, self.requests, self.encoder_cache
         )
