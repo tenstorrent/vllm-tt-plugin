@@ -8,6 +8,7 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+
 from vllm_tt_plugin.sched_interleave import InterleavePolicy, parse_spec
 from vllm_tt_plugin.scheduler import (
     KNOWN_SCHED_FLAGS,
@@ -250,6 +251,7 @@ def _scheduler(*, running=(), waiting=(), policy=None):
     scheduler.max_num_running_reqs = 8
     scheduler._forced_mode = TTSchedulingMode.DEFAULT
     scheduler._interleave = policy
+    scheduler._pack = None  # TT_SCHED_PACK unset
     scheduler.requests = {}
     return scheduler
 

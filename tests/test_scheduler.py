@@ -9,7 +9,6 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
 
-
 _ids = iter(range(10**6))
 
 
@@ -34,6 +33,7 @@ def _scheduler(*, running=(), waiting=0, skipped_waiting=0, mode):
     scheduler._forced_mode = mode
     scheduler._aligned_chunks = False
     scheduler._interleave = None  # TT_SCHED_INTERLEAVE unset
+    scheduler._pack = None  # TT_SCHED_PACK unset
     return scheduler
 
 

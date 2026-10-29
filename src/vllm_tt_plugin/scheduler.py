@@ -122,6 +122,11 @@ class TTScheduler(AsyncScheduler):
       prefill cannot make progress and running decode requests exist.
     """
 
+    # The policies' defaults for a scheduler built without ``__init__`` (the
+    # tests' ``TTScheduler.__new__`` helpers set what they exercise): unset.
+    _interleave: InterleavePolicy | None = None
+    _pack: PackPolicy | None = None
+
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
