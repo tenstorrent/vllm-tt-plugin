@@ -172,3 +172,39 @@ def test_worker_exposes_the_confirmer_only_when_declared():
     assert TTWorker.prefix_cache_hit_confirmer(worker) is None
     worker = SimpleNamespace(model_runner=SimpleNamespace(model=None))
     assert TTWorker.prefix_cache_hit_confirmer(worker) is None
+    # the engine-core wrapper (installed from the platform's load hooks): after
+    # the original __init__ it hands the worker's confirmer to the scheduler,
+    # only when the engine's prefix cache is on
+    import vllm.v1.engine.core as engine_core
+
+    from vllm_tt_plugin.platform import _install_prefix_hit_confirmer_patch
+
+    # the wrapper closes over the constructor it found at install time: a
+    # stand-in replaces upstream's here (the conftest fixture restores the real
+    # one and the install marker after the test)
+    engine_core.__dict__.pop("_tt_original_engine_core_init", None)
+    engine_core.EngineCore.__init__ = lambda self, *a, **k: None
+    _install_prefix_hit_confirmer_patch()
+    _install_prefix_hit_confirmer_patch()  # idempotent
+    assert (
+        engine_core.EngineCore.__init__ is not engine_core._tt_original_engine_core_init
+    )
+
+    class FakeEngine:
+        def __init__(self, enable_prefix_caching, confirmer):
+            self.vllm_config = SimpleNamespace(
+                cache_config=SimpleNamespace(
+                    enable_prefix_caching=enable_prefix_caching
+                )
+            )
+            self.scheduler = SimpleNamespace(installed=[])
+            self.scheduler.set_prefix_hit_confirmer = self.scheduler.installed.append
+            self.model_executor = SimpleNamespace(
+                collective_rpc=lambda name: [confirmer]
+            )
+            engine_core.EngineCore.__init__(self)
+
+    fn = lambda ids, mm_items, n: n  # noqa: E731
+    assert FakeEngine(True, fn).scheduler.installed == [fn]
+    assert FakeEngine(True, None).scheduler.installed == []
+    assert FakeEngine(False, fn).scheduler.installed == []

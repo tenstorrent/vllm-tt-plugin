@@ -1210,6 +1210,13 @@ def _install_prefix_hit_confirmer_patch() -> None:
     on the scheduler through ``set_prefix_hit_confirmer`` (a lane coordinator
     fans it out to its lanes). In-process executors only: the bound method
     crosses no process boundary. ``EngineCoreProc`` inherits the constructor.
+
+    Installed from the platform's load hooks, before any engine exists: the
+    config-time install alone came too late in the engine-core process, whose
+    platform check runs inside ``EngineCore.__init__`` (the wrapper then
+    missed that construction; served GLM-5.3-Flash 2026-10-29). The wrapper
+    does nothing for an engine whose prefix cache is off, and the worker
+    answers None for a model without the capability.
     """
     import vllm.v1.engine.core as engine_core
 
@@ -1220,6 +1227,9 @@ def _install_prefix_hit_confirmer_patch() -> None:
 
     def init_tt(self, *args, **kwargs):
         original(self, *args, **kwargs)
+        cache_config = getattr(getattr(self, "vllm_config", None), "cache_config", None)
+        if not getattr(cache_config, "enable_prefix_caching", False):
+            return
         setter = getattr(self.scheduler, "set_prefix_hit_confirmer", None)
         if setter is None:
             return
@@ -1723,6 +1733,7 @@ class TTPlatform(Platform):
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
         _install_tt_async_spec_method_patch()
+        _install_prefix_hit_confirmer_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
@@ -1806,6 +1817,7 @@ class TTPlatform(Platform):
         # that reaches configuration without the CLI path: a second engine, or
         # a direct VllmConfig construction, then finds the gate patched.
         _install_tt_async_spec_method_patch()
+        _install_prefix_hit_confirmer_patch()
         _warn_unpatched_async_spec_gate(vllm_config)
         # A config without a model starts no engine (vLLM builds one as a default
         # and in tests), so there is nothing to resolve, and it must not take the

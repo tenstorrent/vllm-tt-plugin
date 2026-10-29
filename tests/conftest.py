@@ -61,6 +61,10 @@ def reset_tt_platform_class_state():
     saved_original_pause_scheduler = engine_core.__dict__.get(
         "_tt_original_pause_scheduler", unset
     )
+    saved_engine_core_init = engine_core.EngineCore.__init__
+    saved_original_engine_core_init = engine_core.__dict__.get(
+        "_tt_original_engine_core_init", unset
+    )
 
     yield
 
@@ -85,6 +89,11 @@ def reset_tt_platform_class_state():
         engine_core.__dict__.pop("_tt_original_pause_scheduler", None)
     else:
         engine_core._tt_original_pause_scheduler = saved_original_pause_scheduler
+    engine_core.EngineCore.__init__ = saved_engine_core_init
+    if saved_original_engine_core_init is unset:
+        engine_core.__dict__.pop("_tt_original_engine_core_init", None)
+    else:
+        engine_core._tt_original_engine_core_init = saved_original_engine_core_init
 
     async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
     if saved_original_add_streaming_input_request is unset:
