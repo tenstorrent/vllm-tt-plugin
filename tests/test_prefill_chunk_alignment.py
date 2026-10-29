@@ -50,21 +50,37 @@ def test_a_new_request_that_cannot_reach_the_grid_waits_a_step():
     assert s._mamba_block_aligned_split(_request(32612), 100) == 0
 
 
-def test_a_running_request_short_of_the_grid_still_ends_on_a_kv_block():
-    """The next chunk resumes where this one ends, and the model rejects a resume
-    offset off the KV block grid ("cached prefill start ... must be block
-    aligned"), so a short chunk must not be kept whole."""
-    s = _scheduler()
-    # Started unaligned (e.g. before the feature): the first aligned end is
-    # 4224, so a 4096 chunk from 157 shrinks to 4067 ...
-    assert (
-        s._mamba_block_aligned_split(_request(32612, computed=157), 4096) == 4096 - 29
-    )
-    # ... a chunk too short to reach 256 ends on the 192 block instead ...
-    assert s._mamba_block_aligned_split(_request(32612, computed=157), 50) == 35
-    # ... and from a block boundary a chunk shorter than one block waits a step.
+def test_a_running_request_short_of_the_grid_waits_for_a_step_that_reaches_it():
+    """A chunk that ends short of the grid makes the next chunk start off it,
+    which a model aligning its prefill state to the grid cannot resume (the TT
+    mesh's per-row prefill ownership died on a 224-token end after a 128-token
+    prefix-cache hit under a 256 alignment). A running request offered less
+    than a full step therefore waits, like a new one; a full step always
+    reaches the grid (the cap is validated to be at least the alignment)."""
+    s = _scheduler(alignment=256)
+    # a prefix-cache hit at 128 (off the grid) reaches it with a full chunk ...
+    assert s._mamba_block_aligned_split(_request(65536, computed=128), 16384) == 16256
+    # ... but a leftover-budget chunk ending at 224 waits, never ending on a block
+    assert s._mamba_block_aligned_split(_request(65536, computed=128), 96) == 0
     assert s._mamba_block_aligned_split(_request(32612, computed=192), 50) == 0
     assert s._mamba_block_aligned_split(_request(32612, computed=192), 64) == 64
+
+
+def test_under_a_permanent_cap_below_the_grid_a_request_still_makes_progress():
+    """When no step can reach the grid (a cap below the alignment, which
+    ``_validate_prefill_chunk_alignment`` rejects at init but a config can
+    bypass), a running request ends on a KV block and a new one takes its
+    offer, so prefill never stalls."""
+    s = _scheduler(alignment=256)
+    s.scheduler_config = SimpleNamespace(
+        max_num_scheduled_tokens=None,
+        max_num_batched_tokens=100,
+        long_prefill_token_threshold=0,
+    )
+    # from 157 a 100-token offer ends on the 256 block (64-token blocks)
+    assert s._mamba_block_aligned_split(_request(32612, computed=157), 100) == 99
+    assert s._mamba_block_aligned_split(_request(32612, computed=192), 50) == 0
+    assert s._mamba_block_aligned_split(_request(32612), 100) == 100
 
 
 def test_the_chunk_that_finishes_the_prompt_is_left_alone():
@@ -80,8 +96,9 @@ def test_a_resumed_replay_past_the_prompt_stays_on_the_grid():
     resumed = SimpleNamespace(
         num_prompt_tokens=128, num_tokens=300, num_computed_tokens=128, mm_features=[]
     )
-    assert s._mamba_block_aligned_split(resumed, 100) == 64
-    assert s._mamba_block_aligned_split(resumed, 172) == 172
+    assert s._mamba_block_aligned_split(resumed, 100) == 0  # 228: short of the grid
+    assert s._mamba_block_aligned_split(resumed, 128) == 128  # ends on the grid
+    assert s._mamba_block_aligned_split(resumed, 172) == 172  # the sequence's end
 
 
 def test_decode_and_multimodal_requests_are_untouched():

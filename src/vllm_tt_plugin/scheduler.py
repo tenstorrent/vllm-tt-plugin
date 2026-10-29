@@ -766,9 +766,13 @@ class TTScheduler(AsyncScheduler):
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
         Chunks that finish the prompt, decode steps and multimodal prompts are
-        left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request that cannot reach the grid ends its
-        chunk on a KV block instead, and waits a step if that is empty too.
+        left alone. A request whose aligned chunk would be empty waits for the
+        next step when this step's leftover budget is what stopped it (a full
+        step reaches the grid from any start: the per-step cap is validated to
+        be at least the alignment). Only when a full step cannot reach the grid
+        does it make progress anyway: a running request ends its chunk on a KV
+        block (the model takes a resume offset on a block boundary), a new one
+        takes what it was offered.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if align <= 1 or num_new_tokens <= 0:
@@ -784,19 +788,26 @@ class TTScheduler(AsyncScheduler):
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
+            if num_new_tokens < self._full_step_prefill_cap():
+                # This step's leftover budget is what stopped the request: it
+                # waits for a step whose budget reaches the grid. A chunk that
+                # ends short of the grid would make the next chunk start off
+                # it, which a model aligning its prefill state to the grid
+                # (per-row prefill ownership on the TT mesh) cannot resume: a
+                # 96-token chunk after a 128-token prefix-cache hit under a
+                # 256 alignment ended at 224 and the next chunk's start killed
+                # the engine.
+                return 0
             if start != 0:
-                # The next chunk resumes where this one ends, and the model
-                # takes a resume offset only on a KV block boundary. A running
-                # request whose chunk cannot reach the grid still ends on a
-                # block, or waits for the next step's budget.
+                # A full step cannot reach the grid from here (a permanent cap
+                # below the alignment): the next chunk resumes where this one
+                # ends, and the model takes a resume offset only on a KV block
+                # boundary, so the chunk ends on a block (or waits if that is
+                # empty too).
                 block = self.block_size
                 return max(end // block * block - start, 0)
-            # A new request waits only when this step's leftover budget is what
-            # stopped it. If a full step could not reach the grid either (a
-            # permanent cap below the alignment), it must still make progress.
-            return (
-                0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
-            )
+            # A new request under such a cap must still make progress.
+            return num_new_tokens
         return aligned_end - start
 
     def _full_step_prefill_cap(self) -> int:
