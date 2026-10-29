@@ -131,6 +131,7 @@ transition are still represented by `slot_remap`.
 | Chunked-prefill continuation | reload | no | reload on device | reset on device |
 | Speculative verification → ordinary decode | reload | no | reload on device | reset on device |
 | Drafter-answered ordinary decode → ordinary decode | reload | no | reload on device | reset on device |
+| Decode accepted but its read raised → ordinary decode | reload | no | reload on device | reset on device |
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if allocation changed | keep | keep |

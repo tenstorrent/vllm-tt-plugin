@@ -399,6 +399,7 @@ class _HostAnsweringModel(_VerifyingModel):
     def __init__(self):
         super().__init__()
         self.answer_next_from_host = False
+        self.refuse_next_read = False
 
     def decode_forward(self, **kwargs):
         if kwargs.get("spec_mode") is None and self.answer_next_from_host:
@@ -411,6 +412,9 @@ class _HostAnsweringModel(_VerifyingModel):
         return out
 
     def read_decode_output(self, tt_out, async_read=False):
+        if self.refuse_next_read:
+            self.refuse_next_read = False
+            raise RuntimeError("read refused")
         if isinstance(tt_out, torch.Tensor):
             return (tt_out, []) if async_read else tt_out
         if async_read:
@@ -481,6 +485,39 @@ def test_submit_decode_reloads_the_plain_decode_after_a_host_answered_decode():
         (False, False, False),
         # The served step itself was planned before its answer was known.
         (False, False, False),
+        (True, True, True),
+        (False, False, False),
+    ]
+
+
+def test_a_read_the_model_refuses_invalidates_the_chain():
+    """A decode the model accepted but whose read raised commits nothing.
+
+    The device may have run the step and fed its resident inputs, while the
+    host never applied the answer. Keeping the previous chain would plan the
+    next decode steady over that gap; instead the chain and the transition
+    flags are dropped before the error propagates, so the next decode reloads
+    from host inputs (with the sampling reset a new chain carries) and the one
+    after is steady again. Host-answered state does not survive the failure.
+    """
+    controller, model = _host_answering_controller(speculative_tokens=5)
+    _submit_async(controller)
+    model.answer_next_from_host = True
+    _submit_async(controller)
+    model.refuse_next_read = True
+    with pytest.raises(RuntimeError, match="read refused"):
+        _submit_async(controller)
+    after_failure = _submit_async(controller)
+    steady = _submit_async(controller)
+
+    assert not after_failure.host_answered and after_failure.read_events == ["read"]
+    assert not steady.host_answered
+    assert _commands(model) == [
+        (True, True, True),
+        (False, False, False),
+        # The step after the host answer reloaded as planned; its read raised.
+        (True, True, True),
+        # The decode after the refused read reloads again: nothing committed.
         (True, True, True),
         (False, False, False),
     ]

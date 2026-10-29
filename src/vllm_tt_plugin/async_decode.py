@@ -1431,31 +1431,43 @@ class TTAsyncDecodeController:
         runner.note_decode_layout_consumed()
         runner.note_decode_state_slots_settled()
         read_events = None
-        if async_read:
-            if hasattr(runner.model, "read_decode_output"):
-                tt_out, read_events = cast(
-                    tuple[Any, list[Any]],
-                    runner.model.read_decode_output(
-                        tt_out,
-                        async_read=True,
-                        **(
-                            {"sample_rows": list(readback_rows)}
-                            if readback_rows is not None
-                            else {}
+        try:
+            if async_read:
+                if hasattr(runner.model, "read_decode_output"):
+                    tt_out, read_events = cast(
+                        tuple[Any, list[Any]],
+                        runner.model.read_decode_output(
+                            tt_out,
+                            async_read=True,
+                            **(
+                                {"sample_rows": list(readback_rows)}
+                                if readback_rows is not None
+                                else {}
+                            ),
                         ),
-                    ),
-                )
-            else:
-                is_host_tensor = isinstance(tt_out, torch.Tensor)
-                is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                    tensor is None or isinstance(tensor, torch.Tensor)
-                    for tensor in tt_out
-                )
-                if not (is_host_tensor or is_host_tensor_tuple):
-                    raise AttributeError(
-                        "TT model must implement read_decode_output() "
-                        "unless decode_forward() already returns host tensors"
                     )
+                else:
+                    is_host_tensor = isinstance(tt_out, torch.Tensor)
+                    is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
+                        tensor is None or isinstance(tensor, torch.Tensor)
+                        for tensor in tt_out
+                    )
+                    if not (is_host_tensor or is_host_tensor_tuple):
+                        raise AttributeError(
+                            "TT model must implement read_decode_output() "
+                            "unless decode_forward() already returns host tensors"
+                        )
+        except Exception:
+            # The model accepted the decode, so its device may have run the
+            # step and fed the resident inputs, but the answer never reached
+            # the host and nothing below commits it. The chain and the
+            # transition flags of the previous submission are dropped so the
+            # next decode is planned as a reload from host inputs, not as a
+            # steady step over a state the host never applied.
+            self._decode_chain_valid = False
+            self._previous_submission_verified = False
+            self._previous_submission_host_answered = False
+            raise
         # An ordinary decode a speculating model answered from the host
         # (SPEC_DECODE_CONTRACT.md section 4d): host ids with nothing to read,
         # on a submission whose device output the runner would otherwise read
