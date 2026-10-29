@@ -9,7 +9,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
-
 from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.sched_interleave import InterleavePolicy
@@ -35,6 +34,7 @@ class TTSchedulingMode(Enum):
 # of the token budget (the V4.1 generator's chunk): ``_schedule_prefill_only``
 # admits one new prefill a step and advances a partial prefill alone.
 ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
+
 
 
 class TTScheduler(AsyncScheduler):
@@ -96,21 +96,13 @@ class TTScheduler(AsyncScheduler):
         model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
         self._aligned_chunks = model_type in ALIGNED_CHUNK_MODEL_TYPES
         # TT_SCHED_INTERLEAVE (sched_interleave): decode bursts between
-        # prefills in default mode; None unless the variable is set.
-        self._interleave = InterleavePolicy.from_env()
+        # prefills in default mode; None unless the variable is set. Its
+        # max_prompt=chunk is the token budget (one chunk: 5,120 served).
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        chunk = getattr(scheduler_config, "max_num_batched_tokens", None)
+        self._interleave = InterleavePolicy.from_env(chunk_tokens=chunk)
         if self._interleave is not None:
-            logger.info(
-                "TT scheduler interleaving: every %d completed prefill(s), "
-                "burst %d, ready >= %d, max_prompt %s, queue %s, split %s, "
-                "work_ms %s",
-                self._interleave.every,
-                self._interleave.burst,
-                self._interleave.ready,
-                self._interleave.max_prompt,
-                self._interleave.queue,
-                self._interleave.split,
-                self._interleave.work_ms,
-            )
+            logger.info("TT scheduler interleaving: %s", self._interleave.describe())
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode

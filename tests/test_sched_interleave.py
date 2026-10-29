@@ -8,10 +8,8 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
-
 from vllm_tt_plugin.sched_interleave import InterleavePolicy, parse_spec
 from vllm_tt_plugin.scheduler import TTScheduler, TTSchedulingMode
-
 
 # --- the spec -----------------------------------------------------------------
 
@@ -46,6 +44,23 @@ def test_bad_values_rejected():
         InterleavePolicy(every=0)
     with pytest.raises(ValueError):
         InterleavePolicy(burst=0)
+
+
+def test_max_prompt_chunk_is_the_token_budget():
+    assert parse_spec("every=4,max_prompt=chunk") == {
+        "every": 4,
+        "max_prompt": "chunk",
+    }
+    env = {"TT_SCHED_INTERLEAVE": "every=4,max_prompt=chunk"}
+    policy = InterleavePolicy.from_env(env, chunk_tokens=5120)
+    assert policy is not None and policy.max_prompt == 5120
+    assert "max_prompt 5120 prompt tokens" in policy.describe()
+    with pytest.raises(ValueError, match="token budget"):
+        InterleavePolicy.from_env(env)
+    explicit = InterleavePolicy.from_env(
+        {"TT_SCHED_INTERLEAVE": "every=4,max_prompt=5120"}
+    )
+    assert explicit is not None and explicit.max_prompt == 5120
 
 
 # --- the policy's accounting ----------------------------------------------------
@@ -329,3 +344,133 @@ def test_decode_only_step_never_schedules_a_partial(monkeypatch):
     with pytest.raises(AssertionError, match="partial prefill"):
         scheduler._schedule_decode_only()
     assert partial in scheduler.running, "restored even on the assertion"
+
+
+# --- a closed loop of steps through the hook ---------------------------------------
+#
+# The stand-ins below drive ``TTScheduler.schedule`` through a sequence of steps
+# the way the engine does, with ``_schedule_prefill_only`` and
+# ``_schedule_decode_only`` replaced by mocks that keep the requests' computed
+# counts: a prefill step takes the partial prefill, else the head of the queue,
+# and advances it by one chunk (5,120 tokens); a decode step advances every
+# ready decoder by one token. The trace is one letter a step: ``P`` or ``D``.
+
+CHUNK = 5120
+
+
+def _lreq(req_id, prompt, computed):
+    return SimpleNamespace(
+        request_id=req_id,
+        num_prompt_tokens=prompt,
+        num_computed_tokens=computed,
+        is_prefill_chunk=computed < prompt,
+    )
+
+
+def _loop(scheduler, monkeypatch):
+    def prefill():
+        partial = next((r for r in scheduler.running if r.is_prefill_chunk), None)
+        if partial is None:
+            if not scheduler.waiting:
+                return SchedulerOutput.make_empty()
+            partial = scheduler.waiting.pop_request()
+            scheduler.running.append(partial)
+        n = min(CHUNK, partial.num_prompt_tokens - partial.num_computed_tokens)
+        partial.num_computed_tokens += n
+        partial.is_prefill_chunk = (
+            partial.num_computed_tokens < partial.num_prompt_tokens
+        )
+        return _scheduled({partial.request_id: n})
+
+    def decode():
+        rows = {}
+        for r in scheduler.running:
+            if not r.is_prefill_chunk:
+                r.num_computed_tokens += 1
+                rows[r.request_id] = 1
+        return _scheduled(rows) if rows else SchedulerOutput.make_empty()
+
+    monkeypatch.setattr(scheduler, "_schedule_prefill_only", prefill)
+    monkeypatch.setattr(scheduler, "_schedule_decode_only", decode)
+
+    def trace(steps):
+        out = []
+        for _ in range(steps):
+            if not scheduler._has_pending_prefill():
+                break
+            result = scheduler.schedule()
+            kinds = set()
+            for req_id, n in result.num_scheduled_tokens.items():
+                request = scheduler.requests[req_id]
+                decode = (
+                    n == 1 and request.num_computed_tokens > request.num_prompt_tokens
+                )
+                kinds.add("D" if decode else "P")
+            assert len(kinds) == 1, "a TT step is all-prefill or all-decode"
+            out.append(kinds.pop())
+        return "".join(out)
+
+    return trace
+
+
+def _closed_loop(prompts, *, decoders=1, policy):
+    """A scheduler with ``decoders`` ready decode rows running and ``prompts``
+    (a list of prompt lengths) waiting, in order."""
+    running = [_lreq(f"d{i}", 1028, 1040) for i in range(decoders)]
+    waiting = [_lreq(f"w{i}", p, 0) for i, p in enumerate(prompts)]
+    scheduler = _scheduler(running=running, waiting=waiting, policy=policy)
+    scheduler.requests = {r.request_id: r for r in running + waiting}
+    return scheduler
+
+
+def test_closed_loop_unset_is_prefill_first(monkeypatch):
+    scheduler = _closed_loop([1028] * 8, policy=None)
+    trace = _loop(scheduler, monkeypatch)
+    assert trace(100) == "P" * 8, "no decode step while anything waits"
+
+
+def test_closed_loop_every_4_bursts_once_per_four_prompts(monkeypatch):
+    scheduler = _closed_loop([1028] * 8, policy=InterleavePolicy(every=4))
+    trace = _loop(scheduler, monkeypatch)
+    assert trace(100) == "PPPPDPPPP"
+    assert scheduler._interleave.bursts == 1
+    assert scheduler._interleave.completed == 4, (
+        "a burst is owed at the next schedule()"
+    )
+
+
+def test_closed_loop_long_prompts_are_inert_under_max_prompt(monkeypatch):
+    """The length-aware off switch: a run of prompts longer than one chunk (the
+    8K to 1M c32 benchmark points) is scheduled exactly as with the flag
+    unset, chunk after chunk with no burst, while decoders are ready."""
+    long = [8196] * 8  # two chunks each
+    baseline = _loop(_closed_loop(long, decoders=4, policy=None), monkeypatch)(100)
+    policy = InterleavePolicy(every=4, max_prompt=CHUNK)
+    scheduler = _closed_loop(long, decoders=4, policy=policy)
+    assert _loop(scheduler, monkeypatch)(100) == baseline == "P" * 16
+    assert policy.bursts == 0 and policy.completed == 8, "counted, never fired"
+
+
+def test_closed_loop_without_max_prompt_long_prompts_do_burst(monkeypatch):
+    scheduler = _closed_loop([8196] * 8, decoders=4, policy=InterleavePolicy(every=4))
+    assert _loop(scheduler, monkeypatch)(100) == "P" * 8 + "D" + "P" * 8
+    assert scheduler._interleave.bursts == 1, "every counts prompts, not chunks"
+
+
+def test_closed_loop_mixed_lengths_under_max_prompt(monkeypatch):
+    """Four short prompts complete, a long one is at the head: the gate holds
+    the burst until the long prompt's chunks are done (it is never split),
+    then the burst fires before the next short prompt."""
+    policy = InterleavePolicy(every=4, max_prompt=CHUNK)
+    scheduler = _closed_loop([1028] * 4 + [8196] + [1028] * 4, policy=policy)
+    assert _loop(scheduler, monkeypatch)(100) == "PPPP" + "PP" + "D" + "PPPP"
+    assert policy.bursts == 1
+
+
+def test_closed_loop_short_chunk_prompts_still_burst_under_max_prompt(monkeypatch):
+    """The served short points (1,028 / 2,052 / 4,100 tokens: one call each)
+    keep the every=4 schedule with the switch on."""
+    for prompt in (1028, 2052, 4100):
+        policy = InterleavePolicy(every=4, max_prompt=CHUNK)
+        scheduler = _closed_loop([prompt] * 8, policy=policy)
+        assert _loop(scheduler, monkeypatch)(100) == "PPPPDPPPP", prompt

@@ -20,7 +20,12 @@ The spec is ``k=v`` pairs separated by commas (a bare integer is ``burst``):
 - ``burst=K`` (default 1): decode steps per burst;
 - ``ready=R`` (default 1): at least ``R`` running decode requests;
 - ``max_prompt=T``: no burst while the next prefill work (the partial prefill,
-  else the head of the waiting queue) is longer than ``T`` prompt tokens;
+  else the head of the waiting queue) is longer than ``T`` prompt tokens: the
+  length-aware off switch. ``T`` equal to the token budget (``max_prompt=chunk``
+  resolves to ``scheduler_config.max_num_batched_tokens``, 5,120 served) keeps
+  the bursts to one-call prompts: a prompt that needs several chunks is never
+  interrupted, and a run of such prompts (a long-context benchmark point) is
+  scheduled exactly as with the variable unset;
 - ``queue=Q``: a burst after every completed prompt while the waiting queue
   holds at most ``Q`` requests, ``every`` otherwise; ``split``: a burst once
   half the queue seen at the start of the prefill run has been prefilled;
@@ -49,10 +54,11 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 ENV = "TT_SCHED_INTERLEAVE"
+CHUNK = "chunk"  # max_prompt=chunk: the scheduler's token budget
 
 
-def parse_spec(spec: str) -> dict[str, int | float | bool]:
-    out: dict[str, int | float | bool] = {}
+def parse_spec(spec: str) -> dict[str, int | float | bool | str]:
+    out: dict[str, int | float | bool | str] = {}
     for item in filter(None, (s.strip() for s in spec.split(","))):
         if "=" not in item:
             if item == "split":
@@ -66,6 +72,8 @@ def parse_spec(spec: str) -> dict[str, int | float | bool]:
             out[key] = float(value)
         elif key == "split":
             out[key] = value.strip().lower() in ("1", "true", "yes")
+        elif key == "max_prompt" and value.strip() == CHUNK:
+            out[key] = CHUNK
         elif key in ("every", "burst", "ready", "max_prompt", "queue"):
             out[key] = int(value)
         else:
@@ -105,11 +113,32 @@ class InterleavePolicy:
         self.steps = 0  # decode steps taken inside bursts (diagnostics)
 
     @classmethod
-    def from_env(cls, environ: dict[str, str] | None = None) -> InterleavePolicy | None:
+    def from_env(
+        cls,
+        environ: dict[str, str] | None = None,
+        chunk_tokens: int | None = None,
+    ) -> InterleavePolicy | None:
+        """The policy of ``TT_SCHED_INTERLEAVE``, or ``None`` when it is unset,
+        empty or ``0``. ``chunk_tokens`` is what ``max_prompt=chunk`` resolves
+        to (the scheduler's token budget); the alias without it is an error."""
         spec = (environ if environ is not None else os.environ).get(ENV)
         if spec is None or spec.strip() in ("", "0"):
             return None
-        return cls(**parse_spec(spec))  # type: ignore[arg-type]
+        kwargs = parse_spec(spec)
+        if kwargs.get("max_prompt") == CHUNK:
+            if chunk_tokens is None:
+                raise ValueError(f"{ENV}: max_prompt=chunk needs the token budget")
+            kwargs["max_prompt"] = int(chunk_tokens)
+        return cls(**kwargs)  # type: ignore[arg-type]
+
+    def describe(self) -> str:
+        """The parameters as one line (the scheduler logs it at start-up)."""
+        gate = "none" if self.max_prompt is None else f"{self.max_prompt} prompt tokens"
+        return (
+            f"every {self.every} completed prefill(s), burst {self.burst}, "
+            f"ready >= {self.ready}, max_prompt {gate}, queue {self.queue}, "
+            f"split {self.split}, work_ms {self.work_ms}"
+        )
 
     # --- the hooks ---------------------------------------------------------
 
