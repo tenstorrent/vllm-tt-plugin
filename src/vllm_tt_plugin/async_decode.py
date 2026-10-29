@@ -38,6 +38,9 @@ from vllm_tt_plugin.spec_decode import (
     VerifyOutput,
 )
 from vllm_tt_plugin.spec_device_logprobs import device_logprob_stats
+from vllm_tt_plugin.spec_device_penalties import device_penalty_stats
+from vllm_tt_plugin.spec_masks import device_mask_stats
+from vllm_tt_plugin.spec_specials import count_step_specials, specials_report
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
@@ -108,6 +111,14 @@ logger = init_tt_logger(__name__)
 # with no device work, so 128 is a fraction of a second.
 _SUBMISSION_LOG_INTERVAL = 128
 
+# The ``spec_specials`` path name of each accept mode; no mode is an ordinary decode.
+_SPECIALS_PATHS = {
+    ACCEPT_MODE_FUSED_SAMPLE: "fused",
+    ACCEPT_MODE_LOGITS: "logits",
+    ACCEPT_MODE_TOPK: "topk",
+    ACCEPT_MODE_ARGMAX_IDS: "ids",
+}
+
 
 @dataclass(frozen=True)
 class TTDecodeSubmission:
@@ -129,6 +140,10 @@ class TTDecodeSubmission:
     readback_rows: tuple[int, ...] | None = None
     # A stage model's stage frames from this forward, popped right after it.
     stage_outputs: dict[str, TTStageFrame] | None = None
+    # A masked fused verify (``TTModelInput.spec_mask``) after its first half:
+    # the model has the forward but not the token mask, so nothing may read it
+    # until ``finish_masked_decode``.
+    mask_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -411,6 +426,13 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
             self._model_input,
             grammar_bitmask=[bitmask],
             num_valid_drafts=num_valid_drafts,
+        )
+
+    def finish_masked_step(self, mask: torch.Tensor | None) -> None:
+        """Second half of a masked step, on the engine thread, before the
+        output is handed to anything that can read it."""
+        self._submission = self._controller.finish_masked_decode(
+            self._submission, mask, async_read=True
         )
 
     def _get_output_impl(self) -> ModelRunnerOutput:
@@ -1018,6 +1040,7 @@ class TTAsyncDecodeController:
                 self._valid_drafts_submitted += int(
                     model_input.num_valid_drafts[:live].sum()
                 )
+        self._count_step_specials(model_input)
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
             # Parsed by tests/tt/spec/bench_spec_overhead.py and
@@ -1045,8 +1068,29 @@ class TTAsyncDecodeController:
                 self._accepted_drafts,
                 self._verify_rows,
                 self._chain_report(),
-                self._device_logprobs_report(),
+                self._device_logprobs_report()
+                + self._device_penalties_report()
+                + self._device_masks_report(),
             )
+            # One line per worker for the production mix of special requests,
+            # parsed by tests/spec/_specials_parse.py.
+            logger.info(specials_report())
+
+    def _count_step_specials(self, model_input: TTModelInput) -> None:
+        """Count this step once per special feature a row carries, by path.
+
+        The features were classified when each request was admitted
+        (``TTCachedRequestState.specials``); this only takes their union over
+        the step's rows."""
+        requests = getattr(self.runner, "requests", None) or {}
+        features: set[str] = set()
+        for req_id in getattr(model_input, "row_req_ids", None) or ():
+            state = requests.get(req_id)
+            if state is not None:
+                features.update(getattr(state, "specials", ()))
+        count_step_specials(
+            _SPECIALS_PATHS.get(model_input.spec_mode, "plain"), features
+        )
 
     @staticmethod
     def _device_logprobs_report() -> str:
@@ -1058,6 +1102,32 @@ class TTAsyncDecodeController:
             f"; device logprobs: {stats['steps']} steps, "
             f"{stats['rank_lower_bound']} rank lower bounds, "
             f"{stats['missing_id']} missing ids"
+        )
+
+    @staticmethod
+    def _device_masks_report() -> str:
+        """The device-mask counters for the submission line (empty before any)."""
+        stats = device_mask_stats()
+        if not stats["steps"] and not stats["fallbacks"]:
+            return ""
+        reasons = ", ".join(
+            f"{reason}={count}" for reason, count in sorted(stats["fallbacks"].items())
+        )
+        return (
+            f"; device masks: {stats['steps']} steps, {stats['rows']} masked rows, "
+            f"{sum(stats['fallbacks'].values())} logits fallbacks"
+            + (f" ({reasons})" if reasons else "")
+        )
+
+    @staticmethod
+    def _device_penalties_report() -> str:
+        """The device-penalty counters for the submission line (empty before any)."""
+        stats = device_penalty_stats()
+        if not stats["steps"]:
+            return ""
+        return (
+            f"; device penalties: {stats['steps']} steps, "
+            f"{stats['rebuilds']} state rebuilds"
         )
 
     def _chain_report(self) -> str:
@@ -1612,8 +1682,13 @@ class TTAsyncDecodeController:
             handle = self._deferred_handle(submission)
             tip = getattr(handle, "tip_id", None)
             chained = model_input.chain_rows is not None
-            if handle is None or tip is None:
-                # Not chainable: nothing may be built over it, as before.
+            if (
+                handle is None
+                or tip is None
+                or getattr(submission, "mask_pending", False)
+            ):
+                # Not chainable: nothing may be built over it, as before. A
+                # masked step is never chained, so it is not a chain tip.
                 self._last_fused_step = None
                 self._last_fused_tip = None
                 self._last_fused_rows = ()
@@ -1776,6 +1851,11 @@ class TTAsyncDecodeController:
                 getattr(runner, "_spec_plan", None),
                 vocab_size=getattr(runner, "vocab_size", None),
                 device_top_p=getattr(runner, "_spec_device_top_p", False),
+                penalty_tracker=(
+                    runner._spec_penalty_tracker
+                    if getattr(runner, "_spec_device_penalties", False)
+                    else None
+                ),
             )
             if spec_sampling is not None:
                 kwargs["spec_sampling"] = spec_sampling
@@ -1877,7 +1957,21 @@ class TTAsyncDecodeController:
             runner.previous_req_ids = set(runner.input_batch.req_ids)
 
         enable_trace = runner.trace_mode in ["all", "decode_only"]
-        tt_out = runner.model.decode_forward(
+        # A masked step takes the model's first half here and its second half in
+        # ``finish_masked_decode``, once the sample-time mask exists.
+        split = getattr(model_input, "spec_mask", None) is not None
+        decode = (
+            getattr(runner.model, "decode_forward_begin", None)
+            if split
+            else runner.model.decode_forward
+        )
+        if decode is None:
+            raise AttributeError(
+                f"TT model {type(runner.model).__name__} declares "
+                "supports_spec_device_mask but has no decode_forward_begin / "
+                "decode_forward_finish"
+            )
+        tt_out = decode(
             **kwargs,
             **enc_dec_kwargs,
             enable_trace=enable_trace,
@@ -1966,6 +2060,43 @@ class TTAsyncDecodeController:
             spec_hidden=spec_hidden,
             readback_rows=readback_rows,
             stage_outputs=stage_outputs,
+            mask_pending=split,
+        )
+
+    def finish_masked_decode(
+        self,
+        submission: TTDecodeSubmission,
+        mask: torch.Tensor | None,
+        *,
+        async_read: bool,
+    ) -> TTDecodeSubmission:
+        """The second half of a masked fused verify: hand the model the mask.
+
+        ``mask`` is int32 ``[rows, 1+K, W]`` (``spec_masks.step_mask``) or None
+        for a step no row of which ended up constrained. The model enqueues the
+        rest of the step. With ``defer_read`` (the first half asked for it) the
+        result is the same handle, now readable by the reader thread; otherwise
+        it is the verify's host output. Either way the submission is what
+        ``submit_decode`` would have returned for a one-call step."""
+        if not submission.mask_pending:
+            raise RuntimeError(
+                "finish_masked_decode: the submission is not a pending masked step"
+            )
+        model = self.runner.model
+        out = model.decode_forward_finish(submission.tt_out, mask)
+        tt_out = _verify_output_tensor(
+            out, type(model).__name__, ACCEPT_MODE_FUSED_SAMPLE
+        )
+        deferred = out.handle is not None and out.accepted_token_ids is None
+        read_events = None
+        if async_read and not deferred and hasattr(model, "read_decode_output"):
+            tt_out, read_events = model.read_decode_output(tt_out, async_read=True)
+        return replace(
+            submission,
+            tt_out=tt_out,
+            read_events=read_events,
+            spec_hidden=out.handle if out.handle is not None else out.hidden,
+            mask_pending=False,
         )
 
     def complete_deferred_device_sampling(
@@ -2089,6 +2220,11 @@ class TTAsyncDecodeController:
         if submission.deferred_device_sampling:
             raise RuntimeError(
                 "cannot finalize decode logits before deferred device sampling"
+            )
+        if getattr(submission, "mask_pending", False):
+            raise RuntimeError(
+                "cannot read a masked fused verify before its mask finish "
+                "(decode_forward_finish)"
             )
 
         if self._deferred_handle(submission) is not None:

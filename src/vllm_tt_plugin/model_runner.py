@@ -75,7 +75,11 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import get_tt_finishing_req_ids, get_tt_reasoning_start
+from vllm_tt_plugin.scheduler import (
+    get_tt_finishing_req_ids,
+    get_tt_forced_reset_discard_counts,
+    get_tt_reasoning_start,
+)
 from vllm_tt_plugin.spec_accept import (
     AcceptResult,
     SpecPenalties,
@@ -86,6 +90,8 @@ from vllm_tt_plugin.spec_accept import (
     device_topk_enabled,
     fused_sample_enabled,
     fused_sampled_enabled,
+    has_mask_control,
+    mask_row_refusal,
     params_fused_servable,
     params_support_servable,
     predraw_uniforms,
@@ -106,6 +112,20 @@ from vllm_tt_plugin.spec_decode import (
     accept_greedy_drafts,
 )
 from vllm_tt_plugin.spec_device_logprobs import device_spec_logprobs
+from vllm_tt_plugin.spec_device_penalties import (
+    SpecPenaltyTracker,
+    device_penalties,
+    non_neutral_rows,
+)
+from vllm_tt_plugin.spec_masks import (
+    SpecMaskCache,
+    SpecMaskPlan,
+    count_mask_fallback,
+    count_mask_step,
+    mask_plan_for_step,
+    step_mask,
+)
+from vllm_tt_plugin.spec_specials import count_logits_reason, logits_reason
 from vllm_tt_plugin.stage_outputs import TTStageFrame, set_tt_stage_outputs
 from vllm_tt_plugin.structured_output import (
     ReasoningPhase,
@@ -296,12 +316,19 @@ def _spec_row_params(
     )
 
 
+def _per_live_row(values: Any, live: int, dtype: torch.dtype) -> torch.Tensor:
+    """A per-row sampling parameter of the ``live`` rows, copied (a scalar spreads)."""
+    tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
+    return tensor.expand(live).clone() if tensor.numel() == 1 else tensor[:live].clone()
+
+
 def fused_spec_sampling(
     model_input: TTModelInput,
     plan: Any,
     *,
     vocab_size: int | None = None,
     device_top_p: bool = False,
+    penalty_tracker: SpecPenaltyTracker | None = None,
 ) -> dict[str, Any] | None:
     """The ``spec_sampling`` kwarg of a ``fused_sample`` verify.
 
@@ -323,6 +350,18 @@ def fused_spec_sampling(
     padding row, else the row's top-N. The key is absent otherwise, so a
     step without one is built as before.
 
+    With a ``penalty_tracker`` (the model declares
+    ``supports_spec_device_penalties``) a step with a penalty row also carries
+    ``penalties`` (``spec_device_penalties.device_penalties``). The model takes
+    the argmax of the main trace before it applies penalties, so a greedy
+    penalty row is sent as a sampled row with temperature 1, top_k 1 and top_p 0:
+    it keeps the first candidate, which is the argmax of the penalized logits.
+    A step with a penalty row is never "no sampling", even when every row is
+    greedy, and draws no uniforms for a greedy row. The same holds for a masked
+    step (``model_input.spec_mask``), except that its greedy rows stay greedy:
+    the model rewrites a greedy row that has a constrained mask row at the
+    finish, when it knows the mask.
+
     Top_k off is ``vocab_size``: the input batch normalises it. With
     ``device_top_p`` a sampled row at ``vocab_size`` is sent as 0, the model's
     "whole vocabulary" for the top-p certificate; ``_spec_mode_for_step`` admits
@@ -332,7 +371,35 @@ def fused_spec_sampling(
     temperature, top_k, top_p = _spec_row_params(model_input)
     sampled = temperature > 0.0
     wants_logprobs = model_input.max_num_logprobs[0] is not None
-    if not bool(sampled.any()) and not wants_logprobs:
+    penalties = None
+    if penalty_tracker is not None:
+        params = model_input.tt_sampling_params
+        penalties = device_penalties(
+            penalty_tracker,
+            list(model_input.row_req_ids),
+            _per_live_row(params.repetition_penalty, live, torch.float32),
+            _per_live_row(params.frequency_penalty, live, torch.float32),
+            _per_live_row(params.presence_penalty, live, torch.float32),
+            model_input.prompt_tokens,
+            model_input.output_tokens,
+            chained=model_input.chain_rows is not None,
+            rows=rows,
+        )
+    penalized = torch.zeros_like(sampled)
+    if penalties is not None:
+        penalized = non_neutral_rows(
+            penalties["repetition"][:live],
+            penalties["frequency"][:live],
+            penalties["presence"][:live],
+        )
+    # A masked step is submitted in two halves, and the model's first half takes
+    # its sampling controls (``decode_forward_begin``), so it always carries them.
+    if (
+        not bool(sampled.any())
+        and not wants_logprobs
+        and penalties is None
+        and getattr(model_input, "spec_mask", None) is None
+    ):
         return None
     limit = None if plan is None or plan.topk_candidates is None else int(plan.topk_candidates)
     certificate = (
@@ -346,6 +413,16 @@ def fused_spec_sampling(
             "_spec_mode_for_step admits such a row only with top_p below 1"
         )
     top_k = torch.where(certificate, torch.zeros_like(top_k), top_k)
+    if penalties is not None:
+        # Penalties come before the top-k and top-p of the walk, so a greedy
+        # penalty row is a sampled row that keeps one candidate.
+        greedy_penalty = penalized & ~sampled
+        temperature = torch.where(
+            greedy_penalty, torch.ones_like(temperature), temperature
+        )
+        top_k = torch.where(greedy_penalty, torch.ones_like(top_k), top_k)
+        top_p = torch.where(greedy_penalty, torch.zeros_like(top_p), top_p)
+    sent_sampled = sampled | penalized
     if limit is None or bool(
         (sampled & ~certificate & ((top_k < 1) | (top_k > limit - 1))).any()
     ):
@@ -372,11 +449,17 @@ def fused_spec_sampling(
 
     spec_sampling = {
         "temperature": padded(temperature, 0.0, torch.float32),
-        "top_k": padded(torch.where(sampled, top_k, torch.ones_like(top_k)), 1, torch.int32),
-        "top_p": padded(torch.where(sampled, top_p, torch.ones_like(top_p)), 1.0, torch.float32),
-        "greedy": padded(~sampled, True, torch.bool),
+        "top_k": padded(
+            torch.where(sent_sampled, top_k, torch.ones_like(top_k)), 1, torch.int32
+        ),
+        "top_p": padded(
+            torch.where(sent_sampled, top_p, torch.ones_like(top_p)), 1.0, torch.float32
+        ),
+        "greedy": padded(~sent_sampled, True, torch.bool),
         "uniforms": padded(uniforms, 0.0, torch.float32),
     }
+    if penalties is not None:
+        spec_sampling["penalties"] = penalties
     if wants_logprobs:
         per_row = torch.as_tensor(
             model_input.tt_sampling_params.num_logprobs, dtype=torch.int32
@@ -614,6 +697,15 @@ class TTModelRunner:
         # modes it had.
         self._spec_device_logprobs = False
         self._spec_device_top_p = False
+        self._spec_device_penalties = False
+        # ``supports_spec_device_mask``: read in ``load_model`` and again after
+        # ``warmup_model``, because the model withdraws it there when it built
+        # no mask traces.
+        self._spec_device_mask = False
+        # Which requests the model's device penalty state is current for.
+        self._spec_penalty_tracker = SpecPenaltyTracker()
+        # The cached non-grammar mask rows (allowed ids, one-token bad words).
+        self._spec_mask_cache = SpecMaskCache()
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -877,6 +969,12 @@ class TTModelRunner:
         )
         self._spec_device_top_p = bool(
             capabilities.get("supports_spec_device_top_p", False)
+        )
+        self._spec_device_penalties = bool(
+            capabilities.get("supports_spec_device_penalties", False)
+        )
+        self._spec_device_mask = bool(
+            capabilities.get("supports_spec_device_mask", False)
         )
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
@@ -1267,6 +1365,9 @@ class TTModelRunner:
         the newcomer's session (vllm-tt-plugin#118 review, finding 1). See
         ``_notify_model_slot_moves``.
         """
+        tracker = getattr(self, "_spec_penalty_tracker", None)
+        if tracker is not None:
+            tracker.invalidate((req_id,))
         slot = self._req_state_slot.get(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
         if slot is not None and callable(release):
@@ -1284,14 +1385,23 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+        if getattr(self, "_spec_device_penalties", False):
+            # A step whose output a forced reset discards was counted by the
+            # model's device penalty state but never applied to the request.
+            self._spec_penalty_tracker.invalidate(
+                get_tt_forced_reset_discard_counts(scheduler_output)
+            )
         # The scheduler's reasoning start for every structured request this step
         # schedules; a phase is created from it once, and dropped with its request.
         starts = self.__dict__.setdefault("_reasoning_starts", {})
         starts.update(get_tt_reasoning_start(scheduler_output))
         phases = self.__dict__.setdefault("_reasoning_phases", {})
+        mask_cache = self.__dict__.get("_spec_mask_cache")
         for req_id in scheduler_output.finished_req_ids:
             starts.pop(req_id, None)
             phases.pop(req_id, None)
+            if mask_cache is not None:
+                mask_cache.drop(req_id)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -1350,7 +1460,9 @@ class TTModelRunner:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             self.requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=self.supports_stage_inputs
+                new_req_data,
+                supports_stage_inputs=self.supports_stage_inputs,
+                vocab_size=getattr(self, "vocab_size", None),
             )
             req_ids_to_add.append(req_id)
 
@@ -1869,7 +1981,17 @@ class TTModelRunner:
         width = num_drafts + 1
         batch = self.input_batch
         if not batch.no_penalties:
-            return "penalties", None
+            # A penalty row the model's device state serves chains; any other
+            # needs the ``logits`` walk. The state follows a row only while
+            # every step it takes part in is a fused verify.
+            penalized = [
+                r for r in req_ids if TTModelRunner._request_has_penalties(self, r)
+            ]
+            if not all(self._request_is_fused_servable(r) for r in penalized):
+                return "penalties", None
+            tracker = getattr(self, "_spec_penalty_tracker", None)
+            if tracker is None or not all(tracker.is_current(r) for r in penalized):
+                return "pen_state", None
         if not batch.no_allowed_token_ids:
             return "allowed_token_ids", None
         if batch.sampling.bad_words_token_ids:
@@ -1884,6 +2006,12 @@ class TTModelRunner:
             return "logprobs", None
         if batch.sampling.has_active_logitsprocs():
             return "logitsprocs", None
+        if getattr(self, "_spec_device_mask", False) and any(
+            self._request_holds_back_stop_ids(req_id) for req_id in req_ids
+        ):
+            # ``min_tokens`` is a mask control now, so ``not_fused`` no longer
+            # keeps such a row out of a chain; a masked step is never chained.
+            return "min_tokens", None
         if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
             self.requests, scheduler_output, None
         ):
@@ -2117,6 +2245,8 @@ class TTModelRunner:
         row_req_ids: list[str],
         num_valid_drafts: Any = None,
         spec_drafts: Any = None,
+        *,
+        mask_ok: bool = True,
     ) -> str:
         """The accept mode one verify asks for, from the rows it carries.
 
@@ -2136,6 +2266,11 @@ class TTModelRunner:
         does not constrain such a row, and no token of the step can follow an
         end token. ``spec_drafts`` and ``num_valid_drafts`` are what that test
         reads; without them every structured row asks for logits.
+
+        On a model that declares ``supports_spec_device_mask`` the controls that
+        rule tokens out no longer force ``logits`` (``params_fused_servable``,
+        ``device_mask``); ``mask_ok=False`` asks again as if it did not, for the
+        build to use when the mask cannot be composed (``mask_plan_for_step``).
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
         # Called unbound: runner doubles in the host tests are namespaces.
@@ -2159,7 +2294,11 @@ class TTModelRunner:
         # ``support_ok``.
         fused_ok = topk_offered and all(
             ok
-            or self._request_is_fused_servable(req_id, grammar_ok=req_id in grammar_ok)
+            or self._request_is_fused_servable(
+                req_id,
+                grammar_ok=req_id in grammar_ok,
+                device_mask=mask_ok and getattr(self, "_spec_device_mask", False),
+            )
             for ok, req_id in zip(certifiable, row_req_ids)
         )
         if ACCEPT_MODE_FUSED_SAMPLE in modes and fused_sample_enabled():
@@ -2238,7 +2377,11 @@ class TTModelRunner:
         )
 
     def _request_is_fused_servable(
-        self, req_id: str, *, grammar_ok: bool = False
+        self,
+        req_id: str,
+        *,
+        grammar_ok: bool = False,
+        device_mask: bool | None = None,
     ) -> bool:
         """True when a ``fused_sample`` step can carry this request.
 
@@ -2246,20 +2389,24 @@ class TTModelRunner:
         logprobs of 0..``MAX_DEVICE_LOGPROBS`` with ``supports_spec_device_logprobs``
         (and only under vLLM's ``raw_logprobs`` mode, the one the candidates
         answer), and top_k off with top_p below 1 with
-        ``supports_spec_device_top_p``. The penalties are read off the batch
-        as for the other gates.
+        ``supports_spec_device_top_p``, and a penalty with
+        ``supports_spec_device_penalties`` (never together with logprobs), and
+        the controls that rule tokens out with ``supports_spec_device_mask``
+        (``device_mask`` overrides the runner's capability). The penalties are
+        read off the batch as for the other gates.
         """
         plan = getattr(self, "_spec_plan", None)
         if plan is None or plan.topk_candidates is None:
             return False
         batch = self.input_batch
-        for attr in (
-            "presence_penalties_reqs",
-            "frequency_penalties_reqs",
-            "repetition_penalties_reqs",
-        ):
-            if req_id in getattr(batch, attr, ()):
-                return False
+        penalized = any(
+            req_id in getattr(batch, attr, ())
+            for attr in (
+                "presence_penalties_reqs",
+                "frequency_penalties_reqs",
+                "repetition_penalties_reqs",
+            )
+        )
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
         if params is None:
@@ -2275,6 +2422,35 @@ class TTModelRunner:
             device_logprobs=device_logprobs,
             device_top_p=getattr(self, "_spec_device_top_p", False),
             grammar_ok=grammar_ok,
+            penalized=penalized,
+            device_penalties=getattr(self, "_spec_device_penalties", False),
+            device_mask=(
+                getattr(self, "_spec_device_mask", False)
+                if device_mask is None
+                else device_mask
+            ),
+        )
+
+    def _request_has_penalties(self, req_id: str) -> bool:
+        """True when the persistent batch holds a penalty for this request."""
+        batch = self.input_batch
+        return any(
+            req_id in getattr(batch, attr, ())
+            for attr in (
+                "presence_penalties_reqs",
+                "frequency_penalties_reqs",
+                "repetition_penalties_reqs",
+            )
+        )
+
+    def _request_holds_back_stop_ids(self, req_id: str) -> bool:
+        """True when ``min_tokens`` still holds this request's stop ids back."""
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        return (
+            params is not None
+            and params.min_tokens > len(req_state.output_token_ids)
+            and bool(params.all_stop_token_ids)
         )
 
     def _request_asks_logprobs(self, req_id: str) -> bool:
@@ -2847,6 +3023,7 @@ class TTModelRunner:
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
         spec_mode: str | None = None
+        spec_mask: SpecMaskPlan | None = None
         chain: Any = None
         chain_rows: torch.Tensor | None = None
         if is_prompt:
@@ -2947,6 +3124,14 @@ class TTModelRunner:
                     spec_mode = self._spec_mode_for_step(
                         row_req_ids, num_valid_drafts, spec_drafts
                     )
+                    if chain is None and getattr(self, "_spec_device_mask", False):
+                        spec_mode, spec_mask = TTModelRunner._plan_spec_mask(
+                            self, spec_mode, row_req_ids, spec_drafts, num_valid_drafts
+                        )
+                    if spec_mode == ACCEPT_MODE_LOGITS:
+                        TTModelRunner._count_logits_step_reason(
+                            self, row_req_ids, num_valid_drafts, spec_drafts
+                        )
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
@@ -3158,7 +3343,13 @@ class TTModelRunner:
                 self, row_req_ids, spec_drafts, num_valid_drafts
             )
         if spec_mode == ACCEPT_MODE_FUSED_SAMPLE and has_scheduled_structured:
-            unserved = scheduled_structured_req_ids - grammar_fused_rows
+            # A masked step serves the rest: the scheduler's rows reach the
+            # model as part of the mask (``spec_mask``).
+            masked = frozenset(
+                row_req_ids[row]
+                for row in (spec_mask.grammar_rows if spec_mask else ())
+            )
+            unserved = scheduled_structured_req_ids - grammar_fused_rows - masked
             if unserved:
                 raise RuntimeError(
                     "a fused_sample verify carries structured-output requests "
@@ -3306,6 +3497,14 @@ class TTModelRunner:
             )
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
+        if getattr(self, "_spec_device_penalties", False) and (
+            is_prompt or spec_drafts is None or spec_mode != ACCEPT_MODE_FUSED_SAMPLE
+        ):
+            # The model's device penalty state follows ``fused_sample`` verifies
+            # only. A prefill re-seeds a request's row, and any other decode step
+            # commits tokens the model never counts: its rows' state is stale.
+            self._spec_penalty_tracker.invalidate(row_req_ids)
+
         grammar_rows_per_request = None
         spec_min_tokens = None
         if self._num_speculative_tokens:
@@ -3322,8 +3521,13 @@ class TTModelRunner:
                 spec_drafts is not None
                 and self.async_decode_scheduling
                 # A fused step reads no bitmask, so the scheduler has no use
-                # for its drafts.
-                and spec_mode != ACCEPT_MODE_FUSED_SAMPLE
+                # for its drafts, except a masked step with a grammar row: its
+                # scheduler rows 1..K must be made from the drafts this step
+                # verifies.
+                and (
+                    spec_mode != ACCEPT_MODE_FUSED_SAMPLE
+                    or (spec_mask is not None and bool(spec_mask.grammar_rows))
+                )
             ):
                 self._grammar_draft_handoff = self._structured_drafts(
                     row_req_ids, spec_drafts, num_valid_drafts
@@ -3374,9 +3578,112 @@ class TTModelRunner:
             spec_mode=spec_mode if spec_drafts is not None else None,
             grammar_rows_per_request=grammar_rows_per_request,
             spec_min_tokens=spec_min_tokens,
+            spec_mask=spec_mask,
             chain_rows=chain_rows,
             chain_tip=None if chain is None else chain.tip,
         )
+
+    def _plan_spec_mask(
+        self,
+        spec_mode: str,
+        row_req_ids: list[str],
+        spec_drafts: torch.Tensor,
+        num_valid_drafts: torch.Tensor,
+    ) -> tuple[str, SpecMaskPlan | None]:
+        """The mode and the mask plan of a build on a model that serves masks.
+
+        A ``fused_sample`` step whose rows carry a control the mask applies gets
+        a ``SpecMaskPlan``: it is submitted in two halves. When a row's controls
+        leave no token at some column, the step asks for ``logits`` again with
+        the mask off. A ``logits`` step that carries such a control is counted
+        with the reason it was not served (``mask_row_refusal``).
+        """
+        reasoning_ok = TTModelRunner._grammar_fused_rows(
+            self, row_req_ids, spec_drafts, num_valid_drafts
+        )
+        if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            plan, refusal = mask_plan_for_step(
+                self.requests,
+                row_req_ids,
+                spec_drafts,
+                num_valid_drafts,
+                reasoning_ok,
+                self.__dict__.setdefault("_spec_mask_cache", SpecMaskCache()),
+                width=int(spec_drafts.shape[1]) + 1,
+                vocab_size=int(self.vocab_size),
+            )
+            if refusal is None:
+                return spec_mode, plan
+            count_mask_fallback(refusal)
+            return self._spec_mode_for_step(
+                row_req_ids, num_valid_drafts, spec_drafts, mask_ok=False
+            ), None
+        if spec_mode == ACCEPT_MODE_LOGITS:
+            reasons = []
+            for req_id in row_req_ids:
+                state = self.requests[req_id]
+                args = (state.sampling_params, len(state.output_token_ids))
+                ok = req_id in reasoning_ok
+                if has_mask_control(*args, ok):
+                    reasons.append(mask_row_refusal(*args, ok) or "other")
+            if reasons:
+                count_mask_fallback(next((r for r in reasons if r != "other"), "other"))
+        return spec_mode, None
+
+    def _count_logits_step_reason(
+        self,
+        row_req_ids: list[str],
+        num_valid_drafts: torch.Tensor,
+        spec_drafts: torch.Tensor,
+    ) -> None:
+        """Count one ``logits`` verify under the reason the fused path did not take it.
+
+        One reason per step: a launch reason first, then the first row that the
+        fused rule (``params_fused_servable``) refuses, in row order, then a
+        seeded row with no draft, then the sampled-fused switch.
+        """
+        modes = getattr(self, "_spec_accept_modes", ()) or ()
+        if not (
+            ACCEPT_MODE_FUSED_SAMPLE in modes
+            and fused_sample_enabled()
+            and ACCEPT_MODE_TOPK in modes
+            and device_topk_enabled()
+        ):
+            count_logits_reason("launch_off")
+            return
+        plan = getattr(self, "_spec_plan", None)
+        grammar_ok = TTModelRunner._grammar_fused_rows(
+            self, row_req_ids, spec_drafts, num_valid_drafts
+        )
+        device_logprobs = getattr(self, "_spec_device_logprobs", False) and (
+            getattr(self.model_config, "logprobs_mode", None) == "raw_logprobs"
+        )
+        for req_id in row_req_ids:
+            if self._request_is_argmax_certifiable(
+                req_id, grammar_ok=req_id in grammar_ok
+            ):
+                continue
+            state = self.requests[req_id]
+            reason = logits_reason(
+                state.sampling_params,
+                len(state.output_token_ids),
+                candidates=None if plan is None else plan.topk_candidates,
+                vocab_size=int(self.vocab_size),
+                penalized=self._request_has_penalties(req_id),
+                grammar_ok=req_id in grammar_ok,
+                device_logprobs=device_logprobs,
+                device_top_p=getattr(self, "_spec_device_top_p", False),
+                device_penalties=getattr(self, "_spec_device_penalties", False),
+            )
+            if reason != "other":
+                count_logits_reason(reason)
+                return
+        if self._seeded_row_without_drafts(row_req_ids, num_valid_drafts):
+            count_logits_reason("seed_no_draft")
+        elif not fused_sampled_enabled():
+            count_logits_reason("sampled_off")
+        else:
+            count_logits_reason("other")
 
     def _structured_drafts(
         self,
@@ -3860,7 +4167,8 @@ class TTModelRunner:
     ) -> TTModelInput:
         """Return ``model_input`` with the sample-time grammar bitmask attached."""
         if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
-            self._check_grammar_free_step(model_input, grammar_output, lane_total)
+            if getattr(model_input, "spec_mask", None) is None:
+                self._check_grammar_free_step(model_input, grammar_output, lane_total)
             return model_input
         bitmask = self._reorder_grammar_bitmask(
             grammar_output, model_input, lane_total=lane_total
@@ -3899,6 +4207,42 @@ class TTModelRunner:
                 "scheduler did not"
             )
 
+    def _spec_step_mask(
+        self,
+        model_input: TTModelInput,
+        grammar_output: GrammarOutput | None,
+        lane_total: int | None,
+        *,
+        complete: bool,
+    ) -> torch.Tensor | None:
+        """The token mask of a masked fused verify, from the sample-time grammar output.
+
+        ``complete`` (the synchronous path) refuses a grammar output that lacks a
+        structured request; the asynchronous path leaves such a row unconstrained,
+        as its ``logits`` bitmask does, for a request finished or aborted since.
+
+        The scheduler's bitmask rows (``[live, 1+K, W]`` in TT row order) are
+        ANDed into the build-time part of the plan (``spec_masks.step_mask``).
+        None when no row ended up constrained."""
+        grammar = self._reorder_grammar_bitmask(
+            grammar_output,
+            model_input,
+            lane_total=lane_total,
+            require_complete=complete,
+        )
+        rows, width = (int(size) for size in model_input.input_tokens.shape)
+        mask, constrained = step_mask(
+            model_input.spec_mask,
+            grammar,
+            list(model_input.row_req_ids),
+            rows=rows,
+            width=width,
+            vocab_size=int(self.vocab_size),
+        )
+        if constrained:
+            count_mask_step(constrained)
+        return mask
+
     def _finish_async_decode(
         self,
         grammar_output: GrammarOutput | None,
@@ -3919,7 +4263,15 @@ class TTModelRunner:
             # No bitmask is attached: the fused walk reads none, and attaching
             # one would also zero the step's valid-draft counts
             # (``_grammar_validated_drafts``), which the step's commit reads.
-            self._check_grammar_free_step(model_input, grammar_output, lane_total)
+            if getattr(model_input, "spec_mask", None) is None:
+                self._check_grammar_free_step(model_input, grammar_output, lane_total)
+            else:
+                # The model gets the bitmask inside the composed mask.
+                wrapper.finish_masked_step(
+                    self._spec_step_mask(
+                        model_input, grammar_output, lane_total, complete=False
+                    )
+                )
             return wrapper
         bitmask = self._reorder_grammar_bitmask(
             grammar_output,
@@ -4562,6 +4914,8 @@ class TTModelRunner:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
             )
+        if getattr(fwd.decode_submission, "mask_pending", False):
+            fwd = self._finish_masked_sync_forward(fwd, grammar_output)
         fwd = replace(
             fwd,
             model_input=self._apply_grammar_to_input(
@@ -4624,6 +4978,30 @@ class TTModelRunner:
                 fwd.model_input, sampled_token_ids, row_req_ids
             )
         return output
+
+    def _finish_masked_sync_forward(
+        self, fwd: _SyncForward, grammar_output: GrammarOutput | None
+    ) -> _SyncForward:
+        """The second half of a masked fused verify on the synchronous path.
+
+        The first half ran in ``_forward_with_model_input``. The finish returns
+        the verify's host output (the model synchronizes), which then reaches
+        the accept walk as any fused verify's."""
+        submission = self.async_decode.finish_masked_decode(
+            fwd.decode_submission,
+            self._spec_step_mask(fwd.model_input, grammar_output, None, complete=True),
+            async_read=False,
+        )
+        finalized = self.async_decode.finalize_decode(submission)
+        if finalized is None:
+            raise RuntimeError("a masked fused verify finished with no output")
+        return replace(
+            fwd,
+            tt_out=finalized.tt_out,
+            tt_log_probs=finalized.tt_log_probs,
+            decode_submission=submission,
+            spec_hidden=submission.spec_hidden,
+        )
 
     def _build_chunked_prefill_output(
         self,
@@ -4931,7 +5309,9 @@ class TTModelRunner:
             decode_submission = self.async_decode.submit_decode(
                 model_input, read_from_device=False, async_read=False
             )
-            if model_input.defer_device_sampling:
+            if model_input.defer_device_sampling or getattr(
+                decode_submission, "mask_pending", False
+            ):
                 tt_out = decode_submission.tt_out
             else:
                 finalized = self.async_decode.finalize_decode(decode_submission)
@@ -5624,3 +6004,9 @@ class TTModelRunner:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
         if trace_decode_mode:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+        # A model that built no mask traces withdraws the capability at warmup.
+        self._spec_device_mask = bool(
+            (getattr(self.model, "model_capabilities", None) or {}).get(
+                "supports_spec_device_mask", False
+            )
+        )

@@ -15,9 +15,10 @@ layout, for the committed columns only:
 - columns ``1..N`` are the top-``N`` ids and logprobs.
 
 The values are the logits' own numbers minus the ``lse``, so they match the
-host path to the precision of the ``lse``. Ties inside the top-``N`` list
-resolve to the lower id (the order of the candidates); vLLM's ``topk`` picks
-an arbitrary id among equal values.
+host path to the precision of the ``lse``. A value the device mask wrote
+(below ``MASK_VALUE_FLOOR``) becomes -inf, as on the host path. Ties inside
+the top-``N`` list resolve to the lower id (the order of the candidates);
+vLLM's ``topk`` picks an arbitrary id among equal values.
 
 Two cases a token cannot be placed exactly are counted (``device_logprob_stats``),
 not raised, because the committed token is still correct and only its logprob
@@ -44,6 +45,7 @@ import torch
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_accept import _within_count
 from vllm_tt_plugin.spec_decode import SpecCandidates
+from vllm_tt_plugin.spec_masks import MASK_VALUE_FLOOR
 
 if TYPE_CHECKING:
     from vllm.v1.outputs import LogprobsTensors
@@ -149,12 +151,19 @@ def device_spec_logprobs(
         lower_bound, missing = lower_bound & asked, missing & asked
 
     top = int(num_logprobs)
+
+    def logprob(value: torch.Tensor) -> torch.Tensor:
+        # A token the device mask ruled out comes back as the mask value, far
+        # below any logit. The host path gives it -inf, so this does too.
+        return torch.where(
+            value < MASK_VALUE_FLOOR,
+            torch.full_like(value, float("-inf")),
+            value - lse.unsqueeze(1),
+        )
+
     tensors = LogprobsTensors(
         torch.cat([chosen.unsqueeze(1), ids[:, :top]], dim=1).to(torch.int32),
-        torch.cat(
-            [chosen_value - lse.unsqueeze(1), values[:, :top] - lse.unsqueeze(1)],
-            dim=1,
-        ),
+        torch.cat([logprob(chosen_value), logprob(values[:, :top])], dim=1),
         rank,
         cu_num_generated_tokens=[
             0,

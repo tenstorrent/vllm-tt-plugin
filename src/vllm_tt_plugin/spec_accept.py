@@ -647,6 +647,53 @@ def _controls_servable(params: Any, output_len: int, grammar_ok: bool) -> bool:
     )
 
 
+def has_mask_control(params: Any, output_len: int, grammar_ok: bool) -> bool:
+    """Whether a request carries a control the device token mask applies.
+
+    ``structured_outputs`` (unless ``grammar_ok``: the row stays in its open
+    reasoning phase and its grammar is not applied), ``allowed_token_ids``,
+    ``bad_words`` or a ``min_tokens`` the output has not reached yet."""
+    return (
+        (params.structured_outputs is not None and not grammar_ok)
+        or bool(params.allowed_token_ids)
+        or bool(params.bad_words_token_ids)
+        or (params.min_tokens > output_len and bool(params.all_stop_token_ids))
+    )
+
+
+def mask_row_refusal(params: Any, output_len: int, grammar_ok: bool) -> str | None:
+    """Why the device token mask cannot serve this request's controls, or None.
+
+    The mask path (``supports_spec_device_mask``) serves ``structured_outputs``,
+    ``allowed_token_ids``, ``bad_words`` and a pending ``min_tokens``, with two
+    exceptions, each a reason string (the logits-mode fallback counters):
+
+    - ``grammar_with_controls``: a grammar row that is live (``grammar_ok``
+      False) together with another control. The step is pending when the
+      scheduler's grammar rows arrive, so a composed row that comes out empty
+      (a grammar that allows only a stop token while ``min_tokens`` holds it
+      back, an allowed set the grammar excludes) cannot be sent to logits mode
+      any more.
+    - ``logprobs_with_controls``: a logprobs row with allowed ids, bad words or
+      a pending ``min_tokens``. The raw logprobs are taken after the grammar
+      and before those controls, and the one composed mask applies them first.
+      A grammar-only mask is served: the device payload is taken after it.
+
+    A row in its open reasoning phase (``grammar_ok``) has no grammar mask, so
+    for it ``structured_outputs`` is no control at all.
+    """
+    others = (
+        bool(params.allowed_token_ids)
+        or bool(params.bad_words_token_ids)
+        or (params.min_tokens > output_len and bool(params.all_stop_token_ids))
+    )
+    if others and params.structured_outputs is not None and not grammar_ok:
+        return "grammar_with_controls"
+    if others and params.logprobs is not None:
+        return "logprobs_with_controls"
+    return None
+
+
 def params_fused_servable(
     params: Any,
     output_len: int,
@@ -656,6 +703,9 @@ def params_fused_servable(
     device_logprobs: bool = False,
     device_top_p: bool = False,
     grammar_ok: bool = False,
+    penalized: bool = False,
+    device_penalties: bool = False,
+    device_mask: bool = False,
 ) -> bool:
     """Whether a ``fused_sample`` step can carry this sampled or logprobs request.
 
@@ -675,11 +725,21 @@ def params_fused_servable(
       ``[0, MAX_DEVICE_LOGPROBS]``: ``-1`` (the whole vocabulary) and larger
       counts are not served;
     - no other control masks tokens outside the candidates (``grammar_ok`` as
-      for ``params_support_servable``).
+      for ``params_support_servable``);
+    - it carries no penalty (``penalized`` False), or (with ``device_penalties``)
+      it asks for no logprobs: the model returns the penalized candidates, and
+      the raw logprobs come before the penalties.
 
-    The penalties and the global ``logprobs_mode`` are not read here: the
-    runner reads them off its batch and its model config.
+    - with ``device_mask``, the controls that rule tokens out are served by the
+      model's token mask (``mask_row_refusal`` lists what is still refused)
+      instead of refused outright.
+
+    Whether a request has penalties (``penalized``) and the global
+    ``logprobs_mode`` are not read from ``params`` here: the runner reads them
+    off its batch and its model config.
     """
+    if penalized and not (device_penalties and params.logprobs is None):
+        return False
     greedy = float(params.temperature) < 1e-5
     if not greedy:
         top_k = int(params.top_k)
@@ -692,6 +752,8 @@ def params_fused_servable(
         device_logprobs and 0 <= int(params.logprobs) <= MAX_DEVICE_LOGPROBS
     ):
         return False
+    if device_mask:
+        return mask_row_refusal(params, output_len, grammar_ok) is None
     return _controls_servable(params, output_len, grammar_ok)
 
 

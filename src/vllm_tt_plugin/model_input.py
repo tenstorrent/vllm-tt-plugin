@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
+from vllm_tt_plugin.spec_masks import SpecMaskPlan
+
 
 @dataclass(frozen=True)
 class TTCompactedHostLogits:
@@ -237,6 +239,13 @@ class TTModelInput:
     # at build time, because the walk may run on the readback thread after the
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+    # ``fused_sample`` verify only, on a model that declares
+    # ``supports_spec_device_mask``. Set when a row carries a control that rules
+    # tokens out (grammar, allowed_token_ids, bad_words, min_tokens): the step
+    # is then submitted in two halves, the forward at ``execute_model`` and the
+    # composed token mask at ``sample_tokens``. ``None`` for every other step.
+    spec_mask: SpecMaskPlan | None = None
 
     # Chain mode only (VLLM_TT_SPEC_CHAIN, a fused verify submitted while the
     # previous one is still in flight). ``chain_rows`` is bool ``[total_B]``:

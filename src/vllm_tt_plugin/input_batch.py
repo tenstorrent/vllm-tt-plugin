@@ -31,6 +31,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin.spec_specials import classify_params, count_request_specials
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -62,6 +63,9 @@ class TTCachedRequestState(CachedRequestState):
     # exactly as long as the cached state: kept across preemption, so a resumed
     # prefill sees it again, and dropped on finish or abort.
     stage_inputs: Any = None
+    # The special sampling features the request carries, classified once when it
+    # is admitted (``spec_specials.classify_params``); read by the step counter.
+    specials: tuple[str, ...] = ()
 
 
 def _decode_stage_inputs(payload: Any) -> dict | None:
@@ -78,7 +82,7 @@ def _decode_stage_inputs(payload: Any) -> dict | None:
 
 
 def build_cached_request_state(
-    new_req_data, *, supports_stage_inputs: bool
+    new_req_data, *, supports_stage_inputs: bool, vocab_size: int | None = None
 ) -> TTCachedRequestState:
     """Build the cached state for one newly-scheduled request.
 
@@ -107,6 +111,12 @@ def build_cached_request_state(
         stage_inputs = _decode_stage_inputs(
             getattr(new_req_data, "additional_information", None)
         )
+    specials = classify_params(
+        sampling_params,
+        vocab_size,
+        has_images=bool(getattr(new_req_data, "mm_features", None)),
+    )
+    count_request_specials(specials)
     return TTCachedRequestState(
         req_id=new_req_data.req_id,
         prompt_token_ids=new_req_data.prompt_token_ids,
@@ -120,6 +130,7 @@ def build_cached_request_state(
         lora_request=new_req_data.lora_request,
         prompt_embeds=new_req_data.prompt_embeds,
         stage_inputs=stage_inputs,
+        specials=specials,
     )
 
 
@@ -962,7 +973,9 @@ class TTLaneInputBatch(InputBatch):
             # Lane mode refuses supports_stage_inputs at config time: its prefill
             # inputs carry no per-row stage inputs.
             requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=False
+                new_req_data,
+                supports_stage_inputs=False,
+                vocab_size=self.vocab_size,
             )
             req_ids_to_add.append(req_id)
 
