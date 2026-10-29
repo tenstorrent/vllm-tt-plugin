@@ -176,11 +176,12 @@ class TTScheduler(AsyncScheduler):
                 continue
             # ``_update_after_schedule`` has already advanced the computed
             # count by this step's tokens: the chunk is [end - n, end). A
-            # decode row schedules one token past the prompt; a prefill chunk
-            # ends within the prompt (a resumed preemption may replay
-            # past it, in more than one token).
+            # decode row starts at or past the prompt (one token, or 1 + K
+            # with a speculative round's drafts); a prefill chunk starts
+            # within it (a resumed preemption may replay past it, in more
+            # than one token).
             end = request.num_computed_tokens
-            if n == 1 and end > request.num_prompt_tokens:
+            if end - n >= request.num_prompt_tokens:
                 continue  # a decode row
             sched_events.emit("chunk", id=req_id, start=end - n, end=end)
 

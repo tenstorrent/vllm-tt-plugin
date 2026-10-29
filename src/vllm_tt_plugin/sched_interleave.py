@@ -6,7 +6,8 @@ The TT scheduler is prefill-first: while anything waits or a prefill is
 partial, every step is a prefill step, and the running decodes wait. Under a
 closed-loop client (``c`` requests in flight, each replaced as it finishes)
 that makes every cohort of ``c`` requests prefill in a row and finish together,
-so the next cohort arrives together and waits the same row of prefills again. This policy lets the scheduler
+so the next cohort arrives together and waits the same row of prefills again. This
+policy lets the scheduler
 run a bounded burst of decode steps although prefill work is pending: the
 running requests then finish at staggered times, their replacements arrive a
 few at a time, and a request's time to first token is a few prefills instead
@@ -198,8 +199,13 @@ class InterleavePolicy:
             request = requests.get(req_id)
             if request is None:
                 continue
+            # ``_update_after_schedule`` has advanced the computed count by
+            # this step's tokens: the row's chunk is [end - n, end). A decode
+            # row starts at or past the prompt (one token, or 1 + K with a
+            # speculative round's drafts); a prefill chunk starts inside it
+            # and completes the prompt when it ends at or past it.
             end = request.num_computed_tokens
-            if n == 1 and end > request.num_prompt_tokens:
+            if end - n >= request.num_prompt_tokens:
                 decode_rows += 1
             elif end >= request.num_prompt_tokens:
                 completed += 1

@@ -138,6 +138,23 @@ def test_decode_step_resets_the_count_and_spends_credit():
     assert not policy.burst_due(1, 1, 1028), "nothing completed since the burst"
 
 
+def test_decode_rows_with_drafts_are_decode_rows():
+    """A speculative round schedules 1 + K tokens on a decode row (the last
+    token and K drafts): still a decode step, never a completed prompt."""
+    policy = InterleavePolicy(every=1, burst=1)
+    requests = {"a": _req("a", 1028, 1028), "x": _req("x", 1028, 1044)}
+    policy.observe(_output({"a": 1028}), requests, waiting=1)
+    assert policy.completed == 1
+    policy.start_burst()
+    policy.observe(_output({"x": 4}), requests, waiting=1)  # [1040, 1044): decode
+    assert policy.completed == 0 and policy.credit == 0, "a decode step"
+    policy.observe(_output({"x": 4}), requests, waiting=1)
+    assert policy.completed == 0, "never a completed prompt"
+    requests["r"] = _req("r", 1028, 1030)  # a resumed preemption replaying past it
+    policy.observe(_output({"r": 1030}), requests, waiting=1)
+    assert policy.completed == 1, "a prefill chunk that ends past the prompt"
+
+
 def test_empty_step_ends_a_burst():
     policy = InterleavePolicy(every=1, burst=3)
     policy.observe(_output({"a": 1028}), {"a": _req("a", 1028, 1028)}, waiting=1)
