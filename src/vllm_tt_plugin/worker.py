@@ -60,6 +60,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
     format_tt_visible_devices,
     parse_mesh_grid,
 )
+from vllm_tt_plugin.utils.dp_lane_metal_env import compute_dp_lane_metal_env
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -134,6 +135,36 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
         parallel_config.data_parallel_rank_local,
         inherited,
     )
+
+
+def _bind_dp_lane_metal_env(vllm_config: VllmConfig) -> None:
+    """Give this standard-DP lane its own tt-metal Inspector address and logs.
+
+    Every lane is a separate tt-metal process on one host, so without this
+    they all bind the Inspector RPC default ``localhost:50051`` and share one
+    Inspector log directory, and the auto-triage run on a dispatch timeout
+    reads a neighbouring lane (tt-metal #63345). The overrides come from
+    ``compute_dp_lane_metal_env`` and must land before the first device open,
+    which is when tt-metal reads its runtime options. Launches without
+    discovered groups (MPI) keep the inherited values: tt-metal offsets by MPI
+    rank itself.
+    """
+    groups = _load_standard_dp_visible_groups(vllm_config)
+    if not groups:
+        return
+    overrides = compute_dp_lane_metal_env(
+        vllm_config.parallel_config.data_parallel_rank_local,
+        len(groups),
+        os.environ,
+    )
+    for key, value in overrides.items():
+        os.environ[key] = value
+    if overrides:
+        logger.info(
+            "Bound per-lane tt-metal diagnostics env for local DP rank %s: %s",
+            vllm_config.parallel_config.data_parallel_rank_local,
+            ", ".join(f"{k}={v}" for k, v in overrides.items()),
+        )
 
 
 def _resolve_mesh_grid(
@@ -254,6 +285,7 @@ class TTWorker(WorkerBase):
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
         _bind_visible_devices_env(self.vllm_config)
+        _bind_dp_lane_metal_env(self.vllm_config)
 
         # Validate/apply TT config in this worker process (multiprocessing
         # means platform class attrs + config mutations must be applied per

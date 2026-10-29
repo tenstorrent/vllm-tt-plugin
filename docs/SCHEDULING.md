@@ -729,6 +729,16 @@ On a single host, the plugin discovers TT device groups at startup and assigns
 one group to each rank through `TT_VISIBLE_DEVICES`. Request routing binds each
 request to one rank; requests do not migrate between ranks.
 
+Each rank is a separate tt-metal process, so the worker also separates their
+diagnostics before the first device open: the Inspector RPC address is offset
+by rank (`TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS`), `TT_METAL_LOGS_PATH` gains a
+`dp_rank_<n>` component, and the auto-triage command in
+`TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` receives that rank's Inspector
+host, port and log path. Without this all ranks bind `localhost:50051`, and a
+triage run from a rank that lost the bind reads a neighbouring rank's device
+list, which does not intersect its own `TT_VISIBLE_DEVICES` set, so every
+dispatcher-backed dump is skipped. See `utils/dp_lane_metal_env.py`.
+
 For standard DP, `--max_num_seqs M` is the capacity of each rank. The plugin
 does not multiply the rank-local model or KV-cache capacity by the number of
 ranks.

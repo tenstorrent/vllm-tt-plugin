@@ -516,7 +516,11 @@ The execution model matches TT hardware characteristics:
   via `TT_VISIBLE_DEVICES`. A per-rank assignment is accepted only when it
   exactly matches the discovered group; a conflicting GPU-style `--device-ids`
   assignment fails before mesh creation. This is upstream vLLM's standard DP
-  mechanism (no gather/scatter; ranks are fully independent).
+  mechanism (no gather/scatter; ranks are fully independent). Each rank also
+  gets its own tt-metal Inspector RPC address (`TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS`,
+  default port plus rank) and log directory (`TT_METAL_LOGS_PATH/dp_rank_<n>`),
+  and the auto-triage command in `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE`
+  is pointed at them, so a dispatch-timeout triage reads the rank that hung.
 
 For a deeper walk-through of the scheduling and execution model, read
 [`docs/SCHEDULING.md`](docs/SCHEDULING.md). The model-facing rules that make
