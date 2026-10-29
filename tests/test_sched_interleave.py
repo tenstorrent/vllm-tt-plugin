@@ -75,7 +75,7 @@ def test_known_flags_pass_and_unknown_ones_raise():
     check_sched_flags({})
     check_sched_flags({"TT_SCHED_INTERLEAVE": "every=4", "TT_SCHED_EVENT_LOG": "/x"})
     check_sched_flags({"TT_SCHEDULER": "not ours", "TT_METAL_HOME": "/x"})  # no prefix
-    assert {"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG"} == KNOWN_SCHED_FLAGS
+    assert {"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG", "TT_SCHED_DEFER_FINAL"} == KNOWN_SCHED_FLAGS
     with pytest.raises(ValueError, match="TT_SCHED_ADMISSION_GROUP"):
         check_sched_flags(
             {"TT_SCHED_INTERLEAVE": "every=4", "TT_SCHED_ADMISSION_GROUP": "8"}

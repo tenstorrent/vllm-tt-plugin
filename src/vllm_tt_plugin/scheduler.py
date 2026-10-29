@@ -13,6 +13,8 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin import sched_defer_final
+from vllm_tt_plugin.sched_defer_final import DeferFinalPolicy
 from vllm_tt_plugin.sched_interleave import InterleavePolicy
 
 logger = init_tt_logger(__name__)
@@ -45,7 +47,7 @@ ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
 # ``TT_SCHED_*`` variable makes ``check_sched_flags`` raise, so a misspelt or
 # unimplemented flag (``TT_SCHED_ADMISSION_GROUP`` is not implemented) does
 # not serve the stock schedule under its name.
-KNOWN_SCHED_FLAGS = frozenset({"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG"})
+KNOWN_SCHED_FLAGS = frozenset({"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG", "TT_SCHED_DEFER_FINAL"})
 
 
 def check_sched_flags(environ: Mapping[str, str] | None = None) -> None:
@@ -131,9 +133,24 @@ class TTScheduler(AsyncScheduler):
         self._interleave = InterleavePolicy.from_env(chunk_tokens=chunk)
         if self._interleave is not None:
             logger.info("TT scheduler interleaving: %s", self._interleave.describe())
+        # TT_SCHED_DEFER_FINAL (sched_defer_final): every request's final
+        # chunk deferred until the cohort's bulk prefills are done; None
+        # unless the variable is set. The generator's TT_V41_DEFER_FINAL must
+        # agree (it parks and restores the prefixes), or the start-up refuses.
+        sched_defer_final.check_agreement()
+        self._defer = DeferFinalPolicy.from_env(chunk_tokens=chunk, cohort=self.max_num_running_reqs)
+        if self._defer is not None:
+            if self._interleave is not None:
+                raise ValueError("TT_SCHED_DEFER_FINAL and TT_SCHED_INTERLEAVE do not compose")
+            logger.info("TT scheduler deferred finals: %s", self._defer.describe())
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
+
+    @property
+    def _defer_policy(self):
+        """The deferred-final policy, or None (a scheduler built without ``__init__``, as the unit tests do)."""
+        return getattr(self, "_defer", None)
 
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
@@ -150,6 +167,7 @@ class TTScheduler(AsyncScheduler):
             bool(self.waiting)
             or bool(getattr(self, "skipped_waiting", False))
             or any(request.is_prefill_chunk for request in self.running)
+            or (self._defer_policy is not None and (self._defer_policy.size() > 0 or self._defer_policy.draining))
         )
 
     @sched_events.guarded
@@ -286,6 +304,8 @@ class TTScheduler(AsyncScheduler):
         # Count scheduled work, not schedule() calls: every path ends here.
         if self._interleave is not None:
             self._interleave.observe(scheduler_output, self.requests, len(self.waiting))
+        if self._defer_policy is not None:
+            self._defer_policy.observe(scheduler_output, self.requests)
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
@@ -296,6 +316,8 @@ class TTScheduler(AsyncScheduler):
         admits new ones.  Adjusts max_num_running_reqs so the waiting loop
         respects the true capacity with the decodes hidden.
         """
+        if self._defer_policy is not None:
+            return self._schedule_prefill_deferred()
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
@@ -330,6 +352,80 @@ class TTScheduler(AsyncScheduler):
                         saved_skipped.prepend_requests(self.skipped_waiting)
                     self.skipped_waiting = saved_skipped
             self.running.extend(pure_decodes)
+            self.max_num_running_reqs = saved_max
+        return result
+
+    def _schedule_prefill_deferred(self) -> SchedulerOutput:
+        """``_schedule_prefill_only`` under ``TT_SCHED_DEFER_FINAL`` (sched_defer_final): the base scheduler sees,
+        per step, exactly the request that should advance. A closed cohort drains its finals one a step in order
+        (a held one-chunk prompt put back at the head of the queue and admitted alone; a parked partial un-hidden
+        alone); else an unparked partial (a bulk in progress) advances alone; else, while the cohort is open, the
+        head of the queue is admitted alone (a one-chunk prompt is held instead, and the step looks again); else
+        the cohort closes (full, or a queue tail) and its first final runs. Parked partials and pure decodes are
+        hidden from the base scheduler and counted in the capacity; the waiting queues are hidden except for the
+        one admission."""
+        policy = self._defer_policy
+        assert policy is not None
+        pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
+        saved_running = self.running
+        saved_max = self.max_num_running_reqs
+        saved_waiting = self.waiting
+        saved_skipped = getattr(self, "skipped_waiting", None)
+        hidden_queue = create_request_queue(self.policy)
+        while True:
+            parked_ids = policy.parked_ids
+            partials = [r for r in saved_running if r.is_prefill_chunk]
+            active = [r for r in partials if r.request_id not in parked_ids]
+            visible: list[Request] = []
+            admit: Request | None = None
+            if policy.draining:
+                head_id, held = policy.finals[0]
+                if held is not None:
+                    admit = held
+                else:
+                    visible = [r for r in partials if r.request_id == head_id]
+                    if not visible:  # gone (finished or preempted between steps): skip it
+                        policy.finals.popleft()
+                        continue
+                break
+            if active:
+                visible = active
+                break
+            occupied = policy.size() + len(pure_decodes)
+            if saved_waiting and occupied < policy.cohort:
+                head = saved_waiting.peek_request()
+                if policy.one_chunk(head):
+                    policy.hold(saved_waiting.pop_request())
+                    continue
+                admit = head
+                break
+            if policy.size() > 0:
+                policy.close("full" if occupied >= policy.cohort else "tail")
+                continue
+            break  # nothing to prefill: an empty step (the caller falls back to decode)
+        hidden = [r for r in saved_running if r not in visible]  # parked partials and pure decodes
+        self.running = cast(list[Request], visible)
+        self.max_num_running_reqs = 1 if (admit is not None or visible) else 0
+        if admit is not None and admit is not (saved_waiting.peek_request() if saved_waiting else None):
+            hidden_queue.add_request(admit)  # a held one-chunk prompt: alone at the head
+            self.waiting = hidden_queue
+        elif admit is not None:
+            self.waiting = saved_waiting  # the head of the real queue, admitted alone (max 1)
+        else:
+            self.waiting = hidden_queue
+        if saved_skipped is not None:
+            self.skipped_waiting = create_request_queue(self.policy)
+        try:
+            result = super().schedule()
+        finally:
+            if self.waiting is not saved_waiting and self.waiting:
+                saved_waiting.prepend_requests(self.waiting)
+            self.waiting = saved_waiting
+            if saved_skipped is not None:
+                if self.skipped_waiting:
+                    saved_skipped.prepend_requests(self.skipped_waiting)
+                self.skipped_waiting = saved_skipped
+            self.running.extend(hidden)  # a visible request the base preempted stays out, as in the stock path
             self.max_num_running_reqs = saved_max
         return result
 
