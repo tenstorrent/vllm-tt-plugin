@@ -17,6 +17,7 @@ from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin import sched_defer_final, sched_final_step
 from vllm_tt_plugin.sched_defer_final import DeferFinalPolicy
 from vllm_tt_plugin.sched_interleave import InterleavePolicy
+from vllm_tt_plugin.sched_pack import PackPolicy
 from vllm_tt_plugin.sched_release_first import ReleaseFirstPolicy
 
 logger = init_tt_logger(__name__)
@@ -44,11 +45,12 @@ ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
 # The ``TT_SCHED_*`` environment variables this tree implements. A scheduling
 # policy is one variable, parsed at ``TTScheduler.__init__`` into one
 # attribute (``None`` when unset), consulted in ``_prefer_decode`` and
-# accounted in ``_finalize_scheduler_output``; a tree that adds a policy
-# (``TT_SCHED_PACK``) adds its name here in the same change. Any other
-# ``TT_SCHED_*`` variable makes ``check_sched_flags`` raise, so a misspelt or
-# unimplemented flag (``TT_SCHED_ADMISSION_GROUP`` is not implemented) does
-# not serve the stock schedule under its name.
+# accounted in ``_finalize_scheduler_output``; a tree that adds a policy adds
+# its name here in the same change (``TT_SCHED_PACK``, sched_pack: the
+# admission of a listed layout of whole prompts in one prefill step). Any
+# other ``TT_SCHED_*`` variable makes ``check_sched_flags`` raise, so a
+# misspelt or unimplemented flag (``TT_SCHED_ADMISSION_GROUP`` is not
+# implemented) does not serve the stock schedule under its name.
 KNOWN_SCHED_FLAGS = frozenset(
     {
         "TT_SCHED_INTERLEAVE",
@@ -56,6 +58,7 @@ KNOWN_SCHED_FLAGS = frozenset(
         "TT_SCHED_DEFER_FINAL",
         "TT_SCHED_RELEASE_FIRST",
         "TT_SCHED_FINAL_STEP",
+        "TT_SCHED_PACK",
     }
 )
 
@@ -129,7 +132,9 @@ class TTScheduler(AsyncScheduler):
         # see _schedule_prefill_only: the model types whose generator needs
         # every chunk of a prompt to start at a multiple of the token budget
         model_config = getattr(self.vllm_config, "model_config", None)
-        model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
+        model_type = getattr(
+            getattr(model_config, "hf_config", None), "model_type", None
+        )
         self._aligned_chunks = model_type in ALIGNED_CHUNK_MODEL_TYPES
         # The TT_SCHED_* flags this scheduler knows; any other one in the
         # environment is a typo or another tree's policy and is refused at
@@ -163,6 +168,15 @@ class TTScheduler(AsyncScheduler):
         self._release = ReleaseFirstPolicy.from_env(defer_enabled=self._defer is not None)
         if self._release is not None:
             logger.info("TT scheduler first-token release: %s", self._release.describe())
+        # TT_SCHED_PACK (sched_pack): a prefill step with no partial prefill
+        # admits the whole prompts of a listed layout at the head of the queue
+        # (aligned chunks only: the generator packs them); None unless set.
+        self._pack = PackPolicy.from_env(chunk_tokens=chunk)
+        if self._pack is not None:
+            assert self._aligned_chunks, (
+                "TT_SCHED_PACK needs an aligned-chunk model (the V4.1 generator)"
+            )
+            logger.info("TT scheduler packing: %s", self._pack.describe())
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -346,7 +360,17 @@ class TTScheduler(AsyncScheduler):
                 for req_id, parked in self._defer_policy.last_finals:
                     if parked:  # a one-chunk prompt's prefill is its final: never held
                         release.expect(req_id, self._defer_policy.cohorts)
+        if self._pack is not None:
+            self._pack.observe(scheduler_output, self.requests, len(self.waiting))
         return scheduler_output
+
+    def _pack_admit(self) -> int:
+        """New requests a prefill step with no partial prefill admits under
+        aligned chunks: one, or the prompts of the listed layout the FIFO head
+        of the waiting queue forms (``TT_SCHED_PACK``)."""
+        if self._pack is None or not self.waiting:
+            return 1
+        return self._pack.admit(self.waiting)
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.
@@ -366,9 +390,12 @@ class TTScheduler(AsyncScheduler):
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         # Aligned chunks (``ALIGNED_CHUNK_MODEL_TYPES``, the V4.1 generator):
         # a partial prefill advances alone (the waiting queues hidden), and a
-        # step with no partial prefill admits at most one new request, so every
-        # chunk of a prompt starts at a multiple of the token budget and no
-        # prompt is split at the remainder another prompt left of it.
+        # step with no partial prefill admits at most one new request (or the
+        # whole prompts of a listed layout at the head of the queue under
+        # ``TT_SCHED_PACK``: they fit the budget together and the generator
+        # runs them as one packed chunk), so every chunk of a prompt starts at
+        # a multiple of the token budget and no prompt is split at the
+        # remainder another prompt left of it.
         aligned = self._aligned_chunks
         saved_waiting = saved_skipped = None
         if aligned:
@@ -379,7 +406,9 @@ class TTScheduler(AsyncScheduler):
                 if saved_skipped is not None:
                     self.skipped_waiting = create_request_queue(self.policy)
             else:
-                self.max_num_running_reqs = min(self.max_num_running_reqs, 1)
+                self.max_num_running_reqs = min(
+                    self.max_num_running_reqs, self._pack_admit()
+                )
         try:
             result = super().schedule()
         finally:

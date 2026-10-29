@@ -81,6 +81,7 @@ def test_known_flags_pass_and_unknown_ones_raise():
         "TT_SCHED_DEFER_FINAL",
         "TT_SCHED_RELEASE_FIRST",
         "TT_SCHED_FINAL_STEP",
+        "TT_SCHED_PACK",
     } == KNOWN_SCHED_FLAGS
     with pytest.raises(ValueError, match="TT_SCHED_ADMISSION_GROUP"):
         check_sched_flags(
@@ -88,8 +89,7 @@ def test_known_flags_pass_and_unknown_ones_raise():
         )
     with pytest.raises(ValueError, match="TT_SCHED_INTERLAEVE"):
         check_sched_flags({"TT_SCHED_INTERLAEVE": "every=4"})
-    with pytest.raises(ValueError, match="TT_SCHED_PACK"):
-        check_sched_flags({"TT_SCHED_PACK": "1"})  # not implemented in this tree
+    check_sched_flags({"TT_SCHED_PACK": "4x1028"})  # sched_pack, this tree
 
 
 # --- the policy's accounting ----------------------------------------------------
