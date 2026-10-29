@@ -312,6 +312,12 @@ class TTWorker(WorkerBase):
 
     def load_model(self):
         self.model_runner.load_model()
+        # The scheduler of this process is constructed after the model loads
+        # (EngineCore.__init__: executor, KV caches, then the scheduler) and
+        # reads the confirmer from here; None for a model without one.
+        from vllm_tt_plugin.scheduler import publish_prefix_hit_confirmer
+
+        publish_prefix_hit_confirmer(self.prefix_cache_hit_confirmer())
 
     def take_draft_token_ids(self) -> "DraftTokenIds | None":
         """Hand the runner's proposed drafts to the engine.

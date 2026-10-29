@@ -282,6 +282,33 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+# The model's prefix-hit confirmer, published by the in-process worker at
+# ``load_model`` for the scheduler this process constructs afterwards (the
+# multi-process executors hand it over through ``collective_rpc`` instead).
+_published_confirmer = None
+
+
+def publish_prefix_hit_confirmer(confirmer) -> None:
+    """Record the model's confirmer (None for a model without one) for the
+    scheduler of this process."""
+    global _published_confirmer
+    _published_confirmer = confirmer
+
+
+def _resolve_prefix_hit_confirmer(scheduler):
+    """The scheduler's installed confirmer, or the one the in-process worker
+    published at ``load_model``: the engine core constructs its scheduler after
+    the executor loaded the model, and the general-plugin load runs inside that
+    same constructor, so no wrapper installed from the plugin's entry points
+    reaches this process's engine (served GLM-5.3-Flash, 2026-10-29)."""
+    if scheduler._prefix_hit_confirmer is None and _published_confirmer is not None:
+        scheduler._prefix_hit_confirmer = _published_confirmer
+        logger.info(
+            "Prefix-cache hits are confirmed by the model before they are scheduled"
+        )
+    return scheduler._prefix_hit_confirmer
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -454,7 +481,7 @@ class TTScheduler(AsyncScheduler):
         dropped with a trimmed hit.
         """
         blocks, num_new, boundary = self._orig_get_computed_blocks(request)
-        confirm = self._prefix_hit_confirmer
+        confirm = _resolve_prefix_hit_confirmer(self)
         if confirm is None or num_new <= 0:
             return blocks, num_new, boundary
         mm_items = [

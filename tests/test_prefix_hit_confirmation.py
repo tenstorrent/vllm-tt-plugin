@@ -128,6 +128,20 @@ def test_scheduler_keeps_the_hit_the_model_honours_in_full():
     fake, mgr, blocks = _scheduler(128, lambda ids, mm, n: n)
     out = TTScheduler._confirmed_computed_blocks(fake, _request())
     assert out == (blocks, 128, 64) and mgr.created == []
+    # a scheduler without an installed confirmer takes the one the in-process
+    # worker published at load_model (the engine core builds its scheduler
+    # after the model loaded, so the published one is there first)
+    from vllm_tt_plugin.scheduler import publish_prefix_hit_confirmer
+
+    publish_prefix_hit_confirmer(lambda ids, mm, n: n // 2)
+    try:
+        fake, mgr, blocks = _scheduler(128, None)
+        out = TTScheduler._confirmed_computed_blocks(fake, _request())
+        assert out[1] == 64 and fake._prefix_hit_confirmer is not None
+    finally:
+        publish_prefix_hit_confirmer(None)
+    fake, mgr, blocks = _scheduler(128, None)
+    assert TTScheduler._confirmed_computed_blocks(fake, _request()) == (blocks, 128, 64)
 
 
 def test_scheduler_passes_through_without_a_confirmer_or_a_hit():
