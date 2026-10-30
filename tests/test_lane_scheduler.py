@@ -113,6 +113,7 @@ def _make_coordinator(lanes, *, per_lane_max=32, log_stats=False, **interleave_k
     coordinator._per_lane_max = per_lane_max
     coordinator._prefill_gather_s = 0.0
     coordinator._prefill_gather_quiet_s = 0.01
+    coordinator._prefix_affinity_slack = 4.0
     coordinator.log_stats = log_stats
     coordinator.structured_output_manager = None
     coordinator.connector = None
@@ -633,6 +634,152 @@ def test_preempted_and_finished_in_one_step_frees_the_row_once():
 
     assert coordinator._free_slots_by_lane[0] == [0, 1]
     assert coordinator._req_to_lane == {}
+
+
+class _PrefixKV:
+    """A lane's KV cache manager reduced to its prefix lookup."""
+
+    def __init__(self, cached_tokens=0):
+        self.cached_tokens = cached_tokens
+        self.probes = 0
+
+    def get_computed_blocks(self, request):
+        self.probes += 1
+        return None, self.cached_tokens, 0
+
+
+def _routing_coordinator(loads, cached, *, slack=4.0):
+    """Lanes with ``(waiting, running)`` loads and that many cached tokens."""
+    lanes = []
+    for (waiting, running), tokens in zip(loads, cached):
+        lane = FakeLane(waiting=waiting, running=running)
+        lane.kv_cache_manager = _PrefixKV(tokens)
+        lanes.append(lane)
+    coordinator = _make_coordinator(lanes)
+    coordinator._prefix_affinity_slack = slack
+    return coordinator
+
+
+_ROUTED = SimpleNamespace(request_id="routed")
+
+
+def test_pick_lane_is_least_loaded_with_nothing_cached():
+    coordinator = _routing_coordinator([(0, 2), (0, 1), (0, 1)], [0, 0, 0])
+
+    assert coordinator._pick_lane(_ROUTED) == 1
+
+
+def test_pick_lane_follows_the_cached_prefix_within_the_slack():
+    # Lane 1 runs 3 more than lane 2 (load 3 <= 0 + 4) but holds the prompt.
+    coordinator = _routing_coordinator([(0, 1), (0, 3), (0, 0)], [0, 120_000, 0])
+
+    assert coordinator._pick_lane(_ROUTED) == 1
+
+
+def test_pick_lane_drops_a_cached_prefix_beyond_the_slack():
+    # Two queued requests (load 8 > 0 + 4): not worth the wait, nor a probe.
+    coordinator = _routing_coordinator([(0, 1), (2, 0), (0, 0)], [0, 120_000, 0])
+
+    assert coordinator._pick_lane(_ROUTED) == 2
+    assert coordinator.lanes[1].kv_cache_manager.probes == 0
+
+
+def test_pick_lane_breaks_equal_cached_prefixes_by_load():
+    coordinator = _routing_coordinator([(0, 2), (0, 1), (0, 0)], [64_000, 64_000, 128])
+
+    assert coordinator._pick_lane(_ROUTED) == 1
+
+
+def test_zero_slack_only_breaks_load_ties_by_cached_prefix():
+    coordinator = _routing_coordinator(
+        [(0, 1), (0, 0), (0, 0)], [9_000, 0, 640], slack=0.0
+    )
+
+    assert coordinator._pick_lane(_ROUTED) == 2
+
+
+def test_a_single_candidate_lane_is_not_probed():
+    coordinator = _routing_coordinator([(0, 6), (0, 0)], [120_000, 0])
+
+    assert coordinator._pick_lane(_ROUTED) == 1
+    assert [lane.kv_cache_manager.probes for lane in coordinator.lanes] == [0, 0]
+
+
+def test_add_request_binds_the_lane_holding_the_prefix():
+    coordinator = _routing_coordinator([(0, 0), (0, 2)], [0, 5_000])
+    added = []
+    for lane_id, lane in enumerate(coordinator.lanes):
+        lane.add_request = lambda request, lane_id=lane_id: added.append(lane_id)
+
+    coordinator.add_request(SimpleNamespace(request_id="turn-2"))
+
+    assert added == [1]
+    assert coordinator._req_to_lane == {"turn-2": 1}
+
+
+def test_probing_a_lane_prefix_cache_takes_no_block_references():
+    # A real KV cache manager: the probe must find the previous turn's prefix
+    # and leave every block where it was, since the unpicked lanes never admit
+    # the request.
+    import torch
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.request import Request
+
+    block = 16
+    init_none_hash(sha256)
+
+    def request(request_id, num_tokens):
+        params = SamplingParams(max_tokens=1)
+        params.update_from_generation_config({}, eos_token_id=2)
+        return Request(
+            request_id=request_id,
+            prompt_token_ids=list(range(num_tokens)),
+            sampling_params=params,
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(block, sha256),
+        )
+
+    def manager():
+        config = KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer"],
+                    FullAttentionSpec(
+                        block_size=block,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                )
+            ],
+        )
+        return KVCacheManager(
+            config, max_model_len=256, scheduler_block_size=block, hash_block_size=block
+        )
+
+    lanes = [FakeLane(), FakeLane()]
+    lanes[0].kv_cache_manager = manager()
+    lanes[1].kv_cache_manager = holder = manager()
+    previous_turn = request("turn-1", 4 * block)
+    holder.allocate_slots(previous_turn, 4 * block)
+    holder.free(previous_turn)  # cached and unreferenced, as after a finished turn
+    free_blocks = holder.block_pool.get_num_free_blocks()
+    coordinator = _make_coordinator(lanes)
+    next_turn = request("turn-2", 6 * block)  # extends the previous prompt
+
+    assert coordinator._cached_prefix_tokens(1, next_turn) == 4 * block
+    assert coordinator._pick_lane(next_turn) == 1
+    assert holder.block_pool.get_num_free_blocks() == free_blocks
 
 
 def test_per_lane_vllm_config_uses_per_lane_max_num_seqs():

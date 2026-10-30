@@ -28,6 +28,23 @@ def _vllm_config(
     )
 
 
+def test_lane_prefix_affinity_slack_defaults_to_one_queued_request():
+    assert tt_config.get_tt_lane_prefix_affinity_slack(_vllm_config()) == 4
+
+
+def test_lane_prefix_affinity_slack_reads_the_tt_config():
+    config = _vllm_config(tt_cfg={"lane_prefix_affinity_slack": 0})
+
+    assert tt_config.get_tt_lane_prefix_affinity_slack(config) == 0
+
+
+def test_lane_prefix_affinity_slack_rejects_a_negative_value():
+    config = _vllm_config(tt_cfg={"lane_prefix_affinity_slack": -1})
+
+    with pytest.raises(ValueError, match="lane_prefix_affinity_slack"):
+        tt_config.get_tt_lane_prefix_affinity_slack(config)
+
+
 def test_get_tt_per_lane_max_num_seqs_derives_lane_capacity_from_global_cap():
     config = _vllm_config(max_num_seqs=32, lane_count=4)
 
