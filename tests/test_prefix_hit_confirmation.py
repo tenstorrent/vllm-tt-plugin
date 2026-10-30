@@ -92,6 +92,7 @@ def _scheduler(num_new, confirm, groups=2, blocks_per_group=4):
     )
     fake = SimpleNamespace(
         kv_cache_manager=mgr,
+        block_size=mgr.block_size,
         _prefix_hit_confirmer=confirm,
         _orig_get_computed_blocks=lambda request: (blocks, num_new, 64),
     )

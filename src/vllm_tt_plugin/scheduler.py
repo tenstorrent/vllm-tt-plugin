@@ -494,7 +494,9 @@ class TTScheduler(AsyncScheduler):
             for f in (request.mm_features or ())
         ]
         honoured = int(confirm(list(request.prompt_token_ids), mm_items, num_new))
-        block_size = self.kv_cache_manager.block_size
+        block_size = (
+            self.block_size
+        )  # the scheduler's (vLLM 0.30's KVCacheManager carries none)
         honoured = max(0, min(num_new, honoured)) // block_size * block_size
         if honoured == num_new:
             return blocks, num_new, boundary
