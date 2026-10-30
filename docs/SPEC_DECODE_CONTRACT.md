@@ -1233,8 +1233,11 @@ carries:
 - `chain_tip`: the `tip_id` of the pending step. The model raises unless it is
   the newest deferred verify it enqueued.
 
-Every other row of a chained verify is a gap: position -1, no request. The
-drafts of a chained-onto step are consumed on the device, so its proposal
+Every other row of a chained verify is a gap: position -1, no request. A lane
+verify built from host state sends a slot it does not schedule (a prompt still
+being prefilled, a request left out at `max_tokens`) as a gap too, so a drafter
+that drafts only for a lane of few requests counts the requests the chain plan
+counts. The drafts of a chained-onto step are consumed on the device, so its proposal
 (above) publishes nothing. Both the deferred and the chained verify carry
 `spec_sampling` as section 4i describes, drawn at submission in step order, so
 a seeded request's generator advances exactly as on a synchronous launch. The

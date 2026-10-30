@@ -1006,6 +1006,41 @@ def test_a_lane_that_lost_a_co_resident_request_does_not_chain_onto_that_step(
     assert chain_counters(runner)[0] > 0
 
 
+def test_a_host_built_verify_sends_a_slot_it_leaves_out_as_a_gap():
+    """``b`` holds lane 0's other slot but is never scheduled, as a prompt
+    still being prefilled in chunks is not. A verify built from host state
+    sends ``b``'s slot as a gap: had it carried ``b``'s position, the solo
+    drafter (as MiMo's, which drafts only behind a lane step of one pass)
+    would count two requests in the lane and draft nothing for ``a``, and
+    the next step, which schedules ``a`` alone again, would chain onto drafts
+    the device never made."""
+    model = lane_device_target(draft_policy="solo")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompt_a = engine.add("a", 0, 1)
+    engine.run(6)
+    chained_before = chain_counters(runner)[0]
+    assert chained_before > 0
+    add_request(runner, "b", 1, 9)
+    # Nothing in flight: the next verify is built from host state.
+    engine.drain()
+    calls_before = len(model.calls)
+    engine.run(8)
+    engine.drain()
+
+    host_built = [
+        c
+        for c in model.calls[calls_before:]
+        if c["spec_mode"] and c["chain_rows"] is None
+    ]
+    assert host_built
+    for call in host_built:
+        assert (call["positions"][1] == -1).all(), call["positions"]
+    assert chain_counters(runner)[0] > chained_before
+    produced = engine.outputs["a"]
+    assert produced == expected_greedy(prompt_a, len(produced))
+
+
 @pytest.mark.parametrize(
     "params, reason",
     [

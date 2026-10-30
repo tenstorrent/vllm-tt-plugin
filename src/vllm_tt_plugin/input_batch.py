@@ -1525,7 +1525,12 @@ class TTLaneInputBatch(InputBatch):
         prefill holding its row. That slot is ``None`` here too. Its request
         has no token to commit, and the commit, the recorded count and the
         proposal all key on this identity, so naming it would append a token
-        to a prompt that is still being prefilled.
+        to a prompt that is still being prefilled. A verify sends that slot as
+        a gap too (position -1), as a chained verify does: a drafter that
+        drafts only behind a lane step of few requests (MiMo's) counts every
+        positioned row, so a left-out slot with a position would cost its lane
+        the drafts that the chain plan, which counts only scheduled rows, then
+        chains onto.
         """
         none = {
             "input_tokens": input_tokens,
@@ -1578,6 +1583,14 @@ class TTLaneInputBatch(InputBatch):
             counts,
             total,
         ):
+            left_out = [
+                row
+                for row, req_id in enumerate(self.req_ids[:total])
+                if req_id is not None and row not in scheduled
+            ]
+            if left_out:
+                input_positions = input_positions.clone()
+                input_positions[left_out] = -1
             tokens, positions = runner._spec_candidate_block(
                 drafts, num_valid, input_tokens, input_positions
             )
