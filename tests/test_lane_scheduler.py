@@ -440,6 +440,45 @@ def test_update_from_output_no_metadata_returns_empty():
     assert coordinator.update_from_output(SchedulerOutput.make_empty(), None) == {}
 
 
+def test_lanes_record_request_events_and_leave_stats_to_the_coordinator():
+    # vLLM's queue, prefill and inference time histograms run from a request's
+    # QUEUED and SCHEDULED events, which a scheduler records only with
+    # log_stats on. Lanes built with it off left scheduled_ts at 0, so every
+    # lane-DP request reported a prefill time of first_token_ts - 0 (the host's
+    # monotonic clock).
+    from vllm.v1.engine import EngineCoreEventType
+
+    from tests.test_block_scheduler import (
+        BLOCK_SIZE,
+        _request,
+        _runner_output,
+        _scheduler,
+    )
+    from vllm_tt_plugin.config import store_tt_lane_count
+
+    base = _scheduler(output_width=1, max_num_seqs=2)
+    store_tt_lane_count(base.vllm_config, 2)
+    coordinator = TTLaneCoordinator(
+        base.vllm_config,
+        base.kv_cache_config,
+        base.structured_output_manager,
+        BLOCK_SIZE,
+        log_stats=True,
+    )
+    coordinator.add_request(_request(4, prompt_length=32))
+
+    step = coordinator.schedule()
+    outputs = coordinator.update_from_output(step, _runner_output(step, [7]))
+
+    (output,) = outputs[0].outputs
+    assert [event.type for event in output.events] == [
+        EngineCoreEventType.QUEUED,
+        EngineCoreEventType.SCHEDULED,
+    ]
+    assert outputs[0].scheduler_stats.num_running_reqs == 1
+    assert [lane.make_stats() for lane in coordinator.lanes] == [None, None]
+
+
 # --------------------------------------------------------------------------
 # merge_lane_scheduler_outputs (per-field stitching of non-empty lane outputs)
 # --------------------------------------------------------------------------
