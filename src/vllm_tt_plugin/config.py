@@ -80,6 +80,29 @@ def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
     return int(additional.get(_RESOLVED_LANE_COUNT_KEY, 1))
 
 
+def has_tt_lane_count(vllm_config: "VllmConfig") -> bool:
+    """Whether the DP-to-lanes conversion recorded a lane count (it may be 1:
+    ``store_tt_single_lane``). Not user-facing."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return _RESOLVED_LANE_COUNT_KEY in additional
+
+
+# Set with a lane count of 1 by the DP-to-lanes conversion for a model that
+# declares ``model_capabilities["folds_dp_into_lanes"]`` and is launched with
+# ``--data-parallel-size 1``: the engine still runs the lane coordinator, with
+# one lane. Such a model drives one replica per process the way it drives each
+# lane of a multi-lane launch (stable slots, chained verifies), so a mesh can
+# be split between several engines, one per submesh, that schedule
+# independently. Internal, as ``_RESOLVED_LANE_COUNT_KEY``.
+_SINGLE_LANE_KEY = "_tt_single_lane"
+
+
+def store_tt_single_lane(vllm_config: "VllmConfig") -> None:
+    """Record a one-lane lane-mode launch (``_SINGLE_LANE_KEY``)."""
+    store_tt_lane_count(vllm_config, 1)
+    vllm_config.additional_config[_SINGLE_LANE_KEY] = True
+
+
 def store_tt_lane_count(vllm_config: "VllmConfig", lanes: int) -> None:
     """Record the resolved in-process TT lane count on the config.
 
@@ -528,9 +551,11 @@ def validate_tt_lane_config(vllm_config: "VllmConfig") -> int:
 
 
 def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
-    return (
-        vllm_config.parallel_config.data_parallel_size == 1
-        and get_tt_data_parallel_size(vllm_config) > 1
+    if vllm_config.parallel_config.data_parallel_size != 1:
+        return False
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return get_tt_data_parallel_size(vllm_config) > 1 or bool(
+        additional.get(_SINGLE_LANE_KEY, False)
     )
 
 
