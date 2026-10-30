@@ -11,6 +11,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -390,9 +391,11 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
-        # Set by TTLaneCoordinator on its lanes. A lane runs with log_stats off
-        # (the coordinator owns the stats), so the base scheduler would drop its
-        # drafts; the lane observes them here and the coordinator drains them.
+        # Set by TTLaneCoordinator on its lanes. A lane makes no SchedulerStats
+        # (the coordinator makes one for every lane), so the base scheduler would
+        # drop its drafts; the lane observes them here and the coordinator
+        # drains them.
+        self.stats_made_by_coordinator = False
         self.collect_spec_decoding_stats = False
         self.pending_spec_decoding_stats: SpecDecodingStats | None = None
         # Request id that owns the adaptive model's SINGLE speculative
@@ -1337,6 +1340,15 @@ class TTScheduler(AsyncScheduler):
             if unverified > invalid.get(req_id, 0):
                 invalid[req_id] = unverified
         scheduler_output.num_invalid_spec_tokens = invalid or None
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        """None on a lane: its coordinator makes the step's one SchedulerStats
+        from every lane, and the base make_stats would reset this lane's
+        prefix-cache counters before the coordinator reads them.
+        """
+        if self.stats_made_by_coordinator:
+            return None
+        return super().make_stats(*args, **kwargs)
 
     def make_spec_decoding_stats(
         self,

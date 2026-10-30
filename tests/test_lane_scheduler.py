@@ -744,9 +744,52 @@ def test_make_stats_sums_every_lanes_prefix_cache_stats():
     )  # read once per update
 
 
+def test_lanes_record_request_events_and_prefix_queries_for_the_coordinator():
+    # vLLM's queue, prefill and inference time histograms run from a request's
+    # QUEUED and SCHEDULED events, which a scheduler records only with
+    # log_stats on. Lanes built with it off left scheduled_ts at 0, so every
+    # lane-DP request reported a prefill time of first_token_ts - 0 (the host's
+    # monotonic clock), and their KV cache managers counted no prefix queries.
+    from vllm.v1.engine import EngineCoreEventType
+
+    from tests.test_block_scheduler import (
+        BLOCK_SIZE,
+        _request,
+        _runner_output,
+        _scheduler,
+    )
+    from vllm_tt_plugin.config import store_tt_lane_count
+
+    base = _scheduler(output_width=1, max_num_seqs=2)
+    config = base.vllm_config
+    config.cache_config.enable_prefix_caching = True
+    store_tt_lane_count(config, 2)
+    coordinator = TTLaneCoordinator(
+        config,
+        base.kv_cache_config,
+        base.structured_output_manager,
+        BLOCK_SIZE,
+        log_stats=True,
+    )
+    coordinator.add_request(_request(4, prompt_length=32))
+
+    step = coordinator.schedule()
+    outputs = coordinator.update_from_output(step, _runner_output(step, [7]))
+
+    (output,) = outputs[0].outputs
+    assert [event.type for event in output.events] == [
+        EngineCoreEventType.QUEUED,
+        EngineCoreEventType.SCHEDULED,
+    ]
+    # The lane's KV cache manager counted the lookup and only the coordinator
+    # read it: a lane making its own stats would have reset it first.
+    prefix = outputs[0].scheduler_stats.prefix_cache_stats
+    assert (prefix.requests, prefix.queries, prefix.hits) == (1, 32, 0)
+
+
 def test_a_lane_keeps_its_drafts_for_the_coordinator():
-    # A lane runs with log_stats off, so the base scheduler would drop every
-    # draft and lane-DP serving would report no speculation at all.
+    # A lane makes no SchedulerStats of its own, so the base scheduler would
+    # drop every draft and lane-DP serving would report no speculation at all.
     from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
     lane = TTScheduler.__new__(TTScheduler)

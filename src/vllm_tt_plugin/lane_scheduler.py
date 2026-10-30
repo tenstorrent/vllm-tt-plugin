@@ -322,8 +322,12 @@ class TTLaneCoordinator(SchedulerInterface):
 
         # One independent scheduler per lane. Each gets the same kv_cache_config
         # (every submesh cache is the same size) and its own KV cache manager,
-        # so lane block-ID spaces are independent. Per-lane stats are disabled;
-        # the coordinator aggregates stats itself.
+        # so lane block-ID spaces are independent. Each lane keeps vLLM's
+        # log_stats: it records the QUEUED / SCHEDULED / PREEMPTED request events
+        # behind the queue, prefill and inference time histograms, and its KV
+        # cache manager counts prefix-cache hits. Without them every request's
+        # prefill time is first_token_ts - 0, the host's monotonic clock. The
+        # coordinator alone makes the step's SchedulerStats (make_stats).
         self.lanes: list[TTScheduler] = [
             TTScheduler(
                 per_lane_vllm_config,
@@ -333,13 +337,15 @@ class TTLaneCoordinator(SchedulerInterface):
                 hash_block_size,
                 mm_registry,
                 include_finished_set,
-                log_stats=False,
+                log_stats=log_stats,
             )
             for _ in range(self.num_lanes)
         ]
-        # vLLM computes spec-decode stats inside each lane's update_from_output,
-        # which drops them with stats off; the lanes keep them for make_stats.
+        # vLLM computes spec-decode stats inside each lane's update_from_output
+        # and hands them to the lane's make_stats, which makes none on a lane;
+        # the lanes keep them for the coordinator's make_stats instead.
         for sched in self.lanes:
+            sched.stats_made_by_coordinator = True
             sched.collect_spec_decoding_stats = log_stats
 
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
