@@ -1862,30 +1862,38 @@ class TTModelRunner:
                     f"{offered.tolist()}; a row offers at most the draft "
                     "length the plan resolved, and 0 to offer nothing"
                 )
-        # Range-checked before the ids reach the scheduler, because a draft it
-        # stores is verified next step and committed if the model agrees with
-        # it, and an id outside the vocabulary is not something any verify can
-        # have chosen. Only the offered entries are checked: a row's unoffered
-        # tail is never read, so a drafter may pad it with the placeholder or
-        # with anything else.
-        vocab = int(self.input_batch.vocab_size)
-        if offered is None:
-            out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
-        else:
-            columns = torch.arange(num_drafts).unsqueeze(0)
-            is_offered = columns < offered.to(torch.int64).unsqueeze(1)
-            out_of_range = (
-                (draft_token_ids < 0) | (draft_token_ids >= vocab)
-            ) & is_offered
-        if bool(out_of_range.any()):
-            raise ValueError(
-                f"TT model {type(self.model).__name__} proposed a draft token "
-                f"id outside [0, {vocab}); a drafter offering nothing for a "
-                "row says so with num_valid, and the ids in that row are then "
-                "not read"
-            )
+        offered_by_row = None if offered is None else offered.tolist()
+        # A drafter that offers nothing on any row has declined the step. Its
+        # ids are then never read, so there is nothing to range-check, and the
+        # publish loop below reduces to erasing each live row's last proposal;
+        # the declining drafter's common step skips the rest.
+        declined = offered_by_row is not None and not any(offered_by_row)
+        if not declined:
+            # Range-checked before the ids reach the scheduler, because a
+            # draft it stores is verified next step and committed if the model
+            # agrees with it, and an id outside the vocabulary is not
+            # something any verify can have chosen. Only the offered entries
+            # are checked: a row's unoffered tail is never read, so a drafter
+            # may pad it with the placeholder or with anything else.
+            vocab = int(self.input_batch.vocab_size)
+            if offered is None:
+                out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
+            else:
+                columns = torch.arange(num_drafts).unsqueeze(0)
+                is_offered = columns < offered.to(torch.int64).unsqueeze(1)
+                out_of_range = (
+                    (draft_token_ids < 0) | (draft_token_ids >= vocab)
+                ) & is_offered
+            if bool(out_of_range.any()):
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} proposed a draft "
+                    f"token id outside [0, {vocab}); a drafter offering nothing "
+                    "for a row says so with num_valid, and the ids in that row "
+                    "are then not read"
+                )
         max_model_len = int(self.model_config.max_model_len)
         skipped = set(skip_req_ids or ())
+        counts_by_row = counts.tolist()
         # ``row`` is the request's row of the step's block, which a lane step
         # places at the request's slot rather than at its live position.
         for row, req_id in zip(live_rows, row_req_ids, strict=True):
@@ -1897,7 +1905,14 @@ class TTModelRunner:
                 continue
             # A row that committed nothing this step proposes nothing: there is
             # no continuation to draft from.
-            if int(counts[row]) < 1:
+            if counts_by_row[row] < 1:
+                continue
+            if declined:
+                # Erase, as ``_publish_draft`` does for an empty offer, for a
+                # request that still holds a row (the published-for rows of the
+                # full loop below).
+                if req_id in self.input_batch.req_id_to_index:
+                    self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
             # indexed by the step's rows, which is the order the model answered
@@ -1914,7 +1929,7 @@ class TTModelRunner:
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
             room = max_model_len - int(self.input_batch.num_tokens[batch_row])
-            row_offered = num_drafts if offered is None else int(offered[row])
+            row_offered = num_drafts if offered_by_row is None else offered_by_row[row]
             usable = max(0, min(row_offered, room))
             self._publish_draft(
                 req_id, [int(token) for token in draft_token_ids[row, :usable]]
@@ -1958,15 +1973,23 @@ class TTModelRunner:
         ``live_rows[i]`` is the block row of ``row_req_ids[i]``.
         """
         positions = self._committed_positions(submitted_positions, width)
-        offsets = torch.arange(width, dtype=torch.int32)
         requests = getattr(self, "requests", {})
+        counts_by_row = counts.tolist()
+        rows: list[int] = []
+        firsts: list[int] = []
         for row, req_id in zip(live_rows, row_req_ids, strict=True):
             req_state = requests.get(req_id)
-            count = int(counts[row])
+            count = counts_by_row[row]
             if req_state is None or count < 1:
                 continue
-            first = req_state.num_tokens - count
-            positions[row] = first + offsets
+            rows.append(row)
+            firsts.append(req_state.num_tokens - count)
+        if rows:
+            # One indexed write for every live row rather than one per row:
+            # this runs after every ordinary decode of a speculating launch.
+            positions[rows] = torch.tensor(firsts, dtype=torch.int32).unsqueeze(
+                1
+            ) + torch.arange(width, dtype=torch.int32).unsqueeze(0)
         return positions
 
     @staticmethod
@@ -2111,11 +2134,35 @@ class TTModelRunner:
         if bool(padding.any()):
             input_tokens = input_tokens.masked_fill(padding.unsqueeze(1), 0)
             input_positions = input_positions.masked_fill(padding, -1)
+        # Consumed here on every step, whatever the step turns out to be: a
+        # proposal is handed over once (``_drafts_to_verify``).
+        scheduled_drafts = self._drafts_to_verify(scheduler_output, row_req_ids)
+        self._grammar_draft_handoff = {}
+        self._grammar_handed_over_req_ids = set()
+        if (
+            self._spec_supports_narrow_decode
+            and not any(scheduled_drafts.values())
+            and not any(
+                self._req_accepted_counts.get(req_id, 1) > 1 for req_id in row_req_ids
+            )
+        ):
+            # The declined step. No row carries a draft and no live row has a
+            # commit to resolve, so ``_step_verifies`` answers "ordinary
+            # decode" whichever of its rules is read (rule 2 and the fall
+            # through agree), and the candidate block the full build would
+            # assemble below is discarded unread. A drafter that declines on
+            # every step of a batched stretch makes this the common step, so
+            # it skips the per-row side tensors and goes straight to the plain
+            # rows the full build would also return: the same tokens and
+            # positions, no side tensor, and the count reset below.
+            for req_id in row_req_ids:
+                self._req_accepted_counts.pop(req_id, None)
+            return SpecDecodeRows(input_tokens, input_positions)
         num_drafts = self._num_speculative_tokens
         spec_plan = getattr(self, "_spec_plan", None)
         live_drafts, live_num_valid, live_counts = self._spec_row_state(
             self._req_accepted_counts,
-            self._drafts_to_verify(scheduler_output, row_req_ids),
+            scheduled_drafts,
             row_req_ids,
             num_drafts,
             spec_plan.draft_cap(num_live) if spec_plan is not None else None,
@@ -2132,8 +2179,6 @@ class TTModelRunner:
         num_valid_drafts[rows] = live_num_valid
         accepted_counts = torch.ones(num_rows, dtype=torch.int32)
         accepted_counts[rows] = live_counts
-        self._grammar_draft_handoff = {}
-        self._grammar_handed_over_req_ids = set()
         if _step_verifies(
             self._spec_supports_narrow_decode,
             all(self._request_is_speculable(req_id) for req_id in row_req_ids),
