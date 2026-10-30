@@ -15,7 +15,17 @@ requests run their final chunk one a step in admission order (the generator
 *restores* each prefix from its slot first), each emitting its first token;
 decode starts after the last. A request arriving while a cohort drains waits
 for the next cohort; one arriving while a cohort decodes has its bulk run
-prefill-first as today and is parked into the next cohort.
+prefill-first as today and is parked into the next cohort. With
+``TT_SCHED_DEFER_FINAL=hold`` that last rule changes: while any
+request of the cohort is still decoding, no new prefill is admitted (the
+scheduler takes a decode step instead), so the replacements of the requests
+that finished first wait for the whole cohort to finish and then form the next
+cohort together. Under the stock rule a cohort whose members finish a few steps
+apart (the speculative round's ragged acceptance) has each early finisher's
+replacement bulk run prefill-first between the others' decode steps, and at
+long prompts those bulks (82 s each at 1M) fill the stragglers' windows exactly
+as the serial path's prefills did (32 s per token for the last 13
+requests of a long-context cohort).
 
 The policy keeps three queues: ``parked`` (request ids of multi-chunk prompts
 whose bulk is done; they stay in ``running`` as partial prefills and are
@@ -45,27 +55,38 @@ ENV = "TT_SCHED_DEFER_FINAL"
 MODEL_ENV = "TT_V41_DEFER_FINAL"  # the generator's flag; both must agree
 
 
-def enabled(environ=None) -> bool:
+VALUES = ("1", "hold")  # "1": the cohort rule; "hold": plus no admission while a cohort decodes
+
+
+def value(environ=None) -> str:
     env = os.environ if environ is None else environ
-    return env.get(ENV, "0").strip() == "1"
+    v = env.get(ENV, "0").strip()
+    if v not in ("0", "") and v not in VALUES:
+        raise ValueError(f"{ENV}={v!r}: one of {VALUES}, or unset")
+    return v
+
+
+def enabled(environ=None) -> bool:
+    return value(environ) in VALUES
 
 
 def check_agreement(environ=None) -> None:
     """The scheduler's and the generator's flags must agree: a policy that parks requests the generator does not
     restore (or the reverse) serves wrong tokens or asserts in the middle of a wave, so refuse at start-up."""
     env = os.environ if environ is None else environ
-    sched = env.get(ENV, "0").strip() == "1"
+    sched = enabled(env)
     model = env.get(MODEL_ENV, "0").strip() == "1"
     if sched != model:
         raise ValueError(f"{ENV}={'1' if sched else 'unset'} but {MODEL_ENV}={'1' if model else 'unset'}: set both or neither")
 
 
 class DeferFinalPolicy:
-    def __init__(self, chunk_tokens: int, cohort: int) -> None:
+    def __init__(self, chunk_tokens: int, cohort: int, hold_admission: bool = False) -> None:
         if chunk_tokens <= 0 or cohort <= 0:
             raise ValueError((chunk_tokens, cohort))
         self.chunk = chunk_tokens
         self.cohort = cohort  # the slots: parked + held + decoding requests close a cohort when they reach it
+        self.hold_admission = hold_admission  # TT_SCHED_DEFER_FINAL=hold: no admission while a cohort decodes
         self.parked: deque[str] = deque()
         self.held: deque[Request] = deque()
         self.finals: deque[tuple[str, Request | None]] = deque()
@@ -76,10 +97,19 @@ class DeferFinalPolicy:
     def from_env(cls, environ=None, chunk_tokens: int | None = None, cohort: int | None = None):
         if not enabled(environ):
             return None
-        return cls(chunk_tokens or 5120, cohort or 32)
+        return cls(chunk_tokens or 5120, cohort or 32, hold_admission=value(environ) == "hold")
 
     def describe(self) -> str:
-        return f"defer_final(chunk={self.chunk}, cohort={self.cohort})"
+        return f"defer_final(chunk={self.chunk}, cohort={self.cohort}, hold_admission={self.hold_admission})"
+
+    def hold_for_decoders(self, running) -> bool:
+        """``_prefer_decode``'s clause (``hold``): take a decode step instead of admitting or advancing a prefill
+        while a cohort decodes, i.e. when no bulk is in progress (an unparked partial) and no cohort is draining
+        its finals; the caller has established that a decode row is running."""
+        if not self.hold_admission or self.draining:
+            return False
+        parked = self.parked_ids
+        return not any(r.is_prefill_chunk and r.request_id not in parked for r in running)
 
     # --- the request's shape ------------------------------------------------------------------------------------
     def prefix(self, request) -> int:

@@ -262,8 +262,9 @@ class TTScheduler(AsyncScheduler):
         The contract every scheduling policy keeps (``TT_SCHED_INTERLEAVE``
         here; ``TT_SCHED_PACK`` and any later one conform to it):
 
-        - one clause per policy, in the order below; the first true clause
-          wins; a policy whose variable is unset is ``None`` and adds nothing,
+        - one clause per policy, in the order below (``TT_SCHED_DEFER_FINAL=hold``
+          first: a decoding cohort admits nothing, ``sched_defer_final``); the
+          first true clause wins; a policy whose variable is unset is ``None`` and adds nothing,
           so with every variable unset this returns ``False`` and
           ``_schedule`` is the stock prefill-first path;
         - a clause reads the scheduler's state (``self.running`` and its
@@ -283,6 +284,9 @@ class TTScheduler(AsyncScheduler):
         """
         if not has_running_decode:
             return False
+        defer = self._defer_policy
+        if defer is not None and defer.hold_for_decoders(self.running):
+            return True
         policy = self._interleave
         if policy is not None:
             ready = sum(1 for r in self.running if not r.is_prefill_chunk)

@@ -20,7 +20,12 @@ def test_flags_and_agreement():
     assert DeferFinalPolicy.from_env({}) is None
     assert DeferFinalPolicy.from_env({"TT_SCHED_DEFER_FINAL": "0"}) is None
     policy = DeferFinalPolicy.from_env({"TT_SCHED_DEFER_FINAL": "1"}, chunk_tokens=CHUNK, cohort=32)
-    assert policy is not None and policy.chunk == CHUNK and policy.cohort == 32
+    assert policy is not None and policy.chunk == CHUNK and policy.cohort == 32 and not policy.hold_admission
+    policy = DeferFinalPolicy.from_env({"TT_SCHED_DEFER_FINAL": "hold"}, chunk_tokens=CHUNK, cohort=32)
+    assert policy is not None and policy.hold_admission and "hold_admission=True" in policy.describe()
+    with pytest.raises(ValueError, match="TT_SCHED_DEFER_FINAL"):
+        DeferFinalPolicy.from_env({"TT_SCHED_DEFER_FINAL": "yes"})
+    check_agreement({"TT_SCHED_DEFER_FINAL": "hold", "TT_V41_DEFER_FINAL": "1"})
     check_agreement({})
     check_agreement({"TT_SCHED_DEFER_FINAL": "1", "TT_V41_DEFER_FINAL": "1"})
     with pytest.raises(ValueError, match="TT_V41_DEFER_FINAL"):
@@ -46,7 +51,7 @@ def _scheduled(rows):
     return out
 
 
-def _scheduler(prompts, *, decoders=0, cohort=32, policy=True):
+def _scheduler(prompts, *, decoders=0, cohort=32, policy=True, hold=False):
     """A scheduler with ``decoders`` decode rows running and ``prompts`` waiting; the base scheduler's
     ``schedule`` stubbed as the stock loop sees it: admit from ``waiting`` while ``len(running) <
     max_num_running_reqs`` (one chunk of the new request), else advance the first partial in ``running`` by one
@@ -64,7 +69,7 @@ def _scheduler(prompts, *, decoders=0, cohort=32, policy=True):
     scheduler._forced_mode = TTSchedulingMode.DEFAULT
     scheduler._aligned_chunks = True
     scheduler._interleave = None
-    scheduler._defer = DeferFinalPolicy(CHUNK, cohort) if policy else None
+    scheduler._defer = DeferFinalPolicy(CHUNK, cohort, hold_admission=hold) if policy else None
     scheduler.requests = {r.request_id: r for r in running + waiting}
     return scheduler
 
@@ -194,3 +199,57 @@ def test_forced_decode_only_ignores_the_policy(base):
     scheduler._forced_mode = TTSchedulingMode.DECODE_ONLY
     t = _trace(scheduler, 2)
     assert t == ["D1", "D1"]
+
+
+def test_hold_keeps_replacements_out_until_the_cohort_finishes(base):
+    """TT_SCHED_DEFER_FINAL=hold: the early finisher's replacement waits for the whole cohort."""
+    scheduler = _scheduler([2 * CHUNK] * 2, cohort=32, hold=True)
+    t = _trace(scheduler, 5)
+    assert t[-1] == "D2"
+    out = SchedulerOutput.make_empty()
+    out.finished_req_ids = {"w0"}
+    scheduler._finalize_scheduler_output(out)
+    scheduler.running = [r for r in scheduler.running if r.request_id != "w0"]
+    # the replacement arrives while w1 decodes: decode steps only, the bulk waits
+    t = _trace(scheduler, 3, arrivals={0: [2 * CHUNK]})
+    assert t == ["D1", "D1", "D1"], t
+    assert scheduler._defer.closed_on == ["tail"]
+    # w1 finishes: nothing decodes, the replacement is admitted, its cohort closes on the tail, it decodes
+    out = SchedulerOutput.make_empty()
+    out.finished_req_ids = {"w1"}
+    scheduler._finalize_scheduler_output(out)
+    scheduler.running = [r for r in scheduler.running if r.request_id != "w1"]
+    t = _trace(scheduler, 4)
+    assert t == ["Pa0_10240:0-5120", "Pa0_10240:5120-10240", "D1", "D1"], t
+    assert scheduler._defer.closed_on == ["tail", "tail"]
+
+
+def test_hold_forms_the_next_cohort_from_every_replacement(base):
+    """Three of a cohort of four finish at different steps; their replacements wait (decode steps only), and
+    once the straggler finishes they and a fourth arrival prefill as one cohort of four: bulks, finals back to
+    back, decode together."""
+    scheduler = _scheduler([2 * CHUNK] * 4, cohort=4, hold=True)
+    t = _trace(scheduler, 13)
+    assert t[-1] == "D4" and scheduler._defer.closed_on == ["full"]
+    for i, rid in enumerate(("w0", "w2", "w3")):
+        out = SchedulerOutput.make_empty()
+        out.finished_req_ids = {rid}
+        scheduler._finalize_scheduler_output(out)
+        scheduler.running = [r for r in scheduler.running if r.request_id != rid]
+        t = _trace(scheduler, 3, arrivals={i: [2 * CHUNK]})  # a replacement arrives before step i
+        assert t == [f"D{3 - i}"] * 3, (i, t)  # the ones still decoding; the arrival waits
+    assert len(scheduler.waiting) == 3
+    out = SchedulerOutput.make_empty()
+    out.finished_req_ids = {"w1"}
+    scheduler._finalize_scheduler_output(out)
+    scheduler.running = [r for r in scheduler.running if r.request_id != "w1"]
+    t = _trace(scheduler, 9, arrivals={3: [2 * CHUNK]})  # a fourth arrives while the cohort is open
+    assert t[:4] == [f"Pa{i}_10240:0-5120" for i in range(4)], t
+    assert t[4:8] == [f"Pa{i}_10240:5120-10240" for i in range(4)], t
+    assert t[8] == "D4" and scheduler._defer.closed_on == ["full", "full"]
+
+
+def test_hold_is_off_under_the_stock_value(base):
+    scheduler = _scheduler([2 * CHUNK] * 2, cohort=32)
+    assert not scheduler._defer.hold_admission
+    assert not scheduler._defer.hold_for_decoders(scheduler.running)
