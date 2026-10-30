@@ -686,6 +686,23 @@ def get_tt_prefill_gather_quiet_ms(vllm_config: "VllmConfig") -> float:
     )
 
 
+_LANE_PREFIX_AFFINITY_SLACK_KEY = "lane_prefix_affinity_slack"
+# One queued request's worth of the lane load score (``waiting * 4 + running``).
+_LANE_PREFIX_AFFINITY_SLACK_DEFAULT = 4
+
+
+def get_tt_lane_prefix_affinity_slack(vllm_config: "VllmConfig") -> float:
+    """How much busier than the least-loaded lane, in lane load-score units, a
+    lane-DP request may be routed to reach a lane that caches more of its
+    prompt (default 4, one queued request). 0 only breaks load ties by cached
+    prefix."""
+    return _read_tt_nonnegative_number(
+        get_tt_config(vllm_config),
+        _LANE_PREFIX_AFFINITY_SLACK_KEY,
+        _LANE_PREFIX_AFFINITY_SLACK_DEFAULT,
+    )
+
+
 def _read_tt_nonnegative_number(
     tt_config: dict[str, Any], key: str, default: float
 ) -> float:

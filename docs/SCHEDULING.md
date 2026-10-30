@@ -665,9 +665,19 @@ Single-process lane-DP uses one vLLM engine process and one TT worker.
 its own `waiting` and `running` queues, admission decisions, KV cache manager,
 and lane-local block ID space.
 
-New requests are assigned to the least-loaded lane and remain bound to that
-lane. Because the device executes all lanes together, the coordinator selects
-one shared mode for each step:
+New requests are assigned to a lane at arrival and remain bound to it. A lane's
+load is `waiting * 4 + running`, the score vLLM's DP load balancer uses. Each
+lane has its own prefix cache, so a multi-turn conversation whose next turn
+lands on another lane recomputes its whole prompt. Among the lanes whose load is
+within `lane_prefix_affinity_slack` (default 4, one queued request) of the
+lowest, the request goes to the one that already caches the longest prefix of
+its prompt; ties go to the lower load, then the lower lane index. With nothing
+cached on any of them this is the least-loaded lane. `0` only breaks load ties.
+On a 4-lane agentic trace replay, routing by load alone hit the cache on 79% of
+prompt tokens against the 97% the traces offered.
+
+Because the device executes all lanes together, the coordinator selects one
+shared mode for each step:
 
 - if any lane can admit prefill, all lanes run a prefill step
 - otherwise, all lanes run a decode step
@@ -813,7 +823,7 @@ cross-rank scheduling or execution collectives.
 Single-process lane-DP is TT-specific because one engine coordinates several
 device lanes. It adds:
 
-- static request-to-lane assignment
+- static request-to-lane assignment, by load and cached prefix
 - one prefill/decode mode shared by all in-process lanes
 - merging lane scheduler outputs into one TT input
 - splitting the merged result back into lane-local scheduler state

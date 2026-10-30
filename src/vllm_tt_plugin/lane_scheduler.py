@@ -47,6 +47,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
+    get_tt_lane_prefix_affinity_slack,
     get_tt_per_lane_max_num_seqs,
     get_tt_prefill_gather_ms,
     get_tt_prefill_gather_quiet_ms,
@@ -304,6 +305,7 @@ class TTLaneCoordinator(SchedulerInterface):
         self._prefill_gather_quiet_s = (
             get_tt_prefill_gather_quiet_ms(vllm_config) / 1000.0
         )
+        self._prefix_affinity_slack = get_tt_lane_prefix_affinity_slack(vllm_config)
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -362,17 +364,27 @@ class TTLaneCoordinator(SchedulerInterface):
     # Lane selection / mode negotiation
     # ------------------------------------------------------------------
 
-    def _pick_lane(self) -> int:
-        """Choose the least-loaded lane for a newly arriving request.
+    def _pick_lane(self, request: Request) -> int:
+        """Choose a lane for a newly arriving request: the least-loaded one,
+        unless a slightly busier lane already caches more of its prompt.
 
-        Scores each lane ``waiting * 4 + running`` and picks the lowest
-        (ties resolve to the lowest lane index). This is intentionally the same
-        load score vLLM uses to route requests across DP engines
+        Scores each lane's load ``waiting * 4 + running``. This is intentionally
+        the same load score vLLM uses to route requests across DP engines
         (``DPLBAsyncMPClient.get_core_engine_for_request`` in
         ``vllm/v1/engine/core_client.py``): queued requests are weighted more
         heavily than running ones because each will cost a future prefill. The
         lane coordinator stands in for vLLM's multi-process DP load balancer, so
-        it keeps the same policy.
+        it keeps the same load measure.
+
+        Unlike DP engines behind a router, every lane here has its own prefix
+        cache, and a multi-turn conversation whose next turn lands on another
+        lane recomputes the prefix its previous lane holds. Routed purely by load,
+        a 4-lane agentic trace replay hit the cache on 79% of prompt tokens
+        against the 97% the traces offered. So among the lanes whose load is
+        within ``lane_prefix_affinity_slack`` of the lowest, the one caching the
+        longest prefix of the request wins; ties go to the lower load, then the
+        lower lane index. With nothing cached on any candidate (prefix caching
+        off, or a new conversation) this is the plain least-loaded pick.
 
         Assignment is static: a request is bound to one lane at admission
         (recorded in the coordinator's maps) and never migrates,
@@ -381,14 +393,23 @@ class TTLaneCoordinator(SchedulerInterface):
         the same as an idle DP rank. Cross-lane rebalancing (e.g. work-stealing)
         is a possible future follow-up.
         """
-        best_lane = 0
-        best_score: int | None = None
-        for lane, sched in enumerate(self.lanes):
-            score = len(sched.waiting) * 4 + len(sched.running)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_lane = lane
-        return best_lane
+        scores = [len(sched.waiting) * 4 + len(sched.running) for sched in self.lanes]
+        ceiling = min(scores) + self._prefix_affinity_slack
+        candidates = [lane for lane, score in enumerate(scores) if score <= ceiling]
+        cached = {lane: 0 for lane in candidates}
+        if len(candidates) > 1:
+            for lane in candidates:
+                cached[lane] = self._cached_prefix_tokens(lane, request)
+        return min(candidates, key=lambda lane: (-cached[lane], scores[lane], lane))
+
+    def _cached_prefix_tokens(self, lane: int, request: Request) -> int:
+        """Tokens of ``request``'s prompt already in ``lane``'s prefix cache.
+
+        The lane's own lookup, the one its scheduler runs again at admission: it
+        reads the block hashes the request was created with and takes no block
+        references, so probing a lane that is not picked leaves it untouched.
+        """
+        return self.lanes[lane].kv_cache_manager.get_computed_blocks(request)[1]
 
     def _local_prefill_intent(self, sched: TTScheduler) -> int:
         """Whether this lane *wants* to prefill this step (1) or not (0).
@@ -791,7 +812,7 @@ class TTLaneCoordinator(SchedulerInterface):
         # coordinator-owned state; the shared vLLM Request object stays generic.
         lane = self._req_to_lane.get(request.request_id)
         if lane is None:
-            lane = self._pick_lane()
+            lane = self._pick_lane(request)
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
 
