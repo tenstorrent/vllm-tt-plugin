@@ -102,11 +102,17 @@ class DeferFinalPolicy:
     def describe(self) -> str:
         return f"defer_final(chunk={self.chunk}, cohort={self.cohort}, hold_admission={self.hold_admission})"
 
-    def hold_for_decoders(self, running) -> bool:
+    def hold_for_decoders(self, running, waiting_head) -> bool:
         """``_prefer_decode``'s clause (``hold``): take a decode step instead of admitting or advancing a prefill
         while a cohort decodes, i.e. when no bulk is in progress (an unparked partial) and no cohort is draining
-        its finals; the caller has established that a decode row is running."""
+        its finals; the caller has established that a decode row is running. Not for a one-chunk prompt at the
+        head of the queue (``waiting_head``, or None): its prefill is its final, so deferring it buys nothing and
+        holding it costs the cohort's whole decode (the first of a burst of 32 closed a
+        cohort of one and decoded alone for 5 s); the stock path admits it between decode steps as the serial
+        path does."""
         if not self.hold_admission or self.draining:
+            return False
+        if waiting_head is not None and self.one_chunk(waiting_head):
             return False
         parked = self.parked_ids
         return not any(r.is_prefill_chunk and r.request_id not in parked for r in running)
@@ -129,7 +135,9 @@ class DeferFinalPolicy:
         return bool(self.finals)
 
     def size(self) -> int:
-        return len(self.parked) + len(self.held)
+        """The cohort so far: every parked or held request (``hold`` puts the id in ``parked`` too, for the order;
+        counting both closed a one-chunk cohort at half the slots)."""
+        return len(self.parked)
 
     def hold(self, request) -> None:
         self.held.append(request)

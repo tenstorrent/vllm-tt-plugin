@@ -285,8 +285,10 @@ class TTScheduler(AsyncScheduler):
         if not has_running_decode:
             return False
         defer = self._defer_policy
-        if defer is not None and defer.hold_for_decoders(self.running):
-            return True
+        if defer is not None:
+            head = self.waiting.peek_request() if self.waiting else None
+            if defer.hold_for_decoders(self.running, head):
+                return True
         policy = self._interleave
         if policy is not None:
             ready = sum(1 for r in self.running if not r.is_prefill_chunk)

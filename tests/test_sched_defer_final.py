@@ -252,4 +252,26 @@ def test_hold_forms_the_next_cohort_from_every_replacement(base):
 def test_hold_is_off_under_the_stock_value(base):
     scheduler = _scheduler([2 * CHUNK] * 2, cohort=32)
     assert not scheduler._defer.hold_admission
-    assert not scheduler._defer.hold_for_decoders(scheduler.running)
+    assert not scheduler._defer.hold_for_decoders(scheduler.running, None)
+
+
+def test_one_chunk_cohort_counts_every_held_prompt_once(base):
+    """a cohort of one-chunk prompts closed at half the slots (held ids counted twice)."""
+    scheduler = _scheduler([1028] * 8, cohort=8)
+    t = _trace(scheduler, 9)
+    assert t[:8] == [f"Pw{i}:0-1028" for i in range(8)], t
+    assert t[8] == "D8" and scheduler._defer.closed_on == ["full"]
+
+
+def test_hold_yields_to_a_one_chunk_head(base):
+    """under hold a one-chunk prompt is admitted between decode steps as the stock rule does (its
+    prefill is its final), so the first of a burst does not decode alone while the rest wait."""
+    scheduler = _scheduler([1028], cohort=32, hold=True)
+    t = _trace(scheduler, 2)
+    assert t == ["Pw0:0-1028", "D1"], t  # a tail cohort of one
+    t = _trace(scheduler, 5, arrivals={0: [1028], 1: [1029], 2: [1030]})
+    # each arrival is held, the tail closes, its final runs between w0's decode steps, then all decode
+    assert t == ["Pa0_1028:0-1028", "Pa1_1029:0-1029", "Pa2_1030:0-1030", "D4", "D4"], t
+    # a multi-chunk arrival while they decode waits (the hold rule)
+    t = _trace(scheduler, 2, arrivals={0: [2 * CHUNK]})
+    assert t == ["D4", "D4"], t
