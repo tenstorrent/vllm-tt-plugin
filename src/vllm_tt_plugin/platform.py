@@ -1154,6 +1154,18 @@ def _install_tt_input_processor_patch() -> None:
             _tt_request_vllm_config.reset(token)
 
         cloned_params = request.sampling_params
+        if (
+            cloned_params is not None
+            and getattr(request, "mm_features", None)
+            and os.environ.get("TT_MM_PREFIX_CACHE", "0") != "1"
+        ):
+            # A request with images must not read vLLM's prefix cache: on a hit
+            # the scheduler only hands the model the encoder inputs of the
+            # NOT-yet-computed range, so a model that recomputes the prompt
+            # (the TT snapshot store decides what is reused, and never reuses
+            # state that covers image tokens) would see placeholder tokens
+            # without their pixels and answer without the image.
+            cloned_params.skip_reading_prefix_cache = True
         if not is_block_output_model or cloned_params is None:
             return request
 
