@@ -338,6 +338,7 @@ Common options:
 | `decode_interleave_prefill_steps` | Consecutive prefill steps allowed before one insertion. Raise it to favor time to first token, lower it to favor inter-token latency. Default: `2`. |
 | `decode_interleave_decode_steps` | How many decode-only steps one insertion runs. Reaching this count stops the policy choosing decode; it never forces a prefill step. Does not loosen the latency bound; buys more decode progress per insertion, and more cheaply than a shorter prefill run does. Default: `1`. |
 | `lane_prefix_cache_routing` | Lane mode only (`folds_dp_into_lanes`): route a new request to the lane that already holds the most of its prompt in its prefix cache, unless that lane has no free running slot while the least-loaded one has, or the prefill queued ahead there outweighs the prefill the hit saves. `false` keeps plain least-loaded routing. Default: `true`. |
+| `dp_prefix_cache_routing` | Standard multi-process DP only: the same rule applied to the DP ranks, routing a new request to the rank that was sent the most of its prompt, from the API server's own record of what each rank was sent (it cannot read a rank's prefix cache); the request is pinned through `data_parallel_rank`, ahead of vLLM's least-loaded balancer. `false` leaves every request to vLLM's routing. Default: `true`. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
 

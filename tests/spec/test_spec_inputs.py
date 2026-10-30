@@ -135,6 +135,15 @@ def _fake_runner(
         TTModelRunner._request_is_argmax_certifiable.__get__(runner)
     )
     runner._spec_mode_for_step = TTModelRunner._spec_mode_for_step.__get__(runner)
+    for name in (
+        "_spec_decode_rows",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+        "_forget_finished_spec_state",
+        "_structured_drafts",
+        "_pending_min_tokens",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
     return runner
 
 
@@ -326,6 +335,7 @@ def test_a_draftless_step_is_an_ordinary_decode_for_a_narrow_model():
     batch = _batch()
     request = _add_decoding_request(batch, "r")
     runner = _fake_runner(batch, {"r": request}, supports_narrow_decode=True)
+    built = _count_candidate_builds(runner)
 
     model_input = _decode(runner, "r")
 
@@ -334,6 +344,19 @@ def test_a_draftless_step_is_an_ordinary_decode_for_a_narrow_model():
     assert model_input.spec_mode is None
     assert model_input.accepted_counts is None
     assert model_input.num_valid_drafts is None
+    # The declined step: the candidate block the full build would discard is
+    # not built at all, so a drafter that declines costs the builder only the
+    # plain rows.
+    assert built == [], "a step with nothing to verify built the candidate block"
+
+
+def _count_candidate_builds(runner: SimpleNamespace) -> list:
+    """Record each ``_spec_row_state`` call, the start of the full build."""
+    built: list = []
+    runner._spec_row_state = lambda *args: built.append(args) or (
+        TTModelRunner._spec_row_state(*args)
+    )
+    return built
 
 
 def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
@@ -354,9 +377,11 @@ def test_a_draftless_step_still_verifies_while_a_commit_is_unresolved():
         supports_narrow_decode=True,
         accepted_counts={"r": 3},
     )
+    built = _count_candidate_builds(runner)
 
     model_input = _decode(runner, "r")
 
+    assert len(built) == 1, "an unresolved commit took the declined-step path"
     assert model_input.spec_mode is not None
     assert model_input.accepted_counts.tolist()[0] == 3
     assert model_input.num_valid_drafts.tolist() == [0] * MAX_NUM_REQS

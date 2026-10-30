@@ -1132,8 +1132,10 @@ class TTAsyncDecodeController:
         *,
         steady_decode_fast_path: bool,
     ) -> DeferredDecodeOutput:
-        event = threading.Event()
         context = self.capture_submitted_step_context()
+        if model_input.spec_mode is not None:
+            return self._submit_async_spec_step(model_input, context)
+        event = threading.Event()
         submission = self.submit_decode(
             model_input,
             read_from_device=False,
@@ -1141,25 +1143,6 @@ class TTAsyncDecodeController:
         )
         if submission.tt_out is None:
             event.set()
-        step: DeferredDecodeOutput
-        if model_input.spec_mode is not None:
-            # A speculative step resolves through the accept walk, not the
-            # sampler. It is never overlap-safe: the next candidate block is
-            # built from this step's committed tokens, so the build has to wait
-            # for this commit. This is the only thing that says so:
-            # ``check_perform_device_sampling`` does not look at speculation,
-            # so on a launch that samples on device a verify reaches
-            # ``can_use_steady_decode_fast_path`` with every condition met and
-            # comes back eligible.
-            step = AsyncTTSpecDecodeOutput(
-                controller=self,
-                submission=submission,
-                model_input=model_input,
-                completion_event=event,
-                context=context,
-            )
-            self.register_pending_async_step(step, overlap_ok=False)
-            return step
         step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
@@ -1170,13 +1153,49 @@ class TTAsyncDecodeController:
         self.register_pending_async_step(step, overlap_ok=steady_decode_fast_path)
         return step
 
+    def _submit_async_spec_step(
+        self, model_input: TTModelInput, context: SubmittedStepContext
+    ) -> AsyncTTSpecDecodeOutput:
+        """Submit a verify whose readback and accept walk are deferred.
+
+        One submission for both layouts. A speculative step resolves through
+        the accept walk, not the sampler, and the walk reads the mode's whole
+        ``[B, 1+K]`` block, so a lane verify is read back whole too, never
+        selectively by scheduled slot. It is never overlap-safe: the next
+        candidate block is built from this step's committed tokens, so the
+        build has to wait for this commit. This is the only thing that says
+        so: ``check_perform_device_sampling`` does not look at speculation, so
+        on a launch that samples on device a verify reaches
+        ``can_use_steady_decode_fast_path`` with every condition met and comes
+        back eligible.
+        """
+        event = threading.Event()
+        submission = self.submit_decode(
+            model_input,
+            read_from_device=False,
+            async_read=True,
+        )
+        if submission.tt_out is None:
+            event.set()
+        step = AsyncTTSpecDecodeOutput(
+            controller=self,
+            submission=submission,
+            model_input=model_input,
+            completion_event=event,
+            context=context,
+        )
+        self.register_pending_async_step(step, overlap_ok=False)
+        return step
+
     def submit_async_lane_decode(
         self,
         model_input: TTModelInput,
         context: SubmittedStepContext,
         scheduled_rows: list[int],
-    ) -> AsyncTTModelRunnerOutput:
+    ) -> DeferredDecodeOutput:
         """Submit a non-blocking single-process multi-lane decode step."""
+        if model_input.spec_mode is not None:
+            return self._submit_async_spec_step(model_input, context)
         overlap_ok = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(

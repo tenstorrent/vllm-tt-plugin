@@ -119,6 +119,21 @@ def _host_runner(host_sampler=None, *, vocab=VOCAB, **attrs):
     return runner
 
 
+def _without_speculation(runner):
+    """Bind the speculative row helpers a lane build calls on every step.
+
+    On a launch that does not speculate they return the rows unchanged.
+    """
+    runner._num_speculative_tokens = 0
+    for name in (
+        "_spec_decode_rows",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
+    return runner
+
+
 def _add_to_lane(batch, req, lane):
     """Place ``req`` at the lowest free row in ``lane``'s chunk.
 
@@ -317,13 +332,15 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
         batch_size_per_dp=(1,),
         prefill_empty_slots=(row,),
     )
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _output_tokens_per_step=1,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests={"request": request},
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _output_tokens_per_step=1,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={"request": request},
+        )
     )
 
     logged: list[str] = []
@@ -362,13 +379,15 @@ def test_lane_structured_decode_captures_expected_grammar_request_ids():
     scheduler_output.num_scheduled_tokens = {"request": 1}
     scheduler_output.total_num_scheduled_tokens = 1
     plan = _plan({"request": row}, is_decode=True, capacity=2)
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _decode_layout_changed_since_last_decode=False,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests={"request": request},
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={"request": request},
+        )
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -439,13 +458,15 @@ def test_sparse_two_lane_grammar_uses_submitted_row_snapshot():
         capacity=4,
         num_lanes=2,
     )
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _decode_layout_changed_since_last_decode=False,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests=requests,
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests=requests,
+        )
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -542,6 +563,90 @@ def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
     )
     assert b.req_id_to_index == {"a": 0, "b": 1}
     assert requests["a"].block_ids == ([7],)
+
+
+def test_apply_step_plan_releases_a_freed_slot_to_the_model_first():
+    """Finish and preemption hand the model the request's row before freeing it.
+
+    The row is the device state slot, and a model-owned drafter keeps a
+    session per slot, so the model has to hear of the release while the slot
+    mapping still names the request, exactly as the front-packed path does
+    through ``_release_model_request``.
+    """
+    released: list[tuple[int, dict]] = []
+    b = _lane_batch(num_lanes=2, per_lane=2)
+    requests: dict = {}
+
+    def release(slot):
+        # Captured with the batch's occupancy at the time of the call.
+        released.append((slot, dict(b.req_id_to_index)))
+
+    b.apply_step_plan(
+        _step_output(
+            new_reqs=[_new_req("a", [1]), _new_req("b", [2]), _new_req("c", [3])]
+        ),
+        _plan({"a": 0, "b": 1, "c": 3}, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released == []
+
+    # "c" finishes in lane 1's last slot: released while it still holds row 3.
+    b.apply_step_plan(
+        _step_output(finished=["c"]),
+        _plan({"a": 0, "b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released == [(3, {"a": 0, "b": 1, "c": 3})]
+    assert b.occupied_rows() == [0, 1]
+
+    # "a" is preempted: its slot is released the same way, and its request
+    # state is kept for the resume.
+    b.apply_step_plan(
+        _step_output(preempted=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released[-1] == (0, {"a": 0, "b": 1})
+    assert "a" in requests and "a" not in b.req_id_to_index
+
+    # "a" is aborted before it resumes: it holds no row and its slot was
+    # already released, so the model hears nothing more.
+    b.apply_step_plan(
+        _step_output(finished=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert len(released) == 2
+    assert "a" not in requests
+
+
+def test_apply_step_plan_refuses_a_preemption_of_a_request_without_a_row():
+    b = _lane_batch(num_lanes=1, per_lane=2)
+    requests: dict = {}
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("b", [2])]),
+        _plan({"b": 1}, capacity=2),
+        requests,
+        {},
+    )
+    with pytest.raises(
+        RuntimeError, match="'ghost' was preempted but holds no lane row"
+    ):
+        b.apply_step_plan(
+            _step_output(preempted=["ghost"]),
+            _plan({"b": 1}, is_decode=True, capacity=2),
+            requests,
+            {},
+            release_request=lambda slot: None,
+        )
 
 
 def test_lane_full_raises():
@@ -966,6 +1071,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         _block_tables_per_layer=lambda _: None,
         requests={"prompt": prompt, "waiting": waiting},
     )
+    _without_speculation(runner)
     runner.check_perform_device_sampling = (
         lambda **kwargs: TTModelRunner.check_perform_device_sampling(runner, **kwargs)
     )

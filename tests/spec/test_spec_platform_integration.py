@@ -235,18 +235,26 @@ def test_declaring_async_spec_decode_does_not_admit_async_decode_itself(
     assert vllm_config.scheduler_config.async_scheduling is False
 
 
-def test_lane_mode_cannot_speculate(monkeypatch, vllm_config):
-    # Lane mode builds its device input from TTLaneInputBatch, which has no
-    # candidate-block builder, so the refusal is what stops a lane launch from
-    # accepting the flags and sending plain single-token decodes.
+def test_a_lane_launch_is_admitted_against_the_folded_concurrency(
+    monkeypatch, vllm_config
+):
+    # One device launch verifies every lane's rows together, so the plan is
+    # dimensioned against the folded total the lane fold leaves in
+    # max_num_seqs, not against one lane's share of it.
+    seen = []
+
+    class _RecordingModel(make_fake_spec_model(max_supported_num_seqs=1024)):
+        @classmethod
+        def spec_plan(cls, config, max_num_seqs, requested_k):
+            seen.append(max_num_seqs)
+            return super().spec_plan(config, max_num_seqs, requested_k)
+
     vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
     vllm_config.parallel_config.data_parallel_size = 1
-    model = make_fake_spec_model(max_supported_num_seqs=1024)
-    with pytest.raises(ValueError) as excinfo:
-        _run_hook(monkeypatch, _speculative(vllm_config), model)
-    message = str(excinfo.value)
-    assert "lane mode" in message
-    assert "TTLaneInputBatch" in message
+    vllm_config.scheduler_config.max_num_seqs = 4
+    _run_hook(monkeypatch, _speculative(vllm_config), _RecordingModel)
+    assert seen == [4]
+    assert get_tt_spec_plan(vllm_config) is not None
 
 
 def test_the_rust_frontend_cannot_speculate(monkeypatch, vllm_config):

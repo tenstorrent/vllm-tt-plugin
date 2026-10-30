@@ -96,6 +96,14 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
         runner, toks
     )
+    # The builder asks the speculative row helpers on every step; on a launch
+    # that does not speculate they return the rows unchanged.
+    for name in (
+        "_spec_decode_rows",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
     return runner
 
 

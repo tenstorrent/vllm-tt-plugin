@@ -159,9 +159,11 @@ declarations when the launch has no `speculative_config`.
 | `medusa`, `mlp_speculator`, and vLLM `EagleModelTypes` values | `device_propose`, `hidden_feed` | Recognized, but rejected because the runner has no proposer for these method names. A model-owned implementation uses `custom_class` instead. |
 
 `TTPlatform.check_and_update_config` rejects generic speculative decoding with
-block-output execution or lane-DP. Standard multi-process DP does not use the
-lane-DP rejection, but the selected model must admit the concurrency of each
-engine. Admission is not device validation for a particular DP deployment.
+block-output execution. Single-process lane-DP is admitted, and its plan is
+resolved against the folded `max_num_seqs`, the total across lanes, because
+one device launch verifies every lane's rows together. Standard multi-process
+DP resolves the plan in each engine, against that engine's own concurrency.
+Admission is not device validation for a particular DP deployment.
 
 `resolve_speculative_plan` reads `spec_requirements` and
 `spec_hidden_handoff` at configuration time. If a model-owned drafter declares
@@ -181,7 +183,7 @@ Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 The model class implements
 `spec_plan(vllm_config, max_num_seqs, requested_k)` and returns a `SpecPlan` or
 `SpecReject`. The platform passes the resolved engine-local concurrency as
-`max_num_seqs`. `spec_plan` must not rely on resolved `get_tt_*` state because
+`max_num_seqs`, which in lane mode is the folded total across lanes. `spec_plan` must not rely on resolved `get_tt_*` state because
 speculative admission does not guarantee that state exists yet.
 
 | `SpecPlan` field | Default | Meaning and current validation |
@@ -194,7 +196,7 @@ speculative admission does not guarantee that state exists yet.
 | `drafter_state` | Required | One of `internal`, `paged`, or `shared_with_target`. Admission rejects `paged` because the plugin has no scheduler-owned drafter-cache allocation. |
 | `drafter_target_cache_requires` | `()` | Sequence using `named_layer_caches` and `absolute_positions`. `SpecPlan` rejects strings, unknown names, duplicates, and a nonempty sequence unless `drafter_state="shared_with_target"`. The plugin does not verify that the target cache satisfies these requirements. |
 | `supports_narrow_decode` | `False` | Declares ordinary `[B, 1]` decode support alongside wide `[B, 1+K]` verification. The runner uses this permission for draftless steps when the drafter's hidden-state requirements allow narrow decode. This value is a `SpecPlan` field, not a `model_capabilities` key. |
-| `k_by_rows` | `()` | Per-step draft cap by live rows, as `(max_rows, k)` pairs in strictly ascending `max_rows` order. A step with R live rows carries at most the `k` of the first pair whose `max_rows` is at least R; empty means `effective_k` at every batch size. `SpecPlan` rejects a malformed pair, a `k` outside `[1, effective_k]`, and a mapping whose largest `k` is not `effective_k`. Admission rejects a mapping whose last `max_rows` is below `max_num_seqs`. The verify block stays `1 + effective_k` wide; only `num_valid_drafts` shrinks. |
+| `k_by_rows` | `()` | Per-step draft cap by live rows, as `(max_rows, k)` pairs in strictly ascending `max_rows` order. A step with R live rows (in lane mode, the live rows of the whole lane batch) carries at most the `k` of the first pair whose `max_rows` is at least R; empty means `effective_k` at every batch size. `SpecPlan` rejects a malformed pair, a `k` outside `[1, effective_k]`, and a mapping whose largest `k` is not `effective_k`. Admission rejects a mapping whose last `max_rows` is below `max_num_seqs`. The verify block stays `1 + effective_k` wide; only `num_valid_drafts` shrinks. |
 
 `SpecPlan.block_width` is `1 + effective_k` for wide verification.
 `SpecPlan.accepted_counts_range` is the inclusive range
