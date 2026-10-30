@@ -54,6 +54,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
+    uses_tt_lane_coordinator,
 )
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
@@ -744,14 +745,12 @@ class TTModelRunner:
         ranks keep the plain ``InputBatch``, one per engine.
 
         Derived (rather than cached in ``__init__``) so it depends only on
-        already-set runner state -- this mirrors ``uses_tt_lane_coordinator``:
+        already-set runner state -- this is ``uses_tt_lane_coordinator``:
         vLLM sees a single engine (``data_parallel_size == 1``) while the TT
-        backend runs more than one lane.
+        backend runs more than one lane, or one lane of a model that folds DP
+        into lanes (``store_tt_single_lane``).
         """
-        return (
-            self.parallel_config.data_parallel_size == 1
-            and self.tt_data_parallel_size > 1
-        )
+        return uses_tt_lane_coordinator(self.vllm_config)
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)

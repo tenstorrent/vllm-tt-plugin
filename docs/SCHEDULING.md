@@ -695,6 +695,13 @@ architecture, and model classes that declare
 `model_capabilities["folds_dp_into_lanes"]`. The user-provided `--max_num_seqs M` remains the capacity per
 lane, so the engine's global capacity becomes `N * M`.
 
+A model class that declares `folds_dp_into_lanes` takes the lane path at
+`--data_parallel_size 1` too, with one lane. Several such engines can then each
+serve one submesh of a larger machine (`TT_VISIBLE_DEVICES`), scheduling
+independently: MiMo-V2.6-Flash serves a Galaxy as one engine per row this way.
+The Galaxy generators and GPT-OSS, which fold DP without declaring it, keep the
+non-DP path at `--data_parallel_size 1`.
+
 The fold happens while the engine config is built, after `vllm serve` has
 chosen its API-server count, so a lane-DP launch keeps upstream's default of
 `N` API server processes, all attached to the one lane engine. Each API server

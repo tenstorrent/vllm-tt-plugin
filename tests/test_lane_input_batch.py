@@ -894,11 +894,19 @@ def test_scheduled_seeded_row_isolated_from_unscheduled_random_row():
 # --------------------------------------------------------------------------
 
 
-def _runner_with(data_parallel_size, tt_data_parallel_size):
+def _runner_with(data_parallel_size, tt_data_parallel_size, single_lane=False):
+    from vllm_tt_plugin import config as tt_config
     from vllm_tt_plugin.model_runner import TTModelRunner
 
     r = TTModelRunner.__new__(TTModelRunner)
     r.parallel_config = SimpleNamespace(data_parallel_size=data_parallel_size)
+    r.vllm_config = SimpleNamespace(
+        parallel_config=r.parallel_config, additional_config={}
+    )
+    if single_lane:
+        tt_config.store_tt_single_lane(r.vllm_config)
+    elif tt_data_parallel_size > 1:
+        tt_config.store_tt_lane_count(r.vllm_config, tt_data_parallel_size)
     r.tt_data_parallel_size = tt_data_parallel_size
     return r
 
@@ -909,6 +917,10 @@ def test_runner_is_lane_mode_property():
     assert _runner_with(data_parallel_size=1, tt_data_parallel_size=4)._is_lane_mode
     # Non-DP: one engine, one lane -> plain InputBatch.
     assert not _runner_with(data_parallel_size=1, tt_data_parallel_size=1)._is_lane_mode
+    # One lane of a model that folds DP into lanes -> TTLaneInputBatch.
+    assert _runner_with(
+        data_parallel_size=1, tt_data_parallel_size=1, single_lane=True
+    )._is_lane_mode
     # Standard multi-process DP: each rank is its own engine -> plain InputBatch.
     assert not _runner_with(data_parallel_size=4, tt_data_parallel_size=4)._is_lane_mode
 
