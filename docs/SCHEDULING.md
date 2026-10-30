@@ -773,6 +773,27 @@ On a single host, the plugin discovers TT device groups at startup and assigns
 one group to each rank through `TT_VISIBLE_DEVICES`. Request routing binds each
 request to one rank; requests do not migrate between ranks.
 
+vLLM's DP load balancer (`DPLBAsyncMPClient.get_core_engine_for_request`,
+in the API server) picks the least-loaded rank, and each rank's prefix cache
+is separate, so a prompt whose prefix an earlier request computed only hits
+the cache on the rank that was sent it. With `dp_prefix_cache_routing`
+(default `true`) the plugin applies the lane rule above to the ranks: the
+request goes to the rank that was sent the most of its prompt, unless that
+rank has no free slot while the least-loaded one has, or the prefill queued
+ahead there outweighs the extra prefill the hit saves; among ranks sent the
+same prefix the less loaded one is the candidate, and equal hits resolve on
+load. The API server cannot read a rank's cache, so the plugin keeps its own
+record of which rank each prompt block was sent to
+(`vllm_tt_plugin.prefix_routing.PrefixCacheMirror`), hashed per cache block
+as the KV cache manager hashes them, and pins the request through
+`EngineCoreRequest.data_parallel_rank`, which the balancer honors ahead of its
+own choice; a request the caller already pinned keeps its rank. The record is
+not told of an eviction, is cleared by a prefix-cache reset, and is per API
+server, so `--api-server-count` above 1 routes on each server's own
+dispatches. Queued prefill is estimated from the balancer's waiting count and
+the uncached prompt tokens of the newest requests sent to that rank. `false`
+leaves every request to vLLM's least-loaded routing.
+
 For standard DP, `--max_num_seqs M` is the capacity of each rank. The plugin
 does not multiply the rank-local model or KV-cache capacity by the number of
 ranks.

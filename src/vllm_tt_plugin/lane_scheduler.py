@@ -50,6 +50,7 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.prefix_routing import pick_prefix_cache_target
 from vllm_tt_plugin.scheduler import (
     _TT_STEP_STATE_ATTR,
     TTDecodeInterleavePolicy,
@@ -366,24 +367,16 @@ class TTLaneCoordinator(SchedulerInterface):
         its own KV cache manager, so a prompt whose prefix an earlier request
         computed only hits the prefix cache on the lane holding it; the
         least-loaded rule would send it elsewhere and prefill the prefix again.
-        When some lane holds more of the prompt than the least-loaded lane
-        does, the lane holding the most of it is chosen instead, unless (a)
-        that lane has no free slot once its queued requests are admitted while
-        the least-loaded lane has one (an open-ended wait for a slot costs more
-        than a bounded prefill), or (b) the prefill queued ahead on that lane
-        exceeds the least-loaded lane's queue by more than the *extra* prefill
-        the hit saves over the least-loaded lane's own hit (equal hits save
-        nothing and resolve on load; among lanes holding the same prefix the
-        less loaded one is the candidate). Queued prefill counts the waiting
-        requests' uncached tokens, the ready requests parked in
-        ``skipped_waiting`` (vLLM schedules those first once their grammar or
-        remote KVs arrive) and the running partial prefills' remaining prompt
-        tokens, which vLLM processes before admitting anything new.
-        Rule (b) is what keeps a hot prefix from piling every request onto one
-        lane: requests that reuse a long prefix queue almost nothing, so they
-        all follow it; requests sharing only a short prefix spill as soon as
-        the queue ahead outweighs the saving. The lookup is the KV cache
-        manager's own longest-hit search, read-only.
+        ``pick_prefix_cache_target`` is the rule, shared with standard DP: the
+        lane holding the most of the prompt wins over the least-loaded lane
+        unless it is full while the least-loaded lane is not, or the prefill
+        queued ahead on it outweighs the extra prefill the hit saves. Queued
+        prefill counts the waiting requests' uncached tokens, the ready
+        requests parked in ``skipped_waiting`` (vLLM schedules those first
+        once their grammar or remote KVs arrive) and the running partial
+        prefills' remaining prompt tokens, which vLLM processes before
+        admitting anything new. The lookup is the KV cache manager's own
+        longest-hit search, read-only.
 
         Assignment is static: a request is bound to one lane at admission
         (recorded in the coordinator's maps) and never migrates,
@@ -401,21 +394,13 @@ class TTLaneCoordinator(SchedulerInterface):
         if request is None or not self._prefix_cache_routing:
             return least_lane
         hits = [self._cached_prefix_tokens(sched, request) for sched in self.lanes]
-        # Among lanes holding the same prefix: the less loaded, then the lower index.
-        cached_lane = max(
-            range(len(hits)), key=lambda lane: (hits[lane], -scores[lane], -lane)
+        lane = pick_prefix_cache_target(
+            least_lane,
+            scores,
+            hits,
+            lambda lane: self._lane_occupancy(lane) >= self._per_lane_max,
+            self._queued_prefill_tokens,
         )
-        lane = least_lane
-        # The saving is only the hit beyond what the least-loaded lane holds.
-        extra_hit = hits[cached_lane] - hits[least_lane]
-        if extra_hit > 0 and cached_lane != least_lane:
-            cached_full = self._lane_occupancy(cached_lane) >= self._per_lane_max
-            least_full = self._lane_occupancy(least_lane) >= self._per_lane_max
-            queued_ahead = self._queued_prefill_tokens(
-                cached_lane
-            ) - self._queued_prefill_tokens(least_lane)
-            if not (cached_full and not least_full) and queued_ahead <= extra_hit:
-                lane = cached_lane
         self._uncached_tokens[request.request_id] = max(
             request.num_tokens - hits[lane], 0
         )
