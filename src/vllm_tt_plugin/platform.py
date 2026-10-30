@@ -1201,6 +1201,50 @@ def _install_block_output_reset_abort_patch() -> None:
     engine_core.EngineCore.reset_prefix_cache = reset_prefix_cache_tt
 
 
+def _install_prefix_hit_confirmer_patch() -> None:
+    """Hand the scheduler the model's prefix-hit confirmer once the engine exists.
+
+    After ``EngineCore.__init__`` built the executor and the scheduler, the
+    worker's ``prefix_cache_hit_confirmer`` (the model's bound
+    ``confirm_prefix_cache_hit``, None for models without one) is installed
+    on the scheduler through ``set_prefix_hit_confirmer`` (a lane coordinator
+    fans it out to its lanes). In-process executors only: the bound method
+    crosses no process boundary. ``EngineCoreProc`` inherits the constructor.
+
+    Installed from the general plugin entry point (``register_tt_models_from_plugin``,
+    which every vLLM process runs at import) and from the platform's load hooks:
+    the config-time install alone came too late in the engine-core process,
+    whose platform check runs inside ``EngineCore.__init__`` (the wrapper then
+    missed that construction; served GLM-5.3-Flash 2026-10-29). The wrapper
+    does nothing for an engine whose prefix cache is off, and the worker
+    answers None for a model without the capability.
+    """
+    import vllm.v1.engine.core as engine_core
+
+    if hasattr(engine_core, "_tt_original_engine_core_init"):
+        return
+    original = engine_core.EngineCore.__init__
+    engine_core._tt_original_engine_core_init = original
+
+    def init_tt(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        cache_config = getattr(getattr(self, "vllm_config", None), "cache_config", None)
+        if not getattr(cache_config, "enable_prefix_caching", False):
+            return
+        setter = getattr(self.scheduler, "set_prefix_hit_confirmer", None)
+        if setter is None:
+            return
+        confirmers = self.model_executor.collective_rpc("prefix_cache_hit_confirmer")
+        confirmer = next((c for c in confirmers if c is not None), None)
+        if confirmer is not None:
+            setter(confirmer)
+            logger.info(
+                "Prefix-cache hits are confirmed by the model before they are scheduled"
+            )
+
+    engine_core.EngineCore.__init__ = init_tt
+
+
 def _install_block_output_pause_guard_patch() -> None:
     """Refuse ``pause_generation(mode="keep", clear_cache=True)`` with live
     block requests.
@@ -1542,6 +1586,20 @@ def register_tt_models(register_test_models=False) -> None:
     for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
         _register_model_if_missing(ModelRegistry, arch, _kolibri1_target)
 
+    # GLM-5.3-Flash (tt-metal models/demos/glm53_flash, Blackhole Galaxy 8x4: TP4 over
+    # the columns x 8 data-parallel rows, one engine per mesh). The checkpoint's
+    # architecture is Glm5NextForConditionalGeneration (transformers >= 5.16,
+    # model_type glm5_next); vLLM 0.26 has no upstream Glm5Next model, so both the
+    # bare and the TT-prefixed names resolve to the tt-metal adapter.
+    _glm53_target = "models.demos.glm53_flash.tt.generator_vllm:GLM53FlashForCausalLM"
+    for arch in (
+        "TTGlm5NextForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
+        "TTGlm5NextForCausalLM",
+        "Glm5NextForCausalLM",
+    ):
+        _register_model_if_missing(ModelRegistry, arch, _glm53_target)
+
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare
     # DiffusionGemmaForBlockDiffusion registration; the plugin registers the
@@ -1676,6 +1734,7 @@ class TTPlatform(Platform):
         # which is where upstream decides asynchronous scheduling against the
         # speculative method name. This hook is that call's first statement.
         _install_tt_async_spec_method_patch()
+        _install_prefix_hit_confirmer_patch()
         register_tt_models(
             register_test_models=_should_pre_register_tt_test_models_from_cli()
         )
@@ -1759,6 +1818,7 @@ class TTPlatform(Platform):
         # that reaches configuration without the CLI path: a second engine, or
         # a direct VllmConfig construction, then finds the gate patched.
         _install_tt_async_spec_method_patch()
+        _install_prefix_hit_confirmer_patch()
         _warn_unpatched_async_spec_gate(vllm_config)
         # A config without a model starts no engine (vLLM builds one as a default
         # and in tests), so there is nothing to resolve, and it must not take the
@@ -2150,6 +2210,22 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+        # A model that keeps its own prefix records may confirm vLLM's hit before
+        # the scheduler commits it (confirms_prefix_cache_hits): only with the
+        # prefix cache declared, and only installed when the cache is on.
+        confirms_hits = (
+            bool(model_capabilities.get("confirms_prefix_cache_hits", False))
+            if model_capabilities
+            else False
+        )
+        if confirms_hits and not supports_prefix_caching:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} declares "
+                "model_capabilities['confirms_prefix_cache_hits']=True without "
+                "supports_prefix_caching=True"
+            )
+        if confirms_hits and vllm_config.cache_config.enable_prefix_caching:
+            _install_prefix_hit_confirmer_patch()
 
         if is_block_output_model:
             required_lifecycle_hooks = (

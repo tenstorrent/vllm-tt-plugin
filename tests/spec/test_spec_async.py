@@ -259,6 +259,82 @@ class ResidentDeferredTarget(DeferredVerifyTarget):
         return answer
 
 
+class HostAnsweringTarget(ResidentDeferredTarget):
+    """A resident target whose drafter can answer an ordinary decode itself.
+
+    The model side of section 4d. The step's ids come back from
+    ``decode_forward`` as a host tensor, ``read_decode_output`` passes them
+    straight through with no event to wait on, and the decode trace ran for
+    none of the step's rows, so the resident token and position stay where the
+    last trace-answered decode put them. The drafter offers nothing, so every
+    step is an ordinary decode and the trace-answered ones can overlap.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.answer_next_from_host = False
+        self.host_answers = 0
+        self.plain_commands: list[dict[str, bool]] = []
+        self.reloaded_tokens: list[torch.Tensor] = []
+        self._pass_through_next = False
+
+    def decode_forward(self, tokens, start_pos, spec_mode=None, **kwargs):
+        if spec_mode is not None:
+            return super().decode_forward(tokens, start_pos, spec_mode, **kwargs)
+        self.plain_commands.append(
+            {
+                name: kwargs[name]
+                for name in (
+                    "reload_inputs",
+                    "reload_sampling_params",
+                    "reset_sampling_state",
+                )
+            }
+        )
+        if kwargs["reload_inputs"]:
+            self.reloaded_tokens.append(tokens.clone())
+        if not self.answer_next_from_host:
+            return super().decode_forward(tokens, start_pos, **kwargs)
+        self.answer_next_from_host = False
+        self.host_answers += 1
+        if kwargs["reload_inputs"]:
+            self.resident_tokens = tokens.clone()
+            self.resident_positions = start_pos.clone()
+        # The drafter's answer is the rule's own next token, which is what the
+        # trace would have produced; the trace did not run, so the resident
+        # token and position are left where they are.
+        rows = int(tokens.shape[0])
+        answer = self._choice(
+            self.resident_tokens.reshape(rows, -1)[:, :1],
+            self.resident_positions.reshape(rows, -1)[:, :1],
+        )
+        self._pass_through_next = True
+        return answer.reshape(rows).to(torch.int32)
+
+    def read_decode_output(self, tt_out, async_read: bool = False):
+        if self._pass_through_next:
+            self._pass_through_next = False
+            return (tt_out, []) if async_read else tt_out
+        return super().read_decode_output(tt_out, async_read)
+
+    def propose_draft_tokens(
+        self,
+        num_drafts,
+        committed_tokens,
+        committed_positions,
+        accepted_counts,
+        hidden=None,
+    ):
+        from vllm_tt_plugin.spec_decode import DraftOutput
+
+        self.propose_calls.append(hidden)
+        rows = int(committed_tokens.shape[0])
+        return DraftOutput(
+            draft_token_ids=torch.zeros((rows, num_drafts), dtype=torch.int32),
+            num_valid=torch.zeros(rows, dtype=torch.int32),
+        )
+
+
 @pytest.fixture(autouse=True)
 def wait_for_released_reads(monkeypatch):
     """``ttnn.event_synchronize`` waits for the test's release.
@@ -1380,6 +1456,78 @@ def test_a_draftless_step_is_overlap_safe_and_a_verify_is_not():
     model.release()
     drafted.get_output()
     _drain(runner, "a")
+
+
+def test_a_host_answered_ordinary_step_is_drained_and_reloaded_over():
+    """The drafter answered an ordinary decode; the runner repairs the chain.
+
+    Section 4d lets a speculating model answer an ordinary decode from its
+    drafter and hand back host ids. The decode trace then ran for none of
+    that step's rows, so the resident token and position are one step behind
+    the request, and the model cannot refill them from ``tokens`` under
+    ``reload_inputs=False``, which the reload contract declares stale. The
+    runner sees the answer's form and does for it what it does for a verify:
+    registers the step as not overlap-safe, so the next build drains it (at
+    no cost, there being nothing to wait on), and reloads the plain decode
+    after it, once, with the sampling reset. The trace-answered steps around
+    it keep their overlap, and the committed stream is the rule's
+    continuation throughout, which it could not be without the reload.
+    """
+    model = HostAnsweringTarget()
+    runner = _baseline_runner(model)
+    _admit(runner, ("a", 11))
+    warmup = _submit_plain_step(runner, "a")
+    model.release()
+    warmup.get_output()
+    _drain(runner, "a")
+    _settle_layout(runner)
+    expected = continuation(*_tail(runner, "a"), 4)
+
+    steady = _submit_plain_step(runner, "a")
+    assert list(runner._pending_async_overlap_ok) == [True]
+    assert model.plain_commands[-1]["reload_inputs"] is False
+    model.release()
+    steady.get_output()
+    _drain(runner, "a")
+
+    model.answer_next_from_host = True
+    served = _submit_plain_step(runner, "a")
+    assert model.host_answers == 1
+    assert model.outstanding == 0, "a host answer left nothing to read"
+    # Its own commands were the steady ones: the answer's form is known only
+    # after the forward.
+    assert model.plain_commands[-1]["reload_inputs"] is False
+    assert list(runner._pending_async_overlap_ok) == [False]
+    assert runner.async_decode.must_drain_pending_async_steps(
+        steady_decode_candidate=True
+    ), "a step the drafter answered let the next build overlap it"
+
+    # The next step drains the served step itself, waits on nothing, and
+    # reloads over the token it applied.
+    after = _submit_plain_step(runner, "a")
+    assert served.is_resolved()
+    host_token = served.get_output().sampled_token_ids[0][0]
+    assert model.plain_commands[-1] == {
+        "reload_inputs": True,
+        "reload_sampling_params": True,
+        "reset_sampling_state": True,
+    }
+    assert int(model.reloaded_tokens[-1][0, 0]) == host_token
+    assert list(runner._pending_async_overlap_ok) == [False]
+    model.release()
+    after.get_output()
+    _drain(runner, "a")
+
+    # Once, not from then on.
+    steady_again = _submit_plain_step(runner, "a")
+    assert model.plain_commands[-1]["reload_inputs"] is False
+    assert list(runner._pending_async_overlap_ok) == [True]
+    model.release()
+    steady_again.get_output()
+    _drain(runner, "a")
+
+    assert runner.requests["a"].output_token_ids[-4:] == expected
+    assert runner.async_decode._overlapped_unsafe_submissions == 0
 
 
 def test_a_second_baseline_step_submits_before_the_first_completes():

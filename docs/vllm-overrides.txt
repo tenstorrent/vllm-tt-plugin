@@ -21,9 +21,11 @@ numpy>=1.24.4,<2
 # declares no upper bound, so an uncapped install resolves the newest transformers
 # release, which is validated against neither the pinned vLLM nor the tt-metal env
 # (tt_metal/python_env/requirements-dev.txt pins transformers 5.12.1). The cap was
-# set because vLLM 0.26.0 read Gemma 4's head_dim off the global HF config, which
-# transformers 5.15.0 rejects with AmbiguousGlobalPerLayerAttributeError; vLLM 0.28.0
-# fixed that read (vllm-project/vllm#49797), so the cap now holds only until a newer
-# release is validated. The floor restates vLLM's own: --override replaces a
-# requirement instead of intersecting it.
-transformers>=5.10.4,<5.15.0
+# first set at 5.15.0 because vLLM 0.26.0 read Gemma 4's head_dim off the global HF
+# config, which transformers 5.15.0 rejects with AmbiguousGlobalPerLayerAttributeError;
+# vLLM 0.28.0 fixed that read (vllm-project/vllm#49797). The ceiling now sits above
+# 5.20.2, the release validated with vLLM 0.30.0 for GLM-5.3-Flash (its glm5_next
+# config class exists only from transformers 5.16.0), so a tt-metal env that carries
+# 5.16-5.20 is kept instead of being downgraded by this install. The floor restates
+# vLLM's own: --override replaces a requirement instead of intersecting it.
+transformers>=5.10.4,<5.21.0

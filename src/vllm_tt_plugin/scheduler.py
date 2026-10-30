@@ -282,6 +282,33 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+# The model's prefix-hit confirmer, published by the in-process worker at
+# ``load_model`` for the scheduler this process constructs afterwards (the
+# multi-process executors hand it over through ``collective_rpc`` instead).
+_published_confirmer = None
+
+
+def publish_prefix_hit_confirmer(confirmer) -> None:
+    """Record the model's confirmer (None for a model without one) for the
+    scheduler of this process."""
+    global _published_confirmer
+    _published_confirmer = confirmer
+
+
+def _resolve_prefix_hit_confirmer(scheduler):
+    """The scheduler's installed confirmer, or the one the in-process worker
+    published at ``load_model``: the engine core constructs its scheduler after
+    the executor loaded the model, and the general-plugin load runs inside that
+    same constructor, so no wrapper installed from the plugin's entry points
+    reaches this process's engine (served GLM-5.3-Flash, 2026-10-29)."""
+    if scheduler._prefix_hit_confirmer is None and _published_confirmer is not None:
+        scheduler._prefix_hit_confirmer = _published_confirmer
+        logger.info(
+            "Prefix-cache hits are confirmed by the model before they are scheduled"
+        )
+    return scheduler._prefix_hit_confirmer
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -337,6 +364,14 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # A model that owns its prefix cache (device state per slot) confirms
+        # vLLM's longest hit before the scheduler commits it, so
+        # num_computed_tokens never exceeds what the device can serve and
+        # NewRequestData strips only the mm payload the model has resident.
+        self._prefix_hit_confirmer = None
+        manager = self.kv_cache_manager
+        self._orig_get_computed_blocks = manager.get_computed_blocks
+        manager.get_computed_blocks = self._confirmed_computed_blocks
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -430,6 +465,46 @@ class TTScheduler(AsyncScheduler):
                 "call made by AsyncScheduler._update_request_with_output and "
                 "must disable prefix caching"
             )
+
+    def set_prefix_hit_confirmer(self, confirmer) -> None:
+        """Install the model's hit confirmer (``prefix_cache_hit_confirmer``)."""
+        self._prefix_hit_confirmer = confirmer
+
+    def _confirmed_computed_blocks(self, request: Request):
+        """``get_computed_blocks`` trimmed to the hit the model confirms.
+
+        vLLM's longest block-hash hit is proposed to the model as
+        ``confirm(prompt_token_ids, mm_items, num_new_computed_tokens)``; the
+        model answers the number of cached tokens it will serve (0 = none).
+        The answer is clamped, floored to a block multiple, and the computed
+        blocks are cut to it. The junction pin (sparse retention boundary) is
+        dropped with a trimmed hit.
+        """
+        blocks, num_new, boundary = self._orig_get_computed_blocks(request)
+        confirm = _resolve_prefix_hit_confirmer(self)
+        if confirm is None or num_new <= 0:
+            return blocks, num_new, boundary
+        mm_items = [
+            (
+                getattr(f, "identifier", None),
+                int(f.mm_position.offset),
+                int(f.mm_position.length),
+                getattr(f, "modality", "image"),
+            )
+            for f in (request.mm_features or ())
+        ]
+        honoured = int(confirm(list(request.prompt_token_ids), mm_items, num_new))
+        block_size = (
+            self.block_size
+        )  # the scheduler's (vLLM 0.30's KVCacheManager carries none)
+        honoured = max(0, min(num_new, honoured)) // block_size * block_size
+        if honoured == num_new:
+            return blocks, num_new, boundary
+        keep = honoured // block_size
+        trimmed = self.kv_cache_manager.create_kv_cache_blocks(
+            tuple(list(group[:keep]) for group in blocks.blocks)
+        )
+        return trimmed, honoured, 0
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -766,9 +841,13 @@ class TTScheduler(AsyncScheduler):
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
         Chunks that finish the prompt, decode steps and multimodal prompts are
-        left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request that cannot reach the grid ends its
-        chunk on a KV block instead, and waits a step if that is empty too.
+        left alone. A request whose aligned chunk would be empty waits for the
+        next step when this step's leftover budget is what stopped it (a full
+        step reaches the grid from any start: the per-step cap is validated to
+        be at least the alignment). Only when a full step cannot reach the grid
+        does it make progress anyway: a running request ends its chunk on a KV
+        block (the model takes a resume offset on a block boundary), a new one
+        takes what it was offered.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if align <= 1 or num_new_tokens <= 0:
@@ -784,19 +863,26 @@ class TTScheduler(AsyncScheduler):
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
+            if num_new_tokens < self._full_step_prefill_cap():
+                # This step's leftover budget is what stopped the request: it
+                # waits for a step whose budget reaches the grid. A chunk that
+                # ends short of the grid would make the next chunk start off
+                # it, which a model aligning its prefill state to the grid
+                # (per-row prefill ownership on the TT mesh) cannot resume: a
+                # 96-token chunk after a 128-token prefix-cache hit under a
+                # 256 alignment ended at 224 and the next chunk's start killed
+                # the engine.
+                return 0
             if start != 0:
-                # The next chunk resumes where this one ends, and the model
-                # takes a resume offset only on a KV block boundary. A running
-                # request whose chunk cannot reach the grid still ends on a
-                # block, or waits for the next step's budget.
+                # A full step cannot reach the grid from here (a permanent cap
+                # below the alignment): the next chunk resumes where this one
+                # ends, and the model takes a resume offset only on a KV block
+                # boundary, so the chunk ends on a block (or waits if that is
+                # empty too).
                 block = self.block_size
                 return max(end // block * block - start, 0)
-            # A new request waits only when this step's leftover budget is what
-            # stopped it. If a full step could not reach the grid either (a
-            # permanent cap below the alignment), it must still make progress.
-            return (
-                0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
-            )
+            # A new request under such a cap must still make progress.
+            return num_new_tokens
         return aligned_end - start
 
     def _full_step_prefill_cap(self) -> int:

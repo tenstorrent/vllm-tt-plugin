@@ -87,6 +87,12 @@ count, so a model that prefills in chunks can tell which items the current
 chunk covers (an item whose placeholders lie past the chunk end has no slots
 yet). They are `None` when the item carries no placeholder position.
 
+A third field, `mm_identifiers`, is appended after the two placeholder fields:
+vLLM's content identifier of the item (the key its block hashes carry), one
+string per item, present even when the item's payload was stripped as
+prefix-cached. A model that keeps its own prefix records matches a cached
+item by it without the pixels (`None` when vLLM assigned none).
+
 When `model_config.uses_mrope` enables request-specific RoPE, `prefill_forward`
 returns `(output, rope_deltas)`, with one delta per request. On decode,
 `TTAsyncDecodeController` supplies `rope_deltas_all_users` after a layout
