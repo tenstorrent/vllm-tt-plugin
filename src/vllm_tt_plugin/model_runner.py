@@ -1582,39 +1582,63 @@ class TTModelRunner:
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
 
-    def _structured_spec_active(self) -> bool:
-        """Whether structured requests ride the speculative verify (M1).
+    def _structured_mode(self) -> str:
+        """``m0`` | ``m1`` | ``m2``: how structured requests are served on this launch.
 
-        Needs the switch ``VLLM_TT_STRUCTURED_SPEC=1`` and a model that applies
-        the packed grammar mask inside its verify: the capability
-        ``supports_verify_grammar_bitmask`` and a live
-        ``verify_grammar_enabled`` attribute (False when its layout could not
-        allocate the mask buffers). Otherwise a structured row keeps the
-        ordinary decode with host logits (``VLLM_TT_STRUCTURED_NARROW``).
+        ``m0`` the ordinary decode with host logits (no drafts while one is live);
+        ``m1`` the masked verify, structured rows with k = 0; ``m2`` the masked
+        verify with per-position masks, structured rows speculate. Defaults from
+        ``VLLM_TT_STRUCTURED_SPEC`` (default 0) and ``VLLM_TT_STRUCTURED_M2``
+        (default 1); the file named by ``VLLM_TT_STRUCTURED_MODE_FILE``, when it
+        holds one of the three words, overrides them live (A/B of the modes in
+        one server). m1 / m2 need the model: capability
+        ``supports_verify_grammar_bitmask`` and a live ``verify_grammar_enabled``
+        (m2 also ``verify_grammar_positions``), else ``m0``.
         """
-        if os.environ.get("VLLM_TT_STRUCTURED_SPEC", "0") != "1":
-            return False
+        mode = None
+        path = os.environ.get("VLLM_TT_STRUCTURED_MODE_FILE")
+        if path:
+            # read at most every 0.2 s: this is asked per row per step
+            now = time.monotonic()
+            cached = self.__dict__.get("_struct_mode_file_cache")
+            if cached is not None and now - cached[0] < 0.2:
+                mode = cached[1]
+                path = None
+        if path:
+            try:
+                with open(path) as f:
+                    word = f.read().strip().lower()
+                if word in ("m0", "m1", "m2"):
+                    mode = word
+            except OSError:
+                pass
+            self._struct_mode_file_cache = (time.monotonic(), mode)
+        if mode is None:
+            if os.environ.get("VLLM_TT_STRUCTURED_SPEC", "0") != "1":
+                return "m0"
+            mode = "m1" if os.environ.get("VLLM_TT_STRUCTURED_M2", "1") == "0" else "m2"
+        if mode == "m0":
+            return "m0"
         model = getattr(self, "model", None)
         caps = getattr(model, "model_capabilities", None) or {}
-        return bool(
+        if not (
             caps.get("supports_verify_grammar_bitmask", False)
             and getattr(model, "verify_grammar_enabled", False)
-        )
+        ):
+            return "m0"
+        if mode == "m2" and not getattr(model, "verify_grammar_positions", False):
+            return "m1"
+        return mode
+
+    def _structured_spec_active(self) -> bool:
+        """Whether structured requests ride the speculative verify (M1 or M2):
+        ``_structured_mode`` is not ``m0``. Otherwise a structured row keeps the
+        ordinary decode with host logits (``VLLM_TT_STRUCTURED_NARROW``)."""
+        return TTModelRunner._structured_mode(self) != "m0"
 
     def _structured_m2_active(self) -> bool:
-        """Whether structured rows also speculate (M2): per-position masks.
-
-        Needs the masked verify (``_structured_spec_active``), a model that
-        honours the per-position columns (instance attribute
-        ``verify_grammar_positions``, its ``DSV41_STRUCTURED_M2=1``) and the
-        plugin switch ``VLLM_TT_STRUCTURED_M2`` (default on, 0 = M1: structured
-        rows decode with k = 0).
-        """
-        if os.environ.get("VLLM_TT_STRUCTURED_M2", "1") == "0":
-            return False
-        if not TTModelRunner._structured_spec_active(self):
-            return False
-        return bool(getattr(getattr(self, "model", None), "verify_grammar_positions", False))
+        """Whether structured rows also speculate (M2): per-position masks."""
+        return TTModelRunner._structured_mode(self) == "m2"
 
     def _request_is_structured_verify_row(self, req_id: str) -> bool:
         """True for a structured request served by the masked verify (M1 or M2)."""

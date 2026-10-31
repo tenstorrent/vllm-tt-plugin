@@ -207,3 +207,23 @@ def test_under_m2_a_structured_row_speculates_but_still_forces_the_verify(monkey
     assert TTModelRunner._request_is_structured_verify_row(runner, "s")
     assert not TTModelRunner._request_is_structured_verify_row(runner, "g")
     assert runner._request_is_argmax_certifiable("s")
+
+
+def test_mode_file_overrides_the_environment_live(monkeypatch, tmp_path):
+    f = tmp_path / "mode"
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_MODE_FILE", str(f))
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_SPEC", "1")
+    runner = _runner(_model(positions=True))
+    assert TTModelRunner._structured_mode(runner) == "m2"  # no file: environment defaults
+    for word, want in (("m1", "m1"), ("m0", "m0"), ("m2", "m2")):
+        f.write_text(word + "\n")
+        runner.__dict__.pop("_struct_mode_file_cache", None)  # the 0.2 s cache
+        assert TTModelRunner._structured_mode(runner) == want
+    f.write_text("garbage")
+    runner.__dict__.pop("_struct_mode_file_cache", None)
+    assert TTModelRunner._structured_mode(runner) == "m2"
+    # a model without per-position masks falls back to m1; without the mask to m0
+    f.write_text("m2")
+    runner.__dict__.pop("_struct_mode_file_cache", None)
+    assert TTModelRunner._structured_mode(_runner(_model(positions=False))) == "m1"
+    assert TTModelRunner._structured_mode(_runner(_model(enabled=False))) == "m0"
