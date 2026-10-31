@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -181,8 +182,14 @@ def _step_verifies(
     num_valid_drafts: torch.Tensor,
     accepted_counts: torch.Tensor,
     num_rows: int,
+    force_verify: bool = False,
 ) -> bool:
     """Whether a speculating launch sends the model a verify on this step.
+
+    ``force_verify`` (a live structured row on the masked-verify path,
+    ``TTModelRunner._structured_spec_active``) sends the verify even with no
+    draft in flight, because the grammar mask is applied inside the model's
+    verify round and the ordinary decode would sample that row on the host.
 
     Two things make a step speculative. A row carrying drafts is the obvious
     one. The other is an unresolved commit (``_has_unresolved_commit``). One
@@ -207,7 +214,7 @@ def _step_verifies(
         return True
     if not every_row_speculable:
         return False
-    if bool(num_valid_drafts.any()):
+    if force_verify or bool(num_valid_drafts.any()):
         return True
     return _has_unresolved_commit(accepted_counts, num_rows)
 
@@ -1564,10 +1571,42 @@ class TTModelRunner:
         scheduler is told to verify next, so an entry nothing rewrote would be
         verified against a token the request has already moved past.
         """
-        if tokens and self._request_is_speculable(req_id):
+        if (
+            tokens
+            and self._request_is_speculable(req_id)
+            and not TTModelRunner._request_is_masked_verify_structured(self, req_id)
+        ):
             self._proposed_draft_token_ids[req_id] = list(tokens)
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
+
+    def _structured_spec_active(self) -> bool:
+        """Whether structured requests ride the speculative verify (M1).
+
+        Needs the switch ``VLLM_TT_STRUCTURED_SPEC=1`` and a model that applies
+        the packed grammar mask inside its verify: the capability
+        ``supports_verify_grammar_bitmask`` and a live
+        ``verify_grammar_enabled`` attribute (False when its layout could not
+        allocate the mask buffers). Otherwise a structured row keeps the
+        ordinary decode with host logits (``VLLM_TT_STRUCTURED_NARROW``).
+        """
+        if os.environ.get("VLLM_TT_STRUCTURED_SPEC", "0") != "1":
+            return False
+        model = getattr(self, "model", None)
+        caps = getattr(model, "model_capabilities", None) or {}
+        return bool(
+            caps.get("supports_verify_grammar_bitmask", False)
+            and getattr(model, "verify_grammar_enabled", False)
+        )
+
+    def _request_is_masked_verify_structured(self, req_id: str) -> bool:
+        """True for a structured request served by the masked verify: it is
+        offered no drafts (k = 0) and its column 0 is masked in the model."""
+        if not TTModelRunner._structured_spec_active(self):
+            return False
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        return params is not None and getattr(params, "structured_outputs", None) is not None
 
     def _request_is_speculable(self, req_id: str) -> bool:
         """False when no accept walk this launch drives can certify the request.
@@ -1646,9 +1685,15 @@ class TTModelRunner:
         params = getattr(req_state, "sampling_params", None)
         if params is None:
             return True
+        # A grammar-only request is certifiable when the model applies the
+        # grammar mask inside its verify (``_structured_spec_active``): the row
+        # carries no drafts and commits the masked sample of column 0.
+        structured_blocks = params.structured_outputs is not None and not (
+            TTModelRunner._structured_spec_active(self)
+        )
         return not (
             params.logprobs is not None
-            or params.structured_outputs is not None
+            or structured_blocks
             or bool(params.allowed_token_ids)
             or bool(params.bad_words_token_ids)
             or (
@@ -1671,7 +1716,11 @@ class TTModelRunner:
             return False
         request = getattr(self, "requests", {}).get(req_id)
         params = getattr(request, "sampling_params", None)
-        if params is not None and getattr(params, "structured_outputs", None):
+        if (
+            params is not None
+            and getattr(params, "structured_outputs", None)
+            and not TTModelRunner._structured_spec_active(self)
+        ):
             return False
         return bool(
             self.check_perform_device_sampling(
@@ -2222,6 +2271,10 @@ class TTModelRunner:
                     num_valid_drafts,
                     accepted_counts,
                     len(row_req_ids),
+                    force_verify=any(
+                        TTModelRunner._request_is_masked_verify_structured(self, req_id)
+                        for req_id in row_req_ids
+                    ),
                 ):
                     spec_mode = self._spec_mode_for_step(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
@@ -2397,6 +2450,22 @@ class TTModelRunner:
             has_structured_outputs=has_structured,
             sampling_rows=req_indices,
         )
+        # A masked verify (M1) keeps the model's own device sampling for every
+        # row: the grammar travels to the model with the verify call, which
+        # applies it inside its sampler trace.
+        masked_verify = (
+            not is_prompt
+            and spec_drafts is not None
+            and spec_mode == ACCEPT_MODE_ARGMAX_IDS
+            and has_scheduled_structured
+            and TTModelRunner._structured_spec_active(self)
+        )
+        if masked_verify:
+            perform_device_sampling = self.check_perform_device_sampling(
+                is_decode=True,
+                has_structured_outputs=False,
+                sampling_rows=req_indices,
+            )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
@@ -2410,7 +2479,10 @@ class TTModelRunner:
             # to be the requests' own.
             perform_device_sampling = False
         defer_device_sampling = (
-            perform_device_sampling and has_scheduled_structured and not is_prompt
+            perform_device_sampling
+            and has_scheduled_structured
+            and not is_prompt
+            and not masked_verify
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
@@ -2978,6 +3050,19 @@ class TTModelRunner:
             )
             return None
 
+        if (
+            is_decode
+            and model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
+            and model_input.structured_output_req_ids
+            and TTModelRunner._structured_spec_active(self)
+        ):
+            # The grammar mask is applied inside the model's verify round and
+            # only arrives at sample time, so the whole verify runs there.
+            self._pending_samples.append(
+                partial(self._finish_masked_verify, model_input=model_input)
+            )
+            return None
+
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
         fwd = self._forward_with_model_input(model_input)
@@ -3505,6 +3590,25 @@ class TTModelRunner:
             self._req_accepted_counts[req_id] = max(len(block), 1)
             committed_by_req[req_id] = block
         return committed_by_req
+
+    def _finish_masked_verify(
+        self, grammar_output: GrammarOutput | None, *, model_input: TTModelInput
+    ) -> ModelRunnerOutput:
+        """Run a verify that carries structured rows, with the grammar in hand.
+
+        ``model_input.grammar_bitmask`` becomes ``[W, 1+K, words]`` int32
+        (all ones for rows without a grammar, column 0 the request's row 0) and
+        reaches the model as the ``grammar_bitmask`` keyword of the verify.
+        """
+        model_input = self._apply_grammar_to_input(
+            model_input, grammar_output, lane_total=None
+        )
+        fwd = self._forward_with_model_input(model_input)
+        if fwd is None:
+            return self.apply_and_build_runner_output(
+                torch.tensor([], dtype=torch.int32), None
+            )
+        return self._finish_spec_decode(fwd)
 
     def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
