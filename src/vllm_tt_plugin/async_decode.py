@@ -1283,14 +1283,15 @@ class TTAsyncDecodeController:
             kwargs["spec_mode"] = model_input.spec_mode
         if model_input.accepted_counts is not None:
             kwargs["accepted_counts"] = model_input.accepted_counts
+        gbm = getattr(model_input, "grammar_bitmask", None)  # (stage-model / test inputs without the field: no masked verify)
         if (
             model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
-            and model_input.grammar_bitmask
-            and model_input.grammar_bitmask[0] is not None
+            and gbm
+            and gbm[0] is not None
         ):
             # Masked verify: packed int32 [W, 1+K, words], all ones for a row
             # without a grammar (see STRUCTURED_SPEC_INTERFACE.md).
-            kwargs["grammar_bitmask"] = model_input.grammar_bitmask[0]
+            kwargs["grammar_bitmask"] = gbm[0]
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
