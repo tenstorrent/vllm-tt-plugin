@@ -175,6 +175,9 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # Prefill-only, ``prefix_cache_hit_policy = "model"``: the request id of every prefill row, handed to the model as ``request_ids`` so it can match its prefix-cache reservation.
+    prefill_req_ids: list[str] | None = None
+
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because
     # the accept walk needs them again after the verify returns. ``spec_mode``

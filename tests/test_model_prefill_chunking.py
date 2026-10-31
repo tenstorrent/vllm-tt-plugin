@@ -374,3 +374,69 @@ def test_scheduler_rounds_the_prefix_hit_and_keeps_the_prompt_chunked():
 def test_scheduler_without_the_policy_keeps_vllm_hits_untouched():
     s = _scheduler(budget=2048, align=512, hit_policy="")
     assert s.kv_cache_manager.enable_caching is False  # (no capability: the platform disabled the cache)
+
+
+# ---- prefix_cache_hit_policy = "model": the model's hook answers --------------------------------------------------------------------
+
+
+class _FakeHook:
+    def __init__(self, answers):
+        self.answers, self.calls, self.cancelled = answers, [], []
+
+    def plan_hit(self, request_id, tokens, num_tokens, max_hit=None):
+        self.calls.append((request_id, len(tokens), num_tokens, max_hit))
+        return self.answers.get(request_id, 0), 0
+
+    def cancel(self, request_id):
+        self.cancelled.append(request_id)
+
+
+@pytest.fixture
+def model_hook():
+    from vllm_tt_plugin.prefix_hooks import set_prefix_hook
+
+    yield set_prefix_hook
+    set_prefix_hook(None)
+
+
+def test_model_policy_scheduler_follows_the_hook_not_vllm(model_hook):
+    s = _scheduler(budget=2048, align=512, hit_policy="model")
+    hook = _FakeHook({"b": 2048, "c": 99999})
+    model_hook(hook)
+    a = _request("a", 6000)
+    pieces_a, _ = _drain(s, [a])
+    assert pieces_a["a"][0] == (0, 2048)  # vLLM has no hit yet: the hook is not even asked
+    assert hook.calls == [] or all(c[3] in (None, 0) for c in hook.calls)
+    b = _request("b", 6000)  # vLLM reports 5888; the model says 2048
+    pieces_b, _ = _drain(s, [b])
+    assert pieces_b["b"][0][0] == 2048, pieces_b["b"]
+    assert ("b", 6000, 6000, 5888) in hook.calls
+    c = _request("c", 6000)  # a model answer above vLLM's own hit is clamped to it, then to the grid (5888 -> 5632)
+    pieces_c, _ = _drain(s, [c])
+    assert pieces_c["c"][0][0] == 5632, pieces_c["c"]
+
+
+def test_model_policy_without_a_hook_never_uses_vllms_hit(model_hook):
+    s = _scheduler(budget=2048, align=512, hit_policy="model")
+    _drain(s, [_request("a", 6000)])
+    pieces_b, _ = _drain(s, [_request("b", 6000)])
+    assert pieces_b["b"][0] == (0, 2048)
+
+
+def test_model_policy_abort_cancels_the_reservation(model_hook):
+    from vllm.v1.request import RequestStatus
+
+    s = _scheduler(budget=2048, align=512, hit_policy="model")
+    hook = _FakeHook({})
+    model_hook(hook)
+    s.add_request(_request("w", 6000))
+    s.finish_requests("w", RequestStatus.FINISHED_ABORTED)
+    assert hook.cancelled == ["w"]
+    s.finish_requests(["x", "y"], RequestStatus.FINISHED_ABORTED)
+    assert hook.cancelled == ["w", "x", "y"]
+
+
+def test_model_policy_is_a_valid_capability_and_does_not_round():
+    from vllm_tt_plugin.config import round_tt_prefix_hit as r
+
+    assert r(4992, 5000, 512, "model") == 4992

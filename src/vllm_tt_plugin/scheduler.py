@@ -32,6 +32,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.prefill_rows import prefill_row_capacity
+from vllm_tt_plugin.prefix_hooks import cancel_model_hit, plan_model_hit
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 
 if TYPE_CHECKING:
@@ -969,6 +970,28 @@ class TTScheduler(AsyncScheduler):
         blocks, num_local, boundary, diverged = super()._get_local_prefix_cache_hit(request)
         policy = getattr(self, "_prefix_hit_policy", "")
         align = getattr(self, "_prefill_chunk_alignment", 0)
+        if policy == "model" and align:
+            # The model owns the cache: its answer replaces vLLM's hit semantics (``prefix_hooks``). vLLM's own hit is only the upper bound (the blocks it can hand out); no hook, no hit.
+            hit = 0
+            if num_local:
+                token_ids = getattr(request, "all_token_ids", None)
+                hit = plan_model_hit(
+                    request.request_id,
+                    token_ids if token_ids is not None else request.prompt_token_ids,
+                    request.num_tokens,
+                    max_hit=num_local,
+                    finished_ids=getattr(self, "finished_req_ids", None),
+                )
+                hit = hit // align * align
+            else:
+                cancel_model_hit(request.request_id)  # (a reservation of an earlier step that vLLM's own hit no longer backs)
+            if hit == num_local:
+                return blocks, num_local, boundary, diverged
+            if hit:
+                blocks = self.kv_cache_manager.truncate_computed_blocks(blocks, hit)
+            else:
+                blocks = self.kv_cache_manager.empty_kv_cache_blocks
+            return blocks, hit, boundary, diverged
         if not (policy and align and num_local):
             return blocks, num_local, boundary, diverged
         rounded = round_tt_prefix_hit(num_local, request.num_tokens, align, policy)
@@ -1109,6 +1132,14 @@ class TTScheduler(AsyncScheduler):
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
+
+    def finish_requests(self, request_ids, finished_status):
+        """Abort / finish by id. Under ``prefix_cache_hit_policy = "model"`` a request aborted while it waits holds a reservation in the model (pinned blocks, a reserved user): hand it back."""
+        if getattr(self, "_prefix_hit_policy", "") == "model":
+            if request_ids is not None and not isinstance(request_ids, str):
+                request_ids = list(request_ids)  # (an iterator would be consumed below)
+            cancel_model_hit(list(self.requests) if request_ids is None else request_ids)
+        return super().finish_requests(request_ids, finished_status)
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

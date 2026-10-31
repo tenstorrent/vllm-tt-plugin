@@ -42,6 +42,7 @@ from vllm_tt_plugin.async_decode import (
     TTDecodeSubmission,
 )
 from vllm_tt_plugin.prefill_rows import set_prefill_capacity_provider
+from vllm_tt_plugin.prefix_hooks import get_prefix_hook
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
@@ -49,6 +50,7 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
     get_tt_prefill_lookahead,
     get_tt_prefill_row_aware,
+    get_tt_prefix_hit_policy,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
     get_tt_supports_device_grammar,
@@ -2629,6 +2631,11 @@ class TTModelRunner:
             # back to ``range(N)`` and a prefill overwrites a decoding request's
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
+            prefill_req_ids=(
+                list(row_req_ids)
+                if is_prompt and get_prefix_hook() is not None and get_tt_prefix_hit_policy(self.vllm_config) == "model"
+                else None
+            ),
             intermediate_prefill_mask=intermediate_prefill_mask,
             prefill_total_lens=(
                 torch.from_numpy(
@@ -3935,6 +3942,10 @@ class TTModelRunner:
             totals = getattr(model_input, "prefill_total_lens", None)
             if totals is not None:
                 kwargs["prefill_total"] = [int(x) for x in totals.tolist()]
+        req_ids = getattr(model_input, "prefill_req_ids", None)
+        if req_ids:
+            # ``prefix_cache_hit_policy = "model"``: the model matches each row to the reservation it made when the scheduler asked for the hit
+            kwargs["request_ids"] = list(req_ids)
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
