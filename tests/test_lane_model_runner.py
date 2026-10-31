@@ -412,6 +412,42 @@ def test_submit_prefill_passes_prefill_final_only_with_the_lookahead_capability(
     assert captured["prefill_final"] == [False, True]  # row 0 is an intermediate piece, row 1 ends its sequence
 
 
+def test_submit_prefill_passes_request_ids_when_the_model_owns_the_prefix_cache():
+    captured: dict = {}
+
+    class FakeModel:
+        def prefill_forward(self, **kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        model=FakeModel(),
+        vllm_config=SimpleNamespace(additional_config={}),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        prompt_lens=[1, 1],
+        input_positions=torch.zeros((2,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        multi_modal_kwargs={},
+        perform_device_sampling=False,
+        prefill_empty_slots=None,
+        stage_inputs=None,
+        prefill_req_ids=["r0", "r1"],
+    )
+    TTModelRunner.submit_prefill(runner, model_input, [2])
+    assert captured["request_ids"] == ["r0", "r1"]
+    model_input.prefill_req_ids = None  # (the builder only fills it for policy "model" with a registered hook)
+    TTModelRunner.submit_prefill(runner, model_input, [2])
+    assert "request_ids" not in captured
+
+
 def _sampling_params(rows=2):
     """Every field a per-row tensor, as ``submit_decode``'s ``.tolist()`` expects."""
     return TTSamplingParams(
