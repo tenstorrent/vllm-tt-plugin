@@ -47,6 +47,24 @@ def test_hit_is_clamped_to_vllms_hit_and_never_negative():
     assert ph.plan_model_hit("a", [1], 600, max_hit=600) == 0
 
 
+def test_finished_ids_reach_a_hook_that_takes_them_and_only_when_given():
+    seen = []
+
+    class H2(Hook):
+        def plan_hit(self, request_id, tokens, num_tokens, max_hit=None, finished_ids=()):
+            seen.append(list(finished_ids))
+            return 512, 0
+
+    ph.set_prefix_hook(H2())
+    assert ph.plan_model_hit("a", [1], 600, max_hit=600, finished_ids={"x", "y"}) == 512
+    assert sorted(seen[0]) == ["x", "y"]
+    ph.plan_model_hit("a", [1], 600, max_hit=600, finished_ids=None)
+    assert seen[1] == []
+    h = Hook(hit=512)  # (a hook whose plan_hit has no finished_ids parameter is only called without it)
+    ph.set_prefix_hook(h)
+    assert ph.plan_model_hit("a", [1], 600, max_hit=600, finished_ids=None) == 512
+
+
 def test_zero_max_hit_does_not_ask_the_model():
     h = Hook()
     ph.set_prefix_hook(h)
