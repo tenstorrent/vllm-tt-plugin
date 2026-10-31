@@ -125,6 +125,22 @@ class TTDecodeSubmission:
 
 
 @dataclass(frozen=True)
+class TTDeferredAsyncDecode:
+    """A device grammar decode submitted under asynchronous scheduling.
+
+    Its forward is on the device and its sampling waits for the grammar mask,
+    which ``sample_tokens`` brings. ``overlap_ok`` is decided before the
+    submission, as ``submit_async_lane_decode`` decides it, because the
+    submission commits the residency the decision reads.
+    """
+
+    submission: TTDecodeSubmission
+    context: SubmittedStepContext
+    scheduled_rows: list[int] | None
+    overlap_ok: bool
+
+
+@dataclass(frozen=True)
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
@@ -673,11 +689,13 @@ class TTAsyncDecodeController:
                 return False
         # Structured outputs are detected from the scheduler state, not from a
         # prepared bitmask: grammar is applied at sample time, so no bitmask
-        # exists yet when this runs. Either signal disables steady decode so the
-        # grammar constraint is never skipped by an overlapped step.
-        if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
-            runner.requests, scheduler_output, None
-        ):
+        # exists yet when this runs. Host grammar draws the token on host, so
+        # the next step has to reload it and cannot overlap this one. Device
+        # grammar samples the masked token into the resident input, as any
+        # device-sampled step does, so the step stays steady when
+        # ``check_perform_device_sampling`` below admits its rows.
+        structured = has_structured_outputs(runner.requests, scheduler_output, None)
+        if structured and not runner.supports_device_grammar:
             return False
         if not input_batch.no_penalties:
             return False
@@ -696,7 +714,7 @@ class TTAsyncDecodeController:
             return False
         return runner.check_perform_device_sampling(
             is_decode=True,
-            has_structured_outputs=False,
+            has_structured_outputs=structured,
         )
 
     def can_attempt_steady_decode_from_scheduler(
@@ -740,8 +758,6 @@ class TTAsyncDecodeController:
         if not model_input.perform_device_sampling:
             return False
         if model_input.decode_layout_changed:
-            return False
-        if getattr(model_input, "defer_device_sampling", False):
             return False
         if (
             model_input.prompt_tokens is not None
@@ -1713,6 +1729,87 @@ class TTAsyncDecodeController:
         self.register_pending_async_step(step, overlap_ok=overlap_ok)
         return step
 
+    def submit_deferred_async_decode(
+        self,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+        scheduled_rows: list[int] | None = None,
+    ) -> TTDeferredAsyncDecode:
+        """Submit a device grammar decode's forward under asynchronous scheduling.
+
+        Nothing is read and nothing is registered as pending yet: the step's
+        tokens exist only once ``sample_deferred_async_decode`` has sampled it
+        with the grammar mask. vLLM's ``step_with_batch_queue`` calls
+        ``sample_tokens`` for this step before it calls ``execute_model`` for
+        the next one, so the model never holds two unsampled forwards.
+        """
+        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+        submission = self.submit_decode(model_input, read_from_device=False)
+        return TTDeferredAsyncDecode(
+            submission=submission,
+            context=context,
+            scheduled_rows=scheduled_rows,
+            overlap_ok=overlap_ok,
+        )
+
+    def sample_deferred_async_decode(
+        self, deferred: TTDeferredAsyncDecode, model_input: TTModelInput
+    ) -> AsyncTTModelRunnerOutput:
+        """Sample a deferred decode on device and start reading its tokens.
+
+        ``model_input`` carries the sample-time grammar bitmask. The returned
+        output resolves like an ordinary asynchronous decode, whose read it
+        shares: the tokens are already masked, so the read applies no grammar.
+        """
+        sampled = self._sample_deferred_device_decode(deferred.submission, model_input)
+        try:
+            tt_out, read_events = self._start_async_read(sampled.tt_out)
+        except Exception:
+            self._fail_deferred_device_sampling()
+            raise
+        completion_event = threading.Event()
+        step = AsyncTTModelRunnerOutput(
+            controller=self,
+            submission=replace(sampled, tt_out=tt_out, read_events=read_events),
+            model_input=replace(
+                model_input, grammar_bitmask=[None], defer_device_sampling=False
+            ),
+            completion_event=completion_event,
+            context=deferred.context,
+            scheduled_rows=deferred.scheduled_rows,
+        )
+        self.register_pending_async_step(step, overlap_ok=deferred.overlap_ok)
+        return step
+
+    def _start_async_read(
+        self, tt_out: Any, readback_rows: tuple[int, ...] | None = None
+    ) -> tuple[Any, list[Any] | None]:
+        """Start a non-blocking read of a decode's output; return it and its events."""
+        runner = self.runner
+        if hasattr(runner.model, "read_decode_output"):
+            return cast(
+                tuple[Any, list[Any]],
+                runner.model.read_decode_output(
+                    tt_out,
+                    async_read=True,
+                    **(
+                        {"sample_rows": list(readback_rows)}
+                        if readback_rows is not None
+                        else {}
+                    ),
+                ),
+            )
+        is_host_tensor = isinstance(tt_out, torch.Tensor)
+        is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
+            tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+        )
+        if not (is_host_tensor or is_host_tensor_tuple):
+            raise AttributeError(
+                "TT model must implement read_decode_output() "
+                "unless decode_forward() already returns host tensors"
+            )
+        return tt_out, None
+
     def submit_decode(
         self,
         model_input: TTModelInput,
@@ -1955,30 +2052,7 @@ class TTAsyncDecodeController:
             # Nothing to read now: ``finalize_decode`` resolves the handle.
             pass
         elif async_read:
-            if hasattr(runner.model, "read_decode_output"):
-                tt_out, read_events = cast(
-                    tuple[Any, list[Any]],
-                    runner.model.read_decode_output(
-                        tt_out,
-                        async_read=True,
-                        **(
-                            {"sample_rows": list(readback_rows)}
-                            if readback_rows is not None
-                            else {}
-                        ),
-                    ),
-                )
-            else:
-                is_host_tensor = isinstance(tt_out, torch.Tensor)
-                is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                    tensor is None or isinstance(tensor, torch.Tensor)
-                    for tensor in tt_out
-                )
-                if not (is_host_tensor or is_host_tensor_tuple):
-                    raise AttributeError(
-                        "TT model must implement read_decode_output() "
-                        "unless decode_forward() already returns host tensors"
-                    )
+            tt_out, read_events = self._start_async_read(tt_out, readback_rows)
         return TTDecodeSubmission(
             tt_out=tt_out,
             read_events=read_events,
@@ -1999,12 +2073,29 @@ class TTAsyncDecodeController:
         model_input: TTModelInput,
     ) -> TTFinalizedDecode:
         """Apply sample-time grammar on device, then finalize sampled tokens."""
+        sampled = self._sample_deferred_device_decode(submission, model_input)
+        try:
+            finalized = self.finalize_decode(sampled)
+            if finalized is None:
+                raise RuntimeError("deferred device sampling produced no output")
+        except Exception:
+            self._fail_deferred_device_sampling()
+            raise
+        return finalized
 
-        def fail_deferred() -> None:
-            self._decode_chain_valid = False
-            self._submitted_page_tables = None
-            self.runner._poison_device_grammar()
+    def _fail_deferred_device_sampling(self) -> None:
+        """A deferred decode failed after its forward was submitted: stop serving."""
+        self._decode_chain_valid = False
+        self._submitted_page_tables = None
+        self.runner._poison_device_grammar()
 
+    def _sample_deferred_device_decode(
+        self,
+        submission: TTDecodeSubmission,
+        model_input: TTModelInput,
+    ) -> TTDecodeSubmission:
+        """Sample a deferred decode on device; return its submission, unread."""
+        fail_deferred = self._fail_deferred_device_sampling
         if not submission.deferred_device_sampling:
             raise ValueError(
                 "decode submission is not awaiting deferred device sampling"
@@ -2040,15 +2131,6 @@ class TTAsyncDecodeController:
                 sampling_params=submission.device_sampling_params,
                 grammar_bitmask=grammar_bitmask,
             )
-            completed_submission = replace(
-                submission,
-                tt_out=sampled,
-                read_events=None,
-                deferred_device_sampling=False,
-            )
-            finalized = self.finalize_decode(completed_submission)
-            if finalized is None:
-                raise RuntimeError("deferred device sampling produced no output")
         except Exception:
             fail_deferred()
             raise
@@ -2057,7 +2139,12 @@ class TTAsyncDecodeController:
             "TT device grammar sampling active count=%d",
             self.device_grammar_sample_count,
         )
-        return finalized
+        return replace(
+            submission,
+            tt_out=sampled,
+            read_events=None,
+            deferred_device_sampling=False,
+        )
 
     @staticmethod
     def _deferred_handle(submission: TTDecodeSubmission) -> Any | None:

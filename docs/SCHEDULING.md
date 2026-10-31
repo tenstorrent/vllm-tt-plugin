@@ -623,7 +623,7 @@ Overlap is disabled and pending async work is drained when correctness would oth
 
 - prompt activity or resumed prefill work
 - layout change in the decode batch
-- structured output bookkeeping
+- structured output sampled on host (no effective device grammar)
 - penalties, allowed-token masks, bad-word filtering, or logits processors
 - any other requirement for host-side sampling
 - logprobs, including an explicit `logprobs=0`, or other features that force a
@@ -634,11 +634,14 @@ When device sampling is operator-enabled, a model declares
 support, and the submitted batch has no logprobs or other host-only option, a
 structured decode keeps logits on device until `sample_tokens()` supplies and
 remaps the packed grammar mask. Sampling-path eligibility is batch-wide: one
-ineligible request moves the whole submitted TT batch to host sampling. The
-runner drains pending async work before that forward and completes device
-sampling synchronously after the mask arrives. This initial path also requires
-`async_scheduling=False`, because upstream's batch queue can otherwise submit
-another forward before the current grammar arrives. Structured prefill and
+ineligible request moves the whole submitted TT batch to host sampling.
+Synchronously, the runner completes device sampling after the mask arrives.
+Under async scheduling it starts a non-blocking read of the sampled tokens
+instead, and the step is steady under the same rules as an ordinary
+device-sampled decode: its sampler writes the masked token into the next
+decode's resident input. Upstream's `step_with_batch_queue` calls
+`sample_tokens()` for a deferred step before `execute_model()` for the next
+one, so the model never holds two unsampled forwards. Structured prefill and
 ineligible structured decode retain host sampling. Block-output models reject
 structured outputs.
 
