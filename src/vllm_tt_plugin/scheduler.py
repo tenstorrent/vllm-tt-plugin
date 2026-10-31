@@ -980,6 +980,7 @@ class TTScheduler(AsyncScheduler):
                     token_ids if token_ids is not None else request.prompt_token_ids,
                     request.num_tokens,
                     max_hit=num_local,
+                    finished_ids=getattr(self, "finished_req_ids", None),
                 )
                 hit = hit // align * align
             else:

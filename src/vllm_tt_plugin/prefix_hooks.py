@@ -39,14 +39,15 @@ def get_prefix_hook():
         return _hook
 
 
-def plan_model_hit(request_id, prompt_token_ids, num_tokens: int, max_hit: int | None = None) -> int:
+def plan_model_hit(request_id, prompt_token_ids, num_tokens: int, max_hit: int | None = None, finished_ids=None) -> int:
     """The model's prefix hit for a new request, in tokens (0 = none, no hook, or a failing hook: a broken model hook must not stop the scheduler)."""
     global _errors
     hook = get_prefix_hook()
     if hook is None or num_tokens <= 0 or (max_hit is not None and max_hit <= 0):
         return 0
     try:
-        hit, _row = hook.plan_hit(request_id, prompt_token_ids, int(num_tokens), max_hit=max_hit)
+        extra = {"finished_ids": list(finished_ids)} if finished_ids else {}  # (requests the scheduler finished that the model has not been told about yet: their users are free for the reservation)
+        hit, _row = hook.plan_hit(request_id, prompt_token_ids, int(num_tokens), max_hit=max_hit, **extra)
     except Exception:  # noqa: BLE001
         _errors += 1
         if _errors <= 3:
