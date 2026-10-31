@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import os
+from collections import deque
 from collections.abc import Mapping
 from enum import Enum
 from typing import cast
@@ -13,7 +14,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin import sched_defer_final
+from vllm_tt_plugin import sched_defer_final, sched_final_step
 from vllm_tt_plugin.sched_defer_final import DeferFinalPolicy
 from vllm_tt_plugin.sched_interleave import InterleavePolicy
 from vllm_tt_plugin.sched_release_first import ReleaseFirstPolicy
@@ -49,7 +50,13 @@ ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
 # unimplemented flag (``TT_SCHED_ADMISSION_GROUP`` is not implemented) does
 # not serve the stock schedule under its name.
 KNOWN_SCHED_FLAGS = frozenset(
-    {"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG", "TT_SCHED_DEFER_FINAL", "TT_SCHED_RELEASE_FIRST"}
+    {
+        "TT_SCHED_INTERLEAVE",
+        "TT_SCHED_EVENT_LOG",
+        "TT_SCHED_DEFER_FINAL",
+        "TT_SCHED_RELEASE_FIRST",
+        "TT_SCHED_FINAL_STEP",
+    }
 )
 
 
@@ -142,6 +149,10 @@ class TTScheduler(AsyncScheduler):
         # agree (it parks and restores the prefixes), or the start-up refuses.
         sched_defer_final.check_agreement()
         self._defer = DeferFinalPolicy.from_env(chunk_tokens=chunk, cohort=self.max_num_running_reqs)
+        # TT_SCHED_FINAL_STEP (sched_final_step): the cohort's first tokens
+        # from one decode step; needs the deferred finals and the generator's
+        # parking off.
+        sched_final_step.check_agreement(defer_enabled=self._defer is not None)
         if self._defer is not None:
             if self._interleave is not None:
                 raise ValueError("TT_SCHED_DEFER_FINAL and TT_SCHED_INTERLEAVE do not compose")
@@ -411,6 +422,14 @@ class TTScheduler(AsyncScheduler):
                 head_id, held = policy.finals[0]
                 if held is not None:
                     admit = held
+                elif policy.final_step:
+                    # every parked final of the cohort in one step: one token each (the last prompt token),
+                    # which the runner routes to a decode step (sched_final_step)
+                    ids = {rid for rid, h in policy.finals if h is None}
+                    visible = [r for r in partials if r.request_id in ids]
+                    if not visible:  # all gone (finished or preempted between steps): skip them
+                        policy.finals = deque(x for x in policy.finals if x[1] is not None)
+                        continue
                 else:
                     visible = [r for r in partials if r.request_id == head_id]
                     if not visible:  # gone (finished or preempted between steps): skip it
@@ -434,7 +453,9 @@ class TTScheduler(AsyncScheduler):
             break  # nothing to prefill: an empty step (the caller falls back to decode)
         hidden = [r for r in saved_running if r not in visible]  # parked partials and pure decodes
         self.running = cast(list[Request], visible)
-        self.max_num_running_reqs = 1 if (admit is not None or visible) else 0
+        self.max_num_running_reqs = len(visible) if visible else (1 if admit is not None else 0)
+        saved_budget = getattr(self, "max_num_scheduled_tokens", None)
+        budget = policy.budget(visible[0]) if len(visible) == 1 and not policy.draining else None
         if admit is not None and admit is not (saved_waiting.peek_request() if saved_waiting else None):
             hidden_queue.add_request(admit)  # a held one-chunk prompt: alone at the head
             self.waiting = hidden_queue
@@ -444,6 +465,8 @@ class TTScheduler(AsyncScheduler):
             self.waiting = hidden_queue
         if saved_skipped is not None:
             self.skipped_waiting = create_request_queue(self.policy)
+        if budget is not None:
+            self.max_num_scheduled_tokens = budget  # a stepped bulk's last chunk ends at n - 1
         try:
             result = super().schedule()
         finally:
@@ -456,6 +479,8 @@ class TTScheduler(AsyncScheduler):
                 self.skipped_waiting = saved_skipped
             self.running.extend(hidden)  # a visible request the base preempted stays out, as in the stock path
             self.max_num_running_reqs = saved_max
+            if budget is not None:
+                self.max_num_scheduled_tokens = saved_budget
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:

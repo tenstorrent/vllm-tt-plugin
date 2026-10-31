@@ -32,6 +32,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_tt_plugin import sched_events, sched_final_step
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
@@ -53,7 +54,6 @@ from vllm_tt_plugin.input_batch import (
     build_cached_request_state,
     clone_torch_generator,
 )
-from vllm_tt_plugin import sched_events
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
@@ -101,7 +101,9 @@ def _parse_layer_index(layer_name: str) -> int:
     return int(match.group(1))
 
 
-def _ragged_token_lists(sampled_token_ids: torch.Tensor, num_reqs: int) -> list[list[int]]:
+def _ragged_token_lists(
+    sampled_token_ids: torch.Tensor, num_reqs: int
+) -> list[list[int]]:
     """``[num_reqs, n]`` ids -> per request its tokens up to the first ``-1``
     (``n == 1``: one each; the model-owned speculative round pads the emitted
     tokens with -1)."""
@@ -190,6 +192,11 @@ class TTModelRunner:
         self.full_prompt_chunked = (
             self.model_config.hf_config.model_type in FULL_PROMPT_CHUNKED_MODEL_TYPES
         )
+        # TT_SCHED_FINAL_STEP (sched_final_step): a multi-chunk prompt is
+        # presented to the generator as n - 1 tokens and its last token is a
+        # decode step; only for the generators that take the whole prompt.
+        self.final_step = sched_final_step.enabled() and self.full_prompt_chunked
+        self.chunk_tokens = int(self.scheduler_config.max_num_batched_tokens)
 
         logger.info(
             "TTModelRunner: trace_mode=%s, "
@@ -883,7 +890,12 @@ class TTModelRunner:
         least-recently-used eviction at the next join, which is wrong when several
         requests finish in one step and the joins run from a prefill step."""
         release = getattr(self.model, "release_request", None)
-        if release is None or req_state is None or not req_state.block_ids or not req_state.block_ids[0]:
+        if (
+            release is None
+            or req_state is None
+            or not req_state.block_ids
+            or not req_state.block_ids[0]
+        ):
             return
         release(int(req_state.block_ids[0][0]))
 
@@ -981,6 +993,34 @@ class TTModelRunner:
         input_batch.advance_generators(rows_to_advance)
         return generators
 
+    def _is_final_step(
+        self, scheduler_output: SchedulerOutput, req_indices: list[int]
+    ) -> bool:
+        """``TT_SCHED_FINAL_STEP``: whether this prefill-looking step is the cohort's
+        final step: no new or
+        resumed request, and every row still prefilling is a stepped prompt (longer than
+        the chunk) with exactly
+        its last token scheduled (``sched_final_step``). A step that mixes such rows
+        with others is a scheduler
+        defect and is refused: the generator would assert on an unaligned chunk or serve
+        a wrong prefix."""
+        if (
+            scheduler_output.scheduled_new_reqs
+            or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        ):
+            return False
+        input_batch = self.input_batch
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        rows = [
+            (
+                int(input_batch.num_computed_tokens_cpu[i]),
+                int(input_batch.num_prompt_tokens[i]),
+                int(num_scheduled[input_batch.req_ids[i]]),
+            )
+            for i in req_indices
+        ]
+        return sched_final_step.is_final_step(rows, self.chunk_tokens)
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1069,6 +1109,15 @@ class TTModelRunner:
             or bool(cached_reqs.resumed_req_ids)
             or has_chunked_continuation
         )
+        if (
+            self.final_step
+            and is_prompt
+            and self._is_final_step(scheduler_output, req_indices)
+        ):
+            # sched_final_step: every row's last prompt token, one each, at
+            # position n - 1: a decode step (the bulk ended at n - 1 and the
+            # generator joined the request as a complete prompt of n - 1).
+            is_prompt = False
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         prompt_total_lens: torch.Tensor | None = None
@@ -1137,7 +1186,25 @@ class TTModelRunner:
                 # the whole prompt of every row, its length per row (the
                 # generator still computes [start_pos, prompt_lens))
                 total_lens = input_batch.num_tokens[req_indices]
-                prompt_total_lens = torch.from_numpy(np.asarray(total_lens, dtype=np.int64))
+                if self.final_step:
+                    # sched_final_step: a stepped prompt is n - 1 tokens to the
+                    # generator, from its first chunk on (the next chunk's host
+                    # inputs are prepared ahead from this length)
+                    prompts = input_batch.num_prompt_tokens[req_indices]
+                    total_lens = np.array(
+                        [
+                            sched_final_step.bulk_end(int(n), self.chunk_tokens)
+                            for n in prompts
+                        ],
+                        dtype=np.int64,
+                    )
+                    assert bool((prompt_lens <= total_lens).all()), (
+                        prompt_lens,
+                        total_lens,
+                    )
+                prompt_total_lens = torch.from_numpy(
+                    np.asarray(total_lens, dtype=np.int64)
+                )
                 max_prefill_tokens = max(max_prefill_tokens, int(total_lens.max()))
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens

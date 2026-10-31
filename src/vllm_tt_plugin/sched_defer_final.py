@@ -47,6 +47,8 @@ import os
 from collections import deque
 from typing import TYPE_CHECKING
 
+from vllm_tt_plugin import sched_final_step
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
@@ -76,17 +78,24 @@ def check_agreement(environ=None) -> None:
     env = os.environ if environ is None else environ
     sched = enabled(env)
     model = env.get(MODEL_ENV, "0").strip() == "1"
+    if sched and sched_final_step.enabled(env):
+        return  # TT_SCHED_FINAL_STEP: the generator parks nothing (its own check refuses the model flag)
     if sched != model:
         raise ValueError(f"{ENV}={'1' if sched else 'unset'} but {MODEL_ENV}={'1' if model else 'unset'}: set both or neither")
 
 
 class DeferFinalPolicy:
-    def __init__(self, chunk_tokens: int, cohort: int, hold_admission: bool = False) -> None:
+    def __init__(
+        self, chunk_tokens: int, cohort: int, hold_admission: bool = False, final_step: bool = False
+    ) -> None:
         if chunk_tokens <= 0 or cohort <= 0:
             raise ValueError((chunk_tokens, cohort))
         self.chunk = chunk_tokens
         self.cohort = cohort  # the slots: parked + held + decoding requests close a cohort when they reach it
         self.hold_admission = hold_admission  # TT_SCHED_DEFER_FINAL=hold: no admission while a cohort decodes
+        # TT_SCHED_FINAL_STEP (sched_final_step): a multi-chunk request's bulk runs to n - 1 and the cohort's
+        # parked requests take their first token from one decode step instead of a final chunk each
+        self.final_step = final_step
         self.parked: deque[str] = deque()
         self.held: deque[Request] = deque()
         self.finals: deque[tuple[str, Request | None]] = deque()
@@ -98,10 +107,18 @@ class DeferFinalPolicy:
     def from_env(cls, environ=None, chunk_tokens: int | None = None, cohort: int | None = None):
         if not enabled(environ):
             return None
-        return cls(chunk_tokens or 5120, cohort or 32, hold_admission=value(environ) == "hold")
+        return cls(
+            chunk_tokens or 5120,
+            cohort or 32,
+            hold_admission=value(environ) == "hold",
+            final_step=sched_final_step.enabled(environ),
+        )
 
     def describe(self) -> str:
-        return f"defer_final(chunk={self.chunk}, cohort={self.cohort}, hold_admission={self.hold_admission})"
+        return (
+            f"defer_final(chunk={self.chunk}, cohort={self.cohort}, hold_admission={self.hold_admission}, "
+            f"final_step={self.final_step})"
+        )
 
     def hold_for_decoders(self, running, waiting_head) -> bool:
         """``_prefer_decode``'s clause (``hold``): take a decode step instead of admitting or advancing a prefill
@@ -120,8 +137,20 @@ class DeferFinalPolicy:
 
     # --- the request's shape ------------------------------------------------------------------------------------
     def prefix(self, request) -> int:
-        """The last chunk boundary before the prompt's end: the bulk's extent (0 for a one-chunk prompt)."""
-        return (request.num_prompt_tokens - 1) // self.chunk * self.chunk
+        """The bulk's extent: the last chunk boundary before the prompt's end (0 for a one-chunk prompt), or under
+        ``final_step`` the prompt's end less one token (a one-chunk prompt: 0 still, the stock path)."""
+        n = request.num_prompt_tokens
+        if self.final_step and sched_final_step.stepped(n, self.chunk):
+            return n - 1
+        return (n - 1) // self.chunk * self.chunk
+
+    def budget(self, request) -> int | None:
+        """``final_step``: the token budget that ends a stepped request's last bulk chunk at n - 1 when that is
+        less than a chunk away; None when the stock budget serves."""
+        if not self.final_step:
+            return None
+        left = self.prefix(request) - request.num_computed_tokens
+        return left if 0 < left < self.chunk else None
 
     def one_chunk(self, request) -> bool:
         return request.num_prompt_tokens <= self.chunk
@@ -164,13 +193,15 @@ class DeferFinalPolicy:
 
     # --- the accounting ---------------------------------------------------------------------------------------
     def observe(self, output: SchedulerOutput, requests: dict) -> None:
-        """Called on every scheduler output: park the rows whose chunk ended at their prompt's last boundary, pop
-        the head final once its chunk completed the prompt, drop finished and preempted requests."""
+        """Called on every scheduler output: park the rows whose chunk ended at their bulk's extent, pop a final
+        once its chunk (or, under ``final_step``, its one-token step) completed the prompt, drop finished and
+        preempted requests."""
         self.last_finals = []
         for req_id in output.finished_req_ids or ():
             self.drop(req_id)
         for req_id in output.preempted_req_ids or ():
             self.drop(req_id)
+        completed: set[str] = set()
         for req_id, n in output.num_scheduled_tokens.items():
             request = requests.get(req_id)
             if request is None:
@@ -179,8 +210,10 @@ class DeferFinalPolicy:
             prompt = request.num_prompt_tokens
             if end - n >= prompt:
                 continue  # a decode row
-            if self.finals and self.finals[0][0] == req_id and end >= prompt:
-                _, held = self.finals.popleft()  # the final completed: its first token is out
-                self.last_finals.append((req_id, held is None))
+            if self.finals and end >= prompt and any(x[0] == req_id for x in self.finals):
+                completed.add(req_id)  # the final completed: its first token is out
             elif end == self.prefix(request) and end < prompt and req_id not in self.parked:
                 self.park(req_id)
+        if completed:
+            self.last_finals = [(rid, held is None) for rid, held in self.finals if rid in completed]
+            self.finals = deque(x for x in self.finals if x[0] not in completed)
