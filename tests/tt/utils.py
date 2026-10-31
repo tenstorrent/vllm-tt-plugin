@@ -49,6 +49,7 @@ class RequestConfig:
     allowed_token_ids: list[int] | None = None
     min_tokens: int = 0
     return_tokens_as_token_ids: bool = False
+    return_token_ids: bool = False
     reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
@@ -73,6 +74,8 @@ async def send_request(
         extra_body["allowed_token_ids"] = config.allowed_token_ids
     if config.return_tokens_as_token_ids:
         extra_body["return_tokens_as_token_ids"] = True
+    if config.return_token_ids:
+        extra_body["return_token_ids"] = True
     if config.bad_words is not None:
         raise ValueError("bad_words is not supported in legacy completions API")
 
@@ -227,6 +230,26 @@ def run_concurrent_batch_tokens(tt_server, tt_model_name, configs):
         tt_server, tt_model_name, token_configs, return_full_response=True
     )
     return [extract_token_ids(r) for r in responses]
+
+
+def run_concurrent_batch_raw_tokens(tt_server, tt_model_name, configs):
+    """Return exact token tuples without adding logprobs or changing sampler routing.
+
+    Unlike return_tokens_as_token_ids, the completion return_token_ids field
+    does not require logprobs (which would move TP4 device sampling to host).
+    """
+    responses = run_concurrent_batch(
+        tt_server, tt_model_name,
+        [replace(cfg, return_token_ids=True) for cfg in configs],
+        return_full_response=True,
+    )
+    results = []
+    for response in responses:
+        ids = getattr(response.choices[0], "token_ids", None)
+        assert isinstance(ids, list) and ids, "Missing raw emitted token IDs"
+        assert all(type(token_id) is int for token_id in ids), "Non-integer raw token ID"
+        results.append(tuple(ids))
+    return results
 
 
 def assert_varied(results, min_varied, explanation):

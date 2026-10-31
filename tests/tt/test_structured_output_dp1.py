@@ -118,25 +118,28 @@ def _run_mixed_requests(
 ) -> None:
     async def _run() -> None:
         async_client = tt_server.get_async_client()
-        senders = [
-            _send_choice_request,
-            _send_regex_request,
-            _send_json_request,
-            _send_plain_request,
-        ]
+        try:
+            senders = [
+                _send_choice_request,
+                _send_regex_request,
+                _send_json_request,
+                _send_plain_request,
+            ]
 
-        tasks = [
-            senders[request_id % len(senders)](
-                async_client,
-                tt_model_name,
-                request_id,
-                reasoning_token_budget,
-            )
-            for request_id in range(request_count)
-        ]
+            tasks = [
+                senders[request_id % len(senders)](
+                    async_client,
+                    tt_model_name,
+                    request_id,
+                    reasoning_token_budget,
+                )
+                for request_id in range(request_count)
+            ]
 
-        results = await asyncio.gather(*tasks)
-        assert len(results) == request_count
+            results = await asyncio.gather(*tasks)
+            assert len(results) == request_count
+        finally:
+            await async_client.close()
 
     asyncio.run(_run())
 

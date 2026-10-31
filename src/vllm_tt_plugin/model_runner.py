@@ -1057,7 +1057,7 @@ class TTModelRunner:
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+                self.input_batch.append_block_ids(new_block_ids, req_index)
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -2033,25 +2033,6 @@ class TTModelRunner:
                 self.tt_per_lane_max_num_seqs,
             )
 
-        # Second dim of each block table is (ceil(max_model_len / block_size)).
-        # Slice/pad to ``self.max_num_blocks_per_req``: slicing handles
-        # over-wide tables when the total KV-cache limit is tighter than
-        # ``ceil(max_model_len / block_size)``, and padding handles
-        # under-wide ones from hybrid kv-cache groups whose native
-        # block-table widths differ after upstream page-size unification.
-        target_width = self.max_num_blocks_per_req
-        block_tables_per_group = input_batch.block_tables_for_rows(
-            req_indices, target_width
-        )
-
-        # Group-0 view kept on TTModelInput.block_tables for back-compat with
-        # the single-tensor consumers (decode_forward page_table arg). Hybrid
-        # models additionally consume ``block_tables_per_group`` via the
-        # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
-        # legacy generator_vllm wrappers strip it on the way through and raise
-        # loudly if the list has more than one entry.
-        block_tables = block_tables_per_group[0]
-
         # NOTE: We assume that all sequences in the group are all prompts or
         # all decodes.
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -2095,6 +2076,13 @@ class TTModelRunner:
             or bool(cached_reqs.resumed_req_ids)
             or has_chunked_continuation
         )
+        # Cache the final wire shape, not an unpadded intermediate. Unchanged
+        # decode reuses immutable snapshots without scanning context-wide maps.
+        block_table_snapshot_version, snapshot_tables = input_batch.block_table_snapshot(
+            req_indices, self.max_num_blocks_per_req, num_reqs if is_prompt else decode_pad_to
+        )
+        block_tables_per_group = list(snapshot_tables)
+        block_tables = block_tables_per_group[0]
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
         num_valid_drafts: torch.Tensor | None = None
@@ -2256,19 +2244,6 @@ class TTModelRunner:
                     accepted_counts = torch.cat(
                         [accepted_counts, torch.ones(batch_pad, dtype=torch.int32)]
                     )
-                # Pad each per-group block table to the same wire capacity so
-                # the device sees a fixed shape regardless of how many users
-                # are active. Keep ``block_tables`` aliased to the (now padded)
-                # group-0 view, matching the alias set up where
-                # ``block_tables_per_group`` is built.
-                block_tables_per_group = [
-                    torch.cat(
-                        [bt, torch.zeros(batch_pad, bt.shape[1], dtype=bt.dtype)],
-                        dim=0,
-                    )
-                    for bt in block_tables_per_group
-                ]
-                block_tables = block_tables_per_group[0]
                 # Sampling parameters are intentionally NOT padded here. The
                 # per-row wire tensors are built below by
                 # ``_sampling_params_for_padded_decode``, which takes this
@@ -2450,8 +2425,6 @@ class TTModelRunner:
             # This means sampling is not perfectly deterministic
             # whenever device sampling is enabled.
 
-        block_tables_per_group = [bt.contiguous() for bt in block_tables_per_group]
-        block_tables = block_tables_per_group[0]
         # State follows the request, not the row (``self._req_state_slot``), which
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
@@ -2490,6 +2463,7 @@ class TTModelRunner:
             prompt_lens=prompt_lens,
             block_tables=block_tables,
             block_tables_per_group=block_tables_per_group,
+            block_table_snapshot_version=block_table_snapshot_version,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
             unpadded_batch_size=num_reqs,
             row_req_ids=row_req_ids,
@@ -3743,6 +3717,8 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        if getattr(self.model, "accepts_intermediate_prefill_mask", False):
+            kwargs["intermediate_prefill_mask"] = model_input.intermediate_prefill_mask
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has

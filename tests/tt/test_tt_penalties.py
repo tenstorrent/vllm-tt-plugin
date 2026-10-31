@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+from collections import Counter
+
 from tests.tt.utils import (
     RequestConfig,
     assert_deterministic_allow_near_tie,
     assert_varied,
     count_prompts_changed_by,
     run_concurrent_batch,
+    run_concurrent_batch_raw_tokens,
 )
 
 
@@ -315,23 +318,27 @@ class TestFrequencyPenalty:
                 )
             )
 
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        assert max_batch_size >= 2, "Mixed penalty isolation needs at least two request slots"
+        controls = [
+            run_concurrent_batch_raw_tokens(tt_server, tt_model_name, [config])[0]
+            for config in configs[:2]
+        ]
+        results = run_concurrent_batch_raw_tokens(tt_server, tt_model_name, configs)
+        for index, ids in enumerate(results):
+            assert ids == controls[index % 2], (
+                f"Mixed request {index} differs from its isolated parameter control: "
+                f"control={controls[index % 2]}, mixed={ids}"
+            )
 
-        no_penalty = [results[i] for i in range(0, max_batch_size, 2)]
-        with_penalty = [results[i] for i in range(1, max_batch_size, 2)]
-
-        # Count "a"s in each output
-        no_penalty_a_count = no_penalty[0].count("a")
-        with_penalty_a_count = with_penalty[0].count("a")
-
-        assert no_penalty_a_count > with_penalty_a_count, (
-            f"Frequency penalty should reduce 'a' repetitions: "
-            f"no_penalty={no_penalty_a_count},"
-            f"with_penalty={with_penalty_a_count}"
+        # Frequency penalties count generated token IDs, not prompt characters.
+        # Keep a real application check in addition to the isolation controls:
+        # the fixture must repeat a token, and penalizing must suppress that token.
+        repeated_token, baseline_count = Counter(controls[0]).most_common(1)[0]
+        assert baseline_count >= 2, (
+            f"Frequency-penalty fixture lacks repeated output tokens: {controls[0]}"
         )
-        assert_deterministic_allow_near_tie(
-            no_penalty, "No penalty requests should be identical."
-        )
-        assert_deterministic_allow_near_tie(
-            with_penalty, "With penalty requests should be identical."
+        penalized_count = controls[1].count(repeated_token)
+        assert penalized_count < baseline_count, (
+            f"Frequency penalty did not suppress baseline token {repeated_token}: "
+            f"unpenalized={baseline_count}, penalized={penalized_count}"
         )

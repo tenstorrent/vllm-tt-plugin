@@ -12,6 +12,7 @@ from tests.tt.utils import (
     assert_varied,
     run_concurrent_batch,
     run_concurrent_batch_tokens,
+    run_concurrent_batch_raw_tokens,
 )
 
 
@@ -271,10 +272,10 @@ class TestSeedingAndVariety:
         ]
 
         # Overall
-        results = run_concurrent_batch(tt_server, tt_model_name, configs)
+        results = run_concurrent_batch_raw_tokens(tt_server, tt_model_name, configs)
         assert_varied(results, 2, "With temperature=2.0, outputs should vary in batch.")
 
-        # First token (prefill)
+        # Exact first token: decoded characters may share a leading space.
         prefill_results = [x[:1] for x in results]
         assert_varied(
             prefill_results,
@@ -291,14 +292,14 @@ class TestSeedingAndVariety:
 
         # Overall
         results = [
-            run_concurrent_batch(tt_server, tt_model_name, configs)[0]
+            run_concurrent_batch_raw_tokens(tt_server, tt_model_name, configs)[0]
             for _ in range(tries)
         ]
         assert_varied(
             results, 2, "With temperature=2.0, outputs should vary on re-runs."
         )
 
-        # First token (prefill)
+        # Exact first token: decoded characters may share a leading space.
         prefill_results = [x[:1] for x in results]
         assert_varied(
             prefill_results,
@@ -321,8 +322,23 @@ class TestSeedingAndVariety:
         ]
         joint_configs = greedy_config + topk_configs
 
-        results_1 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
-        results_2 = run_concurrent_batch(tt_server, tt_model_name, joint_configs)
+        results_1 = run_concurrent_batch_raw_tokens(tt_server, tt_model_name, joint_configs)
+        results_2 = run_concurrent_batch_raw_tokens(tt_server, tt_model_name, joint_configs)
+
+        # A separate greedy control exposes the first-step top-10 support.
+        # Keep logprobs OUT of the sampled cohort: on TP4 they force host RNG.
+        reference = run_concurrent_batch(
+            tt_server, tt_model_name,
+            [RequestConfig(prompt=prompt, max_tokens=1, temperature=0,
+                           logprobs=10, return_tokens_as_token_ids=True)],
+            return_full_response=True,
+        )[0]
+        metadata = reference.choices[0].logprobs
+        assert metadata is not None and metadata.top_logprobs, "Missing top-k reference"
+        top = metadata.top_logprobs[0]
+        assert top is not None and len(top) == 10, "Expected greedy top-10 reference"
+        assert all(key.startswith("token_id:") for key in top), "Reference needs exact token IDs"
+        support = {int(key.split(":", 1)[1]) for key in top}
 
         # Within each batch:
         for results in [results_1, results_2]:
@@ -337,10 +353,12 @@ class TestSeedingAndVariety:
                 non_greedy_results, 2, "With top_k=10, outputs should vary in batch."
             )
 
-            # First token (prefill)
-            prefill_results = [x[:1] for x in non_greedy_results]
-            assert_varied(
-                prefill_results, 2, "With top_k=10, first tokens should vary in batch."
+            # top-k bounds token support; it does not guarantee distinct draws.
+            # Even eight identical first IDs can be likely for peaked logits,
+            # and distinct token IDs can share their first decoded character.
+            assert all(ids[0] in support for ids in non_greedy_results), (
+                f"Device top-k first token outside reference top-10: "
+                f"support={sorted(support)}, ids={[ids[0] for ids in non_greedy_results]}"
             )
 
         # Between batches:
@@ -359,16 +377,6 @@ class TestSeedingAndVariety:
             non_greedy_results_2,
             len(non_greedy_results_1) // 2,
             "Non-greedy requests should produce different outputs when re-ran.",
-        )
-
-        # First token (prefill)
-        prefill_results_1 = [x[:1] for x in non_greedy_results_1]
-        prefill_results_2 = [x[:1] for x in non_greedy_results_2]
-        assert_pairwise_varied(
-            prefill_results_1,
-            prefill_results_2,
-            2,
-            "With top_k=10, first tokens should vary when re-ran.",
         )
 
     def test_top1_is_greedy(self, tt_server, tt_model_name):

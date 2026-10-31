@@ -588,3 +588,20 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     )
     expected = not (has_penalties and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+def test_decode_preparation_reuses_final_padded_block_snapshot(monkeypatch):
+    """No unpadded/padded cache-key thrashing between consecutive steps."""
+    batch, request = _batch_with_one_request(3, 1, 3)
+    runner = _fake_runner(batch, request)
+    first = _prepare(runner, ('r', 1, 3, 1))
+    assert first.block_tables.shape[0] == MAX_NUM_SEQS
+    assert not first.block_tables[1:].any()
+    assert first.block_table_snapshot_version is not None
+    def no_materialize(*args, **kwargs):
+        raise AssertionError('Unchanged decode rematerialized block tables')
+    monkeypatch.setattr(batch, 'block_tables_for_rows', no_materialize)
+    for _ in range(3):
+        again = _prepare(runner, ('r', 1, 3, 1))
+        assert again.block_table_snapshot_version == first.block_table_snapshot_version
+        assert again.block_tables is first.block_tables

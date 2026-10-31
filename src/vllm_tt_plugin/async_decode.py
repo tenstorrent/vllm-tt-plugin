@@ -375,6 +375,7 @@ class TTAsyncDecodeController:
         self._previous_device_sampling: bool | None = None
         self._previous_submission_verified = False
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
+        self._submitted_page_table_version: tuple | None = None
         self._legacy_contract_warning_emitted = False
         self.device_grammar_sample_count = 0
         # How many submissions found a step already outstanding, and how many
@@ -404,6 +405,10 @@ class TTAsyncDecodeController:
         return int(getattr(self.runner.model, "decode_input_update_contract", 0))
 
     def _page_tables_changed(self, model_input: TTModelInput) -> bool:
+        version = getattr(model_input, "block_table_snapshot_version", None)
+        previous_version = self._submitted_page_table_version
+        if version is not None or previous_version is not None:
+            return self._submitted_page_tables is None or version != previous_version
         current = model_input.block_tables_per_group
         previous = self._submitted_page_tables
         return (
@@ -476,7 +481,12 @@ class TTAsyncDecodeController:
             or reload_plan.reload_page_table
             or self._submitted_page_tables is None
         ):
-            self._submitted_page_tables = self._clone_page_tables(model_input)
+            version = getattr(model_input, "block_table_snapshot_version", None)
+            self._submitted_page_tables = (
+                tuple(model_input.block_tables_per_group) if version is not None
+                else self._clone_page_tables(model_input)
+            )
+            self._submitted_page_table_version = version
 
     def scheduler_preserves_decode_layout(
         self, scheduler_output: SchedulerOutput

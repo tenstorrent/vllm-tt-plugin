@@ -303,6 +303,8 @@ class InputBatch:
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
     ):
+        self._block_table_revision = 0
+        self._block_table_snapshot_cache = None
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.vocab_size = vocab_size
@@ -422,6 +424,7 @@ class InputBatch:
         self.num_tokens[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self._invalidate_block_table_snapshot()
         self.block_table.add_row(request.block_ids, req_index)
 
         # Sampling-related.
@@ -564,6 +567,7 @@ class InputBatch:
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
             return None
+        self._invalidate_block_table_snapshot()
         self.sampling.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
@@ -637,6 +641,7 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            self._invalidate_block_table_snapshot()
             self.block_table.move_row(last_req_index, empty_index)
 
             # Sampling-related.
@@ -773,6 +778,42 @@ class InputBatch:
                     i, prompt_len:total_len
                 ]
         return output_token_ids_tensor
+
+    def _invalidate_block_table_snapshot(self) -> None:
+        self._block_table_revision += 1
+        self._block_table_snapshot_cache = None
+
+    def append_block_ids(self, block_ids, row: int) -> None:
+        if block_ids is None:
+            return
+        # The scheduler commonly supplies one empty list per group. No live
+        # count or table contents change, so retain the prepared snapshot.
+        if any(len(group) for group in block_ids):
+            self._invalidate_block_table_snapshot()
+        self.block_table.append_row(block_ids, row)
+
+    def block_table_snapshot(self, rows: list[int], width: int, pad_to: int):
+        """Read-only final wire tables, owned by a bounded one-entry cache.
+
+        Mutations replace snapshots; already submitted steps retain their old
+        tensors. Direct/lane consumers that mutate tables use the uncached
+        block_tables_for_rows method instead. All upstream table writes in the
+        persistent batch must invalidate this cache or use append_block_ids.
+        """
+        rows = tuple(rows)
+        if pad_to < len(rows):
+            raise ValueError("Block-table padding cannot drop selected rows")
+        key = (id(self), id(self.block_table), self._block_table_revision, rows, width, pad_to)
+        cached = self._block_table_snapshot_cache
+        if cached is not None and cached[0] == key:
+            return cached
+        tables = self.block_tables_for_rows(list(rows), width)
+        if pad_to > len(rows):
+            tables = [torch.cat([table, torch.zeros(pad_to - len(rows), width, dtype=table.dtype)], dim=0)
+                      for table in tables]
+        snapshot = (key, tuple(table.contiguous() for table in tables))
+        self._block_table_snapshot_cache = snapshot
+        return snapshot
 
     def block_tables_for_rows(
         self, rows: torch.Tensor | list[int], width: int
@@ -1036,7 +1077,7 @@ class TTLaneInputBatch(InputBatch):
                 continue
             self.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.block_table.append_row(new_block_ids, req_index)
+                self.append_block_ids(new_block_ids, req_index)
 
         # Place new / resumed requests at scheduler-owned stable rows.
         for req_id in req_ids_to_add:

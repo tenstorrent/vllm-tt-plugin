@@ -238,6 +238,10 @@ class TTModelInput:
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
 
+    # Trusted immutable block-table snapshot identity. None keeps the defensive
+    # content-comparison path for direct callers and mutable lane-built tables.
+    block_table_snapshot_version: tuple | None = None
+
 
 def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
     """Each row's committed output, with TT's -1 padding removed."""
