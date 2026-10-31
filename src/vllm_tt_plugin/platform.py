@@ -1166,6 +1166,11 @@ def _install_tt_input_processor_patch() -> None:
             # state that covers image tokens) would see placeholder tokens
             # without their pixels and answer without the image.
             cloned_params.skip_reading_prefix_cache = True
+            salt = getattr(request, "cache_salt", None)
+            if salt:
+                # the model keys its own prefix snapshots of image prompts by image content (DSV41_APC_IMAGES) and never sees cache_salt: hand it over in extra_args (set AFTER
+                # request validation, on the clone); the worker forwards it as the multimodal kwarg ``mm_cache_salt``
+                cloned_params.extra_args = {**(cloned_params.extra_args or {}), "tt_cache_salt": str(salt)}
         if not is_block_output_model or cloned_params is None:
             return request
 

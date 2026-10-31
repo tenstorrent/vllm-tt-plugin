@@ -1111,7 +1111,7 @@ class TTModelRunner:
     # emit them, so adapters that read them positionally keep their keys.
     _MM_BASE_FIELDS = ("pixel_values", "image_grid_thw")
     # Per-item placeholder ranges (vLLM ``mm_position``), after the processor fields.
-    _MM_PLACEHOLDER_FIELDS = ("mm_placeholder_offsets", "mm_placeholder_lengths")
+    _MM_PLACEHOLDER_FIELDS = ("mm_placeholder_offsets", "mm_placeholder_lengths", "mm_cache_salt")
 
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
@@ -1203,6 +1203,11 @@ class TTModelRunner:
                         per_field[key].append(None if offset is None else int(offset))
                     elif key == "mm_placeholder_lengths":
                         per_field[key].append(None if length is None else int(length))
+                    elif key == "mm_cache_salt":
+                        # the request's cache_salt (set by the frontend patch into extra_args["tt_cache_salt"]): vLLM does not forward it to the worker, a model that keys its own prefix
+                        # snapshots by image content needs it to keep salts apart. One entry per item (the same value).
+                        ea = getattr(getattr(req_state, "sampling_params", None), "extra_args", None) or {}
+                        per_field[key].append(ea.get("tt_cache_salt"))
                     elif item is None or key not in item:
                         per_field[key].append(None)
                     else:
