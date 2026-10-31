@@ -383,7 +383,7 @@ class _FakeHook:
     def __init__(self, answers):
         self.answers, self.calls, self.cancelled = answers, [], []
 
-    def plan_hit(self, request_id, tokens, num_tokens, max_hit=None):
+    def plan_hit(self, request_id, tokens, num_tokens, max_hit=None, finished_ids=None):
         self.calls.append((request_id, len(tokens), num_tokens, max_hit))
         return self.answers.get(request_id, 0), 0
 
