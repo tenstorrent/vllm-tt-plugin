@@ -1611,7 +1611,8 @@ class TTLaneInputBatch(InputBatch):
         prefill holding its row. That slot is ``None`` here too. Its request
         has no token to commit, and the commit, the recorded count and the
         proposal all key on this identity, so naming it would append a token
-        to a prompt that is still being prefilled.
+        to a prompt that is still being prefilled. A verify also gives it
+        position -1, so the device does not run it.
         """
         none = {
             "input_tokens": input_tokens,
@@ -1674,6 +1675,17 @@ class TTLaneInputBatch(InputBatch):
             counts,
             total,
         ):
+            # A left-out slot is idle on the device too, as a chained block's
+            # is: at its own position the model counts it as a live row, so its
+            # group width and pass count, and with them the drafts the device
+            # chains for the scheduled rows, would differ from what
+            # ``draft_cap`` over those rows declares.
+            left_out = [row for row in self.occupied_rows() if row not in scheduled]
+            if left_out:
+                input_tokens = input_tokens.clone()
+                input_positions = input_positions.clone()
+                input_tokens[left_out] = 0
+                input_positions[left_out] = -1
             tokens, positions = runner._spec_candidate_block(
                 drafts, num_valid, input_tokens, input_positions
             )
