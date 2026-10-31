@@ -34,9 +34,13 @@ from .test_spec_inputs import (
 WORDS = 16  # a small packed width is enough for the pass-through
 
 
-def _model(enabled=True, capable=True):
+def _model(enabled=True, capable=True, positions=False):
     caps = {"supports_verify_grammar_bitmask": capable}
-    return SimpleNamespace(model_capabilities=caps, verify_grammar_enabled=enabled)
+    return SimpleNamespace(
+        model_capabilities=caps,
+        verify_grammar_enabled=enabled,
+        verify_grammar_positions=positions,
+    )
 
 
 def _runner(model, requests=None, drafts_ok=True):
@@ -178,3 +182,28 @@ def test_a_plain_step_of_speculable_rows_still_proposes():
     runner, calls = _plain_step_runner({"a": True, "b": True})
     _propose(runner)
     assert len(calls) == 1
+
+
+def test_m2_needs_the_model_attribute_and_the_plugin_switch(monkeypatch):
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_SPEC", "1")
+    monkeypatch.delenv("VLLM_TT_STRUCTURED_M2", raising=False)
+    assert not TTModelRunner._structured_m2_active(_runner(_model(positions=False)))
+    assert TTModelRunner._structured_m2_active(_runner(_model(positions=True)))
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_M2", "0")
+    assert not TTModelRunner._structured_m2_active(_runner(_model(positions=True)))
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_SPEC", "0")
+    monkeypatch.delenv("VLLM_TT_STRUCTURED_M2", raising=False)
+    assert not TTModelRunner._structured_m2_active(_runner(_model(positions=True)))
+
+
+def test_under_m2_a_structured_row_speculates_but_still_forces_the_verify(monkeypatch):
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_SPEC", "1")
+    monkeypatch.delenv("VLLM_TT_STRUCTURED_M2", raising=False)
+    requests = {"s": _state(structured_outputs=_structured()), "g": _state()}
+    runner = _runner(_model(positions=True), requests)
+    TTModelRunner._publish_draft(runner, "s", [1, 2, 3])
+    assert runner._proposed_draft_token_ids["s"] == [1, 2, 3]
+    assert not TTModelRunner._request_is_masked_verify_structured(runner, "s")
+    assert TTModelRunner._request_is_structured_verify_row(runner, "s")
+    assert not TTModelRunner._request_is_structured_verify_row(runner, "g")
+    assert runner._request_is_argmax_certifiable("s")

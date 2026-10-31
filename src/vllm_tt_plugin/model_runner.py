@@ -1601,14 +1601,37 @@ class TTModelRunner:
             and getattr(model, "verify_grammar_enabled", False)
         )
 
-    def _request_is_masked_verify_structured(self, req_id: str) -> bool:
-        """True for a structured request served by the masked verify: it is
-        offered no drafts (k = 0) and its column 0 is masked in the model."""
+    def _structured_m2_active(self) -> bool:
+        """Whether structured rows also speculate (M2): per-position masks.
+
+        Needs the masked verify (``_structured_spec_active``), a model that
+        honours the per-position columns (instance attribute
+        ``verify_grammar_positions``, its ``DSV41_STRUCTURED_M2=1``) and the
+        plugin switch ``VLLM_TT_STRUCTURED_M2`` (default on, 0 = M1: structured
+        rows decode with k = 0).
+        """
+        if os.environ.get("VLLM_TT_STRUCTURED_M2", "1") == "0":
+            return False
+        if not TTModelRunner._structured_spec_active(self):
+            return False
+        return bool(getattr(getattr(self, "model", None), "verify_grammar_positions", False))
+
+    def _request_is_structured_verify_row(self, req_id: str) -> bool:
+        """True for a structured request served by the masked verify (M1 or M2)."""
         if not TTModelRunner._structured_spec_active(self):
             return False
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
         return params is not None and getattr(params, "structured_outputs", None) is not None
+
+    def _request_is_masked_verify_structured(self, req_id: str) -> bool:
+        """True for a structured request served by the masked verify with k = 0
+        (M1): it is offered no drafts and its column 0 is masked in the model.
+        Under M2 a structured row speculates like any other (its mask rows
+        follow its drafts), so this is False."""
+        return TTModelRunner._request_is_structured_verify_row(
+            self, req_id
+        ) and not TTModelRunner._structured_m2_active(self)
 
     def _request_is_speculable(self, req_id: str) -> bool:
         """False when no accept walk this launch drives can certify the request.
@@ -2274,7 +2297,7 @@ class TTModelRunner:
                     accepted_counts,
                     len(row_req_ids),
                     force_verify=any(
-                        TTModelRunner._request_is_masked_verify_structured(self, req_id)
+                        TTModelRunner._request_is_structured_verify_row(self, req_id)
                         for req_id in row_req_ids
                     ),
                 ):
@@ -3066,7 +3089,11 @@ class TTModelRunner:
             # The grammar mask is applied inside the model's verify round and
             # only arrives at sample time, so the whole verify runs there.
             self._pending_samples.append(
-                partial(self._finish_masked_verify, model_input=model_input)
+                partial(
+                    self._finish_masked_verify,
+                    model_input=model_input,
+                    deferred_at=time.perf_counter(),
+                )
             )
             return None
 
@@ -3612,7 +3639,11 @@ class TTModelRunner:
         return committed_by_req
 
     def _finish_masked_verify(
-        self, grammar_output: GrammarOutput | None, *, model_input: TTModelInput
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        model_input: TTModelInput,
+        deferred_at: float | None = None,
     ) -> ModelRunnerOutput:
         """Run a verify that carries structured rows, with the grammar in hand.
 
@@ -3620,15 +3651,60 @@ class TTModelRunner:
         (all ones for rows without a grammar, column 0 the request's row 0) and
         reaches the model as the ``grammar_bitmask`` keyword of the verify.
         """
+        t0 = time.perf_counter()
         model_input = self._apply_grammar_to_input(
             model_input, grammar_output, lane_total=None
         )
+        t1 = time.perf_counter()
         fwd = self._forward_with_model_input(model_input)
+        t2 = time.perf_counter()
         if fwd is None:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None
             )
-        return self._finish_spec_decode(fwd)
+        out = self._finish_spec_decode(fwd)
+        t3 = time.perf_counter()
+        self._note_masked_verify_timing(
+            None if deferred_at is None else t0 - deferred_at,
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+        )
+        return out
+
+    def _note_masked_verify_timing(
+        self, wait_s: float | None, reorder_s: float, verify_s: float, tail_s: float
+    ) -> None:
+        """Mean per-step cost of a masked verify (``VLLM_TT_STRUCT_TIMING=1``, logged every 100 steps).
+
+        ``wait`` is the time from the end of ``execute_model`` to the start of
+        ``sample_tokens``: vLLM filling the grammar bitmask (xgrammar, host,
+        per structured request and draft position) plus the engine's own
+        bookkeeping. ``reorder`` is the plugin's bitmask layout, ``verify`` the
+        model call (mask permute + upload + the masked round), ``tail`` the
+        accept walk, commit and next proposal.
+        """
+        if os.environ.get("VLLM_TT_STRUCT_TIMING", "0") != "1":
+            return
+        st = self.__dict__.setdefault(
+            "_struct_timing", {"n": 0, "wait": 0.0, "reorder": 0.0, "verify": 0.0, "tail": 0.0}
+        )
+        st["n"] += 1
+        st["wait"] += wait_s or 0.0
+        st["reorder"] += reorder_s
+        st["verify"] += verify_s
+        st["tail"] += tail_s
+        if st["n"] % 100 == 0:
+            n = st["n"]
+            logger.info(
+                "STRUCT_TIMING masked verify steps %d (cumulative means, ms): grammar wait %.2f, "
+                "plugin mask layout %.2f, model verify %.2f, accept+commit+propose %.2f",
+                n,
+                1e3 * st["wait"] / n,
+                1e3 * st["reorder"] / n,
+                1e3 * st["verify"] / n,
+                1e3 * st["tail"] / n,
+            )
 
     def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
