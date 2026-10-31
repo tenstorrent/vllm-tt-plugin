@@ -3472,6 +3472,19 @@ class TTModelRunner:
         produced no handle. ``resolve_speculative_plan`` keeps a drafter that
         is fed its hidden state through the runner off this path entirely.
         """
+        speculable = getattr(self, "_request_is_speculable", None)
+        if speculable is not None and not all(speculable(r) for r in row_req_ids):
+            # A row that cannot be certified by a verify (a grammar on the host
+            # path, say) keeps the whole next step an ordinary decode
+            # (``_step_verifies``), so a draft proposed now would be dropped
+            # unused. Asking a model-owned drafter is not free either: a row
+            # its last step did not advance is reseeded by replaying its
+            # prompt tail, seconds per call, on every step that row's
+            # neighbours stay ordinary. Skip the proposal; the rows are
+            # reseeded once, when the step can verify again.
+            for req_id in row_req_ids:
+                self._proposed_draft_token_ids.pop(req_id, None)
+            return
         skipped = set(skip_req_ids or ())
         live = len(row_req_ids)
         sampled = _coerce_output_block(sampled_token_ids, live, 1).to(torch.int32)

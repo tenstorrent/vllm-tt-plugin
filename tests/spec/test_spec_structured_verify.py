@@ -147,3 +147,34 @@ def test_a_verify_without_a_mask_keeps_the_call_shape():
     model = _Model()
     _submit(runner, model, model_input)
     assert "grammar_bitmask" not in model.calls[0]
+
+
+def _plain_step_runner(speculable):
+    calls = []
+    runner = SimpleNamespace(
+        _request_is_speculable=lambda r: speculable[r],
+        _proposed_draft_token_ids={"a": [1], "b": [2]},
+        _spec_drafts_from_model=True,
+        _propose_model_drafts=lambda *args, **kw: calls.append(args),
+    )
+    return runner, calls
+
+
+def _propose(runner, rows=("a", "b")):
+    batch = SimpleNamespace(input_positions=torch.zeros(len(rows), 1, dtype=torch.int64))
+    TTModelRunner.propose_after_plain_step(
+        runner, batch, torch.zeros(len(rows), 1, dtype=torch.int32), list(rows)
+    )
+
+
+def test_a_plain_step_with_an_uncertifiable_row_proposes_nothing():
+    """The model's drafter reseeds by replaying the prompt tail on every call for a row the step did not advance."""
+    runner, calls = _plain_step_runner({"a": True, "b": False})
+    _propose(runner)
+    assert calls == [] and runner._proposed_draft_token_ids == {}
+
+
+def test_a_plain_step_of_speculable_rows_still_proposes():
+    runner, calls = _plain_step_runner({"a": True, "b": True})
+    _propose(runner)
+    assert len(calls) == 1
