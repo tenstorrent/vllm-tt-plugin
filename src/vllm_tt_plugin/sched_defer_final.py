@@ -92,6 +92,7 @@ class DeferFinalPolicy:
         self.finals: deque[tuple[str, Request | None]] = deque()
         self.cohorts = 0
         self.closed_on: list[str] = []
+        self.last_finals: list[tuple[str, bool]] = []  # the finals the last observe popped: (req_id, parked?)
 
     @classmethod
     def from_env(cls, environ=None, chunk_tokens: int | None = None, cohort: int | None = None):
@@ -165,6 +166,7 @@ class DeferFinalPolicy:
     def observe(self, output: SchedulerOutput, requests: dict) -> None:
         """Called on every scheduler output: park the rows whose chunk ended at their prompt's last boundary, pop
         the head final once its chunk completed the prompt, drop finished and preempted requests."""
+        self.last_finals = []
         for req_id in output.finished_req_ids or ():
             self.drop(req_id)
         for req_id in output.preempted_req_ids or ():
@@ -178,6 +180,7 @@ class DeferFinalPolicy:
             if end - n >= prompt:
                 continue  # a decode row
             if self.finals and self.finals[0][0] == req_id and end >= prompt:
-                self.finals.popleft()  # the final completed: its first token is out
+                _, held = self.finals.popleft()  # the final completed: its first token is out
+                self.last_finals.append((req_id, held is None))
             elif end == self.prefix(request) and end < prompt and req_id not in self.parked:
                 self.park(req_id)

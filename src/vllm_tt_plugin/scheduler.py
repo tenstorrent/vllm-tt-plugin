@@ -16,6 +16,7 @@ from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin import sched_defer_final
 from vllm_tt_plugin.sched_defer_final import DeferFinalPolicy
 from vllm_tt_plugin.sched_interleave import InterleavePolicy
+from vllm_tt_plugin.sched_release_first import ReleaseFirstPolicy
 
 logger = init_tt_logger(__name__)
 
@@ -47,7 +48,9 @@ ALIGNED_CHUNK_MODEL_TYPES = {"deepseek_v41"}
 # ``TT_SCHED_*`` variable makes ``check_sched_flags`` raise, so a misspelt or
 # unimplemented flag (``TT_SCHED_ADMISSION_GROUP`` is not implemented) does
 # not serve the stock schedule under its name.
-KNOWN_SCHED_FLAGS = frozenset({"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG", "TT_SCHED_DEFER_FINAL"})
+KNOWN_SCHED_FLAGS = frozenset(
+    {"TT_SCHED_INTERLEAVE", "TT_SCHED_EVENT_LOG", "TT_SCHED_DEFER_FINAL", "TT_SCHED_RELEASE_FIRST"}
+)
 
 
 def check_sched_flags(environ: Mapping[str, str] | None = None) -> None:
@@ -143,6 +146,12 @@ class TTScheduler(AsyncScheduler):
             if self._interleave is not None:
                 raise ValueError("TT_SCHED_DEFER_FINAL and TT_SCHED_INTERLEAVE do not compose")
             logger.info("TT scheduler deferred finals: %s", self._defer.describe())
+        # TT_SCHED_RELEASE_FIRST (sched_release_first): a cohort's first
+        # tokens released k at a time, or all at the drain's end; None unless
+        # the variable is set, and refused without the deferred finals.
+        self._release = ReleaseFirstPolicy.from_env(defer_enabled=self._defer is not None)
+        if self._release is not None:
+            logger.info("TT scheduler first-token release: %s", self._release.describe())
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -151,6 +160,11 @@ class TTScheduler(AsyncScheduler):
     def _defer_policy(self):
         """The deferred-final policy, or None (a scheduler built without ``__init__``, as the unit tests do)."""
         return getattr(self, "_defer", None)
+
+    @property
+    def _release_policy(self):
+        """The first-token release policy, or None (as above)."""
+        return getattr(self, "_release", None)
 
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
@@ -312,6 +326,15 @@ class TTScheduler(AsyncScheduler):
             self._interleave.observe(scheduler_output, self.requests, len(self.waiting))
         if self._defer_policy is not None:
             self._defer_policy.observe(scheduler_output, self.requests)
+            release = self._release_policy
+            if release is not None:
+                for req_id in scheduler_output.finished_req_ids or ():
+                    release.drop(req_id)
+                for req_id in scheduler_output.preempted_req_ids or ():
+                    release.drop(req_id)
+                for req_id, parked in self._defer_policy.last_finals:
+                    if parked:  # a one-chunk prompt's prefill is its final: never held
+                        release.expect(req_id, self._defer_policy.cohorts)
         return scheduler_output
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
@@ -494,7 +517,7 @@ class TTScheduler(AsyncScheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict:
         if not sched_events.enabled():
-            return super().update_from_output(scheduler_output, model_runner_output)
+            return self._intercept_outputs(super().update_from_output(scheduler_output, model_runner_output))
         before = [
             request
             for req_id in scheduler_output.num_scheduled_tokens
@@ -505,6 +528,17 @@ class TTScheduler(AsyncScheduler):
         for request in before:
             if request.num_output_tokens > 0:
                 sched_events.emit("first_token", id=request.request_id)
+        return self._intercept_outputs(outputs)
+
+    def _intercept_outputs(self, outputs: dict) -> dict:
+        """``TT_SCHED_RELEASE_FIRST``: the first tokens of a draining cohort held and released in groups."""
+        release = self._release_policy
+        if release is not None:
+            defer = self._defer_policy
+            before = release.released
+            release.intercept(outputs, defer is not None and defer.draining)
+            if sched_events.enabled() and release.released > before:
+                sched_events.emit("release", n=release.releases[-1], groups=release.released)
         return outputs
 
     def _free_request(self, request: Request, *args, **kwargs):
