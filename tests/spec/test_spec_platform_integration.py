@@ -333,6 +333,35 @@ _LOGITS_ONLY_IDS = [
 ]
 
 
+def test_structured_outputs_are_served_on_the_narrow_decode(monkeypatch, vllm_config):
+    """A launch that keeps the ordinary decode serves grammars there (no drafts while the row lives)."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(
+        monkeypatch,
+        vllm_config,
+        supports_narrow_decode=True,
+        accept_modes=("argmax_ids",),
+    )
+    _validate(SamplingParams(temperature=0.0, structured_outputs=_structured()))
+
+
+def test_structured_outputs_are_refused_without_the_narrow_decode(
+    monkeypatch, vllm_config
+):
+    """A model that sends every step as a verify cannot apply a grammar."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(
+        monkeypatch,
+        vllm_config,
+        supports_narrow_decode=False,
+        accept_modes=("argmax_ids",),
+    )
+    with pytest.raises(VLLMValidationError, match="structured_outputs"):
+        _validate(SamplingParams(temperature=0.0, structured_outputs=_structured()))
+
+
 @pytest.mark.parametrize("field, value", _LOGITS_ONLY_CONTROLS, ids=_LOGITS_ONLY_IDS)
 @pytest.mark.parametrize("narrow", [True, False], ids=["narrow", "verify-only"])
 def test_a_request_the_greedy_walk_cannot_serve_is_refused(
@@ -352,6 +381,9 @@ def test_a_request_the_greedy_walk_cannot_serve_is_refused(
     """
     from vllm.sampling_params import SamplingParams
 
+    # A model that keeps the ordinary decode serves a grammar there
+    # (VLLM_TT_STRUCTURED_NARROW, default on); the switch off restores the refusal.
+    monkeypatch.setenv("VLLM_TT_STRUCTURED_NARROW", "0")
     _speculating_platform(
         monkeypatch,
         vllm_config,
