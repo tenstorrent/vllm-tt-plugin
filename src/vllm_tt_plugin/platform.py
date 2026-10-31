@@ -118,6 +118,12 @@ _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
 }
 
 
+def _structured_on_narrow_decode() -> bool:
+    """Switch (VLLM_TT_STRUCTURED_NARROW, default on): a launch whose SpecPlan keeps
+    ``supports_narrow_decode`` serves structured outputs on the ordinary decode path."""
+    return os.environ.get("VLLM_TT_STRUCTURED_NARROW", "1") != "0"
+
+
 def _aligned_block_output_remaining(
     prompt_len: int, max_model_len: int
 ) -> tuple[int, int, int]:
@@ -2749,7 +2755,13 @@ class TTPlatform(Platform):
         if not serves_logits:
             if params.logprobs is not None:
                 unsupported.append(f"logprobs={params.logprobs!r}")
-            if getattr(params, "structured_outputs", None) is not None:
+            if getattr(params, "structured_outputs", None) is not None and not (
+                spec_plan.supports_narrow_decode and _structured_on_narrow_decode()
+            ):
+                # A model that keeps the ordinary decode serves a grammar there:
+                # ``_request_is_argmax_certifiable`` is False for the row, so the
+                # step runs as the plain decode with host logits and
+                # ``apply_grammar_bitmask`` (no drafts while the row is live).
                 unsupported.append("structured_outputs")
             if params.bad_words:
                 unsupported.append("bad_words")
