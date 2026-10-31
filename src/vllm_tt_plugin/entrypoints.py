@@ -13,6 +13,7 @@ def register() -> None:
     register_tt_models_from_plugin()
     _register_tt_reasoning_parsers()
     _register_tt_tool_parsers()
+    _install_prestream_validation()
 
 
 # Parsers for TT-served models that upstream vLLM lacks. Registered lazily and
@@ -27,6 +28,19 @@ _TT_REASONING_PARSERS = {
 _TT_TOOL_PARSERS = {
     "kolibri1": ("vllm.tool_parsers.hermes_tool_parser", "Hermes2ProToolParser"),
 }
+
+
+def _install_prestream_validation() -> None:
+    """Make a refused streaming request an HTTP error instead of one SSE error event (API-server processes only)."""
+    import multiprocessing
+
+    name = multiprocessing.current_process().name
+    if name.startswith(("EngineCore", "VllmWorker", "Worker", "DPEngineCore")):
+        return
+    from vllm_tt_plugin import prestream
+
+    if prestream.enabled():
+        prestream.install()
 
 
 def _register_tt_reasoning_parsers() -> None:
