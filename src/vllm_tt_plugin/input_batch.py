@@ -906,7 +906,10 @@ class TTLaneInputBatch(InputBatch):
         Each lane is budgeted on its own:
 
         - the cap is ``SpecPlan.draft_cap`` for the number of the lane's slots
-          in ``carried``, so ``k_by_rows`` is read per lane in lane mode;
+          in ``carried`` plus its riders, so ``k_by_rows`` is read per lane in
+          lane mode, over every slot the device decodes (a model that sizes
+          its verify by the slots holding a position counts the riders too:
+          MiMo's adaptive draft length gives each one a draft group);
         - a plan with ``lanes_per_request > 1`` verifies one candidate token
           per decode row (admission holds it to ``1 + effective_k``), so a
           lane fills ``sum(1 + drafts)`` of its ``per_lane`` rows over its
@@ -943,7 +946,9 @@ class TTLaneInputBatch(InputBatch):
         for lane_index, rows in by_lane.items():
             cap = num_drafts
             if spec_plan is not None:
-                cap = min(cap, spec_plan.draft_cap(len(rows)))
+                cap = min(
+                    cap, spec_plan.draft_cap(len(rows) + riding.get(lane_index, 0))
+                )
             lane = {row: min(carried[row], cap) for row in rows}
             if packs:
                 excess = (
