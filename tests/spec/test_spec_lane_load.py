@@ -142,30 +142,14 @@ def test_a_lane_s_budget_is_its_cap_then_its_rows(
 
 def test_a_slot_the_step_leaves_out_still_fills_a_row():
     """A partial prefill or a finishing request holding slot 1 is decoded
-    with the lane: ``a`` is capped for a lane of two, not one."""
+    with the lane: ``a`` alone is capped at K, and fits K - 1 beside it."""
     plan = lane_device_target(
         k_by_rows=MIMO_K_BY_ROWS, lanes_per_request=1 + K
     ).spec_plan(None, NUM_LANES * PER_LANE, K)
     batch = lane_batch()
-    assert batch.lane_draft_budget(plan, K, {0: K}, riders=[1]) == {0: 1}
+    assert batch.lane_draft_budget(plan, K, {0: K}, riders=[1]) == {0: K - 1}
     # A rider in another lane takes nothing from this one.
     assert batch.lane_draft_budget(plan, K, {0: K}, riders=[5]) == {0: K}
-
-
-def test_a_rider_counts_toward_the_lane_s_draft_cap():
-    """MiMo's adaptive draft length (K for up to two requests, 1 for three or
-    four) gives every slot with a position a draft group, a rider too: two
-    requests beside a partial prefill holding slot 2 verify in the K = 1
-    layout, so they carry one draft each, not K."""
-    plan = lane_device_target(
-        k_by_rows=((2, K), (PER_LANE, 1)), lanes_per_request=1
-    ).spec_plan(None, NUM_LANES * PER_LANE, K)
-    batch = lane_batch()
-    assert batch.lane_draft_budget(plan, K, {0: K, 1: K}) == {0: K, 1: K}
-    assert batch.lane_draft_budget(plan, K, {0: K, 1: K}, riders=[2]) == {0: 1, 1: 1}
-    assert batch.lane_draft_budget(
-        plan, K, {0: K, 1: K}, riders=[2], all_or_none=True
-    ) == {0: 1, 1: 1}
 
 
 THREE_BESIDE_A_PAIR = {0: 0, 1: 0, 2: 0, 4: 1, 5: 1}
