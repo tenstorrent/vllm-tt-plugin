@@ -56,6 +56,7 @@ from vllm_tt_plugin.platform import (
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
 )
+from vllm_tt_plugin.scheduler import publish_prefix_hit_confirmer
 from vllm_tt_plugin.utils.dp_discovery import (
     format_tt_visible_devices,
     parse_mesh_grid,
@@ -344,6 +345,10 @@ class TTWorker(WorkerBase):
 
     def load_model(self):
         self.model_runner.load_model()
+        # The scheduler of this process is constructed after the model loads
+        # (EngineCore.__init__: executor, KV caches, then the scheduler) and
+        # takes the confirmer from here; None for a model without one.
+        publish_prefix_hit_confirmer(self._prefix_hit_confirmer())
 
     def take_draft_token_ids(self) -> "DraftTokenIds | None":
         """Hand the runner's proposed drafts to the engine.
@@ -353,6 +358,17 @@ class TTWorker(WorkerBase):
         admission raises ``AttributeError`` on its first step.
         """
         return self.model_runner.take_draft_token_ids()
+
+    def _prefix_hit_confirmer(self):
+        """The loaded model's ``confirm_prefix_cache_hit(prompt_token_ids,
+        mm_items, num_computed_tokens) -> int`` when it declares
+        ``model_capabilities["confirms_prefix_cache_hits"]`` (the platform
+        checked the method is there), else None."""
+        model = self.model_runner.model
+        capabilities = getattr(model, "model_capabilities", None) or {}
+        if not capabilities.get("confirms_prefix_cache_hits", False):
+            return None
+        return model.confirm_prefix_cache_hit
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
