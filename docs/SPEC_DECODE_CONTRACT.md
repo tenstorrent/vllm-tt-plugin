@@ -69,8 +69,12 @@ serve speculative decoding within the following execution limits:
   `supports_async_spec_decode`, which is about the model's readback and hidden
   handle rather than about step order: a speculative step never overlaps the
   next one, so verify, accept and propose stay ordered per request.
-- **front-packed** execution. Lane mode is refused: it builds its device input
-  from `TTLaneInputBatch`, which has no candidate-block builder.
+- **both batch layouts**: the front-packed batch of single-process and
+  standard-DP execution, and the slot batch of single-process lane-DP. A lane
+  verify is the slot batch widened, with the scheduled slots as its live rows
+  and every other slot a padding row between them (section 4), so a lane
+  adapter sees the `[B, 1+K]` block in the slot order its plain lane decode
+  already uses.
 
 `resolve_speculative_plan` rejects unsupported speculative configurations.
 `TTPlatform.validate_request` rejects request controls that the speculative
@@ -200,7 +204,10 @@ plugin calls it positionally, so parameter names are not part of the contract.
 
 **Arguments.** `max_num_seqs` is the concurrency the plan is dimensioned
 against, and it is the value that is final for the launch, after the platform
-has folded data parallelism into lanes. `requested_k` is the operator's
+has folded data parallelism into lanes: in lane mode the folded total across
+lanes, not one lane's share, because one device launch verifies every lane's
+rows together. `k_by_rows` is read against the live rows of the whole lane
+batch for the same reason. `requested_k` is the operator's
 `num_speculative_tokens`.
 
 **Tenstorrent platform state on `vllm_config` is not guaranteed during
@@ -278,6 +285,23 @@ decode. `TTModelInput` carries the verification inputs as four values.
 so the block carries rows for requests that do not exist. A padding row holds
 token 0 and position -1 in every column, `num_valid_drafts` 0, and
 `accepted_counts` 1.
+
+In lane mode `B` is the slot batch, `lanes x per_lane` rows in slot order,
+exactly as the plain lane decode submits it: a scheduled request's row is its
+slot, and every other slot is the padding row described above, which sits
+between live rows rather than after them. That holds for an occupied slot the
+step did not schedule as much as for an empty one. The plain lane decode of a
+launch that does not speculate fills such a slot with its real last token at
+its real position, which is harmless there: decoding that row again is
+idempotent. A verify or a proposal is not: a drafter keeping a session per
+slot would advance a request the step commits nothing for, and the position
+is the one thing that marks a row as owned by no request. So a speculating
+launch sends the row inactive on every decode step, the ordinary decode of
+section 4d included, and the request's next scheduled step rebuilds its row
+from host state. The slot's page table stays its own; the row is inactive by
+position. Nothing else differs between the layouts: the side tensors,
+`spec_mode`, the return layout of section 6 and the proposal's rows are all
+the slot batch's.
 
 A row with fewer than K valid drafts pads its own tail columns, and the cap is
 per row: one request whose drafter ran short never shortens another request's
@@ -530,7 +554,11 @@ registered as not overlap-safe, so the runner drains it before it builds the
 next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
 unapplied, and verify, accept and propose stay serialized per request. What
-this path defers is the readback and the commit, not the order of the steps.
+this path defers is the readback and the commit, not the order of the steps. A
+lane verify takes this same deferred path
+(`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step
+to it), and is read back whole rather than by scheduled slot, because the walk
+reads every row of the mode's return.
 
 Two demands nevertheless reach the model, and they are what
 `supports_async_spec_decode` declares:
@@ -627,7 +655,9 @@ request contexts. A direct `TTPlatform.validate_request` call outside
 `TTAsyncDecodeController.submit_async_decode` reads `TTModelInput.spec_mode`:
 a step carrying one is registered through
 `TTAsyncDecodeController.register_pending_async_step` with `overlap_ok=False`,
-because the next candidate block is built from this step's committed tokens.
+because the next candidate block is built from this step's committed tokens,
+and with `steady=False`, because it was never built to overlap an outstanding
+step (the controller drained before it).
 Nothing else marks a verify unsafe. `check_perform_device_sampling` does not
 look at speculation, so on a launch that samples on device a verify otherwise
 passes every condition of
@@ -648,13 +678,17 @@ Three obligations come with the declaration.
 **The drafter is still asked, after an ordinary decode too.** The proposer is
 called once per step, so a launch that skipped it on these steps would never
 draft again whatever the batch did afterwards.
-`TTModelRunner.propose_after_plain_step` is the call site. The committed block
+`TTModelRunner.propose_after_plain_step` is the call site, after a
+front-packed and after a lane ordinary decode alike. The committed block
 is one column wide, that column being the token the step committed, every
 `accepted_counts` is 1, and `TTModelRunner._propose_model_drafts` pads the
 block to the uniform `1+K` before the call, so the drafter sees one shape. On
 an asynchronous launch this runs at the next step's drain, because the drafts
 continue a token that had to be read back first, so a drafter that starts
-offering again is acted on one step later.
+offering again is acted on one step later. Under overlap two ordinary decodes
+can be outstanding at once, so their drains can call `propose_draft_tokens`
+twice with no verify in between; `TTModelRunner._publish_draft` keeps only the
+later proposal, and the earlier one is discarded rather than verified.
 
 **The drafter must not need a fed hidden state.** An ordinary decode returns no
 `VerifyOutput`, so it produces no hidden handle, and `propose_draft_tokens`
@@ -681,21 +715,41 @@ device, a model may answer an ordinary decode step for some or all rows from
 its own drafter path and return the step's token ids as a host tensor in the
 flat form the device sampler's readback produces, instead of a device output.
 `_is_host_decode_output` in `vllm_tt_plugin.async_decode` recognises a host
-tensor, and the runner then skips `read_decode_output` and
-`process_decode_output_host` for that step. Rows the model did not compute
+tensor, and the runner then skips `process_decode_output_host` for that step;
+a model that implements `read_decode_output` passes the host tensor through it
+with no read event, there being nothing to read. Rows the model did not compute
 carry whatever id the model puts there; the runner reads only the live rows.
 This is how a drafter that starts a request from its prefill state serves the
 first step, which under narrow decode is an ordinary decode.
 
-The model then owns that row's device-resident decode inputs. The runner's
-reload plan ([DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md)) reloads
-host tokens and positions on layout changes and the other listed transitions,
-including the first ordinary decode after a verify, which the runner sees. It
-does not know that an ordinary decode's committed tokens came from the drafter
-rather than from the plain decode trace. A model whose plain decode keeps
-tokens and positions resident on the device must reload them itself on that
-row's first plain decode after a drafter-served step, or that decode continues
-from stale state.
+Such a step leaves the device-resident decode inputs the way a verify does.
+The decode trace ran for none of the rows the drafter answered, so it fed no
+token back, and the resident token and position still hold what the last
+trace-answered decode wrote. The runner sees this. `submit_decode` records an
+ordinary decode whose answer was host ids with nothing to read
+(`TTDecodeSubmission.host_answered`: on a speculating launch, on a submission
+whose device output the runner would otherwise have read itself), and
+`TTAsyncDecodeController.plan_decode_reload` then treats the next ordinary
+decode as the transition it makes of the one after a verify: `reload_inputs`
+with the sampling reset, whatever the layout did (the "drafter-answered
+ordinary decode → ordinary decode" row of the
+[DECODE_RELOAD_CONTRACT.md](DECODE_RELOAD_CONTRACT.md) transition table).
+Under asynchronous scheduling the served step is registered with
+`overlap_ok=False`, like a verify, so the next build drains it first; that
+drain waits on nothing, there being no read event, and the reload then carries
+the host's tokens with the served step's answer applied. That is what the
+next build may do over the served step. Whether the served step's own
+submission was safe was decided before the forward, on the steady terms it
+was built with (`steady=True`), so a steady decode the drafter answered over
+an outstanding ordinary decode is the overlap the launch exists for, not an
+unsafe one. The model does not
+reload for itself. `tokens` and `start_pos` are stale under
+`reload_inputs=False` after a drafter-served step as after any other, and a
+model that refilled its resident inputs from them there would break the host
+input authority rule. A submission with `read_from_device=True` is outside
+this: the model reads its own output, every answer to it arrives as host
+tensors, and the runner cannot tell a drafter-served step from a trace-answered
+one on that path.
 
 ## 4e. Batch changes while a proposal is outstanding
 
@@ -797,8 +851,10 @@ the adapter implements `release_request`,
 `TTModelRunner._release_model_request` calls `release_request(current_slot)`.
 The adapter releases the model-owned state associated with that current slot.
 `TTModelRunner._release_dead_state_slots` then removes those requests from
-`TTModelRunner._req_state_slot`. A preempted request re-prefills its history
-when the scheduler resumes it.
+`TTModelRunner._req_state_slot`. In lane mode the row is the slot and
+`TTLaneInputBatch.apply_step_plan` calls `release_request(row)` for every
+request whose row the step frees, before the row is reused. A preempted
+request re-prefills its history when the scheduler resumes it.
 `TTModelRunner._prepare_model_inputs` drops a request's
 `TTModelRunner._req_accepted_counts` entry once the request is gone from
 `TTModelRunner.requests`, and drops it for every request of a prefill step, so
@@ -818,7 +874,9 @@ plugin and its target verifies them inside the step's own allocation, so
 `spec_lookahead_tokens` returns zero for `ngram`. `TTScheduler.__init__` uses
 `max` to preserve any upstream reservation while adding the model-owned
 drafter's requirement. Lookahead slots reserve KV block space past the tokens
-the step itself computes.
+the step itself computes. Each lane of `TTLaneCoordinator` is a `TTScheduler`
+over its own KV cache manager, so the reservation is per lane and per request
+and the lane fold does not change it.
 
 The reason is where a model-owned drafter writes. Such a drafter proposes for
 the next step from inside the current one: after the accept walk commits, the
@@ -853,7 +911,9 @@ adaptive block-output gather (#118), and a contract implementer must know them.
 `TTModelRunner._release_model_request(req_id)` for every id in
 `SchedulerOutput.finished_req_ids` and `SchedulerOutput.preempted_req_ids`,
 before it drops the id from `TTModelRunner._req_state_slot`; the model receives
-the request's current state slot. A model-owned drafter that keeps per-request
+the request's current state slot. In lane mode `TTLaneInputBatch.apply_step_plan`
+makes the same call with the request's row, which is its slot, before the row
+is freed. A model-owned drafter that keeps per-request
 state (a committed prefix, an outstanding proposal, a session) must implement
 it. The runner asks for a proposal after every step (section 4b), and the
 scheduler decides a request's finish after `execute_model` returns, so a

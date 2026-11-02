@@ -106,6 +106,13 @@ class TTDecodeSubmission:
     readback_rows: tuple[int, ...] | None = None
     # A stage model's stage frames from this forward, popped right after it.
     stage_outputs: dict[str, TTStageFrame] | None = None
+    # Whether a speculating model answered this ordinary decode from the host
+    # rather than from its decode trace (SPEC_DECODE_CONTRACT.md section 4d):
+    # host ids with nothing to read. The trace fed none of the step's tokens
+    # into the resident inputs, so the controller plans the step after it the
+    # way it plans the step after a verify, and the step is registered as not
+    # overlap-safe so the next build drains it before it reloads.
+    host_answered: bool = False
 
 
 @dataclass(frozen=True)
@@ -374,6 +381,7 @@ class TTAsyncDecodeController:
         self._decode_chain_valid = False
         self._previous_device_sampling: bool | None = None
         self._previous_submission_verified = False
+        self._previous_submission_host_answered = False
         self._submitted_page_tables: tuple[torch.Tensor, ...] | None = None
         self._legacy_contract_warning_emitted = False
         self.device_grammar_sample_count = 0
@@ -434,11 +442,21 @@ class TTAsyncDecodeController:
         verify_to_plain = (
             self._previous_submission_verified and model_input.spec_mode is None
         )
+        # An ordinary decode the model answered from the host (its drafter,
+        # under SPEC_DECODE_CONTRACT.md section 4d) leaves the resident inputs
+        # the same way: the decode trace ran for none of its rows, so it wrote
+        # none of the step's tokens into them, and they still hold what the
+        # last trace-answered decode fed back. The plain decode after it
+        # reloads and starts a new chain exactly as the one after a verify.
+        host_answered_to_plain = (
+            self._previous_submission_host_answered and model_input.spec_mode is None
+        )
         transition = (
             not self._decode_chain_valid
             or model_input.decode_layout_changed
             or sampling_mode_changed
             or verify_to_plain
+            or host_answered_to_plain
         )
         reload_inputs = (
             # A verify's candidate block is assembled from this step's drafts
@@ -466,11 +484,20 @@ class TTAsyncDecodeController:
         self,
         model_input: TTModelInput,
         reload_plan: TTDecodeReloadPlan,
+        *,
+        host_answered: bool = False,
     ) -> None:
-        """Commit residency after the model accepts a decode submission."""
+        """Commit residency after the model accepts a decode submission.
+
+        ``host_answered`` is ``TTDecodeSubmission.host_answered``: the accepted
+        ordinary decode was answered from the host, so, like a verify, it left
+        the resident inputs untouched, and ``plan_decode_reload`` reads the
+        two the same way.
+        """
         self._decode_chain_valid = True
         self._previous_device_sampling = model_input.perform_device_sampling
         self._previous_submission_verified = model_input.spec_mode is not None
+        self._previous_submission_host_answered = host_answered
         if (
             reload_plan.reload_inputs
             or reload_plan.reload_page_table
@@ -671,22 +698,35 @@ class TTAsyncDecodeController:
         self,
         step: DeferredDecodeOutput,
         *,
+        steady: bool,
         overlap_ok: bool,
     ) -> None:
+        """Register a submitted step and account for the overlap it made.
+
+        Two facts, decided at different times. ``steady`` is the eligibility
+        the runner built this submission with, before ``decode_forward``: a
+        steady fast-path decode may be submitted over an outstanding step, a
+        verify or a non-steady decode may not, so a submission that found a
+        step pending overlapped it unsafely exactly when it was not steady.
+        ``overlap_ok`` is what the next build may do over this step, known
+        only after the forward: the planned eligibility less a host answer,
+        whose reload needs this step applied first.
+        ``must_drain_pending_async_steps`` reads it.
+        """
         unsafe_overlap = False
         with self.runner._steady_decode_lock:
             # Counted here because this is the one place that knows both
             # facts: whether a step was already outstanding when this one was
-            # submitted, and whether this one is a verify. Nothing else
-            # reports overlap. A launch option does not prove it, a completed
-            # request does not prove it, and per-step wall clock cannot
-            # separate it from a faster model. The device suite reads these off
-            # the log line below and asserts that ordinary steps overlapped
-            # and that no verify ever did.
+            # submitted, and whether this one was built to overlap. Nothing
+            # else reports overlap. A launch option does not prove it, a
+            # completed request does not prove it, and per-step wall clock
+            # cannot separate it from a faster model. The device suite reads
+            # these off the log line below and asserts that ordinary steps
+            # overlapped and that no verify ever did.
             overlapped = bool(self.runner._pending_async_steps)
             if overlapped:
                 self._overlapped_submissions += 1
-                if not overlap_ok:
+                if not steady:
                     self._overlapped_unsafe_submissions += 1
                     unsafe_overlap = True
             self.runner._pending_async_steps.append(step)
@@ -1132,8 +1172,10 @@ class TTAsyncDecodeController:
         *,
         steady_decode_fast_path: bool,
     ) -> DeferredDecodeOutput:
-        event = threading.Event()
         context = self.capture_submitted_step_context()
+        if model_input.spec_mode is not None:
+            return self._submit_async_spec_step(model_input, context)
+        event = threading.Event()
         submission = self.submit_decode(
             model_input,
             read_from_device=False,
@@ -1141,25 +1183,6 @@ class TTAsyncDecodeController:
         )
         if submission.tt_out is None:
             event.set()
-        step: DeferredDecodeOutput
-        if model_input.spec_mode is not None:
-            # A speculative step resolves through the accept walk, not the
-            # sampler. It is never overlap-safe: the next candidate block is
-            # built from this step's committed tokens, so the build has to wait
-            # for this commit. This is the only thing that says so:
-            # ``check_perform_device_sampling`` does not look at speculation,
-            # so on a launch that samples on device a verify reaches
-            # ``can_use_steady_decode_fast_path`` with every condition met and
-            # comes back eligible.
-            step = AsyncTTSpecDecodeOutput(
-                controller=self,
-                submission=submission,
-                model_input=model_input,
-                completion_event=event,
-                context=context,
-            )
-            self.register_pending_async_step(step, overlap_ok=False)
-            return step
         step = AsyncTTModelRunnerOutput(
             controller=self,
             submission=submission,
@@ -1167,7 +1190,53 @@ class TTAsyncDecodeController:
             completion_event=event,
             context=context,
         )
-        self.register_pending_async_step(step, overlap_ok=steady_decode_fast_path)
+        # An ordinary decode the model answered from the host is not
+        # overlap-safe either, for the verify's reason: the next build reloads
+        # over it (``plan_decode_reload``), and a reload uploads the host's
+        # tokens, which are authoritative only once this step's answer has
+        # been applied. Its drain is free: a host answer has no read event.
+        # Its own submission over an outstanding step is a different matter,
+        # planned before the forward on the steady terms: a steady decode the
+        # drafter happened to answer overlapped nothing unsafely.
+        self.register_pending_async_step(
+            step,
+            steady=steady_decode_fast_path,
+            overlap_ok=steady_decode_fast_path and not submission.host_answered,
+        )
+        return step
+
+    def _submit_async_spec_step(
+        self, model_input: TTModelInput, context: SubmittedStepContext
+    ) -> AsyncTTSpecDecodeOutput:
+        """Submit a verify whose readback and accept walk are deferred.
+
+        One submission for both layouts. A speculative step resolves through
+        the accept walk, not the sampler, and the walk reads the mode's whole
+        ``[B, 1+K]`` block, so a lane verify is read back whole too, never
+        selectively by scheduled slot. It is never overlap-safe: the next
+        candidate block is built from this step's committed tokens, so the
+        build has to wait for this commit. This is the only thing that says
+        so: ``check_perform_device_sampling`` does not look at speculation, so
+        on a launch that samples on device a verify reaches
+        ``can_use_steady_decode_fast_path`` with every condition met and comes
+        back eligible.
+        """
+        event = threading.Event()
+        submission = self.submit_decode(
+            model_input,
+            read_from_device=False,
+            async_read=True,
+        )
+        if submission.tt_out is None:
+            event.set()
+        step = AsyncTTSpecDecodeOutput(
+            controller=self,
+            submission=submission,
+            model_input=model_input,
+            completion_event=event,
+            context=context,
+        )
+        self.register_pending_async_step(step, steady=False, overlap_ok=False)
         return step
 
     def submit_async_lane_decode(
@@ -1175,9 +1244,11 @@ class TTAsyncDecodeController:
         model_input: TTModelInput,
         context: SubmittedStepContext,
         scheduled_rows: list[int],
-    ) -> AsyncTTModelRunnerOutput:
+    ) -> DeferredDecodeOutput:
         """Submit a non-blocking single-process multi-lane decode step."""
-        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+        if model_input.spec_mode is not None:
+            return self._submit_async_spec_step(model_input, context)
+        steady = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(
             model_input,
@@ -1195,7 +1266,11 @@ class TTAsyncDecodeController:
             context=context,
             scheduled_rows=scheduled_rows,
         )
-        self.register_pending_async_step(step, overlap_ok=overlap_ok)
+        # Refused for a host-answered step as in ``submit_async_decode``, and
+        # classified by the eligibility it was built with, as there.
+        self.register_pending_async_step(
+            step, steady=steady, overlap_ok=steady and not submission.host_answered
+        )
         return step
 
     def submit_decode(
@@ -1393,39 +1468,74 @@ class TTAsyncDecodeController:
         # the boundary where the model accepted the decode submission.
         runner.note_decode_layout_consumed()
         runner.note_decode_state_slots_settled()
+        read_events = None
+        try:
+            if async_read:
+                if hasattr(runner.model, "read_decode_output"):
+                    tt_out, read_events = cast(
+                        tuple[Any, list[Any]],
+                        runner.model.read_decode_output(
+                            tt_out,
+                            async_read=True,
+                            **(
+                                {"sample_rows": list(readback_rows)}
+                                if readback_rows is not None
+                                else {}
+                            ),
+                        ),
+                    )
+                else:
+                    is_host_tensor = isinstance(tt_out, torch.Tensor)
+                    is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
+                        tensor is None or isinstance(tensor, torch.Tensor)
+                        for tensor in tt_out
+                    )
+                    if not (is_host_tensor or is_host_tensor_tuple):
+                        raise AttributeError(
+                            "TT model must implement read_decode_output() "
+                            "unless decode_forward() already returns host tensors"
+                        )
+        except Exception:
+            # The model accepted the decode, so its device may have run the
+            # step and fed the resident inputs, but the answer never reached
+            # the host and nothing below commits it. The chain and the
+            # transition flags of the previous submission are dropped so the
+            # next decode is planned as a reload from host inputs, not as a
+            # steady step over a state the host never applied.
+            self._decode_chain_valid = False
+            self._previous_submission_verified = False
+            self._previous_submission_host_answered = False
+            raise
+        # An ordinary decode a speculating model answered from the host
+        # (SPEC_DECODE_CONTRACT.md section 4d): host ids with nothing to read,
+        # on a submission whose device output the runner would otherwise read
+        # itself. Only a speculating launch defines such a step, so a model
+        # that hands back host tensors on every decode of a launch that never
+        # speculates keeps its resident chain; and a ``read_from_device``
+        # call has the model read its own output, so every answer to one
+        # arrives as host tensors and says nothing about the resident inputs.
+        # The legacy adapter remains reload-policy owner, so version 0 never
+        # records one.
+        host_answered = (
+            reload_plan is not None
+            and requested_spec_mode is None
+            and bool(getattr(runner, "_num_speculative_tokens", 0))
+            and not read_from_device
+            and not read_events
+            and _is_host_decode_output(tt_out)
+        )
+        # Committed once the answer's form is known, because the next step's
+        # plan reads it. A read the model refused leaves the chain uncommitted,
+        # and the next step reloads over it.
         if reload_plan is not None:
-            self.commit_decode_submission(model_input, reload_plan)
+            self.commit_decode_submission(
+                model_input, reload_plan, host_answered=host_answered
+            )
         else:
             # Preserve version-0 overlap behavior. The legacy adapter remains
             # reload-policy owner; this records only that submission succeeded.
             self._decode_chain_valid = True
             self._previous_device_sampling = perform_device_sampling
-        read_events = None
-        if async_read:
-            if hasattr(runner.model, "read_decode_output"):
-                tt_out, read_events = cast(
-                    tuple[Any, list[Any]],
-                    runner.model.read_decode_output(
-                        tt_out,
-                        async_read=True,
-                        **(
-                            {"sample_rows": list(readback_rows)}
-                            if readback_rows is not None
-                            else {}
-                        ),
-                    ),
-                )
-            else:
-                is_host_tensor = isinstance(tt_out, torch.Tensor)
-                is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                    tensor is None or isinstance(tensor, torch.Tensor)
-                    for tensor in tt_out
-                )
-                if not (is_host_tensor or is_host_tensor_tuple):
-                    raise AttributeError(
-                        "TT model must implement read_decode_output() "
-                        "unless decode_forward() already returns host tensors"
-                    )
         return TTDecodeSubmission(
             tt_out=tt_out,
             read_events=read_events,
@@ -1438,6 +1548,7 @@ class TTAsyncDecodeController:
             spec_hidden=spec_hidden,
             readback_rows=readback_rows,
             stage_outputs=stage_outputs,
+            host_answered=host_answered,
         )
 
     def complete_deferred_device_sampling(

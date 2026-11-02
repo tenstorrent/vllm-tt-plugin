@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -72,6 +73,7 @@ from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
+    live_row_index,
     penalty_history,
     penalty_prompt_ids,
     slice_tt_sampling_params,
@@ -170,6 +172,25 @@ class SpecWalk(NamedTuple):
     committed: torch.Tensor
     counts: torch.Tensor
     logprobs: LogprobsTensors | None = None
+
+
+class SpecDecodeRows(NamedTuple):
+    """One decode step's rows after ``TTModelRunner._spec_decode_rows``.
+
+    ``input_tokens`` and ``input_positions`` are the plain ``[B, 1]`` and
+    ``[B]`` rows on an ordinary decode, and the ``[B, 1+K]`` candidate block
+    on a verify, where the three side tensors are set and ``spec_mode`` names
+    the accept mode asked for. ``accepted_counts`` alone is set on an ordinary
+    decode that still carries an unresolved multi-token commit.
+    """
+
+    input_tokens: torch.Tensor
+    input_positions: torch.Tensor
+    draft_token_ids: torch.Tensor | None = None
+    num_valid_drafts: torch.Tensor | None = None
+    accepted_counts: torch.Tensor | None = None
+    spec_mode: str | None = None
+    spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
 
 
 def _step_verifies(
@@ -1098,8 +1119,13 @@ class TTModelRunner:
     # Multimodal fields every image model gets, even when a processor does not
     # emit them, so adapters that read them positionally keep their keys.
     _MM_BASE_FIELDS = ("pixel_values", "image_grid_thw")
-    # Per-item placeholder ranges (vLLM ``mm_position``), after the processor fields.
-    _MM_PLACEHOLDER_FIELDS = ("mm_placeholder_offsets", "mm_placeholder_lengths")
+    # Per-item placeholder ranges (vLLM ``mm_position``) and vLLM's content identifier
+    # of the item (the key its block hashes carry), after the processor fields.
+    _MM_PLACEHOLDER_FIELDS = (
+        "mm_placeholder_offsets",
+        "mm_placeholder_lengths",
+        "mm_identifiers",
+    )
 
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
@@ -1191,6 +1217,10 @@ class TTModelRunner:
                         per_field[key].append(None if offset is None else int(offset))
                     elif key == "mm_placeholder_lengths":
                         per_field[key].append(None if length is None else int(length))
+                    elif key == "mm_identifiers":
+                        # Survives payload stripping: a model that keeps its own
+                        # prefix records can match a cached item without its pixels.
+                        per_field[key].append(getattr(mm_feature, "identifier", None))
                     elif item is None or key not in item:
                         per_field[key].append(None)
                     else:
@@ -1687,7 +1717,10 @@ class TTModelRunner:
 
         Rows are the persistent batch's, because that is what the proposer
         indexes; the result is re-keyed by request id, because that is what the
-        scheduler indexes.
+        scheduler indexes. The batch's row list is read whole: a front-packed
+        batch lists its live rows, and a lane batch lists every slot with
+        ``None`` at the empty ones, which are skipped like a row that committed
+        nothing.
         """
         if self._spec_method != "ngram" or not committed:
             return
@@ -1696,18 +1729,22 @@ class TTModelRunner:
 
             self._ngram_proposer = NgramProposer(self.vllm_config)
 
-        num_reqs = self.input_batch.num_reqs
-        row_req_ids = list(self.input_batch.req_ids[:num_reqs])
+        row_req_ids = list(self.input_batch.req_ids)
         # An empty list tells the proposer to skip that row, which is what a
         # request that committed nothing this step needs.
-        sampled = [committed.get(req_id, []) for req_id in row_req_ids]
+        sampled = [
+            committed.get(req_id, []) if req_id is not None else []
+            for req_id in row_req_ids
+        ]
         drafts = self._ngram_proposer.propose(
             self._num_speculative_tokens,
             sampled,
-            self.input_batch.num_tokens[:num_reqs],
+            self.input_batch.num_tokens[: len(row_req_ids)],
             self.input_batch.token_ids_cpu,
         )
-        for req_id, row_drafts in zip(row_req_ids, drafts):
+        for req_id, row_drafts in zip(row_req_ids, drafts, strict=True):
+            if req_id is None:
+                continue
             # A row the proposer found no repeat for drafts nothing this step,
             # and a request whose sampling the accept walk cannot certify is
             # not drafted for at all; _publish_draft handles both by erasing.
@@ -1758,9 +1795,11 @@ class TTModelRunner:
                 ],
                 dim=1,
             )
+        live_rows = live_row_index(model_input, row_req_ids).tolist()
         if model_input.spec_mode is None:
             positions = self._committed_positions_from_state(
                 row_req_ids,
+                live_rows,
                 counts,
                 submitted_positions=model_input.input_positions,
                 width=width,
@@ -1823,31 +1862,41 @@ class TTModelRunner:
                     f"{offered.tolist()}; a row offers at most the draft "
                     "length the plan resolved, and 0 to offer nothing"
                 )
-        # Range-checked before the ids reach the scheduler, because a draft it
-        # stores is verified next step and committed if the model agrees with
-        # it, and an id outside the vocabulary is not something any verify can
-        # have chosen. Only the offered entries are checked: a row's unoffered
-        # tail is never read, so a drafter may pad it with the placeholder or
-        # with anything else.
-        vocab = int(self.input_batch.vocab_size)
-        if offered is None:
-            out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
-        else:
-            columns = torch.arange(num_drafts).unsqueeze(0)
-            is_offered = columns < offered.to(torch.int64).unsqueeze(1)
-            out_of_range = (
-                (draft_token_ids < 0) | (draft_token_ids >= vocab)
-            ) & is_offered
-        if bool(out_of_range.any()):
-            raise ValueError(
-                f"TT model {type(self.model).__name__} proposed a draft token "
-                f"id outside [0, {vocab}); a drafter offering nothing for a "
-                "row says so with num_valid, and the ids in that row are then "
-                "not read"
-            )
+        offered_by_row = None if offered is None else offered.tolist()
+        # A drafter that offers nothing on any row has declined the step. Its
+        # ids are then never read, so there is nothing to range-check, and the
+        # publish loop below reduces to erasing each live row's last proposal;
+        # the declining drafter's common step skips the rest.
+        declined = offered_by_row is not None and not any(offered_by_row)
+        if not declined:
+            # Range-checked before the ids reach the scheduler, because a
+            # draft it stores is verified next step and committed if the model
+            # agrees with it, and an id outside the vocabulary is not
+            # something any verify can have chosen. Only the offered entries
+            # are checked: a row's unoffered tail is never read, so a drafter
+            # may pad it with the placeholder or with anything else.
+            vocab = int(self.input_batch.vocab_size)
+            if offered is None:
+                out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
+            else:
+                columns = torch.arange(num_drafts).unsqueeze(0)
+                is_offered = columns < offered.to(torch.int64).unsqueeze(1)
+                out_of_range = (
+                    (draft_token_ids < 0) | (draft_token_ids >= vocab)
+                ) & is_offered
+            if bool(out_of_range.any()):
+                raise ValueError(
+                    f"TT model {type(self.model).__name__} proposed a draft "
+                    f"token id outside [0, {vocab}); a drafter offering nothing "
+                    "for a row says so with num_valid, and the ids in that row "
+                    "are then not read"
+                )
         max_model_len = int(self.model_config.max_model_len)
         skipped = set(skip_req_ids or ())
-        for row, req_id in enumerate(row_req_ids):
+        counts_by_row = counts.tolist()
+        # ``row`` is the request's row of the step's block, which a lane step
+        # places at the request's slot rather than at its live position.
+        for row, req_id in zip(live_rows, row_req_ids, strict=True):
             # A row whose committed prefix was not applied has nothing to
             # continue: a forced prefix-cache reset discards those tokens, and
             # a draft of what followed them would be verified against the
@@ -1856,7 +1905,14 @@ class TTModelRunner:
                 continue
             # A row that committed nothing this step proposes nothing: there is
             # no continuation to draft from.
-            if int(counts[row]) < 1:
+            if counts_by_row[row] < 1:
+                continue
+            if declined:
+                # Erase, as ``_publish_draft`` does for an empty offer, for a
+                # request that still holds a row (the published-for rows of the
+                # full loop below).
+                if req_id in self.input_batch.req_id_to_index:
+                    self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
             # indexed by the step's rows, which is the order the model answered
@@ -1873,7 +1929,7 @@ class TTModelRunner:
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
             room = max_model_len - int(self.input_batch.num_tokens[batch_row])
-            row_offered = num_drafts if offered is None else int(offered[row])
+            row_offered = num_drafts if offered_by_row is None else offered_by_row[row]
             usable = max(0, min(row_offered, room))
             self._publish_draft(
                 req_id, [int(token) for token in draft_token_ids[row, :usable]]
@@ -1906,22 +1962,34 @@ class TTModelRunner:
     def _committed_positions_from_state(
         self,
         row_req_ids: list[str],
+        live_rows: list[int],
         counts: torch.Tensor,
         *,
         submitted_positions: torch.Tensor,
         width: int,
     ) -> torch.Tensor:
-        """Build committed positions from history after each applied result."""
+        """Build committed positions from history after each applied result.
+
+        ``live_rows[i]`` is the block row of ``row_req_ids[i]``.
+        """
         positions = self._committed_positions(submitted_positions, width)
-        offsets = torch.arange(width, dtype=torch.int32)
         requests = getattr(self, "requests", {})
-        for row, req_id in enumerate(row_req_ids):
+        counts_by_row = counts.tolist()
+        rows: list[int] = []
+        firsts: list[int] = []
+        for row, req_id in zip(live_rows, row_req_ids, strict=True):
             req_state = requests.get(req_id)
-            count = int(counts[row])
+            count = counts_by_row[row]
             if req_state is None or count < 1:
                 continue
-            first = req_state.num_tokens - count
-            positions[row] = first + offsets
+            rows.append(row)
+            firsts.append(req_state.num_tokens - count)
+        if rows:
+            # One indexed write for every live row rather than one per row:
+            # this runs after every ordinary decode of a speculating launch.
+            positions[rows] = torch.tensor(firsts, dtype=torch.int32).unsqueeze(
+                1
+            ) + torch.arange(width, dtype=torch.int32).unsqueeze(0)
         return positions
 
     @staticmethod
@@ -1960,6 +2028,209 @@ class TTModelRunner:
         positions = torch.where(padded, torch.full_like(positions, -1), positions)
         return tokens, positions
 
+    def _spec_grammar_rows_per_request(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[str, int] | None:
+        """How many grammar bitmask rows each scheduled request owns this step.
+
+        One per scheduled draft position plus one for the bonus. Every
+        scheduled request is counted, not only one build's rows, because the
+        bitmask is laid out over every structured request scheduled. ``None``
+        on a launch that does not speculate, whose bitmask holds one row per
+        structured request.
+        """
+        if not self._num_speculative_tokens:
+            return None
+        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+        return {
+            req_id: 1 + len(scheduled_drafts.get(req_id) or ())
+            for req_id in scheduler_output.num_scheduled_tokens
+        }
+
+    def _forget_finished_spec_state(self) -> None:
+        """Drop the accepted counts of requests that are gone for good.
+
+        Pruned at the build rather than where requests finish, because every
+        other way a request leaves the persistent batch is temporary and has
+        to keep its state. ``self.requests`` is what says a request is gone
+        for good: the lifecycle update drops it there only on finish. A
+        preempted request keeps its entry and loses it on the prefill it
+        resumes with (``_reset_spec_state_for_prefill``).
+        """
+        for req_id in self._req_accepted_counts.keys() - self.requests.keys():
+            self._req_accepted_counts.pop(req_id, None)
+
+    def _reset_spec_state_for_prefill(self, row_req_ids: list[str]) -> None:
+        """Drop the speculative state a prefill step makes stale.
+
+        A prefill commits one token, so its accepted count is 1, and a request
+        resumed from preemption has no candidate state left to select anyway.
+        Dropping the entry restores that default, so the first speculative
+        step after a prefill needs no special case. The drafts a prefilling
+        row may still carry are the scheduler's to drop, and it does:
+        update_draft_token_ids clears spec_token_ids for a request in a
+        prefill chunk. The grammar handoff is per step, and a prefill hands
+        over nothing.
+        """
+        if not self._num_speculative_tokens:
+            return
+        self._forget_finished_spec_state()
+        for req_id in row_req_ids:
+            self._req_accepted_counts.pop(req_id, None)
+        self._grammar_draft_handoff = {}
+        self._grammar_handed_over_req_ids = set()
+
+    def _spec_decode_rows(
+        self,
+        scheduler_output: SchedulerOutput,
+        row_req_ids: list[str],
+        input_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+        live_rows: Sequence[int] | None = None,
+    ) -> SpecDecodeRows:
+        """Turn a plain decode's rows into this step's speculative rows.
+
+        The one candidate-block builder, for both layouts. ``input_tokens`` is
+        the plain ``[B, 1]`` decode and ``input_positions`` its ``[B]``
+        positions; ``row_req_ids`` names the live requests and ``live_rows``
+        the block row each sits at, ``None`` meaning the first
+        ``len(row_req_ids)`` rows. The front-packed builder passes its live
+        rows alone and pads afterwards; the lane builder passes its whole slot
+        batch, whose padding rows sit between the live ones.
+
+        A row no live request owns is a padding row whichever layout built it,
+        in every column: token 0 and position -1, no drafts, a count of 1. That
+        covers a lane slot holding a request the step did not schedule, whose
+        plain decode would carry its real last token: a plain decode of such a
+        row is idempotent (the same token at the same position), but a verify
+        or a proposal is not, because a drafter keeping a session per slot
+        would advance a request the step commits nothing for, and the position
+        is the one thing that marks a row as owned by no request. So on a
+        speculating launch such a row is sent inactive on every decode step,
+        verify and ordinary decode alike, and the request's next scheduled
+        step rebuilds its row from host state. ``SpecPlan.draft_cap`` and
+        ``_step_verifies`` read the live rows alone, so a padding row never
+        decides the cap or the call shape. On an ordinary decode inside a
+        speculating launch the rows stay narrow and only an unresolved
+        ``accepted_counts`` is kept.
+        """
+        if not self._num_speculative_tokens:
+            return SpecDecodeRows(input_tokens, input_positions)
+        self._forget_finished_spec_state()
+        num_rows = int(input_tokens.shape[0])
+        num_live = len(row_req_ids)
+        rows = (
+            torch.arange(num_live, dtype=torch.int64)
+            if live_rows is None
+            else torch.as_tensor(live_rows, dtype=torch.int64)
+        )
+        if rows.shape != (num_live,) or (num_live and int(rows.max()) >= num_rows):
+            raise RuntimeError(
+                f"live_rows {rows.tolist()} do not place {num_live} live "
+                f"requests {row_req_ids} inside a block of {num_rows} rows"
+            )
+        padding = torch.ones(num_rows, dtype=torch.bool)
+        padding[rows] = False
+        if bool(padding.any()):
+            input_tokens = input_tokens.masked_fill(padding.unsqueeze(1), 0)
+            input_positions = input_positions.masked_fill(padding, -1)
+        # Consumed here on every step, whatever the step turns out to be: a
+        # proposal is handed over once (``_drafts_to_verify``).
+        scheduled_drafts = self._drafts_to_verify(scheduler_output, row_req_ids)
+        self._grammar_draft_handoff = {}
+        self._grammar_handed_over_req_ids = set()
+        if (
+            self._spec_supports_narrow_decode
+            and not any(scheduled_drafts.values())
+            and not any(
+                self._req_accepted_counts.get(req_id, 1) > 1 for req_id in row_req_ids
+            )
+        ):
+            # The declined step. No row carries a draft and no live row has a
+            # commit to resolve, so ``_step_verifies`` answers "ordinary
+            # decode" whichever of its rules is read (rule 2 and the fall
+            # through agree), and the candidate block the full build would
+            # assemble below is discarded unread. A drafter that declines on
+            # every step of a batched stretch makes this the common step, so
+            # it skips the per-row side tensors and goes straight to the plain
+            # rows the full build would also return: the same tokens and
+            # positions, no side tensor, and the count reset below.
+            for req_id in row_req_ids:
+                self._req_accepted_counts.pop(req_id, None)
+            return SpecDecodeRows(input_tokens, input_positions)
+        num_drafts = self._num_speculative_tokens
+        spec_plan = getattr(self, "_spec_plan", None)
+        live_drafts, live_num_valid, live_counts = self._spec_row_state(
+            self._req_accepted_counts,
+            scheduled_drafts,
+            row_req_ids,
+            num_drafts,
+            spec_plan.draft_cap(num_live) if spec_plan is not None else None,
+        )
+        # Every other row is a padding row: it carries no draft and stands on
+        # its own input token, which is the count 1. ``accepted_counts`` is a
+        # count in [1, 1+K] and is never 0, on a padding row as much as on a
+        # real one.
+        drafts = torch.full(
+            (num_rows, num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
+        )
+        drafts[rows] = live_drafts
+        num_valid_drafts = torch.zeros(num_rows, dtype=torch.int32)
+        num_valid_drafts[rows] = live_num_valid
+        accepted_counts = torch.ones(num_rows, dtype=torch.int32)
+        accepted_counts[rows] = live_counts
+        if _step_verifies(
+            self._spec_supports_narrow_decode,
+            all(self._request_is_speculable(req_id) for req_id in row_req_ids),
+            live_num_valid,
+            live_counts,
+            num_live,
+        ):
+            spec_mode = self._spec_mode_for_step(row_req_ids)
+            # Uniformly 1+K wide, so a model needs one verify shape rather
+            # than two.
+            input_tokens, input_positions = self._spec_candidate_block(
+                drafts, num_valid_drafts, input_tokens, input_positions
+            )
+            # A padding row's draft columns carry token 0 like its column 0,
+            # not the short-row marker of a live row's unused columns.
+            input_tokens = input_tokens.masked_fill(padding.unsqueeze(1), 0)
+            if self.async_decode_scheduling:
+                self._grammar_draft_handoff = self._structured_drafts(
+                    row_req_ids, live_drafts, live_num_valid
+                )
+            return SpecDecodeRows(
+                input_tokens,
+                input_positions,
+                drafts,
+                num_valid_drafts,
+                accepted_counts,
+                spec_mode,
+                (
+                    self._pending_min_tokens(row_req_ids)
+                    if spec_mode == ACCEPT_MODE_LOGITS
+                    else None
+                ),
+            )
+        # Either this step has nothing to verify, or a row that is not
+        # speculable shares it (see ``_step_verifies``). It runs as the
+        # ordinary decode: no ``spec_mode``, no ``num_valid_drafts``, the
+        # sampler's own tail, and eligible for asynchronous overlap, which a
+        # verify never is. That is what keeps batched baseline decoding
+        # overlapped inside a server with speculation configured. Only a model
+        # that declares ``supports_narrow_decode`` reaches this: for any other,
+        # the step stays a wide verify whose rows all carry zero valid drafts,
+        # because that model implements one input shape.
+        if not _has_unresolved_commit(live_counts, num_live):
+            accepted_counts = None
+        # Each row commits one token here, which is the count 1. Reset at the
+        # build because the ordinary commit path records no count.
+        for req_id in row_req_ids:
+            self._req_accepted_counts.pop(req_id, None)
+        return SpecDecodeRows(
+            input_tokens, input_positions, accepted_counts=accepted_counts
+        )
+
     def _prepare_model_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1973,7 +2244,8 @@ class TTModelRunner:
         single-process execution and standard multi-process DP; each rank
         operates on its whole local
         ``input_batch``. Single-process lane mode does not use this builder --
-        it builds its merged device input directly from ``TTLaneInputBatch``.
+        it builds its merged device input directly from ``TTLaneInputBatch``,
+        sharing only the speculative row builder (``_spec_decode_rows``).
 
         Args:
             scheduler_output: Scheduler decisions for this step. Used to detect
@@ -1997,15 +2269,6 @@ class TTModelRunner:
         req_indices = list(range(batch_num_reqs))
         num_reqs = len(req_indices)
         row_req_ids = [input_batch.req_ids[i] for i in req_indices]
-        if self._num_speculative_tokens:
-            # Pruned here rather than where requests finish, because every
-            # other way a request leaves the persistent batch is temporary and
-            # has to keep its state. ``self.requests`` is what says a request
-            # is gone for good: ``_update_states`` drops it there only on
-            # finish. A preempted request keeps its entry and loses it below,
-            # where the prefill it resumes with resets the count.
-            for req_id in self._req_accepted_counts.keys() - self.requests.keys():
-                self._req_accepted_counts.pop(req_id, None)
 
         # Pad decode to the per-rank wire capacity, which outside lane mode is
         # the whole engine capacity.
@@ -2101,6 +2364,7 @@ class TTModelRunner:
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
         spec_mode: str | None = None
+        spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -2136,16 +2400,7 @@ class TTModelRunner:
                 req_indices, :max_prefill_tokens
             ]
             decode_layout_changed = False
-            if self._num_speculative_tokens:
-                # A prefill commits one token, so its accepted count is 1,
-                # and a request resumed from preemption has no candidate state
-                # left to select anyway. Dropping the entry restores that
-                # default, so the first speculative step after a prefill needs
-                # no special case. The drafts a prefilling row may still carry
-                # are the scheduler's to drop, and it does: update_draft_token_ids
-                # clears spec_token_ids for a request in a prefill chunk.
-                for req_id in row_req_ids:
-                    self._req_accepted_counts.pop(req_id, None)
+            self._reset_spec_state_for_prefill(row_req_ids)
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -2158,53 +2413,16 @@ class TTModelRunner:
             # explicit contract commands or the legacy ``reset_batch`` keyword.
             decode_layout_changed = self._decode_layout_changed_since_last_decode
 
-            if self._num_speculative_tokens:
-                spec_plan = getattr(self, "_spec_plan", None)
-                spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
-                    self._req_accepted_counts,
-                    self._drafts_to_verify(scheduler_output, row_req_ids),
-                    row_req_ids,
-                    self._num_speculative_tokens,
-                    (
-                        spec_plan.draft_cap(len(row_req_ids))
-                        if spec_plan is not None
-                        else None
-                    ),
-                )
-                if _step_verifies(
-                    self._spec_supports_narrow_decode,
-                    all(self._request_is_speculable(req_id) for req_id in row_req_ids),
-                    num_valid_drafts,
-                    accepted_counts,
-                    len(row_req_ids),
-                ):
-                    spec_mode = self._spec_mode_for_step(row_req_ids)
-                    # Uniformly 1+K wide, so a model needs one verify shape
-                    # rather than two.
-                    input_tokens, input_positions = self._spec_candidate_block(
-                        spec_drafts, num_valid_drafts, input_tokens, input_positions
-                    )
-                else:
-                    # Either this step has nothing to verify, or a row that is
-                    # not speculable shares it (see ``_step_verifies``). It
-                    # runs as the ordinary decode: no ``spec_mode``, no
-                    # ``num_valid_drafts``, the sampler's own tail, and
-                    # eligible for asynchronous overlap, which a verify never
-                    # is. That is what keeps batched baseline decoding
-                    # overlapped inside a server with speculation configured.
-                    # Only a model that declares ``supports_narrow_decode``
-                    # reaches this: for any other, the step stays a wide verify
-                    # whose rows all carry zero valid drafts, because that
-                    # model implements one input shape.
-                    spec_drafts = None
-                    num_valid_drafts = None
-                    if not _has_unresolved_commit(accepted_counts, len(row_req_ids)):
-                        accepted_counts = None
-                    # Each row commits one token here, which is the count 1.
-                    # Reset at the build because the ordinary commit path
-                    # records no count.
-                    for req_id in row_req_ids:
-                        self._req_accepted_counts.pop(req_id, None)
+            # The live rows alone; the padding below widens with the block.
+            spec = self._spec_decode_rows(
+                scheduler_output, row_req_ids, input_tokens, input_positions
+            )
+            input_tokens, input_positions = spec.input_tokens, spec.input_positions
+            spec_drafts = spec.draft_token_ids
+            num_valid_drafts = spec.num_valid_drafts
+            accepted_counts = spec.accepted_counts
+            spec_mode = spec.spec_mode
+            spec_min_tokens = spec.spec_min_tokens
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
             # Pad decode to the lane/rank wire capacity.
@@ -2465,24 +2683,7 @@ class TTModelRunner:
             # a move that never happened.
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
-        grammar_rows_per_request = None
-        spec_min_tokens = None
-        if self._num_speculative_tokens:
-            # Every scheduled request, not only this build's rows, because the
-            # bitmask is laid out over every structured request scheduled.
-            scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
-            grammar_rows_per_request = {
-                req_id: 1 + len(scheduled_drafts.get(req_id) or ())
-                for req_id in scheduler_output.num_scheduled_tokens
-            }
-            self._grammar_draft_handoff = {}
-            self._grammar_handed_over_req_ids = set()
-            if spec_drafts is not None and self.async_decode_scheduling:
-                self._grammar_draft_handoff = self._structured_drafts(
-                    row_req_ids, spec_drafts, num_valid_drafts
-                )
-            if spec_mode == ACCEPT_MODE_LOGITS and spec_drafts is not None:
-                spec_min_tokens = self._pending_min_tokens(row_req_ids)
+        grammar_rows_per_request = self._spec_grammar_rows_per_request(scheduler_output)
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -2607,7 +2808,10 @@ class TTModelRunner:
     # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the
     # merge/redistribute in ``TTLaneCoordinator``; this orchestration only wires
     # the device submission, async decode, and deferred state application -- the
-    # genuinely runner/model-owned parts.
+    # genuinely runner/model-owned parts. A lane verify takes the same
+    # submission and speculative tail as a front-packed verify: the block's
+    # live rows are the scheduled slots, which ``TTModelInput.live_rows``
+    # names, and every speculative consumer reads rows through it.
 
     @torch.no_grad()
     def _execute_lane_step(
@@ -2646,8 +2850,16 @@ class TTModelRunner:
         ):
             self.async_decode.wait_for_all_pending_async_steps()
 
+        # The model hears of every slot this step frees before the row is
+        # reused, as ``_update_states`` does for the front-packed batch; here
+        # the row is the slot, so the batch resolves it.
+        release = getattr(self.model, "release_request", None)
         layout_changed = lane_batch.apply_step_plan(
-            scheduler_output, plan, self.requests, self.encoder_cache
+            scheduler_output,
+            plan,
+            self.requests,
+            self.encoder_cache,
+            release_request=release if callable(release) else None,
         )
         assert layout_changed == plan.decode_layout_changed, (
             "lane scheduler and runner disagreed about decode layout change: "
@@ -2696,6 +2908,19 @@ class TTModelRunner:
                         model_input=model_input,
                         lane_total=lane_total,
                     )
+                )
+                return None
+            if model_input.spec_mode is not None:
+                # A verify answers with its mode's ``[B, 1+K]`` block, which
+                # the accept walk reads whole, so it takes the front-packed
+                # verify's own submission and tail: no selective readback of
+                # the scheduled slots, and the speculative finish rather than
+                # ``extract_output``. ``_finish_front_packed_sync`` routes a
+                # ``spec_mode`` step to that tail before touching any
+                # front-packed assumption.
+                fwd = self._forward_with_model_input(model_input)
+                self._pending_samples.append(
+                    partial(self._finish_front_packed_sync, fwd=fwd)
                 )
                 return None
             submission = self.async_decode.submit_decode(
@@ -2860,7 +3085,13 @@ class TTModelRunner:
             return self.defer_state_apply_and_build_runner_output(
                 sampled, logprobs, req_ids=req_ids
             )
-        return self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
+        output = self.apply_and_build_runner_output(sampled, logprobs, req_ids=req_ids)
+        if is_decode and self._num_speculative_tokens:
+            # As after a front-packed ordinary decode: the proposer is asked
+            # once per step. ``req_ids`` is the scheduled slots' order, which
+            # is the order ``model_input.row_req_ids`` holds them in.
+            self.propose_after_plain_step(model_input, sampled, req_ids)
+        return output
 
     @torch.no_grad()
     def execute_model(
@@ -3059,7 +3290,9 @@ class TTModelRunner:
         self._grammar_handed_over_req_ids = set()
         structured = set(grammar_output.structured_output_request_ids)
         num_valid = model_input.num_valid_drafts.clone()
-        for row, req_id in enumerate(model_input.row_req_ids):
+        for row, req_id in zip(
+            live_row_index(model_input).tolist(), model_input.row_req_ids, strict=True
+        ):
             if req_id in structured and req_id not in handed_over:
                 num_valid[row] = 0
         return num_valid
@@ -3183,21 +3416,21 @@ class TTModelRunner:
                 "dimension is a truncated or row-folded readback, which cannot "
                 "be sampled as the vocabulary"
             )
-        live = len(model_input.row_req_ids)
+        live = live_row_index(model_input)
         result = accept_sampled_drafts(
-            logits[:live],
-            model_input.draft_token_ids[:live],
-            model_input.num_valid_drafts[:live],
+            logits[live],
+            model_input.draft_token_ids[live],
+            model_input.num_valid_drafts[live],
             sampling,
         )
         # A padding row carries no draft and is greedy, so it commits its own
         # column 0 argmax, which is what the greedy walk gives it too; the
         # drafter is called with every row, and no request reads these.
         committed = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
-        committed[:live] = result.committed_token_ids
-        committed[live:, 0] = logits[live:, 0].argmax(dim=-1).to(torch.int32)
+        committed[:, 0] = logits[:, 0].argmax(dim=-1).to(torch.int32)
+        committed[live] = result.committed_token_ids
         counts = torch.ones(rows, dtype=torch.int32)
-        counts[:live] = result.accepted_counts
+        counts[live] = result.accepted_counts
         return SpecWalk(committed, counts, result.logprobs)
 
     @staticmethod
@@ -3258,13 +3491,13 @@ class TTModelRunner:
         would report tokens the commit then refuses to write, and the request's
         own history and the engine's would disagree about its text.
         """
-        rows = len(model_input.row_req_ids)
+        live = live_row_index(model_input)
         max_model_len = int(self.model_config.max_model_len)
         positions = model_input.input_positions
-        first = positions if positions.dim() == 1 else positions[:, 0]
-        block = committed[:rows].tolist()
+        first = (positions if positions.dim() == 1 else positions[:, 0])[live]
+        block = committed[live].tolist()
         prefixes: list[list[int]] = []
-        for row, count in enumerate(counts[:rows].tolist()):
+        for row, count in enumerate(counts[live].tolist()):
             # One past the row's last committed token is where this step writes.
             start = int(first[row]) + 1
             room = max(0, max_model_len - start)
@@ -3289,11 +3522,11 @@ class TTModelRunner:
         prefix-cache reset drops a frame it has already accounted for.
         """
         row_req_ids = model_input.row_req_ids
-        rows = len(row_req_ids)
+        live = live_row_index(model_input)
         committed_by_req = self._apply_committed_spec_tokens_to_state(
             row_req_ids,
-            committed[:rows],
-            counts[:rows],
+            committed[live],
+            counts[live],
             skip_req_ids=skip_req_ids,
         )
         if getattr(self, "_spec_drafts_from_model", False):
@@ -3336,15 +3569,16 @@ class TTModelRunner:
         is fed its hidden state through the runner off this path entirely.
         """
         skipped = set(skip_req_ids or ())
-        live = len(row_req_ids)
-        sampled = _coerce_output_block(sampled_token_ids, live, 1).to(torch.int32)
+        sampled = _coerce_output_block(sampled_token_ids, len(row_req_ids), 1).to(
+            torch.int32
+        )
         # The drafter's rows are the step's rows, padding included, because its
         # state is indexed by row and a device graph has one shape. A padding
         # row's token is never read: what marks it as owned by no request is
         # its position, which ``_committed_positions`` leaves negative.
         rows = int(model_input.input_positions.shape[0])
         committed = torch.zeros((rows, 1), dtype=torch.int32)
-        committed[:live] = sampled
+        committed[live_row_index(model_input, row_req_ids)] = sampled
         counts = torch.ones(rows, dtype=torch.int32)
         if getattr(self, "_spec_drafts_from_model", False):
             self._propose_model_drafts(
@@ -3472,7 +3706,12 @@ class TTModelRunner:
     def _finish_front_packed_sync_impl(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
     ) -> ModelRunnerOutput:
-        """Sample and build output for a deferred front-packed forward."""
+        """Sample and build output for a deferred front-packed forward.
+
+        A synchronous lane verify lands here too: the speculative tail below
+        reads its rows through ``TTModelInput.live_rows`` and assumes nothing
+        front-packed, and it returns before the front-packed sampling does.
+        """
         if fwd is None:
             return self.apply_and_build_runner_output(
                 torch.tensor([], dtype=torch.int32), None

@@ -352,8 +352,10 @@ each rank runs the policy on its own scheduler state.
 
 The generic speculative path uses `speculative_config` and a model's
 `spec_plan` admission result. `TTPlatform.check_and_update_config` rejects
-speculation for lane-DP and for models with `output_tokens_per_step > 1`.
-Standard multi-process DP keeps speculation local to each independent rank.
+speculation for models with `output_tokens_per_step > 1`. Standard
+multi-process DP keeps speculation local to each independent rank.
+Single-process lane-DP speculates over its one merged lane batch; see
+"Speculation in lane mode" below.
 The [speculative decoding contract](SPEC_DECODE_CONTRACT.md) defines supported
 methods, model hooks, request controls, and acceptance semantics.
 
@@ -708,6 +710,48 @@ lane, so the engine's global capacity becomes `N * M`.
 Lane-DP does not currently support request-specific RoPE state, including mRoPE
 vision models.
 
+### Speculation in lane mode
+
+A speculating lane launch runs the generic speculative path over the merged
+lane batch, with one difference from the front-packed path: where the padding
+rows sit. The lane decode batch is the slot batch, `lanes x per_lane` rows in
+slot order, and a verify's candidate block is that batch widened to
+`[lanes x per_lane, 1+K]`. The scheduled slots are its live rows and every
+other slot, empty or holding a request the step did not schedule, is a
+padding row (token 0 and position -1 in every column, no drafts,
+`accepted_counts` 1), so the padding rows sit between the live rows rather
+than after them. On a speculating launch an unscheduled occupied slot is
+sent inactive on ordinary decode steps too, so a drafter's per-slot session
+never advances for a request the step commits nothing for.
+`TTLaneInputBatch._build_decode_input` builds the block through the
+same `TTModelRunner._spec_decode_rows` the front-packed builder uses, and
+records the scheduled slots on `TTModelInput.live_rows`; the accept walk,
+the commit, the proposal and the sampling capture read rows through it and
+assume nothing front-packed.
+
+What follows from the layout:
+
+- `spec_plan` is called with the folded `max_num_seqs`, the total across
+  lanes, not one lane's share: one device launch verifies every lane's rows
+  together, so that is the batch the verify cost is dimensioned against.
+  `SpecPlan.k_by_rows` and `SpecPlan.draft_cap` read the live rows of the
+  whole lane batch for the same reason.
+- KV reservation is unchanged. Each lane's `TTScheduler` reserves the
+  `K+1` lookahead positions per request for a model-owned drafter, as
+  "Generic speculative decoding" above describes.
+- A lane verify is submitted and read back exactly as a front-packed verify
+  is, through `TTAsyncDecodeController.submit_decode` with no selective
+  readback of the scheduled slots, because the walk reads the mode's whole
+  `[B, 1+K]` return. Synchronously it finishes through the speculative tail
+  of `_finish_front_packed_sync`; asynchronously
+  `TTAsyncDecodeController.submit_async_lane_decode` routes it to the same
+  deferred speculative path as a front-packed verify, which never overlaps
+  the next step. A lane step with nothing to verify, on a model declaring
+  `supports_narrow_decode`, is the ordinary lane decode and still asks the
+  proposer afterwards, over the slot batch.
+- The `supports_async_spec_decode` requirement for a launch that keeps async
+  scheduling applies unchanged.
+
 ## Standard Multi-Process DP
 
 Models that do not fold into lane-DP use upstream vLLM's standard
@@ -749,6 +793,36 @@ a warning. Without this all ranks bind `localhost:50051`, and a
 triage run from a rank that lost the bind reads a neighbouring rank's device
 list, which does not intersect its own `TT_VISIBLE_DEVICES` set, so every
 dispatcher-backed dump is skipped. See `utils/dp_lane_metal_env.py`.
+
+vLLM's DP load balancer (`DPLBAsyncMPClient.get_core_engine_for_request`,
+in the API server) picks the least-loaded rank, and each rank's prefix cache
+is separate, so a prompt whose prefix an earlier request computed only hits
+the cache on the rank that was sent it. With `dp_prefix_cache_routing`
+(default `true`) the plugin applies the lane rule above to the ranks: the
+request goes to the rank that was sent the most of its prompt, unless that
+rank has no free slot while the least-loaded one has, or the prefill queued
+ahead there outweighs the extra prefill the hit saves; among ranks sent the
+same prefix the less loaded one is the candidate, and equal hits resolve on
+load. The API server cannot read a rank's cache, so the plugin keeps its own
+record of which rank each prompt block was sent to
+(`vllm_tt_plugin.prefix_routing.PrefixCacheMirror`), hashed per cache block
+over the identity inputs the KV cache manager folds into its block hashes,
+where it folds them: the block's prompt tokens; the identifier and
+block-relative offset of each multimodal item the block overlaps, as vLLM's
+block hasher keys them, so a conversation that appends an image keeps the
+identity of the blocks before it; and the request's `cache_salt`, which seeds
+the chain. The mirror then pins the request through
+`EngineCoreRequest.data_parallel_rank`, which the balancer honors ahead of its
+own choice; a request the caller already pinned keeps its rank. The routing
+only applies where a hit is possible: with prefix caching disabled no record
+is kept, and a request the engine will not look up in its cache
+(`skip_reading_prefix_cache`, which `prompt_logprobs` sets) is load-routed
+while its blocks are still recorded for the requests after it. The record is
+not told of an eviction, is cleared by a prefix-cache reset, and is per API
+server, so `--api-server-count` above 1 routes on each server's own
+dispatches. Queued prefill is estimated from the balancer's waiting count and
+the uncached prompt tokens of the newest requests sent to that rank. `false`
+leaves every request to vLLM's least-loaded routing.
 
 For standard DP, `--max_num_seqs M` is the capacity of each rank. The plugin
 does not multiply the rank-local model or KV-cache capacity by the number of

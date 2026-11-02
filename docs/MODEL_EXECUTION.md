@@ -87,6 +87,12 @@ count, so a model that prefills in chunks can tell which items the current
 chunk covers (an item whose placeholders lie past the chunk end has no slots
 yet). They are `None` when the item carries no placeholder position.
 
+A third field, `mm_identifiers`, is appended after the two placeholder fields:
+vLLM's content identifier of the item (the key its block hashes carry), one
+string per item, present even when the item's payload was stripped as
+prefix-cached. A model that keeps its own prefix records matches a cached
+item by it without the pixels (`None` when vLLM assigned none).
+
 When `model_config.uses_mrope` enables request-specific RoPE, `prefill_forward`
 returns `(output, rope_deltas)`, with one delta per request. On decode,
 `TTAsyncDecodeController` supplies `rope_deltas_all_users` after a layout
@@ -103,7 +109,7 @@ request-specific RoPE.
 | `start_pos` | CPU integer tensor `[B]` of absolute positions; inactive rows contain `-1`. |
 | `page_table`, `kv_cache` | Block addresses and adapter-owned KV storage. |
 | `enable_trace` | True for `tt.trace_mode="all"` or `"decode_only"`. |
-| `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling or selective readback. The adapter must support the readback mode its execution path requests. |
+| `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling, selective readback, or a speculative verify, which is submitted as a front-packed verify is. The adapter must support the readback mode its execution path requests. |
 | `page_tables_per_layer` | Supplied for multiple KV groups. |
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
@@ -324,7 +330,11 @@ class MyLaneModel:
         return concat(outs)  # [L * per_lane, 1, V] in slot order
 ```
 
-Lane-DP rejects request-specific RoPE and speculative decode. Lane-DP output
+Lane-DP rejects request-specific RoPE. A speculating lane launch submits a
+verify as this same slot batch widened to `[L * per_lane, 1+K]`, with the
+scheduled slots live and every other slot, an occupied one the step did not
+schedule included, a padding row with `start_pos=-1`; see the
+[speculative contract](SPEC_DECODE_CONTRACT.md). Lane-DP output
 handling is in
 [Decode readback and output conversion](#decode-readback-and-output-conversion).
 
