@@ -1103,17 +1103,11 @@ def test_a_deferred_verify_nobody_asked_for_is_refused():
         engine.run(6)
 
 
-@pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
-def test_a_request_finishing_at_max_tokens_frees_its_slot_and_the_chain_goes_on(
-    declared,
-):
+def test_a_request_finishing_at_max_tokens_does_not_hold_the_chain_back():
     """The scheduler leaves ``a`` out once its verify in flight is sure to reach
-    ``max_tokens``. That step still chains for ``b``; a model declaring
-    ``supports_finishing_slots`` is told ``a``'s slot, once, and frees it."""
-    capabilities = dict(LaneDeviceTarget.model_capabilities)
-    if declared:
-        capabilities["supports_finishing_slots"] = True
-    model = lane_device_target(model_capabilities=capabilities)()
+    ``max_tokens``. That step still chains for ``b``, and the model is not told
+    about ``a``: it frees ``a``'s slot when ``a`` finishes."""
+    model = lane_device_target()()
     runner = lane_runner(model)
     engine = LaneEngine(runner)
     # 15 lands a verify in flight that is sure to reach it (the skip fires
@@ -1130,9 +1124,6 @@ def test_a_request_finishing_at_max_tokens_frees_its_slot_and_the_chain_goes_on(
     assert produced == expected_greedy(prompts["b"], len(produced))
     left_out = [i for i, ids in enumerate(engine.finishing_log) if "a" in ids]
     assert len(left_out) == 1
-    sent = [c["finishing_slots"] for c in model.calls if c["finishing_slots"]]
-    assert sent == ([[0]] if declared else [])
-    assert model.freed == ([0] if declared else [])
     # The step that left ``a`` out chained for ``b`` alone.
     chained, breaks = chain_counters(runner)
     assert "layout" not in breaks
