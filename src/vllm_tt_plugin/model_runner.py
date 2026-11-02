@@ -4060,7 +4060,15 @@ class TTModelRunner:
             needs_unbounded_or_larger_k = (temperature != 0) & (
                 (top_k < 1) | (top_k > max_top_k)
             )
-            if needs_unbounded_or_larger_k.any():
+            # A model that declares ``device_top_k_unbounded_as`` (the bound
+            # it substitutes) serves rows without a top-k bound (vLLM's
+            # default) and rows above its bound from its top-``max_top_k``
+            # candidates on the device; without it such a batch samples on
+            # the host.
+            unbounded_as = self.model.model_capabilities.get(
+                "device_top_k_unbounded_as"
+            )
+            if needs_unbounded_or_larger_k.any() and unbounded_as is None:
                 return False
         if not input_batch.no_penalties and not self.model.model_capabilities.get(
             "supports_device_penalties", True

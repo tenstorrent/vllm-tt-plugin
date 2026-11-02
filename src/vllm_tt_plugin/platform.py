@@ -40,6 +40,7 @@ from vllm_tt_plugin.config import (
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
+    validate_tt_device_top_k_unbounded_as,
     validate_tt_lane_config,
     validate_tt_scheduler_config,
 )
@@ -2073,6 +2074,7 @@ class TTPlatform(Platform):
                 "max_device_top_k requires host sampling fallback and cannot be "
                 "used by block-output models (output_tokens_per_step > 1)."
             )
+        validate_tt_device_top_k_unbounded_as(model_capabilities, model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         # Adaptive block-output: the model emits its block ONLY when it decodes
         # alone (batch==1) and falls back to plain batched baseline otherwise,
