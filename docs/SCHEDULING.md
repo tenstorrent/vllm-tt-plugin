@@ -785,9 +785,12 @@ same prefix the less loaded one is the candidate, and equal hits resolve on
 load. The API server cannot read a rank's cache, so the plugin keeps its own
 record of which rank each prompt block was sent to
 (`vllm_tt_plugin.prefix_routing.PrefixCacheMirror`), hashed per cache block
-over the identity inputs the KV cache manager folds into its block hashes
-(the prompt tokens, the multimodal item identifiers and the request's
-`cache_salt`), and pins the request through
+over the identity inputs the KV cache manager folds into its block hashes,
+where it folds them: the block's prompt tokens; the identifier and
+block-relative offset of each multimodal item the block overlaps, as vLLM's
+block hasher keys them, so a conversation that appends an image keeps the
+identity of the blocks before it; and the request's `cache_salt`, which seeds
+the chain. The mirror then pins the request through
 `EngineCoreRequest.data_parallel_rank`, which the balancer honors ahead of its
 own choice; a request the caller already pinned keeps its rank. The routing
 only applies where a hit is possible: with prefix caching disabled no record

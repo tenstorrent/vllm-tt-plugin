@@ -766,16 +766,31 @@ def _dp_request(
     data_parallel_rank=None,
     cache_salt=None,
     skip_reading_prefix_cache=None,
+    mm_items=None,
 ):
-    """A prompt of ``shared_blocks`` blocks every such prompt shares, then its own."""
+    """A prompt of ``shared_blocks`` blocks every such prompt shares, then its own.
+
+    ``mm_items`` are ``(identifier, offset, length)`` multimodal items in
+    prompt order, carried the way ``EngineCoreRequest.mm_features`` carries
+    them.
+    """
     tail = next(_OWN_TAILS) * 1000
     prompt = list(range(shared_blocks * BLOCK)) + [
         10_000 + tail + i for i in range(own_blocks * BLOCK)
     ]
+    mm_features = None
+    if mm_items is not None:
+        mm_features = [
+            SimpleNamespace(
+                identifier=identifier,
+                mm_position=SimpleNamespace(offset=offset, length=length),
+            )
+            for identifier, offset, length in mm_items
+        ]
     return SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt,
-        mm_features=None,
+        mm_features=mm_features,
         sampling_params=SimpleNamespace(
             skip_reading_prefix_cache=skip_reading_prefix_cache
         ),
@@ -970,6 +985,57 @@ def test_dp_block_hashes_fold_in_the_cache_salt():
     assert all(a != b for a, b in zip(plain, salted, strict=True))
     assert mirror.block_hashes(prompt, cache_salt="s1") == salted
     assert mirror.block_hashes(prompt, cache_salt="s2") != salted
+
+
+def test_dp_block_hashes_are_local_to_the_blocks_a_multimodal_item_overlaps():
+    """vLLM's block hasher keys a block only with the items it overlaps."""
+    from vllm_tt_plugin.prefix_routing import PrefixCacheMirror
+
+    mirror = PrefixCacheMirror(BLOCK, 2)
+    prompt = list(range(4 * BLOCK))
+    plain = mirror.block_hashes(prompt)
+    image_a = ("img-a", 4, 8)
+    with_a = mirror.block_hashes(prompt, [image_a])
+    # The item marks its block, and the chain carries that forward.
+    assert all(a != b for a, b in zip(with_a, plain, strict=True))
+    # A later item leaves every block before it as it was.
+    image_b = ("img-b", 3 * BLOCK + 2, 6)
+    with_both = mirror.block_hashes(prompt, [image_a, image_b])
+    assert with_both[:3] == with_a[:3]
+    assert with_both[3] != with_a[3]
+    # The same item one token later in its block is another block.
+    assert mirror.block_hashes(prompt, [("img-a", 5, 8)])[0] != with_a[0]
+    # An item is keyed into each block it spans, with its offset relative to
+    # that block, and into no block it does not reach.
+    short = mirror.block_hashes(prompt, [("img-s", BLOCK + 10, 6)])
+    spanning = mirror.block_hashes(prompt, [("img-s", BLOCK + 10, 10)])
+    assert short[0] == spanning[0] == plain[0]
+    assert short[1] == spanning[1] != plain[1]
+    assert short[2] != spanning[2]
+    # The salt still separates otherwise identical prompts.
+    assert mirror.block_hashes(prompt, [image_a], cache_salt="s") != with_a
+
+
+def test_dp_a_later_image_keeps_the_prefix_holder():
+    client = _dp_client(counts=[[1, 0, 0.0], [1, 0, 0.0], [0, 0, 0.0]])
+    image_a = ("img-a", 4, 8)
+    first_turn = _dp_request("turn1", shared_blocks=4, mm_items=[image_a])
+    assert _route(client, first_turn) == 2
+    _snapshot(client, [0, 0, 0.0], [0, 0, 0.0], [0, 1, 0.0])
+    # The next turn appends an image after the shared prefix. The blocks
+    # before it keep their identity, so the holder takes it, pinned, over the
+    # balancer's idle engines.
+    image_b = ("img-b", 4 * BLOCK + 2, 6)
+    second_turn = _dp_request(
+        "turn2", shared_blocks=4, own_blocks=2, mm_items=[image_a, image_b]
+    )
+    assert _route(client, second_turn) == 2
+    assert second_turn.data_parallel_rank == 2
+    # Another first image is another conversation: nothing to reuse, so the
+    # balancer's idle engine takes it, unpinned.
+    other = _dp_request("other", shared_blocks=4, mm_items=[("img-c", 4, 8)])
+    assert _route(client, other) != 2
+    assert other.data_parallel_rank is None
 
 
 def test_dp_prefix_caching_off_leaves_every_request_to_the_balancer():

@@ -106,21 +106,41 @@ class PrefixCacheMirror:
     def block_hashes(
         self,
         prompt_token_ids: Sequence[int],
-        mm_identifiers: Iterable[str] = (),
+        mm_items: Sequence[tuple[str, int, int]] = (),
         cache_salt: str | None = None,
     ) -> list[int]:
         """The chained hashes of the prompt's full blocks.
 
-        The same identity inputs the KV cache manager folds into its first
-        block hash seed the chain: the multimodal item identifiers and the
-        request's ``cache_salt``, so prompts carrying different items or
-        different salts share no block, as their KV blocks would not.
+        The identity inputs the KV cache manager folds into its block hashes,
+        folded where it folds them. ``cache_salt`` seeds the chain, as the
+        manager keys the first block with it, so prompts under different
+        salts share no block. ``mm_items`` are the request's multimodal items
+        as ``(identifier, offset, length)`` in prompt order, and each block
+        carries the identifier and block-relative offset of every item it
+        overlaps and nothing of the others, as
+        ``vllm.v1.core.kv_cache_utils._gen_mm_extra_hash_keys`` keys them: a
+        conversation that appends an image keeps the identity of every block
+        before it, and the same item at another offset within a block is
+        another block.
         """
         size = self.block_size
-        parent = hash(("tt-prefix-cache-mirror", tuple(mm_identifiers), cache_salt))
+        parent = hash(("tt-prefix-cache-mirror", cache_salt))
         hashes: list[int] = []
+        first = 0
         for start in range(0, len(prompt_token_ids) - size + 1, size):
-            parent = hash((parent, tuple(prompt_token_ids[start : start + size])))
+            end = start + size
+            # In prompt order, an item that ended at or before this block
+            # ended before every later block too.
+            while first < len(mm_items) and sum(mm_items[first][1:]) <= start:
+                first += 1
+            overlapping: list[tuple[str, int]] = []
+            for identifier, offset, _ in mm_items[first:]:
+                if offset >= end:
+                    break
+                overlapping.append((identifier, offset - start))
+            parent = hash(
+                (parent, tuple(prompt_token_ids[start:end]), tuple(overlapping))
+            )
             hashes.append(parent)
         return hashes
 
@@ -296,7 +316,10 @@ def route_dp_request(client: Any, request: Any, original: Callable) -> Any:
         return original(client, request)
     hashes = mirror.block_hashes(
         prompt,
-        (feature.identifier for feature in request.mm_features or ()),
+        [
+            (feature.identifier, feature.mm_position.offset, feature.mm_position.length)
+            for feature in request.mm_features or ()
+        ],
         getattr(request, "cache_salt", None),
     )
     mirror.forget_finished(client.reqs_in_flight)
