@@ -360,9 +360,10 @@ def test_a_slot_the_step_leaves_out_takes_nothing(narrow):
     A decode step the coordinator interleaves into a run of prefills leaves a
     partial prefill in its slot. The commit, the recorded count and the
     proposal key on the verify's row identity, so that slot must read as
-    unowned there, as a gap does. A verify also leaves it positionless, so the
-    device counts only the scheduled rows (the drafts it chains depend on that
-    count).
+    unowned there, as a gap does. A verify and the ordinary decode alike leave
+    it positionless, so the device counts only the scheduled rows (the drafts
+    a verify chains and the group width the model drafts for next depend on
+    that count).
     """
     model = make_fake_spec_model(supports_narrow_decode=narrow)()
     runner = _runner(model, narrow=narrow)
@@ -381,10 +382,10 @@ def test_a_slot_the_step_leaves_out_takes_nothing(narrow):
     assert set(runner._proposed_draft_token_ids) == {"a"}
     assert list(_committed(output)) == ["a"]
     assert model_input.row_req_ids == ["a", None, None, None]
-    if not narrow:
-        assert model_input.spec_mode is not None
-        assert bool((model_input.input_positions[2] == -1).all())
-        assert int(model_input.input_positions[0, 0]) >= 0
+    assert (model_input.spec_mode is None) == narrow
+    assert bool((model_input.input_positions[2] == -1).all())
+    assert int(model_input.input_tokens[2].reshape(-1)[0]) == 0
+    assert int(model_input.input_positions[0].reshape(-1)[0]) >= 0
 
 
 def _run_loop(model: FakeSpecModel, steps: int):
