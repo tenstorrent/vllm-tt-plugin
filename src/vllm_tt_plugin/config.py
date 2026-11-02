@@ -419,6 +419,42 @@ def resolve_tt_supports_stage_outputs(
     additional[_SUPPORTS_STAGE_OUTPUTS_KEY] = supported
 
 
+def validate_tt_device_top_k_unbounded_as(
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``device_top_k_unbounded_as``.
+
+    The value is the top-k bound the model substitutes for a sampled row whose
+    ``top_k`` is unset or above ``max_device_top_k``; ``TTModelRunner`` keeps
+    such rows on the device when it is declared.
+
+    Raises:
+        ValueError: declared without ``max_device_top_k``, or not an integer in
+            ``1..max_device_top_k``.
+    """
+    capabilities = model_capabilities or {}
+    value = capabilities.get("device_top_k_unbounded_as")
+    if value is None:
+        return
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    max_top_k = capabilities.get("max_device_top_k")
+    if max_top_k is None:
+        raise ValueError(
+            f"Model {name} declares model_capabilities['device_top_k_unbounded_as']"
+            f"={value!r} without max_device_top_k"
+        )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= max_top_k
+    ):
+        raise ValueError(
+            f"Model {name} must declare model_capabilities['device_top_k_unbounded_as']"
+            f" as an integer in 1..{max_top_k} (its max_device_top_k), got {value!r}"
+        )
+
+
 def validate_tt_prefix_hit_confirmation(
     vllm_config: "VllmConfig",
     model_capabilities: dict | None,
