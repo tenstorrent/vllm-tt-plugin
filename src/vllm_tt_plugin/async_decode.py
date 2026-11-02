@@ -698,22 +698,35 @@ class TTAsyncDecodeController:
         self,
         step: DeferredDecodeOutput,
         *,
+        steady: bool,
         overlap_ok: bool,
     ) -> None:
+        """Register a submitted step and account for the overlap it made.
+
+        Two facts, decided at different times. ``steady`` is the eligibility
+        the runner built this submission with, before ``decode_forward``: a
+        steady fast-path decode may be submitted over an outstanding step, a
+        verify or a non-steady decode may not, so a submission that found a
+        step pending overlapped it unsafely exactly when it was not steady.
+        ``overlap_ok`` is what the next build may do over this step, known
+        only after the forward: the planned eligibility less a host answer,
+        whose reload needs this step applied first.
+        ``must_drain_pending_async_steps`` reads it.
+        """
         unsafe_overlap = False
         with self.runner._steady_decode_lock:
             # Counted here because this is the one place that knows both
             # facts: whether a step was already outstanding when this one was
-            # submitted, and whether this one is a verify. Nothing else
-            # reports overlap. A launch option does not prove it, a completed
-            # request does not prove it, and per-step wall clock cannot
-            # separate it from a faster model. The device suite reads these off
-            # the log line below and asserts that ordinary steps overlapped
-            # and that no verify ever did.
+            # submitted, and whether this one was built to overlap. Nothing
+            # else reports overlap. A launch option does not prove it, a
+            # completed request does not prove it, and per-step wall clock
+            # cannot separate it from a faster model. The device suite reads
+            # these off the log line below and asserts that ordinary steps
+            # overlapped and that no verify ever did.
             overlapped = bool(self.runner._pending_async_steps)
             if overlapped:
                 self._overlapped_submissions += 1
-                if not overlap_ok:
+                if not steady:
                     self._overlapped_unsafe_submissions += 1
                     unsafe_overlap = True
             self.runner._pending_async_steps.append(step)
@@ -1185,7 +1198,7 @@ class TTAsyncDecodeController:
                 completion_event=event,
                 context=context,
             )
-            self.register_pending_async_step(step, overlap_ok=False)
+            self.register_pending_async_step(step, steady=False, overlap_ok=False)
             return step
         step = AsyncTTModelRunnerOutput(
             controller=self,
@@ -1199,8 +1212,13 @@ class TTAsyncDecodeController:
         # over it (``plan_decode_reload``), and a reload uploads the host's
         # tokens, which are authoritative only once this step's answer has
         # been applied. Its drain is free: a host answer has no read event.
+        # Its own submission over an outstanding step is a different matter,
+        # planned before the forward on the steady terms: a steady decode the
+        # drafter happened to answer overlapped nothing unsafely.
         self.register_pending_async_step(
-            step, overlap_ok=steady_decode_fast_path and not submission.host_answered
+            step,
+            steady=steady_decode_fast_path,
+            overlap_ok=steady_decode_fast_path and not submission.host_answered,
         )
         return step
 
@@ -1211,7 +1229,7 @@ class TTAsyncDecodeController:
         scheduled_rows: list[int],
     ) -> AsyncTTModelRunnerOutput:
         """Submit a non-blocking single-process multi-lane decode step."""
-        overlap_ok = self.can_use_steady_decode_fast_path(model_input)
+        steady = self.can_use_steady_decode_fast_path(model_input)
         completion_event = threading.Event()
         submission = self.submit_decode(
             model_input,
@@ -1229,9 +1247,10 @@ class TTAsyncDecodeController:
             context=context,
             scheduled_rows=scheduled_rows,
         )
-        # Refused for a host-answered step as in ``submit_async_decode``.
+        # Refused for a host-answered step as in ``submit_async_decode``, and
+        # classified by the eligibility it was built with, as there.
         self.register_pending_async_step(
-            step, overlap_ok=overlap_ok and not submission.host_answered
+            step, steady=steady, overlap_ok=steady and not submission.host_answered
         )
         return step
 

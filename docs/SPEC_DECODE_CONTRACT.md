@@ -627,7 +627,9 @@ request contexts. A direct `TTPlatform.validate_request` call outside
 `TTAsyncDecodeController.submit_async_decode` reads `TTModelInput.spec_mode`:
 a step carrying one is registered through
 `TTAsyncDecodeController.register_pending_async_step` with `overlap_ok=False`,
-because the next candidate block is built from this step's committed tokens.
+because the next candidate block is built from this step's committed tokens,
+and with `steady=False`, because it was never built to overlap an outstanding
+step (the controller drained before it).
 Nothing else marks a verify unsafe. `check_perform_device_sampling` does not
 look at speculation, so on a launch that samples on device a verify otherwise
 passes every condition of
@@ -706,7 +708,12 @@ ordinary decode → ordinary decode" row of the
 Under asynchronous scheduling the served step is registered with
 `overlap_ok=False`, like a verify, so the next build drains it first; that
 drain waits on nothing, there being no read event, and the reload then carries
-the host's tokens with the served step's answer applied. The model does not
+the host's tokens with the served step's answer applied. That is what the
+next build may do over the served step. Whether the served step's own
+submission was safe was decided before the forward, on the steady terms it
+was built with (`steady=True`), so a steady decode the drafter answered over
+an outstanding ordinary decode is the overlap the launch exists for, not an
+unsafe one. The model does not
 reload for itself. `tokens` and `start_pos` are stale under
 `reload_inputs=False` after a drafter-served step as after any other, and a
 model that refilled its resident inputs from them there would break the host

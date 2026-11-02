@@ -490,34 +490,53 @@ def test_submit_decode_reloads_the_plain_decode_after_a_host_answered_decode():
     ]
 
 
-def test_a_read_the_model_refuses_invalidates_the_chain():
+@pytest.mark.parametrize("chain", ["steady", "host_answered"])
+def test_a_read_the_model_refuses_invalidates_the_chain(chain):
     """A decode the model accepted but whose read raised commits nothing.
 
     The device may have run the step and fed its resident inputs, while the
     host never applied the answer. Keeping the previous chain would plan the
     next decode steady over that gap; instead the chain and the transition
     flags are dropped before the error propagates, so the next decode reloads
-    from host inputs (with the sampling reset a new chain carries) and the one
-    after is steady again. Host-answered state does not survive the failure.
+    from host inputs (with the sampling reset a new chain carries), once, and
+    the one after is steady again.
+
+    The steady case is the one the chain alone decides: nothing but the
+    dropped chain makes the decode after the failure reload. The host-answered
+    case has the transition flag set when the read raises, and shows the
+    handler clearing it rather than the flag forcing the reload.
     """
     controller, model = _host_answering_controller(speculative_tokens=5)
     _submit_async(controller)
-    model.answer_next_from_host = True
     _submit_async(controller)
+    if chain == "host_answered":
+        model.answer_next_from_host = True
+        _submit_async(controller)
+    assert controller._decode_chain_valid
+    assert not controller._previous_submission_verified
+    assert controller._previous_submission_host_answered is (chain == "host_answered")
+
     model.refuse_next_read = True
     with pytest.raises(RuntimeError, match="read refused"):
         _submit_async(controller)
+    assert not controller._decode_chain_valid
+    assert not controller._previous_submission_verified
+    assert not controller._previous_submission_host_answered
+
     after_failure = _submit_async(controller)
     steady = _submit_async(controller)
 
     assert not after_failure.host_answered and after_failure.read_events == ["read"]
     assert not steady.host_answered
+    # The refused step's own commands were planned before its read: steady
+    # over a steady chain, a reload after the host answer.
+    refused = (chain == "host_answered",) * 3
     assert _commands(model) == [
         (True, True, True),
         (False, False, False),
-        # The step after the host answer reloaded as planned; its read raised.
-        (True, True, True),
-        # The decode after the refused read reloads again: nothing committed.
+        *([(False, False, False)] if chain == "host_answered" else []),
+        refused,
+        # The decode after the refused read reloads: nothing was committed.
         (True, True, True),
         (False, False, False),
     ]

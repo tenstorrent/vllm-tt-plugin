@@ -1472,6 +1472,11 @@ def test_a_host_answered_ordinary_step_is_drained_and_reloaded_over():
     after it, once, with the sampling reset. The trace-answered steps around
     it keep their overlap, and the committed stream is the rule's
     continuation throughout, which it could not be without the reload.
+
+    The served step was itself built as a steady decode over an outstanding
+    one, which is the overlap the launch exists for. Its answer's form
+    decides what the next build may do over it, not whether its own
+    submission was safe, so the unsafe counter stays where it was.
     """
     model = HostAnsweringTarget()
     runner = _baseline_runner(model)
@@ -1482,25 +1487,39 @@ def test_a_host_answered_ordinary_step_is_drained_and_reloaded_over():
     _drain(runner, "a")
     _settle_layout(runner)
     expected = continuation(*_tail(runner, "a"), 4)
+    controller = runner.async_decode
 
+    # The steady step stays outstanding while the host answers the next one.
     steady = _submit_plain_step(runner, "a")
     assert list(runner._pending_async_overlap_ok) == [True]
     assert model.plain_commands[-1]["reload_inputs"] is False
-    model.release()
-    steady.get_output()
-    _drain(runner, "a")
+    assert model.outstanding == 1
+    assert controller._overlapped_submissions == 0
 
     model.answer_next_from_host = True
     served = _submit_plain_step(runner, "a")
     assert model.host_answers == 1
-    assert model.outstanding == 0, "a host answer left nothing to read"
+    assert model.outstanding == 1, "a host answer added nothing to read"
     # Its own commands were the steady ones: the answer's form is known only
     # after the forward.
     assert model.plain_commands[-1]["reload_inputs"] is False
+    assert list(runner._pending_async_overlap_ok) == [True, False]
+    assert controller._overlapped_submissions == 1
+    assert controller._overlapped_unsafe_submissions == 0, (
+        "a steady decode the drafter answered was counted as an unsafe overlap "
+        "of the step it was built over"
+    )
+    assert controller.must_drain_pending_async_steps(steady_decode_candidate=True), (
+        "a step the drafter answered let the next build overlap it"
+    )
+
+    # The steady step completes and is applied at the next step's start, as
+    # the engine applies it; the served step is still pending.
+    model.release()
+    steady.get_output()
+    _drain(runner, "a")
+    assert not served.is_resolved()
     assert list(runner._pending_async_overlap_ok) == [False]
-    assert runner.async_decode.must_drain_pending_async_steps(
-        steady_decode_candidate=True
-    ), "a step the drafter answered let the next build overlap it"
 
     # The next step drains the served step itself, waits on nothing, and
     # reloads over the token it applied.
@@ -2100,8 +2119,10 @@ def test_an_unsafe_overlap_is_logged_at_its_exact_counter_value(tmp_path):
     handler = logging.StreamHandler(stream)
     async_decode_module.logger.addHandler(handler)
     try:
-        for overlap_ok in (True, True, True, False):
-            controller.register_pending_async_step(object(), overlap_ok=overlap_ok)
+        for steady in (True, True, True, False):
+            controller.register_pending_async_step(
+                object(), steady=steady, overlap_ok=steady
+            )
     finally:
         async_decode_module.logger.removeHandler(handler)
 
