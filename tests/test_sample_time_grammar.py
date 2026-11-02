@@ -855,6 +855,8 @@ def test_finish_lane_sync_builds_req_ids_in_scheduled_row_order():
         _apply_grammar_to_input=apply_grammar,
         lane_batch=SimpleNamespace(extract_output=extract_output, req_ids=lane_req_ids),
         apply_and_build_runner_output=build_output,
+        # Read after the apply: a speculating launch proposes here.
+        _num_speculative_tokens=0,
     )
 
     output = TTModelRunner._finish_lane_sync(
@@ -907,6 +909,7 @@ def test_finish_lane_sync_consumes_device_grammar_before_slot_extraction():
         _apply_grammar_to_input=lambda model_input, _grammar_output, **_kwargs: (
             replace(model_input, grammar_bitmask=[bitmask])
         ),
+        _num_speculative_tokens=0,
         async_decode=SimpleNamespace(
             complete_deferred_device_sampling=complete_deferred
         ),

@@ -673,6 +673,25 @@ def get_tt_lane_prefix_cache_routing(vllm_config: "VllmConfig") -> bool:
     )
 
 
+_DP_PREFIX_CACHE_ROUTING_KEY = "dp_prefix_cache_routing"
+_DP_PREFIX_CACHE_ROUTING_DEFAULT = True
+
+
+def get_tt_dp_prefix_cache_routing(vllm_config: "VllmConfig") -> bool:
+    """Whether standard DP routes a request to the engine holding its prefix.
+
+    The lane rule applied to vLLM's DP load balancer: each engine keeps its
+    own prefix cache, so a prompt only hits the cache on the engine that was
+    sent its prefix; ``False`` leaves every request to vLLM's least-loaded
+    routing (see ``vllm_tt_plugin.prefix_routing.route_dp_request``).
+    """
+    return _read_tt_bool(
+        get_tt_config(vllm_config),
+        _DP_PREFIX_CACHE_ROUTING_KEY,
+        _DP_PREFIX_CACHE_ROUTING_DEFAULT,
+    )
+
+
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
 # that starts off that grid is realigned down by the model and the whole

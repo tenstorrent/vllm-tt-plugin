@@ -67,7 +67,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_tt_plugin.model_input import penalty_history, penalty_prompt_ids
+from vllm_tt_plugin.model_input import (
+    live_row_index,
+    penalty_history,
+    penalty_prompt_ids,
+)
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
 if TYPE_CHECKING:
@@ -218,15 +222,17 @@ def spec_sampling_inputs(
     scheduler computes it while the verify runs, and ``sample_tokens``
     attaches it to this step's input before any walk can read it.
     """
-    live = len(model_input.row_req_ids)
+    # The live rows of the step's ``[B, ...]`` tensors, in ``row_req_ids``
+    # order: the first rows of a front-packed block, the scheduled slots of a
+    # lane block. Indexing by them copies, which is what a walk on the readback
+    # thread needs.
+    live = live_row_index(model_input)
     params = model_input.tt_sampling_params
 
     def per_row(values: Any, dtype: torch.dtype) -> torch.Tensor:
         tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
         return (
-            tensor.expand(live).clone()
-            if tensor.numel() == 1
-            else tensor[:live].clone()
+            tensor.expand(live.numel()).clone() if tensor.numel() == 1 else tensor[live]
         )
 
     # Deferred for the same import cycle as the top-k/top-p helper below.
@@ -243,13 +249,16 @@ def spec_sampling_inputs(
     if model_input.prompt_tokens is not None and model_input.output_tokens is not None:
         penalties = SpecPenalties(
             prompt_token_ids=penalty_prompt_ids(
-                model_input.prompt_tokens[:live], vocab_size
+                model_input.prompt_tokens[live], vocab_size
             ),
-            output_token_ids=penalty_history(model_input.output_tokens[:live]),
+            output_token_ids=penalty_history(model_input.output_tokens[live]),
             presence=per_row(params.presence_penalty, torch.float32),
             frequency=per_row(params.frequency_penalty, torch.float32),
             repetition=per_row(params.repetition_penalty, torch.float32),
         )
+    # The builders key generators by block row and only for live rows. The
+    # generators are the requests' own, so the walk advances them.
+    generators = model_input.generators_list[0]
     return SpecSamplingInputs(
         vocab_size=vocab_size,
         temperature=temperature,
@@ -257,9 +266,11 @@ def spec_sampling_inputs(
         # vocabulary per candidate column and changes no probability.
         top_k=top_k if bool((top_k < vocab_size).any()) else None,
         top_p=top_p if bool((top_p < 1.0).any()) else None,
-        # ``_build_host_generators`` keys only live rows. The generators are
-        # the requests' own, so the walk advances them.
-        generators=dict(model_input.generators_list[0]),
+        generators={
+            position: generators[row]
+            for position, row in enumerate(live.tolist())
+            if row in generators
+        },
         penalties=penalties,
         filters=_spec_token_filters(model_input, live),
         num_logprobs=model_input.max_num_logprobs[0],
@@ -267,9 +278,13 @@ def spec_sampling_inputs(
 
 
 def _spec_token_filters(
-    model_input: "TTModelInput", live: int
+    model_input: "TTModelInput", live: torch.Tensor
 ) -> SpecTokenFilters | None:
-    """The step's token filters for its live rows, or ``None`` when it has none."""
+    """The step's token filters for its live rows, or ``None`` when it has none.
+
+    ``live`` is the block row of each live row; the filters come back indexed
+    by live row position, as the walk reads them.
+    """
     bitmask = model_input.grammar_bitmask[0]
     if bitmask is not None and bitmask.dim() != 3:
         raise RuntimeError(
@@ -279,10 +294,11 @@ def _spec_token_filters(
             "spec_grammar_bitmask_for_tt_batch builds"
         )
     allowed = model_input.allowed_token_ids_mask_list[0]
+    src_bad_words = model_input.bad_words_token_ids_list[0]
     bad_words = {
-        row: words
-        for row, words in model_input.bad_words_token_ids_list[0].items()
-        if row < live
+        position: src_bad_words[row]
+        for position, row in enumerate(live.tolist())
+        if row in src_bad_words
     }
     min_tokens = dict(model_input.spec_min_tokens or {})
     if bitmask is None and allowed is None and not bad_words and not min_tokens:
@@ -290,15 +306,15 @@ def _spec_token_filters(
     if bad_words and model_input.output_tokens is None:
         raise RuntimeError(
             "a logits verify carries bad_words but no output history; "
-            "_prepare_model_inputs builds output_tokens for every decode with "
-            "bad words, because a word's prefix is matched against it"
+            "the builders build output_tokens for every decode with bad "
+            "words, because a word's prefix is matched against it"
         )
     return SpecTokenFilters(
-        grammar_bitmask=None if bitmask is None else bitmask[:live],
-        allowed_token_ids_mask=None if allowed is None else allowed[:live],
+        grammar_bitmask=None if bitmask is None else bitmask[live],
+        allowed_token_ids_mask=None if allowed is None else allowed[live],
         bad_words_token_ids=bad_words,
         output_token_ids=(
-            penalty_history(model_input.output_tokens[:live]) if bad_words else None
+            penalty_history(model_input.output_tokens[live]) if bad_words else None
         ),
         min_tokens=min_tokens,
     )
