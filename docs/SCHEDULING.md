@@ -734,7 +734,12 @@ diagnostics before the first device open: the Inspector RPC address is offset
 by rank (`TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS`), `TT_METAL_LOGS_PATH` gains a
 `dp_rank_<n>` component, and the auto-triage command in
 `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` receives that rank's Inspector
-host, port and log path. Without this all ranks bind `localhost:50051`, and a
+host, port and log path as quoted shell words after the `triage`, `triage.py`
+or `tt-triage.py` entry point. Inspector flags the command already carries move
+with the rank when they match the configured address and log directory; any
+other explicit value raises before the device opens, and a command with no
+recognised entry point is left unchanged with a warning. Without this all ranks
+bind `localhost:50051`, and a
 triage run from a rank that lost the bind reads a neighbouring rank's device
 list, which does not intersect its own `TT_VISIBLE_DEVICES` set, so every
 dispatcher-backed dump is skipped. See `utils/dp_lane_metal_env.py`.
