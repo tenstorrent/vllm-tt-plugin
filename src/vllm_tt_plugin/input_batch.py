@@ -1371,9 +1371,22 @@ class TTLaneInputBatch(InputBatch):
 
         num_tokens = lane_batch.num_tokens
         positions_np = num_tokens[:total].astype(np.int32) - 1  # gaps -> -1
+        # A slot whose request is still in a chunked prefill (a decode step the
+        # coordinator interleaves into its run of chunks) is a gap too, on any
+        # launch: its prompt's K / V is only partly written and its block table
+        # covers only the chunks so far, so decoding it at its last prompt
+        # position would attend over unwritten rows and write K / V through
+        # table entries that are still zero, the null block.
+        decoding = [
+            row
+            for row in occupied
+            if lane_batch.num_computed_tokens_cpu[row]
+            >= lane_batch.num_prompt_tokens[row]
+        ]
+        positions_np[sorted(set(occupied) - set(decoding))] = -1
         input_positions = torch.from_numpy(positions_np)
         tokens_np = np.zeros((total, 1), dtype=np.int32)
-        for row in occupied:
+        for row in decoding:
             tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
         input_tokens = torch.from_numpy(tokens_np)
 
@@ -1399,7 +1412,7 @@ class TTLaneInputBatch(InputBatch):
         walk_samples = spec.spec_mode == ACCEPT_MODE_LOGITS
 
         block_tables_per_group = lane_batch.slot_block_tables(
-            occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
+            decoding, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
         )
         rows_all = list(range(total))
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)

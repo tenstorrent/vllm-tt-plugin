@@ -2102,7 +2102,9 @@ class TTModelRunner:
         in every column: token 0 and position -1, no drafts, a count of 1. That
         covers a lane slot holding a request the step did not schedule, whose
         plain decode would carry its real last token: a plain decode of such a
-        row is idempotent (the same token at the same position), but a verify
+        row is idempotent (the same token at the same position; a slot still
+        in a chunked prefill is not, and ``TTLaneInputBatch._build_decode_input``
+        already sends it as a gap), but a verify
         or a proposal is not, because a drafter keeping a session per slot
         would advance a request the step commits nothing for, and the position
         is the one thing that marks a row as owned by no request. So on a
