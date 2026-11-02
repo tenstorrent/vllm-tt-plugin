@@ -81,14 +81,16 @@ serve speculative decoding within the following execution limits:
   carries request id `None`, position -1 in every column, no drafts and count
   1, as a padding row does. A slot whose request the step does not schedule,
   such as a partial prefill held through an interleaved decode step, also
-  carries request id `None`. The drafter and the accept walk run over every
-  slot, and only scheduled slots are committed. `num_valid_drafts`, the draft
-  cap of `SpecPlan.k_by_rows`, `_step_verifies` and the accept mode read the
-  step's live rows across all lanes; a per-lane policy, such as drafting only
-  for a lane with one live request, is the adapter's, through
+  carries request id `None`; a partial prefill is a full gap, position -1
+  included, since its prompt's K / V is only partly written and its block
+  table covers only the chunks so far. The drafter and the accept walk run
+  over every slot, and only scheduled slots are committed. `num_valid_drafts`,
+  the draft cap of `SpecPlan.k_by_rows`, `_step_verifies` and the accept mode
+  read the step's live rows across all lanes; a per-lane policy, such as
+  drafting only for a lane with one live request, is the adapter's, through
   `DraftOutput.num_valid`. Every accept mode serves lane mode as it serves
-  front-packed execution: a sampled request in any lane makes the whole step
-  a `logits` verify, or a `fused_sample` one (section 4i), the model answers
+  front-packed execution: a sampled request in any lane makes the whole step a
+  `logits` verify, or a `fused_sample` one (section 4i), the model answers
   every slot of the grid, gaps included, and only the scheduled slots are
   sampled (section 4h). Under asynchronous scheduling a lane verify is
   deferred like a front-packed one (section 4c) and publishes its scheduled
