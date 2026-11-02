@@ -8,11 +8,16 @@ logger = init_tt_logger(__name__)
 
 def register() -> None:
     """Register TT models, reasoning parsers and tool parsers in every vLLM process."""
+    from vllm_tt_plugin import detok_prime
     from vllm_tt_plugin.model_registry import register_tt_models_from_plugin
 
     register_tt_models_from_plugin()
     _register_tt_reasoning_parsers()
     _register_tt_tool_parsers()
+    # TT_DETOK_PRIME_TOKENS: the streaming detokenizer primed with the prompt's
+    # tail; installed here because the API server process, where the
+    # detokenizer runs, loads general plugins and no platform code.
+    detok_prime.install()
 
 
 def _register_tt_reasoning_parsers() -> None:
