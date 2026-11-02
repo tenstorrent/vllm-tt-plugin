@@ -2351,13 +2351,8 @@ class TTModelRunner:
             # comparison dispatched every post-first block step as prompt
             # work, re-encoding the entire session per canvas: quadratic
             # prefill and decode never ran.
-            row = input_batch.req_id_to_index[req_id]
-            # ``num_computed_tokens`` is the scheduler's pre-step snapshot.
-            num_computed = input_batch.num_computed_tokens_cpu[row]
-            return (
-                num_computed < input_batch.num_prompt_tokens[row]
-                or num_computed + self._output_tokens_per_step
-                < input_batch.num_tokens[row]
+            return input_batch.has_prefill_work(
+                input_batch.req_id_to_index[req_id], self._output_tokens_per_step
             )
 
         # A "prefill" step can contain:
