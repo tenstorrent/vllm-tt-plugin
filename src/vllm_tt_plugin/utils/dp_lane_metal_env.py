@@ -27,7 +27,6 @@ its runtime options.
 
 import logging
 import os
-import re
 import shlex
 from collections.abc import Mapping
 
@@ -45,24 +44,10 @@ DEFAULT_INSPECTOR_RPC_PORT = 50051
 INSPECTOR_LOG_SUBDIR = os.path.join("generated", "inspector")
 LANE_LOGS_DIR_FORMAT = "dp_rank_{rank}"
 
-# The triage entry point as one shell word: ``triage`` (console script),
-# ``triage.py`` (tools/triage/triage.py) or ``tt-triage.py`` (the tools/
-# wrapper tt-metal documents as the timeout command), with an optional
-# directory prefix, optionally wrapped in matching single or double quotes.
-# The whole word is matched so the flags are inserted after the closing quote
-# and the word keeps its shell meaning.
-_TRIAGE_TOKEN_RE = re.compile(
-    r"""
-    (?<!\S)                          # start of string or after whitespace
-    (?P<triage>
-        (?:[^\s"']*/)?(?:tt-)?triage(?:\.py)?      # bare word, no spaces
-      | "(?:[^"]*/)?(?:tt-)?triage(?:\.py)?"       # double-quoted, may hold spaces
-      | '(?:[^']*/)?(?:tt-)?triage(?:\.py)?'       # single-quoted, may hold spaces
-    )
-    (?=\s|$)                         # the word ends at whitespace or EOS
-    """,
-    re.VERBOSE,
-)
+# The triage entry point is one shell word whose basename is ``triage``
+# (console script), ``triage.py`` (tools/triage/triage.py) or ``tt-triage.py``
+# (the tools/ wrapper tt-metal documents as the timeout command).
+_TRIAGE_BASENAMES = frozenset({"triage", "triage.py", "tt-triage.py"})
 
 _INSPECTOR_RPC_PORT_FLAG = "--inspector-rpc-port"
 _INSPECTOR_RPC_HOST_FLAG = "--inspector-rpc-host"
@@ -73,18 +58,217 @@ _INSPECTOR_FLAGS = (
     _INSPECTOR_LOG_PATH_FLAG,
 )
 
-# An Inspector flag the command already carries, in either docopt spelling
-# (``--flag=value`` or ``--flag value``), with a quoted or bare value.
-_INSPECTOR_FLAG_RE = re.compile(
-    r"""
-    (?<!\S)
-    (?P<flag>--inspector-(?:rpc-host|rpc-port|log-path))
-    (?:=|\s+)
-    (?P<value>'[^']*'|"[^"]*"|\S+)
-    (?=\s|$)
-    """,
-    re.VERBOSE,
-)
+# Shell control operators that end a simple command. Redirections (``2>&1``)
+# are kept inside words: they are not Inspector flags and they do not end the
+# triage invocation.
+_OPERATOR_CHARS = "|&;()\n"
+
+
+class _ShellWord:
+    """One word of the command as written (``text``), with its span."""
+
+    __slots__ = ("start", "end", "text", "operator")
+
+    def __init__(self, start: int, end: int, text: str, operator: bool):
+        self.start = start
+        self.end = end
+        self.text = text
+        self.operator = operator
+
+    def literal(self) -> str | None:
+        """The word's value after quote removal, or ``None`` when the shell
+        would still expand it (``$VAR``, ``$(...)``, backticks) or it cannot be
+        read as one word."""
+        if _has_deferred_expansion(self.text):
+            return None
+        try:
+            parts = shlex.split(self.text)
+        except ValueError:
+            return None
+        return parts[0] if len(parts) == 1 else None
+
+
+def _has_deferred_expansion(text: str) -> bool:
+    """True when ``$`` or a backtick appears outside single quotes."""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            close = text.find("'", i + 1)
+            i = len(text) if close < 0 else close + 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "$`":
+            return True
+        i += 1
+    return False
+
+
+def _split_shell_words(command: str) -> list[_ShellWord]:
+    """Split a shell command into words and control operators, keeping each
+    word exactly as written (quotes, escapes, ``$(...)`` groups) with its span.
+
+    Nothing is expanded or executed; the tokenizer only needs to know where
+    one word ends and the next begins.
+    """
+    words: list[_ShellWord] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch in " \t":
+            i += 1
+            continue
+        if ch in _OPERATOR_CHARS:
+            j = i + 1
+            if ch in "|&;" and j < n and command[j] == ch:
+                j += 1  # ``||``, ``&&``, ``;;``
+            words.append(_ShellWord(i, j, command[i:j], operator=True))
+            i = j
+            continue
+        start = i
+        while i < n:
+            ch = command[i]
+            if ch in " \t":
+                break
+            if ch in _OPERATOR_CHARS:
+                # ``>&`` / ``<&`` is a redirection, part of the word.
+                if ch == "&" and i > start and command[i - 1] in "<>":
+                    i += 1
+                    continue
+                break
+            if ch == "\\":
+                i += 2
+            elif ch == "'":
+                close = command.find("'", i + 1)
+                i = n if close < 0 else close + 1
+            elif ch == '"':
+                i = _skip_double_quoted(command, i)
+            elif ch == "`":
+                close = command.find("`", i + 1)
+                i = n if close < 0 else close + 1
+            elif ch == "$" and i + 1 < n and command[i + 1] in "({":
+                i = _skip_group(command, i + 1)
+            else:
+                i += 1
+        words.append(_ShellWord(start, i, command[start:i], operator=False))
+    return words
+
+
+def _skip_double_quoted(command: str, i: int) -> int:
+    """Index just past the double-quoted string opening at ``i``."""
+    i += 1
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+        elif ch == '"':
+            return i + 1
+        elif ch == "$" and i + 1 < n and command[i + 1] in "({":
+            i = _skip_group(command, i + 1)
+        else:
+            i += 1
+    return n
+
+
+def _skip_group(command: str, i: int) -> int:
+    """Index just past the ``(...)`` or ``{...}`` group opening at ``i``."""
+    opener = command[i]
+    closer = ")" if opener == "(" else "}"
+    depth = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif ch == "'":
+            close = command.find("'", i + 1)
+            i = n if close < 0 else close
+        i += 1
+    return n
+
+
+def _is_triage_entry_point(word: _ShellWord) -> bool:
+    literal = word.literal()
+    return literal is not None and os.path.basename(literal) in _TRIAGE_BASENAMES
+
+
+class _ExplicitFlag:
+    """An Inspector flag the triage invocation already carries."""
+
+    __slots__ = ("flag", "start", "end", "value", "written")
+
+    def __init__(
+        self, flag: str, start: int, end: int, value: str | None, written: str
+    ):
+        self.flag = flag
+        self.start = start  # span of the flag word(s) in the command
+        self.end = end
+        self.value = value  # literal value, or None when the shell would expand it
+        self.written = written  # the flag as the operator wrote it, for messages
+
+
+def _explicit_inspector_flags(args: list[_ShellWord]) -> list[_ExplicitFlag]:
+    """Inspector flags among the triage invocation's own arguments, in either
+    docopt spelling (``--flag=value`` as one word, or ``--flag value``)."""
+    found: list[_ExplicitFlag] = []
+    i = 0
+    while i < len(args):
+        word = args[i]
+        literal = word.literal()
+        if literal is None:
+            # ``--flag=$VAR``: the flag is readable even when the value is not.
+            flag = next(
+                (f for f in _INSPECTOR_FLAGS if word.text.startswith(f + "=")), None
+            )
+            if flag is not None:
+                found.append(_ExplicitFlag(flag, word.start, word.end, None, word.text))
+            i += 1
+            continue
+        flag = next(
+            (
+                f
+                for f in _INSPECTOR_FLAGS
+                if literal == f or literal.startswith(f + "=")
+            ),
+            None,
+        )
+        if flag is None:
+            i += 1
+            continue
+        if literal != flag:
+            found.append(
+                _ExplicitFlag(
+                    flag, word.start, word.end, literal[len(flag) + 1 :], word.text
+                )
+            )
+            i += 1
+            continue
+        if i + 1 < len(args):
+            value_word = args[i + 1]
+            found.append(
+                _ExplicitFlag(
+                    flag,
+                    word.start,
+                    value_word.end,
+                    value_word.literal(),
+                    f"{word.text} {value_word.text}",
+                )
+            )
+            i += 2
+            continue
+        i += 1
+    return found
 
 
 def parse_inspector_rpc_address(value: str | None) -> tuple[str, int] | None:
@@ -114,20 +298,6 @@ def lane_logs_path(base_logs_path: str, local_dp_rank: int) -> str:
     return os.path.join(base_logs_path, LANE_LOGS_DIR_FORMAT.format(rank=local_dp_rank))
 
 
-def _unquote(value: str) -> str:
-    """The shell value of one quoted or bare word, as tt-metal's shell sees it."""
-    words = shlex.split(value)
-    return words[0] if len(words) == 1 else value
-
-
-def _explicit_inspector_flags(command: str) -> dict[str, str]:
-    """Inspector flags the command already carries, unquoted, by flag name."""
-    return {
-        match.group("flag"): _unquote(match.group("value"))
-        for match in _INSPECTOR_FLAG_RE.finditer(command)
-    }
-
-
 def rewrite_triage_command(
     command: str,
     *,
@@ -140,28 +310,42 @@ def rewrite_triage_command(
 ) -> str:
     """Point an auto-triage command at this lane's Inspector.
 
-    Inserts ``--inspector-rpc-host``/``--inspector-rpc-port`` (when an RPC
-    address is given) and ``--inspector-log-path`` right after the triage
-    entry point. Each generated argument is a single shell word
-    (``shlex.quote``), because tt-metal runs the command through
-    ``std::system``.
+    The command is split into shell words without expanding anything. The
+    first word whose basename is a triage entry point starts the triage
+    invocation, which runs to the next control operator; only that
+    invocation's arguments are read or edited, so flags given to other
+    commands in a pipeline are untouched. Inserts ``--inspector-rpc-host``
+    / ``--inspector-rpc-port`` (when an RPC address is given) and
+    ``--inspector-log-path`` right after the entry point, each as one shell
+    word (``shlex.quote`` on the value), because tt-metal runs the command
+    through ``std::system``. Generated text is never re-parsed.
 
-    A flag the command already carries is moved with the lane when its value
-    is the pre-lane one (``base_*``: the server address and log directory the
-    operator configured, which triage was pointing at consistently). Any other
-    explicit value contradicts the Inspector this lane will run, so it raises
-    before the worker opens a device rather than leaving triage reading an
-    Inspector that is not this lane's. A command that does not invoke a
-    recognised triage entry point is returned unchanged with a warning, since
-    a triage hidden in it would still read the default address.
+    An Inspector flag the invocation already carries is moved with the lane
+    when its value is the pre-lane one (``base_*``: the server address and
+    log directory the operator configured, which triage was pointing at
+    consistently). A value the shell would still expand (``$VAR``,
+    ``$(...)``) cannot be checked and is left as written, with a warning. Any
+    other explicit value contradicts the Inspector this lane will run, so it
+    raises before the worker opens a device rather than leaving triage
+    reading an Inspector that is not this lane's. A command with no
+    recognised entry point is returned unchanged with a warning, since a
+    triage hidden in it would still read the default address.
     """
-    match = _TRIAGE_TOKEN_RE.search(command)
-    if match is None:
+    words = _split_shell_words(command)
+    entry_index = next(
+        (
+            i
+            for i, w in enumerate(words)
+            if not w.operator and _is_triage_entry_point(w)
+        ),
+        None,
+    )
+    if entry_index is None:
         logger.warning(
-            "%s does not invoke a recognised tt-triage entry point (triage, "
-            "triage.py or tt-triage.py as one shell word); leaving it unchanged. "
-            "If it runs triage some other way, that triage reads the default "
-            "Inspector address, not this lane's %s:%s / %s. Command: %s",
+            "%s does not invoke a recognised tt-triage entry point (a shell word "
+            "named triage, triage.py or tt-triage.py); leaving it unchanged. If it "
+            "runs triage some other way, that triage reads the default Inspector "
+            "address, not this lane's %s:%s / %s. Command: %s",
             TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV,
             rpc_host,
             rpc_port,
@@ -169,6 +353,12 @@ def rewrite_triage_command(
             command,
         )
         return command
+    entry = words[entry_index]
+    args: list[_ShellWord] = []
+    for word in words[entry_index + 1 :]:
+        if word.operator:
+            break
+        args.append(word)
 
     lane_values: dict[str, str] = {}
     if rpc_host is not None and rpc_port is not None:
@@ -181,39 +371,57 @@ def rewrite_triage_command(
         _INSPECTOR_LOG_PATH_FLAG: base_inspector_log_path,
     }
 
-    explicit = _explicit_inspector_flags(command)
-    for flag, value in explicit.items():
-        lane_value = lane_values.get(flag)
-        if lane_value is None or value == lane_value:
+    # (start, end, replacement) edits on the original text, applied last to
+    # first so earlier spans stay valid. Generated text is never re-parsed.
+    edits: list[tuple[int, int, str]] = []
+    explicit = _explicit_inspector_flags(args)
+    for item in explicit:
+        lane_value = lane_values.get(item.flag)
+        if lane_value is None or item.value == lane_value:
             continue  # nothing to move, or already the lane value (idempotent)
-        if value != base_values[flag]:
+        if item.value is None:
+            logger.warning(
+                "%s passes %s to triage with a value the shell expands later, "
+                "which the plugin cannot check against this lane's %s=%r; "
+                "leaving it as written. Command: %s",
+                TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV,
+                item.written,
+                item.flag,
+                lane_value,
+                command,
+            )
+            continue
+        if item.value != base_values[item.flag]:
             raise ValueError(
-                f"{TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV} carries {flag}={value!r} "
-                f"but this lane's Inspector is {flag}={lane_value!r} (configured "
-                f"value before the per-lane offset: {base_values[flag]!r}). Drop "
-                f"the flag so the plugin sets it per lane, or make it match the "
-                f"configured {TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS_ENV} / "
+                f"{TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV} passes "
+                f"{item.flag}={item.value!r} to triage but this lane's Inspector is "
+                f"{item.flag}={lane_value!r} (configured value before the per-lane "
+                f"offset: {base_values[item.flag]!r}). Drop the flag so the plugin "
+                f"sets it per lane, or make it match the configured "
+                f"{TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS_ENV} / "
                 f"{TT_METAL_LOGS_PATH_ENV}. Command: {command!r}"
             )
+        edits.append((item.start, item.end, _flag_word(item.flag, lane_value)))
 
-    # Quote the value, not the whole ``--flag=value`` word: the shell still
-    # sees one argument, and the flag stays recognisable on a second pass.
+    present = {item.flag for item in explicit}
     extra = [
-        f"{flag}={shlex.quote(value)}"
+        _flag_word(flag, value)
         for flag, value in lane_values.items()
-        if flag not in explicit
+        if flag not in present
     ]
-    end = match.end("triage")
-    rewritten = command[:end] + "".join(" " + arg for arg in extra) + command[end:]
+    if extra:
+        edits.append((entry.end, entry.end, "".join(" " + arg for arg in extra)))
 
-    def move_explicit(flag_match: re.Match[str]) -> str:
-        flag = flag_match.group("flag")
-        lane_value = lane_values.get(flag)
-        if lane_value is None:
-            return flag_match.group(0)
-        return f"{flag}={shlex.quote(lane_value)}"
+    rewritten = command
+    for start, end, replacement in sorted(edits, reverse=True):
+        rewritten = rewritten[:start] + replacement + rewritten[end:]
+    return rewritten
 
-    return _INSPECTOR_FLAG_RE.sub(move_explicit, rewritten)
+
+def _flag_word(flag: str, value: str) -> str:
+    """``--flag=value`` as one shell word: the value is quoted, the flag is
+    left bare so the word is still readable as a flag on a later pass."""
+    return f"{flag}={shlex.quote(value)}"
 
 
 def compute_dp_lane_metal_env(

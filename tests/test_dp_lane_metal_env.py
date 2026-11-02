@@ -162,12 +162,30 @@ def _shell_words(command: str) -> list[str]:
     return shlex.split(command)
 
 
+def _inspector_options(words: list[str]) -> list[str]:
+    """``--inspector-*`` options as docopt reads them, ``--flag value`` and
+    ``--flag=value`` alike, in command order."""
+    options = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word.startswith("--inspector-") and "=" not in word and i + 1 < len(words):
+            options.append(f"{word}={words[i + 1]}")
+            i += 2
+            continue
+        if word.startswith("--inspector-"):
+            options.append(word)
+        i += 1
+    return options
+
+
 @pytest.mark.parametrize(
     "logs_path",
     [
         "/logs/rank logs",
         "/logs/$HOME/x",
         "/logs/it's",
+        "/logs/it's here",
         '/logs/say "hi"',
         "/logs/a;rm -rf b",
     ],
@@ -188,6 +206,76 @@ def test_generated_arguments_are_single_shell_words(logs_path: str) -> None:
         f"--inspector-log-path={expected_path}",
         "--disable-progress",
     ]
+
+
+def test_only_the_triage_invocation_is_edited() -> None:
+    """Flags on other commands in the pipeline are neither moved nor checked."""
+    env = {
+        TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS_ENV: "127.0.0.1:60000",
+        TT_METAL_LOGS_PATH_ENV: "/logs",
+        TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV: (
+            "other --inspector-rpc-port=1 && "
+            "python triage.py --inspector-rpc-port=60000; "
+            "echo --inspector-rpc-port=2 2>&1 | tee /logs/t-$(date +%s).log"
+        ),
+    }
+    overrides = compute_dp_lane_metal_env(2, 4, env, cwd="/w")
+    rewritten = overrides[TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV]
+    assert rewritten.startswith("other --inspector-rpc-port=1 && python triage.py ")
+    assert rewritten.endswith(
+        "--inspector-rpc-port=60002; echo --inspector-rpc-port=2 2>&1 "
+        "| tee /logs/t-$(date +%s).log"
+    )
+    assert rewritten.count("--inspector-rpc-port=60002") == 1
+    assert "--inspector-log-path=/logs/dp_rank_2/generated/inspector" in rewritten
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "--inspector-log-path=/logs/rank\\ logs/generated/inspector",
+        "--inspector-log-path='/logs/rank logs/generated/inspector'",
+        '"--inspector-log-path=/logs/rank logs/generated/inspector"',
+        "--inspector-log-path '/logs/rank logs/generated/inspector'",
+    ],
+)
+def test_explicit_flag_spellings_are_read_as_shell_words(written: str) -> None:
+    env = {
+        TT_METAL_LOGS_PATH_ENV: "/logs/rank logs",
+        TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV: f"python triage.py {written} -v",
+    }
+    overrides = compute_dp_lane_metal_env(1, 2, env, cwd="/w")
+    words = _shell_words(overrides[TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV])
+    assert (
+        words.count(
+            "--inspector-log-path=/logs/rank logs/dp_rank_1/generated/inspector"
+        )
+        == 1
+    )
+    assert not any(
+        w.startswith("--inspector-log-path=/logs/rank logs/generated") for w in words
+    )
+    assert words[-1] == "-v"
+
+
+def test_explicit_value_the_shell_expands_is_left_alone_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    env = {
+        TT_METAL_LOGS_PATH_ENV: "/logs",
+        TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV: (
+            'python triage.py --inspector-log-path="$LOGS/generated/inspector" -v'
+        ),
+    }
+    with caplog.at_level(
+        logging.WARNING, logger="vllm_tt_plugin.utils.dp_lane_metal_env"
+    ):
+        overrides = compute_dp_lane_metal_env(1, 2, env, cwd="/w")
+    rewritten = overrides[TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV]
+    assert '--inspector-log-path="$LOGS/generated/inspector" -v' in rewritten
+    assert rewritten.count("--inspector-log-path") == 1
+    assert "--inspector-rpc-port=50052" in rewritten
+    assert any("shell expands later" in r.getMessage() for r in caplog.records)
 
 
 def test_generated_host_argument_is_quoted_too() -> None:
@@ -220,10 +308,11 @@ def test_explicit_consistent_client_flags_move_with_the_lane(rank: int) -> None:
     )
     words = _shell_words(overrides[TT_METAL_DISPATCH_TIMEOUT_COMMAND_ENV])
     assert server_port == 60000 + rank
-    assert words.count("--inspector-rpc-host=127.0.0.1") == 1
-    assert f"--inspector-rpc-port={server_port}" in words
-    assert f"--inspector-log-path=/logs/dp_rank_{rank}/generated/inspector" in words
-    assert len([w for w in words if w.startswith("--inspector-")]) == 3
+    assert sorted(_inspector_options(words)) == [
+        f"--inspector-log-path=/logs/dp_rank_{rank}/generated/inspector",
+        "--inspector-rpc-host=127.0.0.1",
+        f"--inspector-rpc-port={server_port}",
+    ]
     assert words[-1] == "--disable-progress"
     assert server_host == "127.0.0.1"
 
