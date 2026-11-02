@@ -80,10 +80,12 @@ serve speculative decoding within the following execution limits:
   candidate block over its stable slots: a row is a device slot, and a gap
   carries request id `None`, position -1 in every column, no drafts and count
   1, as a padding row does. A slot whose request the step does not schedule,
-  such as a partial prefill held through an interleaved decode step, also
-  carries request id `None`; a partial prefill is a full gap, position -1
-  included, since its prompt's K / V is only partly written and its block
-  table covers only the chunks so far. The drafter and the accept walk run
+  such as a partial prefill held through an interleaved decode step or a
+  request the step in flight finishes at `max_tokens` (section 4j), also
+  carries request id `None` and position -1, so the model counts only the
+  step's live rows; a partial prefill is a full gap, its blocks included,
+  since its prompt's K / V is only partly written and its block table covers
+  only the chunks so far. The drafter and the accept walk run
   over every slot, and only scheduled slots are committed. `num_valid_drafts`,
   the draft cap of `SpecPlan.k_by_rows`, `_step_verifies` and the accept mode
   read the step's live rows across all lanes; a per-lane policy, such as
@@ -1270,7 +1272,8 @@ receives `finishing_slots`, a sorted list of their slots, on every lane decode
 step (ordinary or verify) that leaves them out for that reason, which under
 vLLM's two-deep batch queue is one step. The request still holds the slot
 until the scheduler reports it finished, is never scheduled again, and its
-slot's state may be freed at once; a chained verify sends the slot as a gap.
+slot's state may be freed at once; a chained verify sends the slot as a gap,
+and so does a lane decode built from host state, verify or ordinary.
 
 **A prefill over the verify in flight.** A prefill step cannot chain, and by
 default it drains the deferred verify before it is built. A model declaring

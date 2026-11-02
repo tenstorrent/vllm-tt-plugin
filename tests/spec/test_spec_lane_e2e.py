@@ -357,13 +357,15 @@ def test_a_draftless_lane_step_runs_the_ordinary_decode_and_proposes():
 def test_a_slot_the_step_leaves_out_takes_nothing(narrow):
     """A request holding its slot through a step that skips it gets no token.
 
-    A decode step the coordinator interleaves into a run of prefills leaves a
-    partial prefill in its slot. The commit, the recorded count and the
-    proposal key on the verify's row identity, so that slot must read as
-    unowned there, as a gap does. A verify and the ordinary decode alike leave
-    it positionless, so the device counts only the scheduled rows (the drafts
-    a verify chains and the group width the model drafts for next depend on
-    that count).
+    Under async scheduling vLLM leaves out a request that the step in flight
+    is sure to finish at ``max_tokens``, and it holds its slot, at its real
+    position, until the scheduler reports it finished (a partial prefill, the
+    other such slot, is positionless from ``_build_decode_input`` already).
+    The commit, the recorded count and the proposal key on the verify's row
+    identity, so that slot must read as unowned there, as a gap does. A verify
+    and the ordinary decode alike leave it positionless, so the device counts
+    only the scheduled rows (the drafts a verify chains and the group width
+    the model drafts for next depend on that count).
     """
     model = make_fake_spec_model(supports_narrow_decode=narrow)()
     runner = _runner(model, narrow=narrow)

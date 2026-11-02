@@ -1533,14 +1533,18 @@ class TTLaneInputBatch(InputBatch):
         draft cap counts the step's live rows, the global count
         ``SpecPlan.k_by_rows`` is declared against.
 
-        A slot can hold a request the step leaves out: a decode step that the
+        A slot can hold a request the step leaves out. A decode step that the
         coordinator interleaves into a run of prefills leaves a partial
-        prefill holding its row. That slot is ``None`` here too, and
-        ``_build_decode_input`` already gave it position -1. Its request
-        has no token to commit, and the commit, the recorded count and the
-        proposal all key on this identity, so naming it would append a token
-        to a prompt that is still being prefilled. A verify and the ordinary
-        decode alike give it position -1, so the device does not run it.
+        prefill holding its row; ``_build_decode_input`` already gave that
+        slot position -1. Under async scheduling vLLM also leaves out a
+        request that the step in flight is sure to finish at ``max_tokens``
+        (``get_tt_finishing_req_ids``), which holds its slot, at its real
+        position, until the scheduler reports it finished. Either slot is
+        ``None`` here too. Its request has no token to commit, and the
+        commit, the recorded count and the proposal all key on this identity,
+        so naming it would commit a token for a request this step does not
+        advance. A verify and the ordinary decode alike give either slot
+        position -1, as a chained verify does, so the device does not run it.
         """
         none = {
             "input_tokens": input_tokens,
