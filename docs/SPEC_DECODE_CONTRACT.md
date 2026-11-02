@@ -302,11 +302,11 @@ from host state. The slot's page table stays its own; the row is inactive by
 position. Nothing else differs between the layouts: the side tensors,
 `spec_mode`, the return layout of section 6 and the proposal's rows are all
 the slot batch's. One occupied slot is a gap on every launch, speculating or
-not: a slot whose request is still in a chunked prefill
-(`TTLaneInputBatch._build_decode_input`). Decoding it again is not
-idempotent, since its last prompt position's K / V is not written yet and its
-block table covers only the chunks so far, so it gets position -1 and no
-blocks.
+not: a slot whose request still has prefill work, a chunked prefill or the
+replay of a request resumed after preemption (`InputBatch.has_prefill_work`,
+read by `TTLaneInputBatch._build_decode_input`). Decoding it again is not
+idempotent, since its last position's K / V is not written yet and its block
+table covers only the chunks so far, so it gets position -1 and no blocks.
 
 A row with fewer than K valid drafts pads its own tail columns, and the cap is
 per row: one request whose drafter ran short never shortens another request's
