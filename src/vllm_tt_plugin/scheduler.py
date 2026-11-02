@@ -11,6 +11,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -347,6 +348,8 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # Set by TTLaneCoordinator on its lanes; see make_stats.
+        self.stats_made_by_coordinator = False
         # Request id that owns the adaptive model's SINGLE speculative
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
@@ -1190,6 +1193,16 @@ class TTScheduler(AsyncScheduler):
             elif not solo or first_id != owner:
                 owner = None
         self._spec_session_owner = owner
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        """None on a lane: TTLaneCoordinator.make_stats makes the step's one
+        SchedulerStats for every lane. A lane's own would count only its
+        requests, and the coordinator replaces it on the first client's output
+        alone.
+        """
+        if self.stats_made_by_coordinator:
+            return None
+        return super().make_stats(*args, **kwargs)
 
     def update_from_output(
         self,
