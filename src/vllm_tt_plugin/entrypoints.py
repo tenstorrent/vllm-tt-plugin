@@ -37,10 +37,13 @@ def _install_prestream_validation() -> None:
     name = multiprocessing.current_process().name
     if name.startswith(("EngineCore", "VllmWorker", "Worker", "DPEngineCore")):
         return
-    from vllm_tt_plugin import prestream
+    from vllm_tt_plugin import prestream, tool_arg_typing, tool_result_validation
 
     if prestream.enabled():
         prestream.install()
+    # Installed after prestream, so the tool-result check wraps outermost (it refuses before the engine call).
+    tool_result_validation.install()
+    tool_arg_typing.install()
 
 
 def _register_tt_reasoning_parsers() -> None:
