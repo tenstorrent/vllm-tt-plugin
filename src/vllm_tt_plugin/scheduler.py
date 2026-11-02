@@ -283,6 +283,20 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+# The loaded model's prefix-hit confirmer (its bound ``confirm_prefix_cache_hit``),
+# published by ``TTWorker.load_model`` for the scheduler of its process: the
+# engine core constructs its scheduler after the executor loaded the model, in
+# the same process (a model that confirms hits is admitted only with the
+# uniproc executor). None for a model without ``confirms_prefix_cache_hits``.
+_published_confirmer = None
+
+
+def publish_prefix_hit_confirmer(confirmer) -> None:
+    """Record the loaded model's confirmer for the schedulers of this process."""
+    global _published_confirmer
+    _published_confirmer = confirmer
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -338,6 +352,7 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._take_published_prefix_hit_confirmer()
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -433,6 +448,62 @@ class TTScheduler(AsyncScheduler):
                 "call made by AsyncScheduler._update_request_with_output and "
                 "must disable prefix caching"
             )
+
+    def _take_published_prefix_hit_confirmer(self) -> None:
+        """Route the KV cache manager's hit lookup through the model's confirmer.
+
+        A model that owns its prefix cache (device state per slot) confirms
+        vLLM's longest hit before the scheduler commits it, so
+        ``num_computed_tokens`` never exceeds what the device can serve and
+        ``NewRequestData`` strips only the mm payload the model has resident.
+        """
+        self._prefix_hit_confirmer = _published_confirmer
+        if self._prefix_hit_confirmer is None:
+            return
+        manager = self.kv_cache_manager
+        self._orig_get_computed_blocks = manager.get_computed_blocks
+        manager.get_computed_blocks = self._confirmed_computed_blocks
+        logger.info(
+            "Prefix-cache hits are confirmed by the model before they are scheduled"
+        )
+
+    def _confirmed_computed_blocks(self, request: Request):
+        """``get_computed_blocks`` trimmed to the hit the model confirms.
+
+        vLLM's longest block-hash hit is proposed to the model as
+        ``confirm(prompt_token_ids, mm_items, num_new_computed_tokens)``; the
+        model answers the number of cached tokens it will serve (0 = none),
+        taken at most as the proposal and floored to the scheduler's block
+        size (the KV cache manager carries none), and the computed blocks are
+        cut to it. The shared-prefix boundary pin is dropped with a trimmed hit.
+        """
+        blocks, num_new, boundary = self._orig_get_computed_blocks(request)
+        if num_new <= 0:
+            return blocks, num_new, boundary
+        mm_items = [
+            (
+                f.identifier,
+                int(f.mm_position.offset),
+                int(f.mm_position.length),
+                f.modality,
+            )
+            for f in request.mm_features
+        ]
+        honoured = int(
+            self._prefix_hit_confirmer(
+                list(request.prompt_token_ids), mm_items, num_new
+            )
+        )
+        if honoured < 0:
+            raise ValueError(
+                f"confirm_prefix_cache_hit answered {honoured} cached tokens for the "
+                f"{num_new}-token hit of request {request.request_id}"
+            )
+        honoured = min(honoured, num_new) // self.block_size * self.block_size
+        if honoured == num_new:
+            return blocks, num_new, boundary
+        trimmed = self.kv_cache_manager.truncate_computed_blocks(blocks, honoured)
+        return trimmed, honoured, 0
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode

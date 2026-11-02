@@ -41,6 +41,7 @@ from vllm_tt_plugin.config import (
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
+    validate_tt_prefix_hit_confirmation,
     validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -2540,6 +2541,10 @@ class TTPlatform(Platform):
         )
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
+        )
+        # After lane conversion, which pins the executor backend it checks.
+        validate_tt_prefix_hit_confirmation(
+            vllm_config, model_capabilities, model_class
         )
         validate_tt_scheduler_config(vllm_config)
         if tt_requests_cannot_resume(vllm_config):

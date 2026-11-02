@@ -419,6 +419,47 @@ def resolve_tt_supports_stage_outputs(
     additional[_SUPPORTS_STAGE_OUTPUTS_KEY] = supported
 
 
+def validate_tt_prefix_hit_confirmation(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``confirms_prefix_cache_hits``.
+
+    ``TTWorker.load_model`` publishes the loaded model's
+    ``confirm_prefix_cache_hit`` for the scheduler of its process, which trims
+    vLLM's prefix-cache hit to the answer.
+
+    Raises:
+        ValueError: the declaration comes without ``supports_prefix_caching``
+            or without the method, or the executor runs the worker outside the
+            scheduler's process (anything but the uniproc executor), where the
+            published method would never reach the scheduler.
+    """
+    capabilities = model_capabilities or {}
+    if not capabilities.get("confirms_prefix_cache_hits", False):
+        return
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    if not capabilities.get("supports_prefix_caching", False):
+        raise ValueError(
+            f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
+            "=True without supports_prefix_caching=True"
+        )
+    if not callable(getattr(model_class, "confirm_prefix_cache_hit", None)):
+        raise ValueError(
+            f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
+            "=True without a confirm_prefix_cache_hit(prompt_token_ids, mm_items, "
+            "num_computed_tokens) method"
+        )
+    backend = vllm_config.parallel_config.distributed_executor_backend
+    if backend not in (None, "uni"):
+        raise ValueError(
+            f"Model {name} confirms prefix-cache hits from the worker that loaded "
+            "it, which must share the scheduler's process (the uniproc executor); "
+            f"got distributed_executor_backend={backend!r}"
+        )
+
+
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
     """Return the admitted speculative plan, or ``None``.
 
