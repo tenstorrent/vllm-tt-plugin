@@ -1309,9 +1309,22 @@ class TTLaneInputBatch(InputBatch):
 
         num_tokens = lane_batch.num_tokens
         positions_np = num_tokens[:total].astype(np.int32) - 1  # gaps -> -1
+        # A slot whose request is still in a chunked prefill (a decode step the
+        # coordinator interleaves into its run of chunks) is a gap too: its
+        # prompt's K / V is only partly written and its block table covers only
+        # the chunks so far, so decoding it at its last prompt position would
+        # attend over unwritten rows and write K / V through table entries that
+        # are still zero, the null block.
+        decoding = [
+            row
+            for row in occupied
+            if lane_batch.num_computed_tokens_cpu[row]
+            >= lane_batch.num_prompt_tokens[row]
+        ]
+        positions_np[sorted(set(occupied) - set(decoding))] = -1
         input_positions = torch.from_numpy(positions_np)
         tokens_np = np.zeros((total, 1), dtype=np.int32)
-        for row in occupied:
+        for row in decoding:
             tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
         input_tokens = torch.from_numpy(tokens_np)
 
@@ -1321,7 +1334,7 @@ class TTLaneInputBatch(InputBatch):
         input_tokens, input_positions = spec["input_tokens"], spec["input_positions"]
 
         block_tables_per_group = lane_batch.slot_block_tables(
-            occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
+            decoding, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
         )
         rows_all = list(range(total))
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
@@ -1522,7 +1535,8 @@ class TTLaneInputBatch(InputBatch):
 
         A slot can hold a request the step leaves out: a decode step that the
         coordinator interleaves into a run of prefills leaves a partial
-        prefill holding its row. That slot is ``None`` here too. Its request
+        prefill holding its row. That slot is ``None`` here too, and
+        ``_build_decode_input`` already gave it position -1. Its request
         has no token to commit, and the commit, the recorded count and the
         proposal all key on this identity, so naming it would append a token
         to a prompt that is still being prefilled.
