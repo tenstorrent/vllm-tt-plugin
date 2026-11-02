@@ -1581,6 +1581,15 @@ def register_tt_models(register_test_models=False) -> None:
     for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
         _register_model_if_missing(ModelRegistry, arch, _kolibri1_target)
 
+    # GLM-5.3-Flash (tt-metal models/demos/glm53_flash). The checkpoint's
+    # architecture is Glm5NextForConditionalGeneration (transformers >= 5.16,
+    # model_type glm5_next). vLLM 0.30 registers the bare Glm5Next names itself
+    # and resolves the checkpoint's before the platform prefixes it, so the
+    # TT-prefixed names are the ones that select the tt-metal adapter.
+    _glm53_target = "models.demos.glm53_flash.tt.generator_vllm:GLM53FlashForCausalLM"
+    for arch in ("TTGlm5NextForConditionalGeneration", "TTGlm5NextForCausalLM"):
+        _register_model_if_missing(ModelRegistry, arch, _glm53_target)
+
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare
     # DiffusionGemmaForBlockDiffusion registration; the plugin registers the
