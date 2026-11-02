@@ -31,7 +31,9 @@ examples = ["qwen-vl-utils"]
 # so a direct `ruff` invocation and the commit hook enforce identical rules.
 # pytest is pinned below 9 because 9.x caplog double-captures on non-propagating
 # loggers (see AGENTS.md and tests/test_logger.py).
-dev = ["pre-commit", "ruff==0.14.0", "pytest>=8,<9"]
+# docopt is the option parser tt-metal's tools/triage uses; the per-rank
+# Inspector tests parse the rewritten triage command with it.
+dev = ["pre-commit", "ruff==0.14.0", "pytest>=8,<9", "docopt"]
 
 [project.entry-points."vllm.general_plugins"]
 tt_model_registry = "vllm_tt_plugin.entrypoints:register"

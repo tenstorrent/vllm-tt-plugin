@@ -735,11 +735,17 @@ by rank (`TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS`), `TT_METAL_LOGS_PATH` gains a
 `dp_rank_<n>` component, and the auto-triage command in
 `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` receives that rank's Inspector
 host, port and log path as quoted shell words after the `triage`, `triage.py`
-or `tt-triage.py` entry point. Inspector flags the command already carries move
-with the rank when they match the configured address and log directory; any
-other explicit value raises before the device opens, and a command with no
-recognised entry point is left unchanged with a warning. Without this all ranks
-bind `localhost:50051`, and a
+or `tt-triage.py` entry point. The entry point is recognised where the shell
+would run it: as a command (also behind `env`, `exec`, `nohup`, `time`,
+`command` or `timeout`) or as the script given to a Python interpreter; the
+same name as an argument elsewhere (`test -f tools/triage.py`) is left alone.
+Inspector flags the invocation already carries, in either docopt spelling and
+however quoted, move with the rank when they match the configured address and
+log directory; a value the shell expands later (`"$LOGS"`) is kept with a
+warning; any other explicit value raises before the device opens. Redirections
+(`2>&1`, `>out.log`) and other commands in a pipeline are never read as flags
+or edited, and a command with no recognised entry point is left unchanged with
+a warning. Without this all ranks bind `localhost:50051`, and a
 triage run from a rank that lost the bind reads a neighbouring rank's device
 list, which does not intersect its own `TT_VISIBLE_DEVICES` set, so every
 dispatcher-backed dump is skipped. See `utils/dp_lane_metal_env.py`.
