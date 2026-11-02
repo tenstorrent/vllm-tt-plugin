@@ -1318,8 +1318,32 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        # A request mid-prefill keeps the slot its earlier chunks wrote: a
+        # stateful model (recurrent carries, per-slot chunk cursors) continues
+        # from that slot's state, and no gather moves state between prefill
+        # steps. Reserve those first so a request joining the batch at a lower
+        # row cannot take a continuing request's slot.
+        kept = {
+            req_id: slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in prefilling
+        }
+        kept_slots = list(kept.values())
+        shared = sorted({s for s in kept_slots if s in held or kept_slots.count(s) > 1})
+        if shared:
+            # The map records one live request per slot; two requests on one
+            # slot means it has stopped describing the device, and handing
+            # either a different slot continues it from state it never wrote.
+            raise RuntimeError(
+                f"device state slots {shared} are recorded for more than one live "
+                f"request: prefilling={row_req_ids}, map={self._req_state_slot}"
+            )
+        held.update(kept_slots)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            if req_id in kept:
+                slots.append(kept[req_id])
+                continue
             if row not in held:
                 slot = row
             else:
