@@ -90,6 +90,27 @@ class FakeLane:
         self.update_calls.append(scheduler_output)
         return self._eco
 
+    def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output):
+        # vLLM's rule on the lane's own output: trim each request's drafts to
+        # its reservation, drop the ids the grammar rejects (negative here),
+        # pad with -1 and rebind the list; set the lane's invalid counts.
+        num_invalid: dict[str, int] = {}
+        sched = scheduler_output.scheduled_spec_decode_tokens
+        for rid, ids in zip(
+            draft_token_ids.req_ids, draft_token_ids.draft_token_ids, strict=True
+        ):
+            placeholders = sched.get(rid)
+            if not placeholders:
+                continue
+            n = len(placeholders)
+            kept = [t for t in ids[:n] if t >= 0]
+            invalid = n - len(kept)
+            if invalid:
+                kept = kept + [-1] * invalid
+                num_invalid[rid] = invalid
+            sched[rid] = kept
+        scheduler_output.num_invalid_spec_tokens = num_invalid
+
     def finish_requests(self, request_ids, finished_status):
         self.finish_calls.append((request_ids, finished_status))
         if request_ids is None:
@@ -433,6 +454,46 @@ def test_update_from_output_routes_and_merges_per_lane():
     assert merged[0].finished_requests == {"x"}
     # Stats disabled -> none attached.
     assert merged[0].scheduler_stats is None
+
+
+class _SpecLane(FakeLane):
+    """A lane whose schedule reserves draft positions for its requests."""
+
+    def __init__(self, spec):
+        super().__init__(running=1)
+        self._spec = spec
+
+    def schedule(self):
+        out = super().schedule()
+        out.scheduled_spec_decode_tokens = {k: list(v) for k, v in self._spec.items()}
+        return out
+
+
+def test_update_draft_token_ids_in_output_syncs_the_merged_output():
+    """The async lane step validates drafts per lane, then the grammar
+    bitmask is computed from the MERGED output: it must carry the lanes'
+    validated drafts and invalid counts, not the merge-time placeholders."""
+    from vllm.v1.outputs import DraftTokenIds
+
+    lane0 = _SpecLane({"a": [-1, -1]})
+    lane1 = _SpecLane({"b": [-1, -1, -1]})
+    coordinator = _make_coordinator([lane0, lane1])
+    merged = coordinator.schedule()
+    assert merged.scheduled_spec_decode_tokens == {"a": [-1, -1], "b": [-1, -1, -1]}
+    assert merged.num_invalid_spec_tokens is None
+
+    coordinator.update_draft_token_ids_in_output(
+        DraftTokenIds(["a", "b"], [[7, 8, 9], [5, -3, 6]]), merged
+    )
+    lane_outputs = merged._tt_step_state.lane_outputs
+    # Each lane validated its own request: "a" trimmed to its reservation,
+    # "b" lost the rejected id and was padded.
+    assert lane_outputs[0].scheduled_spec_decode_tokens == {"a": [7, 8]}
+    assert lane_outputs[1].scheduled_spec_decode_tokens == {"b": [5, 6, -1]}
+    assert lane_outputs[1].num_invalid_spec_tokens == {"b": 1}
+    # ... and the merged output the bitmask reads says the same.
+    assert merged.scheduled_spec_decode_tokens == {"a": [7, 8], "b": [5, 6, -1]}
+    assert merged.num_invalid_spec_tokens == {"b": 1}
 
 
 def test_update_from_output_no_metadata_returns_empty():

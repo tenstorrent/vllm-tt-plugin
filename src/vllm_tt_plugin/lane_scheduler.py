@@ -835,8 +835,24 @@ class TTLaneCoordinator(SchedulerInterface):
         state = _get_tt_step_state(scheduler_output)
         if state is None:
             return
+        merged_drafts = scheduler_output.scheduled_spec_decode_tokens
+        num_invalid_spec_tokens: dict[str, int] = {}
         for sched, lane_output in zip(self.lanes, state.lane_outputs, strict=True):
             sched.update_draft_token_ids_in_output(draft_token_ids, lane_output)
+            # The lane scheduler rebinds each request's draft list in its own
+            # output (trimmed to the reservation, grammar-filtered, padded with
+            # -1) and sets its ``num_invalid_spec_tokens``. The merged output,
+            # which ``get_grammar_bitmask`` reads for the candidate positions,
+            # still holds the placeholder lists the merge copied, so carry the
+            # lane's view over; the lane's keys are a subset of the merged ones.
+            for req_id, drafts in lane_output.scheduled_spec_decode_tokens.items():
+                if req_id in merged_drafts:
+                    merged_drafts[req_id] = drafts
+            if lane_output.num_invalid_spec_tokens:
+                num_invalid_spec_tokens.update(lane_output.num_invalid_spec_tokens)
+        # vLLM's scheduler sets the dict (possibly empty) on the output it
+        # updated; the merged output follows it.
+        scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
 
     # ------------------------------------------------------------------
     # SchedulerInterface: request lifecycle

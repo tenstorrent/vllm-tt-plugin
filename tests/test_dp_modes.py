@@ -736,7 +736,9 @@ BLOCK = 16
 _OWN_TAILS = itertools.count(1)
 
 
-def _dp_client(num_engines=3, max_num_seqs=32, routing=True, counts=None):
+def _dp_client(
+    num_engines=3, max_num_seqs=32, routing=True, counts=None, prefix_caching=True
+):
     """A ``DPLBAsyncMPClient`` stand-in carrying what its balancer reads."""
     engines = [f"engine{i}".encode() for i in range(num_engines)]
     return SimpleNamespace(
@@ -749,13 +751,22 @@ def _dp_client(num_engines=3, max_num_seqs=32, routing=True, counts=None):
         eng_start_index=0,
         vllm_config=SimpleNamespace(
             additional_config={"tt": {"dp_prefix_cache_routing": routing}},
-            cache_config=SimpleNamespace(block_size=BLOCK),
+            cache_config=SimpleNamespace(
+                block_size=BLOCK, enable_prefix_caching=prefix_caching
+            ),
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         ),
     )
 
 
-def _dp_request(request_id, shared_blocks=0, own_blocks=1, data_parallel_rank=None):
+def _dp_request(
+    request_id,
+    shared_blocks=0,
+    own_blocks=1,
+    data_parallel_rank=None,
+    cache_salt=None,
+    skip_reading_prefix_cache=None,
+):
     """A prompt of ``shared_blocks`` blocks every such prompt shares, then its own."""
     tail = next(_OWN_TAILS) * 1000
     prompt = list(range(shared_blocks * BLOCK)) + [
@@ -765,7 +776,11 @@ def _dp_request(request_id, shared_blocks=0, own_blocks=1, data_parallel_rank=No
         request_id=request_id,
         prompt_token_ids=prompt,
         mm_features=None,
+        sampling_params=SimpleNamespace(
+            skip_reading_prefix_cache=skip_reading_prefix_cache
+        ),
         pooling_params=None,
+        cache_salt=cache_salt,
         data_parallel_rank=data_parallel_rank,
     )
 
@@ -941,6 +956,85 @@ def test_dp_a_prefix_cache_reset_forgets_what_the_engines_were_sent():
     follower = _dp_request("q", shared_blocks=4)
     assert _route(client, follower) == 0
     assert follower.data_parallel_rank is None
+
+
+def test_dp_block_hashes_fold_in_the_cache_salt():
+    from vllm_tt_plugin.prefix_routing import PrefixCacheMirror
+
+    mirror = PrefixCacheMirror(BLOCK, 2)
+    prompt = list(range(4 * BLOCK))
+    plain = mirror.block_hashes(prompt)
+    salted = mirror.block_hashes(prompt, cache_salt="s1")
+    assert len(plain) == len(salted) == 4
+    # The salt seeds the chain, so no block is shared; the salt is stable.
+    assert all(a != b for a, b in zip(plain, salted, strict=True))
+    assert mirror.block_hashes(prompt, cache_salt="s1") == salted
+    assert mirror.block_hashes(prompt, cache_salt="s2") != salted
+
+
+def test_dp_prefix_caching_off_leaves_every_request_to_the_balancer():
+    client = _dp_client(
+        prefix_caching=False, counts=[[1, 0, 0.0], [1, 0, 0.0], [0, 0, 0.0]]
+    )
+    assert _route(client, _dp_request("doc", shared_blocks=4)) == 2
+    _snapshot(client, [0, 0, 0.0], [0, 0, 0.0], [0, 1, 0.0])
+    follower = _dp_request("q", shared_blocks=4)
+    # No engine can reuse the prefix, so no record is kept and the follower
+    # goes where the balancer sends it: an idle engine, not the holder, unpinned.
+    assert _route(client, follower) != 2
+    assert follower.data_parallel_rank is None
+    assert client._tt_prefix_cache_mirror is None
+
+
+def test_dp_skip_read_request_is_load_routed_but_recorded():
+    from vllm_tt_plugin.prefix_routing import _dp_mirror
+
+    client = _dp_client(counts=[[1, 0, 0.0], [1, 0, 0.0], [0, 0, 0.0]])
+    assert _route(client, _dp_request("doc", shared_blocks=4)) == 2
+    _snapshot(client, [0, 0, 0.0], [0, 0, 0.0], [0, 1, 0.0])
+    skipper = _dp_request("skip", shared_blocks=4, skip_reading_prefix_cache=True)
+    # The engine will not look the prompt up in its cache: no hit credit, so
+    # the balancer's least-loaded engine (an idle one, not the holder) takes
+    # it, unpinned ...
+    engine = _route(client, skipper)
+    assert engine != 2
+    assert skipper.data_parallel_rank is None
+    # ... while its blocks are recorded there for the requests after it.
+    mirror = _dp_mirror(client)
+    prompt = skipper.prompt_token_ids
+    hits = mirror.cached_tokens(mirror.block_hashes(prompt), len(prompt) - 1)
+    assert hits[engine] >= 4 * BLOCK
+    assert hits[2] == 4 * BLOCK
+    assert hits[1 - engine] == 0
+
+
+def test_dp_cache_salt_separates_prefix_identity():
+    client = _dp_client(counts=[[1, 0, 0.0], [1, 0, 0.0], [0, 0, 0.0]])
+    assert _route(client, _dp_request("doc", shared_blocks=4, cache_salt="a")) == 2
+    _snapshot(client, [0, 0, 0.0], [0, 0, 0.0], [0, 1, 0.0])
+    other_salt = _dp_request("q-b", shared_blocks=4, cache_salt="b")
+    # Same tokens, another salt: a different cache identity, nothing to reuse,
+    # so the balancer's idle engine takes it, unpinned.
+    assert _route(client, other_salt) != 2
+    assert other_salt.data_parallel_rank is None
+    same_salt = _dp_request("q-a", shared_blocks=4, cache_salt="a")
+    assert _route(client, same_salt) == 2
+    assert same_salt.data_parallel_rank == 2
+
+
+def test_dp_skip_read_follows_the_request_rule():
+    from vllm_tt_plugin.prefix_routing import skips_prefix_cache_read
+
+    assert skips_prefix_cache_read(_dp_request("a")) is False
+    assert (
+        skips_prefix_cache_read(_dp_request("a", skip_reading_prefix_cache=True))
+        is True
+    )
+    pooled = _dp_request("a")
+    pooled.sampling_params = None
+    pooled.pooling_params = SimpleNamespace(skip_reading_prefix_cache=True)
+    assert skips_prefix_cache_read(pooled) is True
+    assert skips_prefix_cache_read(SimpleNamespace()) is False
 
 
 def test_dp_routing_patch_installs_once():

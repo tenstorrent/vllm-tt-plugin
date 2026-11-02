@@ -104,15 +104,20 @@ class PrefixCacheMirror:
         self._dispatched: dict[str, tuple[int, int, int]] = {}
 
     def block_hashes(
-        self, prompt_token_ids: Sequence[int], mm_identifiers: Iterable[str] = ()
+        self,
+        prompt_token_ids: Sequence[int],
+        mm_identifiers: Iterable[str] = (),
+        cache_salt: str | None = None,
     ) -> list[int]:
         """The chained hashes of the prompt's full blocks.
 
-        Multimodal item identifiers seed the chain, so prompts carrying
-        different items share no block, as their KV blocks would not.
+        The same identity inputs the KV cache manager folds into its first
+        block hash seed the chain: the multimodal item identifiers and the
+        request's ``cache_salt``, so prompts carrying different items or
+        different salts share no block, as their KV blocks would not.
         """
         size = self.block_size
-        parent = hash(("tt-prefix-cache-mirror", tuple(mm_identifiers)))
+        parent = hash(("tt-prefix-cache-mirror", tuple(mm_identifiers), cache_salt))
         hashes: list[int] = []
         for start in range(0, len(prompt_token_ids) - size + 1, size):
             parent = hash((parent, tuple(prompt_token_ids[start : start + size])))
@@ -199,12 +204,35 @@ def _dp_mirror(client: Any) -> PrefixCacheMirror | None:
     if mirror is _UNSET:
         vllm_config = client.vllm_config
         mirror = None
-        if get_tt_dp_prefix_cache_routing(vllm_config):
+        # No engine reuses a prefix with prefix caching off, so a record of
+        # who was sent what would only steer requests to busier engines.
+        if get_tt_dp_prefix_cache_routing(vllm_config) and bool(
+            vllm_config.cache_config.enable_prefix_caching
+        ):
             mirror = PrefixCacheMirror(
                 vllm_config.cache_config.block_size, len(client.core_engines)
             )
         client._tt_prefix_cache_mirror = mirror
     return mirror
+
+
+def skips_prefix_cache_read(request: Any) -> bool:
+    """Whether the engine will skip the prefix-cache lookup for ``request``.
+
+    ``Request.get_skip_reading_prefix_cache``'s rule, applied to the
+    ``EngineCoreRequest`` the router sees: the sampling parameters' flag when
+    set (``SamplingParams`` sets it for ``prompt_logprobs``, whose output
+    would be short of a cached prefix), else the pooling parameters', else
+    False. Such a request gains nothing from the engine holding its prefix.
+    """
+    for params in (
+        getattr(request, "sampling_params", None),
+        getattr(request, "pooling_params", None),
+    ):
+        flag = getattr(params, "skip_reading_prefix_cache", None)
+        if flag is not None:
+            return bool(flag)
+    return False
 
 
 def _upstream_load(client: Any) -> tuple[list[float], int]:
@@ -244,9 +272,12 @@ def route_dp_request(client: Any, request: Any, original: Callable) -> Any:
     """``DPLBAsyncMPClient.get_core_engine_for_request`` with prefix routing.
 
     ``original`` is vLLM's load balancer. A request with no prompt tokens, or
-    one sent while the engine set is changing, is left to it. Every other
-    prompt is looked up in the mirror; a request not already pinned by its
-    caller is pinned, through ``data_parallel_rank``, to the engine
+    one sent while the engine set is changing, is left to it, as is every
+    request when prefix caching is off (no mirror) and one the engine will
+    not look up in its cache (``skips_prefix_cache_read``: recorded, never
+    credited). Every other prompt is looked up in the mirror; a request not
+    already pinned by its caller is pinned, through ``data_parallel_rank``, to
+    the engine
     :func:`pick_prefix_cache_target` prefers over the balancer's own
     least-loaded choice, recomputed here from the counts the balancer reads.
     When the rule keeps the least-loaded engine the request stays unpinned and
@@ -264,10 +295,18 @@ def route_dp_request(client: Any, request: Any, original: Callable) -> Any:
     ):
         return original(client, request)
     hashes = mirror.block_hashes(
-        prompt, (feature.identifier for feature in request.mm_features or ())
+        prompt,
+        (feature.identifier for feature in request.mm_features or ()),
+        getattr(request, "cache_salt", None),
     )
     mirror.forget_finished(client.reqs_in_flight)
-    hits = mirror.cached_tokens(hashes, len(prompt) - 1)
+    # A request the engine will not look up in its cache reuses nothing: it
+    # gets no hit credit, so it is load-routed, while its blocks are still
+    # recorded below for the requests after it that may reuse them.
+    if skips_prefix_cache_read(request):
+        hits = [0] * mirror.num_engines
+    else:
+        hits = mirror.cached_tokens(hashes, len(prompt) - 1)
     if request.data_parallel_rank is None:
         scores, least = _upstream_load(client)
         max_num_seqs = client.vllm_config.scheduler_config.max_num_seqs

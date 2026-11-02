@@ -910,6 +910,13 @@ def test_max_num_logprobs_over_gappy_layout():
     assert b.max_num_logprobs is None  # no logprobs requested
     _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0, logprobs=5)), 1)
     assert b.max_num_logprobs == 5  # found despite the gappy (row 0 + row 4) layout
+    # The speculative input reads the SCHEDULED rows only: a step that
+    # schedules the greedy row 0 while row 4 (logprobs) sits in its prefill
+    # carries no logprob request, so an argmax_ids verify is not refused.
+    assert b.max_num_logprobs_for_rows([0]) is None
+    assert b.max_num_logprobs_for_rows([4]) == 5
+    assert b.max_num_logprobs_for_rows([0, 4]) == 5
+    assert b.max_num_logprobs_for_rows([]) is None
 
 
 def test_merged_sampling_metadata_filters_generators_to_scheduled_rows():

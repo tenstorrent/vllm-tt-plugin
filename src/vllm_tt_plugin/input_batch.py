@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1114,6 +1114,22 @@ class TTLaneInputBatch(InputBatch):
             return None
         return max_val
 
+    def max_num_logprobs_for_rows(self, rows: Sequence[int]) -> int | None:
+        """Max logprobs over ``rows`` only, or None if none of them need logprobs.
+
+        The speculative decode input is read per scheduled row: an occupied
+        slot the step did not schedule (a request partway through its prefill
+        while the lane decodes) produces no token, so its logprobs request must
+        not reach the verify, whose ``argmax_ids`` mode refuses a step that
+        carries one.
+        """
+        if not rows:
+            return None
+        max_val = int(self.sampling.num_logprobs[list(rows)].max().item())
+        if max_val < 0:
+            return None
+        return max_val
+
     def refresh_logitsprocs(self) -> None:
         """Apply batch state changes to logits processors over the full slot
         batch. Passes ``max_num_reqs`` (not ``num_reqs``) as the batch size so
@@ -1469,7 +1485,10 @@ class TTLaneInputBatch(InputBatch):
             # sidecars, keyed by slot row.
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[bad_words_token_ids],
-            max_num_logprobs=[lane_batch.max_num_logprobs],
+            # Over the scheduled rows, like ``row_req_ids`` / ``live_rows``: an
+            # occupied slot the step did not schedule contributes no token and
+            # must not make an ``argmax_ids`` verify refuse the step.
+            max_num_logprobs=[lane_batch.max_num_logprobs_for_rows(scheduled_rows)],
             logitsprocs_list=[None],
             generators_list=[generators],
             prefill_empty_slots=None,

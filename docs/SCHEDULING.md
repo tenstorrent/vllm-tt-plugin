@@ -785,9 +785,15 @@ same prefix the less loaded one is the candidate, and equal hits resolve on
 load. The API server cannot read a rank's cache, so the plugin keeps its own
 record of which rank each prompt block was sent to
 (`vllm_tt_plugin.prefix_routing.PrefixCacheMirror`), hashed per cache block
-as the KV cache manager hashes them, and pins the request through
+over the identity inputs the KV cache manager folds into its block hashes
+(the prompt tokens, the multimodal item identifiers and the request's
+`cache_salt`), and pins the request through
 `EngineCoreRequest.data_parallel_rank`, which the balancer honors ahead of its
-own choice; a request the caller already pinned keeps its rank. The record is
+own choice; a request the caller already pinned keeps its rank. The routing
+only applies where a hit is possible: with prefix caching disabled no record
+is kept, and a request the engine will not look up in its cache
+(`skip_reading_prefix_cache`, which `prompt_logprobs` sets) is load-routed
+while its blocks are still recorded for the requests after it. The record is
 not told of an eviction, is cleared by a prefix-cache reset, and is per API
 server, so `--api-server-count` above 1 routes on each server's own
 dispatches. Queued prefill is estimated from the balancer's waiting count and
