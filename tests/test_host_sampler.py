@@ -7,6 +7,7 @@ import pytest
 import torch
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
+from vllm_tt_plugin import host_sampler
 from vllm_tt_plugin.host_sampler import TTTopKTopPSampler
 
 
@@ -87,6 +88,9 @@ def test_fallback_keeps_global_and_request_rng_state(kind):
 def test_unseeded_categorical_preserves_filter_and_scores(monkeypatch, mode):
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
+    # Exercise the full-vocabulary path; candidate sampling is tested below.
+    monkeypatch.setattr(host_sampler, "TOP_P_CANDIDATES", 4101)
+
     logits = torch.randn(4, 4101)
     k = torch.tensor([1, 20, 100, 4101], dtype=torch.int32)
     p = torch.tensor([0.0, 0.5, 0.95, 1.0])
@@ -150,3 +154,82 @@ def test_unseeded_categorical_distribution_and_zero_support():
     assert counts[[7, 109, 4095]].sum() == tokens.numel()
     observed = counts[[7, 109, 4095]].double() / tokens.numel()
     torch.testing.assert_close(observed, probabilities.double(), rtol=0, atol=0.02)
+
+
+def _candidate_probs(monkeypatch, logits, k, p):
+    """Return the dense distribution that candidate sampling draws from."""
+    captured = []
+    original = torch.multinomial
+
+    def draw(probs, num_samples, **kwargs):
+        captured.append(probs / probs.sum(-1, keepdim=True))
+        return original(probs, num_samples, **kwargs)
+
+    monkeypatch.setattr(torch, "multinomial", draw)
+    tokens, exact = host_sampler._sample_top_p_candidates(logits, k, p)
+    monkeypatch.setattr(torch, "multinomial", original)
+    dense = torch.zeros_like(logits)
+    if captured:
+        _, indices = logits.topk(host_sampler.TOP_P_CANDIDATES, dim=-1)
+        rows = exact.nonzero().squeeze(1)
+        dense[rows] = dense[rows].scatter(1, indices[rows], captured[0])
+    return tokens, exact, dense
+
+
+@pytest.mark.parametrize("top_k", [None, "vocab", 20, "mixed"])
+def test_top_p_candidates_match_full_filter(monkeypatch, top_k):
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+    torch.manual_seed(5)
+    batch, vocab = 16, 8192
+    monkeypatch.setattr(host_sampler, "TOP_P_CANDIDATES", 256)
+    # Peaked rows fit inside the candidates; flat rows do not.
+    scale = torch.tensor([12.0] * 12 + [0.1] * 4).unsqueeze(1)
+    logits = torch.randn(batch, vocab) * scale
+    p = torch.tensor([0.0, 0.5, 0.9, 0.95, 0.99, 1.0, 0.7, 0.8] * 2)
+    k = {
+        None: None,
+        "vocab": torch.full((batch,), vocab),
+        20: torch.full((batch,), 20),
+        "mixed": torch.tensor([vocab, 1, 20, 256] * 4),
+    }[top_k]
+    tokens, exact, dense = _candidate_probs(monkeypatch, logits, k, p)
+    expected = apply_top_k_top_p(logits.clone(), k, p).softmax(-1)
+    assert exact.any()
+    torch.testing.assert_close(dense[exact], expected[exact], rtol=0, atol=1e-5)
+    assert (expected[exact].gather(1, tokens[exact].unsqueeze(1)) > 0).all()
+    if top_k in (None, "vocab"):
+        # Rows needing more than the candidates, or p = 1, must fall back.
+        assert not exact[12:].any() and not exact[5]
+
+
+def test_top_p_candidates_reject_large_top_k(monkeypatch):
+    monkeypatch.setattr(host_sampler, "TOP_P_CANDIDATES", 64)
+    logits = torch.randn(2, 4096)
+    k = torch.tensor([65, 4096])
+    assert host_sampler._sample_top_p_candidates(logits, k, torch.ones(2)) is None
+
+
+def test_unseeded_top_p_falls_back_per_row(monkeypatch):
+    torch.manual_seed(9)
+    monkeypatch.setattr(host_sampler, "TOP_P_CANDIDATES", 64)
+    logits = torch.full((2, 4096), -torch.inf)
+    # Row 0 fits in the candidates; row 1 spreads mass over 1024 tokens.
+    logits[0, [3, 77]] = torch.tensor([0.75, 0.25]).log()
+    logits[1, 1000:2024] = 0.0
+    p = torch.tensor([0.95, 0.95])
+    full = []
+    original = TTTopKTopPSampler._sample_unseeded_full
+
+    def spy(self, values, k, p):
+        full.append(values.shape[0])
+        return original(self, values, k, p)
+
+    monkeypatch.setattr(TTTopKTopPSampler, "_sample_unseeded_full", spy)
+    sampler = TTTopKTopPSampler()
+    for _ in range(50):
+        tokens, scores = sampler(logits.clone(), {}, None, p)
+        assert scores is None
+        assert tokens[0].item() in (3, 77)
+        assert 1000 <= tokens[1].item() < 2024
+    assert full == [1] * 50

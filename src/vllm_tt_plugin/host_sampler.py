@@ -27,6 +27,54 @@ class _PrefetchedNoise:
     future: Future
 
 
+# Candidates read before the full-vocabulary top-p sort. A row is sampled from
+# them only when they provably contain its whole top-p set.
+TOP_P_CANDIDATES = 1024
+
+
+def _sample_top_p_candidates(logits, k, p):
+    """Sample top-p rows from the largest logits without sorting the vocabulary.
+
+    The top-p set of a row is the shortest descending prefix whose exclusive
+    cumulative probability stays below ``p``. When the first candidates already
+    reach ``p`` (or a top-k limit fits inside them), that prefix lies inside the
+    candidates and the distribution equals ``apply_top_k_top_p`` up to ties at
+    the boundary. Rows that do not qualify fall back to the full sort.
+    """
+    batch, vocab = logits.shape
+    count = min(TOP_P_CANDIDATES, vocab)
+    if count == vocab:
+        return None
+    values, indices = logits.topk(count, dim=-1)
+    values = values.float()
+    if k is None:
+        limited = torch.zeros(batch, dtype=torch.bool)
+    else:
+        k = k.to(torch.long)
+        limited = k < vocab
+        if (limited & (k > count)).any():
+            return None
+        outside = torch.arange(count) >= k.unsqueeze(1)
+        values.masked_fill_(limited.unsqueeze(1) & outside, -float("inf"))
+    # Top-k rows renormalize over their candidates; others over the vocabulary.
+    norm = torch.where(
+        limited, values.logsumexp(dim=-1), logits.float().logsumexp(dim=-1)
+    )
+    probs = (values - norm.unsqueeze(1)).exp()
+    covered = probs.cumsum(dim=-1)
+    # p = 1 keeps every nonzero probability, which candidates cannot bound.
+    fits = (covered[:, -1] >= p) & (p < 1)
+    exact = (limited | fits) & torch.isfinite(norm)
+    keep = (covered - probs) < p.unsqueeze(1)
+    keep[:, 0] = True
+    probs.masked_fill_(~keep, 0.0)
+    tokens = torch.zeros(batch, dtype=torch.long)
+    if exact.any():
+        choice = torch.multinomial(probs[exact], num_samples=1)
+        tokens[exact] = indices[exact].gather(1, choice).squeeze(1)
+    return tokens, exact
+
+
 class TTTopKTopPSampler(TopKTopPSampler):
     def __init__(self, logprobs_mode="raw_logprobs", use_fp64_gumbel=False):
         super().__init__(logprobs_mode, use_fp64_gumbel)
@@ -80,6 +128,19 @@ class TTTopKTopPSampler(TopKTopPSampler):
             return self._sample_seeded(logits, generators, k, p)
 
     def _sample_unseeded_cpu(self, logits, k, p):
+        if self.logprobs_mode == "raw_logprobs" and p is not None:
+            fast = _sample_top_p_candidates(logits, k, p)
+            if fast is not None:
+                tokens, exact = fast
+                if not exact.all():
+                    rest = ~exact
+                    tokens[rest] = self._sample_unseeded_full(
+                        logits[rest], None if k is None else k[rest], p[rest]
+                    )[0]
+                return tokens, None
+        return self._sample_unseeded_full(logits, k, p)
+
+    def _sample_unseeded_full(self, logits, k, p):
         values = apply_top_k_top_p(logits, k, p)
         scores = None
         if self.logprobs_mode == "processed_logits":
