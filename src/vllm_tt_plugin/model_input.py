@@ -177,6 +177,12 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
+    # MambaSpec groups only: one entry per layer, in ``block_tables_per_layer``
+    # order. A MambaSpec layer's entry is int32 ``[rows, 1]``, the block id that
+    # holds each row's recurrent state, read from its group's block table; an
+    # attention layer's entry is ``None``. ``None`` without MambaSpec groups.
+    state_block_ids_per_layer: list[torch.Tensor | None] | None = None
+
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because
     # the accept walk needs them again after the verify returns. ``spec_mode``
