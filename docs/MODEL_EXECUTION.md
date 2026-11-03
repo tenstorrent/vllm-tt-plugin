@@ -21,7 +21,9 @@ The plugin rejects encoder-decoder models and `prompt_embeds` input.
 - `start_pos=-1` marks an inactive decode row. The model adapter must not
   interpret an inactive row as a live request or modify another request's state.
 - `page_table` is the first KV group's integer logical-to-physical block
-  table. If the resolved cache has multiple groups, the plugin also sends
+  table. With `MambaSpec` groups it is the first attention group's table,
+  because group 0 can be a `MambaSpec` group. If the resolved cache has
+  multiple groups, the plugin also sends
   `page_tables_per_layer`, ordered by attention-layer index, or by the index
   of every layer when the cache has `MambaSpec` groups. The model adapter must
   use the page table for each layer. See [KV setup](MODEL_SETUP.md).
@@ -58,13 +60,27 @@ for that layer's group.
 
 A row whose `start_pos` is 0 has no earlier state. The model must start that
 row from zero state and must not read its block: vLLM 0.30.0 does not zero
-recurrent-state blocks, so the block can hold stale bytes. Padding rows have
-block 0, the null block. vLLM never allocates block 0 to a request, so the
-model can read or write block 0 without changing live state, and ignores the
-result. `TTModelRunner` derives `state_block_ids_per_layer` from the page
-tables, so it changes only on a step whose page tables or batch layout change.
-Under the [decode reload contract](DECODE_RELOAD_CONTRACT.md), reload it when
-the page tables are reloaded.
+recurrent-state blocks, so the block can hold stale bytes.
+
+Padding rows have block 0, the null block. vLLM never allocates block 0 to a
+request, so the model can read or write block 0 without changing live state,
+and ignores the result. On the layer-slot overlay, padding rows write their
+state into block 0, so block 0 can hold any bytes, including fp32 state that
+reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+
+vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers
+(`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`).
+A block that held Mamba state can be reassigned to an attention group, and its
+stale bytes then read as NaN or Inf at positions attention does not write.
+vLLM lists only the blocks newly allocated to attention groups
+(`vllm/v1/core/single_type_kv_cache_manager.py:117-121`). This is why the
+adapter must implement `zero_kv_cache_blocks`; see
+[block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
+
+`TTModelRunner` derives `state_block_ids_per_layer` from the page tables, so it
+changes only on a step whose page tables or batch layout change. Under the
+[decode reload contract](DECODE_RELOAD_CONTRACT.md), reload it when the page
+tables are reloaded.
 
 ## Prefill
 
