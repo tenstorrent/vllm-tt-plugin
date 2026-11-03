@@ -774,25 +774,29 @@ one group to each rank through `TT_VISIBLE_DEVICES`. Request routing binds each
 request to one rank; requests do not migrate between ranks.
 
 Each rank is a separate tt-metal process, so the worker also separates their
-diagnostics before the first device open: the Inspector RPC address is offset
-by rank (`TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS`), `TT_METAL_LOGS_PATH` gains a
-`dp_rank_<n>` component, and the auto-triage command in
-`TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` receives that rank's Inspector
-host, port and log path as quoted shell words after the `triage`, `triage.py`
-or `tt-triage.py` entry point. The entry point is recognised where the shell
-would run it: as a command (also behind `env`, `exec`, `nohup`, `time`,
-`command` or `timeout`) or as the script given to a Python interpreter; the
-same name as an argument elsewhere (`test -f tools/triage.py`) is left alone.
-Inspector flags the invocation already carries, in either docopt spelling and
-however quoted, move with the rank when they match the configured address and
-log directory; a value the shell expands later (`"$LOGS"`) is kept with a
-warning; any other explicit value raises before the device opens. Redirections
-(`2>&1`, `>out.log`) and other commands in a pipeline are never read as flags
-or edited, and a command with no recognised entry point is left unchanged with
-a warning. Without this all ranks bind `localhost:50051`, and a
-triage run from a rank that lost the bind reads a neighbouring rank's device
-list, which does not intersect its own `TT_VISIBLE_DEVICES` set, so every
-dispatcher-backed dump is skipped. See `utils/dp_lane_metal_env.py`.
+diagnostics before the first device open, using tt-metal's own variables
+(`tt_metal/llrt/rtoptions.cpp`); the plugin adds none of its own:
+
+| Variable | tt-metal meaning | Per rank `n` |
+|---|---|---|
+| `TT_METAL_INSPECTOR_RPC` | `0` disables the Inspector RPC server | read only |
+| `TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS` | `host:port` the server listens on (default `localhost:50051`) | `host:port+n` |
+| `TT_METAL_LOGS_PATH` | directory for everything tt-metal generates: inspector, watcher, dprint, profiler, NoC logs, reports (default: working directory) | `<inherited>/dp_rank_<n>` |
+| `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` | shell command run on a dispatch timeout (tt-metal documents `./tools/tt-triage.py`) | the rank's Inspector host, port and log path inserted as quoted words after the `triage` / `triage.py` / `tt-triage.py` word |
+
+Note the log layout: under standard DP everything that used to land in
+`<TT_METAL_LOGS_PATH>/generated/...` lands in
+`<TT_METAL_LOGS_PATH>/dp_rank_<n>/generated/...`, one tree per rank, so ranks
+no longer overwrite each other's watcher, dprint or inspector files. Single-rank
+and MPI launches keep the plain layout. The triage command stays the operator's:
+one that already names an Inspector flag, or has no triage word, is left as
+written with a warning that gives the rank's values. Without this all ranks
+bind `localhost:50051`, and a triage run from a rank that lost the bind reads a
+neighbouring rank's device list, which does not intersect its own
+`TT_VISIBLE_DEVICES` set, so every dispatcher-backed dump is skipped. tt-metal
+offsets these by rank only for MPI launches (tenstorrent/tt-metal#63345 asks
+for a same-host equivalent, at which point this goes away). See
+`utils/dp_lane_metal_env.py`.
 
 vLLM's DP load balancer (`DPLBAsyncMPClient.get_core_engine_for_request`,
 in the API server) picks the least-loaded rank, and each rank's prefix cache
