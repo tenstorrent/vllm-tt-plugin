@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
@@ -51,14 +53,14 @@ def test_parallel_sampling_preserves_tokens_scores_and_rng(batch, fp64, mode, fi
             parallel._sampling_pool.shutdown()
 
 
-@pytest.mark.parametrize("kind", ["unseeded", "partial", "shared"])
+@pytest.mark.parametrize("kind", ["small_unseeded", "partial", "shared"])
 def test_fallback_keeps_global_and_request_rng_state(kind):
     torch.manual_seed(9)
-    logits = torch.randn(8, 4101)
+    logits = torch.randn(8, 1024 if kind == "small_unseeded" else 4101)
     native = TopKTopPSampler()
     parallel = TTTopKTopPSampler()
     generators = {i: torch.Generator().manual_seed(20 + i) for i in range(8)}
-    if kind == "unseeded":
+    if kind == "small_unseeded":
         generators = {}
     elif kind == "partial":
         generators = {i: gen for i, gen in generators.items() if i % 2}
@@ -77,3 +79,74 @@ def test_fallback_keeps_global_and_request_rng_state(kind):
     assert torch.equal(torch.get_rng_state(), global_final)
     assert all(torch.equal(gen.get_state(), final[i]) for i, gen in generators.items())
     assert parallel._sampling_pool is None
+
+
+@pytest.mark.parametrize(
+    "mode", ["raw_logprobs", "processed_logits", "processed_logprobs"]
+)
+def test_unseeded_categorical_preserves_filter_and_scores(monkeypatch, mode):
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+    logits = torch.randn(4, 4101)
+    k = torch.tensor([1, 20, 100, 4101], dtype=torch.int32)
+    p = torch.tensor([0.0, 0.5, 0.95, 1.0])
+    filtered = apply_top_k_top_p(logits.clone(), k, p)
+    expected = filtered.softmax(-1)
+    observed = []
+    original = torch.multinomial
+
+    def draw(probs, num_samples, replacement):
+        torch.testing.assert_close(probs, expected, rtol=0, atol=0)
+        assert num_samples == 2 and replacement is True
+        result = original(probs, num_samples, replacement)
+        observed.append(result)
+        return result
+
+    monkeypatch.setattr(torch, "multinomial", draw)
+    tokens, scores = TTTopKTopPSampler(mode)(logits.clone(), {}, k, p)
+    assert len(observed) == 1
+    assert torch.equal(tokens, observed[0][:, 0])
+    assert tokens.is_contiguous()
+    if mode == "processed_logits":
+        torch.testing.assert_close(scores, filtered, rtol=0, atol=0)
+    elif mode == "processed_logprobs":
+        torch.testing.assert_close(scores, filtered.log_softmax(-1), rtol=0, atol=0)
+    else:
+        assert scores is None
+
+
+def test_unseeded_invalid_probabilities_preserve_native_rng():
+    logits = torch.full((2, 4101), -torch.inf)
+    state = torch.get_rng_state()
+    expected, _ = TopKTopPSampler().forward_native(logits.clone(), {}, None, None)
+    after = torch.get_rng_state()
+    torch.set_rng_state(state)
+    actual, _ = TTTopKTopPSampler()(logits.clone(), {}, None, None)
+    assert torch.equal(actual, expected)
+    assert torch.equal(torch.get_rng_state(), after)
+
+
+def test_unseeded_large_vocabulary_uses_native_fallback(monkeypatch):
+    logits = SimpleNamespace(shape=(1, 2**24 + 1), device=torch.device("cpu"))
+    expected = object()
+
+    def native(self, values, generators, k, p):
+        assert values is logits
+        assert generators == {} and k is None and p is None
+        return expected
+
+    monkeypatch.setattr(TopKTopPSampler, "forward_native", native)
+    assert TTTopKTopPSampler().forward_native(logits, {}, None, None) is expected
+
+
+def test_unseeded_categorical_distribution_and_zero_support():
+    torch.manual_seed(711)
+    logits = torch.full((1024, 4096), -torch.inf)
+    probabilities = torch.tensor([0.125, 0.25, 0.625])
+    logits[:, [7, 109, 4095]] = probabilities.log()
+    sampler = TTTopKTopPSampler()
+    tokens = torch.cat([sampler(logits.clone(), {}, None, None)[0] for _ in range(10)])
+    counts = torch.bincount(tokens, minlength=4096)
+    assert counts[[7, 109, 4095]].sum() == tokens.numel()
+    observed = counts[[7, 109, 4095]].double() / tokens.numel()
+    torch.testing.assert_close(observed, probabilities.double(), rtol=0, atol=0.02)

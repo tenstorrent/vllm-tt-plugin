@@ -292,6 +292,14 @@ submitted batch. If any request or batch feature cannot use on-device
 sampling, the batch uses vLLM's host-side path. Structured outputs have
 additional rules; see [Structured Output Sampling](#structured-output-sampling).
 
+For unseeded CPU batches with a large vocabulary, host sampling uses PyTorch
+replacement multinomial draws after the same upstream top-k/top-p filter.
+The first of two draws is retained to avoid the expensive single-draw
+exponential-noise path. This preserves the categorical sampling distribution
+and processed logprob settings, but changes global RNG advancement for unseeded
+requests. Batches containing request generators, FP64 Gumbel requests, and
+non-CPU sampling retain their existing implementation.
+
 Single-token-output models can explicitly use
 `"seeded_sampling_policy": "host"` to sample requests with an API seed on
 host during both prefill and decode. The default, `"auto"`, preserves the

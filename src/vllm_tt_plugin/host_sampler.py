@@ -13,6 +13,7 @@ import torch
 from vllm.v1.sample.ops.topk_topp_sampler import (
     TopKTopPSampler,
     apply_top_k_top_p,
+    random_sample,
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import Sampler
@@ -55,6 +56,15 @@ class TTTopKTopPSampler(TopKTopPSampler):
     def forward_native(self, logits, generators, k, p):
         batch, vocab = logits.shape
         if (
+            logits.device.type == "cpu"
+            and batch > 0
+            # PyTorch multinomial supports at most 2**24 categories.
+            and 4096 <= vocab <= 2**24
+            and not generators
+            and not self.use_fp64_gumbel
+        ):
+            return self._sample_unseeded_cpu(logits, k, p)
+        if (
             logits.device.type != "cpu"
             or batch == 0
             or vocab < 4096
@@ -68,6 +78,27 @@ class TTTopKTopPSampler(TopKTopPSampler):
         # generator itself, and verify its complete state before reusing noise.
         with self._sampling_lock:
             return self._sample_seeded(logits, generators, k, p)
+
+    def _sample_unseeded_cpu(self, logits, k, p):
+        values = apply_top_k_top_p(logits, k, p)
+        scores = None
+        if self.logprobs_mode == "processed_logits":
+            scores = values
+        elif self.logprobs_mode == "processed_logprobs":
+            scores = values.log_softmax(dim=-1, dtype=torch.float32)
+        probs = values.softmax(dim=-1, dtype=torch.float32)
+        totals = probs.sum(dim=-1)
+        if not (
+            torch.isfinite(totals).all() and (totals > 0).all() and (probs >= 0).all()
+        ):
+            # Preserve native handling without consuming RNG or filtering twice.
+            return random_sample(probs, {}, False), scores
+        # Two replacement draws avoid PyTorch's single-draw exponential race
+        # over every vocabulary entry. Keeping the first draw preserves the
+        # categorical marginal. Unseeded global RNG advancement changes; every
+        # batch with request generators retains the existing path above.
+        tokens = torch.multinomial(probs, num_samples=2, replacement=True)
+        return tokens[:, 0].contiguous(), scores
 
     def _sample_seeded(self, logits, generators, k, p):
         batch, vocab = logits.shape
