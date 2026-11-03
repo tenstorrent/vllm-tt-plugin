@@ -342,9 +342,15 @@ class TTLaneCoordinator(SchedulerInterface):
         Shallow-copies ``vllm_config`` and its ``scheduler_config`` so the
         per-lane ``max_num_seqs`` override does not leak back onto the shared
         config the coordinator and model runner read for global sizing. All
-        lanes share this one view; the base scheduler only reads
-        ``max_num_seqs`` from it (to set ``max_num_running_reqs``), never
+        lanes share this one view; the base scheduler reads it and never
         mutates it.
+
+        ``max_num_active_seqs`` passes through unchanged because it is already
+        per-lane: only ``_convert_dp_to_lanes`` enters lane mode, so the user's
+        ``--max-num-seqs`` and ``--max-num-active-seqs`` are per-rank values,
+        and vLLM checks ``max_num_active_seqs <= max_num_seqs`` when it builds
+        ``SchedulerConfig``, before that conversion multiplies ``max_num_seqs``
+        by the lane count.
         """
         per_lane_vllm_config = copy.copy(vllm_config)
         per_lane_scheduler_config = copy.copy(vllm_config.scheduler_config)
