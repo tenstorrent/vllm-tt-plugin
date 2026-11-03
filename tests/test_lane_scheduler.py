@@ -744,6 +744,46 @@ def test_make_stats_sums_every_lanes_prefix_cache_stats():
     )  # read once per update
 
 
+def test_lanes_record_prefix_cache_stats_for_the_coordinator():
+    # The lanes run with log_stats off, and a KV cache manager built that way
+    # records no prefix-cache stats, so the sum above would always be zero. A
+    # real coordinator over real lanes: the step that prefills a cold prompt
+    # reports its queries, and the one that prefills its repeat its hits.
+    from tests.test_block_scheduler import (
+        BLOCK_SIZE,
+        _request,
+        _runner_output,
+        _scheduler,
+    )
+    from vllm_tt_plugin.config import store_tt_lane_count
+
+    base = _scheduler(1, max_num_seqs=2)
+    config = base.vllm_config
+    config.cache_config.enable_prefix_caching = True
+    store_tt_lane_count(config, 2)
+    coordinator = TTLaneCoordinator(
+        config,
+        base.kv_cache_config,
+        base.structured_output_manager,
+        BLOCK_SIZE,
+        log_stats=True,
+    )
+
+    prompt_length = BLOCK_SIZE + 8
+    for request_id, hits in (("cold", 0), ("warm", BLOCK_SIZE)):
+        coordinator.add_request(
+            _request(1, request_id=request_id, prompt_length=prompt_length)
+        )
+        output = coordinator.schedule()
+        outputs = coordinator.update_from_output(output, _runner_output(output, [7]))
+        stats = next(iter(outputs.values())).scheduler_stats.prefix_cache_stats
+        assert (stats.requests, stats.queries, stats.hits) == (
+            1,
+            prompt_length,
+            hits,
+        )
+
+
 def test_a_lane_keeps_its_drafts_for_the_coordinator():
     # A lane runs with log_stats off, so the base scheduler would drop every
     # draft and lane-DP serving would report no speculation at all.
