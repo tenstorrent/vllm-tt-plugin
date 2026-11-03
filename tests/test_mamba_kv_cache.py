@@ -426,7 +426,10 @@ def test_state_block_selection_matches_upstream():
     spec = _layer_specs()["model.layers.0.linear_attn"]
     for mode in ("none", "align"):
         groups = MambaCacheGroups(
-            group_indices=(0,), mamba_cache_mode=mode, block_size=BLOCK_SIZE
+            group_indices=(0,),
+            mamba_cache_mode=mode,
+            block_size=BLOCK_SIZE,
+            attention_group_index=1,
         )
         expected = mamba_get_block_table_tensor(block_table, seq_lens, spec, mode)
         # Mode none passes the whole row through; its state is column 0.
@@ -546,6 +549,48 @@ def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
     name, kwargs = model.calls[-1]
     assert name == "decode_forward"
     assert kwargs["state_block_ids_per_layer"] is decode.state_block_ids_per_layer
+
+
+def test_page_table_is_the_attention_groups_table():
+    """``page_table`` is an attention table although group 0 is a GDN group.
+
+    vLLM orders the groups by spec, so the GDN groups come first here. A model
+    that reads ``page_table`` for attention must get the attention group's
+    rows in prefill and in decode.
+    """
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    assert isinstance(
+        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec, MambaSpec
+    )
+    attention_group = 3
+    blocks_a = ([10], [11], [12], [20, 21])
+    blocks_b = ([30], [31], [32], [40])
+
+    prefill = runner.build_model_input(
+        _step(
+            {"a": 1500, "b": 700},
+            new=[_new_request("a", 1500, blocks_a), _new_request("b", 700, blocks_b)],
+        ),
+        None,
+    )
+    runner.submit_prefill(prefill, [2])
+    decode = runner.build_model_input(
+        _step({"a": 1, "b": 1}, cached=[("a", 1500, None), ("b", 700, None)]),
+        None,
+    )
+    runner.async_decode.submit_decode(decode, read_from_device=True)
+
+    forwards = [kwargs for name, kwargs in model.calls if name.endswith("_forward")]
+    assert len(forwards) == 2
+    for model_input, kwargs in zip((prefill, decode), forwards):
+        page_table = kwargs["page_table"]
+        assert torch.equal(
+            page_table, model_input.block_tables_per_group[attention_group]
+        )
+        assert page_table[0, :2].tolist() == [20, 21]
+        assert page_table[1, :1].tolist() == [40]
 
 
 def test_attention_only_model_without_hooks_ignores_block_zeroing():

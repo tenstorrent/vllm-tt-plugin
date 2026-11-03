@@ -48,6 +48,10 @@ class MambaCacheGroups:
     mamba_cache_mode: str
     # ``MambaSpec.block_size``, the same in every Mamba group.
     block_size: int
+    # The first attention group; its block table is the ``page_table`` the
+    # model receives. vLLM orders groups by spec, so group 0 can be a Mamba
+    # group.
+    attention_group_index: int
     # Mode ``align`` only: request id -> the block-table column that holds the
     # request's running state after its last scheduled step. Upstream keeps
     # the same map as ``GPUModelRunner.mamba_state_idx``.
@@ -155,7 +159,15 @@ def mamba_cache_groups(
     )
     if not group_indices:
         return None
-    if not any(isinstance(g.kv_cache_spec, AttentionSpec) for g in kv_cache_groups):
+    attention_group_index = next(
+        (
+            i
+            for i, group in enumerate(kv_cache_groups)
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+        ),
+        None,
+    )
+    if attention_group_index is None:
         raise ValueError(
             "The KV cache config has MambaSpec groups but no attention group. "
             "A TT model keeps Mamba state in the attention layer-slot buffers, "
@@ -195,4 +207,5 @@ def mamba_cache_groups(
         group_indices=group_indices,
         mamba_cache_mode=mode,
         block_size=block_sizes.pop(),
+        attention_group_index=attention_group_index,
     )
