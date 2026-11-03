@@ -142,7 +142,8 @@ a buffer. A single-group cache gives every attention layer a separate
 
 When vLLM creates multiple KV groups, `TTModelRunner` expands group page tables
 into `page_tables_per_layer`, ordered by attention-layer index. Prefill and
-decode receive `page_tables_per_layer` in addition to group 0's `page_table`.
+decode receive `page_tables_per_layer` in addition to group 0's `page_table`
+(the first attention group's with `MambaSpec` groups).
 Each per-layer tensor has shape
 `[tt_max_batch_size, max_num_blocks_per_req]`, with unused rows and columns
 zero-padded. The per-layer row capacity can exceed `tokens.shape[0]` during
@@ -230,8 +231,10 @@ of earlier block boundaries as prefix-cache entries; as with cached attention
 blocks, vLLM evicts them when it needs free blocks.
 
 Page tables: `page_tables_per_layer` has one entry per layer, and the entry of
-a recurrent layer is its group's table. Group 0 can be a `MambaSpec` group, so
-`page_table` is not always an attention table; use `page_tables_per_layer`.
+a recurrent layer is its group's table. vLLM orders the groups by
+specification, so group 0 can be a `MambaSpec` group. With `MambaSpec` groups,
+`page_table` is therefore the table of the first attention group, not of
+group 0.
 The table width `max_num_blocks_per_req` is the largest
 `ceil(max_model_len / block_size)` over the groups, at most `num_blocks`,
 rounded up to a multiple of 8. TT chunked SDPA requires a page-table row of a

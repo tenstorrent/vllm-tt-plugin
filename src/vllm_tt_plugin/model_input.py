@@ -113,7 +113,8 @@ class TTModelInput:
     input_positions: torch.Tensor
     prompt_lens: list[int] | None
     # Group-0 block table, retained as a tensor for back-compat with the
-    # padding paths that read it as ``block_tables``.
+    # padding paths that read it as ``block_tables``. With MambaSpec groups it
+    # is the first attention group's table.
     # Hybrid models must additionally consult ``block_tables_per_group``
     # below; legacy single-group models can continue to use this field.
     block_tables: torch.Tensor
