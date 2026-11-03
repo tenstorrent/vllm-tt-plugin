@@ -94,6 +94,8 @@ passed to `initialize_vllm_model`. The plugin uses `131_072` when the sizing
 call raises `AttributeError`, including when `get_max_tokens_all_users` is absent.
 The plugin adds output reservation and applicable sliding-window headroom.
 The plugin does not measure free device memory to choose this KV budget.
+A model with `MambaSpec` layers gets a different block count; see
+[Recurrent state](#recurrent-state-mambaspec).
 
 The optional class-callable `get_kv_cache_spec(vllm_config)` returns
 `dict[str, KVCacheSpec] | None`. `TTWorker.get_kv_cache_spec` uses a homogeneous
@@ -101,9 +103,10 @@ specification named `"foo"` when `get_kv_cache_spec` is absent or returns `None`
 For per-layer specifications, use names containing `layers.<index>`, such as
 `model.layers.5.self_attn`, and cover every attention-layer index.
 
-`TTModelRunner` accepts `AttentionSpec` groups and `UniformTypeKVCacheSpecs`
-groups. `UniformTypeKVCacheSpecs` can carry different per-layer shapes within
-one group. The worker advertises only the vLLM `LBNHC` cache layout.
+`TTModelRunner` accepts `AttentionSpec` groups, `UniformTypeKVCacheSpecs`
+groups, and `MambaSpec` groups next to attention groups.
+`UniformTypeKVCacheSpecs` can carry different per-layer shapes within one
+group. The worker advertises only the vLLM `LBNHC` cache layout.
 
 A stage with no token KV cache, such as an audio decoder, uses a `TTWorker`
 subclass that sets `uses_token_kv_cache = False`. That worker sizes no KV pool
@@ -120,6 +123,8 @@ Sources: `get_num_available_blocks_tt`, `TTWorker.get_kv_cache_spec`, and
 
 1. `TTModelRunner._build_per_layer_specs` translates the vLLM cache plan into
    `(shape, dtype, tensor_idx)` triples, ordered by attention-layer index.
+   With `MambaSpec` groups, the list covers every layer; see
+   [Recurrent state](#recurrent-state-mambaspec).
 2. `TTModelRunner._allocate_kv_caches` calls the instance's
    `allocate_kv_cache_per_layer(per_layer_specs)` when the adapter exposes it.
    Otherwise, `TTModelRunner._allocate_kv_caches` calls
@@ -155,3 +160,71 @@ and drafter addressing requirements in [the speculative contract](SPEC_DECODE_CO
 Sources: `_kv_cache_shape`, `_build_per_layer_specs`, `_block_tables_per_layer`,
 and `submit_prefill` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
 `submit_decode` in [async_decode.py](../src/vllm_tt_plugin/async_decode.py).
+
+## Recurrent state (MambaSpec)
+
+A model with recurrent layers, such as gated delta network (GDN) layers,
+declares their state to vLLM: `get_kv_cache_spec` returns a `MambaSpec` for
+each recurrent layer and an attention specification for each attention layer.
+vLLM then owns the block ids of the recurrent state as it owns attention block
+ids. vLLM's hybrid KV cache manager puts the layers into KV cache groups of
+equal size, for example one attention group and three `MambaSpec` groups of
+16 layers each for 16 attention and 48 GDN layers. Every group takes block ids
+from one pool, and vLLM overlays the groups on the same memory: block id `b`
+addresses the same bytes in every group, and one group owns a block id at a
+time. This section calls the memory that the layers at one position of each
+group share a **layer slot**. The plugin reports it as `tensor_idx`.
+
+Declaration rules:
+
+- `MambaSpec.shapes` and `MambaSpec.dtypes` describe the state of one layer on
+  one device, convolution history included. The plugin passes them to the
+  adapter unchanged.
+- vLLM requires one page size, in bytes per block per layer, across all groups.
+  `unify_kv_cache_spec_page_size` pads a smaller `MambaSpec` page to the
+  largest page. For a smaller attention page, it multiplies the attention
+  `block_size` when the attention page divides the largest page, and pads the
+  attention page otherwise. TT skips `Platform._align_hybrid_block_size`, so
+  the adapter chooses the attention `block_size` itself: choose one that TT
+  paged attention supports and whose page is at least the recurrent state.
+- `MambaSpec.mamba_cache_mode` must equal the resolved
+  `cache_config.mamba_cache_mode`: `none` when prefix caching is off.
+  `TTModelRunner` supports `none` only, and requires
+  `MambaSpec.num_speculative_blocks == 0`.
+- Lane-DP and block-output models do not support `MambaSpec` groups.
+
+Allocation:
+
+- `per_layer_specs` has one entry per layer that the groups name, in
+  decoder-layer index order, so the list covers the recurrent layers between
+  the attention layers. Layer names must contain `layers.<index>` with indices
+  `0` to `len(per_layer_specs) - 1`.
+- An attention entry is `(shape, dtype, tensor_idx)`, as above. A `MambaSpec`
+  entry is `(MambaSpec.shapes, MambaSpec.dtypes, tensor_idx)`.
+- The layer at position `j` of each group gets `tensor_idx` `j`. The adapter
+  allocates the buffers of each `tensor_idx` from its attention entries and
+  stores the state of each recurrent layer with that `tensor_idx` inside them,
+  at the block ids the layer's group owns. `TTModelRunner` raises if a
+  recurrent layer's `tensor_idx` has no attention layer.
+- The adapter must implement `allocate_kv_cache_per_layer`.
+
+Block count: `get_num_available_blocks_tt` converts `max_tokens_all_users` to
+bytes per layer slot with the attention layers' bytes per token, then divides
+by the unified page size. A token count divided by `block_size` would ignore
+page padding. It then adds one block per running request in each attention
+group, for output, and the state blocks each running request holds in each
+`MambaSpec` group: `1` per group in mode `none`. Upstream's admission floor
+applies as for sliding-window models.
+
+Page tables: `page_tables_per_layer` has one entry per layer, and the entry of
+a recurrent layer is its group's table. Group 0 can be a `MambaSpec` group, so
+`page_table` is not always an attention table; use `page_tables_per_layer`.
+The table width `max_num_blocks_per_req` is the largest
+`ceil(max_model_len / block_size)` over the groups, at most `num_blocks`,
+rounded up to a multiple of 8. TT chunked SDPA requires a page-table row of a
+multiple of 32 bytes. `cache_config.block_size` does not set this width.
+
+Sources: `mamba_cache_groups` in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py);
+`TTModelRunner.initialize_kv_cache` and `_build_per_layer_specs` in
+[model_runner.py](../src/vllm_tt_plugin/model_runner.py);
+`_mamba_hybrid_num_blocks` in [worker.py](../src/vllm_tt_plugin/worker.py).

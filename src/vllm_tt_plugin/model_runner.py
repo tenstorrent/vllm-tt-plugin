@@ -17,10 +17,11 @@ import ttnn
 from vllm.config import VllmConfig
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -71,6 +72,7 @@ from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
+from vllm_tt_plugin.mamba_state import MambaCacheGroups, mamba_cache_groups
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
@@ -735,6 +737,8 @@ class TTModelRunner:
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
+        # The KV cache config's MambaSpec groups, set by ``initialize_kv_cache``.
+        self._mamba_groups: MambaCacheGroups | None = None
 
         # req_id -> device slot holding its per-slot state (GDN recurrent/conv, seed
         # RNG, decode trace buffers). Needed because evict/re-add and condense move a
@@ -968,6 +972,11 @@ class TTModelRunner:
         """
         kv_cache_groups = kv_cache_config.kv_cache_groups
         self._validate_kv_cache_groups(kv_cache_groups)
+        self._mamba_groups = mamba_cache_groups(kv_cache_groups, self.cache_config)
+        if self._mamba_groups is not None and self._is_lane_mode:
+            raise NotImplementedError(
+                "lane-DP does not support MambaSpec KV cache groups yet"
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -1031,6 +1040,19 @@ class TTModelRunner:
             cdiv(max_model_len, self.cache_config.block_size),
             kv_cache_config.num_blocks,
         )
+        if self._mamba_groups is not None:
+            # A MambaSpec model sets its block sizes in ``get_kv_cache_spec``
+            # (TT skips upstream's ``_align_hybrid_block_size``), so
+            # ``cache_config.block_size`` need not be any group's block size:
+            # size the table from the groups. TT chunked SDPA requires a
+            # page-table row of a multiple of 32 bytes, so 8 int32 columns.
+            self.max_num_blocks_per_req = round_up(
+                min(
+                    max(cdiv(max_model_len, bs) for bs in per_group_block_sizes),
+                    kv_cache_config.num_blocks,
+                ),
+                8,
+            )
 
         # Cache layer→group index mapping for hybrid models so submit_*
         # can expand ``block_tables_per_group`` into ``block_tables_per_layer``
@@ -1042,13 +1064,16 @@ class TTModelRunner:
         # worker loads the model.
         self._layer_to_group_idx: list[int] | None = None
         if len(kv_cache_groups) > 1:
-            num_layers = self.model_config.get_num_layers_by_block_type(
-                self.parallel_config, "attention"
-            )
+            num_layers = self._num_kv_layers(kv_cache_config)
             mapping: list[int | None] = [None] * num_layers
             for g_idx, group in enumerate(kv_cache_groups):
                 for layer_name in group.layer_names:
                     idx = _parse_layer_index(layer_name)
+                    if not 0 <= idx < num_layers:
+                        raise ValueError(
+                            f"Layer index {idx} parsed from '{layer_name}' is "
+                            f"out of range for {num_layers} KV cache layers"
+                        )
                     mapping[idx] = g_idx
             missing = [i for i, g in enumerate(mapping) if g is None]
             if missing:
@@ -1074,12 +1099,28 @@ class TTModelRunner:
             # full layers 1x512). We unwrap it to per-layer specs in
             # ``_build_per_layer_specs``, so accept it here too.
             if not isinstance(
-                group.kv_cache_spec, (AttentionSpec, UniformTypeKVCacheSpecs)
+                group.kv_cache_spec,
+                (AttentionSpec, UniformTypeKVCacheSpecs, MambaSpec),
             ):
                 raise TypeError(
-                    f"Expected AttentionSpec/UniformTypeKVCacheSpecs for group "
-                    f"{group.layer_names}, got {type(group.kv_cache_spec).__name__}"
+                    "Expected AttentionSpec/UniformTypeKVCacheSpecs/MambaSpec "
+                    f"for group {group.layer_names}, got "
+                    f"{type(group.kv_cache_spec).__name__}"
                 )
+
+    def _num_kv_layers(self, kv_cache_config: KVCacheConfig) -> int:
+        """Length of the per-layer lists handed to the model.
+
+        Without MambaSpec groups this is the model's attention-layer count.
+        With them, the recurrent layers sit between the attention layers in
+        decoder-layer index order, so the lists cover every layer the groups
+        name.
+        """
+        if self._mamba_groups is None:
+            return self.model_config.get_num_layers_by_block_type(
+                self.parallel_config, "attention"
+            )
+        return sum(len(g.layer_names) for g in kv_cache_config.kv_cache_groups)
 
     def _kv_cache_shape(
         self, spec: AttentionSpec, num_blocks: int
@@ -1099,15 +1140,13 @@ class TTModelRunner:
         """Allocate KV cache tensors, falling back to legacy uniform API.
 
         Builds a ``per_layer_specs`` list of ``(shape, dtype)`` tuples — one
-        entry per attention layer in model layer-index order. Hybrid models
-        opt in to per-layer allocation by exposing
+        entry per layer in model layer-index order (see ``_num_kv_layers``).
+        Hybrid models opt in to per-layer allocation by exposing
         ``allocate_kv_cache_per_layer(per_layer_specs)``; legacy models keep
         the older ``allocate_kv_cache(shape, dtype, num_layers)`` signature
         and we adapt to it here, asserting the per-layer specs are uniform.
         """
-        num_layers = self.model_config.get_num_layers_by_block_type(
-            self.parallel_config, "attention"
-        )
+        num_layers = self._num_kv_layers(kv_cache_config)
         per_layer_specs = self._build_per_layer_specs(kv_cache_config, num_layers)
 
         if hasattr(self.model, "allocate_kv_cache_per_layer"):
@@ -1171,9 +1210,10 @@ class TTModelRunner:
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
-    ) -> list[tuple[tuple[int, int, int, int], Any, int]]:
+    ) -> list[tuple[Any, Any, int]]:
         """Resolve ``KVCacheConfig`` → list of ``(shape, dtype, tensor_idx)``
-        per layer in model layer-index order.
+        per layer in model layer-index order. A ``MambaSpec`` layer's entry
+        is ``(MambaSpec.shapes, MambaSpec.dtypes, tensor_idx)``.
 
         ``tensor_idx`` identifies the unique DRAM buffer that each layer's
         KV cache lives in. Multiple layers from different
@@ -1226,16 +1266,18 @@ class TTModelRunner:
 
         # Multi-group: every group's KVCacheTensor starts at byte 0, so layers
         # whose regions start at the same byte share one buffer -- the i-th
-        # layer of each group, as ``shared_by`` listed before vLLM 0.29.
-        spec_by_layer_name: dict[str, AttentionSpec] = {}
+        # layer of each group, as ``shared_by`` listed before vLLM 0.29. A
+        # MambaSpec layer shares the buffer of the attention layers at its
+        # position; its entry carries the spec's state shapes and dtypes
+        # instead of a KV shape.
+        spec_by_layer_name: dict[str, AttentionSpec | MambaSpec] = {}
         for group in kv_cache_groups:
-            assert isinstance(group.kv_cache_spec, AttentionSpec)
+            assert isinstance(group.kv_cache_spec, (AttentionSpec, MambaSpec))
             for layer_name in group.layer_names:
                 spec_by_layer_name[layer_name] = group.kv_cache_spec
 
-        per_layer: list[tuple[tuple[int, int, int, int], Any, int] | None] = [
-            None
-        ] * num_layers
+        per_layer: list[tuple[Any, Any, int] | None] = [None] * num_layers
+        mamba_tensor_idx: dict[int, int] = {}
         tensor_idx_by_start: dict[int, int] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             for position, layer_name in enumerate(kv_cache_tensor.layers):
@@ -1261,6 +1303,10 @@ class TTModelRunner:
                         "by more than one KVCacheTensor; each layer must "
                         "map to exactly one DRAM buffer"
                     )
+                if isinstance(spec, MambaSpec):
+                    per_layer[idx] = (spec.shapes, spec.dtypes, tensor_idx)
+                    mamba_tensor_idx[idx] = tensor_idx
+                    continue
                 shape = self._kv_cache_shape(spec, kv_cache_config.num_blocks)
                 per_layer[idx] = (shape, spec.dtype, tensor_idx)
 
@@ -1270,6 +1316,24 @@ class TTModelRunner:
                 f"No KVCacheTensor covers layer indices {missing}; "
                 "every attention layer must appear in some "
                 "kv_cache_tensors[i].layers"
+            )
+        # The model sizes each buffer from its attention entries, so a buffer
+        # holding only Mamba state would have no shape.
+        attention_tensor_idx = {
+            entry[2]
+            for i, entry in enumerate(per_layer)
+            if entry is not None and i not in mamba_tensor_idx
+        }
+        mamba_only = {
+            idx: t
+            for idx, t in mamba_tensor_idx.items()
+            if t not in attention_tensor_idx
+        }
+        if mamba_only:
+            raise ValueError(
+                "MambaSpec layers share no buffer with an attention layer "
+                f"(layer index: tensor_idx) {mamba_only}; attention layers "
+                f"use tensor_idx {sorted(attention_tensor_idx)}"
             )
         return per_layer  # type: ignore[return-value]
 
