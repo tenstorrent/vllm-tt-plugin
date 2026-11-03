@@ -40,7 +40,9 @@ from vllm_tt_plugin.config import (
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
+    validate_tt_device_top_k_unbounded_as,
     validate_tt_lane_config,
+    validate_tt_prefix_hit_confirmation,
     validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -1581,6 +1583,15 @@ def register_tt_models(register_test_models=False) -> None:
     for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
         _register_model_if_missing(ModelRegistry, arch, _kolibri1_target)
 
+    # GLM-5.3-Flash (tt-metal models/demos/glm53_flash). The checkpoint's
+    # architecture is Glm5NextForConditionalGeneration (transformers >= 5.16,
+    # model_type glm5_next). vLLM 0.30 registers the bare Glm5Next names itself
+    # and resolves the checkpoint's before the platform prefixes it, so the
+    # TT-prefixed names are the ones that select the tt-metal adapter.
+    _glm53_target = "models.demos.glm53_flash.tt.generator_vllm:GLM53FlashForCausalLM"
+    for arch in ("TTGlm5NextForConditionalGeneration", "TTGlm5NextForCausalLM"):
+        _register_model_if_missing(ModelRegistry, arch, _glm53_target)
+
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare
     # DiffusionGemmaForBlockDiffusion registration; the plugin registers the
@@ -2054,6 +2065,7 @@ class TTPlatform(Platform):
                 "max_device_top_k requires host sampling fallback and cannot be "
                 "used by block-output models (output_tokens_per_step > 1)."
             )
+        validate_tt_device_top_k_unbounded_as(model_capabilities, model_class)
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
         # Adaptive block-output: the model emits its block ONLY when it decodes
         # alone (batch==1) and falls back to plain batched baseline otherwise,
@@ -2531,6 +2543,10 @@ class TTPlatform(Platform):
         )
         resolve_tt_supports_stage_outputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
+        )
+        # After lane conversion, which pins the executor backend it checks.
+        validate_tt_prefix_hit_confirmation(
+            vllm_config, model_capabilities, model_class
         )
         validate_tt_scheduler_config(vllm_config)
         if tt_requests_cannot_resume(vllm_config):

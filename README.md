@@ -344,7 +344,7 @@ Common options:
 
 ### Default top-k for device sampling
 
-The TT device sampler draws only from the 32 most probable tokens. A model class declares this limit as `max_device_top_k` (see [Sampling limits](#sampling-limits)). When a request has a temperature above 0 and a `top_k` that is unset or above the limit, the plugin samples the whole batch on host for that step. Host sampling reads back the full-vocabulary logits on every decode step, so decode is much slower than with device sampling.
+The TT device sampler draws only from the 32 most probable tokens. A model class declares this limit as `max_device_top_k` (see [Sampling limits](#sampling-limits)). When a request has a temperature above 0 and a `top_k` that is unset or above the limit, the plugin samples the whole batch on host for that step, unless the model class also declares `device_top_k_unbounded_as` (see [Sampling limits](#sampling-limits)). Host sampling reads back the full-vocabulary logits on every decode step, so decode is much slower than with device sampling.
 
 Most requests do not set `top_k`: the OpenAI Python client has no `top_k` argument, and `vllm bench serve` sends no sampling parameters. vLLM then uses the default from the model's `generation_config.json`. Llama 3.1, Llama 3.3 and GPT-OSS define no `top_k` default, which means all tokens. Gemma 3 and Gemma 4 define `top_k: 64`. So with these models, every request that does not set `top_k` samples on host.
 
@@ -970,7 +970,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## Sampling limits
 
-Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing. To keep requests that do not set `top_k` on the device, see [Default top-k for device sampling](#default-top-k-for-device-sampling).
+Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. A model that also declares `device_top_k_unbounded_as` keeps those requests on the device, sampled from its `max_device_top_k` most probable tokens. Models without the capability keep their existing routing. To keep requests that do not set `top_k` on the device, see [Default top-k for device sampling](#default-top-k-for-device-sampling).
 
 Block-output models (`output_tokens_per_step > 1`) cannot declare this capability: their model-owned sampler produces a complete canvas, which the host sampler cannot replace. The combination is rejected at startup.
 
