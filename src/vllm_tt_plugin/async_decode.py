@@ -1345,6 +1345,8 @@ class TTAsyncDecodeController:
         # kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        if model_input.state_block_ids_per_layer is not None:
+            kwargs["state_block_ids_per_layer"] = model_input.state_block_ids_per_layer
         device_sampling_params = None
         # Speculative side tensors, sent only on a speculating decode step so a
         # model that never speculates keeps its present call shape. A verify
