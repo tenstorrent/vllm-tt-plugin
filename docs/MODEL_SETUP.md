@@ -188,9 +188,19 @@ Declaration rules:
   the adapter chooses the attention `block_size` itself: choose one that TT
   paged attention supports and whose page is at least the recurrent state.
 - `MambaSpec.mamba_cache_mode` must equal the resolved
-  `cache_config.mamba_cache_mode`: `none` when prefix caching is off.
-  `TTModelRunner` supports `none` only, and requires
-  `MambaSpec.num_speculative_blocks == 0`.
+  `cache_config.mamba_cache_mode`. vLLM's `MambaModelConfig` selects `none`
+  when prefix caching is off and `align` when it is on; prefix caching stays
+  on only for a model that declares `supports_prefix_caching`. In mode `none`
+  a request holds one state block per group. In mode `align`, block-table
+  column `p` of a group holds the state after `(p + 1) * block_size` tokens.
+- `TTModelRunner` supports modes `none` and `align`. It requires
+  `MambaSpec.num_speculative_blocks == 0`,
+  `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` for all
+  `MambaSpec` groups.
+- The adapter must implement `zero_kv_cache_blocks`, and in mode `align` also
+  `copy_kv_cache_blocks`. See [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
+  Prefill and decode receive `state_block_ids_per_layer`; see
+  [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks).
 - Lane-DP and block-output models do not support `MambaSpec` groups.
 
 Allocation:
@@ -213,8 +223,11 @@ bytes per layer slot with the attention layers' bytes per token, then divides
 by the unified page size. A token count divided by `block_size` would ignore
 page padding. It then adds one block per running request in each attention
 group, for output, and the state blocks each running request holds in each
-`MambaSpec` group: `1` per group in mode `none`. Upstream's admission floor
-applies as for sliding-window models.
+`MambaSpec` group: `1` per group in mode `none` and `2` in mode `align`, as
+`MambaSpec.max_memory_usage_bytes` counts them. Upstream's admission floor
+applies as for sliding-window models. Mode `align` also keeps the state blocks
+of earlier block boundaries as prefix-cache entries; as with cached attention
+blocks, vLLM evicts them when it needs free blocks.
 
 Page tables: `page_tables_per_layer` has one entry per layer, and the entry of
 a recurrent layer is its group's table. Group 0 can be a `MambaSpec` group, so
@@ -224,7 +237,8 @@ The table width `max_num_blocks_per_req` is the largest
 rounded up to a multiple of 8. TT chunked SDPA requires a page-table row of a
 multiple of 32 bytes. `cache_config.block_size` does not set this width.
 
-Sources: `mamba_cache_groups` in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py);
+Sources: `mamba_cache_groups` and `MambaCacheGroups` in
+[mamba_state.py](../src/vllm_tt_plugin/mamba_state.py);
 `TTModelRunner.initialize_kv_cache` and `_build_per_layer_specs` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
 `_mamba_hybrid_num_blocks` in [worker.py](../src/vllm_tt_plugin/worker.py).

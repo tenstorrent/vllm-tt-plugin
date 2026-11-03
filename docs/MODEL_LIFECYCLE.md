@@ -101,6 +101,36 @@ Sources: `_alloc_prefill_state_slots`, `_decode_state_slot_remap`,
 `TTLaneInputBatch.apply_step_plan` in
 [input_batch.py](../src/vllm_tt_plugin/input_batch.py).
 
+## KV cache block operations
+
+vLLM can ask the worker to change KV cache blocks before a step's forward.
+The adapter owns the device buffers, so `TTModelRunner._apply_kv_cache_block_ops`
+hands each operation to an optional adapter hook. It runs after
+`_update_states` and before `TTModelRunner` builds the step's inputs, zeroing
+first. Block ids are vLLM block ids; with `MambaSpec` groups, one block id
+addresses one page in every layer slot (see
+[recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)).
+
+| Hook | Adapter responsibility |
+|---|---|
+| `zero_kv_cache_blocks(kv_cache=..., block_ids=[...])` | Zero each listed block in every KV buffer. vLLM lists the blocks it newly allocated to attention groups this step (`SchedulerOutput.new_block_ids_to_zero`). It sends them when `KVCacheConfig.needs_kv_cache_zeroing` is true, which holds with `MambaSpec` layers or mixed attention precisions: a reused block can hold bytes of another group that decode to NaN or Inf. |
+| `copy_kv_cache_blocks(kv_cache=..., copies=[(src, dst), ...])` | Copy each source block to its destination block in every KV buffer, in list order. The list holds vLLM's `SchedulerOutput.kv_cache_block_copies`, then, in Mamba mode `align`, the state copies into each request's new state block (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). |
+
+`kv_cache` is the object the adapter's KV allocator returned. Enqueue the
+operations on the device before the step's forward, so the forward reads the
+result. An adapter with `MambaSpec` groups must implement
+`zero_kv_cache_blocks`, and in mode `align` also `copy_kv_cache_blocks`;
+`TTModelRunner.initialize_kv_cache` raises otherwise. A requested copy that
+reaches a `MambaSpec` adapter without `copy_kv_cache_blocks` raises. For an
+adapter without `MambaSpec` groups that lacks a hook, `TTModelRunner` skips
+the operation. Lane-DP rejects `MambaSpec` groups and does not route these
+operations.
+
+Sources: `_apply_kv_cache_block_ops` and `initialize_kv_cache` in
+[model_runner.py](../src/vllm_tt_plugin/model_runner.py);
+`MambaCacheGroups.align_state_copies` in
+[mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
+
 ## Shutdown
 
 1. `TTWorker.shutdown` calls `TTModelRunner.shutdown` while the mesh is open.
