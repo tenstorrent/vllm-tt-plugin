@@ -664,6 +664,59 @@ def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
     )
 
 
+@pytest.mark.parametrize("pending_tokens", [False, True])
+def test_structured_decode_is_steady_only_under_device_grammar(pending_tokens):
+    """A structured step overlaps the one in flight only when its token is
+    sampled on device, where it becomes the next step's resident input."""
+    req_ids = ["json", "plain"]
+    seen = []
+
+    def check_perform_device_sampling(**kwargs):
+        seen.append(kwargs["has_structured_outputs"])
+        return True
+
+    runner = SimpleNamespace(
+        model=SimpleNamespace(decode_input_update_contract=1),
+        input_batch=SimpleNamespace(
+            req_id_to_index={"json": 0, "plain": 1},
+            no_penalties=True,
+            no_allowed_token_ids=True,
+            sampling=SimpleNamespace(
+                bad_words_token_ids={}, has_active_logitsprocs=lambda: False
+            ),
+            max_num_logprobs=None,
+        ),
+        requests={
+            "json": SimpleNamespace(
+                sampling_params=SimpleNamespace(structured_outputs=object())
+            ),
+            "plain": SimpleNamespace(
+                sampling_params=SimpleNamespace(structured_outputs=None)
+            ),
+        },
+        model_config=SimpleNamespace(logits_processors=[]),
+        _decode_layout_changed_since_last_decode=False,
+        check_perform_device_sampling=check_perform_device_sampling,
+        supports_device_grammar=False,
+    )
+    controller = TTAsyncDecodeController(runner)
+    controller._decode_chain_valid = True
+    controller._previous_device_sampling = True
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=_cached_reqs(req_ids),
+        pending_structured_output_tokens=pending_tokens,
+    )
+
+    assert not controller.steady_decode_scheduler_invariants_met(scheduler_output)
+    assert seen == []
+
+    runner.supports_device_grammar = True
+    assert controller.steady_decode_scheduler_invariants_met(scheduler_output)
+    assert seen == [True]
+
+
 def test_contract_v1_receives_commands_without_legacy_reset():
     captured = {}
 

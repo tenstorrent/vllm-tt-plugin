@@ -28,7 +28,7 @@ may instead be rejected, and failures after deferred submission are terminal.
 | --- | --- |
 | Plugin | Merged in tenstorrent/vllm-tt-plugin#123. |
 | tt-metal reference implementation | Merged in tenstorrent/tt-metal#55892: tt_transformers `LlamaForCausalLM`, `QwenForCausalLM`, `MistralForCausalLM`. |
-| Scope | Decode only, one sampler per data-parallel replica, no logprobs, synchronous scheduling. |
+| Scope | Decode only, one sampler per data-parallel replica, no logprobs; synchronous or asynchronous scheduling. |
 | Follow-up work | tenstorrent/tt-metal#60370. |
 
 Without this contract, structured-output requests keep vLLM's host sampling
@@ -60,14 +60,23 @@ sequenceDiagram
 Between the two calls the adapter holds exactly one pending payload. The
 plugin never submits another decode before consuming it.
 
+Under async scheduling the same two calls run in the same order: vLLM's
+`step_with_batch_queue` defers `sample_tokens()` until it has processed the
+previous step's output, but always calls it before the next
+`execute_model()`. The plugin then reads the sampled tokens without blocking
+(`read_decode_output(tokens, async_read=True)`) and may submit the next decode
+before that read completes. That decode reads its input tokens from the
+device when the batch is steady (`reload_inputs=False`), so they must be the
+tokens `sample_deferred_decode` drew (section 2b).
+
 ## When the plugin uses the contract
 
 The startup gates and per-step routing are in the README section
 [Structured Output Sampling](../README.md#structured-output-sampling), the
 [capability reference](MODEL_CAPABILITIES.md#sampling-and-async-capabilities)
 and [scheduling](SCHEDULING.md#when-steady-async-decode-is-allowed). In
-short: decode steps only, synchronous scheduling, and one ineligible request
-moves the whole step to host sampling. Random-sampling requests without
+short: decode steps only, and one ineligible request moves the whole step to
+host sampling. Random-sampling requests without
 `top_k` stay on device only with a server
 [default top-k](../README.md#default-top-k-for-device-sampling).
 
@@ -112,6 +121,7 @@ The diagram above shows the call order. The requirements are:
 | `decode_forward(..., defer_device_sampling=True)` | See section 2a. |
 | `sample_deferred_decode(payload, sampling_params=..., grammar_bitmask=...)` | See section 2b. |
 | `process_decode_output_host(tokens, is_tokens=True)` | Accept the device output of `sample_deferred_decode`, as for ordinary device sampling. |
+| `read_decode_output(tokens, async_read=True)` | Async scheduling only: accept the device output of `sample_deferred_decode`, as for an ordinary async decode. |
 
 ### 2a. `decode_forward(..., defer_device_sampling=True)`
 
@@ -153,7 +163,11 @@ The adapter must:
 4. **Return the immediate path's output.** That is what
    `decode_forward(..., sampling_params=..., read_from_device=False)` returns:
    device tokens per replica.
-5. **Fail permanently on error.** Any exception means the decode was submitted
+5. **Feed the sampled tokens back.** A later decode with
+   `reload_inputs=False` decodes from the tokens this call drew, as after an
+   immediate device-sampled decode. Under async scheduling that decode can be
+   submitted before the plugin has read these tokens.
+6. **Fail permanently on error.** Any exception means the decode was submitted
    but sampler state may be partly advanced. Mark the adapter failed and make
    every later `decode_forward` and sampling call raise. The plugin also
    disables the runner, and nothing retries on host.
@@ -204,7 +218,6 @@ device:
 - structured prefill;
 - logprobs, including `logprobs=0`;
 - row-sharded sampling (`sampling_dp > 1`);
-- upstream async scheduling;
 - speculative decoding, which rejects structured requests at admission;
 - block-output models;
 - host-only options (`min_p`, `logit_bias`, `bad_words`, `allowed_token_ids`,
@@ -247,8 +260,9 @@ Host tests, mirroring the reference PR:
 
 On device, through the plugin:
 
-1. Start the server with `--no-async-scheduling` and
-   `sample_on_device_mode: decode_only`, and set `VLLM_LOGGING_LEVEL=DEBUG`.
+1. Start the server with `sample_on_device_mode: decode_only` and set
+   `VLLM_LOGGING_LEVEL=DEBUG`. Run the steps below with and without
+   `--no-async-scheduling`.
 2. Run `tests/tt/test_structured_output_dp1.py`. The server log must contain
    `TT device grammar sampling active` lines; zero means the path silently
    fell back to host.

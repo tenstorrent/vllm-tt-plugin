@@ -194,19 +194,23 @@ For an eligible structured decode:
 3. After vLLM supplies the grammar, `TTAsyncDecodeController` calls
    `sample_deferred_decode(output, sampling_params=..., grammar_bitmask=...)`.
    The adapter applies the packed int32 grammar mask and returns sampled
-   output through the ordinary decode conversion path.
+   output through the ordinary decode conversion path. Under async scheduling
+   the controller then starts `read_decode_output(output, async_read=True)`, as
+   for an ordinary async decode, and the next decode may be submitted before
+   that read completes.
 
 Each bit in `grammar_bitmask` names one vocabulary token; a one bit permits
 that token. The model adapter must apply the submitted row order.
 
 Structured prefill uses host sampling. Deferred grammar sampling requires
-synchronous scheduling and effective runtime support. A missing mask or a
+effective runtime support. A missing mask or a
 failure after deferred submission invalidates the runner's grammar path;
 the plugin raises instead of resampling an already advanced step on the host.
 
 Sources: `submit_prefill`, `check_perform_device_sampling`, and
 `_get_output_tokens` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
-`submit_decode`, `finalize_decode`, and `complete_deferred_device_sampling` in
+`submit_decode`, `finalize_decode`, `complete_deferred_device_sampling`, and
+`sample_deferred_async_decode` in
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py).
 
 ## Adapter sketches: DP=1 and lane-DP

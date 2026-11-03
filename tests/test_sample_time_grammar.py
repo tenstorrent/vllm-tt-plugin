@@ -12,6 +12,7 @@ Requires the ttnn-enabled environment because importing the plugin modules pulls
 in ttnn.
 """
 
+import threading
 from collections import deque
 from dataclasses import replace
 from functools import partial
@@ -20,10 +21,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.v1.core.sched.output import GrammarOutput
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
-from vllm_tt_plugin.async_decode import TTAsyncDecodeController, TTDecodeSubmission
-from vllm_tt_plugin.model_input import TTModelInput
+from vllm_tt_plugin.async_decode import (
+    SubmittedStepContext,
+    TTAsyncDecodeController,
+    TTDecodeSubmission,
+)
+from vllm_tt_plugin.lane_scheduler import TTStepPlan
+from vllm_tt_plugin.model_input import TTModelInput, TTSamplingParams
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 
 VOCAB_WORDS = 2  # int32 words per grammar bitmask row
@@ -151,14 +157,13 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens():
     async_decode = SimpleNamespace(
         can_attempt_steady_decode_from_scheduler=lambda _output: False,
         must_drain_pending_async_steps=lambda *_args: False,
-        wait_for_all_pending_async_steps=lambda: events.append("drain"),
         submit_async_decode=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("structured device sampling must not use async overlap")
+            AssertionError("a synchronous decode must not use async overlap")
         ),
     )
     runner = SimpleNamespace(
         async_decode=async_decode,
-        async_decode_scheduling=True,
+        async_decode_scheduling=False,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _pending_samples=deque(),
         build_model_input=build_model_input,
@@ -181,16 +186,11 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens():
     )
 
     assert TTModelRunner.execute_model(runner, SimpleNamespace()) is None
-    assert events == ["build-without-grammar", "drain", "forward"]
+    assert events == ["build-without-grammar", "forward"]
 
     output = TTModelRunner.sample_tokens(runner, _grammar(1))
 
-    assert events == [
-        "build-without-grammar",
-        "drain",
-        "forward",
-        "device-sample",
-    ]
+    assert events == ["build-without-grammar", "forward", "device-sample"]
     assert output.tolist() == [[42]]
 
 
@@ -220,11 +220,11 @@ def test_structured_prefill_remains_host_sampled_with_device_grammar_capability(
     )
 
 
-def test_structured_decode_remains_host_sampled_with_async_scheduling():
+def test_structured_decode_samples_on_device_with_async_scheduling():
     runner = _device_sampling_runner(supports_device_grammar=True)
     runner.scheduler_config.async_scheduling = True
 
-    assert not TTModelRunner.check_perform_device_sampling(
+    assert TTModelRunner.check_perform_device_sampling(
         runner,
         is_decode=True,
         has_structured_outputs=True,
@@ -936,3 +936,359 @@ def test_finish_lane_sync_consumes_device_grammar_before_slot_extraction():
     assert seen["submission"] is submission
     assert seen["bitmask"] is bitmask
     assert output.tolist() == [[11], [12]]
+
+
+# --------------------------------------------------------------------------
+# Device grammar under asynchronous scheduling
+# --------------------------------------------------------------------------
+
+
+def _only(token: int) -> torch.Tensor:
+    """A one-row packed mask allowing ``token`` alone."""
+    row = torch.zeros((1, VOCAB_WORDS), dtype=torch.int32)
+    row[0, token // 32] = 1 << (token % 32)
+    return row
+
+
+def _allowed(bitmask: torch.Tensor, row: int) -> list[int]:
+    return [
+        token
+        for token in range(VOCAB_WORDS * 32)
+        if (int(bitmask[row, token // 32]) >> (token % 32)) & 1
+    ]
+
+
+class _ResidentGrammarModel:
+    """A device grammar adapter reduced to what the async overlap relies on.
+
+    Like a traced adapter it keeps the fed-back token on device: a step that
+    does not reload its inputs decodes from the token the last sample wrote,
+    whatever the host still holds. Its forward prefers token ``input + 1``;
+    its sampler takes that token when the row's mask allows it, else the
+    lowest allowed one. It holds one deferred forward at a time, as
+    DEVICE_GRAMMAR_CONTRACT.md requires.
+    """
+
+    decode_input_update_contract = 1
+    model_capabilities = {"supports_async_decode": True}
+
+    def __init__(self):
+        self.resident: torch.Tensor | None = None
+        self.pending = None
+        self.reload_inputs: list[bool] = []
+
+    def decode_forward(self, *, tokens, reload_inputs, read_from_device, **kwargs):
+        if self.pending is not None:
+            raise RuntimeError("a deferred decode step is pending")
+        assert kwargs["defer_device_sampling"] is True
+        assert read_from_device is False
+        self.reload_inputs.append(reload_inputs)
+        source = tokens if reload_inputs else self.resident
+        self.pending = SimpleNamespace(preferred=source.reshape(-1) + 1)
+        return self.pending
+
+    def sample_deferred_decode(self, payload, *, sampling_params, grammar_bitmask):
+        assert payload is self.pending
+        self.pending = None
+        tokens = []
+        for row, preferred in enumerate(payload.preferred.tolist()):
+            allowed = _allowed(grammar_bitmask, row)
+            tokens.append(preferred if preferred in allowed else allowed[0])
+        sampled = torch.tensor(tokens, dtype=torch.int32)
+        self.resident = sampled.reshape(-1, 1)
+        return {"device": sampled}
+
+    def read_decode_output(self, out, async_read=False):
+        assert async_read
+        return {"host": out["device"].clone()}, []
+
+    def process_decode_output_host(self, out, is_tokens=False):
+        assert is_tokens
+        return out["host"]
+
+
+def _async_grammar_controller(model) -> TTAsyncDecodeController:
+    runner = SimpleNamespace(
+        model=model,
+        trace_mode="decode_only",
+        async_decode_scheduling=True,
+        kv_caches=object(),
+        request_specific_rope=False,
+        supports_stage_outputs=False,
+        note_decode_layout_consumed=lambda: None,
+        note_decode_state_slots_settled=lambda: None,
+        _steady_decode_lock=threading.Lock(),
+        _pending_async_steps=deque(),
+        _pending_async_overlap_ok=deque(),
+        _completed_decode_steps=deque(),
+        _get_output_tokens=lambda **kwargs: (
+            [kwargs["tt_out"].reshape(-1, 1)],
+            [None],
+        ),
+        _build_runner_output=lambda **kwargs: SimpleNamespace(
+            sampled_token_ids=kwargs["sampled_token_ids"]
+        ),
+    )
+    return TTAsyncDecodeController(runner)
+
+
+def _deferred_step_input(token: int, *, layout_changed: bool) -> TTModelInput:
+    return _model_input(
+        input_tokens=torch.tensor([[token]], dtype=torch.int32),
+        tt_sampling_params=TTSamplingParams(
+            temperature=torch.zeros(1),
+            top_k=torch.ones(1, dtype=torch.int32),
+            top_p=torch.ones(1),
+            presence_penalty=torch.zeros(1),
+            frequency_penalty=torch.zeros(1),
+            repetition_penalty=torch.ones(1),
+            seed=torch.full((1,), -1),
+            num_logprobs=torch.full((1,), -2),
+            enable_log_probs=torch.zeros(1, dtype=torch.bool),
+        ),
+        perform_device_sampling=True,
+        defer_device_sampling=True,
+        decode_layout_changed=layout_changed,
+        structured_output_req_ids=frozenset({"req-0"}),
+    )
+
+
+def _context() -> SubmittedStepContext:
+    return SubmittedStepContext(
+        req_ids=["req-0"], req_id_to_index={"req-0": 0}, submit_time_ns=0
+    )
+
+
+def test_async_device_grammar_step_decodes_from_the_masked_token_it_overlaps():
+    """The next forward is submitted before this step's tokens are read, and
+    decodes from the token the grammar mask chose, not the host's or the
+    unmasked forward's."""
+    model = _ResidentGrammarModel()
+    controller = _async_grammar_controller(model)
+
+    first_input = _deferred_step_input(10, layout_changed=True)
+    first = controller.submit_deferred_async_decode(first_input, _context())
+    first_step = controller.sample_deferred_async_decode(
+        first, replace(first_input, grammar_bitmask=[_only(3)])
+    )
+    # The host still holds token 10: the step is in flight.
+    second_input = _deferred_step_input(10, layout_changed=False)
+    second = controller.submit_deferred_async_decode(second_input, _context())
+    assert not first_step.is_resolved()
+    second_step = controller.sample_deferred_async_decode(
+        second,
+        replace(
+            second_input,
+            grammar_bitmask=[torch.full((1, VOCAB_WORDS), -1, dtype=torch.int32)],
+        ),
+    )
+
+    assert model.reload_inputs == [True, False]
+    assert (first.overlap_ok, second.overlap_ok) == (False, True)
+    assert list(controller.runner._pending_async_overlap_ok) == [False, True]
+    assert first_step.get_output().sampled_token_ids.tolist() == [[3]]
+    assert second_step.get_output().sampled_token_ids.tolist() == [[4]]
+    assert controller.device_grammar_sample_count == 2
+
+
+def test_async_device_grammar_sample_failure_is_terminal():
+    poisoned = []
+    model = _ResidentGrammarModel()
+    controller = _async_grammar_controller(model)
+    controller.runner._poison_device_grammar = lambda: poisoned.append(True)
+    model.read_decode_output = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("read failed")
+    )
+    step_input = _deferred_step_input(10, layout_changed=True)
+    deferred = controller.submit_deferred_async_decode(step_input, _context())
+
+    with pytest.raises(RuntimeError, match="read failed"):
+        controller.sample_deferred_async_decode(
+            deferred, replace(step_input, grammar_bitmask=[_only(3)])
+        )
+
+    assert poisoned == [True]
+    assert controller._decode_chain_valid is False
+    assert not controller.runner._pending_async_steps
+
+
+def _async_deferred_runner(events: list, model_input: TTModelInput):
+    """A front-packed runner under async scheduling whose controller records
+    the deferred submission and sampling it is asked for."""
+
+    def submit_deferred(received_input, context, scheduled_rows=None):
+        events.append(("submit", received_input, scheduled_rows))
+        return "deferred-step"
+
+    def sample_deferred(deferred, received_input):
+        events.append(("sample", deferred, received_input.grammar_bitmask[0]))
+        return "async-output"
+
+    def fail(name):
+        return lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(f"a deferred async decode must not call {name}")
+        )
+
+    runner = SimpleNamespace(
+        async_decode=SimpleNamespace(
+            can_attempt_steady_decode_from_scheduler=lambda _output: True,
+            must_drain_pending_async_steps=lambda *_args: False,
+            wait_for_all_pending_async_steps=fail("wait_for_all_pending_async_steps"),
+            submit_async_decode=fail("submit_async_decode"),
+            capture_submitted_step_context=lambda: "context",
+            submit_deferred_async_decode=submit_deferred,
+            sample_deferred_async_decode=sample_deferred,
+        ),
+        async_decode_scheduling=True,
+        _pending_samples=deque(),
+        build_model_input=lambda _output, _grammar: model_input,
+        _forward_with_model_input=fail("_forward_with_model_input"),
+        bitmask_size=VOCAB_WORDS,
+        _poison_device_grammar=lambda: events.append(("poison",)),
+    )
+    runner._reorder_grammar_bitmask = partial(
+        TTModelRunner._reorder_grammar_bitmask, runner
+    )
+    runner._finish_async_deferred_decode = partial(
+        TTModelRunner._finish_async_deferred_decode, runner
+    )
+    return runner
+
+
+def test_execute_model_submits_async_deferred_decode_without_draining_or_reading():
+    events: list = []
+    model_input = _model_input(
+        perform_device_sampling=True,
+        defer_device_sampling=True,
+        structured_output_req_ids=frozenset({"req-0"}),
+    )
+    runner = _async_deferred_runner(events, model_input)
+
+    assert TTModelRunner.execute_model(runner, SimpleNamespace()) is None
+    assert events == [("submit", model_input, None)]
+
+    output = TTModelRunner.sample_tokens(runner, _grammar(1))
+
+    assert output == "async-output"
+    assert events[1][:2] == ("sample", "deferred-step")
+    assert events[1][2].tolist() == [[0, 1]]
+
+
+def test_async_deferred_decode_samples_unconstrained_when_its_grammar_finished():
+    """vLLM builds the mask after the previous step's output, which may have
+    finished every structured request this step still carries: the step is
+    sampled with an all-allowed mask and its late tokens are discarded."""
+    events: list = []
+    model_input = _model_input(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        row_req_ids=["req-0", "req-1"],
+        perform_device_sampling=True,
+        defer_device_sampling=True,
+        structured_output_req_ids=frozenset({"req-0", "req-1"}),
+    )
+    runner = _async_deferred_runner(events, model_input)
+    TTModelRunner.execute_model(runner, SimpleNamespace())
+
+    TTModelRunner.sample_tokens(runner, None)
+
+    assert events[1][2].tolist() == [[-1, -1], [-1, -1]]
+
+
+def test_async_deferred_decode_leaves_a_finished_structured_row_unconstrained():
+    events: list = []
+    model_input = _model_input(
+        input_tokens=torch.zeros((2, 1), dtype=torch.int32),
+        row_req_ids=["req-0", "req-1"],
+        perform_device_sampling=True,
+        defer_device_sampling=True,
+        structured_output_req_ids=frozenset({"req-0", "req-1"}),
+    )
+    runner = _async_deferred_runner(events, model_input)
+    TTModelRunner.execute_model(runner, SimpleNamespace())
+    grammar = GrammarOutput(
+        structured_output_request_ids=["req-1"],
+        grammar_bitmask=np.array([[7, 8]], dtype=np.int32),
+    )
+
+    TTModelRunner.sample_tokens(runner, grammar)
+
+    assert events[1][2].tolist() == [[-1, -1], [7, 8]]
+
+
+def test_async_deferred_decode_failure_poisons_runner():
+    events: list = []
+    model_input = _model_input(
+        perform_device_sampling=True,
+        defer_device_sampling=True,
+        structured_output_req_ids=frozenset({"req-0"}),
+    )
+    runner = _async_deferred_runner(events, model_input)
+
+    def sample_deferred(*_args):
+        raise RuntimeError("device sampler failed")
+
+    runner.async_decode.sample_deferred_async_decode = sample_deferred
+    TTModelRunner.execute_model(runner, SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="device sampler failed"):
+        TTModelRunner.sample_tokens(runner, _grammar(1))
+
+    assert events[-1] == ("poison",)
+
+
+def test_lane_step_submits_async_deferred_decode_with_its_slot_layout():
+    events: list = []
+    plan = TTStepPlan(
+        is_decode=True,
+        capacity=3,
+        scheduled_req_ids=("req-c", "req-a"),
+        scheduled_rows=(2, 0),
+        input_rows=(0, 1, 2),
+        req_id_to_row={"req-a": 0, "req-c": 2},
+        batch_size_per_dp=(3,),
+        prefill_empty_slots=None,
+    )
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.total_num_scheduled_tokens = 2
+    scheduler_output.num_scheduled_tokens = {"req-c": 1, "req-a": 1}
+    scheduler_output._tt_step_state = SimpleNamespace(plan=plan)
+    model_input = _model_input(
+        input_tokens=torch.zeros((3, 1), dtype=torch.int32),
+        row_req_ids=["req-a", None, "req-c"],
+        grammar_row_req_ids=("req-a", None, "req-c"),
+        perform_device_sampling=True,
+        defer_device_sampling=True,
+        structured_output_req_ids=frozenset({"req-a"}),
+    )
+    runner = _async_deferred_runner(events, model_input)
+    runner.request_specific_rope = False
+    runner.requests = {}
+    runner.encoder_cache = {}
+    runner.lane_batch = SimpleNamespace(
+        apply_step_plan=lambda *_args: False,
+        build_model_input=lambda *_args: model_input,
+    )
+    runner.async_decode.can_attempt_steady_lane_decode_from_scheduler = (
+        lambda *_args, **_kwargs: True
+    )
+    runner.async_decode.apply_completed_decode_steps_before_build = lambda _o: None
+    runner.async_decode.capture_submitted_step_context = lambda req_ids: req_ids
+    contexts: list = []
+
+    def submit_deferred(received_input, context, scheduled_rows=None):
+        contexts.append(context)
+        events.append(("submit", received_input, scheduled_rows))
+        return "deferred-step"
+
+    runner.async_decode.submit_deferred_async_decode = submit_deferred
+
+    assert TTModelRunner._execute_lane_step(runner, scheduler_output) is None
+    assert contexts == [["req-c", "req-a"]]
+    assert events == [("submit", model_input, [2, 0])]
+
+    grammar = GrammarOutput(
+        structured_output_request_ids=["req-a"],
+        grammar_bitmask=np.array([[5, 6]], dtype=np.int32),
+    )
+    assert TTModelRunner.sample_tokens(runner, grammar) == "async-output"
+    assert events[1][2].tolist() == [[5, 6], [-1, -1], [-1, -1]]

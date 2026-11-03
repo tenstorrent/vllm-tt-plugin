@@ -40,6 +40,7 @@ from vllm_tt_plugin.async_decode import (
     SubmittedStepContext,
     TTAsyncDecodeController,
     TTDecodeSubmission,
+    TTDeferredAsyncDecode,
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
@@ -556,15 +557,10 @@ class TTModelRunner:
         self.sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
         assert self.sample_on_device_mode in (None, "all", "decode_only")
         self.seeded_sampling_policy = get_tt_seeded_sampling_policy(vllm_config)
-        if self.supports_device_grammar and (
-            self.sample_on_device_mode is None or self.scheduler_config.async_scheduling
-        ):
+        if self.supports_device_grammar and self.sample_on_device_mode is None:
             logger.info(
                 "TT device grammar runtime activation is disabled "
-                "(sample_on_device_mode=%s, async_scheduling=%s); retaining "
-                "host grammar sampling",
-                self.sample_on_device_mode,
-                self.scheduler_config.async_scheduling,
+                "(sample_on_device_mode=None); retaining host grammar sampling"
             )
             self.supports_device_grammar = False
         # Whether the model supports top-K logprobs on device.
@@ -2946,9 +2942,7 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if model_input.defer_device_sampling:
-                self.async_decode.wait_for_all_pending_async_steps()
-            if self.async_decode_scheduling and not model_input.defer_device_sampling:
+            if self.async_decode_scheduling:
                 req_ids = [
                     model_input.grammar_row_req_ids[row] for row in scheduled_rows
                 ]
@@ -2958,6 +2952,19 @@ class TTModelRunner:
                         f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
                     )
                 context = self.async_decode.capture_submitted_step_context(req_ids)
+                if model_input.defer_device_sampling:
+                    deferred = self.async_decode.submit_deferred_async_decode(
+                        model_input, context, scheduled_rows
+                    )
+                    self._pending_samples.append(
+                        partial(
+                            self._finish_async_deferred_decode,
+                            deferred=deferred,
+                            model_input=model_input,
+                            lane_total=lane_total,
+                        )
+                    )
+                    return None
                 wrapper = self.async_decode.submit_async_lane_decode(
                     model_input, context, scheduled_rows
                 )
@@ -3245,13 +3252,20 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if model_input.defer_device_sampling:
-            self.async_decode.wait_for_all_pending_async_steps()
-        if (
-            self.async_decode_scheduling
-            and is_decode
-            and not model_input.defer_device_sampling
-        ):
+        if self.async_decode_scheduling and model_input.defer_device_sampling:
+            deferred = self.async_decode.submit_deferred_async_decode(
+                model_input, self.async_decode.capture_submitted_step_context()
+            )
+            self._pending_samples.append(
+                partial(
+                    self._finish_async_deferred_decode,
+                    deferred=deferred,
+                    model_input=model_input,
+                    lane_total=None,
+                )
+            )
+            return None
+        if self.async_decode_scheduling and is_decode:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
@@ -3381,6 +3395,43 @@ class TTModelRunner:
             ),
         )
         return wrapper
+
+    def _finish_async_deferred_decode(
+        self,
+        grammar_output: GrammarOutput | None,
+        *,
+        deferred: TTDeferredAsyncDecode,
+        model_input: TTModelInput,
+        lane_total: int | None,
+    ) -> AsyncTTModelRunnerOutput:
+        """Sample a device grammar decode submitted under async scheduling.
+
+        The mask arrives after vLLM processed the previous step's output, so a
+        structured row that output finished is absent from it, as on
+        ``_finish_async_decode``; the row samples unconstrained and late-output
+        suppression discards its token. When every structured row finished
+        there is no grammar output at all, and the deferred forward still has
+        to be sampled, so it samples with an all-allowed mask.
+        """
+        try:
+            bitmask = self._reorder_grammar_bitmask(
+                grammar_output,
+                model_input,
+                lane_total=lane_total,
+                require_complete=False,
+            )
+            if bitmask is None:
+                bitmask = torch.full(
+                    (len(model_input.grammar_row_req_ids), self.bitmask_size),
+                    -1,
+                    dtype=torch.int32,
+                )
+            return self.async_decode.sample_deferred_async_decode(
+                deferred, replace(model_input, grammar_bitmask=[bitmask])
+            )
+        except Exception:
+            self._poison_device_grammar()
+            raise
 
     def _grammar_validated_drafts(
         self, model_input: TTModelInput, grammar_output: GrammarOutput
@@ -4225,16 +4276,14 @@ class TTModelRunner:
         if has_always_host_only_sampling_params:
             return False
 
-        # The initial model contract covers decode only. Prefill keeps the
-        # established host path so its first token remains grammar-safe.
-        # Upstream async scheduling can queue another forward before the
-        # current sample-time grammar arrives; the traced TT logits buffer is
-        # single-owner, so structured decode stays on host until that overlap
-        # has a dedicated multi-buffer contract.
+        # The model contract covers decode only. Prefill keeps the established
+        # host path so its first token remains grammar-safe. Upstream async
+        # scheduling needs no exception: ``step_with_batch_queue`` calls
+        # ``sample_tokens`` for a deferred decode before it calls
+        # ``execute_model`` for the next one, so the model's single logits
+        # buffer is sampled before the next forward can overwrite it.
         if has_structured_outputs and (
-            not is_decode
-            or not self.supports_device_grammar
-            or self.scheduler_config.async_scheduling
+            not is_decode or not self.supports_device_grammar
         ):
             return False
 
