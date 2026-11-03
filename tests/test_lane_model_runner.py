@@ -11,6 +11,7 @@ environment because importing the plugin modules pulls in ttnn.
 
 from types import MethodType, SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -362,6 +363,56 @@ def test_get_output_tokens_skips_all_intermediate_prefill_rows():
 
     assert sampled[0].tolist() == [[0]]
     assert logprobs == [None]
+
+
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_split_prompt_of_a_block_output_model(adaptive):
+    """A split prompt (Mamba cache mode align cuts it at block boundaries) runs
+    on an adaptive block-output model, whose prefill emits one anchor token:
+    the intermediate chunk emits nothing and the final chunk its anchor. A
+    model whose prefill emits a whole block still refuses."""
+    runner = SimpleNamespace(
+        host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run"),
+        _is_block_output_model=True,
+        _is_adaptive_block_output=adaptive,
+        _num_speculative_tokens=0,
+        _output_tokens_per_step=8,
+        _apply_sampled_tokens_to_state=lambda tokens, req_ids: None,
+    )
+    model_input = SimpleNamespace(
+        intermediate_prefill_mask=torch.tensor([True]), execution_lane="dflash"
+    )
+
+    def sample():
+        return TTModelRunner._get_output_tokens(
+            runner,
+            torch.zeros((1, 1)),
+            None,
+            SimpleNamespace(),
+            model_input,
+            [1],
+            True,  # sampled on device
+            False,  # prefill
+        )
+
+    def build():
+        return TTModelRunner._build_chunked_prefill_output(
+            runner,
+            req_ids=["mid", "last"],
+            sampled_token_ids=torch.tensor([[0], [42]], dtype=torch.int32),
+            logprobs=None,
+            intermediate_mask=np.array([True, False]),
+        )
+
+    if not adaptive:
+        with pytest.raises(ValueError, match="output_tokens_per_step=8"):
+            sample()
+        with pytest.raises(ValueError, match="output_tokens_per_step=8"):
+            build()
+        return
+    sampled, _ = sample()
+    assert sampled[0].tolist() == [[0]]
+    assert build().sampled_token_ids == [[], [42]]
 
 
 def test_finish_lane_sync_suppresses_intermediate_prefill_output():

@@ -3937,6 +3937,18 @@ class TTModelRunner:
             )
         return output
 
+    def _check_chunked_prefill_output_width(self) -> None:
+        """A split prompt's final chunk emits one token per request. That holds
+        for single-token models and for adaptive block-output prefill, which
+        emits one anchor token (blocks come only from decode); other block
+        models must keep chunked prefill off."""
+        if self._output_tokens_per_step != 1 and not self._is_adaptive_block_output:
+            raise ValueError(
+                "Chunked prefill emits one token per request, but this model "
+                f"emits output_tokens_per_step={self._output_tokens_per_step} "
+                "on prefill; block-output models must disable chunked prefill"
+            )
+
     def _build_chunked_prefill_output(
         self,
         req_ids: list[str],
@@ -3952,10 +3964,7 @@ class TTModelRunner:
         tokens without appending output. Only final rows emit a token and reach
         runner state.
         """
-        assert self._output_tokens_per_step == 1, (
-            "Chunked-prefill output suppression assumes one sampled token per "
-            "request; block-output models must disable chunked prefill"
-        )
+        TTModelRunner._check_chunked_prefill_output_width(self)
         emit_mask = np.asarray(
             [not bool(intermediate_mask[i]) for i in range(len(req_ids))],
             dtype=bool,
@@ -4358,10 +4367,7 @@ class TTModelRunner:
             ):
                 # Every row is mid-prompt; there is nothing to sample and the
                 # placeholders are dropped when the output is built.
-                assert self._output_tokens_per_step == 1, (
-                    "Intermediate-prefill suppression assumes one sampled token "
-                    "per request"
-                )
+                TTModelRunner._check_chunked_prefill_output_width(self)
                 next_token_ids = torch.zeros(sz, dtype=torch.int32)
                 logprobs_per_dp.append(None)
             elif not perform_device_sampling:
