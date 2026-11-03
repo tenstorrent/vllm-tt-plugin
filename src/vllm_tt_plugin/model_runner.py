@@ -3441,7 +3441,8 @@ class TTModelRunner:
         # models additionally consume ``block_tables_per_group`` via the
         # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
         # legacy generator_vllm wrappers strip it on the way through and raise
-        # loudly if the list has more than one entry.
+        # loudly if the list has more than one entry. With MambaSpec groups,
+        # ``build_model_input`` replaces it with the first attention group's.
         block_tables = block_tables_per_group[0]
 
         # NOTE: We assume that all sequences in the group are all prompts or
@@ -4158,8 +4159,13 @@ class TTModelRunner:
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         if self._mamba_groups is not None:
+            # Group 0 can be a MambaSpec group, so ``page_table`` is the first
+            # attention group's table instead.
             model_input = replace(
                 model_input,
+                block_tables=model_input.block_tables_per_group[
+                    self._mamba_groups.attention_group_index
+                ],
                 state_block_ids_per_layer=self._mamba_groups.state_block_ids_per_layer(
                     model_input.block_tables_per_group,
                     model_input.row_req_ids or [],
