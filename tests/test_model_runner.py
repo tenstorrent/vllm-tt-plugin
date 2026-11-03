@@ -588,3 +588,46 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     )
     expected = not (has_penalties and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+@pytest.mark.parametrize("device_eligible", [False, True])
+@pytest.mark.parametrize("lengths", [(8, 8), (2, 8), (2, 2)])
+def test_intermediate_prefill_opt_in_routing_and_forwarding(
+    opt_in, device_eligible, lengths
+):
+    batch, first = _batch_with_one_request(lengths[0], 0, 0)
+    second = CachedRequestState(
+        req_id="s",
+        prompt_token_ids=list(range(lengths[1])),
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([1],),
+        num_computed_tokens=0,
+        output_token_ids=[],
+    )
+    batch.add_request(second)
+    runner = _fake_runner(batch, first)
+    runner.requests["s"] = second
+    runner.supports_intermediate_prefill_mask = opt_in
+    runner.check_perform_device_sampling = lambda **_: device_eligible
+    model_input = _prepare(runner, ("r", 2, 0, 0), ("s", 2, 0, 0))
+    expected = [length > 2 for length in lengths]
+    assert model_input.intermediate_prefill_mask.tolist() == expected
+    assert model_input.perform_device_sampling == (
+        device_eligible and (opt_in or not any(expected))
+    )
+    captured = {}
+    runner.model = SimpleNamespace(prefill_forward=lambda **kw: captured.update(kw))
+    runner.kv_caches = object()
+    runner.trace_mode = "all"
+    runner.request_specific_rope = False
+    runner.async_decode = SimpleNamespace(note_prefill_submitted=lambda: None)
+    TTModelRunner.submit_prefill(runner, model_input, [2])
+    assert ("intermediate_prefill_mask" in captured) == opt_in
+    if opt_in:
+        assert captured["intermediate_prefill_mask"].tolist() == expected
+        assert captured["intermediate_prefill_mask"].dtype == torch.bool
+        assert captured["intermediate_prefill_mask"].device.type == "cpu"
+    assert ("sampling_params" in captured) == model_input.perform_device_sampling

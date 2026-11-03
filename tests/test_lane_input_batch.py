@@ -1154,3 +1154,51 @@ def test_compact_mixed_greedy_random_preserves_logprobs(mode):
         compact.logprobs_tensors.logprob_token_ids,
         reference.logprobs_tensors.logprob_token_ids[rows],
     )
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+@pytest.mark.parametrize("device_eligible", [False, True])
+@pytest.mark.parametrize("lengths", [(8, 8), (2, 8), (2, 2)])
+def test_lane_intermediate_prefill_opt_in_routing(opt_in, device_eligible, lengths):
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    batch = _lane_batch(num_lanes=2, per_lane=2, with_custom=False)
+    requests = {}
+    rows = []
+    for lane, length in enumerate(lengths):
+        req = _make_req(str(lane), list(range(length)), [], dict(temperature=0.0))
+        requests[req.req_id] = req
+        row = _add_to_lane(batch, req, lane=lane)
+        batch.num_computed_tokens_cpu[row] = 0
+        rows.append(row)
+    out = SchedulerOutput.make_empty()
+    out.num_scheduled_tokens = {r: 2 for r in requests}
+    out.total_num_scheduled_tokens = 4
+    plan = TTStepPlan(
+        is_decode=False,
+        capacity=4,
+        scheduled_req_ids=tuple(requests),
+        scheduled_rows=tuple(rows),
+        input_rows=tuple(rows),
+        req_id_to_row=dict(zip(requests, rows)),
+        batch_size_per_dp=(1, 1),
+        prefill_empty_slots=tuple(rows),
+    )
+    runner = SimpleNamespace(
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _block_tables_per_layer=lambda _: None,
+        check_perform_device_sampling=lambda **_: device_eligible,
+        _output_tokens_per_step=1,
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        requests=requests,
+        supports_intermediate_prefill_mask=opt_in,
+    )
+    model_input = batch.build_model_input(runner, out, None, plan)
+    expected = [length > 2 for length in lengths]
+    assert model_input.intermediate_prefill_mask.tolist() == expected
+    assert model_input.perform_device_sampling == (
+        device_eligible and (opt_in or not any(expected))
+    )
+    assert model_input.prefill_empty_slots == rows

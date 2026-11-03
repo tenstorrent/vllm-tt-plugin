@@ -46,6 +46,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
+| `intermediate_prefill_mask` | CPU Boolean tensor `[B]`, supplied only to models declaring `supports_intermediate_prefill_mask=True`. True marks KV-only rows; False marks final rows. Supplied even when all rows are final. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
 For row `i`, `prefill_forward` computes
@@ -58,7 +59,15 @@ The model adapter returns host logits `[B, 1, V]` for host sampling, or sampled
 token IDs for device sampling. The plugin has no separate prefill readback
 hook. `TTModelRunner` suppresses output for intermediate prefill chunks and
 selects host sampling when a submitted prefill contains intermediate chunks,
-so intermediate chunks must not advance a device sampler.
+unless the model opts into `supports_intermediate_prefill_mask`.
+
+Opted-in adapters perform KV work for True rows without terminal sampling,
+RNG/penalty/token-feedback state changes, or logits readback. Return placeholder
+rows in the usual output shape; the plugin discards them. False rows retain the
+requested output and submitted order, and remain eligible for device sampling
+in a mixed batch. Actual host-only controls still select host sampling. An
+all-False mask preserves ordinary prefill behavior. Models without the capability
+retain the existing call arguments and routing.
 
 ### Multimodal inputs and request-specific RoPE
 

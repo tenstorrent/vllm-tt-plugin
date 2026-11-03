@@ -565,6 +565,15 @@ class TTModelRunner:
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
+        self.supports_intermediate_prefill_mask = getattr(
+            self.model, "model_capabilities", {}
+        ).get("supports_intermediate_prefill_mask", False)
+        if not isinstance(self.supports_intermediate_prefill_mask, bool):
+            raise ValueError(
+                "supports_intermediate_prefill_mask must be bool, got "
+                f"{self.supports_intermediate_prefill_mask!r}"
+            )
+
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
             if callable(activate):
@@ -2354,10 +2363,14 @@ class TTModelRunner:
         )
         if has_structured and not has_scheduled_structured:
             perform_device_sampling = False
-        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
-            # Device sampling advances device RNG state for every row it reads,
-            # which an intermediate chunk must not do. Host sampling can hand
-            # those rows a generator clone instead.
+        if (
+            intermediate_prefill_mask is not None
+            and intermediate_prefill_mask.any()
+            and not getattr(self, "supports_intermediate_prefill_mask", False)
+        ):
+            # Legacy adapters cannot suppress device RNG advancement for
+            # intermediate rows. Host sampling uses generator clones for them;
+            # opted-in adapters preserve their state using the forwarded mask.
             perform_device_sampling = False
         if spec_mode == ACCEPT_MODE_LOGITS:
             # The host walk samples from the logits this verify returns, so the
@@ -3743,6 +3756,8 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        if getattr(self, "supports_intermediate_prefill_mask", False):
+            kwargs["intermediate_prefill_mask"] = model_input.intermediate_prefill_mask
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has
