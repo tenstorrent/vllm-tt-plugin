@@ -1533,13 +1533,18 @@ class TTLaneInputBatch(InputBatch):
         draft cap counts the step's live rows, the global count
         ``SpecPlan.k_by_rows`` is declared against.
 
-        A slot can hold a request the step leaves out: a decode step that the
+        A slot can hold a request the step leaves out. A decode step that the
         coordinator interleaves into a run of prefills leaves a partial
-        prefill holding its row. That slot is ``None`` here too, and
-        ``_build_decode_input`` already gave it position -1. Its request
-        has no token to commit, and the commit, the recorded count and the
-        proposal all key on this identity, so naming it would append a token
-        to a prompt that is still being prefilled.
+        prefill holding its row; ``_build_decode_input`` already gave that
+        slot position -1. Under async scheduling vLLM also leaves out a
+        request that the step in flight is sure to finish at ``max_tokens``
+        (``get_tt_finishing_req_ids``), which holds its slot, at its real
+        position, until the scheduler reports it finished. Either slot is
+        ``None`` here too. Its request has no token to commit, and the
+        commit, the recorded count and the proposal all key on this identity,
+        so naming it would commit a token for a request this step does not
+        advance. A verify and the ordinary decode alike give either slot
+        position -1, as a chained verify does, so the device does not run it.
         """
         none = {
             "input_tokens": input_tokens,
@@ -1577,6 +1582,18 @@ class TTLaneInputBatch(InputBatch):
                     input_tokens,
                     input_positions,
                 )
+        # A left-out slot is idle on the device too, as a chained block's is:
+        # at its own position the model counts it as a live row, so its group
+        # width and pass count, and with them the drafts the device chains for
+        # the scheduled rows, would differ from what ``draft_cap`` over those
+        # rows declares. The ordinary decode below needs it as much: the width
+        # the model takes from that count is the one it drafts for next.
+        left_out = [row for row in self.occupied_rows() if row not in scheduled]
+        if left_out:
+            input_tokens = input_tokens.clone()
+            input_positions = input_positions.clone()
+            input_tokens[left_out] = 0
+            input_positions[left_out] = -1
         spec_plan = getattr(runner, "_spec_plan", None)
         drafts, num_valid, counts = runner._spec_row_state(
             runner._req_accepted_counts,
@@ -1614,7 +1631,7 @@ class TTLaneInputBatch(InputBatch):
         # The ordinary decode inside a speculating launch, as in the
         # front-packed builder: every row commits one token, so the counts reset
         # here, and an unresolved commit reaches the model as ``accepted_counts``.
-        out = dict(none)
+        out = dict(none, input_tokens=input_tokens, input_positions=input_positions)
         out["row_req_ids"] = row_req_ids
         if _has_unresolved_commit(counts, total):
             out["accepted_counts"] = counts
