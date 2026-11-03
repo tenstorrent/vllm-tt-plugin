@@ -369,6 +369,22 @@ class TTScheduler(AsyncScheduler):
             self._pack.observe(scheduler_output, self.requests, len(self.waiting))
         return scheduler_output
 
+    def _pack_held(self, policy: DeferFinalPolicy) -> list[Request]:
+        """The held one-chunk prompts a draining cohort's step admits: the head of ``policy.finals`` alone, or,
+        under ``TT_SCHED_PACK``, the leading held prompts whose lengths form a listed layout (they stay in the
+        cohort's order; the generator packs them into one chunk and ``observe`` pops every final the step
+        completed). A parked (multi-chunk) final ends the run: it is never packed."""
+        run: list[Request] = []
+        for _, held in policy.finals:
+            if held is None:
+                break
+            run.append(held)
+        assert run, "no held prompt at the head of the finals"
+        pack = getattr(self, "_pack", None)
+        if pack is None:
+            return run[:1]
+        return run[: pack.admit(run)]
+
     def _pack_admit(self) -> int:
         """New requests a prefill step with no partial prefill admits under
         aligned chunks: one, or the prompts of the listed layout the FIFO head
@@ -432,8 +448,8 @@ class TTScheduler(AsyncScheduler):
     def _schedule_prefill_deferred(self) -> SchedulerOutput:
         """``_schedule_prefill_only`` under ``TT_SCHED_DEFER_FINAL`` (sched_defer_final): the base scheduler sees,
         per step, exactly the request that should advance. A closed cohort drains its finals one a step in order
-        (a held one-chunk prompt put back at the head of the queue and admitted alone; a parked partial un-hidden
-        alone); else an unparked partial (a bulk in progress) advances alone; else, while the cohort is open, the
+        (a held one-chunk prompt put back at the head of the queue and admitted alone, or with the held prompts
+        after it that form a listed layout under ``TT_SCHED_PACK``; a parked partial un-hidden alone); else an unparked partial (a bulk in progress) advances alone; else, while the cohort is open, the
         head of the queue is admitted alone (a one-chunk prompt is held instead, and the step looks again); else
         the cohort closes (full, or a queue tail) and its first final runs. Parked partials and pure decodes are
         hidden from the base scheduler and counted in the capacity; the waiting queues are hidden except for the
@@ -452,10 +468,12 @@ class TTScheduler(AsyncScheduler):
             active = [r for r in partials if r.request_id not in parked_ids]
             visible: list[Request] = []
             admit: Request | None = None
+            admits: list[Request] = []  # held one-chunk prompts admitted together (TT_SCHED_PACK)
             if policy.draining:
                 head_id, held = policy.finals[0]
                 if held is not None:
-                    admit = held
+                    admits = self._pack_held(policy)
+                    admit = admits[0]
                 elif policy.final_step:
                     # every parked final of the cohort in one step: one token each (the last prompt token),
                     # which the runner routes to a decode step (sched_final_step)
@@ -487,11 +505,12 @@ class TTScheduler(AsyncScheduler):
             break  # nothing to prefill: an empty step (the caller falls back to decode)
         hidden = [r for r in saved_running if r not in visible]  # parked partials and pure decodes
         self.running = cast(list[Request], visible)
-        self.max_num_running_reqs = len(visible) if visible else (1 if admit is not None else 0)
+        self.max_num_running_reqs = len(visible) if visible else (max(1, len(admits)) if admit is not None else 0)
         saved_budget = getattr(self, "max_num_scheduled_tokens", None)
         budget = policy.budget(visible[0]) if len(visible) == 1 and not policy.draining else None
-        if admit is not None and admit is not (saved_waiting.peek_request() if saved_waiting else None):
-            hidden_queue.add_request(admit)  # a held one-chunk prompt: alone at the head
+        if admits:
+            for request in admits:  # the held one-chunk prompts: alone at the head, in the cohort's order
+                hidden_queue.add_request(request)
             self.waiting = hidden_queue
         elif admit is not None:
             self.waiting = saved_waiting  # the head of the real queue, admitted alone (max 1)

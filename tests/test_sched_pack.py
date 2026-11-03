@@ -213,3 +213,123 @@ def test_composes_with_interleave_counting_every_packed_prompt():
     assert interleave.completed == 4, "one packed step completed four prompts"
     assert pack.packs == 1 and pack.packed_prompts == 4
     assert interleave.burst_due(ready_decoders=1, waiting=4, next_prompt_tokens=1028)
+
+
+# --- the deferred drain (TT_SCHED_DEFER_FINAL=hold with TT_SCHED_PACK) ----------------
+
+from vllm_tt_plugin.sched_defer_final import DeferFinalPolicy  # noqa: E402
+
+CHUNK = 5120
+
+
+def _held(req_id, prompt, computed=0):
+    return SimpleNamespace(
+        request_id=req_id,
+        num_prompt_tokens=prompt,
+        num_computed_tokens=computed,
+        is_prefill_chunk=computed < prompt,
+        status="WAITING",
+    )
+
+
+def _deferred_scheduler(prompts, *, pack, cohort=8, decoders=0):
+    """The defer tests' scheduler (``test_sched_defer_final``) with the pack policy set."""
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    running = [_held(f"d{i}", 1028, 1040) for i in range(decoders)]
+    waiting = [_held(f"w{i}", p) for i, p in enumerate(prompts)]
+    for request in waiting:
+        scheduler.waiting.add_request(request)
+    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.running = list(running)
+    scheduler.max_num_running_reqs = cohort
+    scheduler._forced_mode = TTSchedulingMode.DEFAULT
+    scheduler._aligned_chunks = True
+    scheduler._interleave = None
+    scheduler._pack = pack
+    scheduler._defer = DeferFinalPolicy(CHUNK, cohort, hold_admission=True)
+    scheduler.requests = {r.request_id: r for r in running + waiting}
+    return scheduler
+
+
+def _base_schedule_whole(self, throttle_prefills=False):
+    """The base loop as the deferred path sees it, admitting whole prompts up to the running cap (the token budget
+    holds a listed layout), else one chunk of the first partial, else a decode of every running decode row."""
+    rows = {}
+    new = []
+    partial = next((r for r in self.running if r.is_prefill_chunk), None)
+    if partial is None:
+        while self.waiting and len(self.running) < self.max_num_running_reqs:
+            r = self.waiting.pop_request()
+            self.running.append(r)
+            new.append(r)
+            n = min(CHUNK, r.num_prompt_tokens)
+            r.num_computed_tokens = n
+            r.is_prefill_chunk = n < r.num_prompt_tokens
+            rows[r.request_id] = n
+    elif partial is not None:
+        n = min(CHUNK, partial.num_prompt_tokens - partial.num_computed_tokens)
+        partial.num_computed_tokens += n
+        partial.is_prefill_chunk = partial.num_computed_tokens < partial.num_prompt_tokens
+        rows[partial.request_id] = n
+    if not rows:
+        for r in self.running:
+            if not r.is_prefill_chunk:
+                r.num_computed_tokens += 1
+                rows[r.request_id] = 1
+    out = SchedulerOutput.make_empty()
+    out.num_scheduled_tokens = rows
+    out.total_num_scheduled_tokens = sum(rows.values())
+    out.scheduled_new_reqs = new
+    return out
+
+
+def _steps(scheduler, n):
+    """Per step: the sorted ids of the rows it scheduled."""
+    out = []
+    for _ in range(n):
+        result = scheduler.schedule()
+        out.append(sorted(result.num_scheduled_tokens))
+    return out
+
+
+def test_deferred_drain_packs_the_held_prompts(monkeypatch):
+    """Under TT_SCHED_DEFER_FINAL=hold a one-chunk prompt is held into the cohort and drained one a step; with
+    TT_SCHED_PACK the drain admits the leading held prompts that form a listed layout in one step."""
+    monkeypatch.setattr(AsyncScheduler, "schedule", _base_schedule_whole)
+    pack = PackPolicy(parse_layouts(LAYOUTS))
+    scheduler = _deferred_scheduler([1028] * 8, pack=pack, cohort=8)
+    t = _steps(scheduler, 3)
+    # the eight held prompts close the cohort (full); the drain is two packs of four, then the decode of all eight
+    assert t == [["w0", "w1", "w2", "w3"], ["w4", "w5", "w6", "w7"], [f"w{i}" for i in range(8)]], t
+    assert scheduler._defer.closed_on == ["full"] and not scheduler._defer.draining
+    assert pack.packs == 2 and pack.packed_prompts == 8
+
+
+def test_deferred_drain_packs_only_a_listed_prefix(monkeypatch):
+    """A tail cohort of 1028, 1028, 2052, 2052, 1028: the first pair, then the pair of 2,052s, then one alone."""
+    monkeypatch.setattr(AsyncScheduler, "schedule", _base_schedule_whole)
+    pack = PackPolicy(parse_layouts(LAYOUTS))
+    scheduler = _deferred_scheduler([1028, 1028, 2052, 2052, 1028], pack=pack, cohort=32)
+    t = _steps(scheduler, 4)
+    assert t == [["w0", "w1"], ["w2", "w3"], ["w4"], [f"w{i}" for i in range(5)]], t
+    assert scheduler._defer.closed_on == ["tail"]
+
+
+def test_deferred_drain_never_packs_a_parked_final(monkeypatch):
+    """A parked (multi-chunk) final between held prompts ends the pack: held w0, w1 pack; w2's final alone; w3."""
+    monkeypatch.setattr(AsyncScheduler, "schedule", _base_schedule_whole)
+    pack = PackPolicy(parse_layouts(LAYOUTS))
+    scheduler = _deferred_scheduler([1028, 1028, 2 * CHUNK + 100, 1028], pack=pack, cohort=32)
+    t = _steps(scheduler, 6)
+    # w0 and w1 held, w2's two bulk chunks (it parks after them), w3 held, the tail closes: w0 + w1 packed, w2's
+    # final alone, w3 alone, then the cohort decodes
+    assert t == [["w2"], ["w2"], ["w0", "w1"], ["w2"], ["w3"], ["w0", "w1", "w2", "w3"]], t
+
+
+def test_deferred_drain_without_the_pack_flag_is_one_a_step(monkeypatch):
+    monkeypatch.setattr(AsyncScheduler, "schedule", _base_schedule_whole)
+    scheduler = _deferred_scheduler([1028] * 4, pack=None, cohort=4)
+    t = _steps(scheduler, 5)
+    assert t == [["w0"], ["w1"], ["w2"], ["w3"], ["w0", "w1", "w2", "w3"]], t
