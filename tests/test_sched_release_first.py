@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
-"""TT_SCHED_RELEASE_FIRST: a cohort's first tokens released in groups (sched_release_first), on the stub of the base
+"""TT_SCHED_RELEASE_FIRST: a cohort's first tokens released in groups
+(sched_release_first), on the stub of the base
 scheduler's loop of test_sched_defer_final plus a stub of its ``update_from_output``."""
 
 import pytest
@@ -12,7 +13,8 @@ from tests.test_sched_defer_final import CHUNK, _base_schedule, _scheduler
 from vllm_tt_plugin.sched_release_first import ReleaseFirstPolicy, value
 from vllm_tt_plugin.scheduler import KNOWN_SCHED_FLAGS, check_sched_flags
 
-FINISH_AT = {}  # req_id -> finish the request on its first token (the stub's finish_reason)
+# req_id -> finish the request on its first token (the stub's finish_reason).
+FINISH_AT = {}
 
 
 def test_flags_and_values():
@@ -48,8 +50,10 @@ def test_flags_and_values():
 
 
 def _base_update(self, scheduler_output, model_runner_output):
-    """The base ``update_from_output`` as the loop sees it: one output per scheduled row that produced a token (a
-    prefill chunk that completed the prompt, or a decode row); a request in FINISH_AT finishes on its first."""
+    """The base ``update_from_output`` as the loop sees it: one output per scheduled row
+    that produced a token (a
+    prefill chunk that completed the prompt, or a decode row); a request in FINISH_AT
+    finishes on its first."""
     outs = []
     for req_id in scheduler_output.num_scheduled_tokens:
         r = self.requests[req_id]
@@ -78,15 +82,17 @@ def base(monkeypatch):
     FINISH_AT.clear()
 
 
-def _sched(prompts, *, cohort=4, group=None, hold=True):
-    scheduler = _scheduler(prompts, cohort=cohort, hold=hold)
+def _sched(prompts, *, cohort=4, group=None, hold=True, hold_all=False):
+    scheduler = _scheduler(prompts, cohort=cohort, hold=hold, hold_all=hold_all)
     scheduler._release = ReleaseFirstPolicy(group)
     return scheduler
 
 
 def _step(scheduler, async_order=False, pending=None):
-    """One engine step: schedule, execute (the stub), update. With ``async_order`` the schedule of step N+1 runs
-    before the update of step N (``pending`` carries the scheduled output across calls)."""
+    """One engine step: schedule, execute (the stub), update. With ``async_order`` the
+    schedule of step N+1 runs
+    before the update of step N (``pending`` carries the scheduled output across
+    calls)."""
     if async_order:
         out = scheduler.schedule()
         prev = pending.pop() if pending else None
@@ -116,7 +122,8 @@ def test_cohort_release_holds_every_first_token_until_the_last_final(base):
     assert delivered[:3] == [[], [], []], delivered
     assert delivered[3] == [("w0", 1), ("w1", 1), ("w2", 1), ("w3", 1)]
     assert scheduler._release.releases == [4] and not scheduler._release.expected
-    # the decode step's tokens pass straight through (the stub's row order is the running list's)
+    # the decode step's tokens pass straight through (the stub's row order is the
+    # running list's)
     assert sorted(_step(scheduler)) == [(f"w{i}", 2) for i in range(4)]
 
 
@@ -146,6 +153,43 @@ def test_one_chunk_prompts_are_never_held(base):
     assert scheduler._release.releases == []
 
 
+def test_hold_all_releases_the_held_prompts_first_tokens_at_the_drains_end(base):
+    """TT_SCHED_DEFER_FINAL=hold-all: a one-chunk prompt held for the cohort has its
+    first token withheld like a parked final's, so a cohort of one-chunk prompts (packed
+    or single) releases
+    every first token at its last drain step; the decode tokens pass through."""
+    scheduler = _sched([1028] * 3, cohort=3, group=None, hold_all=True)
+    delivered = [_step(scheduler) for _ in range(3)]
+    assert delivered == [[], [], [("w0", 1), ("w1", 1), ("w2", 1)]], delivered
+    assert scheduler._release.releases == [3] and not scheduler._release.expected
+    assert sorted(_step(scheduler)) == [(f"w{i}", 2) for i in range(3)]
+
+
+def test_hold_all_releases_a_reopened_cohorts_stragglers_together(base):
+    """The first of a burst (a tail cohort of one) has its first token released at its
+    own drain's end; the
+    stragglers that reopen the cohort are released together at theirs."""
+    scheduler = _sched([1028], cohort=32, group=None, hold_all=True)
+    assert _step(scheduler) == [
+        ("w0", 1)
+    ]  # its prefill is its final, the drain of one ends: released
+    assert _step(scheduler) == [("w0", 2)]  # one decode step: young
+    for i, p in enumerate((1028, 1029, 1030)):
+        _req_for(scheduler, f"a{i}", p)
+    delivered = [_step(scheduler) for _ in range(3)]
+    assert delivered == [[], [], [("a0", 1), ("a1", 1), ("a2", 1)]], delivered
+    assert sorted(_step(scheduler)) == [("a0", 2), ("a1", 2), ("a2", 2), ("w0", 3)]
+
+
+def _req_for(scheduler, req_id, prompt):
+    from tests.test_sched_defer_final import _req
+
+    r = _req(req_id, prompt)
+    scheduler.requests[req_id] = r
+    scheduler.waiting.add_request(r)
+    return r
+
+
 def test_a_request_finishing_on_its_first_token_is_released_at_once(base):
     FINISH_AT["w1"] = True
     scheduler = _sched([2 * CHUNK + 100] * 3, cohort=3, group=None)
@@ -173,7 +217,8 @@ def test_async_order_releases_in_the_update_where_the_last_token_arrives(base):
     scheduler = _sched([2 * CHUNK + 100] * 4, cohort=4, group=None)
     pending = []
     delivered = [_step(scheduler, async_order=True, pending=pending) for _ in range(13)]
-    # schedules 0..12: 8 bulks, 4 finals, 1 decode; updates lag by one: the finals' tokens arrive at steps 9..12
+    # schedules 0..12: 8 bulks, 4 finals, 1 decode; updates lag by one: the finals'
+    # tokens arrive at steps 9..12
     assert delivered[:12] == [[]] * 12, delivered
     assert delivered[12] == [("w0", 1), ("w1", 1), ("w2", 1), ("w3", 1)]
     assert sorted(_step(scheduler, async_order=True, pending=pending)) == [

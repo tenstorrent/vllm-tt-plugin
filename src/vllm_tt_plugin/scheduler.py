@@ -12,9 +12,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
-from vllm_tt_plugin import sched_events
+
+from vllm_tt_plugin import sched_defer_final, sched_events, sched_final_step
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin import sched_defer_final, sched_final_step
 from vllm_tt_plugin.sched_defer_final import DeferFinalPolicy
 from vllm_tt_plugin.sched_interleave import InterleavePolicy
 from vllm_tt_plugin.sched_pack import PackPolicy
@@ -158,21 +158,29 @@ class TTScheduler(AsyncScheduler):
         # unless the variable is set. The generator's TT_V41_DEFER_FINAL must
         # agree (it parks and restores the prefixes), or the start-up refuses.
         sched_defer_final.check_agreement()
-        self._defer = DeferFinalPolicy.from_env(chunk_tokens=chunk, cohort=self.max_num_running_reqs)
+        self._defer = DeferFinalPolicy.from_env(
+            chunk_tokens=chunk, cohort=self.max_num_running_reqs
+        )
         # TT_SCHED_FINAL_STEP (sched_final_step): the cohort's first tokens
         # from one decode step; needs the deferred finals and the generator's
         # parking off.
         sched_final_step.check_agreement(defer_enabled=self._defer is not None)
         if self._defer is not None:
             if self._interleave is not None:
-                raise ValueError("TT_SCHED_DEFER_FINAL and TT_SCHED_INTERLEAVE do not compose")
+                raise ValueError(
+                    "TT_SCHED_DEFER_FINAL and TT_SCHED_INTERLEAVE do not compose"
+                )
             logger.info("TT scheduler deferred finals: %s", self._defer.describe())
         # TT_SCHED_RELEASE_FIRST (sched_release_first): a cohort's first
         # tokens released k at a time, or all at the drain's end; None unless
         # the variable is set, and refused without the deferred finals.
-        self._release = ReleaseFirstPolicy.from_env(defer_enabled=self._defer is not None)
+        self._release = ReleaseFirstPolicy.from_env(
+            defer_enabled=self._defer is not None
+        )
         if self._release is not None:
-            logger.info("TT scheduler first-token release: %s", self._release.describe())
+            logger.info(
+                "TT scheduler first-token release: %s", self._release.describe()
+            )
         # TT_SCHED_PACK (sched_pack): a prefill step with no partial prefill
         # admits the whole prompts of a listed layout at the head of the queue
         # (aligned chunks only: the generator packs them); None unless set.
@@ -188,7 +196,8 @@ class TTScheduler(AsyncScheduler):
 
     @property
     def _defer_policy(self):
-        """The deferred-final policy, or None (a scheduler built without ``__init__``, as the unit tests do)."""
+        """The deferred-final policy, or None (a scheduler built without ``__init__``,
+        as the unit tests do)."""
         return getattr(self, "_defer", None)
 
     @property
@@ -211,7 +220,10 @@ class TTScheduler(AsyncScheduler):
             bool(self.waiting)
             or bool(getattr(self, "skipped_waiting", False))
             or any(request.is_prefill_chunk for request in self.running)
-            or (self._defer_policy is not None and (self._defer_policy.size() > 0 or self._defer_policy.draining))
+            or (
+                self._defer_policy is not None
+                and (self._defer_policy.size() > 0 or self._defer_policy.draining)
+            )
         )
 
     @sched_events.guarded
@@ -225,8 +237,10 @@ class TTScheduler(AsyncScheduler):
         return result
 
     def _log_schedule(self, result: SchedulerOutput) -> None:
-        """One ``admit`` line per newly admitted request, one ``preempt`` line per preempted one, and one
-        ``chunk`` line per prefill row (a new request or a partial prefill) with the chunk it was given
+        """One ``admit`` line per newly admitted request, one ``preempt`` line per
+        preempted one, and one
+        ``chunk`` line per prefill row (a new request or a partial prefill) with the
+        chunk it was given
         (``TT_SCHED_EVENT_LOG``, see ``sched_events``)."""
         for new in result.scheduled_new_reqs:
             sched_events.emit("admit", id=new.req_id)
@@ -308,7 +322,8 @@ class TTScheduler(AsyncScheduler):
 
         - one clause per policy, in the order below (``TT_SCHED_DEFER_FINAL=hold``
           first: a decoding cohort admits nothing, ``sched_defer_final``); the
-          first true clause wins; a policy whose variable is unset is ``None`` and adds nothing,
+          first true clause wins; a policy whose variable is unset is ``None`` and adds
+          nothing,
           so with every variable unset this returns ``False`` and
           ``_schedule`` is the stock prefill-first path;
         - a clause reads the scheduler's state (``self.running`` and its
@@ -363,16 +378,23 @@ class TTScheduler(AsyncScheduler):
                 for req_id in scheduler_output.preempted_req_ids or ():
                     release.drop(req_id)
                 for req_id, parked in self._defer_policy.last_finals:
-                    if parked:  # a one-chunk prompt's prefill is its final: never held
+                    # a one-chunk prompt's prefill is its final: its first token is
+                    # withheld only when it was
+                    # held for the cohort (TT_SCHED_DEFER_FINAL=hold-all), never under
+                    # the stock rule
+                    if parked or self._defer_policy.hold_one_chunk:
                         release.expect(req_id, self._defer_policy.cohorts)
         if self._pack is not None:
             self._pack.observe(scheduler_output, self.requests, len(self.waiting))
         return scheduler_output
 
     def _pack_held(self, policy: DeferFinalPolicy) -> list[Request]:
-        """The held one-chunk prompts a draining cohort's step admits: the head of ``policy.finals`` alone, or,
-        under ``TT_SCHED_PACK``, the leading held prompts whose lengths form a listed layout (they stay in the
-        cohort's order; the generator packs them into one chunk and ``observe`` pops every final the step
+        """The held one-chunk prompts a draining cohort's step admits: the head of
+        ``policy.finals`` alone, or,
+        under ``TT_SCHED_PACK``, the leading held prompts whose lengths form a listed
+        layout (they stay in the
+        cohort's order; the generator packs them into one chunk and ``observe`` pops
+        every final the step
         completed). A parked (multi-chunk) final ends the run: it is never packed."""
         run: list[Request] = []
         for _, held in policy.finals:
@@ -446,13 +468,21 @@ class TTScheduler(AsyncScheduler):
         return result
 
     def _schedule_prefill_deferred(self) -> SchedulerOutput:
-        """``_schedule_prefill_only`` under ``TT_SCHED_DEFER_FINAL`` (sched_defer_final): the base scheduler sees,
-        per step, exactly the request that should advance. A closed cohort drains its finals one a step in order
-        (a held one-chunk prompt put back at the head of the queue and admitted alone, or with the held prompts
-        after it that form a listed layout under ``TT_SCHED_PACK``; a parked partial un-hidden alone); else an unparked partial (a bulk in progress) advances alone; else, while the cohort is open, the
-        head of the queue is admitted alone (a one-chunk prompt is held instead, and the step looks again); else
-        the cohort closes (full, or a queue tail) and its first final runs. Parked partials and pure decodes are
-        hidden from the base scheduler and counted in the capacity; the waiting queues are hidden except for the
+        """``_schedule_prefill_only`` under ``TT_SCHED_DEFER_FINAL``
+        (sched_defer_final): the base scheduler sees,
+        per step, exactly the request that should advance. A closed cohort drains its
+        finals one a step in order
+        (a held one-chunk prompt put back at the head of the queue and admitted alone,
+        or with the held prompts
+        after it that form a listed layout under ``TT_SCHED_PACK``; a parked partial
+        un-hidden alone); else an unparked partial (a bulk in progress) advances alone;
+        else, while the cohort is open, the
+        head of the queue is admitted alone (a one-chunk prompt is held instead, and the
+        step looks again); else
+        the cohort closes (full, or a queue tail) and its first final runs. Parked
+        partials and pure decodes are
+        hidden from the base scheduler and counted in the capacity; the waiting queues
+        are hidden except for the
         one admission."""
         policy = self._defer_policy
         assert policy is not None
@@ -468,23 +498,32 @@ class TTScheduler(AsyncScheduler):
             active = [r for r in partials if r.request_id not in parked_ids]
             visible: list[Request] = []
             admit: Request | None = None
-            admits: list[Request] = []  # held one-chunk prompts admitted together (TT_SCHED_PACK)
+            admits: list[
+                Request
+            ] = []  # held one-chunk prompts admitted together (TT_SCHED_PACK)
             if policy.draining:
                 head_id, held = policy.finals[0]
                 if held is not None:
                     admits = self._pack_held(policy)
                     admit = admits[0]
                 elif policy.final_step:
-                    # every parked final of the cohort in one step: one token each (the last prompt token),
+                    # every parked final of the cohort in one step: one token each (the
+                    # last prompt token),
                     # which the runner routes to a decode step (sched_final_step)
                     ids = {rid for rid, h in policy.finals if h is None}
                     visible = [r for r in partials if r.request_id in ids]
-                    if not visible:  # all gone (finished or preempted between steps): skip them
-                        policy.finals = deque(x for x in policy.finals if x[1] is not None)
+                    if (
+                        not visible
+                    ):  # all gone (finished or preempted between steps): skip them
+                        policy.finals = deque(
+                            x for x in policy.finals if x[1] is not None
+                        )
                         continue
                 else:
                     visible = [r for r in partials if r.request_id == head_id]
-                    if not visible:  # gone (finished or preempted between steps): skip it
+                    if (
+                        not visible
+                    ):  # gone (finished or preempted between steps): skip it
                         policy.finals.popleft()
                         continue
                 break
@@ -503,23 +542,39 @@ class TTScheduler(AsyncScheduler):
                 policy.close("full" if occupied >= policy.cohort else "tail")
                 continue
             break  # nothing to prefill: an empty step (the caller falls back to decode)
-        hidden = [r for r in saved_running if r not in visible]  # parked partials and pure decodes
+        hidden = [
+            r for r in saved_running if r not in visible
+        ]  # parked partials and pure decodes
         self.running = cast(list[Request], visible)
-        self.max_num_running_reqs = len(visible) if visible else (max(1, len(admits)) if admit is not None else 0)
+        self.max_num_running_reqs = (
+            len(visible)
+            if visible
+            else (max(1, len(admits)) if admit is not None else 0)
+        )
         saved_budget = getattr(self, "max_num_scheduled_tokens", None)
-        budget = policy.budget(visible[0]) if len(visible) == 1 and not policy.draining else None
+        budget = (
+            policy.budget(visible[0])
+            if len(visible) == 1 and not policy.draining
+            else None
+        )
         if admits:
-            for request in admits:  # the held one-chunk prompts: alone at the head, in the cohort's order
+            for request in (
+                admits
+            ):  # the held one-chunk prompts: alone at the head, in the cohort's order
                 hidden_queue.add_request(request)
             self.waiting = hidden_queue
         elif admit is not None:
-            self.waiting = saved_waiting  # the head of the real queue, admitted alone (max 1)
+            self.waiting = (
+                saved_waiting  # the head of the real queue, admitted alone (max 1)
+            )
         else:
             self.waiting = hidden_queue
         if saved_skipped is not None:
             self.skipped_waiting = create_request_queue(self.policy)
         if budget is not None:
-            self.max_num_scheduled_tokens = budget  # a stepped bulk's last chunk ends at n - 1
+            self.max_num_scheduled_tokens = (
+                budget  # a stepped bulk's last chunk ends at n - 1
+            )
         try:
             result = super().schedule()
         finally:
@@ -530,7 +585,9 @@ class TTScheduler(AsyncScheduler):
                 if self.skipped_waiting:
                     saved_skipped.prepend_requests(self.skipped_waiting)
                 self.skipped_waiting = saved_skipped
-            self.running.extend(hidden)  # a visible request the base preempted stays out, as in the stock path
+            self.running.extend(
+                hidden
+            )  # a visible request the base preempted stays out, as in the stock path
             self.max_num_running_reqs = saved_max
             if budget is not None:
                 self.max_num_scheduled_tokens = saved_budget
@@ -595,7 +652,9 @@ class TTScheduler(AsyncScheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict:
         if not sched_events.enabled():
-            return self._intercept_outputs(super().update_from_output(scheduler_output, model_runner_output))
+            return self._intercept_outputs(
+                super().update_from_output(scheduler_output, model_runner_output)
+            )
         before = [
             request
             for req_id in scheduler_output.num_scheduled_tokens
@@ -609,14 +668,17 @@ class TTScheduler(AsyncScheduler):
         return self._intercept_outputs(outputs)
 
     def _intercept_outputs(self, outputs: dict) -> dict:
-        """``TT_SCHED_RELEASE_FIRST``: the first tokens of a draining cohort held and released in groups."""
+        """``TT_SCHED_RELEASE_FIRST``: the first tokens of a draining cohort held and
+        released in groups."""
         release = self._release_policy
         if release is not None:
             defer = self._defer_policy
             before = release.released
             release.intercept(outputs, defer is not None and defer.draining)
             if sched_events.enabled() and release.released > before:
-                sched_events.emit("release", n=release.releases[-1], groups=release.released)
+                sched_events.emit(
+                    "release", n=release.releases[-1], groups=release.released
+                )
         return outputs
 
     def _free_request(self, request: Request, *args, **kwargs):
