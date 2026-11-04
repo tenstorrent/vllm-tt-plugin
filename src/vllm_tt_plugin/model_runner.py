@@ -339,6 +339,10 @@ class TTModelRunner:
         self._spec_accept_modes: tuple[str, ...] = (
             tuple(spec_plan.accept_modes) if spec_plan else ()
         )
+        # Whether the last decode step built sampled on the device
+        # (``_decode_device_sampled``): what the proposal after it publishes
+        # drafts under on a model declaring ``spec_ids_are_sampled``.
+        self._step_device_sampled = False
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -1572,13 +1576,18 @@ class TTModelRunner:
         Erasing on an empty offer is not optional. This map is what the
         scheduler is told to verify next, so an entry nothing rewrote would be
         verified against a token the request has already moved past.
+
+        A sampled request is speculable only while its steps sample on the
+        device (a model declaring ``spec_ids_are_sampled``): the offer follows
+        the step this proposal answers, and the step that verifies it decides
+        again over its own rows (``_spec_decode_rows``).
         """
-        if tokens and self._request_is_speculable(req_id):
+        if tokens and self._request_is_speculable(req_id, self._step_device_sampled):
             self._proposed_draft_token_ids[req_id] = list(tokens)
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
 
-    def _request_is_speculable(self, req_id: str) -> bool:
+    def _request_is_speculable(self, req_id: str, device_sampled: bool = False) -> bool:
         """False when no accept walk this launch drives can certify the request.
 
         A model that serves ``logits`` lets a verify walk acceptance against
@@ -1586,13 +1595,17 @@ class TTModelRunner:
         top-p, penalties, seed, token filters and grammar, and return its
         logprobs, which covers every control admission lets through on a
         speculating launch, whichever proposer drafted. Without it only the
-        greedy walk exists.
+        greedy walk exists, which also certifies a sampled request on a model
+        declaring ``spec_ids_are_sampled`` when the step samples on the device
+        (``device_sampled``; see ``_request_is_argmax_certifiable``).
         """
         if ACCEPT_MODE_LOGITS in getattr(self, "_spec_accept_modes", ()):
             return True
-        return self._request_is_argmax_certifiable(req_id)
+        return self._request_is_argmax_certifiable(req_id, device_sampled)
 
-    def _spec_mode_for_step(self, row_req_ids: list[str]) -> str:
+    def _spec_mode_for_step(
+        self, row_req_ids: list[str], device_sampled: bool = False
+    ) -> str:
         """The accept mode one verify asks for, from the rows it carries.
 
         ``argmax_ids`` while every row is certifiable by id equality
@@ -1600,18 +1613,24 @@ class TTModelRunner:
         ids rather than ``[B, 1+K, V]`` logits. One row that needs its target
         distribution makes the whole step ``logits``: the mode is per step, and
         that row would otherwise commit the argmax even with no draft of its
-        own.
+        own. ``device_sampled`` says whether the step samples on the device if
+        it is not a ``logits`` verify (``_decode_device_sampled``).
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
         if ACCEPT_MODE_LOGITS not in modes:
             return ACCEPT_MODE_ARGMAX_IDS
         if ACCEPT_MODE_ARGMAX_IDS not in modes:
             return ACCEPT_MODE_LOGITS
-        if all(self._request_is_argmax_certifiable(req_id) for req_id in row_req_ids):
+        if all(
+            self._request_is_argmax_certifiable(req_id, device_sampled)
+            for req_id in row_req_ids
+        ):
             return ACCEPT_MODE_ARGMAX_IDS
         return ACCEPT_MODE_LOGITS
 
-    def _request_is_argmax_certifiable(self, req_id: str) -> bool:
+    def _request_is_argmax_certifiable(
+        self, req_id: str, device_sampled: bool = False
+    ) -> bool:
         """False when this request's sampling cannot be certified by id equality.
 
         ``accept_greedy_drafts`` compares token ids, so it can only certify a
@@ -1623,6 +1642,15 @@ class TTModelRunner:
         distribution that temperature 0 has already collapsed to a point, so a
         greedy request carrying them is still greedy.
 
+        A model declaring ``spec_ids_are_sampled`` answers an ``argmax_ids``
+        verify of a device-sampled step with the device sampler's draws: for a
+        drafted row one draw per candidate column under the row's own
+        temperature, top-k, top-p and seed, for an undrafted row the plain
+        decode's own draw (penalties included). Against the drafts the id walk
+        is then exact rejection sampling, so on such a step (``device_sampled``)
+        a sampled or penalised request is certifiable; on a host-sampled step
+        it is not, because the ids would be the argmax.
+
         A greedy request is still not certifiable when a control moves its
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
         or a pending ``min_tokens`` rules out the token the unfiltered argmax
@@ -1632,6 +1660,9 @@ class TTModelRunner:
         both modes.
         """
         batch = self.input_batch
+        draws_ids = bool(device_sampled) and bool(
+            self.model.model_capabilities.get("spec_ids_are_sampled", False)
+        )
         # getattr rather than attribute access: the gate has to stay total for
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
@@ -1642,7 +1673,7 @@ class TTModelRunner:
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
-            if req_id in getattr(batch, attr, ()):
+            if not draws_ids and req_id in getattr(batch, attr, ()):
                 return False
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
@@ -2076,6 +2107,37 @@ class TTModelRunner:
         self._grammar_draft_handoff = {}
         self._grammar_handed_over_req_ids = set()
 
+    def _decode_device_sampled(
+        self,
+        scheduler_output: SchedulerOutput,
+        grammar_output: GrammarOutput | None,
+        req_indices: list[int],
+    ) -> bool:
+        """Whether a decode step samples on the device unless it becomes a
+        ``logits`` verify.
+
+        The standing ``check_perform_device_sampling`` decision over the step's
+        rows, with the structured-output rule the submission applies (a
+        grammar in the batch that this step does not schedule keeps the step
+        on the host). The ``logits``-mode override is not included, because the
+        mode is what this value helps decide (``_spec_decode_rows``).
+        """
+        bitmask = grammar_output.grammar_bitmask if grammar_output is not None else None
+        has_structured = has_structured_outputs(
+            self.requests, scheduler_output, bitmask
+        )
+        if has_structured and not scheduled_structured_output_request_ids(
+            self.requests, scheduler_output
+        ):
+            return False
+        return bool(
+            self.check_perform_device_sampling(
+                is_decode=True,
+                has_structured_outputs=has_structured,
+                sampling_rows=req_indices,
+            )
+        )
+
     def _spec_decode_rows(
         self,
         scheduler_output: SchedulerOutput,
@@ -2083,12 +2145,17 @@ class TTModelRunner:
         input_tokens: torch.Tensor,
         input_positions: torch.Tensor,
         live_rows: Sequence[int] | None = None,
+        device_sampled: bool = False,
     ) -> SpecDecodeRows:
         """Turn a plain decode's rows into this step's speculative rows.
 
         The one candidate-block builder, for both layouts. ``input_tokens`` is
         the plain ``[B, 1]`` decode and ``input_positions`` its ``[B]``
-        positions; ``row_req_ids`` names the live requests and ``live_rows``
+        positions; ``device_sampled`` says whether the step samples on the
+        device unless it becomes a ``logits`` verify
+        (``_decode_device_sampled``), which decides what an ``argmax_ids``
+        walk can certify on a model declaring ``spec_ids_are_sampled``;
+        ``row_req_ids`` names the live requests and ``live_rows``
         the block row each sits at, ``None`` meaning the first
         ``len(row_req_ids)`` rows. The front-packed builder passes its live
         rows alone and pads afterwards; the lane builder passes its whole slot
@@ -2177,12 +2244,15 @@ class TTModelRunner:
         accepted_counts[rows] = live_counts
         if _step_verifies(
             self._spec_supports_narrow_decode,
-            all(self._request_is_speculable(req_id) for req_id in row_req_ids),
+            all(
+                self._request_is_speculable(req_id, device_sampled)
+                for req_id in row_req_ids
+            ),
             live_num_valid,
             live_counts,
             num_live,
         ):
-            spec_mode = self._spec_mode_for_step(row_req_ids)
+            spec_mode = self._spec_mode_for_step(row_req_ids, device_sampled)
             # Uniformly 1+K wide, so a model needs one verify shape rather
             # than two.
             input_tokens, input_positions = self._spec_candidate_block(
@@ -2408,10 +2478,22 @@ class TTModelRunner:
             # decode. The controller translates this lifecycle fact into either
             # explicit contract commands or the legacy ``reset_batch`` keyword.
             decode_layout_changed = self._decode_layout_changed_since_last_decode
-
+            # Whether this step samples on the device, read before the block:
+            # on a model declaring ``spec_ids_are_sampled`` that is what lets
+            # the id walk certify a sampled request. The submission below
+            # repeats the decision and adds the ``logits``-mode override; the
+            # next proposal publishes under this step's value.
+            device_sampled = self._decode_device_sampled(
+                scheduler_output, grammar_output, req_indices
+            )
+            self._step_device_sampled = device_sampled
             # The live rows alone; the padding below widens with the block.
             spec = self._spec_decode_rows(
-                scheduler_output, row_req_ids, input_tokens, input_positions
+                scheduler_output,
+                row_req_ids,
+                input_tokens,
+                input_positions,
+                device_sampled=device_sampled,
             )
             input_tokens, input_positions = spec.input_tokens, spec.input_positions
             spec_drafts = spec.draft_token_ids

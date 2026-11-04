@@ -134,6 +134,7 @@ def _lane_runner(
         host_sampler=Sampler(),
         _block_tables_per_layer=lambda _: None,
         _decode_layout_changed_since_last_decode=False,
+        _step_device_sampled=False,  # what the last decode step built under
         note_decode_layout_consumed=lambda: None,
         note_decode_state_slots_settled=lambda: None,
     )

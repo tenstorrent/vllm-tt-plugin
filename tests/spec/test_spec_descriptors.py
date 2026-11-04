@@ -27,7 +27,10 @@ from vllm_tt_plugin.worker import TTWorker
 
 def _bare_runner() -> TTModelRunner:
     """A runner with no device, for methods that touch none."""
-    return TTModelRunner.__new__(TTModelRunner)
+    runner = TTModelRunner.__new__(TTModelRunner)
+    # the publisher reads the last decode step's device-sampling flag
+    runner._step_device_sampled = False
+    return runner
 
 
 def test_take_draft_token_ids_is_callable_on_an_instance():
