@@ -1093,11 +1093,18 @@ class TTScheduler(AsyncScheduler):
     ) -> int:
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
-        Chunks that finish the prompt and decode steps are left alone. A
-        multimodal prompt is never split (``_mm_no_split_grant``); only one that
-        cannot fit a whole step falls through to the alignment. A new request
-        whose aligned chunk would be empty waits for the next step; a running
-        request never gets an empty chunk.
+        Chunks that finish the prefill and decode steps are left alone. The
+        prefill of a request resumed after preemption replays its output tokens
+        too, so it is finished only at ``request.num_tokens`` (the model runner
+        flags every chunk ending below that as intermediate), not at the prompt
+        end. A multimodal prompt is never split (``_mm_no_split_grant``); only
+        one that cannot fit a whole step falls through to the alignment.
+
+        A chunk too short to reach the grid waits for the next step when it
+        starts on the grid or the request is being admitted (new, resumed, or
+        a prefix-cache hit at any block boundary); only a running request that
+        already sits off the grid keeps its whole chunk. Either way a permanent
+        per-step cap below the alignment still makes progress.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if num_new_tokens <= 0:
@@ -1107,16 +1114,19 @@ class TTScheduler(AsyncScheduler):
             return grant
         if align <= 1:
             return num_new_tokens
+        if start >= self._prefill_end(request):
+            return num_new_tokens
         end = start + num_new_tokens
-        if end >= request.num_prompt_tokens:
+        if end >= request.num_tokens:
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
-            if start != 0:
+            admitting = request.num_computed_tokens == 0
+            if not admitting and start % align != 0:
                 return num_new_tokens
-            # A new request waits only when this step's leftover budget is what
-            # stopped it. If a full step could not reach the grid either (a
-            # permanent cap below the alignment), it must still make progress.
+            # Wait only when this step's leftover budget is what stopped it. If
+            # a full step could not reach the grid either (a permanent cap below
+            # the alignment), it must still make progress.
             return (
                 0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
             )
