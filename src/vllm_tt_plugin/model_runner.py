@@ -339,10 +339,6 @@ class TTModelRunner:
         self._spec_accept_modes: tuple[str, ...] = (
             tuple(spec_plan.accept_modes) if spec_plan else ()
         )
-        # Whether the last decode step built sampled on the device
-        # (``_decode_device_sampled``): what the proposal after it publishes
-        # drafts under on a model declaring ``spec_ids_are_sampled``.
-        self._step_device_sampled = False
         # Who proposes: the model's own drafter on device, or a host drafter.
         # Read from the one requirements table rather than from a second list of
         # method names, and once, because that table is rebuilt per call.
@@ -1566,7 +1562,7 @@ class TTModelRunner:
                 drafts[row, :valid] = torch.tensor(row_drafts, dtype=torch.int32)
         return drafts, num_valid, counts
 
-    def _publish_draft(self, req_id: str, tokens) -> None:
+    def _publish_draft(self, req_id: str, tokens, device_sampled: bool) -> None:
         """Record this step's proposal for ``req_id``, or erase the last one.
 
         Every proposer publishes through here, so ``_request_is_speculable``
@@ -1578,11 +1574,13 @@ class TTModelRunner:
         verified against a token the request has already moved past.
 
         A sampled request is speculable only while its steps sample on the
-        device (a model declaring ``spec_ids_are_sampled``): the offer follows
-        the step this proposal answers, and the step that verifies it decides
-        again over its own rows (``_spec_decode_rows``).
+        device (a model declaring ``spec_ids_are_sampled``): ``device_sampled``
+        is the submission's decision for the step this proposal answers
+        (``TTModelInput.perform_device_sampling``, handed down by the proposer),
+        and the step that verifies it decides again over its own rows
+        (``_spec_decode_rows``).
         """
-        if tokens and self._request_is_speculable(req_id, self._step_device_sampled):
+        if tokens and self._request_is_speculable(req_id, device_sampled):
             self._proposed_draft_token_ids[req_id] = list(tokens)
         else:
             self._proposed_draft_token_ids.pop(req_id, None)
@@ -1738,7 +1736,9 @@ class TTModelRunner:
         drafts = [proposed[req_id] for req_id in req_ids]
         return DraftTokenIds(req_ids, drafts)
 
-    def _propose_ngram_drafts(self, committed: dict[str, list[int]]) -> None:
+    def _propose_ngram_drafts(
+        self, committed: dict[str, list[int]], device_sampled: bool
+    ) -> None:
         """Propose the next step's drafts from the tokens just committed.
 
         The n-gram proposer searches the request's own text for a repeat of its
@@ -1780,7 +1780,7 @@ class TTModelRunner:
             # A row the proposer found no repeat for drafts nothing this step,
             # and a request whose sampling the accept walk cannot certify is
             # not drafted for at all; _publish_draft handles both by erasing.
-            self._publish_draft(req_id, row_drafts)
+            self._publish_draft(req_id, row_drafts, device_sampled)
 
     def _propose_model_drafts(
         self,
@@ -1964,7 +1964,9 @@ class TTModelRunner:
             row_offered = num_drafts if offered_by_row is None else offered_by_row[row]
             usable = max(0, min(row_offered, room))
             self._publish_draft(
-                req_id, [int(token) for token in draft_token_ids[row, :usable]]
+                req_id,
+                [int(token) for token in draft_token_ids[row, :usable]],
+                model_input.perform_device_sampling,
             )
 
     @staticmethod
@@ -2472,6 +2474,7 @@ class TTModelRunner:
             ]
             decode_layout_changed = False
             self._reset_spec_state_for_prefill(row_req_ids)
+            device_sampled = None  # a prefill step decides at its submission
         else:
             positions_np = input_batch.num_tokens[req_indices] - 1
             input_positions = torch.from_numpy(positions_np)
@@ -2483,15 +2486,13 @@ class TTModelRunner:
             # decode. The controller translates this lifecycle fact into either
             # explicit contract commands or the legacy ``reset_batch`` keyword.
             decode_layout_changed = self._decode_layout_changed_since_last_decode
-            # Whether this step samples on the device, read before the block:
-            # on a model declaring ``spec_ids_are_sampled`` that is what lets
-            # the id walk certify a sampled request. The submission below
-            # repeats the decision and adds the ``logits``-mode override; the
-            # next proposal publishes under this step's value.
+            # Whether this step samples on the device, decided once, before
+            # the block: on a model declaring ``spec_ids_are_sampled`` that is
+            # what lets the id walk certify a sampled request, and the
+            # submission below applies its own overrides on top of it.
             device_sampled = self._decode_device_sampled(
                 scheduler_output, grammar_output, req_indices
             )
-            self._step_device_sampled = device_sampled
             # The live rows alone; the padding below widens with the block.
             spec = self._spec_decode_rows(
                 scheduler_output,
@@ -2648,13 +2649,19 @@ class TTModelRunner:
                 expected_structured_output_request_ids=structured_output_req_ids,
             )
 
-        perform_device_sampling = self.check_perform_device_sampling(
-            is_decode=not is_prompt,
-            has_structured_outputs=has_structured,
-            sampling_rows=req_indices,
-        )
-        if has_structured and not has_scheduled_structured:
-            perform_device_sampling = False
+        if is_prompt:
+            perform_device_sampling = self.check_perform_device_sampling(
+                is_decode=False,
+                has_structured_outputs=has_structured,
+                sampling_rows=req_indices,
+            )
+            if has_structured and not has_scheduled_structured:
+                perform_device_sampling = False
+        else:
+            # The standing decode decision, made once before the block
+            # (``_decode_device_sampled``, the structured-output rule
+            # included); the overrides below are this submission's own.
+            perform_device_sampling = device_sampled
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
@@ -3646,7 +3653,9 @@ class TTModelRunner:
                 skip_req_ids=skip_req_ids,
             )
         else:
-            self._propose_ngram_drafts(committed_by_req)
+            self._propose_ngram_drafts(
+                committed_by_req, model_input.perform_device_sampling
+            )
         return committed_by_req
 
     def propose_after_plain_step(
@@ -3703,7 +3712,8 @@ class TTModelRunner:
                 req_id: [int(sampled_np[row, 0])]
                 for row, req_id in enumerate(row_req_ids)
                 if req_id not in skipped
-            }
+            },
+            model_input.perform_device_sampling,
         )
 
     def build_spec_runner_output(

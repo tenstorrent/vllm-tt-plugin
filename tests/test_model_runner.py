@@ -105,7 +105,6 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         "_spec_grammar_rows_per_request",
     ):
         setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
-    runner._step_device_sampled = False  # what the last decode step built under
     return runner
 
 

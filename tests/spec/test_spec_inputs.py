@@ -119,7 +119,6 @@ def _fake_runner(
         model=SimpleNamespace(
             model_capabilities={"spec_ids_are_sampled": spec_ids_are_sampled}
         ),
-        _step_device_sampled=False,
         _output_tokens_per_step=1,
         _num_speculative_tokens=num_speculative_tokens,
         # Synchronous harness: the drafts reach the runner through the
@@ -537,16 +536,19 @@ def test_a_model_that_draws_its_ids_drafts_a_sampled_row_on_a_device_sampled_ste
     assert model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 4)
     assert model_input.num_valid_drafts.tolist()[:2] == [2, 0]
-    assert runner._step_device_sampled is True
+    assert model_input.perform_device_sampling is True
     assert runner._request_is_speculable("sampled", True) is True
-    # the proposer's offer for the sampled request stands after that step ...
-    runner._publish_draft("sampled", [31, 32])
+    # the proposer's offer for the sampled request stands after that step (the
+    # proposal publishes under the step's own submission decision) ...
+    runner._publish_draft("sampled", [31, 32], model_input.perform_device_sampling)
     assert runner._proposed_draft_token_ids["sampled"] == [31, 32]
     # ... and is withheld once the step samples on the host
     runner.check_perform_device_sampling = lambda **_: False
     model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
-    assert model_input.spec_mode is None and runner._step_device_sampled is False
-    runner._publish_draft("sampled", [31, 32])
+    assert (
+        model_input.spec_mode is None and model_input.perform_device_sampling is False
+    )
+    runner._publish_draft("sampled", [31, 32], model_input.perform_device_sampling)
     assert "sampled" not in runner._proposed_draft_token_ids
     # without the declaration a device-sampled step changes nothing
     runner = _mixed_batch(spec_ids_are_sampled=False, device_sampled=True)
@@ -575,8 +577,8 @@ def test_a_model_that_draws_its_ids_drafts_a_sampled_row_on_a_device_sampled_ste
     model_input = _decode(
         runner, "greedy", "penalised", drafts=_drafts(greedy=[21, 22])
     )
-    assert model_input.spec_mode is None and runner._step_device_sampled is True
-    runner._publish_draft("penalised", [31, 32])
+    assert model_input.spec_mode is None and model_input.perform_device_sampling is True
+    runner._publish_draft("penalised", [31, 32], model_input.perform_device_sampling)
     assert "penalised" not in runner._proposed_draft_token_ids
 
 

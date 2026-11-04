@@ -134,7 +134,6 @@ def _lane_runner(
         host_sampler=Sampler(),
         _block_tables_per_layer=lambda _: None,
         _decode_layout_changed_since_last_decode=False,
-        _step_device_sampled=False,  # what the last decode step built under
         note_decode_layout_consumed=lambda: None,
         note_decode_state_slots_settled=lambda: None,
     )
@@ -326,15 +325,23 @@ def test_a_lane_verify_keeps_each_request_at_its_slot():
         "spec_ids_are_sampled": True,
     }
     runner = _lane_runner(model)
-    runner.check_perform_device_sampling = lambda **_: True
+    # The decision is made over the rows the submission samples: every occupied
+    # slot, an unscheduled occupant included (``u`` sits in row 1 and is not
+    # part of this step). A decision read over the scheduled rows alone would
+    # answer differently here and the sampled slot would not be certified.
+    runner.check_perform_device_sampling = lambda **kw: sorted(kw["sampling_rows"]) == [
+        0,
+        1,
+        3,
+    ]
     _place(runner, "a", 0, first_token=1)
+    _place(runner, "u", 1, first_token=41)
     _place(runner, "s", 3, first_token=21, params=SamplingParams(temperature=1.0))
     drafts = {"a": _agreed_drafts(runner, "a"), "s": _agreed_drafts(runner, "s")}
     output = _lane_step(runner, "a", "s", drafts=drafts)
     call = model.verify_calls[-1]
     assert call["spec_mode"] == ACCEPT_MODE_ARGMAX_IDS
     assert call["num_valid_drafts"].tolist() == [DRAFT_LEN, 0, 0, DRAFT_LEN]
-    assert runner._step_device_sampled is True
     assert _by_request(output)["s"] == drafts["s"] + [
         (drafts["s"][-1] + 1) % FAKE_VOCAB_SIZE
     ]
