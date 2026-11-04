@@ -1383,12 +1383,21 @@ class TTLaneInputBatch(InputBatch):
         # speculating launch it is sent inactive rather than with the real
         # last token ``occupied`` filled in above), so a verify's block keeps
         # the slot layout the device decodes.
+        # The lane step's standing device-sampling decision, read before the
+        # block as the front-packed path reads it (``_prepare_model_inputs``):
+        # on a model declaring ``spec_ids_are_sampled`` it is what certifies a
+        # sampled slot, and the next proposal publishes under it.
+        device_sampled = runner._decode_device_sampled(
+            scheduler_output, grammar_output, scheduled_rows
+        )
+        runner._step_device_sampled = device_sampled
         spec = runner._spec_decode_rows(
             scheduler_output,
             row_req_ids,
             input_tokens,
             input_positions,
             live_rows=scheduled_rows,
+            device_sampled=device_sampled,
         )
         input_tokens, input_positions = spec.input_tokens, spec.input_positions
         # A ``logits`` verify is walked on the host from the step's own copies

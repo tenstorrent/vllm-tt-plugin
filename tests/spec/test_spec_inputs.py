@@ -66,13 +66,18 @@ def _batch() -> InputBatch:
 
 
 def _request(
-    req_id: str, num_computed_tokens: int, temperature: float = 0.0
+    req_id: str,
+    num_computed_tokens: int,
+    temperature: float = 0.0,
+    presence_penalty: float = 0.0,
 ) -> CachedRequestState:
     return CachedRequestState(
         req_id=req_id,
         prompt_token_ids=list(range(PROMPT_LEN)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=temperature),
+        sampling_params=SamplingParams(
+            temperature=temperature, presence_penalty=presence_penalty
+        ),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -81,11 +86,17 @@ def _request(
 
 
 def _add_decoding_request(
-    batch: InputBatch, req_id: str, temperature: float = 0.0
+    batch: InputBatch,
+    req_id: str,
+    temperature: float = 0.0,
+    presence_penalty: float = 0.0,
 ) -> CachedRequestState:
     """Add a request whose whole history is computed, so it decodes next."""
     request = _request(
-        req_id, num_computed_tokens=PROMPT_LEN + OUTPUT_LEN - 1, temperature=temperature
+        req_id,
+        num_computed_tokens=PROMPT_LEN + OUTPUT_LEN - 1,
+        temperature=temperature,
+        presence_penalty=presence_penalty,
     )
     batch.add_request(request)
     return request
@@ -542,6 +553,31 @@ def test_a_model_that_draws_its_ids_drafts_a_sampled_row_on_a_device_sampled_ste
     model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
     assert model_input.spec_mode is None
     assert runner._request_is_speculable("sampled", True) is False
+    # only the temperature rule is lifted: a penalised request stays off the
+    # drafts on a device-sampled step (the draws carry no penalty history),
+    # so with it in the batch the step is the ordinary decode
+    batch = _batch()
+    requests = {
+        "greedy": _add_decoding_request(batch, "greedy"),
+        "penalised": _add_decoding_request(
+            batch, "penalised", temperature=1.0, presence_penalty=0.5
+        ),
+    }
+    runner = _fake_runner(
+        batch,
+        requests,
+        supports_narrow_decode=True,
+        spec_ids_are_sampled=True,
+        device_sampled=True,
+    )
+    assert "penalised" in runner.input_batch.presence_penalties_reqs
+    assert runner._request_is_speculable("penalised", True) is False
+    model_input = _decode(
+        runner, "greedy", "penalised", drafts=_drafts(greedy=[21, 22])
+    )
+    assert model_input.spec_mode is None and runner._step_device_sampled is True
+    runner._publish_draft("penalised", [31, 32])
+    assert "penalised" not in runner._proposed_draft_token_ids
 
 
 # endregion A request that is not speculable

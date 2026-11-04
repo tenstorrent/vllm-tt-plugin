@@ -1646,10 +1646,11 @@ class TTModelRunner:
         verify of a device-sampled step with the device sampler's draws: for a
         drafted row one draw per candidate column under the row's own
         temperature, top-k, top-p and seed, for an undrafted row the plain
-        decode's own draw (penalties included). Against the drafts the id walk
-        is then exact rejection sampling, so on such a step (``device_sampled``)
-        a sampled or penalised request is certifiable; on a host-sampled step
-        it is not, because the ids would be the argmax.
+        decode's own draw. Against the drafts the id walk is then exact
+        rejection sampling, so on such a step (``device_sampled``) a sampled
+        request is certifiable; on a host-sampled step it is not, because the
+        ids would be the argmax. A penalised request stays uncertifiable
+        either way: the draws carry no penalty history.
 
         A greedy request is still not certifiable when a control moves its
         argmax or asks for more than ids: a grammar, an allowlist, a bad word
@@ -1667,13 +1668,17 @@ class TTModelRunner:
         # any batch the runner is handed. A batch that tracks none of these
         # sets has no sampled request to withhold drafts from, so the answer is
         # the same as an empty set -- speculable.
+        # Under ``draws_ids`` only the temperature rule is lifted: the draws
+        # follow the row's temperature, top-k, top-p and seed, not a penalty
+        # history, so the three penalty sets keep withholding.
+        if not draws_ids and req_id in getattr(batch, "random_reqs", ()):
+            return False
         for attr in (
-            "random_reqs",
             "presence_penalties_reqs",
             "frequency_penalties_reqs",
             "repetition_penalties_reqs",
         ):
-            if not draws_ids and req_id in getattr(batch, attr, ()):
+            if req_id in getattr(batch, attr, ()):
                 return False
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)

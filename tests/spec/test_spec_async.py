@@ -1923,6 +1923,19 @@ def test_a_sampled_row_keeps_the_overlap_whatever_the_greedy_row_proposed():
     assert not runner.async_decode.must_drain_pending_async_steps(
         steady_decode_candidate=True, scheduler_output=scheduler_output
     ), "a step the sampled row keeps ordinary was predicted to verify"
+    # On a model declaring ``spec_ids_are_sampled`` the sampled row is
+    # speculable on a device-sampled step, so the same proposal makes the
+    # next step a verify and the outstanding step must drain first. The
+    # preflight reads the step as device-sampled (its own decision needs the
+    # updated batch), which errs towards the drain.
+    declared = dict(model.model_capabilities)
+    model.model_capabilities = {**declared, "spec_ids_are_sampled": True}
+    try:
+        assert runner.async_decode.must_drain_pending_async_steps(
+            steady_decode_candidate=True, scheduler_output=scheduler_output
+        ), "a verify of a sampled row was built over the outstanding step"
+    finally:
+        model.model_capabilities = declared
 
     model.release()
     outstanding.get_output()

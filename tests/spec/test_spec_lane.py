@@ -316,6 +316,30 @@ def test_a_lane_verify_keeps_each_request_at_its_slot():
     ]
     assert set(runner._proposed_draft_token_ids) == {"a", "b"}
 
+    # On a model declaring ``spec_ids_are_sampled`` a sampled slot is drafted
+    # when the lane step samples on the device: the lane builder reads the
+    # step's decision the way the front-packed path does, the verify carries
+    # the sampled slot's drafts, and the proposal after it keeps the offer.
+    model = FakeSpecModel()
+    model.model_capabilities = {
+        **model.model_capabilities,
+        "spec_ids_are_sampled": True,
+    }
+    runner = _lane_runner(model)
+    runner.check_perform_device_sampling = lambda **_: True
+    _place(runner, "a", 0, first_token=1)
+    _place(runner, "s", 3, first_token=21, params=SamplingParams(temperature=1.0))
+    drafts = {"a": _agreed_drafts(runner, "a"), "s": _agreed_drafts(runner, "s")}
+    output = _lane_step(runner, "a", "s", drafts=drafts)
+    call = model.verify_calls[-1]
+    assert call["spec_mode"] == ACCEPT_MODE_ARGMAX_IDS
+    assert call["num_valid_drafts"].tolist() == [DRAFT_LEN, 0, 0, DRAFT_LEN]
+    assert runner._step_device_sampled is True
+    assert _by_request(output)["s"] == drafts["s"] + [
+        (drafts["s"][-1] + 1) % FAKE_VOCAB_SIZE
+    ]
+    assert set(runner._proposed_draft_token_ids) == {"a", "s"}
+
 
 def test_the_candidate_block_pads_the_empty_slots():
     """An empty slot is a padding row: no position, no draft, a count of 1."""

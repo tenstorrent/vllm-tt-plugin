@@ -110,7 +110,7 @@ launches without `speculative_config`.
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when `speculative_config.method` needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
-| `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled or penalised request is speculable on such steps (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
+| `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history)s (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 
@@ -608,8 +608,9 @@ order, and the first one that holds decides.
    verify in `argmax_ids` mode returns the target argmax for every row, so that
    row would commit the argmax, not a token drawn with its request's
    temperature and penalties. The step is an ordinary decode instead, whatever
-   the other rows carry. On a model declaring `spec_ids_are_sampled` the same
-   request is speculable on a step that samples on the device
+   the other rows carry. On a model declaring `spec_ids_are_sampled` a request whose only
+   such control is its temperature (a penalty keeps it plain) is
+   speculable on a step that samples on the device
    (`TTModelRunner._decode_device_sampled`, read before the block is built):
    that model's `argmax_ids` verify of such a step returns the device
    sampler's draws, which the id walk accepts as exact rejection sampling, and
@@ -952,9 +953,9 @@ temperature, a penalty, logprobs (including `logprobs=0`), structured output,
 `allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not
 reached yet. The mode is per step, and that row would otherwise commit the
 target argmax even with no draft of its own. Padding rows do not decide the
-mode. On a model declaring `spec_ids_are_sampled`, a non-zero temperature or
-a penalty no longer rules a row out on a device-sampled step (section 4d,
-rule 2): the `argmax_ids` answer carries the device sampler's draws for it.
+mode. On a model declaring `spec_ids_are_sampled`, a non-zero temperature
+no longer rules a row out on a device-sampled step (section 4d, rule 2; a
+penalty still does): the `argmax_ids` answer carries the device sampler's draws for it.
 
 **What the model returns.** `VerifyOutput(spec_mode="logits", logits=...)`,
 with `logits` a floating point `[B, 1+K, V]` tensor: every submitted row,
