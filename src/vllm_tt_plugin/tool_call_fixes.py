@@ -19,6 +19,10 @@ target is missing, so a vLLM upgrade that moves the target fails at startup.
   O(n^2) per stream (incremental ``_compute_arg_delta``).
 - P6: ``count_reasoning_tokens`` re-parses the whole output per delta when
   thinking is disabled (the count is always 0 there).
+- P7: an argument value that contains a literal ``</parameter>`` or
+  ``</function>`` (XML, HTML, code) is cut at that string. A closer ends a
+  parameter or a call only where the template's next tag follows it (see
+  ``_scan_params`` and ``_install_function_end_lookahead_patch``).
 
 TODO: remove each patch once the matching upstream fix is in the pinned vLLM.
 """
@@ -46,9 +50,10 @@ def install_tool_call_fixes() -> None:
     _install_string_union_patch()
     _install_arg_delta_patch()
     _install_reasoning_count_patch()
+    _install_function_end_lookahead_patch()
     logger.info(
         "tool-call fixes active: P1 P2 P3 P4 P5(arg delta fast path) "
-        "P6(reasoning count short-circuit)"
+        "P6(reasoning count short-circuit) P7(literal closers in values)"
     )
 
 
@@ -331,8 +336,110 @@ def _strip_one_closer(value: str) -> str | None:
     return None
 
 
+class _ParamScan:
+    """Result of ``_scan_params``.
+
+    ``closed``: (name, value) per parameter that ended, values untrimmed.
+    ``open_name`` / ``open_start`` / ``open_end``: the parameter still open at
+    the end of the text (``open_end`` < len(text) when a possible closer at
+    ``open_end`` is held back), or ``open_name`` None.
+    """
+
+    __slots__ = ("closed", "open_name", "open_start", "open_end")
+
+
+@functools.cache
+def _scan_patterns():
+    import regex  # vLLM's qwen3 parser uses it too; partial matching is needed
+
+    return (
+        regex.compile(r"<\s*parameter\s*=\s*([^>]*)>"),
+        regex.compile(r"(?<=\n)<\s*parameter\s*="),  # a dropped closer
+        regex.compile(r"<\s*/\s*parameter\s*>"),
+        # What follows a real </parameter>: the next parameter, or the end of
+        # the call and the start of the next call.
+        regex.compile(
+            r"\s*(?:<\s*parameter\s*=|<\s*/\s*function\s*>\s*"
+            r"(?:<\s*/?\s*tool_call\s*>|<\s*function\s*=))"
+        ),
+        # ... or only closers up to the end of the call's text.
+        regex.compile(r"\s*(?:<\s*/\s*(?:function|tool_call)\s*>\s*)*\Z"),
+    )
+
+
+def _scan_params(raw: str, partial: bool) -> _ParamScan:
+    """Split Qwen3 XML argument text into parameters.
+
+    The template writes ``<parameter=NAME>`` newline, VALUE, newline,
+    ``</parameter>`` newline per parameter and closes the call with
+    ``</function>`` and ``</tool_call>``. A ``</parameter>`` ends the value
+    only when the next parameter or the end of the call follows it (whitespace
+    allowed); any other ``</parameter>`` is part of the value. With
+    ``partial`` (streaming), a ``</parameter>`` whose follower has not arrived
+    yet is held back: the value stops before it and stays open.
+
+    A value with no real closer ends at a ``<parameter=`` that starts a line
+    (the upstream regex ends it at any ``<parameter=``: a dropped closer), else
+    it runs to the end of the text (an unclosed last parameter). A
+    ``<parameter=`` inside a line stays in the value.
+
+    Every decision depends only on the text up to a bounded lookahead past
+    the tag, so a value streamed by its prefix never has to be taken back.
+    """
+    open_re, line_open_re, close_re, next_re, end_re = _scan_patterns()
+    scan = _ParamScan()
+    scan.closed = []
+    scan.open_name = None
+    scan.open_start = scan.open_end = 0
+    n = len(raw)
+    opener = open_re.search(raw)
+    while opener is not None:
+        name, start = opener.group(1), opener.end()
+        # A line-start "<parameter=" ends the value even before its name and
+        # ">" arrive, as upstream: the decision never waits for later text.
+        implicit = line_open_re.search(raw, start)
+        limit = n if implicit is None else implicit.start()
+        following = None if implicit is None else open_re.search(raw, limit)
+        end = None
+        for closer in close_re.finditer(raw, start, limit):
+            after = closer.end()
+            nxt = next_re.match(raw, after, partial=partial)
+            if nxt is not None and not nxt.partial:
+                end, following = closer.start(), open_re.search(raw, after)
+                break
+            at_end = end_re.match(raw, after, partial=partial) is not None
+            if partial and (nxt is not None or at_end):
+                if name:  # held back: the follower decides
+                    scan.open_name = name
+                    scan.open_start, scan.open_end = start, closer.start()
+                return scan
+            if at_end:
+                end, following = closer.start(), None
+                break
+        if end is None:
+            if implicit is None:
+                if name:
+                    scan.open_name = name
+                    scan.open_start, scan.open_end = start, n
+                return scan
+            end = limit
+        scan.closed.append((name, raw[start:end]))
+        opener = following
+    return scan
+
+
+def _strip_closers(value: str) -> str:
+    while (stripped := _strip_one_closer(value)) is not None:
+        value = stripped
+    return value
+
+
 def _install_unclosed_parameter_patch() -> None:
-    """Keep an unclosed last parameter in the final argument JSON.
+    """Replace the Qwen3 argument converter with one built on ``_scan_params``.
+
+    Keeps an unclosed last parameter in the final argument JSON (P3) and keeps
+    literal ``</parameter>`` text inside a value (P7). For well-formed template
+    output the JSON is the same as the upstream converter's.
 
     ``qwen3_config`` is cached and stores the converter it was built with, so
     its cache is cleared after the module attribute is replaced.
@@ -343,20 +450,16 @@ def _install_unclosed_parameter_patch() -> None:
         return
     original = qwen3._qwen3_arg_converter
     qwen3._tt_original_qwen3_arg_converter = original
-    param_re = qwen3._PARAM_RE
-    partial_param_re = qwen3._PARTIAL_PARAM_RE
     trim = qwen3._trim_wrapping_newlines
 
     def arg_converter(raw_args: str, partial: bool) -> str:
-        result = original(raw_args, partial)
-        match = partial_param_re.search(param_re.sub("", raw_args))
-        if match is None or not match.group(1):
-            return result
-        value = match.group(2)
-        while (stripped := _strip_one_closer(value)) is not None:
-            value = stripped
-        params = json.loads(result)
-        params[match.group(1)] = trim(value)
+        scan = _scan_params(raw_args, partial)
+        params: dict[str, object] = {}
+        for name, value in scan.closed:
+            params[name] = trim(value)
+        if scan.open_name is not None:
+            value = raw_args[scan.open_start : scan.open_end]
+            params[scan.open_name] = trim(_strip_closers(value))
         return json.dumps(params, ensure_ascii=False)
 
     qwen3._qwen3_arg_converter = arg_converter
@@ -397,28 +500,25 @@ def _install_arg_delta_patch() -> None:
     regex = qwen3.re  # the module qwen3 uses for its patterns
     close_re = regex.compile(r"<\s*/\s*parameter\s*>|<\s*parameter\s*=")
     pending_re = regex.compile(r"<[\s/aemoprt]*\Z")  # a tag start not yet complete
-    param_re = qwen3._PARAM_RE
-    partial_param_re = qwen3._PARTIAL_PARAM_RE
 
     def esc(text: str) -> str:
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
     def try_anchor(self, idx, slot, args, anchors) -> None:
-        match = partial_param_re.search(param_re.sub("", args))
-        if match is None or not match.group(1):
+        # The open parameter as the P3/P7 converter sees it: a literal closer
+        # earlier in the value is part of it, a held-back closer is not.
+        scan = _scan_params(args, True)
+        name = scan.open_name
+        if name is None or scan.open_end != len(args):
             return
-        name, value = match.group(1), match.group(2)
-        if not value:
+        value_start = scan.open_start
+        if value_start == len(args):
             return
         if slot.string_keys is not None and name not in slot.string_keys:
             return
-        if name in [m.group(1) for m in param_re.finditer(args)]:
+        if name in [closed for closed, _ in scan.closed]:
             return  # duplicate key: the dict position moves
-        value_start = len(args) - len(value)
-        if (
-            close_re.search(args, value_start) is not None
-            or _strip_one_closer(args) is not None
-        ):
+        if _strip_one_closer(args) is not None:
             return
         trim_start = value_start + (1 if args[value_start] == "\n" else 0)
         end = max(trim_start, len(args) - (1 if args.endswith("\n") else 0))
@@ -515,6 +615,77 @@ def _install_reasoning_count_patch() -> None:
         return original(self, token_ids)
 
     owner.count_reasoning_tokens = count_reasoning_tokens
+
+
+# ---------------------------------------------------------------------------
+# P7: a </function> inside a value does not end the call.
+# ---------------------------------------------------------------------------
+
+_CALL_FOLLOWERS = frozenset(("TOOL_END", "TOOL_START", "FUNC_PREFIX"))
+
+
+def _install_function_end_lookahead_patch() -> None:
+    """End a Qwen3 tool call at ``</function>`` only when a call tag follows.
+
+    Upstream, the engine's ``(TOOL_ARGS, FUNC_END)`` transition ends the call
+    at the first ``</function>``, also one inside a value; the rest of the
+    value is dropped. Here a ``</function>`` in TOOL_ARGS is kept in the
+    argument text and remembered. The call ends when the next terminal is
+    ``</tool_call>``, ``<tool_call>`` or ``<function=`` with only whitespace
+    since that ``</function>``, or when the stream finishes (the engine's
+    ``finish`` already ends an open call). Any other text after it makes it
+    part of the value. The argument converter drops the trailing closers.
+
+    Applies only to engines whose config uses the patched Qwen3 converter,
+    so it must be installed after P3.
+    """
+    from vllm.parser import qwen3
+    from vllm.parser.engine import streaming_parser_engine as spe
+    from vllm.parser.engine.events import EventType
+    from vllm.parser.engine.parser_engine_config import ParserState, Transition
+
+    owner = spe.StreamingParserEngine
+    if hasattr(owner, "_tt_original_on_terminal"):
+        return
+    orig_on_terminal = owner._on_terminal
+    orig_emit = owner._emit_for_state
+    owner._tt_original_on_terminal = orig_on_terminal
+    owner._tt_original_emit_for_state = orig_emit
+    tool_args = ParserState.TOOL_ARGS
+    end_call = Transition(ParserState.TOOL_BETWEEN, (EventType.TOOL_CALL_END,))
+
+    def applies(self) -> bool:
+        cfg = self.config
+        return (
+            hasattr(qwen3, "_tt_original_qwen3_arg_converter")
+            and cfg.arg_converter is qwen3._qwen3_arg_converter
+            and cfg.arg_converter is not qwen3._tt_original_qwen3_arg_converter
+            and cfg.terminal_literal("FUNC_END") == qwen3.FUNC_END
+            and (tool_args, "FUNC_END") in cfg.transitions
+        )
+
+    def on_terminal(self, terminal, value, token_count=0):
+        if self.state is not tool_args or self.skip_tool_parsing or not applies(self):
+            return orig_on_terminal(self, terminal, value, token_count)
+        if terminal == "FUNC_END":
+            events = orig_emit(self, value, token_count)  # stays in the args
+            self._tt_func_end_pending = True
+            return events
+        if self.__dict__.get("_tt_func_end_pending") and terminal in _CALL_FOLLOWERS:
+            self._tt_func_end_pending = False
+            events = self._apply_transition(end_call, "", 0)
+            events.extend(orig_on_terminal(self, terminal, value, token_count))
+            return events
+        self._tt_func_end_pending = False
+        return orig_on_terminal(self, terminal, value, token_count)
+
+    def emit_for_state(self, text, token_count=0):
+        if self.state is tool_args and text and not text.isspace():
+            self._tt_func_end_pending = False
+        return orig_emit(self, text, token_count)
+
+    owner._on_terminal = on_terminal
+    owner._emit_for_state = emit_for_state
 
 
 # ---------------------------------------------------------------------------

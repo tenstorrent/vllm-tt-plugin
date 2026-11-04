@@ -19,8 +19,12 @@ from jsonschema import Draft7Validator
 import vllm_tt_plugin
 import vllm_tt_plugin.tool_call_fixes as fixes
 
-TOKENIZER_PATH = "/mnt/tt-data/sdawle/models/Qwen3.8-27B"
-WORKTREE = "/home/ttuser/atupe/qwen-or/wt/plugin-toolfix"
+TOKENIZER_PATH = os.environ.get(
+    "QWEN38_TOKENIZER_PATH", "/mnt/tt-data/sdawle/models/Qwen3.8-27B"
+)
+WORKTREE = os.environ.get(
+    "TT_PLUGIN_WORKTREE", "/home/ttuser/atupe/qwen-or/wt/plugin-toolfix"
+)
 
 pytestmark = pytest.mark.skipif(
     not os.path.isdir(TOKENIZER_PATH), reason=f"{TOKENIZER_PATH} is not available"
@@ -43,9 +47,12 @@ def installed_fixes():
 def uninstall_fixes() -> None:
     """Put the upstream functions back, to show what the old code does."""
     from vllm.parser import qwen3
-    from vllm.parser.engine import parser_engine
+    from vllm.parser.engine import parser_engine, streaming_parser_engine
 
+    engine = streaming_parser_engine.StreamingParserEngine
     for owner, attr, marker in (
+        (engine, "_on_terminal", "_tt_original_on_terminal"),
+        (engine, "_emit_for_state", "_tt_original_emit_for_state"),
         (parser_engine, "find_tool_properties", "_tt_original_find_tool_properties"),
         (parser_engine, "coerce_to_schema_type", "_tt_original_coerce_to_schema_type"),
         (qwen3, "_qwen3_arg_converter", "_tt_original_qwen3_arg_converter"),
@@ -706,12 +713,15 @@ def test_p2_aclose_closes_original_and_engine_generators(serving):
 def patched_targets():
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
     from vllm.parser import qwen3
-    from vllm.parser.engine import parser_engine
+    from vllm.parser.engine import parser_engine, streaming_parser_engine
 
+    engine = streaming_parser_engine.StreamingParserEngine
     return (
         parser_engine.find_tool_properties,
         parser_engine.coerce_to_schema_type,
         qwen3._qwen3_arg_converter,
+        engine._on_terminal,
+        engine._emit_for_state,
         OpenAIServingChat.chat_completion_stream_generator,
         OpenAIServingChat.chat_completion_full_generator,
     )

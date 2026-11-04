@@ -67,7 +67,7 @@ def reset_tt_platform_class_state():
     # finish_reason in every later test.
     import vllm.parser.qwen3 as qwen3
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-    from vllm.parser.engine import adapters, parser_engine
+    from vllm.parser.engine import adapters, parser_engine, streaming_parser_engine
 
     tool_call_targets = (
         (parser_engine, "find_tool_properties", "_tt_original_find_tool_properties"),
@@ -82,6 +82,16 @@ def reset_tt_platform_class_state():
             adapters.ParserEngineReasoningAdapter,
             "count_reasoning_tokens",
             "_tt_original_count_reasoning_tokens",
+        ),
+        (
+            streaming_parser_engine.StreamingParserEngine,
+            "_on_terminal",
+            "_tt_original_on_terminal",
+        ),
+        (
+            streaming_parser_engine.StreamingParserEngine,
+            "_emit_for_state",
+            "_tt_original_emit_for_state",
         ),
         (
             OpenAIServingChat,

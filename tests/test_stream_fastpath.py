@@ -16,7 +16,9 @@ import pytest
 
 import vllm_tt_plugin.tool_call_fixes as fixes
 
-TOKENIZER_PATH = "/mnt/tt-data/sdawle/models/Qwen3.8-27B"
+TOKENIZER_PATH = os.environ.get(
+    "QWEN38_TOKENIZER_PATH", "/mnt/tt-data/sdawle/models/Qwen3.8-27B"
+)
 
 pytestmark = pytest.mark.skipif(
     not os.path.isdir(TOKENIZER_PATH), reason=f"{TOKENIZER_PATH} is not available"
