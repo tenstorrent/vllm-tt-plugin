@@ -384,8 +384,9 @@ python examples/server_example_tt.py \
 ```
 
 Device grammar works with and without async scheduling. Under async scheduling
-a structured decode step does not overlap with the next forward: the runner
-drains pending async work before it and samples after the mask arrives.
+steady structured decode can overlap token readback and host grammar updates
+with the next forward. Sampling waits for that step's grammar mask; transitions
+that require current host state still drain pending work before the forward.
 
 | Step | Sampling path |
 | --- | --- |

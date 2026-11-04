@@ -2882,7 +2882,7 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if model_input.defer_device_sampling:
+            if model_input.defer_device_sampling and not steady_decode_candidate:
                 self.async_decode.wait_for_all_pending_async_steps()
             if self.async_decode_scheduling and not model_input.defer_device_sampling:
                 req_ids = [
@@ -2955,9 +2955,9 @@ class TTModelRunner:
                 tt_out, _ = tt_out
             is_decode = False
 
-        # Forward done; defer the lane sampling tail to ``sample_tokens``. The
-        # step runs synchronously, so the lane batch layout is stable between
-        # this enqueue and the deferred sample.
+        # Forward done; defer the lane sampling tail to ``sample_tokens``.
+        # model_input retains submitted row identities for sampling and any
+        # deferred token readback.
         self._pending_samples.append(
             partial(
                 self._finish_lane_sync,
@@ -2983,7 +2983,7 @@ class TTModelRunner:
         is_decode: bool,
         lane_total: int,
         decode_submission: TTDecodeSubmission | None = None,
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         deferred = bool(getattr(model_input, "defer_device_sampling", False))
         try:
             return TTModelRunner._finish_lane_sync_impl(
@@ -3013,8 +3013,8 @@ class TTModelRunner:
         is_decode: bool,
         lane_total: int,
         decode_submission: TTDecodeSubmission | None = None,
-    ) -> ModelRunnerOutput:
-        """Sample and build the runner output for a deferred lane forward."""
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Sample a lane forward, optionally deferring token readback."""
         model_input = self._apply_grammar_to_input(
             model_input, grammar_output, lane_total=lane_total
         )
@@ -3023,6 +3023,15 @@ class TTModelRunner:
                 raise RuntimeError(
                     "deferred lane decode is missing its device submission"
                 )
+
+            if self.async_decode_scheduling:
+                return self.async_decode.complete_deferred_device_sampling(
+                    decode_submission,
+                    model_input,
+                    async_read=True,
+                    scheduled_rows=scheduled_rows,
+                )
+
             finalized = self.async_decode.complete_deferred_device_sampling(
                 decode_submission,
                 model_input,
@@ -3129,7 +3138,7 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if model_input.defer_device_sampling:
+        if model_input.defer_device_sampling and not steady_decode_candidate:
             self.async_decode.wait_for_all_pending_async_steps()
         if (
             self.async_decode_scheduling
@@ -3153,8 +3162,8 @@ class TTModelRunner:
             )
             return None
 
-        # Synchronous path (prefill, or decode without async scheduling): run
-        # the forward now and defer sampling to ``sample_tokens``.
+        # Prefill and deferred device sampling submit their forward here;
+        # ``sample_tokens`` receives the grammar and chooses readback timing.
         fwd = self._forward_with_model_input(model_input)
         self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
         return None
@@ -3710,7 +3719,7 @@ class TTModelRunner:
 
     def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         deferred = bool(fwd is not None and fwd.model_input.defer_device_sampling)
         try:
             return TTModelRunner._finish_front_packed_sync_impl(
@@ -3725,8 +3734,8 @@ class TTModelRunner:
 
     def _finish_front_packed_sync_impl(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
-    ) -> ModelRunnerOutput:
-        """Sample and build output for a deferred front-packed forward.
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Sample a front-packed forward, optionally deferring token readback.
 
         A synchronous lane verify lands here too: the speculative tail below
         reads its rows through ``TTModelInput.live_rows`` and assumes nothing
@@ -3744,6 +3753,17 @@ class TTModelRunner:
         )
         if fwd.model_input.spec_mode is not None:
             return self._finish_spec_decode(fwd)
+
+        if (
+            getattr(fwd.model_input, "defer_device_sampling", False)
+            and self.async_decode_scheduling
+        ):
+            if fwd.decode_submission is None:
+                raise RuntimeError("deferred decode is missing its device submission")
+
+            return self.async_decode.complete_deferred_device_sampling(
+                fwd.decode_submission, fwd.model_input, async_read=True
+            )
 
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
         sampled_token_ids = sampled_token_ids_per_dp[0]
@@ -3894,8 +3914,8 @@ class TTModelRunner:
 
         Structured outputs use the device only for decode. Async scheduling
         keeps the single traced logits buffer safe: the engine samples each
-        forward before submitting the next, and a deferred forward first drains
-        pending async steps.
+        forward before submitting the next. Stable device-sampled continuations
+        can overlap readback; transitions requiring host state drain first.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -4349,6 +4369,17 @@ class TTModelRunner:
                 assert model_input.grammar_bitmask[dp_rank] is None, (
                     "grammar bitmask is set but device sampling can't apply it"
                 )
+
+                output_shape = tuple(tt_out.shape)
+                if not output_shape or output_shape[0] < start + sz:
+                    raise ValueError(
+                        f"TT device-sampled {'decode' if is_decode else 'prefill'} "
+                        f"output has shape={output_shape}, but DP segment {dp_rank} "
+                        f"requires rows [{start}, {start + sz}); "
+                        f"batch_size_per_dp={batch_size_per_dp}, "
+                        "submitted_request_ids="
+                        f"{getattr(model_input, 'row_req_ids', None)}"
+                    )
 
                 next_token_ids = _take(tt_out).reshape(sz, -1)
                 allowed_widths = (
