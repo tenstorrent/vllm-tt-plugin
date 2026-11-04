@@ -134,7 +134,9 @@ def test_random_walks_never_produce_an_off_grid_intermediate_end():
         prompt = rng.randint(2, 200000)
         output = rng.choice([0, 0, rng.randint(1, 20000)])
         total = prompt + output
-        hit = rng.randint(0, max(0, (total - 1) // 64)) * 64 if rng.random() < 0.7 else 0
+        hit = (
+            rng.randint(0, max(0, (total - 1) // 64)) * 64 if rng.random() < 0.7 else 0
+        )
         ends = _walk(s, prompt, output, hit, rng)
         bad = [e for e in ends if e % ALIGN]
         assert not bad, (prompt, output, hit, bad)
