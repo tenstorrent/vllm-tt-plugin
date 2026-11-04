@@ -790,15 +790,11 @@ def _mamba_hybrid_num_blocks(
     per token and divides by the page. A token count divided by the block size
     would ignore that padding.
 
-    On top of that come one block per running request in every attention
-    group, for the output reservation, and the blocks every running request
-    holds in each Mamba group, which the token budget does not count.
+    On top of that come the output reservation of every running request in
+    every attention group (one block, or one output canvas of a block-output
+    model, whichever is larger), and the blocks every running request holds in
+    each Mamba group, which the token budget does not count.
     """
-    if is_tt_block_output_model(vllm_config):
-        raise ValueError(
-            "Block-output models (output_tokens_per_step > 1) do not support "
-            "MambaSpec KV cache groups"
-        )
     _, groups = _kv_cache_groups_for_sizing(vllm_config, dict(kv_cache_specs))
     page_size = get_uniform_page_size(group.kv_cache_spec for group in groups)
     attention_specs = [
@@ -814,7 +810,11 @@ def _mamba_hybrid_num_blocks(
             f"{sorted(bytes_per_token)} from attention specs {attention_specs}"
         )
     attention_blocks = -(-max_tokens_all_users * bytes_per_token.pop() // page_size)
-    output_reservation_blocks = max_batch * len(attention_specs)
+    output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    output_reservation_blocks = max_batch * sum(
+        -(-max(spec.block_size, output_tokens_per_step) // spec.block_size)
+        for spec in attention_specs
+    )
     mamba_blocks = max_batch * sum(
         -(-g.kv_cache_spec.max_memory_usage_bytes(vllm_config) // page_size)
         for g in groups

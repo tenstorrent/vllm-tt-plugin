@@ -202,7 +202,12 @@ Declaration rules:
   `copy_kv_cache_blocks`. See [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
   Prefill and decode receive `state_block_ids_per_layer`; see
   [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks).
-- Lane-DP and block-output models do not support `MambaSpec` groups.
+- Lane-DP does not support `MambaSpec` groups. A block-output model with
+  `MambaSpec` groups keeps prefix caching when it declares
+  `supports_prefix_caching`; it must then write the boundary state of a block
+  a decode step crosses, see
+  [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks). Its
+  output reservation per running request is one output canvas, in whole blocks.
 
 Allocation:
 

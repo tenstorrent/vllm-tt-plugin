@@ -275,8 +275,8 @@ runtime reads. Keep class and instance declarations consistent.
 Absent keys default via `.get`. That is the live contract. Do not add
 fail-on-missing for a new key unless the matching tt-metal generators will
 declare it in the same change. Raise when a *present* value contradicts
-another resolved property (block-output plus prefix caching; DiffusionGemma
-without `output_tokens_per_step > 1`) or when an operator request is
+another resolved property (DiffusionGemma without
+`output_tokens_per_step > 1`) or when an operator request is
 unsupported. Copy those existing `ValueError` messages.
 
 Leftover identity gates still exist. Do not copy them for new work, and do

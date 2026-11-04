@@ -93,9 +93,15 @@ class MambaCacheGroups:
         """
         seq_lens = torch.zeros(block_tables_per_group[0].shape[0], dtype=torch.int64)
         for row, req_id in enumerate(row_req_ids):
-            seq_lens[row] = (
-                requests[req_id].num_computed_tokens + num_scheduled_tokens[req_id]
-            )
+            column = self.state_columns.get(req_id)
+            if self.mamba_cache_mode == "align" and column is not None:
+                # The column ``align_state_copies`` moved the state to this
+                # step, which can stay ahead of the scheduled tokens.
+                seq_lens[row] = (column + 1) * self.block_size
+            else:
+                seq_lens[row] = (
+                    requests[req_id].num_computed_tokens + num_scheduled_tokens[req_id]
+                )
         by_group: dict[int, torch.Tensor] = {}
         for g in self.group_indices:
             ids = self.state_block_ids(block_tables_per_group[g], seq_lens)
@@ -118,6 +124,12 @@ class MambaCacheGroups:
         and writes only that block, so the block that holds the state at the
         previous boundary stays unchanged for prefix-cache hits. The copy
         covers every Mamba group, each with the block ids of its own row.
+
+        The column never moves back for a running request. A block-output
+        step reserves a whole canvas and can cross into the next column, then
+        commit fewer tokens; a later step with fewer scheduled tokens would
+        otherwise copy the state back over the block of the earlier column,
+        which may already hold the boundary state the model wrote there.
         """
         if self.mamba_cache_mode != "align":
             return []
@@ -135,7 +147,7 @@ class MambaCacheGroups:
             if prev is None:
                 # A new or resumed request; -1 when nothing is computed yet.
                 prev = (num_computed - 1) // self.block_size
-            curr = cdiv(num_computed + num_scheduled, self.block_size) - 1
+            curr = max(prev, cdiv(num_computed + num_scheduled, self.block_size) - 1)
             self.state_columns[req_id] = curr
             if prev == -1 or prev == curr:
                 continue

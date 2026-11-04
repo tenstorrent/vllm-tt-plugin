@@ -58,6 +58,16 @@ for that layer's group.
 3. The model reads each row's start state from the selected block and writes
    the row's end state to the same block.
 
+A block-output model (`output_tokens_per_step > 1`) can keep a running
+request's state in its own buffers between decode steps instead, because its
+decode steps never start from a block. It must still leave in column `p`'s
+block the state after exactly `(p + 1) * block_size` tokens before the step
+that commits past that boundary returns its output: the scheduler offers a
+block to the prefix cache once its last fed token commits, and a decode step
+can cross a boundary anywhere inside its output block. Column `p`'s block id is
+in the layer's row of `page_tables_per_layer`. Its prompt chunks still end on
+state block boundaries, as for a token model.
+
 A row whose `start_pos` is 0 has no earlier state. The model must start that
 row from zero state and must not read its block: vLLM 0.30.0 does not zero
 recurrent-state blocks, so the block can hold stale bytes.
