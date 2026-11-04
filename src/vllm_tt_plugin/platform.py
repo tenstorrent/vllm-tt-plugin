@@ -880,7 +880,9 @@ def _install_tt_harmony_after_stop_patch() -> None:
     tokens: per-user throughput read about half the real value.
 
     Tokens after the stop token are not part of the assistant message, so the
-    parser drops them; they still count in usage.
+    parser drops them; they still count in usage. The guard is tied to the
+    streaming parser that saw the stop token: ``flush()`` resets ``_parser`` for
+    the next turn, and the fresh parser it creates is not guarded.
 
     TODO: remove this once fixed in vLLM core.
     """
@@ -896,12 +898,14 @@ def _install_tt_harmony_after_stop_patch() -> None:
     parser_cls._tt_original_process_chunk = original
 
     def process_chunk_tt(self, token_ids):
-        if getattr(self, "_tt_after_stop", False):
+        stopped = getattr(self, "_tt_stopped_parser", None)
+        if stopped is not None and stopped is self._parser:
             return harmony_module.ChunkResult(segments=[], reasoning_token_count=0)
         for i, token_id in enumerate(token_ids):
             if token_id in stop_token_ids:
-                self._tt_after_stop = True
-                return original(self, token_ids[: i + 1])
+                result = original(self, token_ids[: i + 1])
+                self._tt_stopped_parser = self._parser
+                return result
         return original(self, token_ids)
 
     parser_cls.process_chunk = process_chunk_tt

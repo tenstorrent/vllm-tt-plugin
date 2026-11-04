@@ -43,3 +43,30 @@ def test_tokens_after_stop_token_are_dropped_not_fatal():
     result = parser.process_chunk(message + after_stop)
     assert "".join(segment.delta for segment in result.segments) == "hi"
     assert parser.process_chunk(after_stop).segments == []
+
+
+def test_next_turn_after_flush_is_parsed():
+    """flush() resets the streaming parser: the next turn must not stay guarded."""
+    from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+
+    from vllm_tt_plugin.platform import _install_tt_harmony_after_stop_patch
+
+    encoding = get_encoding()
+    message = encoding.encode(
+        "<|channel|>final<|message|>hi<|return|>", allowed_special="all"
+    )
+    _install_tt_harmony_after_stop_patch()
+    parser = _fresh_parser()
+    parser.process_chunk(message)
+    parser._parser = None  # what flush() does between turns
+    parser._num_processed_messages = 0
+    parser._current_message_tokens.clear()
+    result = parser.process_chunk(message)
+    assert "".join(segment.delta for segment in result.segments) == "hi"
+
+
+def test_patch_does_not_leak_between_tests():
+    """conftest restores HarmonyParser after each test."""
+    import vllm.parser.harmony as harmony_module
+
+    assert "_tt_original_process_chunk" not in harmony_module.HarmonyParser.__dict__

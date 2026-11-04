@@ -23,6 +23,7 @@ _TT_PLATFORM_CONFIG_ATTRS = (
 def reset_tt_platform_class_state():
     # Deferred: importing the platform from conftest runs before vLLM has
     # finished resolving its platform plugins, and that import is circular.
+    import vllm.parser.harmony as harmony
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.core_client as core_client
@@ -31,7 +32,13 @@ def reset_tt_platform_class_state():
 
     from vllm_tt_plugin.platform import TTPlatform
 
+    unset = object()
     saved_lifespan = server_utils.lifespan
+    # The harmony after-stop patch replaces a class method and leaves a marker.
+    saved_harmony = {
+        name: harmony.HarmonyParser.__dict__.get(name, unset)
+        for name in ("process_chunk", "_tt_original_process_chunk")
+    }
     saved_lifespan_aliases = {
         name: module.lifespan
         for name in ("vllm.entrypoints.launchers.app",)
@@ -39,7 +46,6 @@ def reset_tt_platform_class_state():
     }
     saved_empty_cache = torch.accelerator.empty_cache
 
-    unset = object()
     saved = {
         name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
     }
@@ -78,6 +84,13 @@ def reset_tt_platform_class_state():
     }
 
     yield
+
+    for name, value in saved_harmony.items():
+        if value is unset:
+            if name in harmony.HarmonyParser.__dict__:
+                delattr(harmony.HarmonyParser, name)
+        else:
+            setattr(harmony.HarmonyParser, name, value)
 
     for name, value in saved_dp_client_methods.items():
         if value is unset:
