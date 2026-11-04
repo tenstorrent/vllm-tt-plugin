@@ -613,7 +613,7 @@ Overlap is disabled and pending async work is drained when correctness would oth
 
 - prompt activity or resumed prefill work
 - layout change in the decode batch
-- structured output bookkeeping
+- structured outputs that require host sampling
 - penalties, allowed-token masks, bad-word filtering, or logits processors
 - any other requirement for host-side sampling
 - logprobs, including an explicit `logprobs=0`, or other features that force a
@@ -625,10 +625,15 @@ support, and the submitted batch has no logprobs or other host-only option, a
 structured decode keeps logits on device until `sample_tokens()` supplies and
 remaps the packed grammar mask. Sampling-path eligibility is batch-wide: one
 ineligible request moves the whole submitted TT batch to host sampling. The
-runner drains pending async work before that forward and completes device
-sampling synchronously after the mask arrives. Upstream's batch queue samples
-each forward before it submits the next, so the single deferred logits payload
-works with and without async scheduling. Structured prefill and
+runner submits device sampling after the mask arrives. With async decode enabled,
+token readback starts at sample time and is finalized through the ordinary async
+output wrapper. A steady continuation can submit its next forward before that
+readback completes; its sampling still waits for the host to apply the previous
+token and build the next grammar mask. Eligibility uses the submitted step's
+captured reload plan. Layout changes, prefill, and host-sampling transitions
+still drain pending work. Without async decode, the sampling tail finalizes
+tokens before returning. Upstream's batch queue samples each forward before it
+submits the next, so only one deferred logits payload is needed. Structured prefill and
 ineligible structured decode retain host sampling. Block-output models reject
 structured outputs.
 

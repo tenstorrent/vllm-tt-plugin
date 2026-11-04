@@ -15,6 +15,7 @@ in ttnn.
 from collections import deque
 from dataclasses import replace
 from functools import partial
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,7 +23,11 @@ import pytest
 import torch
 from vllm.v1.core.sched.output import GrammarOutput
 
-from vllm_tt_plugin.async_decode import TTAsyncDecodeController, TTDecodeSubmission
+from vllm_tt_plugin.async_decode import (
+    AsyncTTModelRunnerOutput,
+    TTAsyncDecodeController,
+    TTDecodeSubmission,
+)
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 
@@ -168,13 +173,16 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens(
         can_attempt_steady_decode_from_scheduler=lambda _output: False,
         must_drain_pending_async_steps=lambda *_args: False,
         wait_for_all_pending_async_steps=lambda: events.append("drain"),
+        complete_deferred_device_sampling=lambda _submission, model_input, **_kwargs: (
+            sample_sync(replace(fwd, model_input=model_input))[0][0]
+        ),
         submit_async_decode=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("structured device sampling must not use async overlap")
         ),
     )
     runner = SimpleNamespace(
         async_decode=async_decode,
-        async_decode_scheduling=True,
+        async_decode_scheduling=async_scheduling,
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
         input_batch=SimpleNamespace(req_ids=["req-0"], num_reqs=1),
         _pending_samples=deque(),
@@ -569,6 +577,14 @@ def _real_deferred_grammar_tail(
         return torch.zeros((num_rows, 1), dtype=torch.int32)
 
     runner.model = SimpleNamespace(sample_deferred_decode=sample_deferred_decode)
+    runner.async_decode_scheduling = True
+    runner.trace_mode = "none"
+    runner._steady_decode_lock = Lock()
+    runner._pending_async_steps = deque()
+    runner._pending_async_overlap_ok = deque()
+    runner._completed_decode_steps = deque()
+    runner._build_runner_output = partial(TTModelRunner._build_runner_output, runner)
+    runner._tt_committed_width = lambda _tokens: 1
     runner._apply_grammar_to_input = partial(
         TTModelRunner._apply_grammar_to_input, runner
     )
@@ -604,7 +620,9 @@ def _sample_front_packed(runner, model_input, grammar_output) -> None:
     runner._sample_sync_forward = partial(TTModelRunner._sample_sync_forward, runner)
 
     assert TTModelRunner.execute_model(runner, SimpleNamespace()) is None
-    TTModelRunner.sample_tokens(runner, grammar_output)
+    output = TTModelRunner.sample_tokens(runner, grammar_output)
+    if isinstance(output, AsyncTTModelRunnerOutput):
+        output.get_output()
 
 
 def _sample_lane(runner, model_input, grammar_output) -> None:
@@ -613,7 +631,7 @@ def _sample_lane(runner, model_input, grammar_output) -> None:
     runner.lane_batch = SimpleNamespace(
         extract_output=lambda _runner, tt_out, *_args, **_kwargs: (tt_out, None)
     )
-    TTModelRunner._finish_lane_sync(
+    output = TTModelRunner._finish_lane_sync(
         runner,
         grammar_output,
         tt_out=None,
@@ -624,6 +642,8 @@ def _sample_lane(runner, model_input, grammar_output) -> None:
         lane_total=num_rows,
         decode_submission=_deferred_submission(num_rows),
     )
+    if isinstance(output, AsyncTTModelRunnerOutput):
+        output.get_output()
 
 
 @pytest.mark.parametrize(
@@ -815,21 +835,99 @@ def test_sample_sync_forward_consumes_deferred_grammar_before_extraction():
     assert sampled[0].tolist() == [[42]]
 
 
-def test_deferred_device_sampling_transports_sample_time_grammar():
-    """The deferred sample passes the step's bitmask to the model."""
-    calls: list[tuple] = []
-    device_params = object()
-    raw_logits = object()
-    sampled = torch.tensor([[17]], dtype=torch.int32)
+@pytest.mark.parametrize("read_mode", ["sync", "async", "async-failure"])
+def test_deferred_device_sampling_transports_sample_time_grammar(
+    monkeypatch, read_mode: str
+) -> None:
+    """Check grammar delivery and how token readback produces a host output.
 
+    Sample from submitted logits using the supplied grammar mask, then check
+    both blocking host conversion and asynchronous readback.
+    For asynchronous readback, check that retrieving the output waits for the
+    transfer and that later calls reuse the result or transfer error.
+    """
+    # region Sampling and readback variables
+    calls: list[tuple] = []  # (logits, sampling_parameters, grammar_mask) per sampling
+    events: list[str] = []  # "sample", "readback-started", or "readback-finished"
+    transfer_complete = Event()  # Completion signal for async readback
+    device_params = object()  # Only identity of device-sampling params matter here
+    raw_logits = object()  # Logits retained from previous forward
+    device_tokens = object()  # Sampled tokens still on device
+    sampled = torch.tensor([[17]], dtype=torch.int32)  # Readback/blocking host tensor
+    # endregion
+
+    # region Simulate device sampling and token readback
     def sample_deferred_decode(tt_out, *, sampling_params, grammar_bitmask):
         calls.append((tt_out, sampling_params, grammar_bitmask))
+
+        events.append("sample")
+
+        return device_tokens
+
+    def read_decode_output(output, *, async_read):
+        assert output is device_tokens, (
+            "Readback should copy the tokens returned by device sampling."
+        )
+
+        assert async_read, "Token readback should be asynchronous."
+
+        events.append("readback-started")
+
+        return sampled, [transfer_complete]
+
+    def wait_for_transfer(event):
+        assert event is transfer_complete, (
+            "Output retrieval should wait for this token readback's event."
+        )
+
+        assert event.is_set(), "Readback should be released before retrieving output."
+
+        events.append("readback-finished")
+
+        if read_mode == "async-failure":
+            raise RuntimeError("Token transfer failed.")
+
+    def process_decode_output_host(output, *, is_tokens):
+        assert output is device_tokens, (
+            "Blocking host conversion should receive the sampled device tokens."
+        )
+
+        assert is_tokens, "Host conversion should treat the device output as tokens."
+
+        events.append("blocking-host-conversion")
+
         return sampled
 
+    # endregion
+
+    # region Connect simulated operations to the runner and controller
     runner = SimpleNamespace(
-        model=SimpleNamespace(sample_deferred_decode=sample_deferred_decode)
+        model=SimpleNamespace(
+            sample_deferred_decode=sample_deferred_decode,
+            read_decode_output=read_decode_output,
+            process_decode_output_host=process_decode_output_host,
+        ),
+        _steady_decode_lock=Lock(),
+        async_decode_scheduling=True,
+        trace_mode="none",
+        _pending_async_steps=deque(),
+        _pending_async_overlap_ok=deque(),
+        _completed_decode_steps=deque(),
+        _tt_committed_width=lambda _tokens: 1,
+        _num_speculative_tokens=0,
+        _get_output_tokens=lambda **kwargs: ([kwargs["tt_out"]], [None]),
+    )
+    runner._build_runner_output = partial(TTModelRunner._build_runner_output, runner)
+    runner._poison_device_grammar = partial(
+        TTModelRunner._poison_device_grammar, runner
+    )
+    monkeypatch.setattr(
+        "vllm_tt_plugin.async_decode.ttnn.event_synchronize", wait_for_transfer
     )
     controller = TTAsyncDecodeController(runner)
+    # endregion
+
+    # region Prepare submitted logits, sampling parameters, and grammar mask
     sampling_params = SimpleNamespace(enable_log_probs=torch.tensor([False]))
     submission = TTDecodeSubmission(
         tt_out=raw_logits,
@@ -846,15 +944,82 @@ def test_deferred_device_sampling_transports_sample_time_grammar():
         grammar_bitmask=[bitmask],
         defer_device_sampling=True,
     )
+    # endregion
 
+    # region Sample and check the arguments received by the model
     finalized = controller.complete_deferred_device_sampling(
         submission,
         model_input,
+        async_read=read_mode != "sync",
     )
 
-    assert calls == [(raw_logits, device_params, bitmask)]
-    assert finalized.tt_out is sampled
-    assert controller.device_grammar_sample_count == 1
+    assert calls == [(raw_logits, device_params, bitmask)], (
+        "Sampler should receive the submitted logits, device parameters, and grammar."
+    )
+
+    assert controller.device_grammar_sample_count == 1, (
+        "Controller should count exactly one device grammar sampling call."
+    )
+    # endregion
+
+    if read_mode == "sync":
+        # region Check synchronous sampling returns converted host tokens
+        assert events == ["sample", "blocking-host-conversion"], (
+            "Synchronous completion should sample, then convert tokens on the host."
+        )
+
+        assert finalized.tt_out is sampled, (
+            "Synchronous completion should return the converted host tokens."
+        )
+        # endregion
+    else:
+        # region Check asynchronous readback and repeated output retrieval
+        assert isinstance(finalized, AsyncTTModelRunnerOutput), (
+            "Asynchronous completion should return an output wrapper."
+        )
+
+        assert events == ["sample", "readback-started"], (
+            "Sampling should start readback without waiting for it to finish."
+        )
+
+        assert not finalized.is_resolved(), (
+            "Output should remain unresolved until readback is finalized."
+        )
+
+        transfer_complete.set()
+
+        if read_mode == "async-failure":
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="Token transfer failed."):
+                    finalized.get_output()
+
+            assert not runner._completed_decode_steps, (
+                "A failed transfer should not enqueue a completed decode step."
+            )
+
+        else:
+            output = finalized.get_output()
+
+            assert output.sampled_token_ids == [[17]], (
+                "Host output should contain the sampled token 17."
+            )
+
+            assert output.req_ids == ["req-0"], (
+                "Host output should identify the submitted request."
+            )
+
+            assert finalized.get_output() is output, (
+                "Repeated output retrieval should return the same output object."
+            )
+
+            assert len(runner._completed_decode_steps) == 1, (
+                "Repeated output retrieval should enqueue the completed step only once."
+            )
+
+        assert events == ["sample", "readback-started", "readback-finished"], (
+            "Both output retrieval calls should together wait for readback only once."
+        )
+        # endregion
 
 
 def test_deferred_device_sampling_rejects_missing_sample_time_grammar():
@@ -1101,6 +1266,7 @@ def test_finish_lane_sync_consumes_device_grammar_before_slot_extraction():
         async_decode=SimpleNamespace(
             complete_deferred_device_sampling=complete_deferred
         ),
+        async_decode_scheduling=False,
         lane_batch=SimpleNamespace(
             extract_output=extract_output,
             req_ids={0: "req-a", 1: "req-b"},
