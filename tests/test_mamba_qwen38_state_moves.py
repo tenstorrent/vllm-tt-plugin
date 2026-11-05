@@ -1859,6 +1859,23 @@ def test_deployment_prefill_knobs_keep_chunks_on_the_gdn_block_grid(block_size):
     assert any(start + n == junction for start, n in hit_chunks), hit_chunks
 
 
+def test_a_chunk_cap_below_one_gdn_block_is_refused():
+    """Mode align: vLLM's split rounds a chunk end down to the GDN block
+    grid, so a ``prefill_chunk_cap_table`` cap below one block would give a
+    chunk that starts on the grid no tokens at all."""
+    cfg = _planner_config("align", 0)
+    kv_cache_config = _kv_cache_config(cfg, _qwen38_specs("align", K), NUM_BLOCKS)
+    with pytest.raises(ValueError, match="below the Mamba block size 1024"):
+        _scheduler(
+            kv_cache_config,
+            "align",
+            K,
+            0,
+            4096,
+            tt_config={"prefill_chunk_cap_table": [[0, 4096], [8192, 512]]},
+        )
+
+
 def test_mode_none_needs_a_gdn_block_size_of_max_model_len():
     """In mode none ``MambaSpec.block_size`` must cover the whole sequence.
 
