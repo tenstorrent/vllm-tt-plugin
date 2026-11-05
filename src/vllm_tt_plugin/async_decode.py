@@ -893,10 +893,12 @@ class TTAsyncDecodeController:
         - is ``fused_sample``-servable (``_request_is_fused_servable``: no
           penalties, logprobs, grammar, allowlist, bad words or pending
           ``min_tokens``, sampling inside the device sampler's bounds);
-        - verified the full draft count in step n, which is the count the
-          device's drafter left it, and is offered that many placeholders now:
-          the device verifies exactly ``hints[slot]`` drafts, and a seeded row's
-          uniforms are drawn for that many;
+        - verified at least one draft in step n, at most this step's draft cap
+          (``SpecPlan.draft_cap``) and the placeholders it is offered now: the
+          device's drafter drafts each request the count its verify carried
+          (MiMo-V2.6-Flash's draft groups may give requests of one lane
+          different counts), so the device verifies exactly that many again,
+          ``hints[slot]``, and a seeded row's uniforms are drawn for that many;
         - stays ``2 * (1+K)`` positions under ``max_model_len`` from its
           optimistic length (applied length plus ``1+K`` per step not yet
           applied), so neither step can be cut by the length cap.
@@ -956,7 +958,7 @@ class TTAsyncDecodeController:
             reason = None
             for row, req_id in lane_scheduled.items():
                 tokens = list(offered.get(req_id) or ())
-                hint = min(len(tokens), full)
+                hint = int(pending.num_valid_drafts[row])
                 length = int(batch.num_tokens[row]) + width * inflight
                 if req_id not in runner.requests:
                     reason = "layout"
@@ -964,7 +966,7 @@ class TTAsyncDecodeController:
                     reason = "not_fused"
                 elif any(token != PLACEHOLDER_TOKEN_ID for token in tokens):
                     reason = "real_drafts"
-                elif hint < 1 or int(pending.num_valid_drafts[row]) != hint:
+                elif not 1 <= hint <= min(len(tokens), full):
                     reason = "draft_count"
                 elif length - 1 + 2 * width > max_model_len:
                     reason = "max_len"

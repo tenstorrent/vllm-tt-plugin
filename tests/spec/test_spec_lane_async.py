@@ -956,6 +956,37 @@ def test_a_lane_with_two_requests_keeps_the_step_from_chaining():
         assert produced == expected_greedy(tokens, len(produced))
 
 
+def test_a_lane_whose_requests_draft_different_counts_chains():
+    """A drafter that gives the requests of one lane different draft counts
+    (``ragged``: every draft for the lowest row, one for the other): each
+    chained verify carries every row's count from the verify it chains onto,
+    so the step chains, and every request emits the argmax chain."""
+    model = lane_device_target(draft_policy="ragged")()
+    runner = lane_runner(model)
+    engine = LaneEngine(runner)
+    prompts = {
+        "a": engine.add("a", 0, 1),
+        "b": engine.add("b", 1, 9),
+        "c": engine.add("c", 3, 17),
+    }
+    engine.run(12)
+    engine.drain()
+    chained, breaks = chain_counters(runner)
+    assert chained > 0 and "draft_count" not in breaks
+    k = int(runner._num_speculative_tokens)
+    assert k > 1
+    for call in model.chained_calls:
+        counts = call["num_valid_drafts"].tolist()
+        live = call["chain_rows"].tolist()
+        assert [counts[row] for row in (0, 1, 3) if live[row]] == [
+            n for row, n in ((0, k), (1, 1), (3, k)) if live[row]
+        ]
+    for req_id, tokens in prompts.items():
+        produced = engine.outputs[req_id]
+        assert produced == expected_greedy(tokens, len(produced))
+        assert len(produced) > 12
+
+
 def test_a_request_that_stops_mid_chain_leaves_the_others_chaining():
     """``b`` stops after 9 tokens. Its stop reaches the runner a step late, so
     one more chained verify carries it; that output is discarded and from the

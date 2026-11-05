@@ -24,7 +24,9 @@ lane decode on a device, which is what the asynchronous lane path relies on:
   token, except at a position where ``position % miss_every == miss_at``,
   where it drafts the wrong token, so acceptance varies along a request.
   ``draft_policy="solo"`` drafts only for a lane holding one request, as
-  MiMo-V2.6-Flash's drafter does.
+  MiMo-V2.6-Flash's drafter did with one draft group; ``"ragged"`` drafts
+  every draft for a lane's lowest live row and one for each other row, as its
+  mixed draft groups do.
 
 ``read_decode_output`` hands back host output with no events, so a step
 completes only when the runner resolves its deferred output: exactly where the
@@ -195,6 +197,10 @@ class LaneDeviceTarget:
         for row, alive in enumerate(live):
             if alive:
                 lanes[row // self.per_lane] = lanes.get(row // self.per_lane, 0) + 1
+        lowest: dict[int, int] = {}
+        for row, alive in enumerate(live):
+            if alive:
+                lowest.setdefault(row // self.per_lane, row)
         drafts = torch.full((rows, num_drafts), -1, dtype=torch.int32)
         offered = torch.zeros(rows, dtype=torch.int32)
         for row in range(rows):
@@ -202,12 +208,15 @@ class LaneDeviceTarget:
                 continue
             if self.draft_policy == "solo" and lanes[row // self.per_lane] != 1:
                 continue
+            count = num_drafts
+            if self.draft_policy == "ragged" and lowest[row // self.per_lane] != row:
+                count = min(1, num_drafts)
             token, pos = int(last[row]), int(position[row])
-            for j in range(num_drafts):
+            for j in range(count):
                 token = drafter_token(token, pos, self.miss_every, self.miss_at)
                 pos += 1
                 drafts[row, j] = token
-            offered[row] = num_drafts
+            offered[row] = count
         return drafts, offered
 
     def _invalidate_chain(self) -> None:
