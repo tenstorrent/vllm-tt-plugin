@@ -187,12 +187,16 @@ def _engine_config(
     prefix_match_unit: int | None = None,
     model_class: type = _StubModel,
     mamba_block_size: int | None = None,
+    max_model_len: int = MAX_MODEL_LEN,
+    block_size: int = BLOCK_SIZE,
+    long_prefill_token_threshold: int = 0,
+    tt_config: dict | None = None,
 ) -> VllmConfig:
     """A ``VllmConfig`` resolved by the TT platform hook for ``model_class``.
 
     The cache mode a hybrid model gets from vLLM's config resolution
     (``MambaModelConfig``) is set before the hook runs: mode align comes with
-    prefix caching.
+    prefix caching. ``tt_config`` is ``additional_config["tt"]``.
     """
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -200,17 +204,18 @@ def _engine_config(
         seed=42,
         skip_tokenizer_init=True,
     )
-    model_config.max_model_len = MAX_MODEL_LEN
+    model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=max_num_batched_tokens,
-        max_model_len=MAX_MODEL_LEN,
+        max_model_len=max_model_len,
         enable_chunked_prefill=True,
+        long_prefill_token_threshold=long_prefill_token_threshold,
         async_scheduling=False,
         is_encoder_decoder=False,
     )
     cache_config = CacheConfig(
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=mode == "align",
@@ -241,6 +246,7 @@ def _engine_config(
             cache_config=cache_config,
             parallel_config=ParallelConfig(),
             device_config=DeviceConfig(device="cpu"),
+            additional_config={"tt": dict(tt_config)} if tt_config else {},
         )
 
 
@@ -251,12 +257,16 @@ def _scheduler(
     retention: int | None,
     max_num_batched_tokens: int,
     prefix_match_unit: int | None = None,
+    **engine_kwargs,
 ) -> TTScheduler:
     """A real ``TTScheduler`` over a real ``KVCacheManager``, started as
     ``EngineCore`` starts it: ``block_size`` is set from the groups and
     validated. The model declares chunked prefill and prefix caching.
+    ``engine_kwargs`` go to ``_engine_config``.
     """
-    config = _engine_config(mode, retention, max_num_batched_tokens, prefix_match_unit)
+    config = _engine_config(
+        mode, retention, max_num_batched_tokens, prefix_match_unit, **engine_kwargs
+    )
     cache_config = config.cache_config
     cache_config.num_gpu_blocks = kv_cache_config.num_blocks
     if num_spec:
@@ -1353,6 +1363,239 @@ def test_boundary_state_written_after_acceptance_serves_a_prefix_hit(retention, 
         for g in h.groups:
             copy = boundary_copies[(g, b_blocks[g][1])]
             assert copy.temporal_src != copy.dst
+
+
+def _last_writers(h: _Harness, prompt_lens: dict[str, int]) -> list[dict]:
+    """Replay which kind of step last wrote each GDN block, through the
+    plugin's copies; return, per step, that map before the step ran.
+
+    A row writes its state window from column 0: one state in a prefill
+    chunk, one per query token in a decode step. ``begin_step`` copies run
+    before the writes and ``after_acceptance`` copies after them.
+    """
+    writers: dict[int, str] = {}
+    before = []
+    for step in h.steps:
+        before.append(dict(writers))
+        for src, dst in step.groups_pre or ():
+            writers[dst] = writers.get(src)
+        for row in step.rows:
+            decode = row.num_computed >= prompt_lens[row.req_id]
+            written = row.num_scheduled if decode else 1
+            for window in step.groups_windows[row.req_id].values():
+                for block in window[:written]:
+                    writers[block] = "decode" if decode else "prefill"
+        for src, dst in step.groups_post or ():
+            writers[dst] = writers.get(src)
+    return before
+
+
+@pytest.mark.parametrize("retention", [0, None])
+def test_multi_turn_follow_ups_hit_decode_written_states_only_with_retention(
+    retention,
+):
+    """Turn 1 decodes across a block boundary; four follow-ups, one after the
+    other, extend its prompt and output with new text.
+
+    At retention 0 vLLM keeps a GDN state only at a request's replay boundary
+    (``KVCacheCoordinator.get_replay_boundaries``: the prompt length minus 1)
+    and at its junction (``KVCacheManager.get_computed_blocks``: the attention
+    hit of a request whose GDN hit is shorter). Both end a prefill chunk, so a
+    follow-up never reads a state that decoding wrote: the first follow-up
+    recomputes past turn 1's replay boundary and caches the junction, and the
+    other three hit that state, which the first follow-up's prefill wrote.
+    Turn 1's prompts put a block boundary inside its first verify or just
+    after it (1023 tokens: the state after the first query token is the
+    boundary state). With dense retention the follow-ups hit the boundary
+    states turn 1's decode left, which the plugin's boundary copies keep.
+    Every read is exact either way (the harness ledgers).
+    """
+    h = _Harness("align", num_spec=K, retention=retention)
+    prompt_lens: dict[str, int] = {}
+    turn_1 = {"t1": 1023, "t2": 1022, "t3": 1021, "t4": 2047}
+    for name, length in turn_1.items():
+        prompt_lens[name] = length
+        h.add(name, _prompt(length, length), max_tokens=60)
+    h.run(max_steps=400, accept=_accept_pattern)
+    for i in range(4):
+        for name in turn_1:
+            follow_up = f"{name}-f{i}"
+            prompt = h.tokens[name] + _prompt(100 * i + len(name), 300)
+            prompt_lens[follow_up] = len(prompt)
+            h.add(follow_up, prompt, max_tokens=4)
+        h.run(max_steps=400, accept=_accept_pattern)
+
+    writers = _last_writers(h, prompt_lens)
+    hit_writers = {}
+    for step, before in zip(h.steps, writers):
+        for req_id, hit in step.new_hits.items():
+            if hit:
+                hit_writers[req_id] = (
+                    hit,
+                    {
+                        before.get(step.new_block_ids[req_id][g][hit // BLOCK_SIZE - 1])
+                        for g in h.groups
+                    },
+                )
+    follow_ups = {r: v for r, v in hit_writers.items() if "-f" in r}
+    if retention == 0:
+        assert all(kinds == {"prefill"} for _, kinds in follow_ups.values()), follow_ups
+        for name in turn_1:
+            # The first follow-up caches the junction; the other three hit it.
+            junction = len(h.tokens[name]) // BLOCK_SIZE * BLOCK_SIZE
+            later = [follow_ups.get(f"{name}-f{i}", (0,))[0] for i in range(1, 4)]
+            assert later == [junction] * 3, follow_ups
+    else:
+        assert any("decode" in kinds for _, kinds in follow_ups.values()), follow_ups
+
+
+# The Galaxy deployment's prefill knobs (tt-inference-server
+# atupe/qwen38-glx-mtp) that the plugin accepts: chunked prefill with a
+# 16384-token chunk limit, and one decode step after each prefill step.
+DEPLOYMENT_TT_CONFIG = {
+    "decode_interleave_prefill_steps": 1,
+}
+
+
+@pytest.mark.parametrize("block_size", [1024, 2048])
+def test_deployment_prefill_knobs_keep_chunks_on_the_gdn_block_grid(block_size):
+    """Mode align needs every prefill chunk that does not finish its prompt to
+    end on a GDN block boundary: block-table column ``p`` holds the state after
+    exactly ``(p + 1) * block_size`` tokens, and prefix caching hashes it as
+    such. ``TTScheduler`` applies its 128-token grid after vLLM's
+    block-aligned split, so the grid must keep the chunk on the block grid
+    too.
+
+    The real ``TTScheduler`` and ``KVCacheManager`` serve, with the
+    deployment's knobs and K=3: a 140000-token prompt, a 20000-token prompt, a
+    short one, and a follow-up that shares the long prompt's first 70000
+    tokens (its GDN hit is shorter than its attention hit, so vLLM also stops a
+    chunk at the junction). Every partial chunk ends on the block grid, and a
+    prefill step follows a prefill step only when no request is decoding.
+    vLLM 0.31 drops ``long_prefill_token_threshold`` for a step with one
+    eligible request, and ``TTScheduler`` hides the decoding requests from a
+    prefill step, so a lone prompt's chunk can be longer than 16384 tokens.
+    """
+    max_model_len = 145_000
+    planner = _planner_config("align", 0)
+    planner.model_config.max_model_len = max_model_len
+    planner.model_config.original_max_model_len = max_model_len
+    kv_cache_config = _kv_cache_config(
+        planner, _qwen38_specs("align", K, block_size=block_size), 640
+    )
+    scheduler = _scheduler(
+        kv_cache_config,
+        "align",
+        K,
+        0,
+        525312,
+        max_model_len=max_model_len,
+        block_size=block_size,
+        long_prefill_token_threshold=16384,
+        tt_config=DEPLOYMENT_TT_CONFIG,
+    )
+    init_none_hash(sha256)
+    long_prompt = _prompt(1, 140_037)
+    prompts = {
+        "long": long_prompt,
+        "mid": _prompt(2, 20_005),
+        "short": _prompt(3, 3000),
+    }
+
+    def add(req_id: str, prompt: list[int]) -> None:
+        params = SamplingParams(max_tokens=3, ignore_eos=True)
+        params.update_from_generation_config({}, eos_token_id=2)
+        scheduler.add_request(
+            Request(
+                request_id=req_id,
+                prompt_token_ids=prompt,
+                sampling_params=params,
+                pooling_params=None,
+                block_hasher=get_request_block_hasher(
+                    scheduler.hash_block_size, sha256
+                ),
+            )
+        )
+
+    for req_id, prompt in prompts.items():
+        add(req_id, prompt)
+    chunks: list[tuple[str, int, int]] = []
+    previous_was_prefill = False
+    follow_up_added = False
+    for step in range(400):
+        if not follow_up_added and "long" not in scheduler.requests:
+            prompts["hit"] = long_prompt[:70_000] + _prompt(4, 5000)
+            add("hit", prompts["hit"])
+            follow_up_added = True
+        decoding = [
+            r.request_id
+            for r in scheduler.running
+            if r.num_computed_tokens >= r.num_prompt_tokens
+        ]
+        starts = {
+            r.request_id: r.num_computed_tokens
+            for r in (*scheduler.running, *scheduler.waiting)
+        }
+        out = scheduler.schedule()
+        if not out.num_scheduled_tokens:
+            if not scheduler.requests:
+                break
+            continue
+        prefill = {
+            r: (starts.get(r, 0), n)
+            for r, n in out.num_scheduled_tokens.items()
+            if starts.get(r, 0) < len(prompts[r])
+        }
+        for new in out.scheduled_new_reqs:
+            if new.req_id in prefill:
+                prefill[new.req_id] = (
+                    new.num_computed_tokens,
+                    out.num_scheduled_tokens[new.req_id],
+                )
+        if prefill:
+            assert not (previous_was_prefill and decoding), (step, decoding)
+        previous_was_prefill = bool(prefill)
+        for req_id, (start, n) in prefill.items():
+            chunks.append((req_id, start, n))
+            if start + n == len(prompts[req_id]):
+                continue
+            assert (start + n) % block_size == 0, (req_id, start, n)
+        sampled = []
+        for req_id in out.num_scheduled_tokens:
+            request = scheduler.requests[req_id]
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                sampled.append([])
+                continue
+            drafts = out.scheduled_spec_decode_tokens.get(req_id, [])
+            sampled.append(list(drafts[: len(drafts) // 2]) + [7])
+        req_ids = list(out.num_scheduled_tokens)
+        scheduler.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                sampled_token_ids=sampled,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        running = [r for r, s in zip(req_ids, sampled) if s and r in scheduler.requests]
+        if running:
+            scheduler.update_draft_token_ids(
+                DraftTokenIds(running, [[11, 12, 13] for _ in running])
+            )
+    else:
+        raise AssertionError("scenario did not finish")
+    assert follow_up_added and not scheduler.requests
+    long_chunks = [(start, n) for r, start, n in chunks if r == "long"]
+    assert len(long_chunks) > 1, long_chunks
+    # At retention 0 no GDN state of the long prompt lies below 70000, so the
+    # follow-up starts at 0 and stops a chunk at its junction, the attention hit.
+    junction = 70_000 // block_size * block_size
+    hit_chunks = [(start, n) for r, start, n in chunks if r == "hit"]
+    assert hit_chunks[0][0] == 0, hit_chunks
+    assert any(start + n == junction for start, n in hit_chunks), hit_chunks
 
 
 def test_mode_none_needs_a_gdn_block_size_of_max_model_len():
