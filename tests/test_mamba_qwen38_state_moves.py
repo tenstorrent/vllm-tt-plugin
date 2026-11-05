@@ -29,6 +29,7 @@ layout, where each block holds one full state.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1403,6 +1404,95 @@ def test_multi_turn_follow_ups_hit_decode_written_states_only_with_retention(
             assert later == [junction] * 3, follow_ups
     else:
         assert any("decode" in kinds for _, kinds in follow_ups.values()), follow_ups
+
+
+def _continue_text(h: _Harness, text: list[int]) -> None:
+    """Make a request whose tokens are a prefix of ``text`` continue it: its
+    drafts and its sampled tokens are the next tokens of ``text``, as greedy
+    decoding of a passage the model reproduces."""
+    scheduler = h.scheduler
+    update_from_output = scheduler.update_from_output
+    update_draft_token_ids = scheduler.update_draft_token_ids
+
+    def next_tokens(req_id: str, tokens: list[int]) -> list[int]:
+        request = scheduler.requests[req_id]
+        if list(request.all_token_ids) != text[: request.num_tokens]:
+            return list(tokens)
+        return text[request.num_tokens : request.num_tokens + len(tokens)]
+
+    def update(out, model_runner_output):
+        sampled = [
+            next_tokens(r, t) if t else t
+            for r, t in zip(
+                model_runner_output.req_ids, model_runner_output.sampled_token_ids
+            )
+        ]
+        return update_from_output(
+            out, dataclasses.replace(model_runner_output, sampled_token_ids=sampled)
+        )
+
+    def drafts(draft_token_ids):
+        return update_draft_token_ids(
+            DraftTokenIds(
+                draft_token_ids.req_ids,
+                [
+                    next_tokens(r, d)
+                    for r, d in zip(
+                        draft_token_ids.req_ids, draft_token_ids.draft_token_ids
+                    )
+                ],
+            )
+        )
+
+    scheduler.update_from_output = update
+    scheduler.update_draft_token_ids = drafts
+
+
+@pytest.mark.parametrize("same_text", [True, False])
+def test_follow_ups_of_one_text_hit_the_first_follow_ups_junction(same_text):
+    """A device check at retention 0 and block 2048 saw follow-ups hit the
+    state at 2048 for turn-1 prompts of 2043, 2045 and 2047 tokens of one
+    article, but not for 2040, all on one server. Turn 1's decode crosses
+    2048; each follow-up is turn 1's first 2088 tokens plus a question.
+
+    Here at block 1024: when the model continues the article word for word,
+    every turn 1 decodes the same tokens, so every follow-up starts with the
+    same 1024 tokens. The first follow-up (prompt 1016) has no GDN hit, so it
+    recomputes and caches the state at its junction (1024) from its prefill;
+    the later follow-ups hit that state. No hit reads a state turn 1's decode
+    wrote, and every read is exact although the plugin runs no boundary copy
+    at retention 0. With a different text per turn, no follow-up hits.
+    """
+    h = _Harness("align", num_spec=K, retention=0)
+    text = _prompt(7, 4000)
+    _continue_text(h, text)
+    prompt_lens: dict[str, int] = {}
+    hits = {}
+    for i, length in enumerate((1016, 1019, 1021, 1023)):
+        turn = text if same_text else _prompt(100 + i, 4000)
+        first, follow_up = f"a{length}", f"b{length}"
+        prompt_lens[first] = length
+        h.add(first, turn[:length], max_tokens=1088 - length)
+        h.run(400, _accept_pattern, until=lambda r=first: h.finished(r))
+        prompt = h.tokens[first][:1064] + _prompt(99, 7)
+        prompt_lens[follow_up] = len(prompt)
+        h.add(follow_up, prompt, max_tokens=4)
+        h.run(400, _accept_pattern, until=lambda r=follow_up: h.finished(r))
+        hits[length] = next(
+            (s.new_hits[follow_up] for s in h.steps if follow_up in s.new_hits), None
+        )
+    if not same_text:
+        assert hits == {1016: 0, 1019: 0, 1021: 0, 1023: 0}, hits
+        return
+    assert hits == {1016: 0, 1019: 1024, 1021: 1024, 1023: 1024}, hits
+    for step, before in zip(h.steps, _last_writers(h, prompt_lens)):
+        for req_id, hit in step.new_hits.items():
+            if hit:
+                writers = {
+                    before.get(step.new_block_ids[req_id][g][hit // BLOCK_SIZE - 1])
+                    for g in h.groups
+                }
+                assert writers == {"prefill"}, (req_id, hit, writers)
 
 
 # The Galaxy deployment's prefill knobs (tt-inference-server
