@@ -110,6 +110,7 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
         device_config=None,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
+            tensor_parallel_size=1,
             decode_context_parallel_size=1,
             pipeline_parallel_size=1,
         ),
@@ -124,6 +125,7 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
         attention_config=SimpleNamespace(hisparse_config=None),
         additional_config={},
         speculative_config=None,
+        num_prefill_lookahead_tokens=0,
         kv_transfer_config=None,
         max_in_flight_tokens=MAX_MODEL_LEN,
     )
