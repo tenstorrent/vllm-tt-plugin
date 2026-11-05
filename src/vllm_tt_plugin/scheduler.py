@@ -415,6 +415,22 @@ class TTScheduler(AsyncScheduler):
             _validate_prefill_chunk_alignment(
                 self._prefill_chunk_alignment, self.scheduler_config
             )
+            # With partial hash hits vLLM's block-aligned split also stops at
+            # multiples of hash_block_size. One off the alignment grid is
+            # floored back below the chunk start, so the request never
+            # finishes its prefill.
+            if (
+                getattr(self, "mamba_partial_cache_hit", False)
+                and self.hash_block_size % self._prefill_chunk_alignment
+            ):
+                raise ValueError(
+                    f"cache_config.prefix_match_unit={self.hash_block_size} "
+                    "with mamba_cache_mode 'align' makes vLLM end prefill "
+                    "chunks on multiples of it, off the grid of "
+                    "additional_config['tt']['prefill_chunk_alignment']="
+                    f"{self._prefill_chunk_alignment}. Set prefix_match_unit "
+                    "to a multiple of the alignment."
+                )
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
@@ -802,19 +818,83 @@ class TTScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
         if getattr(self, "_base_need_mamba_split", False):
+            budget = num_new_tokens
             num_new_tokens = super()._mamba_block_aligned_split(
                 request,
                 num_new_tokens,
                 num_new_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        start = (
-            request.num_computed_tokens
-            + num_new_local_computed_tokens
-            + num_external_computed_tokens
-        )
+            num_new_tokens = self._keep_multimodal_items_whole(
+                request, start, num_new_tokens, budget
+            )
         return self._align_prefill_chunk_end(request, start, num_new_tokens)
+
+    def _keep_multimodal_items_whole(
+        self, request: Request, start: int, num_new_tokens: int, budget: int
+    ) -> int:
+        """Move a mode-align prefill chunk end out of every multimodal item.
+
+        Mode align does not allow vLLM's ``disable_chunked_mm_input``, so this
+        keeps each item in one chunk instead. ``budget`` is the chunk length
+        before vLLM's block-aligned split. When that split ends the chunk
+        inside an item, the chunk ends instead at, in order of preference:
+
+        1. the last block boundary before the item, so that boundary's state
+           can still be cached;
+        2. the end of the item, if the budget reaches it. The chunk then
+           crosses the block boundaries inside the item without stopping;
+           ``MambaManager`` keeps null blocks there, so they are only not
+           cacheable;
+        3. the start of the item;
+        4. nowhere: the request waits for a step with more budget.
+
+        ``TTPlatform.validate_request`` rejects an item longer than one step.
+        An item that skipped that check and is longer than a whole step is
+        split, with a warning, rather than stall the queue.
+        """
+        end = start + num_new_tokens
+        if num_new_tokens <= 0 or not request.mm_features:
+            return num_new_tokens
+        items = [
+            (f.mm_position.offset, f.mm_position.offset + f.mm_position.length)
+            for f in request.mm_features
+        ]
+
+        def inside_item(position: int) -> tuple[int, int] | None:
+            return next(((lo, hi) for lo, hi in items if lo < position < hi), None)
+
+        item = inside_item(end)
+        if item is None:
+            return num_new_tokens
+        lo, hi = item
+        block = self.cache_config.block_size
+        boundary = min(end - 1, lo) // block * block
+        while boundary > start:
+            if inside_item(boundary) is None:
+                return boundary - start
+            boundary -= block
+        if hi <= start + budget:
+            return hi - start
+        if lo > start:
+            return lo - start
+        if hi - start > self._full_step_prefill_cap():
+            logger.warning(
+                "Request %s: a multimodal item at tokens [%d, %d) does not fit "
+                "one prefill step from token %d; splitting it.",
+                request.request_id,
+                lo,
+                hi,
+                start,
+            )
+            return num_new_tokens
+        return 0
 
     def _align_prefill_chunk_end(
         self, request: Request, start: int, num_new_tokens: int
