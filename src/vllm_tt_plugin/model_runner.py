@@ -1103,6 +1103,9 @@ class TTModelRunner:
             self._mamba_groups.chained_moves_on_device = bool(
                 capabilities.get("supports_mamba_chained_state_moves", False)
             )
+            self._mamba_groups.zeroes_only_state_blocks = not getattr(
+                kv_cache_config, "has_mixed_precision_kv_cache", True
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -4055,12 +4058,20 @@ class TTModelRunner:
         The upstream GPU runner zeroes ``new_block_ids_to_zero`` and applies
         ``kv_cache_block_copies`` before the forward. The TT model owns the
         device buffers, so the runner calls ``zero_kv_cache_blocks`` and
-        ``copy_kv_cache_blocks``, zeroing first. ``initialize_kv_cache``
+        ``copy_kv_cache_blocks``, zeroing first. With MambaSpec groups it
+        zeroes only the listed blocks that ``MambaCacheGroups.blocks_to_zero``
+        selects: those attention can still read unwritten while they hold
+        recurrent state. ``initialize_kv_cache``
         requires these hooks of a model with MambaSpec groups. For a model
         without MambaSpec groups and without a hook, the runner skips that
         operation. The Mamba state copies follow in ``build_model_input``.
         """
-        block_ids = scheduler_output.new_block_ids_to_zero
+        if self._mamba_groups is not None:
+            block_ids = self._mamba_groups.blocks_to_zero(
+                scheduler_output, self.requests
+            )
+        else:
+            block_ids = scheduler_output.new_block_ids_to_zero
         zero_blocks = getattr(self.model, "zero_kv_cache_blocks", None)
         if block_ids and callable(zero_blocks):
             zero_blocks(kv_cache=self.kv_caches, block_ids=list(block_ids))
