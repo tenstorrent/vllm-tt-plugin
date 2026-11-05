@@ -40,6 +40,8 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroupSpec, MambaSpec
 
+from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -61,7 +63,8 @@ class MambaStepInputs(NamedTuple):
     # int32 ``[rows, 1 + K]``; ``None`` when K is 0.
     state_block_windows_per_layer: list[torch.Tensor | None] | None
     # int32 ``[rows]``: the start state is in window column ``count - 1``;
-    # ``None`` when K is 0.
+    # -1 on a chained row, whose count only the device knows; ``None`` when K
+    # is 0.
     state_accepted_counts: torch.Tensor | None
 
 
@@ -129,7 +132,7 @@ class MambaCacheGroups:
         self,
         block_tables_per_group: Sequence[torch.Tensor],
         row_req_ids: Sequence[str],
-        requests: Mapping[str, TTCachedRequestState],
+        num_computed: Mapping[str, int],
         num_scheduled_tokens: Mapping[str, int],
         layer_to_group_idx: Sequence[int],
         num_rows: int,
@@ -139,13 +142,12 @@ class MambaCacheGroups:
         Row ``i`` of ``block_tables_per_group`` belongs to ``row_req_ids[i]``;
         the rows after them are padding, with zero block tables. The result is
         padded to ``num_rows`` rows, the row count of ``page_tables_per_layer``.
-        ``begin_step`` must have run for this step.
+        ``num_computed`` is as for ``begin_step``, which must have run for this
+        step.
         """
         seq_lens = torch.zeros(block_tables_per_group[0].shape[0], dtype=torch.int64)
         for row, req_id in enumerate(row_req_ids):
-            seq_lens[row] = (
-                requests[req_id].num_computed_tokens + num_scheduled_tokens[req_id]
-            )
+            seq_lens[row] = num_computed[req_id] + num_scheduled_tokens[req_id]
         width = 1 + self.num_speculative_blocks
         windows: dict[int, torch.Tensor] = {}
         for g in self.group_indices:
@@ -170,12 +172,20 @@ class MambaCacheGroups:
         self,
         scheduler_output: SchedulerOutput,
         requests: Mapping[str, TTCachedRequestState],
+        num_computed: Mapping[str, int],
         accepted_counts: Mapping[str, int] | None = None,
     ) -> list[tuple[int, int]]:
         """Record each row's start-state count; return the copies due first.
 
-        ``accepted_counts`` maps a request to the tokens its last step
-        committed (``TTModelRunner._req_accepted_counts``); absent means 1.
+        ``num_computed`` maps each scheduled request to the position of its
+        first query token this step. Under asynchronous scheduling the
+        scheduler's ``num_computed_tokens`` of a speculative row still counts
+        the drafts of its step in flight as accepted, so the runner passes the
+        positions it builds the step with. ``accepted_counts`` maps a request
+        to the count the step's spec ``accepted_counts`` carries; absent means
+        1, and -1 (a chained row) passes through: the start state follows the
+        pending verify's acceptance, which only the device knows, and no move
+        may depend on it (``chain_blocker``).
 
         Mode ``align`` ports upstream ``preprocess_mamba``: when a request's
         tokens cross into a new block-table column, its start state moves to
@@ -185,6 +195,13 @@ class MambaCacheGroups:
         count - 1``, in every Mamba group with the block ids of its own row.
         """
         accepted_counts = accepted_counts or {}
+        if self.mamba_cache_mode == "align":
+            missing = scheduler_output.num_scheduled_tokens.keys() - num_computed.keys()
+            if missing:
+                raise RuntimeError(
+                    f"scheduled requests {sorted(missing)} have no first query "
+                    f"position; positions were given for {sorted(num_computed)}"
+                )
         cached = scheduler_output.scheduled_cached_reqs
         for req_id in (
             *scheduler_output.finished_req_ids,
@@ -200,21 +217,31 @@ class MambaCacheGroups:
         self.step_accepted_counts = {}
         copies: list[tuple[int, int]] = []
         for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
-            count = (
-                1
-                if req_id in fresh or req_id in self.moved_to_window_start
-                else accepted_counts.get(req_id, 1)
-            )
+            count = accepted_counts.get(req_id, 1)
+            if req_id in fresh:
+                count = 1
+            elif count != PLACEHOLDER_TOKEN_ID and req_id in self.moved_to_window_start:
+                # A chained row keeps -1: the move happened before the pending
+                # verify ran, and that verify's result is where the row starts.
+                count = 1
             if self.mamba_cache_mode == "align":
                 req_state = requests[req_id]
-                num_computed = req_state.num_computed_tokens
+                computed = num_computed[req_id]
                 prev = self.state_columns.get(req_id)
                 if prev is None:
                     # A new or resumed request; -1 when nothing is computed yet.
-                    prev = (num_computed - 1) // self.block_size
-                curr = cdiv(num_computed + num_scheduled, self.block_size) - 1
+                    prev = (computed - 1) // self.block_size
+                curr = cdiv(computed + num_scheduled, self.block_size) - 1
                 self.state_columns[req_id] = curr
                 if prev != -1 and prev != curr:
+                    if count == PLACEHOLDER_TOKEN_ID:
+                        raise RuntimeError(
+                            f"chained request {req_id} moves its state from "
+                            f"block-table column {prev} to {curr} at position "
+                            f"{computed}, but the copy source depends on the "
+                            "pending verify's accepted count, which only the "
+                            "device knows; chain_blocker must refuse this chain"
+                        )
                     for g in self.group_indices:
                         block_ids = req_state.block_ids[g]
                         copies.append((block_ids[prev + count - 1], block_ids[curr]))
@@ -267,6 +294,46 @@ class MambaCacheGroups:
                 block_ids = requests[req_id].block_ids[g]
                 copies.append((block_ids[src + shift], block_ids[dst]))
         return copies
+
+    def chain_blocker(
+        self,
+        requests: Mapping[str, TTCachedRequestState],
+        pending_req_ids: Sequence[str],
+        chained_req_ids: Sequence[str],
+        num_pending_steps: int,
+        step_width: int,
+    ) -> str | None:
+        """``"mamba_boundary"`` when a step may not be built over pending verifies.
+
+        Mode ``align`` only. A state move's source depends on a verify's
+        accepted count, so it is due when that verify commits on the host: a
+        boundary copy after acceptance (``after_acceptance``) and a move to a
+        new block-table column before the next step (``begin_step``). A step
+        built over pending verifies (a chained verify, or a prefill submitted
+        behind one) runs before that commit, and the scheduler may have freed
+        a target block by the time the commit runs. So no row may be able to
+        reach a block boundary until the commit: for each request, between its
+        committed length and the most tokens its ``num_pending_steps`` pending
+        verifies, plus this step for ``chained_req_ids``, can compute (each
+        step at most ``step_width``).
+
+        ``pending_req_ids`` are the pending verifies' rows that are not
+        finished, finishing rows included.
+        """
+        if self.mamba_cache_mode != "align":
+            return None
+        chained = set(chained_req_ids)
+        for req_id in dict.fromkeys((*pending_req_ids, *chained_req_ids)):
+            req_state = requests.get(req_id)
+            if req_state is None:
+                continue
+            # The last committed token is the next step's input, not computed.
+            first = req_state.num_tokens - 1
+            steps = num_pending_steps + (req_id in chained)
+            last = first + step_width * steps
+            if first // self.block_size != last // self.block_size:
+                return "mamba_boundary"
+        return None
 
 
 def mamba_cache_groups(

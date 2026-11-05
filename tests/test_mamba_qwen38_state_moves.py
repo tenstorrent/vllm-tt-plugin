@@ -500,7 +500,7 @@ class _Harness:
         inputs = self.plugin_groups.step_inputs(
             tables,
             req_ids,
-            self.req_states,
+            {r: self.req_states[r].num_computed_tokens for r in req_ids},
             out.num_scheduled_tokens,
             list(range(num_groups)),
             len(req_ids),
@@ -585,7 +585,10 @@ class _Harness:
         )
         if self.plugin_groups is not None:
             record.groups_pre = self.plugin_groups.begin_step(
-                out, self.req_states, self.plugin_counts
+                out,
+                self.req_states,
+                {r: self.req_states[r].num_computed_tokens for r in req_ids},
+                self.plugin_counts,
             )
             self.plugin_ledger.copy(record.groups_pre)
             self._groups_step_inputs(out, req_ids, record)

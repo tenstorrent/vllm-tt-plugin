@@ -928,8 +928,34 @@ class TTAsyncDecodeController:
         )
         if reason is not None or plan is None:
             return reason or "layout", None
+        reason = self._mamba_state_move_blocker(
+            scheduler_output, expected, len(unresolved) + completed
+        )
+        if reason is not None:
+            return reason, None
         chain_len, hints = plan
         return None, ChainPlan(self._last_fused_tip, chain_len, hints)
+
+    def _mamba_state_move_blocker(
+        self,
+        scheduler_output: SchedulerOutput,
+        chained_req_ids: list[str],
+        num_pending_steps: int,
+    ) -> str | None:
+        """``MambaCacheGroups.chain_blocker`` for a step built over the pending
+        verify: its rows less the finished ones (finishing rows stay, their
+        verify still commits), plus ``chained_req_ids`` for a chained step."""
+        groups = getattr(self.runner, "_mamba_groups", None)
+        if groups is None:
+            return None
+        finished = set(scheduler_output.finished_req_ids)
+        return groups.chain_blocker(
+            self.runner.requests,
+            [r for r in self._last_fused_rows if r not in finished],
+            chained_req_ids,
+            num_pending_steps,
+            self.runner._num_speculative_tokens + 1,
+        )
 
     def mask_pending(self) -> bool:
         """Whether a masked step was begun and its finish has not been called."""
@@ -953,10 +979,11 @@ class TTAsyncDecodeController:
 
         Asked only once ``chain_blocker`` has answered "prefill". The step must
         be all prefill with no resumed request and no multimodal input, the
-        model must declare ``supports_prefill_over_pending_spec``. A resumed
-        request still
-        drains: ``apply_ready_completed_decode_steps`` assumes its completed
-        steps are ordered oldest to newest for the forced-reset discard counts.
+        model must declare ``supports_prefill_over_pending_spec``, and with
+        MambaSpec groups no pending row may reach a state move
+        (``MambaCacheGroups.chain_blocker``). A resumed request still drains:
+        ``apply_ready_completed_decode_steps`` assumes its completed steps are
+        ordered oldest to newest for the forced-reset discard counts.
         """
         if scheduler_output is None or not self.chain_enabled():
             return False
@@ -976,9 +1003,18 @@ class TTAsyncDecodeController:
             for new_req in scheduler_output.scheduled_new_reqs
         ):
             return False
-        return not any(
+        if any(
             getattr(runner.requests.get(req_id), "mm_features", None)
             for req_id in cached_reqs.req_ids
+        ):
+            return False
+        with runner._steady_decode_lock:
+            num_pending_steps = sum(
+                not step.is_resolved() for step in runner._pending_async_steps
+            ) + len(runner._completed_decode_steps)
+        return (
+            self._mamba_state_move_blocker(scheduler_output, [], num_pending_steps)
+            is None
         )
 
     def chain_forces_drain(self, scheduler_output: SchedulerOutput | None) -> bool:
