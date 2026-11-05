@@ -181,6 +181,14 @@ class TTModelInput:
     # holds each row's recurrent state, read from its group's block table; an
     # attention layer's entry is ``None``. ``None`` without MambaSpec groups.
     state_block_ids_per_layer: list[torch.Tensor | None] | None = None
+    # MambaSpec groups with ``num_speculative_blocks`` K > 0 only, else
+    # ``None``. Per layer, int32 ``[rows, 1 + K]``: the row's state window, in
+    # whose column ``t`` the model writes the state after query token ``t``;
+    # ``None`` for attention layers.
+    state_block_windows_per_layer: list[torch.Tensor | None] | None = None
+    # Same condition. int32 ``[rows]``: each row's start state is in window
+    # column ``state_accepted_counts - 1``.
+    state_accepted_counts: torch.Tensor | None = None
 
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because

@@ -400,8 +400,36 @@ class StateLedger:
         for c, state in staged:
             self.blocks[c.group][c.dst] = state
 
-    def state(self, group: int, block_id: int) -> tuple[Label | None, Label | None]:
-        s = self.blocks[group].get(block_id)
-        if s is None:
-            return None, None
-        return s.temporal, (s.conv[0] if s.conv else None)
+
+class BlockLedger:
+    """Symbolic contents of each block under the TT state layout.
+
+    Every block holds one full state, conv history and recurrent state, so a
+    row reads its start state from window column ``count - 1``, writes the
+    state after its query token ``t`` into window column ``t`` (column 0 only
+    without drafts), and a copy moves a whole block. Block ids of different
+    groups never overlap while owned, so one map covers every group.
+    """
+
+    def __init__(self):
+        self.blocks: dict[int, Label | None] = {}
+
+    def zero(self, block_ids: Sequence[int]) -> None:
+        for b in block_ids:
+            self.blocks[b] = label(())
+
+    def read(self, window: Sequence[int], count: int) -> Label | None:
+        return self.blocks.get(window[count - 1])
+
+    def write(self, window: Sequence[int], query_labels: Sequence[Label]) -> None:
+        for t, lab in enumerate(query_labels):
+            self.blocks[window[t]] = lab
+
+    def reject(self, window: Sequence[int], num_accepted: int) -> None:
+        for t in range(num_accepted, len(window)):
+            self.blocks[window[t]] = None
+
+    def copy(self, pairs: Sequence[tuple[int, int]]) -> None:
+        staged = [(dst, self.blocks.get(src)) for src, dst in pairs]
+        for dst, lab in staged:
+            self.blocks[dst] = lab

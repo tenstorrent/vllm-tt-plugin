@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -656,10 +656,25 @@ class TTModelRunner:
         """
         kv_cache_groups = kv_cache_config.kv_cache_groups
         self._validate_kv_cache_groups(kv_cache_groups)
-        self._mamba_groups = mamba_cache_groups(kv_cache_groups, self.cache_config)
+        self._mamba_groups = mamba_cache_groups(
+            kv_cache_groups, self.cache_config, self.model_config.max_model_len
+        )
         if self._mamba_groups is not None and self._is_lane_mode:
             raise NotImplementedError(
                 "lane-DP does not support MambaSpec KV cache groups yet"
+            )
+        if (
+            self._mamba_groups is not None
+            and self._mamba_groups.num_speculative_blocks
+            != self._num_speculative_tokens
+        ):
+            # The state window holds one block per query token of a verify.
+            raise ValueError(
+                "MambaSpec num_speculative_blocks="
+                f"{self._mamba_groups.num_speculative_blocks} differs from the "
+                f"launch's {self._num_speculative_tokens} speculative tokens; "
+                "the model's get_kv_cache_spec must declare the resolved draft "
+                "length"
             )
         if self._mamba_groups is not None:
             # vLLM sends ``new_block_ids_to_zero`` for every config with Mamba
@@ -702,6 +717,16 @@ class TTModelRunner:
 
         max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
+        # Block-table row width per group, as upstream's
+        # ``KVCacheSpec.max_num_blocks_per_req``: a MambaSpec group holds
+        # ``1 + K`` blocks in mode none and indexes its row by position plus K
+        # in mode align.
+        per_group_max_num_blocks = [
+            self._mamba_groups.max_num_blocks(max_model_len)
+            if self._mamba_groups is not None and i in self._mamba_groups.group_indices
+            else cdiv(max_model_len, bs)
+            for i, bs in enumerate(per_group_block_sizes)
+        ]
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         if self._is_lane_mode:
             # Lane-chunked persistent batch: rows are partitioned into
@@ -730,6 +755,7 @@ class TTModelRunner:
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
+                max_num_blocks=per_group_max_num_blocks,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
@@ -750,10 +776,7 @@ class TTModelRunner:
             # size the table from the groups. TT chunked SDPA requires a
             # page-table row of a multiple of 32 bytes, so 8 int32 columns.
             self.max_num_blocks_per_req = round_up(
-                min(
-                    max(cdiv(max_model_len, bs) for bs in per_group_block_sizes),
-                    kv_cache_config.num_blocks,
-                ),
+                min(max(per_group_max_num_blocks), kv_cache_config.num_blocks),
                 8,
             )
 
@@ -2972,12 +2995,29 @@ class TTModelRunner:
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps()
         self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
+        if self._mamba_groups is not None:
+            # After the drain: an asynchronous verify commits there, and its
+            # accepted counts and boundary copies precede this step's state
+            # moves, as upstream's postprocess precedes the next preprocess.
+            self._copy_kv_cache_blocks(
+                self._mamba_groups.begin_step(
+                    scheduler_output, self.requests, self._req_accepted_counts
+                )
+            )
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         if self._mamba_groups is not None:
+            state = self._mamba_groups.step_inputs(
+                model_input.block_tables_per_group,
+                model_input.row_req_ids or [],
+                self.requests,
+                scheduler_output.num_scheduled_tokens,
+                self._layer_to_group_idx or [],
+                self.tt_max_batch_size,
+            )
             # Group 0 can be a MambaSpec group, so ``page_table`` is the first
             # attention group's table instead.
             model_input = replace(
@@ -2985,41 +3025,37 @@ class TTModelRunner:
                 block_tables=model_input.block_tables_per_group[
                     self._mamba_groups.attention_group_index
                 ],
-                state_block_ids_per_layer=self._mamba_groups.state_block_ids_per_layer(
-                    model_input.block_tables_per_group,
-                    model_input.row_req_ids or [],
-                    self.requests,
-                    scheduler_output.num_scheduled_tokens,
-                    self._layer_to_group_idx or [],
-                    self.tt_max_batch_size,
-                ),
+                state_block_ids_per_layer=state.state_block_ids_per_layer,
+                state_block_windows_per_layer=state.state_block_windows_per_layer,
+                state_accepted_counts=state.state_accepted_counts,
             )
         return model_input
 
     def _apply_kv_cache_block_ops(self, scheduler_output: SchedulerOutput) -> None:
-        """Hand the model the block zeroing and copies due before this step.
+        """Hand the model the block zeroing and copies vLLM asks for.
 
         The upstream GPU runner zeroes ``new_block_ids_to_zero`` and applies
-        ``kv_cache_block_copies`` before the forward, and in mamba cache mode
-        align copies each request's state into its current block
-        (``preprocess_mamba``). The TT model owns the device buffers, so the
-        runner calls ``zero_kv_cache_blocks`` and ``copy_kv_cache_blocks``,
-        zeroing first. ``initialize_kv_cache`` requires these hooks of a model
-        with MambaSpec groups. For a model without MambaSpec groups and without
-        a hook, the runner skips that operation.
+        ``kv_cache_block_copies`` before the forward. The TT model owns the
+        device buffers, so the runner calls ``zero_kv_cache_blocks`` and
+        ``copy_kv_cache_blocks``, zeroing first. ``initialize_kv_cache``
+        requires these hooks of a model with MambaSpec groups. For a model
+        without MambaSpec groups and without a hook, the runner skips that
+        operation. The Mamba state copies follow in ``build_model_input``.
         """
         block_ids = scheduler_output.new_block_ids_to_zero
-        copies = [
-            (copy.src_block_id, copy.dst_block_id)
-            for copy in scheduler_output.kv_cache_block_copies or ()
-        ]
-        if self._mamba_groups is not None:
-            copies += self._mamba_groups.align_state_copies(
-                scheduler_output, self.requests
-            )
         zero_blocks = getattr(self.model, "zero_kv_cache_blocks", None)
         if block_ids and callable(zero_blocks):
             zero_blocks(kv_cache=self.kv_caches, block_ids=list(block_ids))
+        self._copy_kv_cache_blocks(
+            [
+                (copy.src_block_id, copy.dst_block_id)
+                for copy in scheduler_output.kv_cache_block_copies or ()
+            ]
+        )
+
+    def _copy_kv_cache_blocks(self, copies: list[tuple[int, int]]) -> None:
+        """Hand ``(src, dst)`` block copies to the model's
+        ``copy_kv_cache_blocks``; raise if a MambaSpec model has none."""
         if not copies:
             return
         copy_blocks = getattr(self.model, "copy_kv_cache_blocks", None)
@@ -3028,7 +3064,7 @@ class TTModelRunner:
         elif self._mamba_groups is not None:
             raise RuntimeError(
                 f"{type(self.model).__name__} declares MambaSpec KV cache groups "
-                "and vLLM requested KV cache block copies (src, dst) "
+                "and the step needs KV cache block copies (src, dst) "
                 f"{copies}, but the model does not implement copy_kv_cache_blocks"
             )
 
@@ -3781,6 +3817,8 @@ class TTModelRunner:
             counts[live],
             skip_req_ids=skip_req_ids,
         )
+        if getattr(self, "_mamba_groups", None) is not None:
+            self._copy_mamba_boundary_states(model_input, committed_by_req)
         if getattr(self, "_spec_drafts_from_model", False):
             self._propose_model_drafts(
                 committed,
@@ -3795,6 +3833,27 @@ class TTModelRunner:
                 committed_by_req, model_input.perform_device_sampling
             )
         return committed_by_req
+
+    def _copy_mamba_boundary_states(
+        self, model_input: TTModelInput, committed_by_req: Mapping[str, list[int]]
+    ) -> None:
+        """Copy each reached block-boundary state into its own column.
+
+        Upstream's ``postprocess_mamba_align_gpu``, run on the commit like the
+        accepted counts it reads: ``_apply_committed_spec_tokens_to_state``
+        has recorded them in ``_req_accepted_counts``.
+        """
+        positions = model_input.input_positions
+        first = positions if positions.dim() == 1 else positions[:, 0]
+        first = first[live_row_index(model_input)].tolist()
+        committed = {
+            req_id: (int(first[row]), self._req_accepted_counts[req_id])
+            for row, req_id in enumerate(model_input.row_req_ids)
+            if req_id in committed_by_req
+        }
+        self._copy_kv_cache_blocks(
+            self._mamba_groups.after_acceptance(committed, self.requests)
+        )
 
     def propose_after_plain_step(
         self,
@@ -4246,6 +4305,11 @@ class TTModelRunner:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
         if model_input.state_block_ids_per_layer is not None:
             kwargs["state_block_ids_per_layer"] = model_input.state_block_ids_per_layer
+        if model_input.state_block_windows_per_layer is not None:
+            kwargs["state_block_windows_per_layer"] = (
+                model_input.state_block_windows_per_layer
+            )
+            kwargs["state_accepted_counts"] = model_input.state_accepted_counts
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
