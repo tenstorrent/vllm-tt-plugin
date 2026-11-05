@@ -1386,9 +1386,11 @@ row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With
 of the pending verify, finishing rows included, and no row of the chained
 step may be able to reach a block boundary before the pending verify commits
 (blocker `mamba_boundary`): the state copies at a boundary take their source
-from the accepted count, which the host has only after the commit. A model
-that declares `supports_mamba_chained_state_moves` runs those moves itself, so
-only pending rows left out of the chained step count. Anything
+from the accepted count, which the host has only after the commit. With
+`prefix_cache_retention_interval` 0 no boundary copy runs, so only a chained
+row whose running block-table column depends on the pending count blocks. A
+model that declares `supports_mamba_chained_state_moves` runs those moves
+itself, so only pending rows left out of the chained step count. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
 
@@ -1403,7 +1405,8 @@ input; it submits the prefill behind the verify and finalizes the verify later,
 before the next decode build. A step after such a prefill does not chain onto
 the verify it overtook. A resumed request, a multimodal request or a model
 without the key still drains first, as does a pending verify with a row that
-can reach a `MambaSpec` block boundary in mode `align` (`mamba_boundary`).
+can reach a `MambaSpec` block boundary in mode `align` (`mamba_boundary`; not
+at retention 0, where no boundary copy runs).
 
 ## 4l. Device logprobs and the device top-p certificate
 

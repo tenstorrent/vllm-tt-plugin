@@ -78,8 +78,10 @@ and prefill and decode also receive two more keywords.
   its `accepted_counts` does: the start column follows the accepted count of
   the pending verify, which only the device knows. Unless the model declares
   `supports_mamba_chained_state_moves` (below), the runner chains a row in
-  mode `align` only while neither step can reach a block boundary, so no
-  state copy falls between the two verifies.
+  mode `align` only while no state move falls between the two verifies:
+  neither step may reach a block boundary, or, at retention 0, where no
+  boundary copy runs, the chained step's running column must not depend on
+  the pending count.
 
 The model writes the state after the row's query token `t` into window
 column `t`: a verify writes columns 0 to K, a prefill or an ordinary decode
@@ -89,9 +91,12 @@ the accepted column: before the forward, column `prev + count - 1`, as
 upstream `preprocess_mamba`; and after a verify's acceptance,
 `commit_spec_acceptance` copies the state at a block boundary that the
 committed tokens reached into that boundary's own column, as upstream
-`postprocess_mamba_align_gpu` does. Upstream keeps the conv history of all
-`1 + K` positions in window column 0 instead; TT does not support that
-layout.
+`postprocess_mamba_align_gpu` does. That copy runs only when
+`cache_config.prefix_cache_retention_interval` is not 0: at 0 (vLLM's default)
+vLLM caches a Mamba block only at a prompt's replay boundary or a
+shared-prefix junction, never at a boundary that decoding reaches, so nothing
+reads the copy. Upstream keeps the conv history of all `1 + K` positions in
+window column 0 instead; TT does not support that layout.
 
 **Chained state moves on the device.** A model that declares
 `supports_mamba_chained_state_moves` runs the mode-`align` state moves of a
@@ -106,7 +111,7 @@ tokens for that row, `1 <= c <= 1 + K`:
   `(src, dst)` block pair. Before this step reads or writes any state, the
   model copies the full state (conv history and recurrent state) of block
   `src` into block `dst`. `src == dst` means no copy; padding rows and rows
-  without a copy hold `(0, 0)`. This is the pending verify's boundary copy
+  without a copy hold `(0, 0)`, and at retention 0 every entry does. This is the pending verify's boundary copy
   (upstream `postprocess_mamba`); the runner does not run it again when that
   verify commits.
 - `state_chain_start_blocks_per_layer`: int32 `[tt_max_batch_size, 1 + K]`,

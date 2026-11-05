@@ -149,6 +149,7 @@ def _mamba_run(
     steps=40,
     cycle=(3, 0, 1, 2),
     on_device=False,
+    retains=True,
     **kw,
 ):
     model = _chain_model(accept_cycle=cycle, **kw)
@@ -171,6 +172,7 @@ def _mamba_run(
         attention_group_index=ATTENTION_GROUP,
         num_speculative_blocks=K,
         chained_moves_on_device=on_device,
+        retains_decode_boundaries=retains,
     )
     runner._layer_to_group_idx = [ATTENTION_GROUP, GDN_GROUP]
     runner.tt_max_batch_size = MAX_NUM_REQS
@@ -295,6 +297,24 @@ def test_chained_align_steps_read_the_committed_state(monkeypatch, cycle):
     assert f"mamba_boundary={controller._chain_breaks['mamba_boundary']}" in report
 
 
+@pytest.mark.parametrize("cycle", [(3, 0, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0)])
+def test_retention_0_breaks_the_chain_only_for_a_move_into_a_new_column(
+    monkeypatch, cycle
+):
+    """At retention 0 no boundary copy runs, so only a chained step whose
+    running column depends on the pending count breaks the chain: fewer breaks
+    than with dense retention, every read still exact, the same streams."""
+    run = _mamba_run(monkeypatch, "align", cycle=cycle, retains=False)
+    dense = _mamba_run(monkeypatch, "align", cycle=cycle)
+    assert run.ledger.chained_reads > dense.ledger.chained_reads
+    breaks = run.controller._chain_breaks["mamba_boundary"]
+    assert 0 < breaks < dense.controller._chain_breaks["mamba_boundary"]
+    for req_id, tokens in run.engine.outputs.items():
+        shorter = min(len(tokens), len(dense.engine.outputs[req_id]))
+        assert shorter > 20
+        assert tokens[:shorter] == dense.engine.outputs[req_id][:shorter]
+
+
 def test_chained_align_steps_match_the_unchained_run(monkeypatch):
     chained = _mamba_run(monkeypatch, "align")
     plain = _mamba_run(monkeypatch, "align", chain=False)
@@ -378,12 +398,23 @@ def _pending_rows_reach_a_boundary(run, controller) -> bool:
     return False
 
 
-def test_a_prefill_waits_for_a_pending_verify_that_reaches_a_boundary(monkeypatch):
+@pytest.mark.parametrize("retains", [True, False])
+def test_a_prefill_waits_for_a_pending_verify_that_reaches_a_boundary(
+    monkeypatch, retains
+):
     """A prefill submitted behind a pending verify runs before that verify
     commits; with a row of it able to reach a block boundary, the boundary copy
     would follow the scheduler's free of the verify's blocks. Such a prefill
-    drains the verify instead."""
-    run = _mamba_run(monkeypatch, "align", steps=0, model_capabilities=PREFILL_CAPS)
+    drains the verify instead. At retention 0 there is no boundary copy, and
+    the next decode drains the verify before it moves any state, so the
+    prefill never waits."""
+    run = _mamba_run(
+        monkeypatch,
+        "align",
+        steps=0,
+        model_capabilities=PREFILL_CAPS,
+        retains=retains,
+    )
     engine, controller = run.engine, run.controller
     from .test_spec_async import _scheduler_output
 
@@ -397,10 +428,14 @@ def test_a_prefill_waits_for_a_pending_verify_that_reaches_a_boundary(monkeypatc
             prefill.scheduled_cached_reqs, num_output_tokens=[]
         )
         expected = not _pending_rows_reach_a_boundary(run, controller)
-        assert controller.prefill_overlap_allowed(prefill) is expected
+        allowed = controller.prefill_overlap_allowed(prefill)
+        assert allowed is (expected or not retains)
         seen.add(expected)
     engine.finish()
-    assert seen == {True, False}
+    # The accept cycle reaches both cases with dense retention; with
+    # retention 0 the overlap is allowed whatever it reaches
+    # (``test_chain_blocker_ignores_pending_rows_at_retention_0``).
+    assert seen == {True, False} if retains else seen
 
 
 # --- MambaCacheGroups.chain_blocker -------------------------------------------
