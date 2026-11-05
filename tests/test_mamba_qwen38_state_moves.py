@@ -56,6 +56,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    get_group_id,
     get_request_block_hasher,
     init_none_hash,
     resolve_kv_cache_block_sizes,
@@ -85,7 +86,7 @@ from vllm_tt_plugin.mamba_state import MambaCacheGroups, mamba_cache_groups
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import TTScheduler
+from vllm_tt_plugin.scheduler import TTScheduler, get_tt_mamba_checkpoints
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     MODEL_OWNED_DRAFT_SENTINEL,
@@ -122,7 +123,10 @@ def _qwen38_specs(
     num_spec: int = K,
     block_size: int = BLOCK_SIZE,
     gdn_block_size: int | None = None,
+    checkpoint: bool = False,
 ) -> dict:
+    """``checkpoint``: GDN groups with one prefill checkpoint block, as a model
+    whose prefill writes the state at vLLM's checkpoint declares it."""
     attention = FullAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
@@ -140,6 +144,8 @@ def _qwen38_specs(
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         mamba_cache_mode=mode,
         num_speculative_blocks=num_spec,
+        num_prefill_checkpoint_blocks=int(checkpoint),
+        prefill_checkpoint_alignment=128 if checkpoint else None,
     )
     return {
         (
@@ -358,6 +364,8 @@ class _Step:
     groups_post: list[tuple[int, int]] | None = None
     groups_windows: dict[str, dict[int, list[int]]] = field(default_factory=dict)
     groups_counts: dict[str, int] = field(default_factory=dict)
+    # Request id -> the positions of the states its prefill chunk left inside.
+    checkpoints: dict[str, list[int]] = field(default_factory=dict)
 
 
 class _Harness:
@@ -387,13 +395,23 @@ class _Harness:
         plugin: bool = False,
         plugin_groups: bool = True,
         prefix_match_unit: int | None = None,
+        checkpoint: bool = False,
     ):
         self.mode = mode
         self.num_spec = num_spec
         self.cfg = _planner_config(mode, retention)
         self.kv_cache_config = _kv_cache_config(
-            self.cfg, _qwen38_specs(mode, num_spec), NUM_BLOCKS
+            self.cfg, _qwen38_specs(mode, num_spec, checkpoint=checkpoint), NUM_BLOCKS
         )
+        # A model that declares checkpoint blocks writes the checkpoint state;
+        # False stands for one that ignores the plugin's checkpoint inputs.
+        self.writes_checkpoints = True
+        # Mode align holds the running block and K draft blocks, plus a block
+        # passed until the next step frees it. With a checkpoint the step also
+        # holds the checkpoint block, and vLLM keeps the previous chunk's K
+        # draft blocks in place (``allocate_new_blocks`` relocates them only
+        # without a checkpoint) until the next step frees them.
+        self.max_live_state_blocks = 2 + num_spec + (1 + num_spec) * checkpoint
         self.scheduler = _scheduler(
             self.kv_cache_config,
             mode,
@@ -555,6 +573,34 @@ class _Harness:
             for pair in kwargs["copies"]
         ]
 
+    def _write_checkpoint(self, out, req_id: str, tokens: list[int], record) -> None:
+        """The states a prefill chunk leaves inside itself: upstream's kernel
+        writes the state at each block boundary it passes into that column's
+        block; the TT model writes where ``MambaCacheGroups.checkpoint_inputs``
+        says. Only columns vLLM holds a block for matter."""
+        entries = get_tt_mamba_checkpoints(out).get(req_id, ())
+        for position, column in entries:
+            for g in self.groups:
+                block = self.req_states[req_id].block_ids[g][column]
+                self.ledger.write(g, [block], [label(tokens[:position])], False)
+        if not entries or self.plugin_groups is None or not self.writes_checkpoints:
+            return
+        num_groups = len(self.kv_cache_config.kv_cache_groups)
+        ids, positions = self.plugin_groups.checkpoint_inputs(
+            get_tt_mamba_checkpoints(out),
+            [req_id],
+            self.req_states,
+            list(range(num_groups)),
+            1,
+        )
+        for entry, position in enumerate(positions[0].tolist()):
+            if position:
+                for g in self.groups:
+                    self.plugin_ledger.write(
+                        [int(ids[g][0, entry])], [label(tokens[:position])]
+                    )
+        record.checkpoints[req_id] = [p for p, _ in entries]
+
     def step(self, accept: Callable[[str, int, list[int]], int]) -> bool:
         scheduler = self.scheduler
         out = scheduler.schedule()
@@ -700,6 +746,7 @@ class _Harness:
                         )
                         assert got == expect, ("tt", req_id, g, nc, plugin_window)
                     self.plugin_ledger.write(plugin_window, labels)
+            self._write_checkpoint(out, req_id, tokens, record)
             record.rows.append(_Row(req_id, nc, ns, drafts, windows))
 
             emits_token = nc + ns - len(drafts) >= request.num_tokens
@@ -789,7 +836,7 @@ class _Harness:
                     if self.mode == "none":
                         assert live == 1 + self.num_spec, (req_id, g, live)
                     else:
-                        assert live <= 2 + self.num_spec, (req_id, g, live)
+                        assert live <= self.max_live_state_blocks, (req_id, g, live)
         self.steps.append(record)
         return True
 
@@ -1537,6 +1584,89 @@ def test_follow_ups_of_one_text_hit_the_first_follow_ups_junction(same_text):
                     for g in h.groups
                 }
                 assert writers == {"prefill"}, (req_id, hit, writers)
+
+
+def _checkpoint_scenario(retention, checkpoint: bool, writes_checkpoints=True):
+    """Prompts below, at and past block boundaries, each served alone, then
+    follow-ups that repeat each prompt and add text, so they hit its cached
+    GDN state. 3100 tokens follow a 1024-token request at once, so their
+    first chunk is the rest of a step's budget and their second chunk runs
+    past a block boundary on a running request."""
+    h = _Harness(
+        "align",
+        num_spec=K,
+        retention=retention,
+        max_num_batched_tokens=4096,
+        checkpoint=checkpoint,
+    )
+    h.writes_checkpoints = writes_checkpoints
+    prompts = {f"a{n}": _prompt(n, n) for n in (900, 1500, 2048, 2049, 3000)}
+    for req_id, prompt in prompts.items():
+        h.add(req_id, prompt, max_tokens=4)
+        h.run(accept=_accept_pattern)
+    prompts["c1024"], prompts["a3100"] = _prompt(7, 3072), _prompt(3100, 3100)
+    h.add("c1024", prompts["c1024"], max_tokens=4)
+    h.add("a3100", prompts["a3100"], max_tokens=4)
+    h.run(accept=_accept_pattern)
+    for req_id, prompt in list(prompts.items()):
+        prompts["b" + req_id] = prompt + _prompt(len(prompt) + 1, 300)
+        h.add("b" + req_id, prompts["b" + req_id], max_tokens=4)
+        h.run(accept=_accept_pattern)
+    chunks: dict[str, int] = {}
+    for step in h.steps:
+        for row in step.rows:
+            if row.num_computed < len(prompts[row.req_id]):
+                chunks[row.req_id] = chunks.get(row.req_id, 0) + 1
+    hits = {r: n for step in h.steps for r, n in step.new_hits.items()}
+    pool = h.scheduler.kv_cache_manager.block_pool
+    cached = {
+        (get_group_id(block.block_hash), block.block_hash_num_tokens)
+        for block in pool.blocks
+        if block.block_hash is not None and get_group_id(block.block_hash) in h.groups
+    }
+    return h, chunks, hits, cached
+
+
+@pytest.mark.parametrize("retention", [0, None])
+def test_prefill_checkpoints_keep_the_split_prefix_cache(retention):
+    """``MambaSpec.num_prefill_checkpoint_blocks``: vLLM no longer ends a
+    prefill chunk at the prompt's last cacheable boundary; it reserves a block
+    for the state there, and the TT model writes it from
+    ``MambaCacheGroups.checkpoint_inputs``.
+
+    Against the same requests without checkpoint blocks: fewer prefill
+    chunks, a hit at least as long for every follow-up, every cached GDN
+    state of the split version cached too (group and tokens), and every read
+    exact (the harness ledgers), with upstream's kernel and the TT model each
+    writing the states. At retention 0 vLLM keeps the prompt's own
+    checkpoint (``is_prompt_checkpoint`` in
+    ``MambaManager._cache_partial_tail_block``), so follow-ups hit it."""
+    _, split_chunks, split_hits, split_cached = _checkpoint_scenario(retention, False)
+    h, chunks, hits, cached = _checkpoint_scenario(retention, True)
+    assert any(step.checkpoints for step in h.steps)
+    # A first prompt that fits one chunk takes one. A follow-up whose GDN hit
+    # is shorter than its attention hit still stops a chunk at the junction
+    # (vLLM's ``junction_stop``), as without checkpoint blocks.
+    firsts = [r for r in chunks if not r.startswith("b") and r != "a3100"]
+    assert all(chunks[r] == 1 for r in firsts), chunks
+    assert all(chunks[r] <= split_chunks[r] for r in chunks), (chunks, split_chunks)
+    assert sum(chunks.values()) < sum(split_chunks.values())
+    # At least the split version's hits and cached states. A prompt of whole
+    # blocks runs as one chunk either way, and only the checkpoint leaves the
+    # state at its replay boundary (2048 tokens: 1024; 3072 tokens: 2048);
+    # with a checkpoint on a running request vLLM also keeps the previous
+    # chunk's draft blocks, which dense retention caches.
+    assert all(hits[r] >= split_hits[r] for r in hits), (hits, split_hits)
+    assert {r for r in hits if hits[r] > split_hits[r]} <= {"ba2048", "bc1024"}
+    assert split_cached <= cached
+
+
+def test_a_model_that_ignores_the_checkpoint_inputs_serves_stale_hits():
+    """Negative control: a follow-up that hits a checkpoint block reads the
+    state its prefill was to write; without the write the ledger finds the
+    block empty."""
+    with pytest.raises(AssertionError, match="tt"):
+        _checkpoint_scenario(0, True, writes_checkpoints=False)
 
 
 # The Galaxy deployment's prefill knobs (tt-inference-server

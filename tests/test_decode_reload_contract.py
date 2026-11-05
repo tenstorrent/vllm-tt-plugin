@@ -96,6 +96,7 @@ def _submission_input(
         state_block_windows_per_layer=None,
         state_accepted_counts=None,
         state_chain_copies_per_layer=None,
+        state_checkpoint_positions=None,
         unpadded_batch_size=1,
         tt_sampling_params=_sampling_params(),
         perform_device_sampling=device_sampling,

@@ -135,7 +135,7 @@ out (a request finishing at `max_tokens`) still breaks the chain near a
 boundary, since its boundary copy waits for the host commit.
 
 A row whose `start_pos` is 0 has no earlier state. The model must start that
-row from zero state and must not read its block: vLLM 0.30.0 does not zero
+row from zero state and must not read its block: vLLM does not zero
 recurrent-state blocks, so the block can hold stale bytes.
 
 Padding rows have block 0, the null block. vLLM never allocates block 0 to a
@@ -143,6 +143,31 @@ request, so the model can read or write block 0 without changing live state,
 and ignores the result. On the layer-slot overlay, padding rows write their
 state into block 0, so block 0 can hold any bytes, including fp32 state that
 reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+
+**States inside a prefill chunk.** With `MambaSpec.num_prefill_checkpoint_blocks`
+1, every prefill also receives two keywords. Row `i` and entry `j`:
+
+- `state_checkpoint_positions`: CPU int32 `[tt_max_batch_size, W]`; a token
+  count `n`, or 0 for an unused entry.
+- `state_checkpoint_ids_per_layer`: one entry per layer, as above; a
+  `MambaSpec` layer's entry is a CPU int32 tensor `[tt_max_batch_size, W]`,
+  the block of the layer's group; 0 for an unused entry.
+
+The prefill writes the full state (conv history and recurrent state) after
+exactly `n` tokens of row `i` into that block, in every `MambaSpec` layer,
+in addition to the state at its chunk end. `start_pos[i] < n < prompt_lens[i]`,
+so the model writes these states while it runs the chunk, as upstream's
+kernel does at every block boundary inside a chunk. vLLM can cache each block
+as the state after `n` tokens. `W` is at least 1 and differs between steps.
+
+`TTScheduler._attach_mamba_checkpoints` takes the entries from vLLM's own
+allocation: every block-table column inside the chunk where vLLM keeps a
+block. That is the prefill checkpoint vLLM reserved
+(`MambaManager._needs_internal_checkpoint`), at its checkpoint position, and,
+on a later chunk of a prompt with a checkpoint, the previous chunk's draft
+blocks that `allocate_new_blocks` leaves in place, at their block boundary.
+A shared-prefix junction inside the chunk still ends a chunk, as without
+checkpoint blocks.
 
 vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers
 (`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`).
@@ -189,6 +214,7 @@ tables are reloaded.
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `state_block_ids_per_layer` | Supplied for `MambaSpec` groups. See [recurrent state blocks](#recurrent-state-blocks). |
 | `state_block_windows_per_layer`, `state_accepted_counts` | Supplied for `MambaSpec` groups with `num_speculative_blocks` > 0. See [recurrent state blocks](#recurrent-state-blocks). |
+| `state_checkpoint_ids_per_layer`, `state_checkpoint_positions` | Supplied for `MambaSpec` groups with `num_prefill_checkpoint_blocks` 1. See [recurrent state blocks](#recurrent-state-blocks). |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 

@@ -346,7 +346,8 @@ def test_attention_only_page_table_width_is_unchanged():
     [
         # The launch speculates with 0 tokens here.
         (dict(num_speculative_blocks=1), "differs from the launch's 0"),
-        (dict(num_prefill_checkpoint_blocks=1), "prefill-checkpoint"),
+        # Mode none: vLLM places prefill checkpoints in mode align only.
+        (dict(num_prefill_checkpoint_blocks=1), "prefill checkpoints need mode"),
     ],
 )
 def test_unsupported_mamba_configs_fail_at_kv_cache_init(mamba_kwargs, match):
@@ -727,6 +728,72 @@ def test_attention_only_model_without_hooks_ignores_block_zeroing():
 
     assert model.calls == []
     assert model_input.state_block_ids_per_layer is None
+
+
+def test_a_prefill_hands_the_model_the_states_it_must_leave_inside_its_chunk():
+    """``MambaSpec`` prefill checkpoint blocks: the scheduler passes vLLM's
+    ``(position, column)`` list per request (``_attach_mamba_checkpoints``);
+    the prefill gets, per GDN layer, the block at each column of its group,
+    and the positions. A row without an entry holds block 0 and position 0,
+    and a step that is not a prefill carries neither keyword."""
+    cfg = _vllm_config("align")
+    model = _RecordingModel()
+    specs = _layer_specs(
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=128,
+    )
+    runner = _live_runner(cfg, specs, model)
+    assert runner._mamba_groups.prefill_checkpoints
+    step = _step(
+        {"a": 2500, "b": 700},
+        new=[
+            _new_request("a", 2500, ([0, 10, 11], [0, 20, 21], [0, 30, 31], [40])),
+            _new_request("b", 700, ([50], [60], [70], [80])),
+        ],
+    )
+    step._tt_mamba_checkpoints = {"a": ((2048, 1),)}
+    prefill = runner.build_model_input(step, None)
+
+    assert prefill.state_checkpoint_positions[:3].tolist() == [[2048], [0], [0]]
+    for layer in range(NUM_LAYERS):
+        ids = prefill.state_checkpoint_ids_per_layer[layer]
+        if _is_attention(layer):
+            assert ids is None
+            continue
+        assert ids.shape == (MAX_BATCH, 1)
+        assert ids[:2, 0].tolist() == [(10, 20, 30)[layer % 4], 0]
+    runner.submit_prefill(prefill, [2, 0])
+    name, kwargs = model.calls[-1]
+    assert name == "prefill_forward"
+    assert kwargs["state_checkpoint_positions"] is prefill.state_checkpoint_positions
+    assert (
+        kwargs["state_checkpoint_ids_per_layer"]
+        is prefill.state_checkpoint_ids_per_layer
+    )
+
+    decode = runner.build_model_input(
+        _step({"a": 1, "b": 1}, cached=[("a", 2500, None), ("b", 700, None)]), None
+    )
+    assert decode.state_checkpoint_positions is None
+
+
+@pytest.mark.parametrize(
+    ("mamba_kwargs", "match"),
+    [
+        (dict(num_prefill_checkpoint_blocks=1), "an alignment"),
+        (
+            dict(num_prefill_checkpoint_blocks=2, prefill_checkpoint_alignment=128),
+            "exactly 1 block",
+        ),
+    ],
+)
+def test_prefill_checkpoints_need_one_block_and_an_alignment(mamba_kwargs, match):
+    cfg = _vllm_config("align")
+    specs = _layer_specs(mamba_cache_mode="align", **mamba_kwargs)
+    kv_cache_config = _kv_cache_config(cfg, specs, 256)
+    with pytest.raises(ValueError, match=match):
+        TTModelRunner.initialize_kv_cache(_runner(cfg), kv_cache_config)
 
 
 def test_mode_align_moves_state_into_the_block_of_each_new_column():

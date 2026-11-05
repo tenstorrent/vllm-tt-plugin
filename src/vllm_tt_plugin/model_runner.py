@@ -85,6 +85,7 @@ from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import (
     get_tt_finishing_req_ids,
     get_tt_forced_reset_discard_counts,
+    get_tt_mamba_checkpoints,
     get_tt_reasoning_start,
 )
 from vllm_tt_plugin.spec_accept import (
@@ -4238,6 +4239,21 @@ class TTModelRunner:
             self._layer_to_group_idx or [],
             self.tt_max_batch_size,
         )
+        checkpoint_ids = checkpoint_positions = None
+        checkpoints = get_tt_mamba_checkpoints(scheduler_output)
+        if model_input.prompt_lens is not None and groups.prefill_checkpoints:
+            checkpoint_ids, checkpoint_positions = groups.checkpoint_inputs(
+                checkpoints,
+                row_req_ids,
+                self.requests,
+                self._layer_to_group_idx or [],
+                self.tt_max_batch_size,
+            )
+        elif checkpoints:
+            raise RuntimeError(
+                f"vLLM reserved Mamba prefill checkpoints {checkpoints} for a "
+                "step that is not a prefill"
+            )
         # Group 0 can be a MambaSpec group, so ``page_table`` is the first
         # attention group's table instead.
         model_input = replace(
@@ -4248,6 +4264,8 @@ class TTModelRunner:
             state_block_ids_per_layer=state.state_block_ids_per_layer,
             state_block_windows_per_layer=state.state_block_windows_per_layer,
             state_accepted_counts=state.state_accepted_counts,
+            state_checkpoint_ids_per_layer=checkpoint_ids,
+            state_checkpoint_positions=checkpoint_positions,
         )
         return model_input
 
@@ -5971,6 +5989,13 @@ class TTModelRunner:
                 model_input.state_block_windows_per_layer
             )
             kwargs["state_accepted_counts"] = model_input.state_accepted_counts
+        if model_input.state_checkpoint_positions is not None:
+            kwargs["state_checkpoint_ids_per_layer"] = (
+                model_input.state_checkpoint_ids_per_layer
+            )
+            kwargs["state_checkpoint_positions"] = (
+                model_input.state_checkpoint_positions
+            )
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
