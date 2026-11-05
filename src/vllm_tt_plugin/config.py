@@ -379,7 +379,7 @@ def resolve_tt_supports_stage_outputs(
 
     The scheduler checks the remaining condition once it knows the KV pool: a
     stage model's request cannot be preempted and resumed, so the pool must hold
-    every sequence at full length.
+    every sequence at its peak.
 
     Raises:
         ValueError: the declaration is not a boolean, or it is declared with lane

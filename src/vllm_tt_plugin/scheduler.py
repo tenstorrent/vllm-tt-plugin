@@ -300,6 +300,9 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
     )
 
     groups = kv_cache_config.kv_cache_groups
+    if not groups:
+        # An attention-free model allocates no blocks, so nothing preempts.
+        return
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
     max_model_len = vllm_config.model_config.max_model_len
     per_request = -(
@@ -315,7 +318,8 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
             f"so its KV pool must hold max_num_seqs={max_num_seqs} requests at "
             f"max_model_len={max_model_len}: {needed} blocks across "
             f"{len(groups)} KV cache group(s), but only "
-            f"{usable} are usable. Lower max_num_seqs or max_model_len."
+            f"{usable} are usable. Lower max_num_seqs or max_model_len, or raise "
+            "the model's get_max_tokens_all_users budget."
         )
 
 

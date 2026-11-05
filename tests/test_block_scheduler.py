@@ -1094,6 +1094,17 @@ def test_a_stage_output_model_counts_sliding_groups_by_their_window(max_num_seqs
         _require_kv_for_every_sequence(config, pool(enough - 1))
 
 
+def test_a_stage_output_model_without_kv_groups_passes_the_pool_check():
+    """An attention-free model gets only the null block and never preempts."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+    )
+    _require_kv_for_every_sequence(
+        config, KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+
+
 def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
     scheduler, request, submitted = _scheduled(output_width=1, async_scheduling=True)
     scheduler.running.remove(request)
