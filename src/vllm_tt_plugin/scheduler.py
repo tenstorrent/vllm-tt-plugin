@@ -4,9 +4,10 @@
 import itertools
 import sys
 from enum import Enum
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -68,6 +69,19 @@ def set_tt_finishing_req_ids(
 
 def get_tt_finishing_req_ids(scheduler_output: SchedulerOutput) -> tuple[str, ...]:
     return tuple(getattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, ()))
+
+
+# Request id -> ``((position, column), ...)``: the Mamba states a prefill
+# chunk must leave inside itself. The model writes the state after
+# ``position`` tokens into the block at block-table ``column`` of every Mamba
+# group (``TTScheduler._attach_mamba_checkpoints``).
+_TT_MAMBA_CHECKPOINTS_ATTR = "_tt_mamba_checkpoints"
+
+
+def get_tt_mamba_checkpoints(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    return dict(getattr(scheduler_output, _TT_MAMBA_CHECKPOINTS_ATTR, {}))
 
 
 def request_will_reach_max_tokens(request: Request) -> bool:
@@ -435,6 +449,7 @@ class TTScheduler(AsyncScheduler):
 
     # Class default: a scheduler built without __init__ (tests) is unlimited.
     _max_partial_prefills = 0
+    _mamba_checkpoint_manager: Any = None
 
     waiting: RequestQueue
     running: list[Request]
@@ -442,6 +457,7 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._mamba_checkpoint_manager = self._mamba_checkpoint_registry()
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -1189,7 +1205,86 @@ class TTScheduler(AsyncScheduler):
             if getattr(request, "num_output_placeholders", 0) > 0
             and request_will_reach_max_tokens(request)
         ]
-        return self._schedule_mode()
+        scheduler_output = self._schedule_mode()
+        self._attach_mamba_checkpoints(scheduler_output)
+        return scheduler_output
+
+    def _mamba_checkpoint_registry(self) -> Any:
+        """The ``MambaManager`` of a Mamba group with prefill checkpoint
+        blocks, or ``None`` when no group has any.
+
+        Every Mamba group has the same block size and allocates alike, so one
+        group's row and ``_checkpoints`` entry stand for all.
+        """
+        manager = next(
+            (
+                m
+                for m in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(m.kv_cache_spec, MambaSpec)
+                and m.kv_cache_spec.num_prefill_checkpoint_blocks
+            ),
+            None,
+        )
+        if manager is None:
+            return None
+        if not isinstance(getattr(manager, "_checkpoints", None), dict):
+            raise RuntimeError(
+                f"{type(manager).__name__} has MambaSpec prefill checkpoint "
+                "blocks but no _checkpoints map; the TT scheduler hands the "
+                "model vLLM's checkpoint positions from it. Update "
+                "TTScheduler._mamba_checkpoint_registry for this vLLM version"
+            )
+        from vllm_tt_plugin.platform import install_mamba_prompt_checkpoint_patch
+
+        install_mamba_prompt_checkpoint_patch()
+        return manager
+
+    def _attach_mamba_checkpoints(self, scheduler_output: SchedulerOutput) -> None:
+        """Hand the runner the Mamba states this step's prefill chunks must
+        leave inside themselves.
+
+        A block-table column that a chunk passes is the null block, except
+        where vLLM keeps a block: the prefill checkpoint it reserved
+        (``MambaManager._needs_internal_checkpoint``), and, on a later chunk
+        with a checkpoint, the previous chunk's draft blocks, which
+        ``allocate_new_blocks`` then leaves in place. vLLM can cache each such
+        block, as the state at the checkpoint position for the checkpoint
+        column and as the state after the column's block boundary otherwise,
+        so the chunk must write them, as upstream's kernel does. The
+        allocation records a request's checkpoint for a step that reserves
+        one and drops it at the next step that reserves none, so an entry is
+        this step's only if it lies inside the step's tokens.
+        """
+        manager = self._mamba_checkpoint_manager
+        if manager is None:
+            return
+        block_size = manager.block_size
+        writes = {}
+        for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            end = request.num_computed_tokens
+            start = end - num_scheduled
+            first, running = start // block_size, cdiv(end, block_size) - 1
+            if start >= request.num_prompt_tokens or running <= first:
+                continue
+            blocks = manager.req_to_blocks.get(req_id, [])
+            checkpoint = manager._checkpoints.get(req_id)
+            entries = []
+            for column in range(first, min(running, len(blocks))):
+                if blocks[column].is_null:
+                    continue
+                position = (column + 1) * block_size
+                if (
+                    checkpoint is not None
+                    and checkpoint[1] == column
+                    and start < checkpoint[0] < end
+                ):
+                    position = checkpoint[0]
+                entries.append((position, column))
+            if entries:
+                writes[req_id] = tuple(entries)
+        if writes:
+            setattr(scheduler_output, _TT_MAMBA_CHECKPOINTS_ATTR, writes)
 
     def _schedule_mode(self) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base

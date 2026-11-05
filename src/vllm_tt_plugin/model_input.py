@@ -199,6 +199,12 @@ class TTModelInput:
     state_chain_copies_per_layer: list[torch.Tensor | None] | None = None
     state_chain_windows_per_layer: list[torch.Tensor | None] | None = None
     state_chain_start_blocks_per_layer: list[torch.Tensor | None] | None = None
+    # Prefill with ``MambaSpec`` prefill checkpoint blocks
+    # (``MambaCacheGroups.checkpoint_inputs``), else ``None``: per layer the
+    # block that takes the state after ``state_checkpoint_positions[i]``
+    # tokens, int32 ``[rows, 1]``; 0 where a row has no checkpoint.
+    state_checkpoint_ids_per_layer: list[torch.Tensor | None] | None = None
+    state_checkpoint_positions: torch.Tensor | None = None
 
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because

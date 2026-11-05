@@ -847,6 +847,44 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+def install_mamba_prompt_checkpoint_patch() -> None:
+    """Keep a prompt's own Mamba prefill checkpoint cached at retention 0.
+
+    ``MambaManager._cache_partial_tail_block`` evicts a checkpoint at
+    ``prefix_cache_retention_interval=0`` when it is called with fewer tokens
+    than the prompt, as a transient one. The hybrid coordinator rounds the
+    tokens down to the scheduler block size, so the prompt's final chunk
+    looks transient too, and vLLM 0.30.0 drops the prompt's reusable boundary
+    state. vLLM 0.31.0 exempts the prompt's own checkpoint
+    (``is_prompt_checkpoint``); this does the same by passing no retention
+    interval for it, which skips only that eviction. Idempotent.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.kv_cache_interface import get_mamba_prefill_checkpoint_position
+
+    if "_tt_original_cache_partial_tail_block" in MambaManager.__dict__:
+        return
+    original = MambaManager._cache_partial_tail_block
+
+    def _cache_partial_tail_block(self, request, num_tokens, retention_interval):
+        checkpoint = self._checkpoints.get(request.request_id)
+        if (
+            retention_interval == 0
+            and checkpoint is not None
+            and checkpoint[0]
+            == get_mamba_prefill_checkpoint_position(
+                request.num_prompt_tokens,
+                self.block_pool.hash_block_size,
+                self.drop_eagle_checkpoint_block,
+            )
+        ):
+            retention_interval = None
+        return original(self, request, num_tokens, retention_interval)
+
+    MambaManager._tt_original_cache_partial_tail_block = original
+    MambaManager._cache_partial_tail_block = _cache_partial_tail_block
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 

@@ -104,6 +104,16 @@ def reset_tt_platform_class_state():
             "_tt_original_chat_completion_full_generator",
         ),
     )
+    # install_mamba_prompt_checkpoint_patch does the same to MambaManager.
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    tool_call_targets += (
+        (
+            MambaManager,
+            "_cache_partial_tail_block",
+            "_tt_original_cache_partial_tail_block",
+        ),
+    )
     saved_tool_call_targets = [
         (owner, attr, owner.__dict__[attr], marker, marker in owner.__dict__)
         for owner, attr, marker in tool_call_targets

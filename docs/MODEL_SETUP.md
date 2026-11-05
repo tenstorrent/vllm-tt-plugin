@@ -204,9 +204,23 @@ Declaration rules:
   `cache_config.prefix_match_unit` must be a multiple of
   `additional_config['tt']['prefill_chunk_alignment']`, because with partial
   hash hits vLLM also ends chunks on its multiples.
-- `TTModelRunner` supports modes `none` and `align`. It requires
-  `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` and
-  one `num_speculative_blocks` for all `MambaSpec` groups.
+- `TTModelRunner` supports modes `none` and `align`, and one `block_size`,
+  one `num_speculative_blocks` and one `num_prefill_checkpoint_blocks` for all
+  `MambaSpec` groups.
+- `MambaSpec.num_prefill_checkpoint_blocks` is 0, or 1 in mode `align` with a
+  `MambaSpec.prefill_checkpoint_alignment`. With 1, vLLM no longer ends a
+  prefill chunk at the prompt's last cacheable block boundary: a prompt that
+  fits one chunk is one prefill step instead of two, and vLLM reserves a
+  block inside the chunk for the state at its checkpoint position
+  (`get_mamba_prefill_checkpoint_position`). The prefill must then write
+  the states named by `state_checkpoint_ids_per_layer`; see
+  [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks). vLLM
+  places a checkpoint only where its offset from the chunk start is a
+  multiple of `prefill_checkpoint_alignment`, so declare the granularity at
+  which the prefill can stop to write a state. With checkpoint blocks the TT
+  scheduler installs `install_mamba_prompt_checkpoint_patch`, vLLM 0.31.0's
+  fix: without it, vLLM 0.30.0 drops the prompt's checkpoint from the prefix
+  cache at `prefix_cache_retention_interval=0`.
 - `MambaSpec.num_speculative_blocks` must equal the launch's draft length K
   (0 without speculative decoding), as upstream sets it from
   `num_speculative_tokens`. A request then holds `1 + K` state blocks per

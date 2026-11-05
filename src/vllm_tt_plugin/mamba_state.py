@@ -131,6 +131,11 @@ class MambaCacheGroups:
     blocks_owned_since_zero: set[int] = field(default_factory=set)
     # Group index -> block size, for every group that is not a Mamba group.
     attention_block_sizes: dict[int, int] = field(default_factory=dict)
+    # ``MambaSpec.num_prefill_checkpoint_blocks`` is 1: vLLM schedules a prompt
+    # that fits one chunk as one chunk, and reserves a block inside the chunk
+    # for the state at the prompt's last cacheable position
+    # (``checkpoint_inputs``), instead of ending a chunk there.
+    prefill_checkpoints: bool = False
 
     def max_num_blocks(self, max_model_len: int) -> int:
         """Block-table row width of a Mamba group, as
@@ -227,6 +232,53 @@ class MambaCacheGroups:
             return []
         table = [by_group.get(g) for g in range(max(layer_to_group_idx) + 1)]
         return list(map(table.__getitem__, layer_to_group_idx))
+
+    def checkpoint_inputs(
+        self,
+        checkpoints: Mapping[str, Sequence[tuple[int, int]]],
+        row_req_ids: Sequence[str],
+        requests: Mapping[str, TTCachedRequestState],
+        layer_to_group_idx: Sequence[int],
+        num_rows: int,
+    ) -> tuple[list[torch.Tensor | None], torch.Tensor]:
+        """The states a prefill chunk must leave inside itself, from the
+        scheduler's ``(position, column)`` list per request
+        (``get_tt_mamba_checkpoints``).
+
+        Returns, per layer, int32 ``[num_rows, W]``: the blocks at those
+        columns in the layer's group; and int32 ``[num_rows, W]``: the tokens
+        each block's state covers. ``W`` is the longest list, at least 1;
+        unused entries hold block 0 and 0 tokens. vLLM can cache each block as
+        the state after exactly that many tokens.
+        """
+        width = max((len(checkpoints.get(r, ())) for r in row_req_ids), default=0)
+        width = max(width, 1)
+        num_groups = len(self.group_indices)
+        blocks = np.zeros((num_groups, num_rows, width), dtype=np.int32)
+        positions = np.zeros((num_rows, width), dtype=np.int32)
+        for row, req_id in enumerate(row_req_ids[:num_rows]):
+            block_ids = requests[req_id].block_ids
+            for entry, (position, column) in enumerate(checkpoints.get(req_id, ())):
+                for i, g in enumerate(self.group_indices):
+                    row_blocks = block_ids[g]
+                    block = row_blocks[column] if column < len(row_blocks) else 0
+                    if not block:
+                        raise RuntimeError(
+                            f"request {req_id} must write the state after "
+                            f"{position} tokens into block-table column {column}, "
+                            f"but group {g}'s row holds no block there: "
+                            f"{list(row_blocks)}"
+                        )
+                    blocks[i, row, entry] = block
+                positions[row, entry] = position
+        tensor = torch.from_numpy(blocks)
+        return (
+            self.per_layer(
+                {g: tensor[i] for i, g in enumerate(self.group_indices)},
+                layer_to_group_idx,
+            ),
+            torch.from_numpy(positions),
+        )
 
     def blocks_to_zero(
         self,
@@ -692,13 +744,6 @@ def mamba_cache_groups(
                 f"{mode!r}; the model's get_kv_cache_spec must use the resolved "
                 "cache mode"
             )
-        if spec.num_prefill_checkpoint_blocks:
-            raise ValueError(
-                f"MambaSpec of KV cache group {i} has "
-                f"num_prefill_checkpoint_blocks="
-                f"{spec.num_prefill_checkpoint_blocks}; TT does not support "
-                "prefill-checkpoint Mamba blocks yet"
-            )
     if mode not in SUPPORTED_MAMBA_CACHE_MODES:
         raise ValueError(
             f"mamba_cache_mode={mode!r} is not supported on TT; supported: "
@@ -717,6 +762,29 @@ def mamba_cache_groups(
             f"MambaSpec groups {list(group_indices)} have different "
             f"num_speculative_blocks {sorted(num_speculative_blocks)}; one state "
             "window width serves every group"
+        )
+    checkpoints = {
+        (spec.num_prefill_checkpoint_blocks, spec.prefill_checkpoint_alignment)
+        for spec in specs
+    }
+    if len(checkpoints) != 1:
+        raise ValueError(
+            f"MambaSpec groups {list(group_indices)} have different "
+            "(num_prefill_checkpoint_blocks, prefill_checkpoint_alignment) "
+            f"{sorted(checkpoints, key=str)}; vLLM places one checkpoint per "
+            "request for every group"
+        )
+    num_checkpoint_blocks, checkpoint_alignment = checkpoints.pop()
+    if num_checkpoint_blocks and (
+        mode != "align" or num_checkpoint_blocks != 1 or checkpoint_alignment is None
+    ):
+        # vLLM's MambaManager reserves at most one checkpoint block per
+        # request, only in mode align, and never without an alignment.
+        raise ValueError(
+            f"MambaSpec num_prefill_checkpoint_blocks={num_checkpoint_blocks} "
+            f"with prefill_checkpoint_alignment={checkpoint_alignment} in "
+            f"mamba_cache_mode={mode!r}; prefill checkpoints need mode 'align', "
+            "exactly 1 block and an alignment"
         )
     if mode == "none" and block_size < max_model_len:
         # MambaManager allocates one block per block_size tokens, so a smaller
@@ -756,4 +824,5 @@ def mamba_cache_groups(
             for i, group in enumerate(kv_cache_groups)
             if i not in group_indices
         },
+        prefill_checkpoints=bool(num_checkpoint_blocks),
     )
