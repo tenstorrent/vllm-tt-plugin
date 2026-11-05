@@ -62,11 +62,15 @@ def _layer_specs(attention_block_size: int = BLOCK_SIZE, **mamba_kwargs) -> dict
         head_size=256,
         dtype=torch.bfloat16,
     )
+    mamba_kwargs = {"mamba_cache_mode": "none", **mamba_kwargs}
     gdn = MambaSpec(
-        block_size=BLOCK_SIZE,
+        # Upstream resolves mamba_block_size to max_model_len in mode none.
+        block_size=MAX_MODEL_LEN
+        if mamba_kwargs["mamba_cache_mode"] == "none"
+        else BLOCK_SIZE,
         shapes=GDN_SHAPES,
         dtypes=GDN_DTYPES,
-        **{"mamba_cache_mode": "none", **mamba_kwargs},
+        **mamba_kwargs,
     )
     return {
         (
@@ -199,6 +203,7 @@ def _runner(cfg, model=None, tt_data_parallel_size: int = 1) -> TTModelRunner:
     runner._is_block_output_model = False
     runner._output_tokens_per_step = 1
     runner._mamba_groups = None
+    runner._num_speculative_tokens = 0
     runner.model = model if model is not None else _RecordingModel()
     return runner
 
@@ -337,14 +342,18 @@ def test_attention_only_page_table_width_is_unchanged():
 
 
 @pytest.mark.parametrize(
-    "mamba_kwargs",
-    [dict(num_speculative_blocks=1), dict(num_prefill_checkpoint_blocks=1)],
+    ("mamba_kwargs", "match"),
+    [
+        # The launch speculates with 0 tokens here.
+        (dict(num_speculative_blocks=1), "differs from the launch's 0"),
+        (dict(num_prefill_checkpoint_blocks=1), "prefill-checkpoint"),
+    ],
 )
-def test_unsupported_mamba_configs_fail_at_kv_cache_init(mamba_kwargs):
+def test_unsupported_mamba_configs_fail_at_kv_cache_init(mamba_kwargs, match):
     cfg = _vllm_config()
     kv_cache_config = _kv_cache_config(cfg, _layer_specs(**mamba_kwargs), 256)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=match):
         TTModelRunner.initialize_kv_cache(_runner(cfg), kv_cache_config)
 
 
@@ -425,12 +434,12 @@ def test_state_block_selection_matches_upstream():
 
     block_table = torch.arange(1, 6 * 24 + 1, dtype=torch.int32).reshape(6, 24)
     seq_lens = torch.tensor([0, 1, 1024, 1025, 5000, 20_000])
-    spec = _layer_specs()["model.layers.0.linear_attn"]
     for mode in ("none", "align"):
+        spec = _layer_specs(mamba_cache_mode=mode)["model.layers.0.linear_attn"]
         groups = MambaCacheGroups(
             group_indices=(0,),
             mamba_cache_mode=mode,
-            block_size=BLOCK_SIZE,
+            block_size=spec.block_size,
             attention_group_index=1,
         )
         expected = mamba_get_block_table_tensor(block_table, seq_lens, spec, mode)
@@ -642,10 +651,11 @@ def test_mode_align_moves_state_into_the_block_of_each_new_column():
         None,
     )
     assert model.calls == [
+        ("copy_kv_cache_blocks", {"kv_cache": ["kv"], "copies": [(5, 6)]}),
         (
             "copy_kv_cache_blocks",
-            {"kv_cache": ["kv"], "copies": [(5, 6), (10, 11), (20, 21), (30, 31)]},
-        )
+            {"kv_cache": ["kv"], "copies": [(10, 11), (20, 21), (30, 31)]},
+        ),
     ]
     assert [_state_ids(chunk2, layer)[0] for layer in (0, 1, 2)] == [11, 21, 31]
 
