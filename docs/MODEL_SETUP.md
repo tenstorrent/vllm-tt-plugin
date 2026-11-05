@@ -198,7 +198,12 @@ Declaration rules:
   every `MambaSpec` group. In mode `align`, block-table column `p` of a group
   holds the state after `(p + 1) * block_size` tokens, and `MambaSpec.block_size`
   must equal the attention `block_size`: the scheduler ends prefill chunks on
-  multiples of the smallest group `block_size`.
+  multiples of the smallest group `block_size`. `TTScheduler` prefills a
+  multimodal prompt that fits one step in one chunk, so the block boundaries
+  inside that chunk keep no state for prefix caching. A
+  `cache_config.prefix_match_unit` must be a multiple of
+  `additional_config['tt']['prefill_chunk_alignment']`, because with partial
+  hash hits vLLM also ends chunks on its multiples.
 - `TTModelRunner` supports modes `none` and `align`. It requires
   `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` and
   one `num_speculative_blocks` for all `MambaSpec` groups.
