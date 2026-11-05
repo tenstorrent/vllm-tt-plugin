@@ -150,9 +150,10 @@ The scheduler therefore refuses to start unless the KV pool holds
 preempts one. The pool comes from the model's `get_max_tokens_all_users`
 (see [KV budget and specifications](MODEL_SETUP.md#kv-budget-and-specifications)).
 For a model with only full-attention layers, returning at least
-`max_model_len * max_num_seqs` meets the rule. The platform refuses a forced prefix-cache reset while such a
-request runs (or aborts it first when the engine can tell its client), and
-`TTModelRunner` raises if a preemption reaches it anyway.
+`max_model_len * max_num_seqs` meets the rule. The platform refuses a forced
+prefix-cache reset while such a request runs (or aborts it first when the
+engine can tell its client), and `TTModelRunner` raises if a preemption
+reaches it anyway.
 
 ## Decode readback and output conversion
 
