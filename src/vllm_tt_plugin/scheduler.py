@@ -528,6 +528,20 @@ class TTScheduler(AsyncScheduler):
             if self._prefill_chunk_alignment > 1
             else ()
         )
+        smallest_cap = min((cap for _, cap in self._prefill_chunk_cap_table), default=0)
+        if (
+            smallest_cap
+            and getattr(self, "_base_need_mamba_split", False)
+            and smallest_cap < self.cache_config.block_size
+        ):
+            # vLLM's split rounds a chunk end down to the Mamba block grid, so a
+            # cap below one block leaves a chunk that starts on the grid with no
+            # tokens.
+            raise ValueError(
+                f"prefill_chunk_cap_table cap {smallest_cap} is below the "
+                f"Mamba block size {self.cache_config.block_size} in "
+                "mamba_cache_mode='align'; every cap must hold one block"
+            )
         if self._prefill_chunk_cap_table:
             logger.info(
                 "TT scheduler: depth-dependent prefill chunk caps "
@@ -1033,6 +1047,10 @@ class TTScheduler(AsyncScheduler):
         # not apply to it either.
         grant = self._mm_no_split_grant(request, start, num_new_tokens)
         if grant is None:
+            # Capped before vLLM's split, which ends the capped chunk on the
+            # Mamba block grid: a cap that is not a multiple of the block (896)
+            # applied after it would end the chunk off the grid.
+            num_new_tokens = self._cap_prefill_chunk(request, start, num_new_tokens)
             if getattr(self, "_base_need_mamba_split", False):
                 num_new_tokens = super()._mamba_block_aligned_split(
                     request,
@@ -1040,7 +1058,6 @@ class TTScheduler(AsyncScheduler):
                     num_new_local_computed_tokens,
                     num_external_computed_tokens,
                 )
-            num_new_tokens = self._cap_prefill_chunk(request, start, num_new_tokens)
             grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
         if grant > 0 and start < self._prefill_end(request):
             self._step_prefill_tokens = getattr(self, "_step_prefill_tokens", 0) + grant

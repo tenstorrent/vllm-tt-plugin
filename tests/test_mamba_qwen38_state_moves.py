@@ -394,12 +394,15 @@ class _Harness:
         plugin_groups: bool = True,
         prefix_match_unit: int | None = None,
         checkpoint: bool = False,
+        block_size: int = BLOCK_SIZE,
     ):
         self.mode = mode
         self.num_spec = num_spec
         self.cfg = _planner_config(mode, retention)
         self.kv_cache_config = _kv_cache_config(
-            self.cfg, _qwen38_specs(mode, num_spec, checkpoint=checkpoint), NUM_BLOCKS
+            self.cfg,
+            _qwen38_specs(mode, num_spec, block_size=block_size, checkpoint=checkpoint),
+            NUM_BLOCKS,
         )
         # A model that declares checkpoint blocks writes the checkpoint state;
         # False stands for one that ignores the plugin's checkpoint inputs.
@@ -417,6 +420,7 @@ class _Harness:
             retention,
             max_num_batched_tokens,
             prefix_match_unit,
+            block_size=block_size,
         )
         self.reference = UpstreamMambaRunner(self.kv_cache_config)
         self.groups = self.reference.group_indices
@@ -1542,7 +1546,9 @@ def test_follow_ups_of_one_text_hit_the_first_follow_ups_junction(same_text):
                 assert writers == {"prefill"}, (req_id, hit, writers)
 
 
-def _checkpoint_scenario(retention, checkpoint: bool, writes_checkpoints=True):
+def _checkpoint_scenario(
+    retention, checkpoint: bool, writes_checkpoints=True, block_size=BLOCK_SIZE
+):
     """Prompts below, at and past block boundaries, each served alone, then
     follow-ups that repeat each prompt and add text, so they hit its cached
     GDN state. 3100 tokens follow a 1024-token request at once, so their
@@ -1554,6 +1560,7 @@ def _checkpoint_scenario(retention, checkpoint: bool, writes_checkpoints=True):
         retention=retention,
         max_num_batched_tokens=4096,
         checkpoint=checkpoint,
+        block_size=block_size,
     )
     h.writes_checkpoints = writes_checkpoints
     prompts = {f"a{n}": _prompt(n, n) for n in (900, 1500, 2048, 2049, 3000)}
@@ -1580,11 +1587,12 @@ def _checkpoint_scenario(retention, checkpoint: bool, writes_checkpoints=True):
         for block in pool.blocks
         if block.block_hash is not None and get_group_id(block.block_hash) in h.groups
     }
-    return h, chunks, hits, cached
+    return h, chunks, hits, cached, prompts
 
 
+@pytest.mark.parametrize("block_size", [896, BLOCK_SIZE])
 @pytest.mark.parametrize("retention", [0, None])
-def test_prefill_checkpoints_keep_the_split_prefix_cache(retention):
+def test_prefill_checkpoints_keep_the_split_prefix_cache(retention, block_size):
     """``MambaSpec.num_prefill_checkpoint_blocks``: vLLM no longer ends a
     prefill chunk at the prompt's last cacheable boundary; it reserves a block
     for the state there, and the TT model writes it from
@@ -1597,8 +1605,12 @@ def test_prefill_checkpoints_keep_the_split_prefix_cache(retention):
     writing the states. At retention 0 this needs
     ``install_mamba_prompt_checkpoint_patch``: vLLM 0.30.0 otherwise evicts
     the prompt's checkpoint and follow-ups lose their hit."""
-    _, split_chunks, split_hits, split_cached = _checkpoint_scenario(retention, False)
-    h, chunks, hits, cached = _checkpoint_scenario(retention, True)
+    _, split_chunks, split_hits, split_cached, _ = _checkpoint_scenario(
+        retention, False, block_size=block_size
+    )
+    h, chunks, hits, cached, prompts = _checkpoint_scenario(
+        retention, True, block_size=block_size
+    )
     assert any(step.checkpoints for step in h.steps)
     # A first prompt that fits one chunk takes one. A follow-up whose GDN hit
     # is shorter than its attention hit still stops a chunk at the junction
@@ -1609,11 +1621,12 @@ def test_prefill_checkpoints_keep_the_split_prefix_cache(retention):
     assert sum(chunks.values()) < sum(split_chunks.values())
     # At least the split version's hits and cached states. A prompt of whole
     # blocks runs as one chunk either way, and only the checkpoint leaves the
-    # state at its replay boundary (2048 tokens: 1024; 3072 tokens: 2048);
-    # with a checkpoint on a running request vLLM also keeps the previous
-    # chunk's draft blocks, which dense retention caches.
+    # state at its replay boundary; with a checkpoint on a running request
+    # vLLM also keeps the previous chunk's draft blocks, which dense
+    # retention caches.
     assert all(hits[r] >= split_hits[r] for r in hits), (hits, split_hits)
-    assert {r for r in hits if hits[r] > split_hits[r]} <= {"ba2048", "bc1024"}
+    whole_blocks = {"b" + r for r, p in prompts.items() if len(p) % block_size == 0}
+    assert {r for r in hits if hits[r] > split_hits[r]} <= whole_blocks
     assert split_cached <= cached
 
 
@@ -1623,6 +1636,61 @@ def test_a_model_that_ignores_the_checkpoint_inputs_serves_stale_hits():
     block empty."""
     with pytest.raises(AssertionError, match="tt"):
         _checkpoint_scenario(0, True, writes_checkpoints=False)
+    with pytest.raises(AssertionError, match="tt"):
+        _checkpoint_scenario(0, True, writes_checkpoints=False, block_size=896)
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_dp_engines_keep_their_own_gdn_state_and_hit_estimates(checkpoint):
+    """Standard multi-process DP, as the Galaxy runs ``data_parallel_size`` 4:
+    each engine has its own ``TTScheduler``, ``KVCacheManager`` and
+    ``MambaCacheGroups``. vLLM's balancer picks an engine by load only
+    (``DPLBAsyncMPClient.get_core_engine_for_request``), not by cached prefix.
+
+    Four engines here, in one process, step in lockstep with different
+    prompts, and every read stays exact (each engine's ledgers). Then one
+    follow-up of engine 2's prompt waits on every engine: the prefill-aware
+    DP load (``dp_load_prefill_aware``) estimates its GDN hit on engine 2
+    alone, so only that engine's waiting penalty shrinks, and only there does
+    the follow-up hit when it runs."""
+    engines = [
+        _Harness(
+            "align",
+            num_spec=K,
+            retention=0,
+            max_num_batched_tokens=4096,
+            checkpoint=checkpoint,
+        )
+        for _ in range(4)
+    ]
+    prompts = [_prompt(500 + i, 1500 + 700 * i) for i in range(4)]
+    for i, (h, prompt) in enumerate(zip(engines, prompts)):
+        h.add(f"e{i}", prompt, max_tokens=8)
+    for _ in range(400):
+        if not any([h.step(_accept_pattern) for h in engines]):
+            break
+    assert all(h.finished(f"e{i}") for i, h in enumerate(engines))
+
+    follow_up = prompts[2] + _prompt(9, 300)
+    for h in engines:
+        h.scheduler._dp_load_prefill_aware = True
+        h.scheduler._dp_load_min_tokens = 0
+        h.scheduler._dp_load_tokens_per_unit = 1
+        h.add("f", follow_up, max_tokens=2)
+    estimates = [
+        h.scheduler._estimate_cached_prefix_tokens(h.scheduler.requests["f"])
+        for h in engines
+    ]
+    assert estimates[2] > 0 and estimates[:2] + estimates[3:] == [0, 0, 0]
+    penalties = [h.scheduler.get_request_counts()[1] for h in engines]
+    assert penalties == [1 + len(follow_up) - e for e in estimates]
+
+    for h in engines:
+        h.run(accept=_accept_pattern)
+    hits = [
+        next(s.new_hits["f"] for s in h.steps if "f" in s.new_hits) for h in engines
+    ]
+    assert hits == estimates
 
 
 # The Galaxy deployment's prefill knobs (tt-inference-server
@@ -1637,7 +1705,9 @@ DEPLOYMENT_TT_CONFIG = {
 }
 
 
-@pytest.mark.parametrize("block_size", [1024, 2048])
+# 896: the block of a 7-bank Blackhole Galaxy (UBB_BLACKHOLE_CF), where the
+# chunk caps are not multiples of the block.
+@pytest.mark.parametrize("block_size", [896, 1024, 2048])
 def test_deployment_prefill_knobs_keep_chunks_on_the_gdn_block_grid(block_size):
     """Mode align needs every prefill chunk that does not finish its prompt to
     end on a GDN block boundary: block-table column ``p`` holds the state after
@@ -1647,15 +1717,15 @@ def test_deployment_prefill_knobs_keep_chunks_on_the_gdn_block_grid(block_size):
     chunk on the block grid too.
 
     The real ``TTScheduler`` and ``KVCacheManager`` serve, with the
-    deployment's knobs and K=3: a 140000-token prompt (past the 131072 step of
-    the cap table), a 20000-token prompt, a short one, and a follow-up that
+    deployment's knobs and K=3: a 175037-token prompt (chunks past the 131072
+    step of the cap table), a 20000-token prompt, a short one, and a follow-up that
     shares the long prompt's first 70000 tokens (its GDN hit is shorter than
     its attention hit, so vLLM also stops a chunk at the junction). Every
     partial chunk ends on the block grid within its cap, at most one prompt
     that needs several chunks advances in a step, and a prefill step follows
     a prefill step only when no request is decoding.
     """
-    max_model_len = 145_000
+    max_model_len = 180_000
     planner = _planner_config("align", 0)
     planner.model_config.max_model_len = max_model_len
     planner.model_config.original_max_model_len = max_model_len
@@ -1674,7 +1744,7 @@ def test_deployment_prefill_knobs_keep_chunks_on_the_gdn_block_grid(block_size):
         tt_config=DEPLOYMENT_TT_CONFIG,
     )
     init_none_hash(sha256)
-    long_prompt = _prompt(1, 140_037)
+    long_prompt = _prompt(1, 175_037)
     prompts = {
         "long": long_prompt,
         "mid": _prompt(2, 20_005),
