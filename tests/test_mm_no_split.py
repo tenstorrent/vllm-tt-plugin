@@ -62,9 +62,12 @@ def test_grants_accumulate_so_a_second_mm_request_never_overshoots_the_step():
     assert s._mamba_block_aligned_split(_request(4000, mm=True), 2048) == 0
 
 
-def test_mm_prompt_larger_than_a_step_is_split_on_the_grid_not_stuck():
+def test_mm_prompt_larger_than_a_step_is_split_not_stuck():
+    """The chunk is not rounded to the grid: its end stays where vLLM's
+    multimodal rule (or ``_keep_multimodal_items_whole``) put it, outside the
+    items."""
     s = _scheduler(step=4096, threshold=0)
-    assert s._mamba_block_aligned_split(_request(10000, mm=True), 4000) == 3968
+    assert s._mamba_block_aligned_split(_request(10000, mm=True), 4000) == 4000
 
 
 def test_mm_decode_row_passes_through():

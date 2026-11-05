@@ -29,7 +29,7 @@ layout, where each block holds one full state.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,10 +46,13 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
@@ -74,10 +77,12 @@ from tests.test_mamba_kv_cache import (
     _RecordingModel,
     _vllm_config,
 )
+from vllm_tt_plugin import scheduler as scheduler_module
 from vllm_tt_plugin.config import store_tt_spec_plan
 from vllm_tt_plugin.mamba_state import MambaCacheGroups, mamba_cache_groups
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import TTScheduler
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
@@ -168,20 +173,25 @@ def _plan(num_spec: int) -> SpecPlan:
 class _StubModel:
     """Stands in for the TT model class while the platform hook runs."""
 
+    model_capabilities = {
+        "supports_chunked_prefill": True,
+        "supports_prefix_caching": True,
+    }
 
-def _scheduler(
-    kv_cache_config,
+
+def _engine_config(
     mode: str,
-    num_spec: int,
     retention: int | None,
     max_num_batched_tokens: int,
-) -> TTScheduler:
-    """A real ``TTScheduler`` over a real ``KVCacheManager``.
+    prefix_match_unit: int | None = None,
+    model_class: type = _StubModel,
+    mamba_block_size: int | None = None,
+) -> VllmConfig:
+    """A ``VllmConfig`` resolved by the TT platform hook for ``model_class``.
 
-    The cache fields a hybrid model would get from vLLM's config resolution
-    (``MambaModelConfig``) are set after construction, as the engine core has
-    them when it builds the scheduler: ``block_size`` is the groups' block
-    size, and mode align comes with prefix caching.
+    The cache mode a hybrid model gets from vLLM's config resolution
+    (``MambaModelConfig``) is set before the hook runs: mode align comes with
+    prefix caching.
     """
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -199,7 +209,14 @@ def _scheduler(
         is_encoder_decoder=False,
     )
     cache_config = CacheConfig(
-        block_size=BLOCK_SIZE, gpu_memory_utilization=0.9, cache_dtype="auto"
+        block_size=BLOCK_SIZE,
+        gpu_memory_utilization=0.9,
+        cache_dtype="auto",
+        enable_prefix_caching=mode == "align",
+        mamba_cache_mode=mode,
+        prefix_cache_retention_interval=retention,
+        prefix_match_unit=prefix_match_unit,
+        mamba_block_size=mamba_block_size,
     )
     with (
         patch("vllm_tt_plugin.platform.TTPlatform._tt_vllm_config", None),
@@ -214,24 +231,33 @@ def _scheduler(
         ),
         patch(
             "vllm.model_executor.model_loader.utils.get_model_architecture",
-            return_value=(_StubModel, None),
+            return_value=(model_class, None),
         ),
     ):
-        config = VllmConfig(
+        return VllmConfig(
             scheduler_config=scheduler_config,
             model_config=model_config,
             cache_config=cache_config,
             parallel_config=ParallelConfig(),
             device_config=DeviceConfig(device="cpu"),
         )
-    cache_config.enable_prefix_caching = mode == "align"
-    cache_config.mamba_cache_mode = mode
-    cache_config.prefix_cache_retention_interval = retention
+
+
+def _scheduler(
+    kv_cache_config,
+    mode: str,
+    num_spec: int,
+    retention: int | None,
+    max_num_batched_tokens: int,
+    prefix_match_unit: int | None = None,
+) -> TTScheduler:
+    """A real ``TTScheduler`` over a real ``KVCacheManager``, started as
+    ``EngineCore`` starts it: ``block_size`` is set from the groups and
+    validated. The model declares chunked prefill and prefix caching.
+    """
+    config = _engine_config(mode, retention, max_num_batched_tokens, prefix_match_unit)
+    cache_config = config.cache_config
     cache_config.num_gpu_blocks = kv_cache_config.num_blocks
-    # The stub declares no chunked-prefill support, so the platform hook turned
-    # chunked prefill off; mode align needs it (``MambaModelConfig`` asserts).
-    config.scheduler_config.enable_chunked_prefill = True
-    config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     if num_spec:
         config.speculative_config = SpeculativeConfig(
             method=MODEL_OWNED_DRAFT_METHOD,
@@ -246,6 +272,7 @@ def _scheduler(
     cache_config.block_size = min(
         g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
     )
+    config.validate_block_size()
     return TTScheduler(
         vllm_config=config,
         kv_cache_config=kv_cache_config,
@@ -347,6 +374,7 @@ class _Harness:
         max_num_batched_tokens: int = 2048,
         plugin: bool = False,
         plugin_groups: bool = True,
+        prefix_match_unit: int | None = None,
     ):
         self.mode = mode
         self.num_spec = num_spec
@@ -355,7 +383,12 @@ class _Harness:
             self.cfg, _qwen38_specs(mode, num_spec), NUM_BLOCKS
         )
         self.scheduler = _scheduler(
-            self.kv_cache_config, mode, num_spec, retention, max_num_batched_tokens
+            self.kv_cache_config,
+            mode,
+            num_spec,
+            retention,
+            max_num_batched_tokens,
+            prefix_match_unit,
         )
         self.reference = UpstreamMambaRunner(self.kv_cache_config)
         self.groups = self.reference.group_indices
@@ -392,17 +425,40 @@ class _Harness:
         self.draft_base = 70_000
         self.bonus_base = 50_000
 
-    def add(self, req_id: str, prompt: list[int], max_tokens: int = 64) -> None:
+    def add(
+        self,
+        req_id: str,
+        prompt: list[int],
+        max_tokens: int = 64,
+        images: Sequence[tuple[int, int]] = (),
+    ) -> None:
+        """Queue a request; ``images`` are (offset, length) placeholder ranges."""
         init_none_hash(sha256)
         params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
         params.update_from_generation_config({}, eos_token_id=2)
+        if images and not self.scheduler.max_num_encoder_input_tokens:
+            # The text-only model config gives the scheduler no encoder budget.
+            self.scheduler.max_num_encoder_input_tokens = MAX_MODEL_LEN
+            self.scheduler.encoder_cache_manager = EncoderCacheManager(MAX_MODEL_LEN)
         self.scheduler.add_request(
             Request(
                 request_id=req_id,
                 prompt_token_ids=list(prompt),
                 sampling_params=params,
                 pooling_params=None,
-                block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+                mm_features=[
+                    MultiModalFeatureSpec(
+                        data=None,
+                        modality="image",
+                        identifier=f"image-{offset}-{length}",
+                        mm_position=PlaceholderRange(offset=offset, length=length),
+                    )
+                    for offset, length in images
+                ]
+                or None,
+                block_hasher=get_request_block_hasher(
+                    self.scheduler.hash_block_size, sha256
+                ),
             )
         )
 
@@ -832,6 +888,177 @@ def test_prefill_chunk_ends_are_block_aligned_in_mode_align(mode, chunks):
     h.add("a", _prompt(1, 3500), max_tokens=1)
     h.run()
     assert [s.num_scheduled["a"] for s in h.steps] == chunks
+
+
+# --- Chunked prefill with prefix caching in mode align -------------------------
+
+
+class _ChunkedOnlyModel:
+    model_capabilities = {"supports_chunked_prefill": True}
+
+
+@pytest.mark.parametrize(
+    ("model_class", "mode", "chunked_mm_input_disabled"),
+    [
+        # vLLM rejects disable_chunked_mm_input in mode align
+        # (``VllmConfig.validate_block_size``); TTScheduler keeps items whole.
+        (_StubModel, "align", False),
+        # The platform turns prefix caching off for a model that does not
+        # declare it, which resets the mode to none; vLLM's flag applies again.
+        (_ChunkedOnlyModel, "none", True),
+    ],
+)
+def test_mode_align_engine_starts_with_chunked_prefill(
+    model_class, mode, chunked_mm_input_disabled
+):
+    """A model that declares chunked prefill starts in the mode the platform
+    resolves, and the scheduler aligns chunk ends in mode align."""
+    config = _engine_config(
+        "align", 0, 2048, model_class=model_class, mamba_block_size=BLOCK_SIZE
+    )
+    assert config.cache_config.mamba_cache_mode == mode
+    assert config.scheduler_config.enable_chunked_prefill
+    assert config.scheduler_config.disable_chunked_mm_input is chunked_mm_input_disabled
+    config.validate_block_size()
+
+    h = _Harness("align", num_spec=0)
+    assert h.scheduler.cache_config.enable_prefix_caching
+    assert h.scheduler.need_mamba_block_aligned_split
+    assert h.scheduler._prefill_chunk_alignment == 128
+
+
+@pytest.mark.parametrize(
+    ("max_num_batched_tokens", "chunks"),
+    [
+        (2500, [2048, 1024, 428]),
+        # A block wider than a step: vLLM's split lets the chunk end inside the
+        # block, TT floors it to its 128 grid, and the next chunk stops at the
+        # block boundary (vLLM) that is also on the grid.
+        (600, [512] * 6 + [428]),
+    ],
+)
+def test_tt_chunk_grid_agrees_with_the_block_aligned_split(
+    max_num_batched_tokens, chunks
+):
+    """vLLM's split ends chunks on 1024-token blocks, which are on TT's
+    128-token grid, so ``TTScheduler._align_prefill_chunk_end`` never moves
+    them, and every block boundary a chunk reaches is a chunk end."""
+    h = _Harness("align", num_spec=0, max_num_batched_tokens=max_num_batched_tokens)
+    h.add("a", _prompt(1, 3500), max_tokens=1)
+    h.run()
+    assert h.finished("a")
+    assert [s.num_scheduled["a"] for s in h.steps] == chunks
+
+
+def test_prefix_match_unit_off_the_chunk_grid_is_rejected():
+    """With partial hash hits vLLM also stops a chunk at the prompt's last
+    ``prefix_match_unit`` boundary. At 64 tokens that stop (2944 + 64 for a
+    3050-token prompt) is off TT's 128 grid: the chunk end is floored back to
+    the chunk start and the prefill never finishes, so startup refuses it.
+    At 128 the stop is on the grid and a repeat of the prompt hits it."""
+    with pytest.raises(ValueError, match="prefix_match_unit=64"):
+        _Harness("align", num_spec=0, max_num_batched_tokens=8192, prefix_match_unit=64)
+
+    h = _Harness(
+        "align", num_spec=0, max_num_batched_tokens=8192, prefix_match_unit=128
+    )
+    prompt = _prompt(1, 3050)
+    h.add("a", prompt, max_tokens=1)
+    h.run(until=lambda: h.finished("a"))
+    assert [s.num_scheduled["a"] for s in h.steps] == [2048, 896, 106]
+    h.add("b", list(prompt), max_tokens=1)
+    h.run()
+    assert h.finished("b")
+    assert h.steps[3].new_hits == {"b": 2944}
+
+
+def _chunk_ends(h: _Harness, req_id: str) -> list[int]:
+    ends, total = [], 0
+    for step in h.steps:
+        if req_id in step.num_scheduled:
+            total += step.num_scheduled[req_id]
+            ends.append(total)
+    return ends
+
+
+@pytest.mark.parametrize(
+    ("images", "max_num_batched_tokens", "chunks"),
+    [
+        # The prompt is longer than a step. vLLM's split would end the first
+        # chunk at 2048, inside the image; the chunk ends at the block boundary
+        # before it instead. The rest fits a step and is one chunk.
+        ([(1500, 1100)], 2048, [1024, 2048, 428]),
+        # No block boundary before the image: the first chunk ends at its start,
+        # the second takes the whole image, crossing the 1024 and 2048
+        # boundaries without stopping. The rest fits a step and is one chunk,
+        # past the prompt's last block boundary.
+        ([(900, 1400)], 2048, [900, 1400, 1200]),
+        # Two images back to back, each taken whole.
+        ([(1000, 1000), (2000, 1000)], 2048, [2000, 1500]),
+        # The prompt fits a step: one prefill step, although vLLM's split
+        # would stop it at a block boundary.
+        ([(2900, 400)], 4096, [3500]),
+    ],
+)
+def test_multimodal_item_is_never_split_in_mode_align(
+    images, max_num_batched_tokens, chunks
+):
+    """``TTScheduler`` schedules a multimodal prompt that fits a step as one
+    chunk (``_mm_no_split_grant``) and moves every chunk end of a longer one
+    out of the images (``_keep_multimodal_items_whole``). The GDN state reads
+    stay exact (``StateLedger`` and ``BlockLedger``). A repeat of the prompt
+    reads no prefix cache and prefills in the same chunks."""
+    h = _Harness("align", num_spec=0, max_num_batched_tokens=max_num_batched_tokens)
+    prompt = _prompt(1, 3500)
+    h.add("a", prompt, max_tokens=1, images=images)
+    h.run(until=lambda: h.finished("a"))
+    assert [s.num_scheduled["a"] for s in h.steps] == chunks
+    for end in _chunk_ends(h, "a"):
+        assert not any(lo < end < lo + n for lo, n in images)
+    h.add("b", list(prompt), max_tokens=1, images=images)
+    h.run()
+    assert h.finished("b")
+    assert {r: n for s in h.steps for r, n in s.new_hits.items()} == {"a": 0, "b": 0}
+    assert [s.num_scheduled["b"] for s in h.steps if "b" in s.num_scheduled] == chunks
+
+
+def test_multimodal_item_longer_than_a_step_is_split_with_a_warning():
+    """An item that skipped ``TTPlatform.validate_request`` and is longer than
+    a whole step is split rather than stall the queue."""
+    h = _Harness("align", num_spec=0, max_num_batched_tokens=2048)
+    h.add("a", _prompt(1, 3500), max_tokens=1, images=[(500, 2500)])
+    with patch.object(scheduler_module.logger, "warning") as warning:
+        h.run()
+    assert h.finished("a")
+    assert [s.num_scheduled["a"] for s in h.steps] == [500, 524, 2048, 428]
+    # One warning for the prompt longer than a step (``_mm_no_split_grant``,
+    # once per scheduler) and one for the item.
+    assert warning.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "length", "rejected"),
+    [("align", 2049, True), ("align", 2048, False), ("none", 2049, False)],
+)
+def test_validate_request_rejects_an_item_longer_than_a_step(
+    monkeypatch, mode, length, rejected
+):
+    """Mode align: ``TTPlatform.validate_request`` rejects an item that one
+    prefill step (here ``max_num_batched_tokens``) cannot hold. Mode none
+    keeps vLLM's own startup check under ``disable_chunked_mm_input``."""
+    h = _Harness(mode, num_spec=0, max_num_batched_tokens=2048)
+    monkeypatch.setattr(TTPlatform, "_tt_vllm_config", h.scheduler.vllm_config)
+    engine_input = {
+        "type": "multimodal",
+        "prompt_token_ids": [1] * 3000,
+        "mm_placeholders": {"image": [PlaceholderRange(offset=10, length=length)]},
+    }
+    params = SamplingParams(max_tokens=1)
+    if rejected:
+        with pytest.raises(VLLMValidationError, match="max_num_batched_tokens=2048"):
+            TTPlatform.validate_request(engine_input, params)
+    else:
+        TTPlatform.validate_request(engine_input, params)
 
 
 # --- TT runner versus upstream, no drafts --------------------------------------

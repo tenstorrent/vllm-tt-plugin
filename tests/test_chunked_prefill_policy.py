@@ -10,7 +10,10 @@ from types import SimpleNamespace
 import pytest
 import vllm  # noqa: F401
 
-from vllm_tt_plugin.platform import _apply_chunked_prefill_policy
+from vllm_tt_plugin.platform import (
+    _allow_chunked_mm_input_in_mamba_align,
+    _apply_chunked_prefill_policy,
+)
 from vllm_tt_plugin.scheduler import _effective_prefill_step_limit
 
 
@@ -178,10 +181,17 @@ def _with_cache(config, mamba_cache_mode, *, multimodal):
     return config
 
 
+def _apply_then_resolve_cache_mode(config, capabilities):
+    """The policy, then the align-mode step the platform runs once prefix
+    caching (and so the mamba cache mode) is final."""
+    _apply(config, capabilities)
+    _allow_chunked_mm_input_in_mamba_align(config)
+
+
 def test_mamba_align_keeps_mm_chunk_guard_off_for_text_only_models():
     config = _with_cache(_vllm_config(), "align", multimodal=False)
 
-    _apply(config, {"supports_chunked_prefill": True})
+    _apply_then_resolve_cache_mode(config, {"supports_chunked_prefill": True})
 
     assert config.scheduler_config.enable_chunked_prefill is True
     assert config.scheduler_config.disable_chunked_mm_input is False
@@ -189,10 +199,10 @@ def test_mamba_align_keeps_mm_chunk_guard_off_for_text_only_models():
 
 def test_mamba_align_keeps_mm_chunk_guard_off_for_declaring_multimodal_models():
     # vLLM's VllmConfig asserts disable_chunked_mm_input is False in align
-    # mode; TTScheduler never splits a multimodal request there.
+    # mode; TTScheduler keeps each multimodal item whole there.
     config = _with_cache(_vllm_config(), "align", multimodal=True)
 
-    _apply(config, {"supports_chunked_prefill": True})
+    _apply_then_resolve_cache_mode(config, {"supports_chunked_prefill": True})
 
     assert config.scheduler_config.disable_chunked_mm_input is False
 
@@ -201,7 +211,7 @@ def test_non_align_mamba_mode_keeps_mm_chunk_guard_on():
     for mode in ("none", "all", None):
         config = _with_cache(_vllm_config(), mode, multimodal=True)
 
-        _apply(config, {"supports_chunked_prefill": True})
+        _apply_then_resolve_cache_mode(config, {"supports_chunked_prefill": True})
 
         assert config.scheduler_config.disable_chunked_mm_input is True
 
@@ -209,7 +219,7 @@ def test_non_align_mamba_mode_keeps_mm_chunk_guard_on():
 def test_multimodal_model_without_chunked_prefill_declaration_stays_unchunked():
     config = _with_cache(_vllm_config(), "align", multimodal=True)
 
-    _apply(config, {})
+    _apply_then_resolve_cache_mode(config, {})
 
     assert config.scheduler_config.enable_chunked_prefill is False
     assert config.scheduler_config.disable_chunked_mm_input is False

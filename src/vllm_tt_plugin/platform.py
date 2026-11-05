@@ -266,16 +266,9 @@ def _apply_chunked_prefill_policy(
     # A chunk boundary inside a multimodal item would split its embeddings from
     # their positions. Only meaningful while prefill can be split, and vLLM
     # rejects the flag outright when one item exceeds the token budget, so it
-    # stays off for every model that does not reach here.
-    # vLLM's own config check rejects the flag in mamba "align" mode (prefix
-    # caching on a hybrid model), because the multimodal roll-back would undo the
-    # block-aligned split. There it stays False when the scheduler can keep a
-    # multimodal item whole by itself: text-only models have no items (vllm-tt-plugin
-    # PR #232), and a multimodal model that declares chunked prefill gets the
-    # ``TTScheduler`` no-split guard (``_align_prefill_chunk_end``).
-    cache_config = getattr(vllm_config, "cache_config", None)
-    mamba_align = getattr(cache_config, "mamba_cache_mode", None) == "align"
-    scheduler_config.disable_chunked_mm_input = not mamba_align
+    # stays off for every model that does not reach here. Mamba cache mode
+    # "align" clears it again (``_allow_chunked_mm_input_in_mamba_align``).
+    scheduler_config.disable_chunked_mm_input = True
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
@@ -315,6 +308,20 @@ def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
         "max_model_len=%d and mamba_cache_mode to 'none'.",
         cache_config.mamba_block_size,
     )
+
+
+def _allow_chunked_mm_input_in_mamba_align(vllm_config: "VllmConfig") -> None:
+    """Leave the no-split rule for multimodal items to ``TTScheduler`` in mode align.
+
+    ``VllmConfig.validate_block_size`` rejects ``disable_chunked_mm_input`` in
+    ``mamba_cache_mode`` "align", because vLLM's roll-back to the start of an
+    item would undo its block-aligned split. ``TTScheduler`` keeps each item
+    whole there instead (``_keep_multimodal_items_whole``). Must run after
+    prefix caching is resolved: turning prefix caching off resets the mode to
+    "none", where vLLM's own flag still applies.
+    """
+    if getattr(vllm_config.cache_config, "mamba_cache_mode", None) == "align":
+        vllm_config.scheduler_config.disable_chunked_mm_input = False
 
 
 def _galaxy_generator_version() -> str | None:
@@ -1783,6 +1790,41 @@ class TTPlatform(Platform):
         return output_tokens_per_step
 
     @classmethod
+    def _reject_multimodal_items_wider_than_a_step(
+        cls, processed_inputs: "EngineInput"
+    ) -> None:
+        """Reject a multimodal item that one prefill step cannot hold.
+
+        In ``mamba_cache_mode`` "align" ``TTScheduler`` never splits an item
+        across prefill chunks, so such an item could never be scheduled. vLLM
+        checks item sizes at startup only under ``disable_chunked_mm_input``,
+        which mode align does not allow.
+        """
+        from vllm.exceptions import VLLMValidationError
+
+        from vllm_tt_plugin.scheduler import _effective_prefill_step_limit
+
+        placeholders = processed_inputs.get("mm_placeholders")
+        vllm_config = cls._resolve_tt_admission_handle()
+        if (
+            not placeholders
+            or vllm_config is None
+            or getattr(vllm_config.cache_config, "mamba_cache_mode", None) != "align"
+        ):
+            return
+        limit, name = _effective_prefill_step_limit(vllm_config.scheduler_config)
+        for modality, items in placeholders.items():
+            for index, item in enumerate(items):
+                if item.length > limit:
+                    raise VLLMValidationError(
+                        f"{modality} item {index} takes {item.length} prompt "
+                        f"tokens, more than one prefill step holds ({name}="
+                        f"{limit}). With mamba_cache_mode 'align' a "
+                        f"multimodal item is prefilled in one step; raise "
+                        f"{name} or send a smaller item."
+                    )
+
+    @classmethod
     def _get_block_output_contract(cls) -> tuple[int, int] | None:
         """Read the live block width and frontend max-model-length limit."""
         vllm_config = cls._resolve_tt_admission_handle()
@@ -2223,6 +2265,7 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+        _allow_chunked_mm_input_in_mamba_align(vllm_config)
 
         if is_block_output_model:
             required_lifecycle_hooks = (
@@ -2821,6 +2864,8 @@ class TTPlatform(Platform):
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)
+
+        cls._reject_multimodal_items_wider_than_a_step(processed_inputs)
 
         block_contract = cls._get_block_output_contract()
         if not isinstance(params, SamplingParams) or block_contract is None:
