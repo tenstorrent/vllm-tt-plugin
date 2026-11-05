@@ -1263,7 +1263,9 @@ row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With
 of the pending verify, finishing rows included, and no row of the chained
 step may be able to reach a block boundary before the pending verify commits
 (blocker `mamba_boundary`): the state copies at a boundary take their source
-from the accepted count, which the host has only after the commit. Anything
+from the accepted count, which the host has only after the commit. A model
+that declares `supports_mamba_chained_state_moves` runs those moves itself, so
+only pending rows left out of the chained step count. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
 

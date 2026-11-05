@@ -76,7 +76,8 @@ and prefill and decode also receive two more keywords.
   rows hold 1. A chained row (`chain_rows`, see
   [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4j) holds -1, as
   its `accepted_counts` does: the start column follows the accepted count of
-  the pending verify, which only the device knows. The runner chains a row in
+  the pending verify, which only the device knows. Unless the model declares
+  `supports_mamba_chained_state_moves` (below), the runner chains a row in
   mode `align` only while neither step can reach a block boundary, so no
   state copy falls between the two verifies.
 
@@ -91,6 +92,40 @@ committed tokens reached into that boundary's own column, as upstream
 `postprocess_mamba_align_gpu` does. Upstream keeps the conv history of all
 `1 + K` positions in window column 0 instead; TT does not support that
 layout.
+
+**Chained state moves on the device.** A model that declares
+`supports_mamba_chained_state_moves` runs the mode-`align` state moves of a
+chained verify itself, so block boundaries do not break the chain. On such a
+step (`chain_rows` set), `decode_forward` also receives three keywords. Each
+is a list with one entry per layer, in `page_tables_per_layer` order; an
+attention layer's entry is `None`. Index `[i, c - 1]` holds the values for
+row `i` when the pending verify (the one `chain_tip` names) accepted `c`
+tokens for that row, `1 <= c <= 1 + K`:
+
+- `state_chain_copies_per_layer`: int32 `[tt_max_batch_size, 1 + K, 2]`, a
+  `(src, dst)` block pair. Before this step reads or writes any state, the
+  model copies the full state (conv history and recurrent state) of block
+  `src` into block `dst`. `src == dst` means no copy; padding rows and rows
+  without a copy hold `(0, 0)`. This is the pending verify's boundary copy
+  (upstream `postprocess_mamba`); the runner does not run it again when that
+  verify commits.
+- `state_chain_start_blocks_per_layer`: int32 `[tt_max_batch_size, 1 + K]`,
+  the block that holds the row's start state, read after the copy. When the
+  row crosses into a new block-table column, this is the block that the move
+  into the new column would copy from (upstream `preprocess_mamba`), and no
+  copy runs: the step writes window column 0 itself. The start block can be
+  one of this step's window blocks; the model must read the start state
+  before it writes that block.
+- `state_chain_windows_per_layer`: int32
+  `[tt_max_batch_size, 1 + K, 1 + K]`, the row's state window; the model
+  writes the state after query token `t` into column `t`.
+
+The model takes `c` from its own result of the pending verify, as it does for
+a chained row's `accepted_counts` (-1). `state_block_windows_per_layer` and
+`state_block_ids_per_layer` hold the `c = 1 + K` entry and
+`state_accepted_counts` holds -1. A pending row that the chained step leaves
+out (a request finishing at `max_tokens`) still breaks the chain near a
+boundary, since its boundary copy waits for the host commit.
 
 A row whose `start_pos` is 0 has no earlier state. The model must start that
 row from zero state and must not read its block: vLLM 0.30.0 does not zero

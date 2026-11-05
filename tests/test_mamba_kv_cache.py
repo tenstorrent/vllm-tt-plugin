@@ -676,3 +676,19 @@ def test_mode_align_moves_state_into_the_block_of_each_new_column():
     finished.finished_req_ids = {"a"}
     runner.build_model_input(finished, None)
     assert runner._mamba_groups.state_columns == {}
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_the_model_capability_turns_on_chained_state_moves(declared):
+    """``supports_mamba_chained_state_moves`` is read when the cache is set up;
+    absent, chained steps keep the host's moves (and the boundary blocker)."""
+    cfg = _vllm_config()
+    kv_cache_config = _kv_cache_config(cfg, _layer_specs(), 256)
+    model = _RecordingModel()
+    if declared:
+        model.model_capabilities = {"supports_mamba_chained_state_moves": True}
+    runner = _runner(cfg, model)
+
+    TTModelRunner.initialize_kv_cache(runner, kv_cache_config)
+
+    assert runner._mamba_groups.chained_moves_on_device is declared

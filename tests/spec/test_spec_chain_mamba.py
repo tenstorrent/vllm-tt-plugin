@@ -74,15 +74,17 @@ class _StateLedger:
             self.chained_reads += 1
         if not 1 <= count <= len(window):
             raise AssertionError(f"{req_id}: start count {count} outside the window")
-        block = window[count - 1]
+        self.verify_block(req_id, window[count - 1], window, p0, num_valid)
+
+    def verify_block(self, req_id, block, window, p0, num_valid):
         if req_id not in self.last_count:
             # The prefill this harness skips left the state here.
             self.blocks[block] = (req_id, p0)
         found = self.blocks.get(block)
         if found != (req_id, p0):
             raise AssertionError(
-                f"{req_id} at position {p0} read block {block} (window {window}, "
-                f"count {count}) holding {found}"
+                f"{req_id} at position {p0} read block {block} (window {window}) "
+                f"holding {found}"
             )
         self.reads += 1
         for t in range(num_valid + 1):
@@ -140,7 +142,16 @@ def runner_row_width(mode: str) -> int:
     return cdiv(MAX_MODEL_LEN, MAMBA_BLOCK) + K
 
 
-def _mamba_run(monkeypatch, mode, *, chain=True, steps=40, cycle=(3, 0, 1, 2), **kw):
+def _mamba_run(
+    monkeypatch,
+    mode,
+    *,
+    chain=True,
+    steps=40,
+    cycle=(3, 0, 1, 2),
+    on_device=False,
+    **kw,
+):
     monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1" if chain else "0")
     model = _chain_model(accept_cycle=cycle, **kw)
     runner = _make_runner(model)
@@ -159,6 +170,7 @@ def _mamba_run(monkeypatch, mode, *, chain=True, steps=40, cycle=(3, 0, 1, 2), *
         block_size=MAMBA_BLOCK if mode == "align" else MAX_MODEL_LEN,
         attention_group_index=ATTENTION_GROUP,
         num_speculative_blocks=K,
+        chained_moves_on_device=on_device,
     )
     runner._layer_to_group_idx = [ATTENTION_GROUP, GDN_GROUP]
     runner.tt_max_batch_size = MAX_NUM_REQS
@@ -187,18 +199,36 @@ def _mamba_run(monkeypatch, mode, *, chain=True, steps=40, cycle=(3, 0, 1, 2), *
             # A synchronous verify: the next step carries host counts.
             p0, num_valid = kwargs["start_pos"][:, 0], kwargs["num_valid_drafts"]
             accepted = None
+        plan = kwargs.get("state_chain_copies_per_layer")
         for row, req_id in enumerate(runner._last_rows):
             if chain_rows is not None and bool(chain_rows[row]):
                 assert int(counts[row]) == PLACEHOLDER_TOKEN_ID, (
                     f"chained row {req_id} carries a host count {int(counts[row])}"
                 )
-            ledger.verify(
-                req_id,
-                windows[row].tolist(),
-                int(counts[row]),
-                int(p0[row]),
-                int(num_valid[row]),
-            )
+            if plan is not None:
+                # The device picks the plan entry by the pending verify's count.
+                entry = (row, ledger.last_count[req_id] - 1)
+                ledger.chained_reads += 1
+                src, dst = plan[GDN_GROUP][entry].tolist()
+                if src != dst:
+                    ledger.copy([(src, dst)])
+                starts = kwargs["state_chain_start_blocks_per_layer"][GDN_GROUP]
+                windows_by_count = kwargs["state_chain_windows_per_layer"][GDN_GROUP]
+                ledger.verify_block(
+                    req_id,
+                    int(starts[entry]),
+                    windows_by_count[entry].tolist(),
+                    int(p0[row]),
+                    int(num_valid[row]),
+                )
+            else:
+                ledger.verify(
+                    req_id,
+                    windows[row].tolist(),
+                    int(counts[row]),
+                    int(p0[row]),
+                    int(num_valid[row]),
+                )
             if accepted is not None:
                 ledger.last_count[req_id] = int(accepted[row])
             else:
@@ -273,6 +303,53 @@ def test_chained_align_steps_match_the_unchained_run(monkeypatch):
         shorter = min(len(tokens), len(plain.engine.outputs[req_id]))
         assert shorter > 20
         assert tokens[:shorter] == plain.engine.outputs[req_id][:shorter]
+
+
+@pytest.mark.parametrize("cycle", [(3, 0, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0)])
+def test_device_moves_keep_the_chain_at_block_boundaries(monkeypatch, cycle):
+    """With ``supports_mamba_chained_state_moves`` a chained verify carries its
+    moves for every count the pending verify can accept, so boundaries do not
+    break the chain, the reads stay exact, and the boundary states are kept,
+    though the host commits each verify after the next one ran."""
+    run = _mamba_run(monkeypatch, "align", cycle=cycle, on_device=True)
+    assert run.ledger.chained_reads > 0
+    assert run.controller._chain_breaks["mamba_boundary"] == 0
+    _boundary_states_are_kept(run)
+    plain = _mamba_run(monkeypatch, "align", cycle=cycle, chain=False)
+    for req_id, tokens in run.engine.outputs.items():
+        shorter = min(len(tokens), len(plain.engine.outputs[req_id]))
+        assert shorter > 20
+        assert tokens[:shorter] == plain.engine.outputs[req_id][:shorter]
+
+
+def test_without_the_host_skip_a_late_boundary_copy_corrupts_the_state(monkeypatch):
+    """The host must not also run a chained step's boundary copy when the
+    pending verify commits: by then the chained step has overwritten the
+    copy's source in its window, so the boundary column, which only a prefix
+    hit reads, ends up holding a later state."""
+    real = MambaCacheGroups.after_acceptance
+
+    def after_acceptance(self, committed, requests):
+        late: list[tuple[int, int]] = []
+        deferred = set(self.deferred_chained_steps)
+        copy_boundary = self._copy_boundary_state
+
+        def capture(req_id, block_ids, position, count):
+            copies = copy_boundary(req_id, block_ids, position, count)
+            if req_id in deferred:
+                late.extend(copies)
+            return copies
+
+        self._copy_boundary_state = capture
+        try:
+            return real(self, committed, requests) + late
+        finally:
+            del self._copy_boundary_state
+
+    monkeypatch.setattr(MambaCacheGroups, "after_acceptance", after_acceptance)
+    run = _mamba_run(monkeypatch, "align", on_device=True)
+    with pytest.raises(AssertionError):
+        _boundary_states_are_kept(run)
 
 
 def test_mode_none_chains_across_block_boundaries(monkeypatch):

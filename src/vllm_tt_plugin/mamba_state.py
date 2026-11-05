@@ -68,6 +68,22 @@ class MambaStepInputs(NamedTuple):
     state_accepted_counts: torch.Tensor | None
 
 
+class MambaChainPlan(NamedTuple):
+    """A chained verify's state moves, indexed by the pending verify's count.
+
+    One entry per layer, ``None`` for attention layers. Index ``[i, c - 1]``
+    holds row ``i``'s values for a pending verify that committed ``c`` tokens.
+    """
+
+    # int32 ``[rows, 1 + K, 2]``: the ``(src, dst)`` block copy to run before
+    # the step; ``(0, 0)`` (the null block) when there is none.
+    copies_per_layer: list[torch.Tensor | None]
+    # int32 ``[rows, 1 + K, 1 + K]``: the step's state window.
+    windows_per_layer: list[torch.Tensor | None]
+    # int32 ``[rows, 1 + K]``: the block holding the step's start state.
+    start_blocks_per_layer: list[torch.Tensor | None]
+
+
 @dataclass
 class MambaCacheGroups:
     """The ``MambaSpec`` groups of one ``KVCacheConfig``."""
@@ -94,6 +110,13 @@ class MambaCacheGroups:
     moved_to_window_start: set[str] = field(default_factory=set)
     # Request id -> the start-state count of the step being built.
     step_accepted_counts: dict[str, int] = field(default_factory=dict)
+    # The model declares ``supports_mamba_chained_state_moves``: a chained
+    # verify carries its moves for every count the pending verify can accept
+    # (``plan_chained_step``), and the model runs the one its count selects.
+    chained_moves_on_device: bool = False
+    # Request id -> the scheduled tokens of a chained step whose moves the
+    # device runs; its bookkeeping catches up when the pending verify commits.
+    deferred_chained_steps: dict[str, int] = field(default_factory=dict)
 
     def max_num_blocks(self, max_model_len: int) -> int:
         """Block-table row width of a Mamba group, as
@@ -168,6 +191,18 @@ class MambaCacheGroups:
             ids_per_layer, [windows.get(g) for g in layer_to_group_idx], counts
         )
 
+    def forget(self, scheduler_output: SchedulerOutput) -> None:
+        """Drop the bookkeeping of finished, preempted and resumed requests."""
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id in (
+            *scheduler_output.finished_req_ids,
+            *(scheduler_output.preempted_req_ids or ()),
+            *cached.resumed_req_ids,
+        ):
+            self.state_columns.pop(req_id, None)
+            self.moved_to_window_start.discard(req_id)
+            self.deferred_chained_steps.pop(req_id, None)
+
     def begin_step(
         self,
         scheduler_output: SchedulerOutput,
@@ -202,16 +237,10 @@ class MambaCacheGroups:
                     f"scheduled requests {sorted(missing)} have no first query "
                     f"position; positions were given for {sorted(num_computed)}"
                 )
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id in (
-            *scheduler_output.finished_req_ids,
-            *(scheduler_output.preempted_req_ids or ()),
-            *cached.resumed_req_ids,
-        ):
-            self.state_columns.pop(req_id, None)
-            self.moved_to_window_start.discard(req_id)
+        self.forget(scheduler_output)
         # A new or resumed request replays its history: its candidate states
         # are gone, as upstream's new input-batch row starts at count 1.
+        cached = scheduler_output.scheduled_cached_reqs
         fresh = {new.req_id for new in scheduler_output.scheduled_new_reqs}
         fresh.update(cached.resumed_req_ids)
         self.step_accepted_counts = {}
@@ -225,30 +254,51 @@ class MambaCacheGroups:
                 # verify ran, and that verify's result is where the row starts.
                 count = 1
             if self.mamba_cache_mode == "align":
-                req_state = requests[req_id]
-                computed = num_computed[req_id]
-                prev = self.state_columns.get(req_id)
-                if prev is None:
-                    # A new or resumed request; -1 when nothing is computed yet.
-                    prev = (computed - 1) // self.block_size
-                curr = cdiv(computed + num_scheduled, self.block_size) - 1
-                self.state_columns[req_id] = curr
-                if prev != -1 and prev != curr:
-                    if count == PLACEHOLDER_TOKEN_ID:
-                        raise RuntimeError(
-                            f"chained request {req_id} moves its state from "
-                            f"block-table column {prev} to {curr} at position "
-                            f"{computed}, but the copy source depends on the "
-                            "pending verify's accepted count, which only the "
-                            "device knows; chain_blocker must refuse this chain"
-                        )
-                    for g in self.group_indices:
-                        block_ids = req_state.block_ids[g]
-                        copies.append((block_ids[prev + count - 1], block_ids[curr]))
-                    count = 1
-                    self.moved_to_window_start.add(req_id)
+                moves, count = self._move_to_running_column(
+                    req_id,
+                    requests[req_id].block_ids,
+                    num_computed[req_id],
+                    num_scheduled,
+                    count,
+                )
+                copies += moves
             self.step_accepted_counts[req_id] = count
         return copies
+
+    def _move_to_running_column(
+        self,
+        req_id: str,
+        block_ids: Sequence[Sequence[int]],
+        computed: int,
+        num_scheduled: int,
+        count: int,
+    ) -> tuple[list[tuple[int, int]], int]:
+        """Mode ``align``: a step's move into its running column.
+
+        Records the column and returns the copies, one per Mamba group, and the
+        step's start-state count (1 after a move).
+        """
+        prev = self.state_columns.get(req_id)
+        if prev is None:
+            # A new or resumed request; -1 when nothing is computed yet.
+            prev = (computed - 1) // self.block_size
+        curr = cdiv(computed + num_scheduled, self.block_size) - 1
+        self.state_columns[req_id] = curr
+        if prev == -1 or prev == curr:
+            return [], count
+        if count == PLACEHOLDER_TOKEN_ID:
+            raise RuntimeError(
+                f"chained request {req_id} moves its state from block-table "
+                f"column {prev} to {curr} at position {computed}, but the copy "
+                "source depends on the pending verify's accepted count, which "
+                "only the device knows; chain_blocker must refuse this chain"
+            )
+        self.moved_to_window_start.add(req_id)
+        moves = [
+            (block_ids[g][prev + count - 1], block_ids[g][curr])
+            for g in self.group_indices
+        ]
+        return moves, 1
 
     def after_acceptance(
         self,
@@ -267,6 +317,10 @@ class MambaCacheGroups:
         that boundary moves from its window column into the boundary's own
         block-table column, where prefix caching looks for it. If that column
         is the running column, the start state is now in window column 0.
+
+        A request whose next step was chained with its moves on the device
+        (``plan_chained_step``) gets no copies here, because that step ran
+        them; its bookkeeping catches up with this commit and that step's move.
         """
         for req_id in committed:
             self.moved_to_window_start.discard(req_id)
@@ -274,26 +328,127 @@ class MambaCacheGroups:
             return []
         copies: list[tuple[int, int]] = []
         for req_id, (position, count) in committed.items():
-            src = self.state_columns.get(req_id)
-            if src is None:
-                raise RuntimeError(
-                    f"request {req_id} committed {count} tokens at position "
-                    f"{position} but begin_step recorded no running column for it"
-                )
-            running = position + 1
-            aligned = (position + count) // self.block_size * self.block_size
-            if aligned < running:
+            block_ids = requests[req_id].block_ids
+            boundary = self._copy_boundary_state(req_id, block_ids, position, count)
+            num_scheduled = self.deferred_chained_steps.pop(req_id, None)
+            if num_scheduled is None:
+                copies += boundary
                 continue
-            shift = aligned - running
-            dst = aligned // self.block_size - 1
-            if src == dst:
-                self.moved_to_window_start.add(req_id)
-                if shift == 0:
-                    continue
-            for g in self.group_indices:
-                block_ids = requests[req_id].block_ids[g]
-                copies.append((block_ids[src + shift], block_ids[dst]))
+            start_count = 1 if req_id in self.moved_to_window_start else count
+            self._move_to_running_column(
+                req_id, block_ids, position + count, num_scheduled, start_count
+            )
         return copies
+
+    def _copy_boundary_state(
+        self,
+        req_id: str,
+        block_ids: Sequence[Sequence[int]],
+        position: int,
+        count: int,
+    ) -> list[tuple[int, int]]:
+        """Mode ``align``: the boundary copies after a verify committed
+        ``count`` tokens from ``position``, one per Mamba group."""
+        src = self.state_columns.get(req_id)
+        if src is None:
+            raise RuntimeError(
+                f"request {req_id} committed {count} tokens at position "
+                f"{position} but begin_step recorded no running column for it"
+            )
+        running = position + 1
+        aligned = (position + count) // self.block_size * self.block_size
+        if aligned < running:
+            return []
+        shift = aligned - running
+        dst = aligned // self.block_size - 1
+        if src == dst:
+            self.moved_to_window_start.add(req_id)
+            if shift == 0:
+                return []
+        return [
+            (block_ids[g][src + shift], block_ids[g][dst]) for g in self.group_indices
+        ]
+
+    def plan_chained_step(
+        self,
+        row_req_ids: Sequence[str],
+        requests: Mapping[str, TTCachedRequestState],
+        num_scheduled_tokens: Mapping[str, int],
+        layer_to_group_idx: Sequence[int],
+        num_rows: int,
+    ) -> MambaChainPlan:
+        """A chained verify's state moves for every count its pending verify
+        can accept (mode ``align``, ``chained_moves_on_device``).
+
+        Row ``i``'s pending verify starts at the row's committed length minus
+        one (the verify before it has committed, ``chain_blocker``) and
+        commits ``c`` tokens, ``1 <= c <= 1 + K``. For each ``c`` this runs,
+        on the row's bookkeeping, what the host runs between two verifies, and
+        then restores it: the pending verify's boundary copy
+        (``after_acceptance``), and this step's move into its running column
+        (``begin_step``). The model runs the boundary copy itself before the
+        step, and reads the start state where the move would copy it from, so
+        the move needs no copy: the step writes window column 0 anyway. The
+        bookkeeping catches up when the pending verify commits.
+        """
+        width = 1 + self.num_speculative_blocks
+        copies = {
+            g: torch.zeros((num_rows, width, 2), dtype=torch.int32)
+            for g in self.group_indices
+        }
+        windows = {
+            g: torch.zeros((num_rows, width, width), dtype=torch.int32)
+            for g in self.group_indices
+        }
+        starts = {
+            g: torch.zeros((num_rows, width), dtype=torch.int32)
+            for g in self.group_indices
+        }
+        for row, req_id in enumerate(row_req_ids):
+            if (
+                req_id in self.deferred_chained_steps
+                or req_id not in self.state_columns
+            ):
+                raise RuntimeError(
+                    f"chained request {req_id} has no settled running column "
+                    f"(column {self.state_columns.get(req_id)}, deferred step "
+                    f"{self.deferred_chained_steps.get(req_id)}): the verify "
+                    "before its pending one has not committed"
+                )
+            block_ids = requests[req_id].block_ids
+            position = requests[req_id].num_tokens - 1
+            num_scheduled = num_scheduled_tokens[req_id]
+            column = self.state_columns[req_id]
+            moved = req_id in self.moved_to_window_start
+            for c in range(1, width + 1):
+                self.moved_to_window_start.discard(req_id)
+                boundary = self._copy_boundary_state(req_id, block_ids, position, c)
+                start_count = 1 if req_id in self.moved_to_window_start else c
+                moves, start_count = self._move_to_running_column(
+                    req_id, block_ids, position + c, num_scheduled, start_count
+                )
+                first = (position + c + num_scheduled - 1) // self.block_size
+                for i, g in enumerate(self.group_indices):
+                    window = torch.tensor(
+                        block_ids[g][first : first + width], dtype=torch.int32
+                    )
+                    windows[g][row, c - 1] = window
+                    if boundary:
+                        copies[g][row, c - 1] = torch.tensor(boundary[i])
+                    starts[g][row, c - 1] = (
+                        moves[i][0] if moves else window[start_count - 1]
+                    )
+                self.state_columns[req_id] = column
+                if moved:
+                    self.moved_to_window_start.add(req_id)
+                else:
+                    self.moved_to_window_start.discard(req_id)
+            self.deferred_chained_steps[req_id] = num_scheduled
+        return MambaChainPlan(
+            [copies.get(g) for g in layer_to_group_idx],
+            [windows.get(g) for g in layer_to_group_idx],
+            [starts.get(g) for g in layer_to_group_idx],
+        )
 
     def chain_blocker(
         self,
@@ -319,13 +474,21 @@ class MambaCacheGroups:
 
         ``pending_req_ids`` are the pending verifies' rows that are not
         finished, finishing rows included.
+
+        With ``chained_moves_on_device`` a chained row is exempt: its step
+        carries the moves for every count the one unresolved verify can accept
+        (``plan_chained_step``; ``chain_evaluate`` chains over exactly one, and
+        the steps before it commit before the build). A pending row that the
+        step leaves out still counts, since its boundary copy waits for the
+        host commit.
         """
         if self.mamba_cache_mode != "align":
             return None
         chained = set(chained_req_ids)
+        exempt = chained if self.chained_moves_on_device else ()
         for req_id in dict.fromkeys((*pending_req_ids, *chained_req_ids)):
             req_state = requests.get(req_id)
-            if req_state is None:
+            if req_state is None or req_id in exempt:
                 continue
             # The last committed token is the next step's input, not computed.
             first = req_state.num_tokens - 1
