@@ -1009,6 +1009,9 @@ class TTScheduler(AsyncScheduler):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+        if start >= self._prefill_end(request):
+            # Past the prefill every step below keeps the grant as it is.
+            return num_new_tokens
         # A multimodal request is never split, so vLLM's own block-aligned
         # clipping (which would end a chunk at the last cacheable block) does
         # not apply to it either.
