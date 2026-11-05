@@ -191,6 +191,14 @@ class TTModelInput:
     # Same condition. int32 ``[rows]``: each row's start state is in window
     # column ``state_accepted_counts - 1``.
     state_accepted_counts: torch.Tensor | None = None
+    # A chained verify in mode align with ``chained_moves_on_device`` only
+    # (``MambaCacheGroups.plan_chained_step``), else ``None``. Per layer,
+    # indexed ``[row, c - 1]`` by the count c the pending verify accepted:
+    # int32 ``[rows, 1 + K, 2]`` block copies, ``[rows, 1 + K, 1 + K]``
+    # windows and ``[rows, 1 + K]`` start blocks; ``None`` for attention layers.
+    state_chain_copies_per_layer: list[torch.Tensor | None] | None = None
+    state_chain_windows_per_layer: list[torch.Tensor | None] | None = None
+    state_chain_start_blocks_per_layer: list[torch.Tensor | None] | None = None
 
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because

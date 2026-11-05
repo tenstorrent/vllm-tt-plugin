@@ -1011,6 +1011,10 @@ class TTModelRunner:
                     f"{self._mamba_groups.mamba_cache_mode!r} but does not "
                     f"implement {missing_hooks}"
                 )
+            capabilities = getattr(self.model, "model_capabilities", None) or {}
+            self._mamba_groups.chained_moves_on_device = bool(
+                capabilities.get("supports_mamba_chained_state_moves", False)
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -4201,6 +4205,13 @@ class TTModelRunner:
         chained row) and each row's first query position.
         """
         row_req_ids = model_input.row_req_ids or []
+        groups = self._mamba_groups
+        if (
+            model_input.chain_rows is not None
+            and groups.chained_moves_on_device
+            and groups.mamba_cache_mode == "align"
+        ):
+            return self._attach_mamba_chain_plan(scheduler_output, model_input)
         # A prefill's positions are a numpy array, a decode's a tensor.
         positions = torch.as_tensor(model_input.input_positions)
         first = positions if positions.dim() == 1 else positions[:, 0]
@@ -4239,6 +4250,47 @@ class TTModelRunner:
             state_accepted_counts=state.state_accepted_counts,
         )
         return model_input
+
+    def _attach_mamba_chain_plan(
+        self, scheduler_output: SchedulerOutput, model_input: TTModelInput
+    ) -> TTModelInput:
+        """A chained verify's state inputs when the model runs its moves.
+
+        Every row is chained. The plan holds the window, start block and
+        boundary copy for each count the pending verify can accept; the
+        ordinary window keywords carry the all-accepted entry, the one the
+        submitted positions assume, and the counts carry -1.
+        """
+        groups = self._mamba_groups
+        row_req_ids = model_input.row_req_ids or []
+        groups.forget(scheduler_output)
+        plan = groups.plan_chained_step(
+            row_req_ids,
+            self.requests,
+            scheduler_output.num_scheduled_tokens,
+            self._layer_to_group_idx or [],
+            self.tt_max_batch_size,
+        )
+        windows = [
+            None if w is None else w[:, -1].contiguous() for w in plan.windows_per_layer
+        ]
+        # Padding rows hold 1, as on every other step.
+        counts = torch.ones(self.tt_max_batch_size, dtype=torch.int32)
+        counts[: len(row_req_ids)] = PLACEHOLDER_TOKEN_ID
+        return replace(
+            model_input,
+            block_tables=model_input.block_tables_per_group[
+                groups.attention_group_index
+            ],
+            state_block_ids_per_layer=[
+                None if w is None else w[:, :1] for w in windows
+            ],
+            state_block_windows_per_layer=windows,
+            state_accepted_counts=counts,
+            state_chain_copies_per_layer=plan.copies_per_layer,
+            state_chain_windows_per_layer=plan.windows_per_layer,
+            state_chain_start_blocks_per_layer=plan.start_blocks_per_layer,
+        )
 
     def _apply_kv_cache_block_ops(self, scheduler_output: SchedulerOutput) -> None:
         """Hand the model the block zeroing and copies vLLM asks for.
