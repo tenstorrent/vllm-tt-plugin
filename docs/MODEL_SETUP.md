@@ -192,8 +192,13 @@ Declaration rules:
   `cache_config.mamba_cache_mode`. vLLM's `MambaModelConfig` selects `none`
   when prefix caching is off and `align` when it is on; prefix caching stays
   on only for a model that declares `supports_prefix_caching`. In mode `none`
-  a request holds one state block per group. In mode `align`, block-table
-  column `p` of a group holds the state after `(p + 1) * block_size` tokens.
+  a request holds one state block per group, provided `MambaSpec.block_size`
+  is at least `max_model_len`, as upstream resolves `mamba_block_size`;
+  `MambaManager` otherwise allocates one block per `block_size` tokens in
+  every `MambaSpec` group. In mode `align`, block-table column `p` of a group
+  holds the state after `(p + 1) * block_size` tokens, and `MambaSpec.block_size`
+  must equal the attention `block_size`: the scheduler ends prefill chunks on
+  multiples of the smallest group `block_size`.
 - `TTModelRunner` supports modes `none` and `align`. It requires
   `MambaSpec.num_speculative_blocks == 0`,
   `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` for all
