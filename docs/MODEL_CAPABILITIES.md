@@ -113,6 +113,17 @@ speculating launch, while a model that also offers `logits` speculates for
 sampled requests and applies all of those on the host. See
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
 
+`spec_ids_are_sampled` is the one exception to the greedy-only rule, and it
+holds only while the step actually samples on the device: a request whose
+only non-greedy control is its temperature is then drafted and its
+`argmax_ids` verify is answered with the device sampler's draws (exact
+rejection sampling). A penalty keeps a request plain, the token controls
+above stay refused, a host-sampled step withholds the drafts and drops a
+retained proposal, and on a model that also serves `logits` the device draws
+take precedence on such a step. Per-request admission on a launch without
+narrow decode is unchanged by the capability. The rules are gathered in
+[SPEC_DECODE_CONTRACT.md, section 4i](SPEC_DECODE_CONTRACT.md#4i-sampled-ids-spec_ids_are_sampled).
+
 Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py),
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
@@ -173,7 +184,9 @@ Admission is not device validation for a particular DP deployment.
 applies even if the model also declares `on_device`. Every decode step of
 that launch is a verify, so unless the model also serves `logits`,
 per-request admission refuses a request with a non-zero temperature or a
-penalty.
+penalty, whether or not the model declares `spec_ids_are_sampled` (that
+capability lifts the temperature rule for draft publication on a
+device-sampled step, not for admission).
 
 Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py), and

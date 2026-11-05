@@ -760,18 +760,42 @@ today, use `temperature=0` with no penalties to exercise speculation.
 `TTModelRunner._publish_draft` withholds drafts for requests with non-zero
 temperature or penalties.
 
-**A sampled request never enters an `argmax_ids` verify.** A verify in
-`argmax_ids` mode commits the target argmax on every row, so it cannot apply a
-row's temperature or penalties. When the model supports narrow decode, every
-step that includes a sampled or penalized request runs as the ordinary decode,
-with the selected model's normal sampling path; the other rows' drafts on that
-step are dropped, so no request speculates while a sampled one shares its
-batch. A model without narrow decode verifies every decode step, so
-`TTPlatform.validate_request` refuses a request with a non-zero temperature or
-a penalty on that launch. An adapter that also declares `logits` does not have
-this limit: a step with a sampled or penalized row verifies in `logits` mode,
-and the runner samples every row from its own distribution (section 4h of the
-contract).
+**A sampled request never enters an `argmax_ids` verify**, with one
+exception below. A verify in `argmax_ids` mode commits the target argmax on
+every row, so it cannot apply a row's temperature or penalties. When the model
+supports narrow decode, every step that includes a sampled or penalized
+request runs as the ordinary decode, with the selected model's normal sampling
+path; the other rows' drafts on that step are dropped, so no request
+speculates while a sampled one shares its batch. A model without narrow decode
+verifies every decode step, so `TTPlatform.validate_request` refuses a request
+with a non-zero temperature or a penalty on that launch. An adapter that also
+declares `logits` does not have this limit: a step with a sampled or penalized
+row verifies in `logits` mode, and the runner samples every row from its own
+distribution (section 4h of the contract).
+
+**The exception: an adapter declaring `spec_ids_are_sampled`.** Its
+`argmax_ids` verify of a step that samples on the device answers a drafted
+sampled row with the device sampler's draws under that row's own temperature,
+top-k, top-p and seed, so the id walk is exact rejection sampling and a
+request whose only non-greedy control is its temperature speculates. What to
+expect on such an adapter:
+
+- it applies only while the step actually samples on the device: configure a
+  `sample_on_device_mode` (the capability needs `supports_sample_on_device`),
+  and keep requests within the device sampler's limits (the
+  [default top-k](#default-top-k-for-device-sampling) above); a step any row
+  of which samples on the host withholds the drafts and runs as before;
+- a presence, frequency or repetition penalty keeps a request plain, and
+  logprobs, structured output, `bad_words`, `allowed_token_ids` and
+  `min_tokens` are refused on a speculative launch exactly as above;
+- on an adapter that also serves `logits`, the device draws take precedence on
+  a device-sampled step and the host `logits` walk serves the rest;
+- a launch without narrow decode still refuses sampled and penalized requests
+  per request: the capability lifts the temperature rule for draft
+  publication, not for admission.
+
+Section 4i of [the model contract](docs/SPEC_DECODE_CONTRACT.md) gathers the
+rules.
 
 On an adapter that serves `logits`, logprobs, structured output, `bad_words`,
 `allowed_token_ids` and `min_tokens` speculate too: the host accept walk
@@ -797,8 +821,10 @@ clear error before anything reaches the device:
 - Tensor parallel and pipeline parallel execution are provided by the models
   internal implementation, not exposed at the vLLM level.
 - Speculative decoding supports `argmax_ids` verification for greedy requests
-  and `logits` verification for sampled ones, with `ngram` or the model-owned
-  `custom_class` drafter on a compatible tt-metal adapter.
+  (and, on an adapter declaring `spec_ids_are_sampled`, for sampled requests
+  on device-sampled steps) and `logits` verification for sampled ones, with
+  `ngram` or the model-owned `custom_class` drafter on a compatible tt-metal
+  adapter.
   See [Speculative Decoding](#speculative-decoding) for launch settings,
   model selection and sampling limits.
 - LoRA is not currently supported.
