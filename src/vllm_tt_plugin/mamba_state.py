@@ -117,6 +117,11 @@ class MambaCacheGroups:
     # Request id -> the scheduled tokens of a chained step whose moves the
     # device runs; its bookkeeping catches up when the pending verify commits.
     deferred_chained_steps: dict[str, int] = field(default_factory=dict)
+    # ``prefix_cache_retention_interval`` is not 0. At 0 vLLM caches a Mamba
+    # block only at a prompt's replay boundary or a shared-prefix junction
+    # (``MambaManager.reachable_block_mask``), never at a block boundary that
+    # decoding reaches, so the boundary copy after acceptance has no reader.
+    retains_decode_boundaries: bool = True
 
     def max_num_blocks(self, max_model_len: int) -> int:
         """Block-table row width of a Mamba group, as
@@ -348,13 +353,21 @@ class MambaCacheGroups:
         count: int,
     ) -> list[tuple[int, int]]:
         """Mode ``align``: the boundary copies after a verify committed
-        ``count`` tokens from ``position``, one per Mamba group."""
+        ``count`` tokens from ``position``, one per Mamba group.
+
+        None without ``retains_decode_boundaries``. The copy also moves the
+        start state into window column 0 when the boundary ends the running
+        column, but then the next step moves into a new column, and without
+        the copy it reads the same state from window column ``count - 1``.
+        """
         src = self.state_columns.get(req_id)
         if src is None:
             raise RuntimeError(
                 f"request {req_id} committed {count} tokens at position "
                 f"{position} but begin_step recorded no running column for it"
             )
+        if not self.retains_decode_boundaries:
+            return []
         running = position + 1
         aligned = (position + count) // self.block_size * self.block_size
         if aligned < running:
@@ -481,11 +494,33 @@ class MambaCacheGroups:
         the steps before it commit before the build). A pending row that the
         step leaves out still counts, since its boundary copy waits for the
         host commit.
+
+        Without ``retains_decode_boundaries`` no boundary copy is due, so only
+        a chained row can block: when its step's running column could differ
+        from the oldest pending verify's, that is, when a boundary lies within
+        ``step_width * num_pending_steps`` tokens past the oldest pending
+        verify's last query token.
         """
         if self.mamba_cache_mode != "align":
             return None
         chained = set(chained_req_ids)
         exempt = chained if self.chained_moves_on_device else ()
+        if not self.retains_decode_boundaries:
+            # No boundary copy is due, so a pending row needs nothing. A
+            # chained row still needs the running column of every step from
+            # the oldest pending one to the chained one to be the same: a move
+            # into a new column reads from the column the count selects.
+            for req_id in chained_req_ids:
+                req_state = requests.get(req_id)
+                if req_state is None or req_id in exempt:
+                    continue
+                first = req_state.num_tokens - 1
+                last = first + step_width * (num_pending_steps + 1)
+                if (first + step_width - 1) // self.block_size != (
+                    last - 1
+                ) // self.block_size:
+                    return "mamba_boundary"
+            return None
         for req_id in dict.fromkeys((*pending_req_ids, *chained_req_ids)):
             req_state = requests.get(req_id)
             if req_state is None or req_id in exempt:
@@ -596,4 +631,7 @@ def mamba_cache_groups(
         block_size=block_size,
         attention_group_index=attention_group_index,
         num_speculative_blocks=num_speculative_blocks.pop(),
+        retains_decode_boundaries=(
+            getattr(cache_config, "prefix_cache_retention_interval", None) != 0
+        ),
     )

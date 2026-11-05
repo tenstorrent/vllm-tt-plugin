@@ -407,7 +407,9 @@ class _Harness:
         self.plugin_groups = (
             mamba_cache_groups(
                 self.kv_cache_config.kv_cache_groups,
-                SimpleNamespace(mamba_cache_mode=mode),
+                SimpleNamespace(
+                    mamba_cache_mode=mode, prefix_cache_retention_interval=retention
+                ),
                 MAX_MODEL_LEN,
             )
             if plugin_groups
@@ -1134,6 +1136,22 @@ def test_mode_align_moves_state_with_accepted_counts_and_boundary_copies():
     assert any(c.conv_row_offset > 0 for c in pre), pre
     assert any(c.conv_row_offset > 0 for c in post), post
     assert any(c.temporal_src != c.conv_src for c in pre + post)
+
+
+def test_retention_0_runs_no_boundary_copy_and_every_read_stays_exact():
+    """At retention 0 vLLM caches no decode-time boundary state, so the TT
+    runner's ``MambaCacheGroups`` skips upstream's boundary copies after
+    acceptance. Under the real scheduler and ``KVCacheManager`` the second
+    ledger still finds every state the TT layout reads, across block
+    boundaries with partial acceptance."""
+    h = _Harness("align", num_spec=K, retention=0, max_num_batched_tokens=2048)
+    assert not h.plugin_groups.retains_decode_boundaries
+    h.add("a", _prompt(1, 1010), max_tokens=60)
+    h.add("bb", _prompt(2, 2030), max_tokens=60)
+    h.run(accept=_accept_pattern)
+    assert h.finished("a") and h.finished("bb")
+    assert any(s.post_copies for s in h.steps), "upstream copies at boundaries"
+    assert not any(s.groups_post for s in h.steps)
 
 
 @pytest.mark.parametrize(
