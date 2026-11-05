@@ -254,6 +254,15 @@ def test_chained_align_steps_read_the_committed_state(monkeypatch, cycle):
     # for it rather than build over a pending state move.
     assert run.controller._chain_breaks["mamba_boundary"] > 0
     _boundary_states_are_kept(run)
+    # The "TT submissions:" line reports the breaks by reason and the share of
+    # fused verifies that chained.
+    controller = run.controller
+    report = controller._chain_report()
+    share = (
+        100.0 * controller._chained_submissions / controller._fused_verify_submissions
+    )
+    assert f"({share:.1f}% of {controller._fused_verify_submissions} fused" in report
+    assert f"mamba_boundary={controller._chain_breaks['mamba_boundary']}" in report
 
 
 def test_chained_align_steps_match_the_unchained_run(monkeypatch):

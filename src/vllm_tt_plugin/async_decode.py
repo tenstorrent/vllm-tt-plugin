@@ -1234,8 +1234,11 @@ class TTAsyncDecodeController:
         breaks = ", ".join(
             f"{reason}={count}" for reason, count in sorted(self._chain_breaks.items())
         )
+        fused = self._fused_verify_submissions
+        chained_share = 100.0 * self._chained_submissions / fused if fused else 0.0
         return (
-            f"; chain: {self._chained_submissions} chained fused steps, "
+            f"; chain: {self._chained_submissions} chained fused steps "
+            f"({chained_share:.1f}% of {fused} fused verifies), "
             f"{sum(self._chain_breaks.values())} chain breaks"
             + (f" ({breaks})" if breaks else "")
             + f", prefill_overlap={self._prefill_overlap_steps}"
