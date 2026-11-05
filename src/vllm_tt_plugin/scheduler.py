@@ -13,6 +13,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -881,11 +882,21 @@ class TTScheduler(AsyncScheduler):
         ``num_prompt_tokens - 1`` (vLLM always recomputes the last token) and
         rounded down to whole blocks. Returns 0 when caching is off, the request
         skips the cache, or anything needed is missing.
+
+        With MambaSpec groups a hit also needs the recurrent state cached at
+        its exact end, which group 0 does not show (it may even be a Mamba
+        group). There the hit is the coordinator's ``find_longest_cache_hit``,
+        the call ``get_computed_blocks`` makes; it reads the block pool only.
         """
         try:
             manager = self.kv_cache_manager
             if not manager.prefix_cache_lookup_enabled(request):
                 return 0
+            if self._has_mamba_groups():
+                _, hit, _ = manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, int(request.num_tokens) - 1
+                )
+                return int(hit)
             pool = manager.block_pool
             block_size = int(self.block_size)
             if block_size <= 0 or int(pool.hash_block_size) != block_size:
@@ -899,6 +910,13 @@ class TTScheduler(AsyncScheduler):
             return hits * block_size
         except (AttributeError, TypeError, ValueError, IndexError):
             return 0
+
+    def _has_mamba_groups(self) -> bool:
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        return any(
+            isinstance(group.kv_cache_spec, MambaSpec)
+            for group in getattr(kv_cache_config, "kv_cache_groups", ())
+        )
 
     def _pending_prefill_tokens(self, request: Request, waiting: bool = False) -> int:
         """Prompt tokens a request still has to prefill, as far as known now.

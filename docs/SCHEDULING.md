@@ -459,8 +459,12 @@ holding a short prompt. Two keys address that:
   moves, or prefix-cache stats). The estimate is capped at
   `num_prompt_tokens - 1`, is 0 when prefix caching is off, the request skips
   the cache (prompt logprobs), or the hash block size differs from the
-  scheduler block size. The cache can change before the request is admitted, so
-  it is an estimate. Running partial prefills use their real computed count.
+  scheduler block size. With `MambaSpec` groups a hit also needs the recurrent
+  state at its end, so the estimate is instead the KV cache coordinator's
+  `find_longest_cache_hit` over all groups, the call `get_computed_blocks`
+  makes (also block-pool reads only). The cache can change before the request
+  is admitted, so it is an estimate. Running partial prefills use their real
+  computed count.
 - `dp_load_prefill_tokens_per_unit` (default 2048, integer >= 1).
 - `dp_load_prefill_min_tokens` (default 8192, integer >= 0): a request adds to
   `pending_prefill_tokens` only if its own pending tokens are at least this

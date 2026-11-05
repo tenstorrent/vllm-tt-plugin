@@ -1394,3 +1394,72 @@ def test_mamba_block_size_rules_are_checked(mode, gdn_block_size, match):
             SimpleNamespace(mamba_cache_mode=mode),
             MAX_MODEL_LEN,
         )
+
+
+# --- Prefill-aware DP load: the hybrid prefix-cache hit -----------------------
+
+
+def _block_pool_state(scheduler: TTScheduler):
+    manager = scheduler.kv_cache_manager
+    pool = manager.block_pool
+    return (
+        [(b.block_id, b.ref_cnt, b.block_hash) for b in pool.blocks],
+        [b.block_id for b in pool.free_block_queue.get_all_free_blocks()],
+        vars(manager.prefix_cache_stats).copy() if manager.prefix_cache_stats else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("variant", "hit"),
+    [
+        # The whole prompt again: the GDN state was kept at the prompt's last
+        # block boundary (3072), as were the attention blocks before it.
+        ("same", 3072),
+        # 2500 shared tokens: attention blocks hit up to 2048, but no GDN state
+        # was kept at 1024 or 2048, so the request recomputes from 0.
+        ("shared", 0),
+        ("other", 0),
+    ],
+)
+def test_prefill_aware_estimate_is_the_hybrid_hit(variant, hit):
+    """``TTScheduler._estimate_cached_prefix_tokens`` counts a waiting
+    request's prefill as the scheduler will: with MambaSpec groups a hit also
+    needs the GDN state at its end. The estimate equals the hit the scheduler
+    then takes and leaves the block pool and prefix-cache stats as they were.
+    The group-0 walk it replaces gets one of these cases wrong."""
+    h = _Harness("align", num_spec=0, max_num_batched_tokens=8192)
+    prompt = _prompt(1, 3500)
+    h.add("a", prompt, max_tokens=1)
+    h.run(until=lambda: h.finished("a"))
+    variants = {
+        "same": list(prompt),
+        "shared": prompt[:2500] + _prompt(2, 1000),
+        "other": _prompt(3, 3500),
+    }
+    h.add("b", variants[variant], max_tokens=1)
+    scheduler = h.scheduler
+    request = scheduler.requests["b"]
+    before = _block_pool_state(scheduler)
+    estimate = scheduler._estimate_cached_prefix_tokens(request)
+    assert _block_pool_state(scheduler) == before
+    assert estimate == hit
+    h.run()
+    assert h.finished("b")
+    assert {r: n for s in h.steps for r, n in s.new_hits.items()}["b"] == hit
+
+
+def test_group_0_walk_misses_the_hit_of_a_repeated_prompt():
+    """The estimate without MambaSpec groups walks group 0 from block 0. On the
+    Qwen3.8 layout group 0 is a GDN group, which keeps state only at the
+    prompt's last boundary, so the walk stops at block 0 and reports no hit
+    for a repeat that the scheduler serves from 3072."""
+    h = _Harness("align", num_spec=0, max_num_batched_tokens=8192)
+    assert isinstance(h.kv_cache_config.kv_cache_groups[0].kv_cache_spec, MambaSpec)
+    prompt = _prompt(1, 3500)
+    h.add("a", prompt, max_tokens=1)
+    h.run(until=lambda: h.finished("a"))
+    h.add("b", list(prompt), max_tokens=1)
+    request = h.scheduler.requests["b"]
+    with patch.object(TTScheduler, "_has_mamba_groups", return_value=False):
+        assert h.scheduler._estimate_cached_prefix_tokens(request) == 0
+    assert h.scheduler._estimate_cached_prefix_tokens(request) == 3072
