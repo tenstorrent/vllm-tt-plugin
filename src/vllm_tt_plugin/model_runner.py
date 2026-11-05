@@ -1227,7 +1227,6 @@ class TTModelRunner:
         """
         if self._layer_to_group_idx is None:
             return None
-        result = [block_tables_per_group[g] for g in self._layer_to_group_idx]
         # Pad to the warmup shape ``[max_batch, max_num_blocks_per_req]``.
         # The model side (``Transformer._page_tables_to_ttnn``) allocates
         # *persistent* ttnn device tensors at this shape during warmup so
@@ -1237,14 +1236,12 @@ class TTModelRunner:
         # tables push their content into those buffers. Padding rows with
         # zeros is harmless — the kernel only reads up to each layer's
         # active block count.
+        # The layers of a group share its padded table.
         max_batch = self.tt_max_batch_size
         target_shape = (max_batch, self.max_num_blocks_per_req)
         padded = []
-        for bt in result:
-            if bt is None:
-                padded.append(None)
-                continue
-            if bt.shape == target_shape:
+        for bt in block_tables_per_group:
+            if bt is None or bt.shape == target_shape:
                 padded.append(bt)
                 continue
             full = torch.zeros(target_shape, dtype=bt.dtype)
@@ -1252,7 +1249,7 @@ class TTModelRunner:
             cols = min(bt.shape[1], target_shape[1])
             full[:rows, :cols] = bt[:rows, :cols]
             padded.append(full)
-        return padded
+        return list(map(padded.__getitem__, self._layer_to_group_idx))
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
@@ -4263,17 +4260,19 @@ class TTModelRunner:
         """
         groups = self._mamba_groups
         row_req_ids = model_input.row_req_ids or []
+        layer_to_group_idx = self._layer_to_group_idx or []
         groups.forget(scheduler_output)
         plan = groups.plan_chained_step(
             row_req_ids,
             self.requests,
             scheduler_output.num_scheduled_tokens,
-            self._layer_to_group_idx or [],
+            layer_to_group_idx,
             self.tt_max_batch_size,
         )
-        windows = [
-            None if w is None else w[:, -1].contiguous() for w in plan.windows_per_layer
-        ]
+        windows = {
+            g: plan.windows_per_layer[layer_to_group_idx.index(g)][:, -1].contiguous()
+            for g in groups.group_indices
+        }
         # Padding rows hold 1, as on every other step.
         counts = torch.ones(self.tt_max_batch_size, dtype=torch.int32)
         counts[: len(row_req_ids)] = PLACEHOLDER_TOKEN_ID
@@ -4282,10 +4281,10 @@ class TTModelRunner:
             block_tables=model_input.block_tables_per_group[
                 groups.attention_group_index
             ],
-            state_block_ids_per_layer=[
-                None if w is None else w[:, :1] for w in windows
-            ],
-            state_block_windows_per_layer=windows,
+            state_block_ids_per_layer=groups.per_layer(
+                {g: w[:, :1] for g, w in windows.items()}, layer_to_group_idx
+            ),
+            state_block_windows_per_layer=groups.per_layer(windows, layer_to_group_idx),
             state_accepted_counts=counts,
             state_chain_copies_per_layer=plan.copies_per_layer,
             state_chain_windows_per_layer=plan.windows_per_layer,

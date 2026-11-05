@@ -36,6 +36,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import numpy as np
 import torch
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroupSpec, MambaSpec
@@ -173,28 +174,51 @@ class MambaCacheGroups:
         ``num_computed`` is as for ``begin_step``, which must have run for this
         step.
         """
-        seq_lens = torch.zeros(block_tables_per_group[0].shape[0], dtype=torch.int64)
-        for row, req_id in enumerate(row_req_ids):
-            seq_lens[row] = num_computed[req_id] + num_scheduled_tokens[req_id]
         width = 1 + self.num_speculative_blocks
-        windows: dict[int, torch.Tensor] = {}
-        for g in self.group_indices:
-            ids = self.state_windows(block_tables_per_group[g], seq_lens)
-            padded = torch.zeros((num_rows, width), dtype=torch.int32)
-            rows = min(ids.shape[0], num_rows)
-            padded[:rows] = ids[:rows]
-            windows[g] = padded
-        ids_per_layer = [
-            windows[g][:, :1] if g in windows else None for g in layer_to_group_idx
-        ]
+        live = min(len(row_req_ids), num_rows)
+        req_ids = row_req_ids[:live]
+        # NumPy, one array for all groups: a few small operations per group.
+        stacked = np.zeros((len(self.group_indices), num_rows, width), dtype=np.int32)
+        if self.mamba_cache_mode == "none":
+            rows, columns = slice(None, live), slice(None, width)
+        else:
+            # The running state's column, as ``state_windows`` finds it.
+            starts = [
+                max(num_computed[r] + num_scheduled_tokens[r] - 1, 0) // self.block_size
+                for r in req_ids
+            ]
+            rows = np.arange(live)[:, None]
+            columns = np.array(starts, dtype=np.int64)[:, None] + np.arange(width)
+        for i, g in enumerate(self.group_indices):
+            stacked[i, :live] = block_tables_per_group[g].numpy()[rows, columns]
+        tensor = torch.from_numpy(stacked)
+        windows = {g: tensor[i] for i, g in enumerate(self.group_indices)}
+        ids_per_layer = self.per_layer(
+            {g: tensor[i, :, :1] for i, g in enumerate(self.group_indices)},
+            layer_to_group_idx,
+        )
         if not self.num_speculative_blocks:
             return MambaStepInputs(ids_per_layer, None, None)
-        counts = torch.ones(num_rows, dtype=torch.int32)
-        for row, req_id in enumerate(row_req_ids[:num_rows]):
-            counts[row] = self.step_accepted_counts.get(req_id, 1)
-        return MambaStepInputs(
-            ids_per_layer, [windows.get(g) for g in layer_to_group_idx], counts
+        counts = torch.tensor(
+            [self.step_accepted_counts.get(r, 1) for r in req_ids]
+            + [1] * (num_rows - live),
+            dtype=torch.int32,
         )
+        return MambaStepInputs(
+            ids_per_layer, self.per_layer(windows, layer_to_group_idx), counts
+        )
+
+    @staticmethod
+    def per_layer(
+        by_group: Mapping[int, Any], layer_to_group_idx: Sequence[int]
+    ) -> list[Any]:
+        """``by_group`` expanded to one entry per layer, ``None`` for a layer
+        whose group has no entry. The layers of a group share one object, so
+        a model can convert each group's tensor once."""
+        if not layer_to_group_idx:
+            return []
+        table = [by_group.get(g) for g in range(max(layer_to_group_idx) + 1)]
+        return list(map(table.__getitem__, layer_to_group_idx))
 
     def forget(self, scheduler_output: SchedulerOutput) -> None:
         """Drop the bookkeeping of finished, preempted and resumed requests."""
@@ -405,18 +429,15 @@ class MambaCacheGroups:
         bookkeeping catches up when the pending verify commits.
         """
         width = 1 + self.num_speculative_blocks
-        copies = {
-            g: torch.zeros((num_rows, width, 2), dtype=torch.int32)
-            for g in self.group_indices
-        }
-        windows = {
-            g: torch.zeros((num_rows, width, width), dtype=torch.int32)
-            for g in self.group_indices
-        }
-        starts = {
-            g: torch.zeros((num_rows, width), dtype=torch.int32)
-            for g in self.group_indices
-        }
+        num_groups = len(self.group_indices)
+        # Nested lists ``[group][row][count - 1]``, one tensor each at the end.
+        copies = [
+            [[(0, 0)] * width for _ in range(num_rows)] for _ in range(num_groups)
+        ]
+        windows = [
+            [[[0] * width] * width for _ in range(num_rows)] for _ in range(num_groups)
+        ]
+        starts = [[[0] * width for _ in range(num_rows)] for _ in range(num_groups)]
         for row, req_id in enumerate(row_req_ids):
             if (
                 req_id in self.deferred_chained_steps
@@ -442,13 +463,11 @@ class MambaCacheGroups:
                 )
                 first = (position + c + num_scheduled - 1) // self.block_size
                 for i, g in enumerate(self.group_indices):
-                    window = torch.tensor(
-                        block_ids[g][first : first + width], dtype=torch.int32
-                    )
-                    windows[g][row, c - 1] = window
+                    window = block_ids[g][first : first + width]
+                    windows[i][row][c - 1] = window
                     if boundary:
-                        copies[g][row, c - 1] = torch.tensor(boundary[i])
-                    starts[g][row, c - 1] = (
+                        copies[i][row][c - 1] = boundary[i]
+                    starts[i][row][c - 1] = (
                         moves[i][0] if moves else window[start_count - 1]
                     )
                 self.state_columns[req_id] = column
@@ -457,10 +476,17 @@ class MambaCacheGroups:
                 else:
                     self.moved_to_window_start.discard(req_id)
             self.deferred_chained_steps[req_id] = num_scheduled
+        copies_t = torch.tensor(copies, dtype=torch.int32)
+        windows_t = torch.tensor(windows, dtype=torch.int32)
+        starts_t = torch.tensor(starts, dtype=torch.int32)
         return MambaChainPlan(
-            [copies.get(g) for g in layer_to_group_idx],
-            [windows.get(g) for g in layer_to_group_idx],
-            [starts.get(g) for g in layer_to_group_idx],
+            *(
+                self.per_layer(
+                    {g: t[i] for i, g in enumerate(self.group_indices)},
+                    layer_to_group_idx,
+                )
+                for t in (copies_t, windows_t, starts_t)
+            )
         )
 
     def chain_blocker(

@@ -43,7 +43,9 @@ decode also receive `state_block_ids_per_layer`. It has one entry per layer,
 in `page_tables_per_layer` order. An attention layer's entry is `None`. A
 `MambaSpec` layer's entry is a CPU int32 tensor `[tt_max_batch_size, 1]`:
 row `i` is the block id that holds the recurrent state of submitted row `i`
-for that layer's group.
+for that layer's group. All layers of one group get the same tensor object,
+in this list and in every per-layer list below and in `page_tables_per_layer`,
+so a model can convert each group's tensor once.
 
 1. `TTModelRunner` selects the block as upstream
    `mamba_get_block_table_tensor` does: column 0 of the row of the layer's
