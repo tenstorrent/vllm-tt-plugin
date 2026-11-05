@@ -15,7 +15,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
-from vllm_tt_plugin.model_input import TTCompactedHostLogits
+from vllm_tt_plugin.model_input import TTCompactedHostLogits, live_row_index
 from vllm_tt_plugin.scheduler import (
     TT_VALID_DRAFTS_ATTR,
     get_tt_finishing_req_ids,
@@ -1117,6 +1117,17 @@ class TTAsyncDecodeController:
             self.runner._pending_async_overlap_ok.append(overlap_ok)
         self._log_overlap_counters(force=unsafe_overlap)
 
+    def count_accepted_drafts(
+        self, model_input: TTModelInput, counts: torch.Tensor
+    ) -> None:
+        """Add a verify's accepted drafts to the "TT submissions:" report: each
+        live row's committed count less the one token it commits anyway.
+
+        Every accept walk calls it, on the asynchronous and the synchronous
+        tail alike."""
+        live = live_row_index(model_input)
+        self._accepted_drafts += max(0, int(counts[live].sum()) - int(live.numel()))
+
     def count_decode_submission(self, model_input: TTModelInput) -> None:
         """Count what was actually submitted, and report it on a cadence.
 
@@ -1655,8 +1666,7 @@ class TTAsyncDecodeController:
                 completion_time_ns=time.perf_counter_ns(),
             )
         walk = self.runner.walk_spec_acceptance(model_input, finalized.tt_out)
-        live_rows = len(model_input.row_req_ids)
-        self._accepted_drafts += max(0, int(walk.counts[:live_rows].sum()) - live_rows)
+        self.count_accepted_drafts(model_input, walk.counts)
         if finalized.p0 is None:
             prefixes = self.runner.spec_committed_prefixes(
                 model_input, walk.committed, walk.counts
