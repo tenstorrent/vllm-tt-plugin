@@ -148,10 +148,26 @@ vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers
 (`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`).
 A block that held Mamba state can be reassigned to an attention group, and its
 stale bytes then read as NaN or Inf at positions attention does not write.
-vLLM lists only the blocks newly allocated to attention groups
+vLLM lists every block newly allocated to an attention group
 (`vllm/v1/core/single_type_kv_cache_manager.py:117-121`). This is why the
 adapter must implement `zero_kv_cache_blocks`; see
 [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
+
+`TTModelRunner` passes on only the listed blocks that can still be read
+unwritten while they hold state (`MambaCacheGroups.blocks_to_zero`): a block
+that a `MambaSpec` group owned since its last zeroing, unless the prefill step
+that gets it writes all of its positions. This relies on two properties of the
+model:
+
+- It allocates its KV buffers zeroed, as upstream
+  `vllm.v1.worker.utils.allocate_kv_cache` does, so a block that only
+  attention used holds zeroes or finite values.
+- A step writes the keys and values of its scheduled positions before its
+  attention reads them from the cache.
+
+With attention groups of different KV precisions
+(`KVCacheConfig.has_mixed_precision_kv_cache`) the runner passes on every
+listed block.
 
 `TTModelRunner` derives `state_block_ids_per_layer` from the page tables, so it
 changes only on a step whose page tables or batch layout change. Under the

@@ -506,13 +506,14 @@ def _state_ids(model_input, layer: int) -> list[int]:
     return model_input.state_block_ids_per_layer[layer].reshape(-1).tolist()
 
 
-def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
+def test_mode_none_reads_state_from_column_0():
     """Mode none: a request's single GDN block per group is its state block.
 
     Requests A and B prefill, then decode. Every GDN layer gets the block of
     its own group for each row, attention layers get none, and the padding
-    rows get the null block 0. vLLM's ``new_block_ids_to_zero`` reaches the
-    model before the forward.
+    rows get the null block 0. vLLM lists the new attention blocks in
+    ``new_block_ids_to_zero``, but no GDN group has owned them, so the model
+    zeroes none.
     """
     cfg = _vllm_config()
     model = _RecordingModel()
@@ -530,9 +531,7 @@ def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
         None,
     )
 
-    assert model.calls == [
-        ("zero_kv_cache_blocks", {"kv_cache": ["kv"], "block_ids": [20, 21, 40]})
-    ]
+    assert model.calls == []
     assert len(prefill.state_block_ids_per_layer) == NUM_LAYERS
     for layer in range(NUM_LAYERS):
         if _is_attention(layer):
@@ -560,6 +559,113 @@ def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
     name, kwargs = model.calls[-1]
     assert name == "decode_forward"
     assert kwargs["state_block_ids_per_layer"] is decode.state_block_ids_per_layer
+
+
+def _zeroed(model) -> list[list[int]]:
+    return [
+        kwargs["block_ids"]
+        for name, kwargs in model.calls
+        if name == "zero_kv_cache_blocks"
+    ]
+
+
+def test_only_attention_blocks_a_gdn_group_owned_are_zeroed():
+    """vLLM lists every new attention block in ``new_block_ids_to_zero``.
+
+    The model allocates its KV buffers zeroed and attention writes finite
+    values, so only a block a GDN group owned since its last zeroing can read
+    as NaN at the positions attention masks, and only if the prefill that
+    gets it does not write it whole. The runner hands the model those blocks
+    and no others: a block passes from request A's GDN group 0 to request B's
+    attention group and is zeroed; a block that passes from A's attention
+    group to B's is not; a block zeroed once and kept by attention is not
+    zeroed again; a GDN block that a running request gets with its new blocks
+    counts too; a GDN block that a prefill chunk writes whole is not zeroed.
+    """
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    assert runner._mamba_groups.zeroes_only_state_blocks
+
+    runner.build_model_input(
+        _step(
+            {"a": 1500},
+            new=[_new_request("a", 1500, ([10], [11], [12], [20, 21]))],
+            zero=[20, 21],
+        ),
+        None,
+    )
+    assert _zeroed(model) == []
+
+    model.calls.clear()
+    step = _step(
+        {"b": 700},
+        new=[_new_request("b", 700, ([20], [30], [31], [10, 21]))],
+        zero=[10, 21],
+    )
+    step.finished_req_ids = {"a"}
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == [[10]]
+
+    model.calls.clear()
+    step = _step(
+        {"b": 1, "c": 700},
+        new=[_new_request("c", 700, ([50], [51], [52], [11, 12]))],
+        cached=[("b", 700, ([], [], [60], []))],
+        zero=[11, 12],
+    )
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == [[11, 12]]
+
+    model.calls.clear()
+    step = _step(
+        {"d": 700},
+        new=[_new_request("d", 700, ([70], [71], [72], [10, 20, 60]))],
+        zero=[10, 20, 60],
+    )
+    step.finished_req_ids = {"b", "c"}
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == [[20, 60]]
+
+    # Prefill chunks that write a block whole leave no position to read
+    # unwritten: D's GDN blocks 70 and 71 go to E's first chunk, and 72 to its
+    # second chunk, unzeroed.
+    model.calls.clear()
+    step = _step(
+        {"e": 2048},
+        new=[_new_request("e", 4096, ([90], [91], [92], [70, 71]))],
+        zero=[70, 71],
+    )
+    step.finished_req_ids = {"d"}
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == []
+
+    model.calls.clear()
+    step = _step(
+        {"e": 2048}, cached=[("e", 2048, ([], [], [], [72, 21]))], zero=[72, 21]
+    )
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == []
+
+
+def test_mixed_attention_precision_zeroes_every_listed_block():
+    """Without ``zeroes_only_state_blocks`` (attention groups of different KV
+    precisions, which vLLM also zeroes for) the runner hands the model every
+    block vLLM lists."""
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    runner._mamba_groups.zeroes_only_state_blocks = False
+
+    runner.build_model_input(
+        _step(
+            {"a": 1500},
+            new=[_new_request("a", 1500, ([10], [11], [12], [20, 21]))],
+            zero=[20, 21],
+        ),
+        None,
+    )
+    assert _zeroed(model) == [[20, 21]]
 
 
 def test_page_table_is_the_attention_groups_table():

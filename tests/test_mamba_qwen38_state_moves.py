@@ -35,6 +35,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.config import (
@@ -1196,6 +1197,126 @@ def test_retention_0_runs_no_boundary_copy_and_every_read_stays_exact():
     assert h.finished("a") and h.finished("bb")
     assert any(s.post_copies for s in h.steps), "upstream copies at boundaries"
     assert not any(s.groups_post for s in h.steps)
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+@pytest.mark.parametrize("variant", ["plugin", "no_zeroing", "every_block_written"])
+def test_attention_never_reads_a_position_that_holds_state(mode, variant):
+    """Blocks pass between the attention group and the GDN groups.
+
+    Waves of requests finish and new ones take their blocks from vLLM's pool,
+    so the real ``KVCacheManager`` gives the attention group blocks that a GDN
+    group owned and blocks that only attention owned. The test replays what
+    each position of each attention block holds:
+
+    1. a block in a GDN group's row can hold recurrent state in every
+       position, which reads as NaN in bf16;
+    2. ``zero_kv_cache_blocks`` clears a whole block;
+    3. a step writes the keys and values of its scheduled positions;
+    4. the step's attention then reads every position of every block up to
+       the one of its last position (masked positions included).
+
+    No read may find state, and the runner (``MambaCacheGroups.blocks_to_zero``)
+    zeroes only blocks that hold state. Both rules of the runner must matter:
+    some listed blocks held no state, and some held state but their prefill
+    wrote them whole. The variants are negative controls: a runner that zeroes
+    nothing, and one that counts every prefill block as written whole, each
+    lets a read find state.
+    """
+    h = _Harness(mode, num_spec=K, retention=0, plugin=True)
+    groups = h.runner._mamba_groups
+    if variant == "no_zeroing":
+        groups.blocks_to_zero = lambda scheduler_output, requests: []
+    elif variant == "every_block_written":
+        groups._add_written_blocks = (
+            lambda written, block_ids, first_columns, start, num_tokens: (
+                written.update(
+                    b for g in groups.attention_block_sizes for b in block_ids[g]
+                )
+            )
+        )
+    [attention] = groups.attention_block_sizes
+    zeroed: list[int] = []
+    real_zero = h.model.zero_kv_cache_blocks
+
+    def zero_kv_cache_blocks(**kwargs):
+        zeroed.extend(kwargs["block_ids"])
+        return real_zero(**kwargs)
+
+    h.model.zero_kv_cache_blocks = zero_kv_cache_blocks
+    steps = []
+    schedule = h.scheduler.schedule
+
+    def schedule_and_record(*args, **kwargs):
+        out = schedule(*args, **kwargs)
+        starts = {new.req_id: new.num_computed_tokens for new in out.scheduled_new_reqs}
+        cached = out.scheduled_cached_reqs
+        starts.update(zip(cached.req_ids, cached.num_computed_tokens))
+        # Taken before a request that finishes gives its blocks back.
+        gdn = {
+            b
+            for req_id in h.scheduler.requests
+            for g in h.groups
+            for b in h.manager_blocks(req_id, g)
+            if b
+        }
+        rows = {
+            req_id: (start, start + out.num_scheduled_tokens[req_id])
+            for req_id, start in starts.items()
+        }
+        attention_rows = {r: h.manager_blocks(r, attention) for r in rows}
+        steps.append((out, gdn, rows, attention_rows))
+        return out
+
+    h.scheduler.schedule = schedule_and_record
+    for i in range(16):
+        h.add(f"r{i}", _prompt(100 + i, 1100 + 97 * i), max_tokens=6)
+
+    state: dict[int, np.ndarray] = {}
+
+    def holds(block: int) -> np.ndarray:
+        return state.setdefault(block, np.zeros(BLOCK_SIZE, dtype=bool))
+
+    needed = skipped_clear = skipped_written = 0
+    for _ in range(400):
+        zeroed.clear()
+        if not h.step(_accept_pattern):
+            break
+        out, gdn, rows, attention_rows = steps[-1]
+        listed = out.new_block_ids_to_zero or []
+        for block in listed:
+            if not holds(block).any():
+                skipped_clear += 1
+            elif block in zeroed:
+                needed += 1
+            else:
+                skipped_written += 1
+        for block in zeroed:
+            assert holds(block).any(), f"block {block} held no state"
+            holds(block)[:] = False
+        for req_id, (start, end) in rows.items():
+            for position in range(start, end):
+                block = attention_rows[req_id][position // BLOCK_SIZE]
+                holds(block)[position % BLOCK_SIZE] = False
+        for req_id, (start, end) in rows.items():
+            for block in attention_rows[req_id][: (end - 1) // BLOCK_SIZE + 1]:
+                if holds(block).any():
+                    assert variant != "plugin", (
+                        f"{req_id} reads block {block} holding state at "
+                        f"{np.flatnonzero(holds(block))[:4].tolist()}"
+                    )
+                    return
+        for block in gdn:
+            holds(block)[:] = True
+    else:
+        raise AssertionError("scenario did not finish")
+    assert variant == "plugin", "no read found state: the scenario needs churn"
+    assert all(h.finished(f"r{i}") for i in range(16))
+    assert needed and skipped_clear and skipped_written, (
+        needed,
+        skipped_clear,
+        skipped_written,
+    )
 
 
 @pytest.mark.parametrize(

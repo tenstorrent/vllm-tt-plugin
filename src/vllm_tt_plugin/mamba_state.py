@@ -123,6 +123,14 @@ class MambaCacheGroups:
     # (``MambaManager.reachable_block_mask``), never at a block boundary that
     # decoding reaches, so the boundary copy after acceptance has no reader.
     retains_decode_boundaries: bool = True
+    # Every attention group has one KV precision
+    # (``KVCacheConfig.has_mixed_precision_kv_cache`` is False), so only a
+    # block a Mamba group owned can hold bytes attention reads as NaN or Inf.
+    zeroes_only_state_blocks: bool = True
+    # Block ids a Mamba group was given since the model last zeroed them.
+    blocks_owned_since_zero: set[int] = field(default_factory=set)
+    # Group index -> block size, for every group that is not a Mamba group.
+    attention_block_sizes: dict[int, int] = field(default_factory=dict)
 
     def max_num_blocks(self, max_model_len: int) -> int:
         """Block-table row width of a Mamba group, as
@@ -219,6 +227,89 @@ class MambaCacheGroups:
             return []
         table = [by_group.get(g) for g in range(max(layer_to_group_idx) + 1)]
         return list(map(table.__getitem__, layer_to_group_idx))
+
+    def blocks_to_zero(
+        self,
+        scheduler_output: SchedulerOutput,
+        requests: Mapping[str, TTCachedRequestState],
+    ) -> list[int]:
+        """The blocks of ``new_block_ids_to_zero`` the model must zero.
+
+        Run after the runner has applied the scheduler output to ``requests``.
+        vLLM lists every block newly allocated to an attention group, because
+        attention reads positions of a block that it has not written yet and
+        masks them, and a NaN or Inf there still spoils the result. A listed
+        block needs no zeroing when:
+
+        - no Mamba group has owned it since it was last zeroed. Only recurrent
+          state reads as NaN or Inf: the model allocates its KV buffers zeroed,
+          as upstream ``vllm.v1.worker.utils.allocate_kv_cache`` does, and
+          attention writes finite values;
+        - or the prefill step that allocates it writes all of its positions.
+          The model writes a step's keys and values before its attention reads
+          them, so no later step can read a position of that block unwritten.
+
+        Without ``zeroes_only_state_blocks``, every listed block.
+        """
+        listed = scheduler_output.new_block_ids_to_zero or []
+        if not self.zeroes_only_state_blocks:
+            return list(listed)
+        owned = self.blocks_owned_since_zero
+        written: set[int] = set()
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        for new in scheduler_output.scheduled_new_reqs:
+            for g in self.group_indices:
+                owned.update(new.block_ids[g])
+            self._add_written_blocks(
+                written,
+                new.block_ids,
+                (0,) * len(new.block_ids),
+                new.num_computed_tokens,
+                num_scheduled.get(new.req_id, 0),
+            )
+        cached = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
+            block_ids = cached.new_block_ids[i]
+            if block_ids is None:
+                continue
+            for g in self.group_indices:
+                owned.update(block_ids[g])
+            start = cached.num_computed_tokens[i]
+            end = start + num_scheduled.get(req_id, 0)
+            state = requests.get(req_id)
+            # Past the prompt, asynchronous scheduling counts the drafts of a
+            # step in flight as computed, so this step's positions can be lower.
+            if state is None or end > state.num_prompt_tokens:
+                continue
+            first_columns = tuple(
+                len(row) - len(ids) for row, ids in zip(state.block_ids, block_ids)
+            )
+            self._add_written_blocks(
+                written, block_ids, first_columns, start, end - start
+            )
+        zero = [b for b in listed if b in owned and b not in written]
+        # Each listed block holds attention data or zeroes after this step.
+        owned.difference_update(listed)
+        return zero
+
+    def _add_written_blocks(
+        self,
+        written: set[int],
+        block_ids: Sequence[Sequence[int]],
+        first_columns: Sequence[int],
+        start: int,
+        num_tokens: int,
+    ) -> None:
+        """Add to ``written`` the attention blocks whose positions all lie in
+        ``[start, start + num_tokens)``; ``block_ids[g]`` begins at block-table
+        column ``first_columns[g]``."""
+        end = start + num_tokens
+        for g, block_size in self.attention_block_sizes.items():
+            first = first_columns[g]
+            for i, block in enumerate(block_ids[g]):
+                column = first + i
+                if start <= column * block_size and (column + 1) * block_size <= end:
+                    written.add(block)
 
     def forget(self, scheduler_output: SchedulerOutput) -> None:
         """Drop the bookkeeping of finished, preempted and resumed requests."""
@@ -660,4 +751,9 @@ def mamba_cache_groups(
         retains_decode_boundaries=(
             getattr(cache_config, "prefix_cache_retention_interval", None) != 0
         ),
+        attention_block_sizes={
+            i: group.kv_cache_spec.block_size
+            for i, group in enumerate(kv_cache_groups)
+            if i not in group_indices
+        },
     )
