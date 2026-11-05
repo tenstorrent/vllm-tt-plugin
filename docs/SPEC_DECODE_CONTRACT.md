@@ -1257,7 +1257,13 @@ reads only `num_valid` and publishes a length hint, never ids.
 The runner chains only when exactly one verify is unresolved and it is the
 newest fused step; the scheduled requests are its rows less the finished ones;
 no prefill chunk, forced reset, grammar, penalties or allowlist (with `supports_spec_device_mask` the grammar, allowlist, bad words and `min_tokens` are served by the token mask, section 4m), and no logprobs row the model cannot serve (section 4k); every
-row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. Anything
+row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With
+`MambaSpec` groups in mode `align` (see
+[recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)), no row
+of the pending verify, finishing rows included, and no row of the chained
+step may be able to reach a block boundary before the pending verify commits
+(blocker `mamba_boundary`): the state copies at a boundary take their source
+from the accepted count, which the host has only after the commit. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
 
@@ -1272,7 +1278,8 @@ input; it submits the prefill behind the verify and finalizes the verify later,
 before the next decode build. A step after such a prefill does not chain onto
 the verify it overtook. `VLLM_TT_SPEC_PREFILL_OVERLAP=0` (default `1`) turns it
 off. A resumed request, a multimodal request or a model without the key still
-drains first.
+drains first, as does a pending verify with a row that can reach a `MambaSpec`
+block boundary in mode `align` (`mamba_boundary`).
 
 ## 4k. Device logprobs and the device top-p certificate
 

@@ -48,8 +48,10 @@ for that layer's group.
 1. `TTModelRunner` selects the block as upstream
    `mamba_get_block_table_tensor` does: column 0 of the row of the layer's
    group in mode `none`, and column `(seq_len - 1) // block_size` in mode
-   `align`. `seq_len` is the request's `num_computed_tokens` plus its
-   scheduled tokens, drafts included.
+   `align`. `seq_len` is the row's first query position (its `start_pos`)
+   plus its scheduled tokens, drafts included. Under asynchronous scheduling
+   the scheduler's `num_computed_tokens` still counts the drafts of a step in
+   flight as accepted, so the runner does not use it.
 2. Before the forward, in mode `align`, `TTModelRunner` calls
    `copy_kv_cache_blocks` to copy the state from the previous column into
    the selected block when the request crosses into a new column. The block
@@ -71,7 +73,12 @@ and prefill and decode also receive two more keywords.
   count of tokens the row's previous step committed, as the verify's
   `accepted_counts`, but 1 after a prefill, after a step that did not verify,
   and after `TTModelRunner` copied the state into window column 0. Padding
-  rows hold 1.
+  rows hold 1. A chained row (`chain_rows`, see
+  [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4j) holds -1, as
+  its `accepted_counts` does: the start column follows the accepted count of
+  the pending verify, which only the device knows. The runner chains a row in
+  mode `align` only while neither step can reach a block boundary, so no
+  state copy falls between the two verifies.
 
 The model writes the state after the row's query token `t` into window
 column `t`: a verify writes columns 0 to K, a prefill or an ordinary decode

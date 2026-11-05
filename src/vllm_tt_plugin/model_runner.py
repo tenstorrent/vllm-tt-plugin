@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -3934,40 +3934,68 @@ class TTModelRunner:
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps()
         self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
-        if self._mamba_groups is not None:
-            # After the drain: an asynchronous verify commits there, and its
-            # accepted counts and boundary copies precede this step's state
-            # moves, as upstream's postprocess precedes the next preprocess.
-            self._copy_kv_cache_blocks(
-                self._mamba_groups.begin_step(
-                    scheduler_output, self.requests, self._req_accepted_counts
-                )
-            )
         if not scheduler_output.total_num_scheduled_tokens:
+            if self._mamba_groups is not None:
+                # Forget finished and preempted requests; nothing is scheduled.
+                self._mamba_groups.begin_step(scheduler_output, self.requests, {})
             return None
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         if self._mamba_groups is not None:
-            state = self._mamba_groups.step_inputs(
-                model_input.block_tables_per_group,
-                model_input.row_req_ids or [],
-                self.requests,
-                scheduler_output.num_scheduled_tokens,
-                self._layer_to_group_idx or [],
-                self.tt_max_batch_size,
+            model_input = self._attach_mamba_state(scheduler_output, model_input)
+        return model_input
+
+    def _attach_mamba_state(
+        self, scheduler_output: SchedulerOutput, model_input: TTModelInput
+    ) -> TTModelInput:
+        """Run this step's Mamba state moves and add the state inputs.
+
+        After ``_prepare_model_inputs``: every verify that commits before this
+        step has committed by then, including one that resolved during the
+        build, so its boundary copies precede this step's moves, as upstream's
+        postprocess precedes the next preprocess. The counts and positions are
+        the ones the step is built with: the spec ``accepted_counts`` (-1 on a
+        chained row) and each row's first query position.
+        """
+        row_req_ids = model_input.row_req_ids or []
+        # A prefill's positions are a numpy array, a decode's a tensor.
+        positions = torch.as_tensor(model_input.input_positions)
+        first = positions if positions.dim() == 1 else positions[:, 0]
+        first = first[: len(row_req_ids)].tolist()
+        num_computed = {
+            req_id: int(first[row]) for row, req_id in enumerate(row_req_ids)
+        }
+        accepted_counts = {}
+        if model_input.accepted_counts is not None:
+            counts = model_input.accepted_counts[: len(row_req_ids)].tolist()
+            accepted_counts = {
+                req_id: int(counts[row]) for row, req_id in enumerate(row_req_ids)
+            }
+        self._copy_kv_cache_blocks(
+            self._mamba_groups.begin_step(
+                scheduler_output, self.requests, num_computed, accepted_counts
             )
-            # Group 0 can be a MambaSpec group, so ``page_table`` is the first
-            # attention group's table instead.
-            model_input = replace(
-                model_input,
-                block_tables=model_input.block_tables_per_group[
-                    self._mamba_groups.attention_group_index
-                ],
-                state_block_ids_per_layer=state.state_block_ids_per_layer,
-                state_block_windows_per_layer=state.state_block_windows_per_layer,
-                state_accepted_counts=state.state_accepted_counts,
-            )
+        )
+        state = self._mamba_groups.step_inputs(
+            model_input.block_tables_per_group,
+            row_req_ids,
+            num_computed,
+            scheduler_output.num_scheduled_tokens,
+            self._layer_to_group_idx or [],
+            self.tt_max_batch_size,
+        )
+        # Group 0 can be a MambaSpec group, so ``page_table`` is the first
+        # attention group's table instead.
+        model_input = replace(
+            model_input,
+            block_tables=model_input.block_tables_per_group[
+                self._mamba_groups.attention_group_index
+            ],
+            state_block_ids_per_layer=state.state_block_ids_per_layer,
+            state_block_windows_per_layer=state.state_block_windows_per_layer,
+            state_accepted_counts=state.state_accepted_counts,
+        )
         return model_input
 
     def _apply_kv_cache_block_ops(self, scheduler_output: SchedulerOutput) -> None:
@@ -5021,7 +5049,9 @@ class TTModelRunner:
             skip_req_ids=skip_req_ids,
         )
         if getattr(self, "_mamba_groups", None) is not None:
-            self._copy_mamba_boundary_states(model_input, committed_by_req)
+            self._copy_mamba_boundary_states(
+                model_input, committed_by_req, first_positions
+            )
         # Read off ``__dict__``: the books exist only once a chain was built,
         # and a launch with chaining off never touches them.
         chain_consumed = False
@@ -5055,15 +5085,22 @@ class TTModelRunner:
         return committed_by_req
 
     def _copy_mamba_boundary_states(
-        self, model_input: TTModelInput, committed_by_req: Mapping[str, list[int]]
+        self,
+        model_input: TTModelInput,
+        committed_by_req: Mapping[str, list[int]],
+        first_positions: torch.Tensor | None = None,
     ) -> None:
         """Copy each reached block-boundary state into its own column.
 
         Upstream's ``postprocess_mamba_align_gpu``, run on the commit like the
         accepted counts it reads: ``_apply_committed_spec_tokens_to_state``
-        has recorded them in ``_req_accepted_counts``.
+        has recorded them in ``_req_accepted_counts``. A chained step's
+        submitted positions are an upper bound, so the device-reported
+        ``first_positions`` win when given.
         """
-        positions = model_input.input_positions
+        positions = (
+            model_input.input_positions if first_positions is None else first_positions
+        )
         first = positions if positions.dim() == 1 else positions[:, 0]
         first = first[: len(model_input.row_req_ids)].tolist()
         committed = {
