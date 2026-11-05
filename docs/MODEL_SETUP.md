@@ -200,9 +200,15 @@ Declaration rules:
   must equal the attention `block_size`: the scheduler ends prefill chunks on
   multiples of the smallest group `block_size`.
 - `TTModelRunner` supports modes `none` and `align`. It requires
-  `MambaSpec.num_speculative_blocks == 0`,
-  `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` for all
-  `MambaSpec` groups.
+  `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` and
+  one `num_speculative_blocks` for all `MambaSpec` groups.
+- `MambaSpec.num_speculative_blocks` must equal the launch's draft length K
+  (0 without speculative decoding), as upstream sets it from
+  `num_speculative_tokens`. A request then holds `1 + K` state blocks per
+  group in mode `none` and up to `2 + K` in mode `align`; each holds the full
+  state of one position. The block-table row of a `MambaSpec` group holds
+  `MambaSpec.max_num_blocks_per_req` blocks: `1 + K` in mode `none`,
+  `ceil(max_model_len / block_size) + K` in mode `align`.
 - The adapter must implement `zero_kv_cache_blocks`, and in mode `align` also
   `copy_kv_cache_blocks`. See [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
   Prefill and decode receive `state_block_ids_per_layer`; see
@@ -229,8 +235,8 @@ bytes per layer slot with the attention layers' bytes per token, then divides
 by the unified page size. A token count divided by `block_size` would ignore
 page padding. It then adds one block per running request in each attention
 group, for output, and the state blocks each running request holds in each
-`MambaSpec` group: `1` per group in mode `none` and `2` in mode `align`, as
-`MambaSpec.max_memory_usage_bytes` counts them. Upstream's admission floor
+`MambaSpec` group: `1 + K` per group in mode `none` and `2 + K` in mode
+`align`, as `MambaSpec.max_memory_usage_bytes` counts them. Upstream's admission floor
 applies as for sliding-window models. Mode `align` also keeps the state blocks
 of earlier block boundaries as prefix-cache entries; as with cached attention
 blocks, vLLM evicts them when it needs free blocks.
@@ -241,8 +247,8 @@ specification, so group 0 can be a `MambaSpec` group. With `MambaSpec` groups,
 `page_table` is therefore the table of the first attention group, not of
 group 0.
 The table width `max_num_blocks_per_req` is the largest
-`ceil(max_model_len / block_size)` over the groups, at most `num_blocks`,
-rounded up to a multiple of 8. TT chunked SDPA requires a page-table row of a
+block-table row width over the groups, at most `num_blocks`, rounded up to a
+multiple of 8. TT chunked SDPA requires a page-table row of a
 multiple of 32 bytes. `cache_config.block_size` does not set this width.
 
 Sources: `mamba_cache_groups` and `MambaCacheGroups` in

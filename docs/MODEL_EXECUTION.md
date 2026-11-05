@@ -49,14 +49,41 @@ for that layer's group.
    `mamba_get_block_table_tensor` does: column 0 of the row of the layer's
    group in mode `none`, and column `(seq_len - 1) // block_size` in mode
    `align`. `seq_len` is the request's `num_computed_tokens` plus its
-   scheduled tokens.
+   scheduled tokens, drafts included.
 2. Before the forward, in mode `align`, `TTModelRunner` calls
-   `copy_kv_cache_blocks` to copy the state from the previous column's block
-   into the selected block when the request crosses into a new column. The
-   block of the previous column keeps the state at that block boundary for
+   `copy_kv_cache_blocks` to copy the state from the previous column into
+   the selected block when the request crosses into a new column. The block
+   of the previous column keeps the state at that block boundary for
    prefix-cache hits.
 3. The model reads each row's start state from the selected block and writes
    the row's end state to the same block.
+
+With speculative decoding, `MambaSpec.num_speculative_blocks` is the draft
+length K (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)),
+and prefill and decode also receive two more keywords.
+
+- `state_block_windows_per_layer`: one entry per layer, as above. A
+  `MambaSpec` layer's entry is a CPU int32 tensor `[tt_max_batch_size, 1 + K]`,
+  the row's state window: the columns from step 1's column on, `1 + K` of
+  them. `state_block_ids_per_layer` is its column 0.
+- `state_accepted_counts`: a CPU int32 tensor `[tt_max_batch_size]`. Row `i`'s
+  start state is in window column `state_accepted_counts[i] - 1`. It is the
+  count of tokens the row's previous step committed, as the verify's
+  `accepted_counts`, but 1 after a prefill, after a step that did not verify,
+  and after `TTModelRunner` copied the state into window column 0. Padding
+  rows hold 1.
+
+The model writes the state after the row's query token `t` into window
+column `t`: a verify writes columns 0 to K, a prefill or an ordinary decode
+writes column 0. Each block holds a full state, conv history and recurrent
+state, of one position. In mode `align` the state copies take the source from
+the accepted column: before the forward, column `prev + count - 1`, as
+upstream `preprocess_mamba`; and after a verify's acceptance,
+`commit_spec_acceptance` copies the state at a block boundary that the
+committed tokens reached into that boundary's own column, as upstream
+`postprocess_mamba_align_gpu` does. Upstream keeps the conv history of all
+`1 + K` positions in window column 0 instead; TT does not support that
+layout.
 
 A row whose `start_pos` is 0 has no earlier state. The model must start that
 row from zero state and must not read its block: vLLM 0.30.0 does not zero
@@ -96,6 +123,7 @@ tables are reloaded.
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `state_block_ids_per_layer` | Supplied for `MambaSpec` groups. See [recurrent state blocks](#recurrent-state-blocks). |
+| `state_block_windows_per_layer`, `state_accepted_counts` | Supplied for `MambaSpec` groups with `num_speculative_blocks` > 0. See [recurrent state blocks](#recurrent-state-blocks). |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
@@ -137,6 +165,7 @@ request-specific RoPE.
 | `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling or selective readback. The adapter must support the readback mode its execution path requests. |
 | `page_tables_per_layer` | Supplied for multiple KV groups. |
 | `state_block_ids_per_layer` | Supplied for `MambaSpec` groups. See [recurrent state blocks](#recurrent-state-blocks). |
+| `state_block_windows_per_layer`, `state_accepted_counts` | Supplied for `MambaSpec` groups with `num_speculative_blocks` > 0. See [recurrent state blocks](#recurrent-state-blocks). |
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
 | `prompt_tokens`, `output_tokens` | Supplied together when device sampling needs token history for penalties. Histories use `-1` padding. |

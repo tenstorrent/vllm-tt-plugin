@@ -101,14 +101,15 @@ vLLM can ask the worker to change KV cache blocks before a step's forward.
 The adapter owns the device buffers, so `TTModelRunner._apply_kv_cache_block_ops`
 hands each operation to an optional adapter hook. It runs after
 `_update_states` and before `TTModelRunner` builds the step's inputs, zeroing
-first. Block ids are vLLM block ids; with `MambaSpec` groups, one block id
+first. The Mamba state copies of mode `align` follow after the runner applies
+an asynchronous verify's commit, which can bring its own copies. Block ids are vLLM block ids; with `MambaSpec` groups, one block id
 addresses one page in every layer slot (see
 [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)).
 
 | Hook | Adapter responsibility |
 |---|---|
 | `zero_kv_cache_blocks(kv_cache=..., block_ids=[...])` | Zero each listed block in every KV buffer. vLLM lists the blocks it newly allocated to attention groups this step (`SchedulerOutput.new_block_ids_to_zero`). It sends them when `KVCacheConfig.needs_kv_cache_zeroing` is true, which holds with `MambaSpec` layers or mixed attention precisions: a reused block can hold bytes of another group that decode to NaN or Inf. |
-| `copy_kv_cache_blocks(kv_cache=..., copies=[(src, dst), ...])` | Copy each source block to its destination block in every KV buffer, in list order. The list holds vLLM's `SchedulerOutput.kv_cache_block_copies`, then, in Mamba mode `align`, the state copies into each request's new state block (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). |
+| `copy_kv_cache_blocks(kv_cache=..., copies=[(src, dst), ...])` | Copy each source block to its destination block in every KV buffer, in list order. One call holds vLLM's `SchedulerOutput.kv_cache_block_copies`. In Mamba mode `align`, a second call before the forward holds the state copies into each request's new state block, and with speculative decoding a call from `commit_spec_acceptance` holds the block-boundary state copies after acceptance (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). |
 
 `kv_cache` is the object the adapter's KV allocator returned. Enqueue the
 operations on the device before the step's forward, so the forward reads the
@@ -122,7 +123,7 @@ operations.
 
 Sources: `_apply_kv_cache_block_ops` and `initialize_kv_cache` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
-`MambaCacheGroups.align_state_copies` in
+`MambaCacheGroups.begin_step` and `MambaCacheGroups.after_acceptance` in
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
 
 ## Shutdown
