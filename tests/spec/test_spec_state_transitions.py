@@ -120,6 +120,7 @@ def _runner() -> SimpleNamespace:
             setattr(runner, name, member.__func__.__get__(TTModelRunner))
         elif inspect.isfunction(member):
             setattr(runner, name, member.__get__(runner))
+    runner.async_decode = TTAsyncDecodeController(runner)
     return runner
 
 

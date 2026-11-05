@@ -4722,6 +4722,7 @@ class TTModelRunner:
         are separate methods rather than one.
         """
         walk = self.walk_spec_acceptance(fwd.model_input, fwd.tt_out)
+        self.async_decode.count_accepted_drafts(fwd.model_input, walk.counts)
         prefixes = self.spec_committed_prefixes(
             fwd.model_input, walk.committed, walk.counts
         )

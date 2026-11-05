@@ -162,6 +162,7 @@ def _runner(
             setattr(runner, name, member.__func__.__get__(TTModelRunner))
         elif inspect.isfunction(member):
             setattr(runner, name, member.__get__(runner))
+    runner.async_decode = TTAsyncDecodeController(runner)
     return runner
 
 
@@ -227,9 +228,7 @@ def _step(
 
     scheduler_output = _scheduler_output_for(runner, *req_ids, drafts=drafts)
     model_input = TTModelRunner._prepare_model_inputs(runner, scheduler_output, None)
-    submission = TTAsyncDecodeController(runner).submit_decode(
-        model_input, read_from_device=True
-    )
+    submission = runner.async_decode.submit_decode(model_input, read_from_device=True)
     fwd = _SyncForward(
         tt_out=submission.tt_out,
         tt_log_probs=None,
@@ -300,6 +299,24 @@ def test_an_accept_depth_commits_exactly_that_many_drafts():
     assert len(output.sampled_token_ids[0]) == 3
     assert output.sampled_token_ids[0][:2] == drafts[:2]
     assert output.sampled_token_ids[0][2] != drafts[2]
+
+
+def test_the_synchronous_tail_counts_the_drafts_it_accepted():
+    """The "TT submissions:" report's real drafts: a verify through the
+    synchronous tail counts the drafts it carried and the drafts its accept
+    walk took, as the asynchronous tail does."""
+    model = make_fake_spec_model(accept_depth=2)()
+    runner = _runner(model)
+    _add_request(runner, "r")
+    last = int(runner.input_batch.token_ids_cpu[0, PROMPT_LEN - 1])
+    drafts = [(last + 1 + j) % FAKE_VOCAB_SIZE for j in range(DRAFT_LEN)]
+
+    _step(runner, "r", drafts={"r": drafts})
+
+    controller = runner.async_decode
+    assert controller._verify_rows == 1
+    assert controller._valid_drafts_submitted == DRAFT_LEN
+    assert controller._accepted_drafts == 2
 
 
 def test_a_draftless_step_commits_one_token():
