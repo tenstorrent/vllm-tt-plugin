@@ -2139,6 +2139,25 @@ class TTPlatform(Platform):
                 "declares model_capabilities['supports_device_grammar']=True "
                 "without model_capabilities['supports_sample_on_device']=True"
             )
+        # ``spec_ids_are_sampled`` answers only device-sampled steps, so a
+        # declaration without device sampling could never take effect.
+        spec_ids_are_sampled = (
+            model_capabilities.get("spec_ids_are_sampled", False)
+            if model_capabilities
+            else False
+        )
+        if not isinstance(spec_ids_are_sampled, bool):
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "must declare model_capabilities['spec_ids_are_sampled'] "
+                f"as a boolean, got {spec_ids_are_sampled!r}"
+            )
+        if spec_ids_are_sampled and not supports_sample_on_device:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['spec_ids_are_sampled']=True "
+                "without model_capabilities['supports_sample_on_device']=True"
+            )
         if is_block_output_model and supports_device_grammar:
             raise ValueError(
                 f"Model {model_class.__module__}.{model_class.__name__} "
@@ -2680,7 +2699,10 @@ class TTPlatform(Platform):
           (``TTModelRunner._publish_draft`` offers it no drafts, and
           ``_step_verifies`` runs the step as the ordinary decode), and is
           refused when it does not, because then every decode step is a verify
-          that commits the target argmax.
+          that commits the target argmax. On a model declaring
+          ``spec_ids_are_sampled`` a non-zero temperature alone no longer rules
+          a request out on a device-sampled step (SPEC_DECODE_CONTRACT.md,
+          section 4d rule 2); a penalty still does.
 
         vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
         speculating launch before this runs. Refused per request rather than at

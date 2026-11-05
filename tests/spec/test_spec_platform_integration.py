@@ -752,7 +752,7 @@ def _publish(tokens, **batch_kwargs):
     runner = object.__new__(TTModelRunner)
     runner.input_batch = _FakeBatch(**batch_kwargs)
     runner._proposed_draft_token_ids = {"r0": [9, 9]}  # a stale earlier offer
-    TTModelRunner._publish_draft(runner, "r0", tokens)
+    TTModelRunner._publish_draft(runner, "r0", tokens, False)
     return runner._proposed_draft_token_ids
 
 

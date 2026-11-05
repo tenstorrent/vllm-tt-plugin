@@ -66,13 +66,18 @@ def _batch() -> InputBatch:
 
 
 def _request(
-    req_id: str, num_computed_tokens: int, temperature: float = 0.0
+    req_id: str,
+    num_computed_tokens: int,
+    temperature: float = 0.0,
+    presence_penalty: float = 0.0,
 ) -> CachedRequestState:
     return CachedRequestState(
         req_id=req_id,
         prompt_token_ids=list(range(PROMPT_LEN)),
         mm_features=None,
-        sampling_params=SamplingParams(temperature=temperature),
+        sampling_params=SamplingParams(
+            temperature=temperature, presence_penalty=presence_penalty
+        ),
         generator=None,
         block_ids=([0],),
         num_computed_tokens=num_computed_tokens,
@@ -81,11 +86,17 @@ def _request(
 
 
 def _add_decoding_request(
-    batch: InputBatch, req_id: str, temperature: float = 0.0
+    batch: InputBatch,
+    req_id: str,
+    temperature: float = 0.0,
+    presence_penalty: float = 0.0,
 ) -> CachedRequestState:
     """Add a request whose whole history is computed, so it decodes next."""
     request = _request(
-        req_id, num_computed_tokens=PROMPT_LEN + OUTPUT_LEN - 1, temperature=temperature
+        req_id,
+        num_computed_tokens=PROMPT_LEN + OUTPUT_LEN - 1,
+        temperature=temperature,
+        presence_penalty=presence_penalty,
     )
     batch.add_request(request)
     return request
@@ -97,10 +108,17 @@ def _fake_runner(
     supports_narrow_decode: bool = False,
     num_speculative_tokens: int = 3,
     accepted_counts: dict[str, int] | None = None,
+    spec_ids_are_sampled: bool = False,
+    device_sampled: bool = False,
 ) -> SimpleNamespace:
     runner = SimpleNamespace(
         input_batch=batch,
         requests=requests,
+        # the model's declaration the certifiability gate reads, and the step's
+        # device-sampling decision (``check_perform_device_sampling``)
+        model=SimpleNamespace(
+            model_capabilities={"spec_ids_are_sampled": spec_ids_are_sampled}
+        ),
         _output_tokens_per_step=1,
         _num_speculative_tokens=num_speculative_tokens,
         # Synchronous harness: the drafts reach the runner through the
@@ -119,7 +137,7 @@ def _fake_runner(
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         supports_stage_inputs=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
-        check_perform_device_sampling=lambda **_: False,
+        check_perform_device_sampling=lambda **_: device_sampled,
         _block_tables_per_layer=lambda _: None,
         _alloc_prefill_state_slots=lambda row_req_ids: list(range(len(row_req_ids))),
         _decode_state_slot_remap=lambda row_req_ids: None,
@@ -135,6 +153,8 @@ def _fake_runner(
         TTModelRunner._request_is_argmax_certifiable.__get__(runner)
     )
     runner._spec_mode_for_step = TTModelRunner._spec_mode_for_step.__get__(runner)
+    runner._decode_device_sampled = TTModelRunner._decode_device_sampled.__get__(runner)
+    runner._publish_draft = TTModelRunner._publish_draft.__get__(runner)
     for name in (
         "_spec_decode_rows",
         "_reset_spec_state_for_prefill",
@@ -418,7 +438,10 @@ def test_narrow_decode_widens_when_any_row_carries_a_draft():
 
 
 def _mixed_batch(
-    supports_narrow_decode: bool = True, accepted_counts: dict[str, int] | None = None
+    supports_narrow_decode: bool = True,
+    accepted_counts: dict[str, int] | None = None,
+    spec_ids_are_sampled: bool = False,
+    device_sampled: bool = False,
 ) -> SimpleNamespace:
     """A greedy request and a sampled one decoding in the same batch."""
     batch = _batch()
@@ -431,6 +454,8 @@ def _mixed_batch(
         requests,
         supports_narrow_decode=supports_narrow_decode,
         accepted_counts=accepted_counts,
+        spec_ids_are_sampled=spec_ids_are_sampled,
+        device_sampled=device_sampled,
     )
 
 
@@ -495,6 +520,66 @@ def test_a_sampled_row_does_not_change_a_model_that_only_verifies():
 
     assert model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
     assert model_input.input_tokens.shape == (MAX_NUM_REQS, 4)
+
+
+def test_a_model_that_draws_its_ids_drafts_a_sampled_row_on_a_device_sampled_step():
+    """``spec_ids_are_sampled``: the id walk certifies a sampled request while
+    the step samples on the device, because that model's ``argmax_ids`` verify
+    returns the device sampler's draws for it. The step stays a verify with
+    the sampled row inside it, its proposal publishes drafts for the request,
+    and a host-sampled step (or a model without the declaration) keeps the
+    ordinary decode of
+    ``test_a_sampled_row_turns_a_drafted_step_into_an_ordinary_decode``.
+    """
+    runner = _mixed_batch(spec_ids_are_sampled=True, device_sampled=True)
+    model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
+    assert model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
+    assert model_input.input_tokens.shape == (MAX_NUM_REQS, 4)
+    assert model_input.num_valid_drafts.tolist()[:2] == [2, 0]
+    assert model_input.perform_device_sampling is True
+    assert runner._request_is_speculable("sampled", True) is True
+    # the proposer's offer for the sampled request stands after that step (the
+    # proposal publishes under the step's own submission decision) ...
+    runner._publish_draft("sampled", [31, 32], model_input.perform_device_sampling)
+    assert runner._proposed_draft_token_ids["sampled"] == [31, 32]
+    # ... and is withheld once the step samples on the host
+    runner.check_perform_device_sampling = lambda **_: False
+    model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
+    assert (
+        model_input.spec_mode is None and model_input.perform_device_sampling is False
+    )
+    runner._publish_draft("sampled", [31, 32], model_input.perform_device_sampling)
+    assert "sampled" not in runner._proposed_draft_token_ids
+    # without the declaration a device-sampled step changes nothing
+    runner = _mixed_batch(spec_ids_are_sampled=False, device_sampled=True)
+    model_input = _decode(runner, "greedy", "sampled", drafts=_drafts(greedy=[21, 22]))
+    assert model_input.spec_mode is None
+    assert runner._request_is_speculable("sampled", True) is False
+    # only the temperature rule is lifted: a penalised request stays off the
+    # drafts on a device-sampled step (the draws carry no penalty history),
+    # so with it in the batch the step is the ordinary decode
+    batch = _batch()
+    requests = {
+        "greedy": _add_decoding_request(batch, "greedy"),
+        "penalised": _add_decoding_request(
+            batch, "penalised", temperature=1.0, presence_penalty=0.5
+        ),
+    }
+    runner = _fake_runner(
+        batch,
+        requests,
+        supports_narrow_decode=True,
+        spec_ids_are_sampled=True,
+        device_sampled=True,
+    )
+    assert "penalised" in runner.input_batch.presence_penalties_reqs
+    assert runner._request_is_speculable("penalised", True) is False
+    model_input = _decode(
+        runner, "greedy", "penalised", drafts=_drafts(greedy=[21, 22])
+    )
+    assert model_input.spec_mode is None and model_input.perform_device_sampling is True
+    runner._publish_draft("penalised", [31, 32], model_input.perform_device_sampling)
+    assert "penalised" not in runner._proposed_draft_token_ids
 
 
 # endregion A request that is not speculable

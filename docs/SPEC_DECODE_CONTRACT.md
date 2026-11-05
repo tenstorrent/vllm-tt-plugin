@@ -44,7 +44,9 @@ serve speculative decoding within the following execution limits:
   is admitted and decoded without speculation:
   `TTModelRunner._publish_draft` offers no drafts for it, and every step it is
   part of runs as the ordinary decode, so it is never answered with the target
-  argmax. On such a model without `supports_narrow_decode` every decode step
+  argmax (on a model declaring `spec_ids_are_sampled` a non-zero temperature
+  alone no longer rules a request out on a device-sampled step: section 4d,
+  rule 2). On such a model without `supports_narrow_decode` every decode step
   is a verify, so such a request is refused per request. `min_p`, `top_p` and
   `top_k` alone do not change the argmax, so they do not stop a request
   speculating. Section 4d.
@@ -110,6 +112,7 @@ launches without `speculative_config`.
 | `spec_requirements` | `[]` | What the drafter can serve: `device_propose`, `hidden_feed`, `drafter_scores`, `paged_drafter_cache`. |
 | `spec_hidden_handoff` | `[]` | How the target hidden state reaches a device drafter: `on_device`, `roundtrip`. Required when `speculative_config.method` needs `hidden_feed`. |
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
+| `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
 
@@ -607,7 +610,14 @@ order, and the first one that holds decides.
    verify in `argmax_ids` mode returns the target argmax for every row, so that
    row would commit the argmax, not a token drawn with its request's
    temperature and penalties. The step is an ordinary decode instead, whatever
-   the other rows carry.
+   the other rows carry. On a model declaring `spec_ids_are_sampled` a request whose only
+   such control is its temperature (a penalty keeps it plain) is
+   speculable on a step that samples on the device
+   (`TTModelRunner._decode_device_sampled`, read before the block is built):
+   that model's `argmax_ids` verify of such a step returns the device
+   sampler's draws, which the id walk accepts as exact rejection sampling, and
+   its proposal publishes drafts for the request only after a device-sampled
+   step. A host-sampled step keeps the rule as written.
 3. **Some row carries a draft: verify.** `num_valid_drafts` is nonzero
    somewhere, so there is something to verify. One row is enough: a batch in
    which one row offers five drafts and every other row offers none is still
@@ -777,9 +787,10 @@ real drafts while B's row carries its own committed token in column 0 and
 `PLACEHOLDER_TOKEN_ID` with position -1 in columns 1..K. B joining does not
 turn A's existing drafts into an ordinary decode. The adapter must serve that
 mixed block and must respect per-row `num_valid_drafts`. If B has a non-zero
-temperature or a penalty, rule 2 of section 4d applies instead: the step is
-an ordinary decode, A's five drafts are dropped, and an unresolved commit of
-A's reaches that call as `accepted_counts`.
+temperature or a penalty (a temperature alone on a host-sampled step, or on a
+model not declaring `spec_ids_are_sampled`), rule 2 of section 4d applies
+instead: the step is an ordinary decode, A's five drafts are dropped, and an
+unresolved commit of A's reaches that call as `accepted_counts`.
 
 **Declining the next proposal is always available.** In that same step the
 adapter can return `DraftOutput.num_valid=[0, 0]`, offering nothing for either
@@ -945,7 +956,9 @@ temperature, a penalty, logprobs (including `logprobs=0`), structured output,
 `allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not
 reached yet. The mode is per step, and that row would otherwise commit the
 target argmax even with no draft of its own. Padding rows do not decide the
-mode.
+mode. On a model declaring `spec_ids_are_sampled`, a non-zero temperature
+no longer rules a row out on a device-sampled step (section 4d, rule 2; a
+penalty still does): the `argmax_ids` answer carries the device sampler's draws for it.
 
 **What the model returns.** `VerifyOutput(spec_mode="logits", logits=...)`,
 with `logits` a floating point `[B, 1+K, V]` tensor: every submitted row,
@@ -1089,6 +1102,66 @@ from the requests' own generators, so it must run once per step;
 `DeferredDecodeOutput` resolves a step exactly once, so a request's generator
 advances once however many callers race to resolve it.
 
+## 4i. Sampled ids: `spec_ids_are_sampled`
+
+This section gathers every rule the capability touches; the sections above
+state each one where it applies.
+
+**The exception.** On a model declaring `spec_ids_are_sampled`, an
+`argmax_ids` verify of a step that samples on the device returns, for a
+drafted row with a non-zero temperature, the device sampler's draw at every
+candidate column under that row's own temperature, top-k, top-p and seed
+(for an undrafted row, the plain decode's own draw; for a greedy row, the
+target argmax as before). The id walk then compares each draft with a draw
+from the target distribution at that column, which is exact rejection
+sampling against the drafts, so such a request is speculable and
+`TTModelRunner._publish_draft` offers it drafts. Nothing else about the walk,
+the commit or the bonus token changes (section 6).
+
+**Actual device sampling is required.** The draws exist only on a step the
+runner samples on the device: `TTModelRunner._decode_device_sampled` is true
+for the decode step (a `sample_on_device_mode` is configured, the model
+declares `supports_sample_on_device`, and no row of the step forces host
+sampling). The decision is made once before the candidate block is built and
+reused by the submission (`TTModelInput.perform_device_sampling`), so the
+drafts, the verify and the sampler agree on the step. The platform validates
+the capability at configuration time: a boolean, and `True` only together
+with `supports_sample_on_device`.
+
+**Boundaries.** Only the temperature rule is lifted. A request with a
+presence, frequency or repetition penalty stays plain (the draws carry no
+penalty history, and `TTModelRunner._request_is_argmax_certifiable` keeps the
+penalty sets out). The token controls of section 4d are unchanged: on a model
+serving only `argmax_ids`, logprobs, structured output, `allowed_token_ids`,
+`bad_words` and a nonzero `min_tokens` are still refused per request, and
+`logit_bias` on every speculative launch. `min_p`, `top_p` and `top_k` never
+ruled a request out and still do not; a `top_k` the device sampler cannot
+serve makes the step host-sampled, which is the next rule.
+
+**Host fallback.** A host-sampled step certifies nothing it did not before:
+a sampled request is withheld from the drafts, the step runs as the ordinary
+decode on a model with narrow decode (section 4d, rule 2 as written), and a
+proposal retained for such a request is dropped rather than verified against
+the argmax (section 4e). The asynchronous preflight
+(`TTAsyncDecodeController._next_step_verifies`) reads speculability as a
+device-sampled step would, so a pending step is drained before a verify of a
+sampled request is built over it.
+
+**Precedence over `logits`.** On a model serving both accept modes, a
+device-sampled step verifies in `argmax_ids` where section 4h chose `logits`
+for a sampled row before; the host `logits` walk remains the mode for the
+controls the device draws do not carry (penalties, logprobs, grammars, token
+filters) and for host-sampled steps.
+
+**Admission is unchanged.** On a launch whose plan keeps no
+`supports_narrow_decode` and serves no `logits`, every decode step is a verify
+and `TTPlatform.validate_request` refuses a request with a non-zero
+temperature or a penalty per request, exactly as without the capability: on
+a host-sampled step that verify would commit the target argmax, and the
+runner cannot promise every step samples on the device. The capability lifts
+the temperature rule for draft publication and the per-step mode, not for
+admission.
+
 ## 5. One request, from prefill to release
 
 The sequence below follows a single request A on a launch that declares
@@ -1198,7 +1271,8 @@ at execution time and raises the corresponding type or mode error. These
 checks report the offending values. On a model that does not serve `logits`, a
 non-zero temperature or a penalty is admitted without draft publication on a
 launch with narrow decode, and refused per request on a launch without it
-(section 4d), and logprobs, structured output, `bad_words`,
+(section 4d; a model declaring `spec_ids_are_sampled` publishes drafts for a
+sampled request on a device-sampled step, section 4d rule 2), and logprobs, structured output, `bad_words`,
 `allowed_token_ids` and `min_tokens` are refused; a model that serves `logits`
 speculates for all of them (section 4h). The ordinary async capability check
 separately permits
