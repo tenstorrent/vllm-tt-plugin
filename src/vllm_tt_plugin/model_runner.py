@@ -1293,11 +1293,14 @@ class TTModelRunner:
             self._req_state_slot.pop(req_id, None)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
-        """Pick each prefilling request's state slot, skipping slots that live
-        off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        """Pick each prefilling request's state slot. A request that already owns one
+        keeps it: a continuing chunk reads the state its earlier chunks wrote there,
+        and only decode gathers move state, so re-placing it by row would leave the
+        state behind (and hand the slot to another request). A request without a slot
+        gets its own row (where it decodes) when that is free, so the steady state
+        moves nothing, and otherwise the first free slot.
 
-        Exhaustion is unreachable: holders and prefills are disjoint and both count
+        Exhaustion is unreachable: existing holders and new prefills both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
         stopped describing the device, and nothing on the host can recover it, so fail
         rather than guess and return plausible, wrong text.
@@ -1309,13 +1312,21 @@ class TTModelRunner:
                 "slots; admission is the scheduler's job, not this function's"
             )
         prefilling = set(row_req_ids)
-        held = {
-            slot
+        owned = {
+            req_id: slot
             for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling and req_id in self.requests
+            if req_id in prefilling or req_id in self.requests
         }
+        held = set(owned.values())
+        if len(held) != len(owned):
+            raise RuntimeError(
+                f"two requests own one device state slot: map={self._req_state_slot}"
+            )
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            if req_id in owned:
+                slots.append(owned[req_id])
+                continue
             if row not in held:
                 slot = row
             else:
