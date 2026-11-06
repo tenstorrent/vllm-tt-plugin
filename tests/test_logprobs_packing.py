@@ -4,16 +4,25 @@
 
 These tests use synthetic data only (no device required) to verify that
 build_logprobs_from_topk and build_device_logprobs pack device logprobs into
-LogprobsTensors for the downstream vLLM pipeline. A selected token's rank
-follows vLLM: the number of vocabulary scores at or above the selected one,
-ties included, so the most likely token has rank 1.
+LogprobsTensors for the downstream vLLM pipeline, and that a payload returned
+as host decode output reaches that packing through the decode controller. A
+selected token's rank follows vLLM: the number of vocabulary scores at or above
+the selected one, ties included, so the most likely token has rank 1.
 """
 
+import dataclasses
+import math
+from types import SimpleNamespace
 from typing import NamedTuple
 
+import pytest
 import torch
 
+from tests.test_block_model_runner import _bind_committed_width
+from tests.test_decode_reload_contract import _accepted_decode_hooks, _submission_input
+from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.logprobs import build_device_logprobs, build_logprobs_from_topk
+from vllm_tt_plugin.model_runner import TTModelRunner
 
 
 class TestBuildLogprobsFromTopk:
@@ -114,7 +123,7 @@ class TestBuildLogprobsFromTopk:
         its vocabulary rank; above that score the count is exact.
         """
         k = 32
-        logprobs = torch.full((1, k), -3.4657)
+        logprobs = torch.full((1, k), math.log(1 / 33))
         indices = torch.arange(100, 100 + k, dtype=torch.int32).unsqueeze(0)
         sampled = indices[:, 7].clone()
 
@@ -209,3 +218,93 @@ class TestBuildDeviceLogprobs:
 
         assert result.logprobs.tolist() == [[-0.25], [-1.5]]
         assert result.selected_token_ranks.tolist() == [-1, -1]
+
+
+class _HostOutputModel:
+    """An adapter whose decode_forward already returns host output, so it
+    implements neither read_decode_output nor process_decode_output_host."""
+
+    decode_input_update_contract = 1
+    model_capabilities = {"supports_async_decode": True}
+
+    def __init__(self, output):
+        self.output = output
+
+    def decode_forward(self, **kwargs):
+        return self.output
+
+
+class TestHostDecodeOutput:
+    """Tests that a nested logprob payload in host decode output passes the
+    decode controller and reaches the runner's output packing."""
+
+    @pytest.mark.parametrize("async_read", [False, True], ids=["sync", "async"])
+    @pytest.mark.parametrize(
+        "payload, rank",
+        [
+            pytest.param(
+                (
+                    torch.tensor([[-0.5, -1.5, -2.0]]),
+                    torch.tensor([[41, 42, 43]], dtype=torch.int32),
+                ),
+                2,
+                id="topk",
+            ),
+            pytest.param(
+                _ReportedLogprobs(torch.tensor([-1.5]), torch.tensor([7])),
+                7,
+                id="reported-rank",
+            ),
+        ],
+    )
+    def test_payload_rank_reaches_packing(self, payload, rank, async_read):
+        token_ids = torch.tensor([[42]], dtype=torch.int32)
+        controller = TTAsyncDecodeController(
+            _accepted_decode_hooks(
+                SimpleNamespace(
+                    model=_HostOutputModel((token_ids, payload)),
+                    trace_mode="decode_only",
+                    kv_caches=object(),
+                    request_specific_rope=False,
+                    supports_stage_outputs=False,
+                )
+            )
+        )
+        model_input = _submission_input(device_sampling=True)
+        model_input.tt_sampling_params = dataclasses.replace(
+            model_input.tt_sampling_params,
+            num_logprobs=torch.zeros(1, dtype=torch.int64),
+            enable_log_probs=torch.ones(1, dtype=torch.bool),
+        )
+
+        submission = controller.submit_decode(
+            model_input, read_from_device=not async_read, async_read=async_read
+        )
+        finalized = controller.finalize_decode(submission)
+        runner = _bind_committed_width(
+            SimpleNamespace(
+                _num_speculative_tokens=0,
+                _output_tokens_per_step=1,
+                _is_block_output_model=False,
+                tt_per_lane_max_num_seqs=1,
+            )
+        )
+        _, logprobs_per_dp = TTModelRunner._get_output_tokens(
+            runner,
+            finalized.tt_out,
+            finalized.tt_log_probs,
+            submission.sampling_params,
+            SimpleNamespace(
+                intermediate_prefill_mask=None,
+                max_num_logprobs=[0],
+                grammar_bitmask=[None],
+            ),
+            submission.batch_size_per_dp,
+            perform_device_sampling=True,
+            is_decode=True,
+        )
+
+        (logprobs,) = logprobs_per_dp
+        assert logprobs.logprob_token_ids.tolist() == [[42]]
+        assert logprobs.logprobs.tolist() == [[-1.5]]
+        assert logprobs.selected_token_ranks.tolist() == [rank]

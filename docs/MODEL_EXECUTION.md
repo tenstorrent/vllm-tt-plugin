@@ -169,7 +169,9 @@ reaches it anyway.
    `read_decode_output(output, async_read=True)` when the adapter exposes
    `read_decode_output`. The adapter returns `(output_handles, read_events)`.
    Without `read_decode_output`, `decode_forward` must already return host
-   torch output. Keep asynchronous output buffers valid until consumption.
+   torch output: a tensor, or a tuple whose elements are host tensors, `None`,
+   or such tuples (the device logprob payloads below nest one). Keep
+   asynchronous output buffers valid until consumption.
 3. `TTAsyncDecodeController.finalize_decode` synchronizes each TTNN read event.
    For output that is not already host torch output, the controller calls
    `process_decode_output_host(output_handles, is_tokens=perform_device_sampling)`.
