@@ -18,6 +18,7 @@ from typing import Any
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
+from vllm_tt_plugin.mamba_state import MambaStepState
 from vllm_tt_plugin.spec_masks import SpecMaskPlan
 
 
@@ -178,34 +179,9 @@ class TTModelInput:
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
 
-    # MambaSpec groups only: one entry per layer, in ``block_tables_per_layer``
-    # order. A MambaSpec layer's entry is int32 ``[rows, 1]``, the block id that
-    # holds each row's recurrent state, read from its group's block table; an
-    # attention layer's entry is ``None``. ``None`` without MambaSpec groups.
-    state_block_ids_per_layer: list[torch.Tensor | None] | None = None
-    # MambaSpec groups with ``num_speculative_blocks`` K > 0 only, else
-    # ``None``. Per layer, int32 ``[rows, 1 + K]``: the row's state window, in
-    # whose column ``t`` the model writes the state after query token ``t``;
-    # ``None`` for attention layers.
-    state_block_windows_per_layer: list[torch.Tensor | None] | None = None
-    # Same condition. int32 ``[rows]``: each row's start state is in window
-    # column ``state_accepted_counts - 1``.
-    state_accepted_counts: torch.Tensor | None = None
-    # A chained verify in mode align with ``chained_moves_on_device`` only
-    # (``MambaCacheGroups.plan_chained_step``), else ``None``. Per layer,
-    # indexed ``[row, c - 1]`` by the count c the pending verify accepted:
-    # int32 ``[rows, 1 + K, 2]`` block copies, ``[rows, 1 + K, 1 + K]``
-    # windows and ``[rows, 1 + K]`` start blocks; ``None`` for attention layers.
-    state_chain_copies_per_layer: list[torch.Tensor | None] | None = None
-    state_chain_windows_per_layer: list[torch.Tensor | None] | None = None
-    state_chain_start_blocks_per_layer: list[torch.Tensor | None] | None = None
-    # Prefill with ``MambaSpec`` prefill checkpoint blocks
-    # (``MambaCacheGroups.checkpoint_inputs``), else ``None``: per layer the
-    # blocks that take the state after ``state_checkpoint_positions[i, j]``
-    # tokens, int32 ``[rows, W]`` with ``W`` the longest checkpoint list of the
-    # step; block 0 and 0 tokens where a row has fewer.
-    state_checkpoint_ids_per_layer: list[torch.Tensor | None] | None = None
-    state_checkpoint_positions: torch.Tensor | None = None
+    # MambaSpec groups only, else ``None``: the recurrent-state inputs, one
+    # ``MambaGroupState`` per group (``MambaCacheGroups.step_state``).
+    mamba_state: MambaStepState | None = None
 
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because

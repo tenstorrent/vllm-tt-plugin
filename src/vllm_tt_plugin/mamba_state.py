@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -52,37 +52,60 @@ if TYPE_CHECKING:
 SUPPORTED_MAMBA_CACHE_MODES = ("none", "align")
 
 
-class MambaStepInputs(NamedTuple):
-    """The recurrent-state inputs of one forward, one entry per layer.
+@dataclass(frozen=True, slots=True)
+class MambaChainChoices:
+    """A chained verify's state moves for one ``MambaSpec`` group, indexed by
+    the count the pending verify accepted.
 
-    Attention layers get ``None``. Every tensor has ``num_rows`` rows; padding
-    rows hold block 0, the null block vLLM never allocates, and count 1.
+    Entry ``[i, c - 1]`` holds row ``i``'s values for a pending verify that
+    accepted ``c`` tokens, ``1 <= c <= 1 + K``. All tensors are CPU int32.
     """
 
-    # int32 ``[rows, 1]``: window column 0, the block of the running state.
-    state_block_ids_per_layer: list[torch.Tensor | None]
-    # int32 ``[rows, 1 + K]``; ``None`` when K is 0.
-    state_block_windows_per_layer: list[torch.Tensor | None] | None
-    # int32 ``[rows]``: the start state is in window column ``count - 1``;
-    # -1 on a chained row, whose count only the device knows; ``None`` when K
-    # is 0.
-    state_accepted_counts: torch.Tensor | None
+    # ``[rows, 1 + K, 2]``: the ``(src, dst)`` full-state block copy to run
+    # before the step reads or writes any state; ``(0, 0)`` for no copy.
+    copies: torch.Tensor
+    # ``[rows, 1 + K]``: the block that holds the row's start state, read
+    # after the copy.
+    start_blocks: torch.Tensor
+    # ``[rows, 1 + K, 1 + K]``: entry ``[i, c - 1, t]`` is the block that takes
+    # the state after query token ``t``.
+    windows: torch.Tensor
 
 
-class MambaChainPlan(NamedTuple):
-    """A chained verify's state moves, indexed by the pending verify's count.
+@dataclass(frozen=True, slots=True)
+class MambaGroupState:
+    """The recurrent-state inputs of one forward for one ``MambaSpec`` group.
 
-    One entry per layer, ``None`` for attention layers. Index ``[i, c - 1]``
-    holds row ``i``'s values for a pending verify that committed ``c`` tokens.
+    All tensors are CPU int32 with one row per submitted row; padding rows
+    hold block 0, the null block vLLM never allocates.
     """
 
-    # int32 ``[rows, 1 + K, 2]``: the ``(src, dst)`` block copy to run before
-    # the step; ``(0, 0)`` (the null block) when there is none.
-    copies_per_layer: list[torch.Tensor | None]
-    # int32 ``[rows, 1 + K, 1 + K]``: the step's state window.
-    windows_per_layer: list[torch.Tensor | None]
-    # int32 ``[rows, 1 + K]``: the block holding the step's start state.
-    start_blocks_per_layer: list[torch.Tensor | None]
+    # The group's layers, ``KVCacheGroupSpec.layer_names``.
+    layer_names: tuple[str, ...]
+    # ``[rows, 1 + K]``, K the group's ``MambaSpec.num_speculative_blocks``:
+    # the step writes the state after query token ``t`` into column ``t``.
+    windows: torch.Tensor
+    # Prefill with prefill checkpoint blocks only: ``[rows, W]``, the blocks
+    # that take the state after ``MambaStepState.checkpoint_positions`` tokens.
+    checkpoint_blocks: torch.Tensor | None = None
+    # A chained verify in mode ``align`` only.
+    chain: MambaChainChoices | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MambaStepState:
+    """The recurrent-state inputs of one forward, the model's ``mamba_state``."""
+
+    # One per ``MambaSpec`` KV cache group, in KV cache group order.
+    groups: tuple[MambaGroupState, ...]
+    # K > 0 only: int32 ``[rows]``; the start state is in window column
+    # ``count - 1``; -1 on a chained row, whose count only the device knows;
+    # 1 on padding rows.
+    accepted_counts: torch.Tensor | None = None
+    # Prefill with prefill checkpoint blocks only: int32 ``[rows, W]``, the
+    # tokens the state in each ``MambaGroupState.checkpoint_blocks`` entry
+    # covers; 0 for an unused entry.
+    checkpoint_positions: torch.Tensor | None = None
 
 
 @dataclass
@@ -91,6 +114,9 @@ class MambaCacheGroups:
 
     # Indices into ``KVCacheConfig.kv_cache_groups``, in group order.
     group_indices: tuple[int, ...]
+    # Each Mamba group's ``KVCacheGroupSpec.layer_names``, in the order of
+    # ``group_indices``.
+    layer_names: tuple[tuple[str, ...], ...]
     # ``CacheConfig.mamba_cache_mode``; every Mamba group's spec carries it.
     mamba_cache_mode: str
     # ``MambaSpec.block_size``, the same in every Mamba group.
@@ -111,10 +137,6 @@ class MambaCacheGroups:
     moved_to_window_start: set[str] = field(default_factory=set)
     # Request id -> the start-state count of the step being built.
     step_accepted_counts: dict[str, int] = field(default_factory=dict)
-    # The model declares ``supports_mamba_chained_state_moves``: a chained
-    # verify carries its moves for every count the pending verify can accept
-    # (``plan_chained_step``), and the model runs the one its count selects.
-    chained_moves_on_device: bool = False
     # Request id -> the scheduled tokens of a chained step whose moves the
     # device runs; its bookkeeping catches up when the pending verify commits.
     deferred_chained_steps: dict[str, int] = field(default_factory=dict)
@@ -176,16 +198,19 @@ class MambaCacheGroups:
         row_req_ids: Sequence[str],
         num_computed: Mapping[str, int],
         num_scheduled_tokens: Mapping[str, int],
-        layer_to_group_idx: Sequence[int],
         num_rows: int,
-    ) -> MambaStepInputs:
-        """The recurrent-state inputs of one forward.
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor | None]:
+        """The state windows and start-state counts of one forward.
 
         Row ``i`` of ``block_tables_per_group`` belongs to ``row_req_ids[i]``;
         the rows after them are padding, with zero block tables. The result is
         padded to ``num_rows`` rows, the row count of ``page_tables_per_layer``.
         ``num_computed`` is as for ``begin_step``, which must have run for this
         step.
+
+        Returns each Mamba group's windows, int32 ``[num_rows, 1 + K]`` in the
+        order of ``group_indices``, and the counts, int32 ``[num_rows]``, or
+        ``None`` when K is 0.
         """
         width = 1 + self.num_speculative_blocks
         live = min(len(row_req_ids), num_rows)
@@ -204,52 +229,32 @@ class MambaCacheGroups:
             columns = np.array(starts, dtype=np.int64)[:, None] + np.arange(width)
         for i, g in enumerate(self.group_indices):
             stacked[i, :live] = block_tables_per_group[g].numpy()[rows, columns]
-        tensor = torch.from_numpy(stacked)
-        windows = {g: tensor[i] for i, g in enumerate(self.group_indices)}
-        ids_per_layer = self.per_layer(
-            {g: tensor[i, :, :1] for i, g in enumerate(self.group_indices)},
-            layer_to_group_idx,
-        )
+        windows = tuple(torch.from_numpy(stacked))
         if not self.num_speculative_blocks:
-            return MambaStepInputs(ids_per_layer, None, None)
+            return windows, None
         counts = torch.tensor(
             [self.step_accepted_counts.get(r, 1) for r in req_ids]
             + [1] * (num_rows - live),
             dtype=torch.int32,
         )
-        return MambaStepInputs(
-            ids_per_layer, self.per_layer(windows, layer_to_group_idx), counts
-        )
-
-    @staticmethod
-    def per_layer(
-        by_group: Mapping[int, Any], layer_to_group_idx: Sequence[int]
-    ) -> list[Any]:
-        """``by_group`` expanded to one entry per layer, ``None`` for a layer
-        whose group has no entry. The layers of a group share one object, so
-        a model can convert each group's tensor once."""
-        if not layer_to_group_idx:
-            return []
-        table = [by_group.get(g) for g in range(max(layer_to_group_idx) + 1)]
-        return list(map(table.__getitem__, layer_to_group_idx))
+        return windows, counts
 
     def checkpoint_inputs(
         self,
         checkpoints: Mapping[str, Sequence[tuple[int, int]]],
         row_req_ids: Sequence[str],
         requests: Mapping[str, TTCachedRequestState],
-        layer_to_group_idx: Sequence[int],
         num_rows: int,
-    ) -> tuple[list[torch.Tensor | None], torch.Tensor]:
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """The states a prefill chunk must leave inside itself, from the
         scheduler's ``(position, column)`` list per request
         (``get_tt_mamba_checkpoints``).
 
-        Returns, per layer, int32 ``[num_rows, W]``: the blocks at those
-        columns in the layer's group; and int32 ``[num_rows, W]``: the tokens
-        each block's state covers. ``W`` is the longest list, at least 1;
-        unused entries hold block 0 and 0 tokens. vLLM can cache each block as
-        the state after exactly that many tokens.
+        Returns each Mamba group's blocks at those columns, int32
+        ``[num_rows, W]`` in the order of ``group_indices``; and int32
+        ``[num_rows, W]``: the tokens each block's state covers. ``W`` is the
+        longest list, at least 1; unused entries hold block 0 and 0 tokens.
+        vLLM can cache each block as the state after exactly that many tokens.
         """
         width = max((len(checkpoints.get(r, ())) for r in row_req_ids), default=0)
         width = max(width, 1)
@@ -271,13 +276,38 @@ class MambaCacheGroups:
                         )
                     blocks[i, row, entry] = block
                 positions[row, entry] = position
-        tensor = torch.from_numpy(blocks)
-        return (
-            self.per_layer(
-                {g: tensor[i] for i, g in enumerate(self.group_indices)},
-                layer_to_group_idx,
+        return tuple(torch.from_numpy(blocks)), torch.from_numpy(positions)
+
+    def step_state(
+        self,
+        windows: Sequence[torch.Tensor],
+        accepted_counts: torch.Tensor | None,
+        checkpoint_blocks: Sequence[torch.Tensor] | None = None,
+        checkpoint_positions: torch.Tensor | None = None,
+        chains: Sequence[MambaChainChoices] | None = None,
+    ) -> MambaStepState:
+        """The model's ``mamba_state`` from per-group tensors, each sequence in
+        the order of ``group_indices``."""
+        num_groups = len(self.group_indices)
+        per_group = (
+            windows,
+            (None,) * num_groups if checkpoint_blocks is None else checkpoint_blocks,
+            (None,) * num_groups if chains is None else chains,
+        )
+        lengths = [len(self.layer_names), *map(len, per_group)]
+        if lengths != [num_groups] * len(lengths):
+            raise RuntimeError(
+                f"Mamba groups {list(self.group_indices)} need one entry each; "
+                f"got {lengths} layer-name tuples, windows, checkpoint blocks "
+                "and chain choices"
+            )
+        return MambaStepState(
+            groups=tuple(
+                MambaGroupState(names, *values)
+                for names, *values in zip(self.layer_names, *per_group)
             ),
-            torch.from_numpy(positions),
+            accepted_counts=accepted_counts,
+            checkpoint_positions=checkpoint_positions,
         )
 
     def blocks_to_zero(
@@ -390,9 +420,10 @@ class MambaCacheGroups:
         the drafts of its step in flight as accepted, so the runner passes the
         positions it builds the step with. ``accepted_counts`` maps a request
         to the count the step's spec ``accepted_counts`` carries; absent means
-        1, and -1 (a chained row) passes through: the start state follows the
-        pending verify's acceptance, which only the device knows, and no move
-        may depend on it (``chain_blocker``).
+        1. In mode ``none`` -1 (a chained row) passes through: the start state
+        follows the pending verify's acceptance, which only the device knows.
+        In mode ``align`` a chained verify carries its moves for every count
+        instead (``plan_chained_step``), so -1 raises.
 
         Mode ``align`` ports upstream ``preprocess_mamba``: when a request's
         tokens cross into a new block-table column, its start state moves to
@@ -419,11 +450,14 @@ class MambaCacheGroups:
         copies: list[tuple[int, int]] = []
         for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
             count = accepted_counts.get(req_id, 1)
-            if req_id in fresh:
-                count = 1
-            elif count != PLACEHOLDER_TOKEN_ID and req_id in self.moved_to_window_start:
-                # A chained row keeps -1: the move happened before the pending
-                # verify ran, and that verify's result is where the row starts.
+            if count == PLACEHOLDER_TOKEN_ID and self.mamba_cache_mode == "align":
+                raise RuntimeError(
+                    f"chained request {req_id} at position "
+                    f"{num_computed[req_id]} reached begin_step in "
+                    "mamba_cache_mode 'align'; its moves depend on the pending "
+                    "verify's accepted count and come from plan_chained_step"
+                )
+            if req_id in fresh or req_id in self.moved_to_window_start:
                 count = 1
             if self.mamba_cache_mode == "align":
                 moves, count = self._move_to_running_column(
@@ -458,13 +492,6 @@ class MambaCacheGroups:
         self.state_columns[req_id] = curr
         if prev == -1 or prev == curr:
             return [], count
-        if count == PLACEHOLDER_TOKEN_ID:
-            raise RuntimeError(
-                f"chained request {req_id} moves its state from block-table "
-                f"column {prev} to {curr} at position {computed}, but the copy "
-                "source depends on the pending verify's accepted count, which "
-                "only the device knows; chain_blocker must refuse this chain"
-            )
         self.moved_to_window_start.add(req_id)
         moves = [
             (block_ids[g][prev + count - 1], block_ids[g][curr])
@@ -554,11 +581,11 @@ class MambaCacheGroups:
         row_req_ids: Sequence[str],
         requests: Mapping[str, TTCachedRequestState],
         num_scheduled_tokens: Mapping[str, int],
-        layer_to_group_idx: Sequence[int],
         num_rows: int,
-    ) -> MambaChainPlan:
+    ) -> tuple[MambaChainChoices, ...]:
         """A chained verify's state moves for every count its pending verify
-        can accept (mode ``align``, ``chained_moves_on_device``).
+        can accept (mode ``align``), one ``MambaChainChoices`` per Mamba group
+        in the order of ``group_indices``, padded to ``num_rows`` rows.
 
         Row ``i``'s pending verify starts at the row's committed length minus
         one (the verify before it has committed, ``chain_blocker``) and
@@ -619,16 +646,12 @@ class MambaCacheGroups:
                 else:
                     self.moved_to_window_start.discard(req_id)
             self.deferred_chained_steps[req_id] = num_scheduled
-        copies_t = torch.tensor(copies, dtype=torch.int32)
-        windows_t = torch.tensor(windows, dtype=torch.int32)
-        starts_t = torch.tensor(starts, dtype=torch.int32)
-        return MambaChainPlan(
-            *(
-                self.per_layer(
-                    {g: t[i] for i, g in enumerate(self.group_indices)},
-                    layer_to_group_idx,
-                )
-                for t in (copies_t, windows_t, starts_t)
+        return tuple(
+            MambaChainChoices(copies=c, start_blocks=s, windows=w)
+            for c, s, w in zip(
+                torch.tensor(copies, dtype=torch.int32),
+                torch.tensor(starts, dtype=torch.int32),
+                torch.tensor(windows, dtype=torch.int32),
             )
         )
 
@@ -642,62 +665,38 @@ class MambaCacheGroups:
     ) -> str | None:
         """``"mamba_boundary"`` when a step may not be built over pending verifies.
 
-        Mode ``align`` only. A state move's source depends on a verify's
-        accepted count, so it is due when that verify commits on the host: a
-        boundary copy after acceptance (``after_acceptance``) and a move to a
-        new block-table column before the next step (``begin_step``). A step
-        built over pending verifies (a chained verify, or a prefill submitted
-        behind one) runs before that commit, and the scheduler may have freed
-        a target block by the time the commit runs. So no row may be able to
-        reach a block boundary until the commit: for each request, between its
-        committed length and the most tokens its ``num_pending_steps`` pending
-        verifies, plus this step for ``chained_req_ids``, can compute (each
-        step at most ``step_width``).
+        Mode ``align`` only. A pending verify's boundary copy
+        (``after_acceptance``) takes its source from the verify's accepted
+        count, so it is due when that verify commits on the host. A step built
+        over pending verifies (a chained verify, or a prefill submitted behind
+        one) runs before that commit, and the scheduler may have freed the
+        copy's target block by the time the commit runs. So no pending row may
+        be able to reach a block boundary until the commit: for each request,
+        between its committed length and the most tokens its
+        ``num_pending_steps`` pending verifies can compute (each step at most
+        ``step_width``).
 
         ``pending_req_ids`` are the pending verifies' rows that are not
-        finished, finishing rows included.
+        finished, finishing rows included. A row of ``chained_req_ids`` is
+        exempt: its step carries the moves for every count the one unresolved
+        verify can accept (``plan_chained_step``; ``chain_evaluate`` chains
+        over exactly one, and the steps before it commit before the build), and
+        the host runs no boundary copy for it at the commit. A pending row that
+        the step leaves out still counts.
 
-        With ``chained_moves_on_device`` a chained row is exempt: its step
-        carries the moves for every count the one unresolved verify can accept
-        (``plan_chained_step``; ``chain_evaluate`` chains over exactly one, and
-        the steps before it commit before the build). A pending row that the
-        step leaves out still counts, since its boundary copy waits for the
-        host commit.
-
-        Without ``retains_decode_boundaries`` no boundary copy is due, so only
-        a chained row can block: when its step's running column could differ
-        from the oldest pending verify's, that is, when a boundary lies within
-        ``step_width * num_pending_steps`` tokens past the oldest pending
-        verify's last query token.
+        Without ``retains_decode_boundaries`` no boundary copy is due, so
+        nothing blocks.
         """
-        if self.mamba_cache_mode != "align":
+        if self.mamba_cache_mode != "align" or not self.retains_decode_boundaries:
             return None
         chained = set(chained_req_ids)
-        exempt = chained if self.chained_moves_on_device else ()
-        if not self.retains_decode_boundaries:
-            # No boundary copy is due, so a pending row needs nothing. A
-            # chained row still needs the running column of every step from
-            # the oldest pending one to the chained one to be the same: a move
-            # into a new column reads from the column the count selects.
-            for req_id in chained_req_ids:
-                req_state = requests.get(req_id)
-                if req_state is None or req_id in exempt:
-                    continue
-                first = req_state.num_tokens - 1
-                last = first + step_width * (num_pending_steps + 1)
-                if (first + step_width - 1) // self.block_size != (
-                    last - 1
-                ) // self.block_size:
-                    return "mamba_boundary"
-            return None
-        for req_id in dict.fromkeys((*pending_req_ids, *chained_req_ids)):
+        for req_id in pending_req_ids:
             req_state = requests.get(req_id)
-            if req_state is None or req_id in exempt:
+            if req_state is None or req_id in chained:
                 continue
             # The last committed token is the next step's input, not computed.
             first = req_state.num_tokens - 1
-            steps = num_pending_steps + (req_id in chained)
-            last = first + step_width * steps
+            last = first + step_width * num_pending_steps
             if first // self.block_size != last // self.block_size:
                 return "mamba_boundary"
         return None
@@ -812,6 +811,7 @@ def mamba_cache_groups(
             )
     return MambaCacheGroups(
         group_indices=group_indices,
+        layer_names=tuple(tuple(kv_cache_groups[i].layer_names) for i in group_indices),
         mamba_cache_mode=mode,
         block_size=block_size,
         attention_group_index=attention_group_index,
@@ -826,3 +826,13 @@ def mamba_cache_groups(
         },
         prefill_checkpoints=bool(num_checkpoint_blocks),
     )
+
+
+__all__ = [
+    "SUPPORTED_MAMBA_CACHE_MODES",
+    "MambaCacheGroups",
+    "MambaChainChoices",
+    "MambaGroupState",
+    "MambaStepState",
+    "mamba_cache_groups",
+]

@@ -10,7 +10,9 @@ engine of ``test_spec_chain_async`` with one attention group and one
 
 - the model reads a row's start state from window column ``count - 1``, where a
   chained row's count (-1) is the device's own accepted count of the pending
-  verify;
+  verify; in mode ``align`` a chained verify instead carries its moves for
+  every count (``MambaGroupState.chain``), and the model applies the entry of
+  the device's count;
 - it writes the state after query token ``t`` into window column ``t``;
 - ``copy_kv_cache_blocks`` moves whole states, in the order the runner hands
   them over.
@@ -51,6 +53,7 @@ WIDTH = K + 1
 # Small blocks, so a run crosses many block boundaries.
 MAMBA_BLOCK = 16
 ATTENTION_GROUP, GDN_GROUP = 0, 1
+GDN_LAYERS = ("model.layers.1.linear_attn",)
 
 
 class _StateLedger:
@@ -149,10 +152,12 @@ def _mamba_run(
     chain=True,
     steps=40,
     cycle=(3, 0, 1, 2),
-    on_device=False,
     retains=True,
+    applies_chain=True,
     **kw,
 ):
+    """``applies_chain=False`` stands for a model that ignores
+    ``MambaGroupState.chain`` and reads the ordinary window."""
     monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1" if chain else "0")
     model = _chain_model(accept_cycle=cycle, **kw)
     runner = _make_runner(model)
@@ -167,11 +172,11 @@ def _mamba_run(
     )
     runner._mamba_groups = MambaCacheGroups(
         group_indices=(GDN_GROUP,),
+        layer_names=(GDN_LAYERS,),
         mamba_cache_mode=mode,
         block_size=MAMBA_BLOCK if mode == "align" else MAX_MODEL_LEN,
         attention_group_index=ATTENTION_GROUP,
         num_speculative_blocks=K,
-        chained_moves_on_device=on_device,
         retains_decode_boundaries=retains,
     )
     runner._layer_to_group_idx = [ATTENTION_GROUP, GDN_GROUP]
@@ -189,8 +194,10 @@ def _mamba_run(
         calls.append("forward")
         logged = len(model.chain_log)
         out = forward(*args, **kwargs)
-        windows = kwargs["state_block_windows_per_layer"][GDN_GROUP]
-        counts = kwargs["state_accepted_counts"]
+        mamba_state = kwargs["mamba_state"]
+        [gdn] = mamba_state.groups
+        assert gdn.layer_names == GDN_LAYERS
+        windows, counts = gdn.windows, mamba_state.accepted_counts
         chain_rows = kwargs.get("chain_rows")
         if len(model.chain_log) > logged:
             # A deferred fused verify: the device's own positions and counts.
@@ -201,25 +208,27 @@ def _mamba_run(
             # A synchronous verify: the next step carries host counts.
             p0, num_valid = kwargs["start_pos"][:, 0], kwargs["num_valid_drafts"]
             accepted = None
-        plan = kwargs.get("state_chain_copies_per_layer")
+        chain = gdn.chain
+        if chain is not None:
+            calls.append("chain")
+            if chain.copies[: len(runner._last_rows)].any():
+                calls.append("chain_copy")
         for row, req_id in enumerate(runner._last_rows):
             if chain_rows is not None and bool(chain_rows[row]):
                 assert int(counts[row]) == PLACEHOLDER_TOKEN_ID, (
                     f"chained row {req_id} carries a host count {int(counts[row])}"
                 )
-            if plan is not None:
-                # The device picks the plan entry by the pending verify's count.
+            if chain is not None and applies_chain:
+                # The device picks the entry by the pending verify's count.
                 entry = (row, ledger.last_count[req_id] - 1)
                 ledger.chained_reads += 1
-                src, dst = plan[GDN_GROUP][entry].tolist()
+                src, dst = chain.copies[entry].tolist()
                 if src != dst:
                     ledger.copy([(src, dst)])
-                starts = kwargs["state_chain_start_blocks_per_layer"][GDN_GROUP]
-                windows_by_count = kwargs["state_chain_windows_per_layer"][GDN_GROUP]
                 ledger.verify_block(
                     req_id,
-                    int(starts[entry]),
-                    windows_by_count[entry].tolist(),
+                    int(chain.start_blocks[entry]),
+                    chain.windows[entry].tolist(),
                     int(p0[row]),
                     int(num_valid[row]),
                 )
@@ -278,68 +287,48 @@ def _boundary_states_are_kept(run) -> None:
 
 
 @pytest.mark.parametrize("cycle", [(3, 0, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0)])
-def test_chained_align_steps_read_the_committed_state(monkeypatch, cycle):
+def test_chained_align_steps_keep_the_chain_at_block_boundaries(monkeypatch, cycle):
+    """In mode align a chained verify carries its moves for every count the
+    pending verify can accept, so boundaries do not break the chain, the reads
+    stay exact, and the boundary states are kept, though the host commits each
+    verify after the next one ran."""
     run = _mamba_run(monkeypatch, "align", cycle=cycle)
     assert run.ledger.reads > 0
     assert run.ledger.chained_reads > 0, "no row was chained"
-    # Each request crossed a block boundary several times, and the chain broke
-    # for it rather than build over a pending state move.
-    assert run.controller._chain_breaks["mamba_boundary"] > 0
+    assert "chain_copy" in run.calls
+    assert run.controller._chain_breaks["mamba_boundary"] == 0
     _boundary_states_are_kept(run)
-    # The "TT submissions:" line reports the breaks by reason and the share of
-    # fused verifies that chained.
+    # The "TT submissions:" line reports the share of fused verifies that
+    # chained.
     controller = run.controller
-    report = controller._chain_report()
     share = (
         100.0 * controller._chained_submissions / controller._fused_verify_submissions
     )
-    assert f"({share:.1f}% of {controller._fused_verify_submissions} fused" in report
-    assert f"mamba_boundary={controller._chain_breaks['mamba_boundary']}" in report
-
-
-@pytest.mark.parametrize("cycle", [(3, 0, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0)])
-def test_retention_0_breaks_the_chain_only_for_a_move_into_a_new_column(
-    monkeypatch, cycle
-):
-    """At retention 0 no boundary copy runs, so only a chained step whose
-    running column depends on the pending count breaks the chain: fewer breaks
-    than with dense retention, every read still exact, the same streams."""
-    run = _mamba_run(monkeypatch, "align", cycle=cycle, retains=False)
-    dense = _mamba_run(monkeypatch, "align", cycle=cycle)
-    assert run.ledger.chained_reads > dense.ledger.chained_reads
-    breaks = run.controller._chain_breaks["mamba_boundary"]
-    assert 0 < breaks < dense.controller._chain_breaks["mamba_boundary"]
-    for req_id, tokens in run.engine.outputs.items():
-        shorter = min(len(tokens), len(dense.engine.outputs[req_id]))
-        assert shorter > 20
-        assert tokens[:shorter] == dense.engine.outputs[req_id][:shorter]
-
-
-def test_chained_align_steps_match_the_unchained_run(monkeypatch):
-    chained = _mamba_run(monkeypatch, "align")
-    plain = _mamba_run(monkeypatch, "align", chain=False)
-    assert plain.ledger.chained_reads == 0
-    for req_id, tokens in chained.engine.outputs.items():
-        shorter = min(len(tokens), len(plain.engine.outputs[req_id]))
-        assert shorter > 20
-        assert tokens[:shorter] == plain.engine.outputs[req_id][:shorter]
-
-
-@pytest.mark.parametrize("cycle", [(3, 0, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0)])
-def test_device_moves_keep_the_chain_at_block_boundaries(monkeypatch, cycle):
-    """With ``supports_mamba_chained_state_moves`` a chained verify carries its
-    moves for every count the pending verify can accept, so boundaries do not
-    break the chain, the reads stay exact, and the boundary states are kept,
-    though the host commits each verify after the next one ran."""
-    run = _mamba_run(monkeypatch, "align", cycle=cycle, on_device=True)
-    assert run.ledger.chained_reads > 0
-    assert run.controller._chain_breaks["mamba_boundary"] == 0
-    _boundary_states_are_kept(run)
+    assert (
+        f"({share:.1f}% of {controller._fused_verify_submissions} fused"
+        in controller._chain_report()
+    )
     plain = _mamba_run(monkeypatch, "align", cycle=cycle, chain=False)
     for req_id, tokens in run.engine.outputs.items():
         shorter = min(len(tokens), len(plain.engine.outputs[req_id]))
         assert shorter > 20
         assert tokens[:shorter] == plain.engine.outputs[req_id][:shorter]
+
+
+@pytest.mark.parametrize("cycle", [(3, 0, 1, 2), (3, 3, 3, 3), (0, 0, 0, 0)])
+def test_retention_0_chains_without_boundary_copies(monkeypatch, cycle):
+    """At retention 0 no boundary copy runs: every chained copy entry is
+    ``(0, 0)``, the reads stay exact, and the streams match dense retention."""
+    run = _mamba_run(monkeypatch, "align", cycle=cycle, retains=False)
+    dense = _mamba_run(monkeypatch, "align", cycle=cycle)
+    assert run.ledger.chained_reads > 0
+    assert "chain" in run.calls
+    assert "chain_copy" not in run.calls
+    assert run.controller._chain_breaks["mamba_boundary"] == 0
+    for req_id, tokens in run.engine.outputs.items():
+        shorter = min(len(tokens), len(dense.engine.outputs[req_id]))
+        assert shorter > 20
+        assert tokens[:shorter] == dense.engine.outputs[req_id][:shorter]
 
 
 def test_without_the_host_skip_a_late_boundary_copy_corrupts_the_state(monkeypatch):
@@ -367,33 +356,42 @@ def test_without_the_host_skip_a_late_boundary_copy_corrupts_the_state(monkeypat
             del self._copy_boundary_state
 
     monkeypatch.setattr(MambaCacheGroups, "after_acceptance", after_acceptance)
-    run = _mamba_run(monkeypatch, "align", on_device=True)
+    run = _mamba_run(monkeypatch, "align")
     with pytest.raises(AssertionError):
         _boundary_states_are_kept(run)
 
 
 def test_mode_none_chains_across_block_boundaries(monkeypatch):
     """Mode none keeps the state in the 1 + K blocks of the row and never
-    copies, so nothing breaks the chain."""
+    copies, so nothing breaks the chain, and no step carries chain choices."""
     run = _mamba_run(monkeypatch, "none")
     assert run.ledger.chained_reads > 0
     assert run.controller._chain_breaks["mamba_boundary"] == 0
     assert "copy" not in run.calls
+    assert "chain" not in run.calls
 
 
-def test_without_the_boundary_check_a_chained_step_reads_a_stale_state(monkeypatch):
-    """The check is what keeps the reads right: with it off, a chained step
-    is built over a pending move and the run fails."""
-    monkeypatch.setattr(MambaCacheGroups, "chain_blocker", lambda self, *a, **k: None)
-    with pytest.raises((AssertionError, RuntimeError)):
-        _mamba_run(monkeypatch, "align")
+def test_a_model_that_ignores_the_chain_choices_reads_a_stale_state(monkeypatch):
+    """The negative control: a model that reads a chained row's start state
+    from window column ``count - 1`` of ``MambaGroupState.windows``, as in mode
+    none, and runs no chain copy, reads a state that was never written once a
+    chained step crosses a block boundary."""
+    with pytest.raises(AssertionError, match="read block"):
+        _mamba_run(monkeypatch, "align", applies_chain=False)
 
 
 def _pending_rows_reach_a_boundary(run, controller) -> bool:
+    """Whether a row of the pending verify can reach a block boundary before
+    the host applies it. A chained run can also hold a resolved verify that
+    the host has not applied yet, so the row's committed length can lag by
+    that verify too."""
+    runner = run.runner
+    unapplied = sum(not s.is_resolved() for s in runner._pending_async_steps) + len(
+        runner._completed_decode_steps
+    )
     for req_id in controller._last_fused_rows:
-        state = run.runner.requests[req_id]
-        first = state.num_tokens - 1
-        if first // MAMBA_BLOCK != (first + WIDTH) // MAMBA_BLOCK:
+        first = runner.requests[req_id].num_tokens - 1
+        if first // MAMBA_BLOCK != (first + WIDTH * unapplied) // MAMBA_BLOCK:
             return True
     return False
 
@@ -445,6 +443,7 @@ def test_a_prefill_waits_for_a_pending_verify_that_reaches_a_boundary(
 def _groups(mode="align"):
     return MambaCacheGroups(
         group_indices=(1,),
+        layer_names=(GDN_LAYERS,),
         mamba_cache_mode=mode,
         block_size=MAMBA_BLOCK,
         attention_group_index=0,
@@ -457,26 +456,28 @@ def _requests(**lengths):
 
 
 @pytest.mark.parametrize(
-    ("length", "pending", "chained", "blocked"),
+    ("length", "pending", "blocked"),
     [
-        # 9 computed tokens; one pending verify and the chained step reach 17.
-        (10, 1, True, True),
-        # Without the chained step they reach 13.
-        (10, 1, False, False),
-        # 4 computed tokens: 12 at most.
-        (5, 1, True, False),
+        # 9 computed tokens; one pending verify reaches 13.
+        (10, 1, False),
+        # Two pending verifies reach 17.
+        (10, 2, True),
+        # 13 computed tokens: 17 at most.
+        (14, 1, True),
         # Exactly on a boundary: the computed state is already past it.
-        (17, 1, True, False),
-        (16, 1, True, True),
+        (17, 1, False),
+        (16, 1, True),
     ],
 )
-def test_chain_blocker_looks_one_step_width_ahead_per_step(
-    length, pending, chained, blocked
+def test_chain_blocker_looks_one_step_width_ahead_per_pending_step(
+    length, pending, blocked
 ):
-    reason = _groups().chain_blocker(
-        _requests(a=length), ["a"], ["a"] if chained else [], pending, WIDTH
-    )
+    """A pending row that the step leaves out, as for a prefill built over the
+    pending verifies; the same row is exempt as a chained row."""
+    requests = _requests(a=length)
+    reason = _groups().chain_blocker(requests, ["a"], [], pending, WIDTH)
     assert (reason == "mamba_boundary") is blocked
+    assert _groups().chain_blocker(requests, ["a"], ["a"], pending, WIDTH) is None
 
 
 def test_chain_blocker_counts_a_finishing_row_of_the_pending_verify():

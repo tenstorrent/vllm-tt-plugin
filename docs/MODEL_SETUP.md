@@ -215,7 +215,7 @@ Declaration rules:
   fits one chunk is one prefill step instead of two, and vLLM reserves a
   block inside the chunk for the state at its checkpoint position
   (`get_mamba_prefill_checkpoint_position`). The prefill must then write
-  the states named by `state_checkpoint_ids_per_layer`; see
+  the states named by `MambaGroupState.checkpoint_blocks`; see
   [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks). vLLM
   places a checkpoint only where its offset from the chunk start is a
   multiple of `prefill_checkpoint_alignment`, so declare the granularity at
@@ -232,7 +232,7 @@ Declaration rules:
   `ceil(max_model_len / block_size) + K` in mode `align`.
 - The adapter must implement `zero_kv_cache_blocks`, and in mode `align` also
   `copy_kv_cache_blocks`. See [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
-  Prefill and decode receive `state_block_ids_per_layer`; see
+  Prefill and decode receive `mamba_state`; see
   [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks).
 - Lane-DP and block-output models do not support `MambaSpec` groups.
 
