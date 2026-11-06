@@ -151,6 +151,23 @@ def test_state_follows_the_request_across_row_moves():
     )
 
 
+def test_a_continuing_chunk_keeps_its_slot_when_its_row_moves():
+    """A chunked prefill's next chunk reads the state its earlier chunks wrote (e.g. a
+    recurrent state), so it must stay in that slot when its batch row changes."""
+    r = _runner()
+    assert _prefill(r, ["A", "B"]) == [0, 1]
+    # A finished its prompt and now decodes from slot 0; B still has chunks to go, and
+    # a new request C is scheduled ahead of it. C's own row 0 is held by A.
+    slots = _prefill(r, ["C", "B"])
+    assert slots[1] == 1, f"B's next chunk must stay in slot 1, got {slots}"
+    assert slots[0] not in (0, 1), f"C must not take A's or B's slot, got {slots}"
+
+    # Two continuing requests whose rows swap keep their own slots.
+    r = _runner()
+    assert _prefill(r, ["A", "B"]) == [0, 1]
+    assert _prefill(r, ["B", "A"]) == [1, 0]
+
+
 def test_accepting_the_decode_remap_advances_the_ownership_map():
     """An accepted decode records the post-gather layout.
 
