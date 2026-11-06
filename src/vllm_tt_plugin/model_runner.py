@@ -1183,7 +1183,9 @@ class TTModelRunner:
         )
         if self._mamba_groups is not None:
             # A MambaSpec model sets its block sizes in ``get_kv_cache_spec``
-            # (TT skips upstream's ``_align_hybrid_block_size``), so
+            # (upstream's ``update_block_size_for_backend`` returns before
+            # ``_align_hybrid_block_size``: a TT model registers no vLLM
+            # attention layer for ``_find_non_ssm_backend`` to find), so
             # ``cache_config.block_size`` need not be any group's block size:
             # size the table from the groups. TT chunked SDPA requires a
             # page-table row of a multiple of 32 bytes, so 8 int32 columns.
