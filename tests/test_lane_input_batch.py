@@ -398,6 +398,59 @@ def test_lane_structured_decode_captures_expected_grammar_request_ids():
     assert model_input.defer_device_sampling is True
 
 
+def test_lane_decode_input_gaps_a_slot_with_prefill_work():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    batch = _lane_batch(num_lanes=1, per_lane=3, with_custom=False)
+    decoding = _make_req("decoding", [1, 2, 3], [4], dict(temperature=0.0))
+    decoding.block_ids = ([3],)
+    # Four of the eight prompt tokens are written; the coordinator interleaves
+    # a decode step of the other request before the next chunk.
+    prefilling = _make_req("prefilling", list(range(8)), [], dict(temperature=0.0))
+    prefilling.block_ids = ([5],)
+    prefilling.num_computed_tokens = 4
+    # Resumed after preemption: the replay of its eight prompt tokens and four
+    # outputs has reached ten, past the prompt but two short of the sequence.
+    resumed = _make_req(
+        "resumed", list(range(8)), [8, 9, 10, 11], dict(temperature=0.0)
+    )
+    resumed.block_ids = ([6],)
+    resumed.num_computed_tokens = 10
+    decoding_row = _add_to_lane(batch, decoding, lane=0)
+    prefilling_row = _add_to_lane(batch, prefilling, lane=0)
+    resumed_row = _add_to_lane(batch, resumed, lane=0)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"decoding": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    plan = _plan({"decoding": decoding_row}, is_decode=True, capacity=3)
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={
+                "decoding": decoding,
+                "prefilling": prefilling,
+                "resumed": resumed,
+            },
+        )
+    )
+
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+
+    # A slot with prefill work decodes nothing: no position, no token, no blocks.
+    table = model_input.block_tables_per_group[0]
+    for row in (prefilling_row, resumed_row):
+        assert model_input.input_positions.tolist()[row] == -1
+        assert model_input.input_tokens.tolist()[row] == [0]
+        assert not table[row].any()
+    assert model_input.input_positions.tolist()[decoding_row] == 3
+    assert model_input.input_tokens.tolist()[decoding_row] == [4]
+    assert table[decoding_row, 0] == 3
+
+
 def test_slot_grammar_bitmask_default_preserves_non_strict_mapping():
     batch = _lane_batch(num_lanes=1, per_lane=2, with_custom=False)
     request = _make_req(

@@ -389,6 +389,23 @@ class InputBatch:
             and len(self.repetition_penalties_reqs) == 0
         )
 
+    def has_prefill_work(
+        self, row: int, output_tokens_per_step: int | None = None
+    ) -> bool:
+        """Whether ``row``'s request still has prefill work this step: an
+        uncomputed prompt token, or, in a replay after preemption, more than
+        one step's output (``output_tokens_per_step``, default the batch's)
+        uncomputed. A decode row has exactly one step's output left (the
+        sampled token for AR, one whole canvas for block models).
+        ``num_computed_tokens_cpu`` is the scheduler's pre-step snapshot."""
+        if output_tokens_per_step is None:
+            output_tokens_per_step = self.output_tokens_per_step
+        num_computed = self.num_computed_tokens_cpu[row]
+        return bool(
+            num_computed < self.num_prompt_tokens[row]
+            or num_computed + output_tokens_per_step < self.num_tokens[row]
+        )
+
     def add_request(
         self,
         request: "CachedRequestState",
@@ -1371,9 +1388,18 @@ class TTLaneInputBatch(InputBatch):
 
         num_tokens = lane_batch.num_tokens
         positions_np = num_tokens[:total].astype(np.int32) - 1  # gaps -> -1
+        # A slot whose request still has prefill work (a chunked prefill, or the
+        # replay of a request resumed after preemption, that a decode step the
+        # coordinator interleaves into its run of chunks leaves out) is a gap
+        # too, on any launch: its K / V is only partly written and its block
+        # table covers only the chunks so far, so decoding it at its last
+        # position would attend over unwritten rows and write K / V through
+        # table entries that are still zero, the null block.
+        decoding = [row for row in occupied if not lane_batch.has_prefill_work(row)]
+        positions_np[sorted(set(occupied) - set(decoding))] = -1
         input_positions = torch.from_numpy(positions_np)
         tokens_np = np.zeros((total, 1), dtype=np.int32)
-        for row in occupied:
+        for row in decoding:
             tokens_np[row, 0] = lane_batch.token_ids_cpu[row, num_tokens[row] - 1]
         input_tokens = torch.from_numpy(tokens_np)
 
@@ -1409,7 +1435,7 @@ class TTLaneInputBatch(InputBatch):
         walk_samples = spec.spec_mode == ACCEPT_MODE_LOGITS
 
         block_tables_per_group = lane_batch.slot_block_tables(
-            occupied, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
+            decoding, zero_gaps=True, total=total, width=runner.max_num_blocks_per_req
         )
         rows_all = list(range(total))
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
