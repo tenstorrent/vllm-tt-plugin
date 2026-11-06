@@ -126,9 +126,12 @@ class TTFinalizedDecode:
 def _is_host_decode_output(tt_out: Any) -> bool:
     if isinstance(tt_out, torch.Tensor):
         return True
+    # Device logprobs nest a tuple in ``(token_ids, logprobs)``: the top-K
+    # ``(topk_logprobs, topk_indices)`` pair, or a named tuple carrying
+    # ``selected_token_ranks``.
     if isinstance(tt_out, tuple):
         return all(
-            tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
+            element is None or _is_host_decode_output(element) for element in tt_out
         )
     return False
 
@@ -1493,17 +1496,11 @@ class TTAsyncDecodeController:
                             ),
                         ),
                     )
-                else:
-                    is_host_tensor = isinstance(tt_out, torch.Tensor)
-                    is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                        tensor is None or isinstance(tensor, torch.Tensor)
-                        for tensor in tt_out
+                elif not _is_host_decode_output(tt_out):
+                    raise AttributeError(
+                        "TT model must implement read_decode_output() "
+                        "unless decode_forward() already returns host tensors"
                     )
-                    if not (is_host_tensor or is_host_tensor_tuple):
-                        raise AttributeError(
-                            "TT model must implement read_decode_output() "
-                            "unless decode_forward() already returns host tensors"
-                        )
         except Exception:
             # The model accepted the decode, so its device may have run the
             # step and fed the resident inputs, but the answer never reached
