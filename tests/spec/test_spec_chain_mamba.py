@@ -177,7 +177,7 @@ def _mamba_run(
         block_size=MAMBA_BLOCK if mode == "align" else MAX_MODEL_LEN,
         attention_group_index=ATTENTION_GROUP,
         num_speculative_blocks=K,
-        retains_decode_boundaries=retains,
+        retention_interval=None if retains else 0,
     )
     runner._layer_to_group_idx = [ATTENTION_GROUP, GDN_GROUP]
     runner.tt_max_batch_size = MAX_NUM_REQS

@@ -1380,7 +1380,7 @@ reads only `num_valid` and publishes a length hint, never ids.
 The runner chains only when exactly one verify is unresolved and it is the
 newest fused step; the scheduled requests are its rows less the finished ones;
 no prefill chunk, forced reset, grammar, penalties or allowlist (with `supports_spec_device_mask` the grammar, allowlist, bad words and `min_tokens` are served by the token mask, section 4n), and no logprobs row the model cannot serve (section 4l); every
-row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With `MambaSpec` groups in mode `align` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)), the state copies at a block boundary take their source from the pending verify's accepted count, which the host has only after the commit. A chained verify therefore carries these moves for every count the pending verify can accept (`MambaGroupState.chain` in `mamba_state`), and a `MambaSpec` model in mode `align` that chains verifies must apply them. A row of the pending verify that the chained step leaves out (a finishing row) may not be able to reach a block boundary before the pending verify commits (blocker `mamba_boundary`), since its boundary copy waits for the host commit. With `prefix_cache_retention_interval` 0 no boundary copy runs, and nothing blocks. Anything
+row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With `MambaSpec` groups in mode `align` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)), the state copies at a block boundary take their source from the pending verify's accepted count, which the host has only after the commit. A chained verify therefore carries these moves for every count the pending verify can accept (`MambaGroupState.chain` in `mamba_state`), and a `MambaSpec` model in mode `align` that chains verifies must apply them. A row of the pending verify that the chained step leaves out (a finishing row) may not be able to reach a block boundary before the pending verify commits (blocker `mamba_boundary`), since its boundary copy waits for the host commit. Only a boundary whose state vLLM keeps has a boundary copy and blocks: with `prefix_cache_retention_interval` 0 none does, above one block only its multiples do. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
 
@@ -1395,8 +1395,8 @@ input; it submits the prefill behind the verify and finalizes the verify later,
 before the next decode build. A step after such a prefill does not chain onto
 the verify it overtook. A resumed request, a multimodal request or a model
 without the key still drains first, as does a pending verify with a row that
-can reach a `MambaSpec` block boundary in mode `align` (`mamba_boundary`; not
-at retention 0, where no boundary copy runs).
+can reach a `MambaSpec` block boundary whose state vLLM keeps in mode `align`
+(`mamba_boundary`; never at retention 0, where no boundary copy runs).
 
 ## 4l. Device logprobs and the device top-p certificate
 
