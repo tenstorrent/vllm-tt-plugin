@@ -1383,12 +1383,22 @@ class TTLaneInputBatch(InputBatch):
         # speculating launch it is sent inactive rather than with the real
         # last token ``occupied`` filled in above), so a verify's block keeps
         # the slot layout the device decodes.
+        # The lane step's device-sampling decision, made once before the block
+        # over the rows the submission samples (every occupied slot: an
+        # unscheduled occupant must not change its sampling route) as the
+        # front-packed path makes it (``_prepare_model_inputs``): on a model
+        # declaring ``spec_ids_are_sampled`` it is what certifies a sampled
+        # slot, and the submission below reuses it.
+        device_sampled = runner._decode_device_sampled(
+            scheduler_output, grammar_output, occupied
+        )
         spec = runner._spec_decode_rows(
             scheduler_output,
             row_req_ids,
             input_tokens,
             input_positions,
             live_rows=scheduled_rows,
+            device_sampled=device_sampled,
         )
         input_tokens, input_positions = spec.input_tokens, spec.input_positions
         # A ``logits`` verify is walked on the host from the step's own copies
@@ -1405,9 +1415,6 @@ class TTLaneInputBatch(InputBatch):
         tt_sampling_params = lane_batch.slot_sampling_params(rows_all)
 
         bitmask = lane_batch.slot_grammar_bitmask(grammar_output, total)
-        has_structured = has_structured_outputs(
-            runner.requests, scheduler_output, bitmask
-        )
         scheduled_structured_req_ids = scheduled_structured_output_request_ids(
             runner.requests,
             scheduler_output,
@@ -1417,13 +1424,8 @@ class TTLaneInputBatch(InputBatch):
             scheduled_structured_req_ids,
             lane_batch.req_ids[:total],
         )
-        perform_device_sampling = runner.check_perform_device_sampling(
-            is_decode=True,
-            has_structured_outputs=has_structured,
-            sampling_rows=occupied,
-        )
-        if has_structured and not has_scheduled_structured:
-            perform_device_sampling = False
+        # The standing decision above (the structured-output rule included).
+        perform_device_sampling = device_sampled
         if walk_samples:
             # The host walk samples from the logits this verify returns, so
             # the model must not sample on device.

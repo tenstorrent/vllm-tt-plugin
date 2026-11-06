@@ -104,6 +104,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     # that does not speculate they return the rows unchanged.
     for name in (
         "_spec_decode_rows",
+        "_decode_device_sampled",
         "_reset_spec_state_for_prefill",
         "_spec_grammar_rows_per_request",
     ):

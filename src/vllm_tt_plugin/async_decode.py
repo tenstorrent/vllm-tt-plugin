@@ -1012,12 +1012,21 @@ class TTAsyncDecodeController:
             return False
         scheduled = scheduler_output.num_scheduled_tokens
         if runner._spec_supports_narrow_decode and not all(
-            runner._request_is_speculable(req_id) for req_id in scheduled
+            runner._request_is_speculable(req_id, device_sampled=True)
+            for req_id in scheduled
         ):
             # ``_step_verifies`` sends such a step as the ordinary decode,
             # whatever its rows carry. A scheduled request that is not in the
             # persistent batch yet reads as speculable here, which errs
-            # towards True below.
+            # towards True below. So does ``device_sampled=True``: the step's
+            # own device-sampling decision (``_decode_device_sampled``) needs
+            # the updated batch and the grammar output, which this preflight
+            # does not have, and on a model declaring ``spec_ids_are_sampled``
+            # a sampled request is speculable exactly when the step samples on
+            # the device. Reading it as speculable drains before a verify
+            # that may come; reading it as plain would build that verify over
+            # the outstanding step. On every other model the flag changes
+            # nothing (``_request_is_argmax_certifiable``).
             return False
         drafts = scheduler_output.scheduled_spec_decode_tokens
         for req_id in scheduled:

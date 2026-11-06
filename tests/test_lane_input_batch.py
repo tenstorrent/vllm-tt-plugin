@@ -127,6 +127,7 @@ def _without_speculation(runner):
     runner._num_speculative_tokens = 0
     for name in (
         "_spec_decode_rows",
+        "_decode_device_sampled",
         "_reset_spec_state_for_prefill",
         "_spec_grammar_rows_per_request",
     ):
