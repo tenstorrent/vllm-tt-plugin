@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -113,6 +114,14 @@ if TYPE_CHECKING:
 import numpy as np
 
 logger = init_tt_logger(__name__)
+
+
+def _startup_log(name, t0):
+    """MIMO_STARTUP_TIMING: log a warmup phase's wall time; returns the time now."""
+    t = time.perf_counter()
+    if os.environ.get("MIMO_STARTUP_TIMING", "0") not in ("", "0"):
+        logger.info("MIMO_STARTUP warmup.%s %.3f s t=%.3f", name, t - t0, time.time())
+    return t
 
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
@@ -5100,8 +5109,11 @@ class TTModelRunner:
         # Phase 1: eager warmup (no trace capture). tt-metal #55343 also
         # stages generic decode trace inputs here, using the profiled
         # num_blocks above, so Phase 2 can reuse their device allocations.
+        _t = time.perf_counter()
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
+        _t = _startup_log("phase1.prefill", _t)
         self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
+        _t = _startup_log("phase1.decode", _t)
 
         # Reset prefill warmup flag so Phase 2 re-runs with tracing
         if hasattr(self.model, "already_warmed_up_prefill"):
@@ -5115,5 +5127,7 @@ class TTModelRunner:
         # capture. Older tt-metal revisions lack that protection (see #122).
         if trace_prefill_mode:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
+            _t = _startup_log("phase2.prefill", _t)
         if trace_decode_mode:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
+            _t = _startup_log("phase2.decode", _t)
