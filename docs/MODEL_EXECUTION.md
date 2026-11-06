@@ -65,16 +65,19 @@ the accepted column: before the forward, column `prev + count - 1`, as
 upstream `preprocess_mamba`; and after a verify's acceptance,
 `commit_spec_acceptance` copies the state at a block boundary that the
 committed tokens reached into that boundary's own column, as upstream
-`postprocess_mamba_align_gpu` does. That copy runs only when
-`cache_config.prefix_cache_retention_interval` is not 0: at 0 (vLLM's default)
-vLLM caches a Mamba block only at a prompt's replay boundary or a
-shared-prefix junction, never at a boundary that decoding reaches, so nothing
-reads the copy. Upstream keeps the conv history of all `1 + K` positions in
+`postprocess_mamba_align_gpu` does. That copy runs only at a boundary whose
+state vLLM keeps (`MambaManager.reachable_block_mask`): every block boundary
+when `cache_config.prefix_cache_retention_interval` is `None` or one block,
+every multiple of the interval when it is larger, and none at 0 (vLLM's
+default), where vLLM caches a Mamba block only at a prompt's replay boundary
+or a shared-prefix junction, never at a boundary that decoding reaches. At
+any other boundary nothing reads the copy, and vLLM may already have freed
+its destination block. Upstream keeps the conv history of all `1 + K` positions in
 window column 0 instead; TT does not support that layout.
 
 **Chained verifies in mode `align`.** A chained verify (`chain_rows` set) is built before the pending verify (the one `chain_tip` names) commits, so the host cannot run the mode-`align` state moves between the two verifies: their source depends on the pending verify's accepted count. In mode `align`, each group's `MambaGroupState.chain` therefore holds a `MambaChainChoices` with these moves for every count the pending verify can accept. A `MambaSpec` model in mode `align` that chains verifies must apply `chain`. Index `[i, c - 1]` holds the values for row `i` when the pending verify accepted `c` tokens for that row, `1 <= c <= 1 + K`:
 
-- `MambaChainChoices.copies`: `[tt_max_batch_size, 1 + K, 2]`, a `(src, dst)` block pair. Before this step reads or writes any state, the model copies the full state (conv history and recurrent state) of block `src` into block `dst`. `src == dst` means no copy; padding rows and rows without a copy hold `(0, 0)`, and at retention 0 every entry does. This is the pending verify's boundary copy (upstream `postprocess_mamba`); the runner does not run it again when that verify commits.
+- `MambaChainChoices.copies`: `[tt_max_batch_size, 1 + K, 2]`, a `(src, dst)` block pair. Before this step reads or writes any state, the model copies the full state (conv history and recurrent state) of block `src` into block `dst`. `src == dst` means no copy; padding rows and rows without a copy hold `(0, 0)`, as does every entry at a boundary whose state vLLM does not keep (every entry at retention 0). This is the pending verify's boundary copy (upstream `postprocess_mamba`); the runner does not run it again when that verify commits.
 - `MambaChainChoices.start_blocks`: `[tt_max_batch_size, 1 + K]`, the block that holds the row's start state, read after the copy. When the row crosses into a new block-table column, this is the block that the move into the new column would copy from (upstream `preprocess_mamba`), and no copy runs: the step writes window column 0 itself. The start block can be one of this step's window blocks; the model must read the start state before it writes that block.
 - `MambaChainChoices.windows`: `[tt_max_batch_size, 1 + K, 1 + K]`, the row's state window; entry `[i, c - 1, t]` is the block that takes the state after query token `t`.
 

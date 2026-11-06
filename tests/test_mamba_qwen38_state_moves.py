@@ -1192,13 +1192,32 @@ def test_retention_0_runs_no_boundary_copy_and_every_read_stays_exact():
     ledger still finds every state the TT layout reads, across block
     boundaries with partial acceptance."""
     h = _Harness("align", num_spec=K, retention=0, max_num_batched_tokens=2048)
-    assert not h.plugin_groups.retains_decode_boundaries
+    assert h.plugin_groups.kept_boundary_interval == 0
     h.add("a", _prompt(1, 1010), max_tokens=60)
     h.add("bb", _prompt(2, 2030), max_tokens=60)
     h.run(accept=_accept_pattern)
     assert h.finished("a") and h.finished("bb")
     assert any(s.post_copies for s in h.steps), "upstream copies at boundaries"
     assert not any(s.groups_post for s in h.steps)
+
+
+def test_sparse_retention_copies_only_the_boundaries_vllm_keeps():
+    """Retention 2048 at block 1024: vLLM keeps A's decode-reached state at
+    2048 but not at 3072. Upstream copies at both boundaries; the TT
+    runner's ``MambaCacheGroups`` copies at 2048 only, every read stays
+    exact, and B's prefix hit lands on 2048 and reads the copied state."""
+    h = _Harness("align", num_spec=K, retention=2048)
+    assert h.plugin_groups.kept_boundary_interval == 2048
+    h.add("a", _prompt(1, 1900), max_tokens=1250)
+    h.run(max_steps=1500, accept=_accept_pattern, until=lambda: h.finished("a"))
+    upstream = [s for s in h.steps if s.post_copies]
+    plugin = [s for s in h.steps if s.groups_post]
+    assert len(upstream) == 2, "A passes 2048 and 3072"
+    assert plugin == upstream[:1]
+    h.add("b", h.tokens["a"][:3100], max_tokens=2)
+    h.run(accept=_accept_pattern)
+    hits = {r: n for s in h.steps for r, n in s.new_hits.items()}
+    assert hits["b"] == 2048
 
 
 @pytest.mark.parametrize("mode", ["none", "align"])

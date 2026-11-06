@@ -140,11 +140,14 @@ class MambaCacheGroups:
     # Request id -> the scheduled tokens of a chained step whose moves the
     # device runs; its bookkeeping catches up when the pending verify commits.
     deferred_chained_steps: dict[str, int] = field(default_factory=dict)
-    # ``prefix_cache_retention_interval`` is not 0. At 0 vLLM caches a Mamba
-    # block only at a prompt's replay boundary or a shared-prefix junction
-    # (``MambaManager.reachable_block_mask``), never at a block boundary that
-    # decoding reaches, so the boundary copy after acceptance has no reader.
-    retains_decode_boundaries: bool = True
+    # ``CacheConfig.prefix_cache_retention_interval``. vLLM keeps the state of
+    # a block boundary that decoding reaches only where
+    # ``MambaManager.reachable_block_mask`` keeps a periodic one: every block
+    # boundary at ``None`` or an interval of one block, every multiple of the
+    # interval above that, none at 0 (it then keeps a Mamba block only at a
+    # prompt's replay boundary or a shared-prefix junction). A boundary copy
+    # after acceptance at any other boundary has no reader.
+    retention_interval: int | None = None
     # Every attention group has one KV precision
     # (``KVCacheConfig.has_mixed_precision_kv_cache`` is False), so only a
     # block a Mamba group owned can hold bytes attention reads as NaN or Inf.
@@ -158,6 +161,16 @@ class MambaCacheGroups:
     # for the state at the prompt's last cacheable position
     # (``checkpoint_inputs``), instead of ending a chunk there.
     prefill_checkpoints: bool = False
+
+    @property
+    def kept_boundary_interval(self) -> int:
+        """Tokens between two decode-reached block boundaries whose state vLLM
+        keeps (``retention_interval``); 0 when it keeps none."""
+        if self.retention_interval is None:
+            return self.block_size
+        if self.retention_interval == 0:
+            return 0
+        return max(self.retention_interval, self.block_size)
 
     def max_num_blocks(self, max_model_len: int) -> int:
         """Block-table row width of a Mamba group, as
@@ -549,10 +562,11 @@ class MambaCacheGroups:
         """Mode ``align``: the boundary copies after a verify committed
         ``count`` tokens from ``position``, one per Mamba group.
 
-        None without ``retains_decode_boundaries``. The copy also moves the
-        start state into window column 0 when the boundary ends the running
-        column, but then the next step moves into a new column, and without
-        the copy it reads the same state from window column ``count - 1``.
+        None at a boundary whose state vLLM does not keep
+        (``kept_boundary_interval``). The copy also moves the start state into
+        window column 0 when the boundary ends the running column, but then
+        the next step moves into a new column, and without the copy it reads
+        the same state from window column ``count - 1``.
         """
         src = self.state_columns.get(req_id)
         if src is None:
@@ -560,11 +574,12 @@ class MambaCacheGroups:
                 f"request {req_id} committed {count} tokens at position "
                 f"{position} but begin_step recorded no running column for it"
             )
-        if not self.retains_decode_boundaries:
+        kept = self.kept_boundary_interval
+        if not kept:
             return []
         running = position + 1
         aligned = (position + count) // self.block_size * self.block_size
-        if aligned < running:
+        if aligned < running or aligned % kept:
             return []
         shift = aligned - running
         dst = aligned // self.block_size - 1
@@ -684,10 +699,11 @@ class MambaCacheGroups:
         the host runs no boundary copy for it at the commit. A pending row that
         the step leaves out still counts.
 
-        Without ``retains_decode_boundaries`` no boundary copy is due, so
-        nothing blocks.
+        Only a boundary whose state vLLM keeps (``kept_boundary_interval``)
+        has a copy, so only such a boundary blocks.
         """
-        if self.mamba_cache_mode != "align" or not self.retains_decode_boundaries:
+        kept = self.kept_boundary_interval
+        if self.mamba_cache_mode != "align" or not kept:
             return None
         chained = set(chained_req_ids)
         for req_id in pending_req_ids:
@@ -697,7 +713,7 @@ class MambaCacheGroups:
             # The last committed token is the next step's input, not computed.
             first = req_state.num_tokens - 1
             last = first + step_width * num_pending_steps
-            if first // self.block_size != last // self.block_size:
+            if first // kept != last // kept:
                 return "mamba_boundary"
         return None
 
@@ -816,8 +832,8 @@ def mamba_cache_groups(
         block_size=block_size,
         attention_group_index=attention_group_index,
         num_speculative_blocks=num_speculative_blocks.pop(),
-        retains_decode_boundaries=(
-            getattr(cache_config, "prefix_cache_retention_interval", None) != 0
+        retention_interval=getattr(
+            cache_config, "prefix_cache_retention_interval", None
         ),
         attention_block_sizes={
             i: group.kv_cache_spec.block_size

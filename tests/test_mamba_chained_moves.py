@@ -36,7 +36,7 @@ GDN = 1
 REQ = "r"
 
 
-def _groups(block_size: int, retains: bool = True) -> MambaCacheGroups:
+def _groups(block_size: int, retention: int | None = None) -> MambaCacheGroups:
     return MambaCacheGroups(
         group_indices=(GDN,),
         layer_names=(("model.layers.1.linear_attn",),),
@@ -44,7 +44,7 @@ def _groups(block_size: int, retains: bool = True) -> MambaCacheGroups:
         block_size=block_size,
         attention_group_index=0,
         num_speculative_blocks=K,
-        retains_decode_boundaries=retains,
+        retention_interval=retention,
     )
 
 
@@ -61,9 +61,9 @@ def _scheduled(num_tokens: int, *, new: bool = False):
 class _Run:
     """One request: a prompt prefilled whole, then verifies of 1 + K tokens."""
 
-    def __init__(self, block_size: int, prompt_len: int, retains: bool = True):
+    def __init__(self, block_size: int, prompt_len: int, retention: int | None = None):
         self.bs = block_size
-        self.groups = _groups(block_size, retains)
+        self.groups = _groups(block_size, retention)
         columns = 64
         self.row = list(range(100, 100 + columns))
         self.state = SimpleNamespace(block_ids=[[], self.row], num_tokens=0)
@@ -98,16 +98,22 @@ class _Run:
             self.blocks[block] = position + t + 1
 
     def boundaries_are_kept(self, columns: int) -> None:
+        """Every column the request passed whose boundary vLLM keeps holds the
+        state after that boundary."""
+        kept = self.groups.kept_boundary_interval
         for column in range(self.first_column, columns):
-            assert self.blocks.get(self.row[column]) == (column + 1) * self.bs, column
+            if kept and (column + 1) * self.bs % kept == 0:
+                assert self.blocks.get(self.row[column]) == (column + 1) * self.bs, (
+                    column
+                )
 
     def window(self, position: int) -> list[int]:
         first = (position + WIDTH - 1) // self.bs
         return self.row[first : first + WIDTH]
 
 
-def _host_order(block_size, prompt_len, counts, retains=True):
-    run = _Run(block_size, prompt_len, retains=retains)
+def _host_order(block_size, prompt_len, counts, retention=None):
+    run = _Run(block_size, prompt_len, retention=retention)
     position, count = run.position, 1
     for accepted in counts:
         run.copy(
@@ -125,10 +131,10 @@ def _host_order(block_size, prompt_len, counts, retains=True):
     return run, position
 
 
-def _chained_order(block_size, prompt_len, counts, retains=True):
+def _chained_order(block_size, prompt_len, counts, retention=None):
     """Step 0 is built by the host; step n > 0 is built while step n - 1 is
     pending, after step n - 2 committed, as ``chain_evaluate`` allows."""
-    run = _Run(block_size, prompt_len, retains=retains)
+    run = _Run(block_size, prompt_len, retention=retention)
     position = run.position
     run.copy(run.groups.begin_step(_scheduled(WIDTH), run.requests, {REQ: position}))
     window = run.window(position)
@@ -157,20 +163,20 @@ def _chained_order(block_size, prompt_len, counts, retains=True):
 
 
 def test_retention_0_issues_no_boundary_copy():
-    run = _Run(8, 9, retains=False)
+    run = _Run(8, 9, retention=0)
     run.groups.begin_step(_scheduled(WIDTH), run.requests, {REQ: run.position})
     # 9 + 4 crosses 16 with all four tokens accepted; dense retention copies.
     assert run.groups.after_acceptance({REQ: (12, 4)}, run.requests) == []
     assert run.groups.moved_to_window_start == set()
-    dense = _Run(8, 9, retains=True)
+    dense = _Run(8, 9)
     dense.groups.begin_step(_scheduled(WIDTH), dense.requests, {REQ: dense.position})
     assert dense.groups.after_acceptance({REQ: (12, 4)}, dense.requests)
 
 
 @pytest.mark.parametrize(
-    ("retention", "retains"), [(0, False), (None, True), (2048, True)]
+    ("retention", "kept"), [(0, 0), (None, 16), (16, 16), (32, 32)]
 )
-def test_retention_is_read_from_the_cache_config(retention, retains):
+def test_retention_is_read_from_the_cache_config(retention, kept):
     import torch
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -200,28 +206,42 @@ def test_retention_is_read_from_the_cache_config(retention, retains):
     cache_config = SimpleNamespace(
         mamba_cache_mode="align", prefix_cache_retention_interval=retention
     )
-    assert mamba_cache_groups(groups, cache_config, 64).retains_decode_boundaries is (
-        retains
-    )
+    assert mamba_cache_groups(groups, cache_config, 64).kept_boundary_interval == kept
 
 
-@pytest.mark.parametrize("retains", [True, False])
+def test_sparse_retention_copies_only_at_kept_boundaries():
+    """At retention 16 with block 8, vLLM keeps the decode-reached state at
+    16 but not at 24, so only a verify that reaches 16 copies."""
+    for retention, reaches, copies in [
+        (16, 16, True),
+        (16, 24, False),
+        (None, 24, True),
+    ]:
+        # The verify runs from 2 tokens before the boundary and accepts all.
+        run = _Run(8, reaches - 2, retention=retention)
+        run.groups.begin_step(_scheduled(WIDTH), run.requests, {REQ: run.position})
+        made = run.groups.after_acceptance({REQ: (run.position, WIDTH)}, run.requests)
+        assert bool(made) is copies, (retention, reaches, made)
+
+
+@pytest.mark.parametrize("retention_blocks", [None, 0, 1, 2])
 @pytest.mark.parametrize("block_size", [4, 5, 8])
-def test_every_count_sequence_matches_the_host_order(block_size, retains):
+def test_every_count_sequence_matches_the_host_order(block_size, retention_blocks):
     """All 4**4 count sequences of four verifies, from every prompt offset in
     a block: the chained run reads what the host run reads, keeps every
-    boundary state (dense retention), and ends with the same bookkeeping."""
+    boundary state that vLLM keeps (dense, none, every block, every second
+    block), and ends with the same bookkeeping."""
+    retention = None if retention_blocks is None else retention_blocks * block_size
     for prompt_len in range(block_size + 1, 2 * block_size + 1):
         for counts in itertools.product(range(1, WIDTH + 1), repeat=4):
-            host, host_end = _host_order(block_size, prompt_len, counts, retains)
+            host, host_end = _host_order(block_size, prompt_len, counts, retention)
             chained, chained_end = _chained_order(
-                block_size, prompt_len, counts, retains
+                block_size, prompt_len, counts, retention
             )
             assert chained_end == host_end
-            if retains:
-                passed = (host_end - 1) // block_size
-                host.boundaries_are_kept(passed)
-                chained.boundaries_are_kept(passed)
+            passed = (host_end - 1) // block_size
+            host.boundaries_are_kept(passed)
+            chained.boundaries_are_kept(passed)
             assert chained.groups.state_columns == host.groups.state_columns
             assert (
                 chained.groups.moved_to_window_start
@@ -290,6 +310,18 @@ def test_chain_blocker_ignores_pending_rows_at_retention_0():
     at retention 0 nothing is due."""
     requests = {"a": SimpleNamespace(num_tokens=14)}
     assert _groups(16).chain_blocker(requests, ["a"], [], 1, WIDTH)
+    assert _groups(16, retention=0).chain_blocker(requests, ["a"], [], 1, WIDTH) is None
+
+
+def test_chain_blocker_ignores_boundaries_whose_state_vllm_drops():
+    """Retention 32 at block 16: a pending row 2 tokens before 48 has no
+    boundary copy due (vLLM drops the state at 48), one 2 tokens before 64
+    has."""
+    groups = _groups(16, retention=32)
     assert (
-        _groups(16, retains=False).chain_blocker(requests, ["a"], [], 1, WIDTH) is None
+        groups.chain_blocker({"a": SimpleNamespace(num_tokens=46)}, ["a"], [], 1, WIDTH)
+        is None
+    )
+    assert groups.chain_blocker(
+        {"a": SimpleNamespace(num_tokens=62)}, ["a"], [], 1, WIDTH
     )
