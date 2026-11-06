@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 """Host-only tests for ``TTModelRunner`` (non-lane path)."""
 
+from collections import deque
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +11,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -21,7 +23,9 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin import input_batch as input_batch_module
-from vllm_tt_plugin.input_batch import InputBatch
+from vllm_tt_plugin.async_decode import TTAsyncDecodeController
+from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
+from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.worker import TTWorker
 
@@ -597,3 +601,253 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     )
     expected = not (has_penalties and declared is False)
     assert TTModelRunner.check_perform_device_sampling(runner, True, False) is expected
+
+
+@pytest.mark.parametrize("lane", [False, True], ids=["front-packed", "lane"])
+@pytest.mark.parametrize("transition", ["steady", "page-table", "layout"])
+def test_structured_decode_submits_next_forward_before_readback(
+    monkeypatch, lane: bool, transition: str
+) -> None:
+    """Check when the next forward must wait for a sampled token's host copy.
+
+    Run a forward, sample a token using a grammar mask, and start
+    copying that token from device to host without finishing the copy.
+    It checks that the next forward runs while the copy is pending for an
+    unchanged batch or a KV block mapping update, but waits for the copy and
+    reloads inputs when the batch layout is marked as changed.
+    """
+    # region Build batch and request
+    batch, request = _batch_with_one_request(
+        prompt_len=4,
+        output_len=1,
+        num_computed_tokens=4,
+        sampling_params=SamplingParams(
+            temperature=0,
+            structured_outputs=StructuredOutputsParams(regex="4567"),
+        ),
+    )
+
+    slot = 3 if lane else 0  # Batch row occupied by `request`.
+    if lane:
+        batch = TTLaneInputBatch(
+            num_lanes=2,
+            per_lane=2,
+            max_model_len=MAX_MODEL_LEN,
+            max_num_batched_tokens=MAX_MODEL_LEN,
+            vocab_size=VOCAB_SIZE,
+            block_sizes=[BLOCK_SIZE],
+            kernel_block_sizes=[BLOCK_SIZE],
+        )
+        batch.add_request_to_row(request, slot)
+    # endregion
+
+    # region Simulate model runner
+    runner = TTModelRunner.__new__(TTModelRunner)
+    runner.__dict__.update(vars(_fake_runner(batch, request)))
+    # Keep the existing input-batch setup, but use production sampling decisions.
+    del runner.check_perform_device_sampling
+    del runner._sampling_params_for_padded_decode
+    runner.model_config.logits_processors = []
+    runner.model_config.max_model_len = MAX_MODEL_LEN
+    runner.encoder_cache = {}
+    runner.kv_caches = object()
+    runner.request_specific_rope = False
+    runner.supports_stage_outputs = False
+    runner.supports_device_grammar = True
+    runner.supports_topk_logprobs = False
+    runner.sample_on_device_mode = "decode_only"
+    runner.seeded_sampling_policy = "auto"
+    runner.num_devices = 1
+    runner.trace_mode = "decode_only"
+    runner.vocab_size = VOCAB_SIZE
+    runner.bitmask_size = VOCAB_SIZE // 32
+    runner.async_decode_scheduling = True
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner._steady_decode_lock = Lock()
+    runner._pending_samples = deque()
+    runner._pending_async_steps = deque()
+    runner._pending_async_overlap_ok = deque()
+    runner._completed_decode_steps = deque()
+    runner._pending_state_slot_settle = None
+    runner._pending_decode_state_slot_remap = None
+    runner._pending_state_slot_moves = None
+    # endregion
+
+    # region Simulate device forward, sampling, and readback
+    state = SimpleNamespace(tokens=None, payload=None)
+    forwards, reads = [], []
+    page_reloads = []
+    drain_allowed = Event()
+    waits = []
+
+    def decode_forward(*, tokens, reload_inputs, **kwargs):
+        assert state.payload is None, "Previous logits were not sampled."
+        assert kwargs["defer_device_sampling"], (
+            "Forward should defer device sampling until grammar is supplied."
+        )
+
+        if reload_inputs:
+            state.tokens = tokens.clone()
+
+        forwards.append((int(state.tokens[slot, 0]), reload_inputs))
+        page_reloads.append(kwargs["reload_page_table"])
+
+        state.payload = object()
+        return state.payload
+
+    def sample_deferred_decode(payload, *, grammar_bitmask, sampling_params):
+        assert payload is state.payload, (
+            "Sampling should consume the current forward's logits payload."
+        )
+
+        token = int(state.tokens[slot, 0]) + 1
+        assert int(grammar_bitmask[slot, 0]) == 1 << token, (
+            f"Grammar at row {slot} should allow only token {token}."
+        )
+
+        state.tokens[slot, 0] = token
+        state.payload = None
+
+        return state.tokens
+
+    def read_decode_output(tokens, *, async_read):
+        assert async_read, "Token readback should be asynchronous."
+
+        host = torch.full_like(tokens, -99)
+        event = Event()
+        reads.append((host, tokens.clone(), event))
+
+        return host, [event]
+
+    def synchronize(event):
+        if not event.is_set():
+            assert drain_allowed.is_set(), (
+                "forward waited for a deliberately held readback"
+            )
+
+            release(next(i for i, read in enumerate(reads) if read[2] is event))
+
+        waits.append((event, len(forwards)))
+
+    runner.model = SimpleNamespace(
+        decode_input_update_contract=1,
+        model_capabilities={
+            "supports_async_decode": True,
+            "supports_sample_on_device": True,
+            "supports_device_grammar": True,
+        },
+        decode_forward=decode_forward,
+        sample_deferred_decode=sample_deferred_decode,
+        read_decode_output=read_decode_output,
+    )
+    runner.async_decode = TTAsyncDecodeController(runner)
+    monkeypatch.setattr(
+        "vllm_tt_plugin.async_decode.ttnn.event_synchronize", synchronize
+    )
+    # endregion
+
+    # region Define helpers to forward, sample, and finish readback
+    def forward(step):
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = {"r": 1}
+        output.total_num_scheduled_tokens = 1
+        output.scheduled_cached_reqs = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids=set(),
+            new_token_ids=[[]],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[4 + step],
+            num_output_tokens=[1 + step],
+        )
+        if step == 2 and transition == "page-table":
+            output.scheduled_cached_reqs.new_block_ids = [([1],)]
+        output.pending_structured_output_tokens = step > 0
+        if lane:
+            output._tt_step_state = SimpleNamespace(
+                plan=TTStepPlan(
+                    is_decode=True,
+                    capacity=MAX_NUM_REQS,
+                    scheduled_req_ids=("r",),
+                    scheduled_rows=(slot,),
+                    input_rows=tuple(range(MAX_NUM_REQS)),
+                    req_id_to_row={"r": slot},
+                    batch_size_per_dp=(2, 2),
+                    prefill_empty_slots=None,
+                )
+            )
+
+        assert runner.execute_model(output) is None, (
+            "Forward should leave sampling to sample_tokens()."
+        )
+
+    def sample(token):
+        mask = np.zeros((1, VOCAB_SIZE // 32), dtype=np.int32)
+        mask[0, 0] = 1 << token
+        return runner.sample_tokens(GrammarOutput(["r"], mask))
+
+    def release(index):
+        host, snapshot, event = reads[index]
+        host.copy_(snapshot)
+        event.set()
+
+    # endregion
+
+    # region Run first forward, finish readback
+    forward(0)
+    first = sample(5)
+    release(0)
+    assert first.get_output().sampled_token_ids == [[5]], (
+        "Readback should be finished, with host output storing token 5."
+    )
+    # endregion
+
+    # region Run second forward, leave readback pending
+    forward(1)
+    second = sample(6)
+    assert not reads[1][2].is_set(), "Token 6 sampled but readback should be pending."
+    # endregion
+
+    # region Run third forward, check whether it waited for readback
+    if transition == "layout":
+        runner._decode_layout_changed_since_last_decode = True
+        drain_allowed.set()
+
+    forward(2)
+    assert forwards == [(4, True), (5, False), (6, transition == "layout")], (
+        "Tokens 4, 5, 6 should've been forwarded."
+    )
+    assert page_reloads == [False, False, transition == "page-table"], (
+        "Only the third forward in the 'page-table' case should reload "
+        "the KV block mapping."
+    )
+
+    if transition == "layout":
+        assert reads[1][2].is_set(), "Token 6 readback is finished."
+        assert (reads[1][2], 2) in waits, (
+            "Layout change should drain token 6 readback before the third forward."
+        )
+        assert request.output_token_ids == [4, 5, 6], (
+            "Host should store tokens 4, 5, 6."
+        )
+    else:
+        assert not reads[1][2].is_set(), (
+            "Third forward should consume token 6 while its readback is pending."
+        )
+        assert request.output_token_ids == [4, 5], (
+            "Host should still store only tokens 4, 5 while device consumes token 6."
+        )
+    # endregion
+
+    # region Finish second readback, sample and read back third output
+    release(1)
+    assert second.get_output().sampled_token_ids == [[6]], (
+        "Finished second readback should return host output storing token 6."
+    )
+
+    third = sample(7)
+    release(2)
+    assert third.get_output().sampled_token_ids == [[7]], (
+        "Finished third readback should return host output storing token 7."
+    )
+    # endregion
