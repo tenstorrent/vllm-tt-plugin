@@ -151,7 +151,12 @@ A model that declares `supports_stage_outputs` implements
 
 A stage model's request cannot be preempted and resumed: a resume re-prefills
 from the token history, which does not hold the stage frames already emitted.
-The platform therefore requires `max_num_seqs=1`, refuses a forced
+The scheduler therefore refuses to start unless the KV pool holds
+`max_num_seqs` requests at their peak, so no step runs short of blocks and
+preempts one. The pool comes from the model's `get_max_tokens_all_users`
+(see [KV budget and specifications](MODEL_SETUP.md#kv-budget-and-specifications)).
+For a model with only full-attention layers, returning at least
+`max_model_len * max_num_seqs` meets the rule. The platform refuses a forced
 prefix-cache reset while such a request runs (or aborts it first when the
 engine can tell its client), and `TTModelRunner` raises if a preemption
 reaches it anyway.
