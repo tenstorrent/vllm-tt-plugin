@@ -1380,17 +1380,7 @@ reads only `num_valid` and publishes a length hint, never ids.
 The runner chains only when exactly one verify is unresolved and it is the
 newest fused step; the scheduled requests are its rows less the finished ones;
 no prefill chunk, forced reset, grammar, penalties or allowlist (with `supports_spec_device_mask` the grammar, allowlist, bad words and `min_tokens` are served by the token mask, section 4n), and no logprobs row the model cannot serve (section 4l); every
-row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With
-`MambaSpec` groups in mode `align` (see
-[recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)), no row
-of the pending verify, finishing rows included, and no row of the chained
-step may be able to reach a block boundary before the pending verify commits
-(blocker `mamba_boundary`): the state copies at a boundary take their source
-from the accepted count, which the host has only after the commit. With
-`prefix_cache_retention_interval` 0 no boundary copy runs, so only a chained
-row whose running block-table column depends on the pending count blocks. A
-model that declares `supports_mamba_chained_state_moves` runs those moves
-itself, so only pending rows left out of the chained step count. Anything
+row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With `MambaSpec` groups in mode `align` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)), the state copies at a block boundary take their source from the pending verify's accepted count, which the host has only after the commit. A chained verify therefore carries these moves for every count the pending verify can accept (`MambaGroupState.chain` in `mamba_state`), and a `MambaSpec` model in mode `align` that chains verifies must apply them. A row of the pending verify that the chained step leaves out (a finishing row) may not be able to reach a block boundary before the pending verify commits (blocker `mamba_boundary`), since its boundary copy waits for the host commit. With `prefix_cache_retention_interval` 0 no boundary copy runs, and nothing blocks. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
 

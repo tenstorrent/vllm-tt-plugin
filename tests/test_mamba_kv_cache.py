@@ -439,6 +439,7 @@ def test_state_block_selection_matches_upstream():
         spec = _layer_specs(mamba_cache_mode=mode)["model.layers.0.linear_attn"]
         groups = MambaCacheGroups(
             group_indices=(0,),
+            layer_names=(("model.layers.0.linear_attn",),),
             mamba_cache_mode=mode,
             block_size=spec.block_size,
             attention_group_index=1,
@@ -503,8 +504,15 @@ def _step(
     return output
 
 
+def _group_state(model_input, layer: int):
+    """The ``MambaGroupState`` whose layers include GDN layer ``layer``."""
+    name = f"model.layers.{layer}.linear_attn"
+    [group] = [g for g in model_input.mamba_state.groups if name in g.layer_names]
+    return group
+
+
 def _state_ids(model_input, layer: int) -> list[int]:
-    return model_input.state_block_ids_per_layer[layer].reshape(-1).tolist()
+    return _group_state(model_input, layer).windows[:, 0].tolist()
 
 
 def test_mode_none_reads_state_from_column_0():
@@ -533,13 +541,16 @@ def test_mode_none_reads_state_from_column_0():
     )
 
     assert model.calls == []
-    assert len(prefill.state_block_ids_per_layer) == NUM_LAYERS
+    groups = runner.kv_cache_config.kv_cache_groups
+    assert [g.layer_names for g in prefill.mamba_state.groups] == [
+        tuple(groups[i].layer_names) for i in (0, 1, 2)
+    ]
+    assert prefill.mamba_state.accepted_counts is None
     for layer in range(NUM_LAYERS):
         if _is_attention(layer):
-            assert prefill.state_block_ids_per_layer[layer] is None
             continue
         group = layer % 4
-        assert prefill.state_block_ids_per_layer[layer].shape == (MAX_BATCH, 1)
+        assert _group_state(prefill, layer).windows.shape == (MAX_BATCH, 1)
         ids = _state_ids(prefill, layer)
         assert ids[:2] == [blocks_a[group][0], blocks_b[group][0]]
         assert set(ids[2:]) == {0}
@@ -547,7 +558,7 @@ def test_mode_none_reads_state_from_column_0():
     runner.submit_prefill(prefill, [2])
     name, kwargs = model.calls[-1]
     assert name == "prefill_forward"
-    assert kwargs["state_block_ids_per_layer"] is prefill.state_block_ids_per_layer
+    assert kwargs["mamba_state"] is prefill.mamba_state
 
     decode = runner.build_model_input(
         _step({"a": 1, "b": 1}, cached=[("a", 1500, None), ("b", 700, None)]),
@@ -559,7 +570,7 @@ def test_mode_none_reads_state_from_column_0():
     runner.async_decode.submit_decode(decode, read_from_device=True)
     name, kwargs = model.calls[-1]
     assert name == "decode_forward"
-    assert kwargs["state_block_ids_per_layer"] is decode.state_block_ids_per_layer
+    assert kwargs["mamba_state"] is decode.mamba_state
 
 
 def _zeroed(model) -> list[list[int]]:
@@ -727,7 +738,7 @@ def test_attention_only_model_without_hooks_ignores_block_zeroing():
     )
 
     assert model.calls == []
-    assert model_input.state_block_ids_per_layer is None
+    assert model_input.mamba_state is None
 
 
 def test_a_prefill_hands_the_model_the_states_it_must_leave_inside_its_chunk():
@@ -755,27 +766,24 @@ def test_a_prefill_hands_the_model_the_states_it_must_leave_inside_its_chunk():
     step._tt_mamba_checkpoints = {"a": ((2048, 1),)}
     prefill = runner.build_model_input(step, None)
 
-    assert prefill.state_checkpoint_positions[:3].tolist() == [[2048], [0], [0]]
+    state = prefill.mamba_state
+    assert state.checkpoint_positions[:3].tolist() == [[2048], [0], [0]]
     for layer in range(NUM_LAYERS):
-        ids = prefill.state_checkpoint_ids_per_layer[layer]
         if _is_attention(layer):
-            assert ids is None
             continue
+        ids = _group_state(prefill, layer).checkpoint_blocks
         assert ids.shape == (MAX_BATCH, 1)
         assert ids[:2, 0].tolist() == [(10, 20, 30)[layer % 4], 0]
     runner.submit_prefill(prefill, [2, 0])
     name, kwargs = model.calls[-1]
     assert name == "prefill_forward"
-    assert kwargs["state_checkpoint_positions"] is prefill.state_checkpoint_positions
-    assert (
-        kwargs["state_checkpoint_ids_per_layer"]
-        is prefill.state_checkpoint_ids_per_layer
-    )
+    assert kwargs["mamba_state"] is state
 
     decode = runner.build_model_input(
         _step({"a": 1, "b": 1}, cached=[("a", 2500, None), ("b", 700, None)]), None
     )
-    assert decode.state_checkpoint_positions is None
+    assert decode.mamba_state.checkpoint_positions is None
+    assert all(g.checkpoint_blocks is None for g in decode.mamba_state.groups)
 
 
 @pytest.mark.parametrize(
@@ -849,19 +857,3 @@ def test_mode_align_moves_state_into_the_block_of_each_new_column():
     finished.finished_req_ids = {"a"}
     runner.build_model_input(finished, None)
     assert runner._mamba_groups.state_columns == {}
-
-
-@pytest.mark.parametrize("declared", [True, False])
-def test_the_model_capability_turns_on_chained_state_moves(declared):
-    """``supports_mamba_chained_state_moves`` is read when the cache is set up;
-    absent, chained steps keep the host's moves (and the boundary blocker)."""
-    cfg = _vllm_config()
-    kv_cache_config = _kv_cache_config(cfg, _layer_specs(), 256)
-    model = _RecordingModel()
-    if declared:
-        model.model_capabilities = {"supports_mamba_chained_state_moves": True}
-    runner = _runner(cfg, model)
-
-    TTModelRunner.initialize_kv_cache(runner, kv_cache_config)
-
-    assert runner._mamba_groups.chained_moves_on_device is declared

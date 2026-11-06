@@ -77,7 +77,9 @@ from tests.mamba_runner_reference import (
 from tests.test_mamba_kv_cache import (
     MAX_BATCH,
     _kv_cache_config,
+    _new_request,
     _RecordingModel,
+    _step,
     _vllm_config,
 )
 from vllm_tt_plugin import scheduler as scheduler_module
@@ -521,8 +523,7 @@ class _Harness:
         raise AssertionError("scenario did not finish")
 
     def _groups_step_inputs(self, out, req_ids: list[str], record: _Step) -> None:
-        """``MambaCacheGroups.step_inputs`` over this step's rows, one "layer"
-        per KV cache group."""
+        """``MambaCacheGroups.step_inputs`` over this step's rows."""
         width = self.plugin_groups.max_num_blocks(MAX_MODEL_LEN)
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         tables = [
@@ -533,27 +534,17 @@ class _Harness:
             for i, r in enumerate(req_ids):
                 row = self.req_states[r].block_ids[g]
                 tables[g][i, : len(row)] = torch.tensor(row, dtype=torch.int32)
-        inputs = self.plugin_groups.step_inputs(
+        windows, counts = self.plugin_groups.step_inputs(
             tables,
             req_ids,
             {r: self.req_states[r].num_computed_tokens for r in req_ids},
             out.num_scheduled_tokens,
-            list(range(num_groups)),
             len(req_ids),
         )
-        windows = (
-            inputs.state_block_windows_per_layer or inputs.state_block_ids_per_layer
-        )
+        by_group = dict(zip(self.plugin_groups.group_indices, windows))
         for i, r in enumerate(req_ids):
-            record.groups_windows[r] = {g: windows[g][i].tolist() for g in self.groups}
-            record.groups_counts[r] = (
-                1
-                if inputs.state_accepted_counts is None
-                else int(inputs.state_accepted_counts[i])
-            )
-            assert [
-                int(inputs.state_block_ids_per_layer[g][i, 0]) for g in self.groups
-            ] == [record.groups_windows[r][g][0] for g in self.groups]
+            record.groups_windows[r] = {g: by_group[g][i].tolist() for g in self.groups}
+            record.groups_counts[r] = 1 if counts is None else int(counts[i])
 
     def _runner_commit(self, model_input, sampled, req_ids, record: _Step) -> None:
         """``TTModelRunner.commit_spec_acceptance`` for a verify step, with
@@ -589,19 +580,14 @@ class _Harness:
                 self.ledger.write(g, [block], [label(tokens[:position])], False)
         if not entries or self.plugin_groups is None or not self.writes_checkpoints:
             return
-        num_groups = len(self.kv_cache_config.kv_cache_groups)
-        ids, positions = self.plugin_groups.checkpoint_inputs(
-            get_tt_mamba_checkpoints(out),
-            [req_id],
-            self.req_states,
-            list(range(num_groups)),
-            1,
+        blocks, positions = self.plugin_groups.checkpoint_inputs(
+            get_tt_mamba_checkpoints(out), [req_id], self.req_states, 1
         )
         for entry, position in enumerate(positions[0].tolist()):
             if position:
-                for g in self.groups:
+                for group_blocks in blocks:
                     self.plugin_ledger.write(
-                        [int(ids[g][0, entry])], [label(tokens[:position])]
+                        [int(group_blocks[0, entry])], [label(tokens[:position])]
                     )
         record.checkpoints[req_id] = [p for p, _ in entries]
 
@@ -674,23 +660,20 @@ class _Harness:
                 for pair in kwargs["copies"]
             ]
             record.runner_copies = copies[len(vllm_copies) :]
-            layer_groups = self.runner._layer_to_group_idx
-            windows = model_input.state_block_windows_per_layer
+            state = model_input.mamba_state
+            group_states = dict(
+                zip(self.runner._mamba_groups.group_indices, state.groups)
+            )
             for row, req_id in enumerate(model_input.row_req_ids or []):
                 record.runner_state_ids[req_id] = {
-                    layer_groups[layer]: int(ids[row, 0])
-                    for layer, ids in enumerate(model_input.state_block_ids_per_layer)
-                    if ids is not None
+                    g: int(group.windows[row, 0]) for g, group in group_states.items()
                 }
-                if windows is not None:
+                if state.accepted_counts is not None:
                     record.runner_windows[req_id] = {
-                        layer_groups[layer]: ids[row].tolist()
-                        for layer, ids in enumerate(windows)
-                        if ids is not None
+                        g: group.windows[row].tolist()
+                        for g, group in group_states.items()
                     }
-                    record.runner_counts[req_id] = int(
-                        model_input.state_accepted_counts[row]
-                    )
+                    record.runner_counts[req_id] = int(state.accepted_counts[row])
 
         accepted: dict[str, int] = {}
         verified: dict[str, int] = {}
@@ -1138,8 +1121,9 @@ def test_tt_runner_picks_upstream_state_blocks_without_drafts(mode):
 
     Request A (3500 tokens) prefills in chunks of 2048, 1024 and 428 tokens;
     request B (1020 tokens) prefills in one chunk and decodes across the 1024
-    boundary. In every step the TT runner's ``state_block_ids_per_layer``
-    equals the upstream window column, and in mode align its
+    boundary. In every step window column 0 of the TT runner's
+    ``MambaGroupState.windows`` equals the upstream window column, and in mode
+    align its
     ``copy_kv_cache_blocks`` pairs equal upstream ``preprocess_mamba``'s
     copies.
     """
@@ -1929,6 +1913,7 @@ def test_tt_runner_state_window_has_1_plus_k_columns():
     spec = _qwen38_specs("align", num_spec=K)["model.layers.0.linear_attn"]
     groups = MambaCacheGroups(
         group_indices=(0,),
+        layer_names=(("model.layers.0.linear_attn",),),
         mamba_cache_mode="align",
         block_size=BLOCK_SIZE,
         attention_group_index=3,
@@ -2020,19 +2005,18 @@ def test_tt_runner_moves_with_drafts_match_upstream(mode):
 
 
 def test_state_windows_and_counts_reach_the_model():
-    """Prefill and decode get ``state_block_windows_per_layer`` and
-    ``state_accepted_counts`` next to ``state_block_ids_per_layer``."""
+    """Prefill and decode get ``mamba_state`` with ``1 + K`` window columns per
+    group and the start-state counts."""
     h = _Harness("align", num_spec=K, retention=None, plugin=True)
     h.add("a", _prompt(1, 1010), max_tokens=8)
     h.run(accept=_accept_pattern)
     prefill = h.steps[0].runner_input
     decode = next(s.runner_input for s in h.steps if s.runner_input.spec_mode)
-    windows = prefill.state_block_windows_per_layer
-    assert len(windows) == NUM_LAYERS
-    assert all((w is None) == _is_attention(i) for i, w in enumerate(windows))
-    assert windows[0].shape == (MAX_BATCH, 1 + K)
+    groups = prefill.mamba_state.groups
+    assert len(groups) == 3
+    assert {g.windows.shape for g in groups} == {(MAX_BATCH, 1 + K)}
     assert torch.equal(
-        prefill.state_accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32)
+        prefill.mamba_state.accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32)
     )
 
     h.model.calls.clear()
@@ -2043,11 +2027,198 @@ def test_state_windows_and_counts_reach_the_model():
         h.runner.async_decode.submit_decode(decode, read_from_device=True)
     forwards = {name: kwargs for name, kwargs in h.model.calls}
     for name, model_input in (("prefill_forward", prefill), ("decode_forward", decode)):
-        kwargs = forwards[name]
-        assert kwargs["state_block_windows_per_layer"] is (
-            model_input.state_block_windows_per_layer
+        assert forwards[name]["mamba_state"] is model_input.mamba_state
+
+
+def _batch_rows(rows: list[list[int]], *shape: int) -> torch.Tensor:
+    """``rows`` as the first rows of an int32 ``[MAX_BATCH, *shape]`` tensor;
+    the padding rows hold block 0."""
+    out = torch.zeros((MAX_BATCH, *shape), dtype=torch.int32)
+    for i, row in enumerate(rows):
+        out[i] = torch.tensor(row, dtype=torch.int32).reshape(shape)
+    return out
+
+
+def _assert_packed(state, kv_cache_config, expected: dict[int, dict]) -> None:
+    """``state`` holds one ``MambaGroupState`` per GDN group, in KV cache group
+    order, and each GDN layer finds in the group that names it exactly the
+    tensors of its own KV cache group: ``expected[g]`` maps a
+    ``MambaGroupState`` field to its value for group ``g``."""
+    groups = kv_cache_config.kv_cache_groups
+    gdn = [i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)]
+    assert [g.layer_names for g in state.groups] == [
+        tuple(groups[i].layer_names) for i in gdn
+    ]
+    owner = {name: i for i in gdn for name in groups[i].layer_names}
+    by_layer = {name: g for g in state.groups for name in g.layer_names}
+    assert by_layer.keys() == owner.keys()
+    assert sum(len(g.layer_names) for g in state.groups) == len(owner)
+    for name, group_state in by_layer.items():
+        want = expected[owner[name]]
+        for field_name in ("windows", "checkpoint_blocks"):
+            got, value = getattr(group_state, field_name), want.get(field_name)
+            if value is None:
+                assert got is None, (name, field_name)
+                continue
+            assert got.dtype == torch.int32 and got.device.type == "cpu"
+            assert torch.equal(got, value), (name, field_name, got, value)
+        if "chain" not in want:
+            assert group_state.chain is None, name
+            continue
+        for field_name, value in want["chain"].items():
+            got = getattr(group_state.chain, field_name)
+            assert got.dtype == torch.int32 and got.device.type == "cpu"
+            assert torch.equal(got, value), (name, field_name, got, value)
+
+
+def test_mamba_state_gives_each_gdn_layer_its_own_groups_tensors():
+    """``mamba_state`` packs each GDN group's state inputs once, with the
+    group's ``layer_names``: three GDN groups, K=3, mode align, a prefill with
+    a checkpoint block, a verify, and a chained verify built while that verify
+    is pending.
+
+    Every GDN group's row holds different blocks, so a tensor packed for the
+    wrong group, or a group with another group's layer names, fails. The
+    expected values come from the block ids alone: the windows from upstream
+    ``mamba_get_block_table_tensor`` (``state_window``), the checkpoint from
+    the scheduler's ``(position, column)`` entry, and the chained verify's
+    choices from the block-table columns worked out in the comments.
+    """
+    cfg = _planner_config("align", retention=None)
+    kv_cache_config = _kv_cache_config(
+        cfg, _qwen38_specs("align", K, checkpoint=True), NUM_BLOCKS
+    )
+    model = _RecordingModel()
+    runner = _tt_runner(cfg, kv_cache_config, model, num_spec=K)
+    groups = kv_cache_config.kv_cache_groups
+    gdn = [i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)]
+    assert len(gdn) == 3
+    spec = groups[gdn[0]].kv_cache_spec
+    width = runner._mamba_groups.max_num_blocks(MAX_MODEL_LEN)
+    # A full block-table row per GDN group and request, distinct block ids.
+    blocks = iter(range(1, NUM_BLOCKS))
+    rows = {
+        r: {g: [next(blocks) for _ in range(width)] for g in gdn} for r in ("a", "b")
+    }
+    attention = {"a": [next(blocks) for _ in range(3)], "b": [next(blocks)]}
+
+    def block_ids(r):
+        return tuple(
+            rows[r][g] if g in gdn else attention[r] for g in range(len(groups))
         )
-        assert kwargs["state_accepted_counts"] is model_input.state_accepted_counts
+
+    def windows(seq_lens):
+        return {
+            g: _batch_rows(
+                [
+                    state_window(rows[r][g], seq_len, spec, width)
+                    for r, seq_len in seq_lens.items()
+                ],
+                1 + K,
+            )
+            for g in gdn
+        }
+
+    # The prefill: a (2045 tokens) leaves the state after 1024 tokens in
+    # block-table column 0; b (700 tokens) leaves none.
+    step = _step(
+        {"a": 2045, "b": 700},
+        new=[
+            _new_request("a", 2045, block_ids("a")),
+            _new_request("b", 700, block_ids("b")),
+        ],
+    )
+    step._tt_mamba_checkpoints = {"a": ((1024, 0),)}
+    prefill = runner.build_model_input(step, None)
+    assert prefill.row_req_ids[:2] == ["a", "b"]
+    state = prefill.mamba_state
+    assert torch.equal(state.accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32))
+    assert torch.equal(state.checkpoint_positions, _batch_rows([[1024], [0]], 1))
+    expected_windows = windows({"a": 2045, "b": 700})
+    _assert_packed(
+        state,
+        kv_cache_config,
+        {
+            g: {
+                "windows": expected_windows[g],
+                "checkpoint_blocks": _batch_rows([[rows["a"][g][0]], [0]], 1),
+            }
+            for g in gdn
+        },
+    )
+    runner.submit_prefill(prefill, [2])
+    assert model.calls[-1][0] == "prefill_forward"
+    assert model.calls[-1][1]["mamba_state"] is state
+
+    # The verify: one sampled token each, then 1 + K tokens from 2045 and 700.
+    runner._apply_sampled_tokens_to_state(
+        torch.tensor([[11], [12]], dtype=torch.int32), req_ids=["a", "b"]
+    )
+    step = _step({"a": 1 + K, "b": 1 + K}, cached=[("a", 2045, None), ("b", 700, None)])
+    step.scheduled_spec_decode_tokens = {"a": [21, 22, 23], "b": [31, 32, 33]}
+    verify = runner.build_model_input(step, None)
+    assert verify.spec_mode is not None
+    assert verify.row_req_ids[:2] == ["a", "b"]
+    state = verify.mamba_state
+    assert torch.equal(state.accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32))
+    assert state.checkpoint_positions is None
+    expected_windows = windows({"a": 2045 + 1 + K, "b": 700 + 1 + K})
+    _assert_packed(
+        state, kv_cache_config, {g: {"windows": expected_windows[g]} for g in gdn}
+    )
+
+    # The chained verify, built while the verify is pending: entry c - 1 is
+    # for a verify that accepted c tokens. a's verify runs in column 2 from
+    # 2045; with c >= 3 it reaches 2048, so the state after 2048 tokens, in its
+    # window column 2 (block-table column 4), goes to column 1. a's chained
+    # step stays in column 2 and starts from window column c - 1. b stays in
+    # column 0 and copies nothing.
+    step = _step(
+        {"a": 1 + K, "b": 1 + K},
+        cached=[("a", 2045 + 1 + K, None), ("b", 700 + 1 + K, None)],
+    )
+    chained = runner._attach_mamba_state(
+        step, dataclasses.replace(verify, chain_rows=torch.ones(2, dtype=torch.bool))
+    )
+    state = chained.mamba_state
+    counts = torch.ones(MAX_BATCH, dtype=torch.int32)
+    counts[:2] = -1
+    assert torch.equal(state.accepted_counts, counts)
+    assert state.checkpoint_positions is None
+    counts_range = range(1, 2 + K)
+    expected = {}
+    for g in gdn:
+        a, b = rows["a"][g], rows["b"][g]
+        chain_windows = _batch_rows(
+            [
+                [state_window(a, 2045 + c + 1 + K, spec, width) for c in counts_range],
+                [state_window(b, 700 + c + 1 + K, spec, width) for c in counts_range],
+            ],
+            1 + K,
+            1 + K,
+        )
+        expected[g] = {
+            "windows": chain_windows[:, -1],
+            "chain": {
+                "copies": _batch_rows(
+                    [
+                        [(0, 0) if c < 3 else (a[4], a[1]) for c in counts_range],
+                        [(0, 0)] * (1 + K),
+                    ],
+                    1 + K,
+                    2,
+                ),
+                "start_blocks": _batch_rows(
+                    [
+                        [a[1 + c] for c in counts_range],
+                        [b[c - 1] for c in counts_range],
+                    ],
+                    1 + K,
+                ),
+                "windows": chain_windows,
+            },
+        }
+    _assert_packed(state, kv_cache_config, expected)
 
 
 def test_speculative_rows_are_sized_like_upstream():

@@ -1012,10 +1012,6 @@ class TTModelRunner:
                     f"{self._mamba_groups.mamba_cache_mode!r} but does not "
                     f"implement {missing_hooks}"
                 )
-            capabilities = getattr(self.model, "model_capabilities", None) or {}
-            self._mamba_groups.chained_moves_on_device = bool(
-                capabilities.get("supports_mamba_chained_state_moves", False)
-            )
             self._mamba_groups.zeroes_only_state_blocks = not getattr(
                 kv_cache_config, "has_mixed_precision_kv_cache", True
             )
@@ -4205,15 +4201,12 @@ class TTModelRunner:
         build, so its boundary copies precede this step's moves, as upstream's
         postprocess precedes the next preprocess. The counts and positions are
         the ones the step is built with: the spec ``accepted_counts`` (-1 on a
-        chained row) and each row's first query position.
+        chained row in mode ``none``) and each row's first query position. A
+        chained verify in mode ``align`` takes ``_attach_mamba_chain_plan``.
         """
         row_req_ids = model_input.row_req_ids or []
         groups = self._mamba_groups
-        if (
-            model_input.chain_rows is not None
-            and groups.chained_moves_on_device
-            and groups.mamba_cache_mode == "align"
-        ):
+        if model_input.chain_rows is not None and groups.mamba_cache_mode == "align":
             return self._attach_mamba_chain_plan(scheduler_output, model_input)
         # A prefill's positions are a numpy array, a decode's a tensor.
         positions = torch.as_tensor(model_input.input_positions)
@@ -4233,23 +4226,18 @@ class TTModelRunner:
                 scheduler_output, self.requests, num_computed, accepted_counts
             )
         )
-        state = self._mamba_groups.step_inputs(
+        windows, start_counts = self._mamba_groups.step_inputs(
             model_input.block_tables_per_group,
             row_req_ids,
             num_computed,
             scheduler_output.num_scheduled_tokens,
-            self._layer_to_group_idx or [],
             self.tt_max_batch_size,
         )
-        checkpoint_ids = checkpoint_positions = None
+        checkpoint_blocks = checkpoint_positions = None
         checkpoints = get_tt_mamba_checkpoints(scheduler_output)
         if model_input.prompt_lens is not None and groups.prefill_checkpoints:
-            checkpoint_ids, checkpoint_positions = groups.checkpoint_inputs(
-                checkpoints,
-                row_req_ids,
-                self.requests,
-                self._layer_to_group_idx or [],
-                self.tt_max_batch_size,
+            checkpoint_blocks, checkpoint_positions = groups.checkpoint_inputs(
+                checkpoints, row_req_ids, self.requests, self.tt_max_batch_size
             )
         elif checkpoints:
             raise RuntimeError(
@@ -4263,39 +4251,31 @@ class TTModelRunner:
             block_tables=model_input.block_tables_per_group[
                 self._mamba_groups.attention_group_index
             ],
-            state_block_ids_per_layer=state.state_block_ids_per_layer,
-            state_block_windows_per_layer=state.state_block_windows_per_layer,
-            state_accepted_counts=state.state_accepted_counts,
-            state_checkpoint_ids_per_layer=checkpoint_ids,
-            state_checkpoint_positions=checkpoint_positions,
+            mamba_state=groups.step_state(
+                windows, start_counts, checkpoint_blocks, checkpoint_positions
+            ),
         )
         return model_input
 
     def _attach_mamba_chain_plan(
         self, scheduler_output: SchedulerOutput, model_input: TTModelInput
     ) -> TTModelInput:
-        """A chained verify's state inputs when the model runs its moves.
+        """A chained verify's state inputs in mode ``align``.
 
-        Every row is chained. The plan holds the window, start block and
-        boundary copy for each count the pending verify can accept; the
-        ordinary window keywords carry the all-accepted entry, the one the
-        submitted positions assume, and the counts carry -1.
+        Every row is chained. Each group's ``MambaGroupState.chain`` holds the
+        window, start block and boundary copy for each count the pending
+        verify can accept; ``MambaGroupState.windows`` holds the all-accepted
+        entry, the one the submitted positions assume, and the counts hold -1.
         """
         groups = self._mamba_groups
         row_req_ids = model_input.row_req_ids or []
-        layer_to_group_idx = self._layer_to_group_idx or []
         groups.forget(scheduler_output)
-        plan = groups.plan_chained_step(
+        chains = groups.plan_chained_step(
             row_req_ids,
             self.requests,
             scheduler_output.num_scheduled_tokens,
-            layer_to_group_idx,
             self.tt_max_batch_size,
         )
-        windows = {
-            g: plan.windows_per_layer[layer_to_group_idx.index(g)][:, -1].contiguous()
-            for g in groups.group_indices
-        }
         # Padding rows hold 1, as on every other step.
         counts = torch.ones(self.tt_max_batch_size, dtype=torch.int32)
         counts[: len(row_req_ids)] = PLACEHOLDER_TOKEN_ID
@@ -4304,14 +4284,11 @@ class TTModelRunner:
             block_tables=model_input.block_tables_per_group[
                 groups.attention_group_index
             ],
-            state_block_ids_per_layer=groups.per_layer(
-                {g: w[:, :1] for g, w in windows.items()}, layer_to_group_idx
+            mamba_state=groups.step_state(
+                [chain.windows[:, -1].contiguous() for chain in chains],
+                counts,
+                chains=chains,
             ),
-            state_block_windows_per_layer=groups.per_layer(windows, layer_to_group_idx),
-            state_accepted_counts=counts,
-            state_chain_copies_per_layer=plan.copies_per_layer,
-            state_chain_windows_per_layer=plan.windows_per_layer,
-            state_chain_start_blocks_per_layer=plan.start_blocks_per_layer,
         )
 
     def _apply_kv_cache_block_ops(self, scheduler_output: SchedulerOutput) -> None:
@@ -5984,20 +5961,8 @@ class TTModelRunner:
         # and never see the kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
-        if model_input.state_block_ids_per_layer is not None:
-            kwargs["state_block_ids_per_layer"] = model_input.state_block_ids_per_layer
-        if model_input.state_block_windows_per_layer is not None:
-            kwargs["state_block_windows_per_layer"] = (
-                model_input.state_block_windows_per_layer
-            )
-            kwargs["state_accepted_counts"] = model_input.state_accepted_counts
-        if model_input.state_checkpoint_positions is not None:
-            kwargs["state_checkpoint_ids_per_layer"] = (
-                model_input.state_checkpoint_ids_per_layer
-            )
-            kwargs["state_checkpoint_positions"] = (
-                model_input.state_checkpoint_positions
-            )
+        if model_input.mamba_state is not None:
+            kwargs["mamba_state"] = model_input.mamba_state
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
