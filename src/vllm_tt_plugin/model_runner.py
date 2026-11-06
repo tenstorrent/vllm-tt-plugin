@@ -2662,10 +2662,16 @@ class TTModelRunner:
             # (``_decode_device_sampled``, the structured-output rule
             # included); the overrides below are this submission's own.
             perform_device_sampling = device_sampled
-        if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
-            # Device sampling advances device RNG state for every row it reads,
-            # which an intermediate chunk must not do. Host sampling can hand
-            # those rows a generator clone instead.
+        if (
+            perform_device_sampling
+            and intermediate_prefill_mask is not None
+            and intermediate_prefill_mask.any()
+            and not self.model.model_capabilities.get(
+                "supports_device_prefill_sampling_mask", False
+            )
+        ):
+            # Legacy samplers advance every row. Only opted-in adapters can
+            # preserve intermediate rows while sampling final rows on device.
             perform_device_sampling = False
         if spec_mode == ACCEPT_MODE_LOGITS:
             # The host walk samples from the logits this verify returns, so the
@@ -4124,6 +4130,15 @@ class TTModelRunner:
                 for s in sampling_param_dict["seed"]
             ]
             kwargs["sampling_params"] = TTSamplingParams(**sampling_param_dict)
+            if self.model.model_capabilities.get(
+                "supports_device_prefill_sampling_mask", False
+            ):
+                intermediate = model_input.intermediate_prefill_mask
+                kwargs["prefill_sample_mask"] = (
+                    ~intermediate
+                    if intermediate is not None
+                    else torch.ones(model_input.input_tokens.shape[0], dtype=torch.bool)
+                )
         # The slots go to the model whenever the build supplied them: a stateful
         # model's ``range(N)`` default clobbers live state, DP=1 included.
         empty_slots = model_input.prefill_empty_slots

@@ -341,6 +341,7 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
             _output_tokens_per_step=1,
             model_config=SimpleNamespace(is_multimodal_model=False),
             requests={"request": request},
+            model=SimpleNamespace(model_capabilities={}),
         )
     )
 

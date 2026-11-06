@@ -46,6 +46,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
+| `prefill_sample_mask` | Supplied only for device sampling when the adapter declares `supports_device_prefill_sampling_mask`. CPU Boolean tensor `[B]` in submitted-row order; true exactly when the scheduled chunk completes the current history being prefetched or replayed. See masked prefill below. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
 For row `i`, `prefill_forward` computes
@@ -57,8 +58,34 @@ Resume prefill can replay generated tokens to rebuild KV state.
 The model adapter returns host logits `[B, 1, V]` for host sampling, or sampled
 token IDs for device sampling. The plugin has no separate prefill readback
 hook. `TTModelRunner` suppresses output for intermediate prefill chunks and
-selects host sampling when a submitted prefill contains intermediate chunks,
-so intermediate chunks must not advance a device sampler.
+selects host sampling when a submitted prefill contains intermediate chunks
+unless the adapter opts into masked device prefill below.
+
+### Masked device prefill
+
+`supports_device_prefill_sampling_mask=True` preserves an otherwise eligible
+device-sampling route for intermediate and mixed-finality prefill. Both
+front-packed and lane-DP calls supply ordinary `sampling_params` and
+`prefill_sample_mask`, including an all-true mask for final-only submissions.
+Legacy adapters receive no new keyword and retain the existing routing.
+Host-only sampling controls still select host sampling and receive neither
+the mask nor device sampling parameters.
+
+The adapter must execute every submitted chunk and update its cache and
+recurrent state. Map mask rows through `empty_slots`, just like the token
+rows; the mask is not indexed by device slot. Sample each true row once.
+False rows must not commit a sample or advance their request's sampling state.
+Preserve unrelated live slots' token, RNG, and sampler state across parameter
+reload as well as sampling. Initialize fresh request state even when its first
+chunk is intermediate.
+
+Return the ordinary full-row token-ID shape `[B, 1]` (or the adapter's existing
+negotiated output width). False rows contain ignored placeholders, which the
+runner suppresses when building request output. An all-false mask must still
+execute the prefill state updates, but must not replay the sampler or read
+device output back to the host; return host-created placeholders. Mixed calls
+must read sampled IDs rather than full logits. Request-specific RoPE retains
+the existing `(output, rope_deltas)` return structure.
 
 ### Multimodal inputs and request-specific RoPE
 
