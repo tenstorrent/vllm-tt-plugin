@@ -185,8 +185,10 @@ Declaration rules:
   `unify_kv_cache_spec_page_size` pads a smaller `MambaSpec` page to the
   largest page. For a smaller attention page, it multiplies the attention
   `block_size` when the attention page divides the largest page, and pads the
-  attention page otherwise. TT skips `Platform._align_hybrid_block_size`, so
-  the adapter chooses the attention `block_size` itself: choose one that TT
+  attention page otherwise. vLLM's `Platform.update_block_size_for_backend`
+  returns before `_align_hybrid_block_size` on TT, because a TT model registers
+  no vLLM attention layer for `_find_non_ssm_backend` to find, so the adapter
+  chooses the attention `block_size` itself: choose one that TT
   paged attention supports and whose page is at least the recurrent state.
 - `MambaSpec.mamba_cache_mode` must equal the resolved
   `cache_config.mamba_cache_mode`. vLLM's `MambaModelConfig` selects `none`
