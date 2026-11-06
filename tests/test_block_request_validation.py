@@ -820,21 +820,23 @@ def test_startup_auto_disables_prefix_caching_for_block_models(monkeypatch):
     assert config.cache_config.enable_prefix_caching is False
 
 
-def test_startup_rejects_block_model_declaring_prefix_caching(monkeypatch):
-    class BlockModelClaimingPrefixCaching(BlockModel):
+def test_startup_keeps_prefix_caching_for_a_block_model_declaring_it(monkeypatch):
+    """A block-output model that can resume a prefill keeps prefix caching; the
+    scheduler then caches its prompt blocks only (``_cache_prompt_blocks_only``)."""
+
+    class BlockModelWithPrefixCaching(BlockModel):
         model_capabilities = {
             **BlockModel.model_capabilities,
             "supports_prefix_caching": True,
         }
 
     config = _config()
-    _patch_model_resolution(monkeypatch, BlockModelClaimingPrefixCaching)
+    config.cache_config.enable_prefix_caching = True
+    _patch_model_resolution(monkeypatch, BlockModelWithPrefixCaching)
 
-    with pytest.raises(
-        ValueError,
-        match=r"supports_prefix_caching.*capability declaration",
-    ):
-        TTPlatform.check_and_update_config(config)
+    TTPlatform.check_and_update_config(config)
+
+    assert config.cache_config.enable_prefix_caching
 
 
 @pytest.mark.parametrize("sliding_window", [None, 128])
