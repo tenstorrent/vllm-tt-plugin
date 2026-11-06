@@ -201,11 +201,22 @@ class TTModelInput:
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
 
-    # Request id per forward row. A prefill build can drop rows, so forward row
-    # order is not recoverable from the persistent batch; sample-time consumers
-    # must resolve rows through this. ``None`` for lane builds, whose rows are
-    # the persistent slots.
+    # Request id per live forward row. A prefill build can drop rows, so
+    # forward row order is not recoverable from the persistent batch;
+    # sample-time consumers must resolve rows through this. A lane decode
+    # build sets it to the scheduled requests in slot order, with ``live_rows``
+    # naming their slots; ``None`` for a lane prefill build, whose rows are the
+    # persistent slots.
     row_req_ids: list[str] | None = None
+
+    # The block row each ``row_req_ids`` entry sits at. ``None`` means the live
+    # rows are the first ``len(row_req_ids)`` rows of the block, which is the
+    # front-packed layout. A lane decode holds every request at its own stable
+    # slot, so its live rows are the scheduled slots and the padding rows sit
+    # between them; the speculative consumers (the accept walk, the commit,
+    # the proposal and the sampling capture) read rows through
+    # ``live_row_index`` rather than assuming the front-packed layout.
+    live_rows: tuple[int, ...] | None = None
 
     # Prefill-only: each row's stage inputs, passed to ``prefill_forward`` as
     # ``stage_inputs``. ``None`` unless the model declares
@@ -232,11 +243,41 @@ class TTModelInput:
     # speculate, whose bitmask holds one row per structured request.
     grammar_rows_per_request: dict[str, int] | None = None
 
-    # ``logits`` verify only. Row to ``(remaining, stop_token_ids)`` for each
-    # live row whose output is still shorter than its ``min_tokens``, captured
-    # at build time, because the walk may run on the readback thread after the
+    # ``logits`` verify only. Live row position (the index into
+    # ``row_req_ids``) to ``(remaining, stop_token_ids)`` for each live row
+    # whose output is still shorter than its ``min_tokens``, captured at build
+    # time, because the walk may run on the readback thread after the
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+
+def live_row_index(
+    model_input: TTModelInput, row_req_ids: list[str] | None = None
+) -> torch.Tensor:
+    """The block row of each live request, as an int64 index.
+
+    ``tensor[live_row_index(model_input)]`` selects the live rows of any
+    ``[B, ...]`` tensor of the step in ``row_req_ids`` order, whichever layout
+    built the step. A front-packed build leaves ``live_rows`` unset and gets
+    ``arange(len(row_req_ids))``. ``row_req_ids`` defaults to the step's own;
+    a caller handed the live requests separately passes those, so the rows
+    answer for the list it is iterating.
+    """
+    if row_req_ids is None:
+        row_req_ids = model_input.row_req_ids
+    if row_req_ids is None:
+        raise RuntimeError(
+            "live_row_index needs row_req_ids, which this build did not set"
+        )
+    live_rows = getattr(model_input, "live_rows", None)
+    if live_rows is None:
+        return torch.arange(len(row_req_ids), dtype=torch.int64)
+    if len(live_rows) != len(row_req_ids):
+        raise RuntimeError(
+            f"live_rows names {len(live_rows)} rows for {len(row_req_ids)} "
+            f"live requests {row_req_ids}: {live_rows}"
+        )
+    return torch.as_tensor(live_rows, dtype=torch.int64)
 
 
 def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:

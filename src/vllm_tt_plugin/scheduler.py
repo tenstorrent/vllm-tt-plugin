@@ -11,6 +11,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -21,6 +22,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
+    get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     tt_requests_cannot_resume,
@@ -282,6 +284,46 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
+    """Refuse a KV pool that could make vLLM preempt a stage-output request.
+
+    vLLM preempts a running request when a step finds no free block, and a request
+    of a model with ``supports_stage_outputs`` cannot resume. While ``max_num_seqs``
+    requests at their peak fit in the pool at once, no step runs short. One
+    request's peak is upstream's admission bound: the full context for a
+    full-attention group, the window plus in-flight tokens for a sliding one.
+    Every request is charged the whole in-flight budget, an over-count when
+    several share it.
+    """
+    from vllm.v1.core.kv_cache_utils import (
+        _max_memory_usage_bytes_from_groups,
+        _pool_bytes_per_block,
+    )
+
+    groups = kv_cache_config.kv_cache_groups
+    if not groups:
+        # An attention-free model allocates no blocks, so nothing preempts.
+        return
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = vllm_config.model_config.max_model_len
+    per_request = -(
+        -_max_memory_usage_bytes_from_groups(vllm_config, groups)
+        // _pool_bytes_per_block(groups)
+    )
+    needed = max_num_seqs * per_request
+    # Block 0 is vLLM's null block, never handed to a request.
+    usable = kv_cache_config.num_blocks - 1
+    if usable < needed:
+        raise ValueError(
+            "a model with supports_stage_outputs cannot resume a preempted request, "
+            f"so its KV pool must hold max_num_seqs={max_num_seqs} requests at "
+            f"max_model_len={max_model_len}: {needed} blocks across "
+            f"{len(groups)} KV cache group(s), but only "
+            f"{usable} are usable. Lower max_num_seqs or max_model_len, or raise "
+            "the model's get_max_tokens_all_users budget."
+        )
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -294,11 +336,13 @@ class TTScheduler(AsyncScheduler):
       the next chunk until the prompt is fully computed. Those continuations
       count as prefill work here, never as decodes.
 
-    The base scheduler holds temporarily blocked prefill requests (e.g. while
-    a structured-output grammar compiles) in ``skipped_waiting`` rather than
-    ``waiting``. Its prefill loop revisits that queue and promotes requests
-    whose dependency is ready. Decode-only scheduling must hide both queues so
-    that the base scheduler cannot admit a prefill into a decode step.
+    The base scheduler admits prefills from two queues: ``kv_holding_waiting``
+    (requests that still hold KV blocks, e.g. a streaming-input session waiting
+    for its next chunk), which it drains first, and ``waiting``. A temporarily
+    blocked request (e.g. while a structured-output grammar compiles) stays in
+    its queue, and the prefill loop skips it until its dependency is ready.
+    Decode-only scheduling must hide both queues so that the base scheduler
+    cannot admit a prefill into a decode step.
 
     Inherits from AsyncScheduler to get num_output_placeholders support.
     TT uses this scheduler in both sync and async execution modes:
@@ -337,6 +381,13 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.aux_output_connector is not None:
+            # The base update_from_output asserts an auxiliary output for every
+            # request that emits tokens, and the TT model runner produces none.
+            raise ValueError(
+                "TT backend does not return auxiliary model outputs; remove "
+                "--enable-return-routed-experts."
+            )
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -347,6 +398,8 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # Set by TTLaneCoordinator on its lanes; see make_stats.
+        self.stats_made_by_coordinator = False
         # Request id that owns the adaptive model's SINGLE speculative
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
@@ -369,6 +422,8 @@ class TTScheduler(AsyncScheduler):
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
+        if get_tt_supports_stage_outputs(self.vllm_config):
+            _require_kv_for_every_sequence(self.vllm_config, self.kv_cache_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
         # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
         self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
@@ -685,8 +740,9 @@ class TTScheduler(AsyncScheduler):
             request.structured_output_request = None
             stripped.append("structured_outputs")
             # Request.__init__ parked the request on grammar compilation; with
-            # the structured-output request gone nothing would ever promote it
-            # out of skipped_waiting, so restore schedulability.
+            # the structured-output request gone no grammar ever arrives, and
+            # the base prefill loop would skip the request forever, so restore
+            # schedulability.
             if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
                 request.status = RequestStatus.WAITING
         if params.structured_outputs is not None:
@@ -712,17 +768,17 @@ class TTScheduler(AsyncScheduler):
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 
-        A request in ``skipped_waiting`` still needs a future prefill pass:
-        that is where the base scheduler retries promotion after its dependency
-        becomes ready. In decode-only mode this check also ensures both waiting
-        queues are hidden from the base scheduler.
+        A blocked request in ``waiting`` or ``kv_holding_waiting`` still needs
+        a future prefill pass: only the base scheduler's prefill loop checks
+        whether its dependency became ready. In decode-only mode this check also
+        ensures both waiting queues are hidden from the base scheduler.
 
         A running ``is_prefill_chunk`` request is a partial prefill whose next
         chunk can only be scheduled by a prefill step.
         """
         return (
             bool(self.waiting)
-            or bool(getattr(self, "skipped_waiting", False))
+            or bool(self.kv_holding_waiting)
             or any(request.is_prefill_chunk for request in self.running)
         )
 
@@ -903,39 +959,43 @@ class TTScheduler(AsyncScheduler):
 
         Temporarily hides the running *decode* requests so the base scheduler's
         running loop only advances partial prefills, and its waiting loop
-        admits new ones.  Adjusts max_num_running_reqs so the waiting loop
-        respects the true capacity with the decodes hidden.
+        admits new ones.  Lowers both running caps by the hidden decodes so the
+        waiting loop respects the true capacity: the loop admits against
+        ``max_num_active_reqs``, and the end-of-step check asserts
+        ``max_num_running_reqs``.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        saved_active = self.max_num_active_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            self.max_num_active_reqs = saved_active
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
 
-        Temporarily hides both the ``waiting`` and ``skipped_waiting`` queues
-        so the base scheduler's waiting loop is a no-op and cannot promote a
-        grammar-ready structured-output request into this decode step, and
-        hides partial prefills so their next chunk is not scheduled into it
-        either.  Any requests that get preempted during decode scheduling are
-        merged back into the original queues afterwards.
+        Temporarily hides both the ``waiting`` and ``kv_holding_waiting``
+        queues so the base scheduler's waiting loop is a no-op and cannot admit
+        a prefill (for example a grammar-ready structured-output request) into
+        this decode step, and hides partial prefills so their next chunk is not
+        scheduled into it either.  Any requests that get preempted during
+        decode scheduling are merged back into the original queues afterwards.
         """
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_waiting = self.waiting
-        saved_skipped = getattr(self, "skipped_waiting", None)
+        saved_kv_holding = self.kv_holding_waiting
         self.waiting = create_request_queue(self.policy)
-        if saved_skipped is not None:
-            self.skipped_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy)
         if partial_prefills:
             self.running = [r for r in self.running if not r.is_prefill_chunk]
         try:
@@ -943,11 +1003,10 @@ class TTScheduler(AsyncScheduler):
         finally:
             if self.waiting:
                 saved_waiting.prepend_requests(self.waiting)
-            if saved_skipped is not None:
-                if self.skipped_waiting:
-                    saved_skipped.prepend_requests(self.skipped_waiting)
-                self.skipped_waiting = saved_skipped
+            if self.kv_holding_waiting:
+                saved_kv_holding.prepend_requests(self.kv_holding_waiting)
             self.waiting = saved_waiting
+            self.kv_holding_waiting = saved_kv_holding
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
@@ -971,10 +1030,11 @@ class TTScheduler(AsyncScheduler):
                 "(block output or stage outputs) is running; finish or abort the "
                 "request first."
             )
-            # pause_generation(mode="keep") reaches this through an unguarded
-            # idle-state callback while intentionally retaining live requests.
-            # Returning False preserves them without letting an exception
-            # escape EngineCore and strand the callback's Future.
+            # pause_generation(mode="keep") retains live requests on purpose,
+            # so a refused reset is an expected result there: return the
+            # refusal the reset API defines instead of raising.
+            # _install_block_output_pause_guard_patch refuses a keep-mode
+            # pause that would clear the cache before it reaches this.
             if self.pause_state == PauseState.PAUSED_ALL:
                 logger.error("%s", message)
                 return False
@@ -1190,6 +1250,16 @@ class TTScheduler(AsyncScheduler):
             elif not solo or first_id != owner:
                 owner = None
         self._spec_session_owner = owner
+
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        """None on a lane: TTLaneCoordinator.make_stats makes the step's one
+        SchedulerStats for every lane. A lane's own would count only its
+        requests, and the coordinator replaces it on the first client's output
+        alone.
+        """
+        if self.stats_made_by_coordinator:
+            return None
+        return super().make_stats(*args, **kwargs)
 
     def update_from_output(
         self,

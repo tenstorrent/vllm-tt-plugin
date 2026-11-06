@@ -1120,6 +1120,45 @@ def _install_tt_input_processor_patch() -> None:
     input_processor.InputProcessor.process_inputs = process_inputs_tt
 
 
+def _install_tt_dp_prefix_cache_routing_patch() -> None:
+    """Route a standard-DP request to the engine holding its cached prefix.
+
+    vLLM's DP load balancer, ``DPLBAsyncMPClient.get_core_engine_for_request``,
+    picks the least-loaded engine and honors a ``data_parallel_rank`` the
+    request already carries. It runs in the API server, which reads no
+    engine's prefix cache, so ``vllm_tt_plugin.prefix_routing`` keeps a record
+    of which engine each prompt block was sent to and pins the request through
+    that field. A prefix-cache reset clears the record. Only the load-balancing
+    client is patched: the other clients serve one engine and route nothing.
+    The record is per client, so a launch with several API servers routes on
+    each server's own dispatches.
+
+    TODO: remove once vLLM exposes a routing hook for DP engines.
+    """
+    import vllm.v1.engine.core_client as core_client
+
+    from vllm_tt_plugin.prefix_routing import forget_dp_prefix_mirror, route_dp_request
+
+    if hasattr(core_client, "_tt_original_get_core_engine_for_request"):
+        return
+
+    client_cls = core_client.DPLBAsyncMPClient
+    original = client_cls.get_core_engine_for_request
+    core_client._tt_original_get_core_engine_for_request = original
+    original_reset = client_cls.reset_prefix_cache_async
+    core_client._tt_original_dp_reset_prefix_cache_async = original_reset
+
+    def get_core_engine_for_request_tt(self, request):
+        return route_dp_request(self, request, original)
+
+    async def reset_prefix_cache_async_tt(self, *args, **kwargs):
+        forget_dp_prefix_mirror(self)
+        return await original_reset(self, *args, **kwargs)
+
+    client_cls.get_core_engine_for_request = get_core_engine_for_request_tt
+    client_cls.reset_prefix_cache_async = reset_prefix_cache_async_tt
+
+
 def _install_block_output_streaming_input_patch() -> None:
     """Reject streaming-input sessions before vLLM creates a final request."""
     import vllm.v1.engine.async_llm as async_llm
@@ -1155,7 +1194,7 @@ def _install_block_output_reset_abort_patch() -> None:
     fall through to the scheduler guard's raise instead.
     ``pause_generation(mode="keep")`` reaches the same method from its deferred
     idle callback while intentionally retaining live requests; that path is
-    left to the scheduler guard, which refuses the reset without raising.
+    left to the scheduler guard, which refuses the reset by returning False.
     """
     import vllm.v1.engine.core as engine_core
     from vllm.v1.core.sched.interface import PauseState
@@ -1206,11 +1245,11 @@ def _install_block_output_pause_guard_patch() -> None:
     block requests.
 
     The keep-mode cache reset runs from the engine's deferred idle callback,
-    whose result upstream discards: ``EngineCore._reset_caches`` ignores the
-    scheduler's ``False`` and the pause Future resolves regardless, so the
-    caller would be told the pause succeeded with a cleared cache while the
-    retained canvases kept their state. Refusing here, before any pause state
-    changes, surfaces the conflict synchronously — the raise is caught by
+    after the scheduler is already paused. ``EngineCore._reset_caches`` turns
+    the scheduler's ``False`` into a generic "Failed to reset the KV connector
+    cache" error on the pause Future, which does not name the live request
+    that blocked the reset. Refusing here, before any pause state changes,
+    surfaces the conflict synchronously and names it: the raise is caught by
     ``_invoke_utility_method`` and returned to the client as a failed call.
     ``EngineCoreProc`` overrides ``pause_scheduler``, so both classes are
     wrapped.
@@ -1937,6 +1976,13 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+        # ModelConfig caches whether the model takes multimodal input, and
+        # ModelConfig.__post_init__ fills that cache while the architecture
+        # still names the upstream class. Drop it so the next read resolves the
+        # TT class: a text-only TT class behind a multimodal upstream
+        # architecture (Gemma4) otherwise keeps the upstream True, and the
+        # renderer builds a multimodal processor the TT class does not have.
+        vars(model_config).pop("_supports_multimodal_inputs_cache", None)
 
         # Verify that the TT architecture is registered in the model registry
         from vllm.model_executor.models.registry import ModelRegistry
@@ -2091,6 +2137,25 @@ class TTPlatform(Platform):
             raise ValueError(
                 f"Model {model_class.__module__}.{model_class.__name__} "
                 "declares model_capabilities['supports_device_grammar']=True "
+                "without model_capabilities['supports_sample_on_device']=True"
+            )
+        # ``spec_ids_are_sampled`` answers only device-sampled steps, so a
+        # declaration without device sampling could never take effect.
+        spec_ids_are_sampled = (
+            model_capabilities.get("spec_ids_are_sampled", False)
+            if model_capabilities
+            else False
+        )
+        if not isinstance(spec_ids_are_sampled, bool):
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "must declare model_capabilities['spec_ids_are_sampled'] "
+                f"as a boolean, got {spec_ids_are_sampled!r}"
+            )
+        if spec_ids_are_sampled and not supports_sample_on_device:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['spec_ids_are_sampled']=True "
                 "without model_capabilities['supports_sample_on_device']=True"
             )
         if is_block_output_model and supports_device_grammar:
@@ -2332,6 +2397,7 @@ class TTPlatform(Platform):
                 model_config.generation_config = "vllm"
 
         _install_tt_input_processor_patch()
+        _install_tt_dp_prefix_cache_routing_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
 
@@ -2426,21 +2492,14 @@ class TTPlatform(Platform):
             # method check. These capability checks determine whether the
             # selected model can serve the combined async speculative path.
 
-        if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
-            raise ValueError(
-                "TT lane mode and speculative decoding cannot be combined. "
-                "Lane mode builds its device input from TTLaneInputBatch, "
-                "which has no candidate-block builder, so a speculating lane "
-                "launch would send plain single-token decodes and silently "
-                "serve no speculation. Drop the speculative flags, or set "
-                "--data-parallel-size 1 to leave lane mode"
-            )
-
         # After the lane fold: _convert_dp_to_lanes rewrites
         # scheduler_config.max_num_seqs and stores the lane count, and a plan is
         # dimensioned against the concurrency it was resolved for. Admitting
         # earlier would resolve a plan for the per-lane batch and then have the
-        # engine-core re-run resolve it for the global one.
+        # engine-core re-run resolve it for the global one. The folded total is
+        # the right concurrency for a lane launch: one device launch verifies
+        # every lane's rows together, so that is the batch the verify cost and
+        # SpecPlan.k_by_rows are dimensioned against.
         spec_plan = resolve_speculative_plan(
             vllm_config,
             model_class,
@@ -2640,7 +2699,10 @@ class TTPlatform(Platform):
           (``TTModelRunner._publish_draft`` offers it no drafts, and
           ``_step_verifies`` runs the step as the ordinary decode), and is
           refused when it does not, because then every decode step is a verify
-          that commits the target argmax.
+          that commits the target argmax. On a model declaring
+          ``spec_ids_are_sampled`` a non-zero temperature alone no longer rules
+          a request out on a device-sampled step (SPEC_DECODE_CONTRACT.md,
+          section 4d rule 2); a penalty still does.
 
         vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
         speculating launch before this runs. Refused per request rather than at

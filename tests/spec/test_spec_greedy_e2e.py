@@ -953,6 +953,73 @@ def test_a_drafter_offering_nothing_for_a_row_proposes_nothing():
     assert runner._proposed_draft_token_ids["s"] == [7]
 
 
+def test_a_declined_step_is_the_plain_decode_and_a_later_offer_still_verifies():
+    """A drafter that declines every row costs the step the plain decode only.
+
+    The common step of a drafter with a batch policy: it is asked after every
+    step and offers nothing, so the next step has nothing to verify and runs
+    as the ordinary decode. The builder then skips the candidate block it would
+    discard, and the drafter's answer is erased rather than range-checked and
+    trimmed row by row. Nothing of the contract goes with it: the drafter is
+    still asked with the padded ``[B, 1+K]`` block and every count 1, and once
+    it offers again the step after that offer verifies its drafts.
+    """
+    from vllm_tt_plugin.spec_decode import DraftOutput
+
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "r")
+    built: list = []
+    runner._spec_row_state = lambda *args: built.append(args) or (
+        TTModelRunner._spec_row_state(*args)
+    )
+    offering: list[bool] = []
+    drafts_from = model.propose_draft_tokens
+
+    def declines_until_told(num_drafts, committed, positions, counts, hidden=None):
+        drafted = drafts_from(num_drafts, committed, positions, counts, hidden=hidden)
+        if offering:
+            return drafted
+        return DraftOutput(
+            draft_token_ids=drafted.draft_token_ids,
+            num_valid=torch.zeros(int(committed.shape[0]), dtype=torch.int32),
+        )
+
+    model.propose_draft_tokens = declines_until_told
+
+    output = _step(runner, "r")
+
+    assert len(output.sampled_token_ids[0]) == 1
+    assert model.verify_calls == []
+    assert [call["width"] for call in model.plain_calls] == [1]
+    assert built == [], "a declined step built the candidate block it discards"
+    # The drafter was asked all the same, with the contract's block.
+    (asked,) = model.propose_calls
+    assert asked["committed_tokens"].shape == (MAX_NUM_REQS, DRAFT_LEN + 1)
+    assert asked["accepted_counts"].tolist() == [1] * MAX_NUM_REQS
+    assert runner._proposed_draft_token_ids == {}
+    assert runner.take_draft_token_ids() is None
+
+    # The drafter offers after the next plain step, which is built before its
+    # offer exists and so is still the plain decode.
+    offering.append(True)
+    _step(runner, "r")
+    assert built == []
+    assert [call["width"] for call in model.plain_calls] == [1, 1]
+    handoff = runner.take_draft_token_ids()
+    assert handoff.req_ids == ["r"]
+    drafts = handoff.draft_token_ids[0]
+    assert len(drafts) == DRAFT_LEN
+
+    output = _step(runner, "r", drafts={"r": drafts})
+
+    assert len(built) == 1, "the step verifying the offer skipped the full build"
+    assert len(model.verify_calls) == 1
+    assert output.sampled_token_ids[0][:DRAFT_LEN] == drafts
+    assert runner._req_accepted_counts["r"] == DRAFT_LEN + 1
+
+
 def test_an_unoffered_row_may_carry_any_ids_including_the_placeholder():
     """The range check covers what can reach the scheduler, and no more.
 

@@ -4,8 +4,9 @@
 
 The coordinator is exercised over lightweight fake lane schedulers: a real
 ``TTScheduler`` needs a device KV cache config, but the coordinator only relies
-on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
-length, forced-mode scheduling, and ``update_from_output``).
+on a small surface of each lane (``waiting`` / ``kv_holding_waiting`` /
+``running``, ``get_request_counts``, forced-mode scheduling, and
+``update_from_output``).
 """
 
 import collections
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.request import RequestStatus
 
@@ -40,17 +42,20 @@ class FakeLane:
     fallback.
     """
 
+    # Upstream's own count, so the fake fails loudly if vLLM moves the queues.
+    get_request_counts = Scheduler.get_request_counts
+
     def __init__(
         self,
         waiting=0,
         running=0,
-        skipped_waiting=0,
+        kv_holding_waiting=0,
         partial_prefills=0,
         pending_finished=(),
         owns=(),
     ):
         self.waiting = [object()] * waiting
-        self.skipped_waiting = [object()] * skipped_waiting
+        self.kv_holding_waiting = [object()] * kv_holding_waiting
         self.running = [
             SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
         ] + [
@@ -89,6 +94,27 @@ class FakeLane:
     def update_from_output(self, scheduler_output, model_runner_output):
         self.update_calls.append(scheduler_output)
         return self._eco
+
+    def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output):
+        # vLLM's rule on the lane's own output: trim each request's drafts to
+        # its reservation, drop the ids the grammar rejects (negative here),
+        # pad with -1 and rebind the list; set the lane's invalid counts.
+        num_invalid: dict[str, int] = {}
+        sched = scheduler_output.scheduled_spec_decode_tokens
+        for rid, ids in zip(
+            draft_token_ids.req_ids, draft_token_ids.draft_token_ids, strict=True
+        ):
+            placeholders = sched.get(rid)
+            if not placeholders:
+                continue
+            n = len(placeholders)
+            kept = [t for t in ids[:n] if t >= 0]
+            invalid = n - len(kept)
+            if invalid:
+                kept = kept + [-1] * invalid
+                num_invalid[rid] = invalid
+            sched[rid] = kept
+        scheduler_output.num_invalid_spec_tokens = num_invalid
 
     def finish_requests(self, request_ids, finished_status):
         self.finish_calls.append((request_ids, finished_status))
@@ -153,11 +179,13 @@ def test_negotiate_decode_when_no_lane_wants_prefill():
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.DECODE_ONLY
 
 
-def test_negotiate_prefill_when_lane_has_only_grammar_blocked_request():
-    # Lane 1's only pending work is a grammar-blocked structured-output request
-    # held in skipped_waiting (waiting is empty). It must still force prefill so
-    # the base scheduler can revisit and promote it after the grammar is ready.
-    coordinator = _make_coordinator([FakeLane(running=2), FakeLane(skipped_waiting=1)])
+def test_negotiate_prefill_when_lane_has_only_kv_holding_request():
+    # Lane 1's only pending work holds KV blocks while it waits (for example a
+    # streaming-input session that received its next chunk), so it sits in
+    # kv_holding_waiting and waiting is empty. It must still force prefill.
+    coordinator = _make_coordinator(
+        [FakeLane(running=2), FakeLane(kv_holding_waiting=1)]
+    )
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
@@ -435,9 +463,88 @@ def test_update_from_output_routes_and_merges_per_lane():
     assert merged[0].scheduler_stats is None
 
 
+class _SpecLane(FakeLane):
+    """A lane whose schedule reserves draft positions for its requests."""
+
+    def __init__(self, spec):
+        super().__init__(running=1)
+        self._spec = spec
+
+    def schedule(self):
+        out = super().schedule()
+        out.scheduled_spec_decode_tokens = {k: list(v) for k, v in self._spec.items()}
+        return out
+
+
+def test_update_draft_token_ids_in_output_syncs_the_merged_output():
+    """The async lane step validates drafts per lane, then the grammar
+    bitmask is computed from the MERGED output: it must carry the lanes'
+    validated drafts and invalid counts, not the merge-time placeholders."""
+    from vllm.v1.outputs import DraftTokenIds
+
+    lane0 = _SpecLane({"a": [-1, -1]})
+    lane1 = _SpecLane({"b": [-1, -1, -1]})
+    coordinator = _make_coordinator([lane0, lane1])
+    merged = coordinator.schedule()
+    assert merged.scheduled_spec_decode_tokens == {"a": [-1, -1], "b": [-1, -1, -1]}
+    assert merged.num_invalid_spec_tokens is None
+
+    coordinator.update_draft_token_ids_in_output(
+        DraftTokenIds(["a", "b"], [[7, 8, 9], [5, -3, 6]]), merged
+    )
+    lane_outputs = merged._tt_step_state.lane_outputs
+    # Each lane validated its own request: "a" trimmed to its reservation,
+    # "b" lost the rejected id and was padded.
+    assert lane_outputs[0].scheduled_spec_decode_tokens == {"a": [7, 8]}
+    assert lane_outputs[1].scheduled_spec_decode_tokens == {"b": [5, 6, -1]}
+    assert lane_outputs[1].num_invalid_spec_tokens == {"b": 1}
+    # ... and the merged output the bitmask reads says the same.
+    assert merged.scheduled_spec_decode_tokens == {"a": [7, 8], "b": [5, 6, -1]}
+    assert merged.num_invalid_spec_tokens == {"b": 1}
+
+
 def test_update_from_output_no_metadata_returns_empty():
     coordinator = _make_coordinator([FakeLane(), FakeLane()])
     assert coordinator.update_from_output(SchedulerOutput.make_empty(), None) == {}
+
+
+def test_lanes_record_request_events_and_leave_stats_to_the_coordinator():
+    # vLLM's queue, prefill and inference time histograms run from a request's
+    # QUEUED and SCHEDULED events, which a scheduler records only with
+    # log_stats on. Lanes built with it off left scheduled_ts at 0, so every
+    # lane-DP request reported a prefill time of first_token_ts - 0 (the host's
+    # monotonic clock).
+    from vllm.v1.engine import EngineCoreEventType
+
+    from tests.test_block_scheduler import (
+        BLOCK_SIZE,
+        _request,
+        _runner_output,
+        _scheduler,
+    )
+    from vllm_tt_plugin.config import store_tt_lane_count
+
+    base = _scheduler(output_width=1, max_num_seqs=2)
+    store_tt_lane_count(base.vllm_config, 2)
+    coordinator = TTLaneCoordinator(
+        base.vllm_config,
+        base.kv_cache_config,
+        base.structured_output_manager,
+        BLOCK_SIZE,
+        log_stats=True,
+    )
+    coordinator.add_request(_request(4, prompt_length=32))
+
+    step = coordinator.schedule()
+    outputs = coordinator.update_from_output(step, _runner_output(step, [7]))
+
+    (output,) = outputs[0].outputs
+    assert [event.type for event in output.events] == [
+        EngineCoreEventType.QUEUED,
+        EngineCoreEventType.SCHEDULED,
+    ]
+    assert outputs[0].scheduler_stats.num_running_reqs == 1
+    assert [lane.make_stats() for lane in coordinator.lanes] == [None, None]
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +849,7 @@ def _request(request_id, num_tokens=4096, prefix="", skip_reading_prefix_cache=F
         block_hashes=prefix or request_id,
         num_tokens=num_tokens,
         skip_reading_prefix_cache=skip_reading_prefix_cache,
+        status=RequestStatus.WAITING,
     )
 
 
@@ -951,7 +1059,7 @@ def test_equal_cached_prefixes_resolve_by_load_among_the_cached_lanes():
     assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
 
 
-def _skipped(request_id, status, *, grammar=None, num_tokens=8192):
+def _blocked(request_id, status, *, grammar=None, num_tokens=8192):
     structured = (
         None
         if grammar is None
@@ -965,12 +1073,13 @@ def _skipped(request_id, status, *, grammar=None, num_tokens=8192):
     )
 
 
-def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
-    # A grammar-blocked request whose grammar has compiled goes first at the next
-    # prefill step: its 8192 tokens outweigh the 3968-token hit on lane 0.
+def test_only_ready_waiting_requests_count_as_prefill_work_ahead():
+    # A grammar-blocked request stays in ``waiting``. Once its grammar has
+    # compiled it is scheduled at the next prefill step: its 8192 tokens
+    # outweigh the 3968-token hit on lane 0.
     lanes = [_lane_with_cache(doc=3968), _lane_with_cache()]
-    lanes[0].skipped_waiting.append(
-        _skipped(
+    lanes[0].waiting.append(
+        _blocked(
             "ready",
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             grammar=object(),
@@ -980,19 +1089,23 @@ def test_ready_skipped_waiting_requests_count_as_prefill_work_ahead():
     assert coordinator._queued_prefill_tokens(0) == 8192
     assert _lane_of(coordinator, _request("q", prefix="doc")) == 1
     # Still compiling: not ahead of the newcomer, the hit draws it to lane 0.
-    lanes[0].skipped_waiting[0] = _skipped(
+    lanes[0].waiting[0] = _blocked(
         "pending",
         RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
         grammar="pending",
     )
     assert coordinator._queued_prefill_tokens(0) == 0
     assert _lane_of(coordinator, _request("q2", prefix="doc")) == 0
-    # q2 now waits on lane 0 with its 128 uncached tokens. Remote KVs that have
-    # arrived count on top of it; a streaming-input request does not.
+    # q2 now waits on lane 0 with its 128 uncached tokens. A request holding KV
+    # blocks waits in ``kv_holding_waiting``: remote KVs that have arrived count
+    # on top of q2; a streaming-input request does not.
+    del lanes[0].waiting[0]
     lanes[0].finished_recving_kv_req_ids = {"kv"}
-    lanes[0].skipped_waiting[0] = _skipped("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    lanes[0].kv_holding_waiting.append(
+        _blocked("kv", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    )
     assert coordinator._queued_prefill_tokens(0) == 8192 + 128
-    lanes[0].skipped_waiting[0] = _skipped(
+    lanes[0].kv_holding_waiting[0] = _blocked(
         "stream", RequestStatus.WAITING_FOR_STREAMING_REQ
     )
     assert coordinator._queued_prefill_tokens(0) == 128
@@ -1012,3 +1125,19 @@ def test_lane_prefix_cache_routing_config_key():
         get_tt_lane_prefix_cache_routing(
             SimpleNamespace(additional_config={"tt": {"lane_prefix_cache_routing": 1}})
         )
+
+
+def test_coordinator_reads_the_queues_of_real_lane_schedulers():
+    # The fakes above mirror a lane's queues; this drives the same reads on real
+    # lane schedulers, so a change to vLLM's waiting-queue layout fails here.
+    from tests.test_block_scheduler import _request as _real_request
+    from tests.test_block_scheduler import _scheduler as _real_scheduler
+
+    lanes = [_real_scheduler(output_width=1, max_num_seqs=2) for _ in range(2)]
+    lanes[0].add_request(_real_request(4, request_id="A", prompt_length=32))
+    coordinator = _make_coordinator(lanes, per_lane_max=2)
+
+    assert coordinator._pick_lane() == 1
+    assert coordinator._lane_occupancy(0) == 1
+    assert coordinator._queued_prefill_tokens(0) == 32
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY

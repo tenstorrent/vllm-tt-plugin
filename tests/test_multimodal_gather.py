@@ -146,7 +146,39 @@ def test_each_items_placeholder_range_is_forwarded_after_the_processor_fields():
         ["a", "b"],
     )
     out = TTModelRunner._gather_multi_modal_inputs(runner)
-    assert list(out)[-2:] == PLACEHOLDER_FIELDS
+    assert list(out)[-len(PLACEHOLDER_FIELDS) :] == PLACEHOLDER_FIELDS
     assert out["pixel_values"] == [[pv0, None, pv1], None]
     assert out["mm_placeholder_offsets"] == [[12, 300, None], None]
     assert out["mm_placeholder_lengths"] == [[270, 256, None], None]
+
+
+def test_the_item_identifier_is_forwarded_even_without_a_payload():
+    pv = torch.zeros(4, 3)
+    cached = SimpleNamespace(  # payload stripped by vLLM: a prefix-cached item
+        modality="image",
+        data=None,
+        identifier="img-aaa",
+        mm_position=SimpleNamespace(offset=3, length=4, is_embed=None),
+    )
+    fresh = SimpleNamespace(
+        modality="image",
+        data={"pixel_values": _field(pv)},
+        identifier="img-bbb",
+        mm_position=SimpleNamespace(offset=10, length=4, is_embed=None),
+    )
+    runner = _runner(
+        {
+            "text": SimpleNamespace(mm_features=[]),
+            "mm": SimpleNamespace(mm_features=[cached, fresh]),
+        },
+        ["text", "mm"],
+    )
+    out = TTModelRunner._gather_multi_modal_inputs(runner)
+    assert list(out)[-3:] == [
+        "mm_placeholder_offsets",
+        "mm_placeholder_lengths",
+        "mm_identifiers",
+    ]
+    assert out["mm_identifiers"] == [None, ["img-aaa", "img-bbb"]]
+    assert out["mm_placeholder_offsets"] == [None, [3, 10]]
+    assert out["pixel_values"] == [None, [None, pv]]
