@@ -43,6 +43,7 @@ from vllm_tt_plugin.config import (
     get_tt_per_lane_max_num_seqs,
     is_tt_block_output_model,
 )
+from vllm_tt_plugin import background_warmup
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
@@ -496,12 +497,22 @@ class TTWorker(WorkerBase):
             start = time.perf_counter()
             self.model_runner.warmup_model()
             elapsed = time.perf_counter() - start
+            # Work the model deferred past start (MiMo's MIMO_DEFER_TRACES) runs while the engine is idle.
+            pending = background_warmup.pending(self.model_runner.model)
+            if pending:
+                background_warmup.install()
+                logger.info("%d warmup units deferred until the engine is idle", pending)
+            background_warmup.write_readiness(pending)
 
         # vLLM sizes multiproc workers' torch threads for startup only.
         if os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) == "1":
             set_torch_threads_for_runtime()
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
+
+    def background_warmup_step(self) -> bool:
+        """One unit of the model's deferred warmup (EngineCore calls it while idle); whether more remain."""
+        return background_warmup.step(self.model_runner.model)
 
     def execute_model(
         self,
