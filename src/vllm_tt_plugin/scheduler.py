@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import copy
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -58,6 +59,23 @@ def set_tt_verified_drafts(
 
 def get_tt_verified_drafts(runner_output: ModelRunnerOutput) -> dict[str, int]:
     return dict(getattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, {}))
+
+
+# Request id to reason for each prefill row a model declaring
+# ``reports_prefill_errors`` could not serve, attached to that step's
+# ModelRunnerOutput by the runner; ``TTScheduler.update_from_output`` finishes
+# those requests as errors.
+_TT_PREFILL_ERRORS_ATTR = "_tt_prefill_errors"
+
+
+def set_tt_prefill_errors(
+    runner_output: ModelRunnerOutput, errors: dict[str, str]
+) -> None:
+    setattr(runner_output, _TT_PREFILL_ERRORS_ATTR, dict(errors))
+
+
+def get_tt_prefill_errors(runner_output: ModelRunnerOutput) -> dict[str, str]:
+    return dict(getattr(runner_output, _TT_PREFILL_ERRORS_ATTR, {}))
 
 
 def set_tt_forced_reset_discard_counts(
@@ -1309,11 +1327,48 @@ class TTScheduler(AsyncScheduler):
             )
         if self.num_spec_tokens and self.scheduler_config.async_scheduling:
             self._mark_unverified_drafts_invalid(scheduler_output, model_runner_output)
+        model_runner_output = self._fail_unserved_prefills(
+            scheduler_output, model_runner_output
+        )
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
             self._committing_block_step_decisions = {}
             self.tt_release_output_frames(scheduler_output)
+
+    def _fail_unserved_prefills(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> ModelRunnerOutput:
+        """Have this update finish as errors the prefills the model could not serve.
+
+        The runner reports them on the step's output (``set_tt_prefill_errors``),
+        on a final chunk or an intermediate one. Each such request of this
+        scheduler loses the token the model sampled for it, so it does not stop
+        on that token, and joins vLLM's request-error set
+        (``grammar_compile_error_reqs``, which grammar compile failures also
+        feed), whose requests the base update finishes ``FINISHED_ERROR``.
+        Their finish reason ``error`` reaches the OpenAI server, which answers
+        HTTP 500, or an error event and ``[DONE]`` on a stream. The returned
+        output is a copy; the merged output a lane coordinator hands every lane
+        stays as it was.
+        """
+        failed = [
+            req_id
+            for req_id in get_tt_prefill_errors(model_runner_output)
+            if req_id in scheduler_output.num_scheduled_tokens
+        ]
+        if not failed:
+            return model_runner_output
+        sampled = list(model_runner_output.sampled_token_ids)
+        if sampled:
+            for req_id in failed:
+                sampled[model_runner_output.req_id_to_index[req_id]] = []
+        model_runner_output = copy.copy(model_runner_output)
+        model_runner_output.sampled_token_ids = sampled
+        self.grammar_compile_error_reqs.update(failed)
+        return model_runner_output
 
     def tt_release_output_frames(self, scheduler_output: SchedulerOutput) -> None:
         """Release the output frames ``scheduler_output`` reserved.

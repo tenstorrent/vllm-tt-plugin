@@ -80,6 +80,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import set_tt_prefill_errors
 from vllm_tt_plugin.spec_accept import (
     AcceptResult,
     SpecPenalties,
@@ -3036,15 +3037,18 @@ class TTModelRunner:
         # step runs synchronously, so the lane batch layout is stable between
         # this enqueue and the deferred sample.
         self._pending_samples.append(
-            partial(
-                self._finish_lane_sync,
-                tt_out=tt_out,
-                tt_log_probs=tt_log_probs,
-                model_input=model_input,
-                scheduled_rows=scheduled_rows,
-                is_decode=is_decode,
-                lane_total=lane_total,
-                decode_submission=submission,
+            TTModelRunner._with_prefill_errors(
+                partial(
+                    self._finish_lane_sync,
+                    tt_out=tt_out,
+                    tt_log_probs=tt_log_probs,
+                    model_input=model_input,
+                    scheduled_rows=scheduled_rows,
+                    is_decode=is_decode,
+                    lane_total=lane_total,
+                    decode_submission=submission,
+                ),
+                model_input,
             )
         )
         return None
@@ -3301,7 +3305,11 @@ class TTModelRunner:
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
         fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
+        self._pending_samples.append(
+            TTModelRunner._with_prefill_errors(
+                partial(self._finish_front_packed_sync, fwd=fwd), model_input
+            )
+        )
         return None
 
     def _reorder_grammar_bitmask(
@@ -4392,10 +4400,64 @@ class TTModelRunner:
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
             self.async_decode.note_prefill_submitted()
+            TTModelRunner._take_prefill_errors(self, model_input)
             return tt_out
         tt_out = self.model.prefill_forward(**kwargs)
         self.async_decode.note_prefill_submitted()
+        TTModelRunner._take_prefill_errors(self, model_input)
         return tt_out
+
+    def _take_prefill_errors(self, model_input: TTModelInput) -> None:
+        """Record the rows the prefill just run could not serve, by request id.
+
+        A model declaring ``reports_prefill_errors`` returns them from
+        ``take_prefill_errors()`` as ``{prefill row: reason}``. They go into
+        ``model_input.prefill_errors``; ``_with_prefill_errors`` puts them on the
+        step's output, and ``TTScheduler`` finishes those requests as errors.
+        """
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        if not capabilities.get("reports_prefill_errors", False):
+            return
+        errors = self.model.take_prefill_errors()
+        if not errors:
+            return
+        if model_input.row_req_ids is not None:
+            row_req_ids = list(model_input.row_req_ids)
+        else:
+            # A lane prefill's rows are the slots it seeds, in order.
+            row_req_ids = [
+                self.input_batch.req_ids[slot]
+                for slot in model_input.prefill_empty_slots
+            ]
+        for row, reason in errors.items():
+            if not 0 <= int(row) < len(row_req_ids) or not isinstance(reason, str):
+                raise ValueError(
+                    f"take_prefill_errors() returned {errors!r} for "
+                    f"{len(row_req_ids)} prefill rows; expected "
+                    "{prefill row: reason string}."
+                )
+            req_id = row_req_ids[int(row)]
+            model_input.prefill_errors[req_id] = reason
+            logger.error(
+                "Request %s fails: its prefill (row %d) could not be served: %s",
+                req_id,
+                int(row),
+                reason,
+            )
+
+    @staticmethod
+    def _with_prefill_errors(finish, model_input: TTModelInput):
+        """``finish``, with the step's prefill errors set on the output it builds."""
+        errors = model_input.prefill_errors
+        if not errors:
+            return finish
+
+        def finish_and_report(grammar_output: GrammarOutput | None):
+            output = finish(grammar_output)
+            set_tt_prefill_errors(output, errors)
+            return output
+
+        return finish_and_report
 
     def _forward_with_model_input(
         self,

@@ -12,7 +12,7 @@ without importing the runner.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -263,6 +263,11 @@ class TTModelInput:
     # ``stage_inputs``. ``None`` unless the model declares
     # ``supports_stage_inputs``.
     stage_inputs: list[Any] | None = None
+
+    # Prefill-only: request id to reason for each row the model could not serve,
+    # filled by ``submit_prefill`` from a model declaring
+    # ``reports_prefill_errors``; the step's output carries it to the scheduler.
+    prefill_errors: dict[str, str] = field(default_factory=dict)
 
     # Decode-only: retain device logits until sample_tokens supplies the grammar,
     # then invoke the model's device sampler. Structured prefills stay on host.

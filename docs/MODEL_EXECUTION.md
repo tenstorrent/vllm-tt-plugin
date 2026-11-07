@@ -62,6 +62,20 @@ hook. `TTModelRunner` suppresses output for intermediate prefill chunks and
 selects host sampling when a submitted prefill contains intermediate chunks,
 so intermediate chunks must not advance a device sampler.
 
+### Prefill errors
+
+A model that declares `reports_prefill_errors` can fail a prefill row instead
+of raising, since an exception out of `prefill_forward` kills the engine. After
+every `prefill_forward`, `submit_prefill` calls `take_prefill_errors()`, which
+returns `{row: reason}` for the rows of that call the model could not serve
+(the row index into `tokens`, the reason a string) and clears them. The row
+still needs a valid output; the plugin discards whatever the model returns for
+it. `TTScheduler` finishes each such request `FINISHED_ERROR`, on an
+intermediate chunk as on the final one: vLLM's finish reason `error`, which the
+OpenAI server answers with HTTP 500, or with an error event followed by
+`[DONE]` on a stream. The request's other state is released as for any finished
+request, and the other rows of the step are unaffected.
+
 ### Multimodal inputs
 
 For multimodal prefill, `_gather_multi_modal_inputs` adds one of two inputs.
