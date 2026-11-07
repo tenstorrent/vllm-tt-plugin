@@ -230,6 +230,17 @@ def test_a_load_pinned_in_another_pool_generation_is_refused(connector):
     assert c.client.pool(c.pool_global).gen == "g2", "it reopened the pool and found a new generation"
 
 
+def test_a_failed_release_is_logged_not_swallowed(connector, caplog):
+    c = connector()
+
+    def fail(lease):
+        raise kvc.KVStoreError("release: unknown reservation or lease 7")
+
+    c.client.release = fail
+    c._release(7)
+    assert c.release_errors == 1
+
+
 # --- KVStoreClient against a scripted store ---------------------------------------------------------------------
 
 import json  # noqa: E402

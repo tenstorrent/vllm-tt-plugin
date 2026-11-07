@@ -224,6 +224,7 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._pending: dict[str, tuple] = {}  # req_id -> lookup result held until update_state_after_alloc
         self._loads: list[LoadSpec] = []
         self._kv = None  # worker: per layer [K, V] ttnn tensors
+        self.release_errors = 0
         logger.info(
             "TTKVStoreConnector (%s): identity %s, pools %s / %s, global slot %d B, SWA slot %d B, layout %s",
             role.name, tag, self.pool_global, self.pool_swa, self.layout.global_slot_bytes,
@@ -410,12 +411,15 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def _release(self, lease: int) -> None:
+        """Unpin; a failure is logged (the store expires a lost lease after its TTL, but it pins pages until then)."""
         if not lease:
             return
         try:
             self.client.release(lease)
-        except KVStoreError:
-            pass
+        except KVStoreError as e:
+            self.release_errors += 1
+            logger.warning("TTKVStoreConnector: release of lease %x failed (%s); %d so far", lease, e,
+                           self.release_errors)
 
     def _release_pending(self, req_id: str) -> None:
         pend = self._pending.pop(req_id, None)
