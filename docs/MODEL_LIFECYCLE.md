@@ -115,11 +115,18 @@ addresses one page in every layer slot (see
 | Hook | Adapter responsibility |
 |---|---|
 | `zero_kv_cache_blocks(kv_cache=..., block_ids=[...])` | Zero each listed block in every KV buffer. vLLM lists the blocks it newly allocated to attention groups this step (`SchedulerOutput.new_block_ids_to_zero`). It sends them when `KVCacheConfig.needs_kv_cache_zeroing` is true, which holds with `MambaSpec` layers or mixed attention precisions: a reused block can hold bytes of another group that decode to NaN or Inf. With `MambaSpec` groups and one attention precision, `TTModelRunner` passes only the listed blocks that a `MambaSpec` group owned since their last zeroing and that the prefill step getting them does not write whole; this needs zeroed KV buffers at allocation (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). |
-| `copy_kv_cache_blocks(kv_cache=..., copies=[(src, dst), ...])` | Copy each source block to its destination block in every KV buffer, in list order. One call holds vLLM's `SchedulerOutput.kv_cache_block_copies`. In Mamba mode `align`, a second call before the forward holds the state copies into each request's new state block, and with speculative decoding a call from `commit_spec_acceptance` holds the block-boundary state copies after acceptance. For the rows of a chained verify in mode `align`, the runner copies nothing before that verify's forward and nothing when the pending verify commits: the model reads the start state from `MambaChainChoices.start_blocks` and runs the pending verify's boundary copy from `MambaChainChoices.copies` in the forward (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). |
+| `copy_kv_cache_blocks(kv_cache=..., copies=[(src, dst), ...])` | Make each destination block hold what its source block holds, in list order, so that a later pair can take an earlier pair's destination as its source. For an attention layer, that is the block's bytes in every KV buffer. For a `MambaSpec` layer, it is the full state that the source block stands for, including any part that the model keeps outside the block (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). One call holds vLLM's `SchedulerOutput.kv_cache_block_copies`. In Mamba mode `align`, a second call before the forward holds the state copies into each request's new state block, and with speculative decoding a call from `commit_spec_acceptance` holds the block-boundary state copies after acceptance. For the rows of a chained verify in mode `align`, the runner copies nothing before that verify's forward and nothing when the pending verify commits: the model reads the start state from `MambaChainChoices.start_blocks` and runs the pending verify's boundary copy from `MambaChainChoices.copies` in the forward (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). |
 
 `kv_cache` is the object the adapter's KV allocator returned. Enqueue the
 operations on the device before the step's forward, so the forward reads the
-result. An adapter with `MambaSpec` groups must implement
+result. `TTModelRunner` does not wait for the operations to complete: a hook
+can return after it enqueues them, and the adapter must order them before
+every later device read or write of the same blocks, including the step's
+forward and later block operations. State that the adapter keeps for a block
+outside the KV buffers belongs to the request that owns the block. Drop that
+state when the request ends or prefills again: vLLM can give the block id to
+another request, and a later copy from that id must not read the old
+request's state. An adapter with `MambaSpec` groups must implement
 `zero_kv_cache_blocks`, and in mode `align` also `copy_kv_cache_blocks`;
 `TTModelRunner.initialize_kv_cache` raises otherwise. A requested copy that
 reaches a `MambaSpec` adapter without `copy_kv_cache_blocks` raises. For an

@@ -37,7 +37,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 
 ### Recurrent state blocks
 
-When the KV cache has `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)), prefill and decode also receive `mamba_state`, a `MambaStepState`. It holds one `MambaGroupState` per `MambaSpec` group, in the way upstream vLLM gives each Mamba group one metadata object (`BaseMambaAttentionMetadata` in `vllm/v1/attention/backends/mamba_attn.py`). The classes are frozen dataclasses in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py). Every tensor is a CPU int32 tensor with `tt_max_batch_size` rows, and row `i` belongs to submitted row `i`. K is `MambaSpec.num_speculative_blocks`, 0 without speculative decoding.
+When the KV cache has `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)), prefill and decode also receive `mamba_state`, a `MambaStepState`. It holds one `MambaGroupState` per `MambaSpec` group, as upstream vLLM builds one attention metadata object per KV cache group (for GDN layers, `GDNAttentionMetadata` in `vllm/v1/attention/backends/gdn_attn.py`). The classes are frozen dataclasses in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py). Every tensor is a CPU int32 tensor with `tt_max_batch_size` rows, and row `i` belongs to submitted row `i`. K is `MambaSpec.num_speculative_blocks`, 0 without speculative decoding.
 
 | Field | Content |
 |---|---|
@@ -59,8 +59,16 @@ With speculative decoding, K is the draft length (see [recurrent state](MODEL_SE
 
 The model writes the state after the row's query token `t` into window
 column `t`: a verify writes columns 0 to K, a prefill or an ordinary decode
-writes column 0. Each block holds a full state, conv history and recurrent
-state, of one position. In mode `align` the state copies take the source from
+writes column 0. Each block stands for the full state (conv history and
+recurrent state) of one position. The model can keep part of that state
+outside the block while only the row's own next step reads it; the Qwen3.8
+adapter keeps a verify's conv history in a private window buffer. Before
+anything else reads the block, the state must be complete: a
+`copy_kv_cache_blocks` pair that takes the block as its source must give its
+destination the full state, and a block that vLLM can serve as a prefix-cache
+hit must hold the full state itself. See
+[block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations) for the copy
+order and lifetime rules. In mode `align` the state copies take the source from
 the accepted column: before the forward, column `prev + count - 1`, as
 upstream `preprocess_mamba`; and after a verify's acceptance,
 `commit_spec_acceptance` copies the state at a block boundary that the

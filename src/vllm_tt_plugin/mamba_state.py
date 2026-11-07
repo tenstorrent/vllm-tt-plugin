@@ -24,10 +24,11 @@ With ``MambaSpec.num_speculative_blocks`` K > 0 a row's state window is
 ``1 + K`` block ids: the model writes the state after the row's query token
 ``t`` into window column ``t``, and the row's start state is in window column
 ``num_accepted - 1``. Upstream keeps the GDN conv state of all ``1 + K``
-positions in window column 0 and shifts it on a copy; the TT contract keeps
-the full state (conv history and recurrent state) of each position in its own
-block, so every copy here is a whole-block ``(src, dst)`` copy from the block
-of the accepted column.
+positions in window column 0 and shifts it on a copy; in the TT contract each
+block stands for the full state (conv history and recurrent state) of one
+position, so every copy here is a ``(src, dst)`` block copy from the block of
+the accepted column, and ``copy_kv_cache_blocks`` copies that logical state,
+also the part a model has not written into the source block yet.
 """
 
 from __future__ import annotations
