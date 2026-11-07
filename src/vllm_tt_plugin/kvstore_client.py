@@ -8,6 +8,13 @@ the pools' files, so the caller copies KV pages straight between the device and 
 newline-delimited JSON over a Unix socket, one request, one response. This module is the whole boundary between the
 TT KV connector and the store: another store (an LMCache server) would replace this class.
 
+Slot numbers only mean something in one incarnation of a pool, named by its generation (``Pool.gen``: the store's
+random epoch plus a counter). This client sends the generation of its mapping with every ``acquire`` and ``reserve``
+(the store refuses a stale one) and checks the generation in the response; a stale pool is forgotten, and so is every
+pool when the connection to the store closes (the store may have restarted), so the next ``open_pool`` maps the
+current file. A caller copying through ``pool(name)`` therefore always holds the mapping of the generation the store
+gave it the slots in.
+
 Thread-safe (one lock per client). Any socket error closes the connection and raises KVStoreError; the next call
 reconnects. The store drops a connection's reservations and leases when it closes.
 """
@@ -27,13 +34,18 @@ class KVStoreError(RuntimeError):
     pass
 
 
+class StalePool(KVStoreError):
+    """The pool's generation is not the one this client mapped (the store restarted or recreated it)."""
+
+
 @dataclass
 class Pool:
     name: str
     path: str
+    gen: str
     num_slots: int
     slot_bytes: int
-    mm: mmap.mmap
+    mm: mmap.mmap | None
     base: int  # address of the mapping
 
 
@@ -44,7 +56,8 @@ class KVStoreClient:
         self._sock: socket.socket | None = None
         self._rfile = None
         self._lock = threading.Lock()
-        self._pools: dict[str, Pool] = {}
+        self._pools: dict[str, Pool] = {}  # pools valid on the current connection
+        self._maps: dict[tuple[str, str], Pool] = {}  # (path, gen) -> mapping, reused when a pool is reopened
 
     # -- transport ---------------------------------------------------------------------------------------------
     def _connect(self) -> None:
@@ -65,6 +78,8 @@ class KVStoreClient:
         finally:
             self._sock = None
             self._rfile = None
+            # The store may have restarted behind this connection: no pool is trusted until reopened.
+            self._pools.clear()
 
     def call(self, timeout_s: float | None = None, **req) -> dict:
         with self._lock:
@@ -75,32 +90,55 @@ class KVStoreClient:
                 self._sock.sendall((json.dumps(req) + "\n").encode())
                 line = self._rfile.readline()
                 if not line:
-                    raise KVStoreError("store closed the connection")
+                    raise ConnectionError("store closed the connection")
                 resp = json.loads(line)
-            except (OSError, ValueError) as e:
+            except (OSError, ValueError) as e:  # ConnectionError is an OSError
                 self._close()
                 raise KVStoreError(f"{req.get('op')}: {e}") from e
         if not resp.get("ok"):
-            raise KVStoreError(f"{req.get('op')}: {resp.get('error')}")
+            err = str(resp.get("error"))
+            if "stale pool generation" in err or "unknown pool" in err:
+                self._pools.pop(req.get("pool"), None)
+                raise StalePool(f"{req.get('op')}: {err}")
+            raise KVStoreError(f"{req.get('op')}: {err}")
         return resp
 
     # -- pools ---------------------------------------------------------------------------------------------------
     def open_pool(self, name: str, slot_bytes: int, capacity_bytes: int) -> Pool:
         # Creating a pool reserves its memory up front: tens of seconds for tens of GiB.
         r = self.call(op="open_pool", pool=name, slot_bytes=slot_bytes, capacity_bytes=capacity_bytes, timeout_s=600)
-        old = self._pools.get(name)
-        if old is not None and old.path == r["path"] and old.num_slots == r["num_slots"]:
-            return old
-        size = r["num_slots"] * r["slot_bytes"]
-        fd = os.open(r["path"], os.O_RDWR)
-        try:
-            mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
-        finally:
-            os.close(fd)
-        base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-        pool = Pool(name, r["path"], r["num_slots"], r["slot_bytes"], mm, base)
+        key = (r["path"], r["gen"])
+        pool = self._maps.get(key)
+        if pool is None:
+            size = r["num_slots"] * r["slot_bytes"]
+            fd = os.open(r["path"], os.O_RDWR)
+            try:
+                mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            finally:
+                os.close(fd)
+            base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+            pool = Pool(name, r["path"], r["gen"], r["num_slots"], r["slot_bytes"], mm, base)
+            # Older mappings of this pool name are of other generations: never used again.
+            self._maps = {k: p for k, p in self._maps.items() if p.name != name}
+            self._maps[key] = pool
         self._pools[name] = pool
         return pool
+
+    def pool(self, name: str) -> Pool | None:
+        """The pool's mapping, if it is open on the current connection (None: call open_pool)."""
+        return self._pools.get(name)
+
+    def _gen(self, pool: str) -> str:
+        p = self._pools.get(pool)
+        if p is None:
+            raise KVStoreError(f"pool {pool} is not open")
+        return p.gen
+
+    def _check_gen(self, pool: str, r: dict) -> None:
+        p = self._pools.get(pool)
+        if p is None or r.get("gen") != p.gen:
+            self._pools.pop(pool, None)
+            raise StalePool(f"pool {pool}: the store answered for generation {r.get('gen')}, mapped {p and p.gen}")
 
     # -- entries -------------------------------------------------------------------------------------------------
     @staticmethod
@@ -119,21 +157,36 @@ class KVStoreClient:
         return self.call(op="contains", pool=pool, keys=self._hex(keys))["present"]
 
     def acquire(self, pool: str, keys: list[bytes]) -> tuple[int, list[int]]:
-        """Pin the leading present keys: (lease, their slots). Release the lease once their bytes are copied."""
+        """Pin the leading present keys: (lease, their slots in ``pool(pool)``, whose generation was checked). Release
+        the lease once their bytes are copied."""
         if not keys:
             return 0, []
-        r = self.call(op="acquire", pool=pool, keys=self._hex(keys))
+        r = self.call(op="acquire", pool=pool, keys=self._hex(keys), gen=self._gen(pool))
+        try:
+            self._check_gen(pool, r)
+        except StalePool:
+            if r.get("lease"):
+                self.release(r["lease"])
+            raise
         return r["lease"], r["slots"]
 
     def release(self, lease: int) -> None:
+        """Unpin. Raises KVStoreError if the store does not know the lease (expired, or the store restarted)."""
         if lease:
             self.call(op="release", lease=lease)
 
     def reserve(self, pool: str, keys: list[bytes]) -> tuple[int, list[int | None]]:
-        """Slots to write for the keys not yet present (None: present, being written elsewhere, or no room)."""
+        """Slots to write for the keys not yet present (None: present, being written elsewhere, or no room), in
+        ``pool(pool)``, whose generation was checked."""
         if not keys:
             return 0, []
-        r = self.call(op="reserve", pool=pool, keys=self._hex(keys))
+        r = self.call(op="reserve", pool=pool, keys=self._hex(keys), gen=self._gen(pool))
+        try:
+            self._check_gen(pool, r)
+        except StalePool:
+            if r.get("reservation"):
+                self.abort(r["reservation"])
+            raise
         return r["reservation"], r["slots"]
 
     def commit(self, reservation: int) -> int:

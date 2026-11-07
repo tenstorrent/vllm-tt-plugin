@@ -45,11 +45,17 @@ class FakeStore:
         self.reservations = {}
         self._pools = {}
 
+        self.gen = "g1"
+
     def open_pool(self, name, slot_bytes, capacity_bytes):
-        if name not in self._pools:
-            self._pools[name] = Pool(name, f"/dev/shm/{name}", 64, slot_bytes, None, 1 << 40)
-            self.next_slot[name] = 0
+        p = self._pools.get(name)
+        if p is None or p.gen != self.gen:
+            self._pools[name] = Pool(name, f"/dev/shm/{name}", self.gen, 64, slot_bytes, None, 1 << 40)
+            self.next_slot.setdefault(name, 0)
         return self._pools[name]
+
+    def pool(self, name):
+        return self._pools.get(name)
 
     def lookup(self, pool, keys):
         n = 0
@@ -201,10 +207,103 @@ def test_a_prefill_chunk_saves_its_blocks_and_a_window_snapshot(connector):
 
 def test_global_regions_coalesce_runs(connector):
     c = connector(role=KVConnectorRole.WORKER)
-    regs = c._global_regions([3, 4, 5, 9], [10, 11, 12, 20])
+    regs = c._global_regions(c.client.pool(c.pool_global), [3, 4, 5, 9], [10, 11, 12, 20])
     k = regs[(GLOBAL[0], 0)]
     assert len(regs) == 18 and len(k) == 8 * 2  # 8 chips x 2 runs
     pb = 12 * 1088
-    pool = c.client._pools[c.pool_global]
+    pool = c.client.pool(c.pool_global)
     assert k[0] == (0, 10 * pb, 3 * pb, pool.base + 3 * pb)  # chip 0, layer 0, K: plane 0
     assert k[1] == (0, 20 * pb, pb, pool.base + 9 * pb)
+
+
+def test_a_load_pinned_in_another_pool_generation_is_refused(connector):
+    """The scheduler pinned the slots in generation g1; the store restarted (g2): copying through either mapping
+    would read some other entry's bytes, so the step fails."""
+    c = connector(role=KVConnectorRole.WORKER)
+    c._kv = [[object(), object()] for _ in range(48)]
+    ld = kvc.LoadSpec("r", 128, [0], [5], 0, {}, [], global_gen="g1", swa_gen="g1")
+    c.client.gen = "g2"
+    c.client._pools.clear()  # the client forgot its pools when its connection to the old store closed
+    c.bind_connector_metadata(kvc.TTKVMeta(loads=[ld]))
+    with pytest.raises(RuntimeError, match="restarted"):
+        c.start_load_kv(None)
+    assert c.client.pool(c.pool_global).gen == "g2", "it reopened the pool and found a new generation"
+
+
+# --- KVStoreClient against a scripted store ---------------------------------------------------------------------
+
+import json  # noqa: E402
+import socket  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+
+from vllm_tt_plugin.kvstore_client import KVStoreClient, KVStoreError, StalePool  # noqa: E402
+
+
+class ScriptedStore:
+    """A Unix socket server that answers each request with the next scripted response (a callable of the request)."""
+
+    def __init__(self, tmp, script):
+        self.path = f"{tmp}/s.sock"
+        self.script = list(script)
+        self.requests = []
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen(4)
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        while self.script:
+            conn, _ = self.srv.accept()
+            f = conn.makefile("rwb")
+            while self.script:
+                line = f.readline()
+                if not line:
+                    break
+                req = json.loads(line)
+                self.requests.append(req)
+                resp = self.script.pop(0)(req)
+                if resp is None:  # drop the connection (a store restart)
+                    break
+                f.write((json.dumps(resp) + "\n").encode())
+                f.flush()
+            f.close()
+            conn.shutdown(socket.SHUT_RDWR)
+            conn.close()
+
+
+def _pool_file(tmp, name, size=4096):
+    path = f"{tmp}/{name}"
+    with open(path, "wb") as f:
+        f.truncate(size)
+    return path
+
+
+def test_client_checks_generations_and_forgets_pools_on_reconnect():
+    with tempfile.TemporaryDirectory() as tmp:
+        p1 = _pool_file(tmp, "p.g1")
+        p2 = _pool_file(tmp, "p.g2")
+        opened = lambda path, gen: lambda r: {"ok": True, "path": path, "gen": gen, "num_slots": 1, "slot_bytes": 4096}
+        store = ScriptedStore(tmp, [
+            opened(p1, "g1"),
+            lambda r: {"ok": True, "lease": 5, "slots": [0], "gen": "g2"},  # the store answers for another generation
+            lambda r: {"ok": True},  # the client releases that lease
+            lambda r: None,  # then the store "restarts": the connection drops
+            opened(p2, "g2"),
+            lambda r: {"ok": False, "error": "release: unknown reservation or lease 9"},
+        ])
+        c = KVStoreClient(store.path)
+        pool = c.open_pool("p", 4096, 4096)
+        assert (pool.gen, c.pool("p").gen) == ("g1", "g1")
+        with pytest.raises(StalePool):
+            c.acquire("p", [b"k" * 32])
+        assert store.requests[1]["gen"] == "g1", "the mapping's generation is sent"
+        assert store.requests[2] == {"op": "release", "lease": 5}, "the lease of the stale answer is given back"
+        assert c.pool("p") is None, "a stale pool is forgotten"
+        c._pools["p"] = pool
+        with pytest.raises(KVStoreError):
+            c.lookup("p", [b"k" * 32])  # the connection drops
+        assert c.pool("p") is None, "every pool is forgotten when the connection to the store closes"
+        assert c.open_pool("p", 4096, 4096).gen == "g2"
+        with pytest.raises(KVStoreError):
+            c.release(9)

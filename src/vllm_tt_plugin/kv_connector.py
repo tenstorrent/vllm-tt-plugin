@@ -53,7 +53,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
-from vllm_tt_plugin.kvstore_client import KVStoreClient, KVStoreError
+from vllm_tt_plugin.kvstore_client import KVStoreClient, KVStoreError, Pool
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -168,6 +168,9 @@ class LoadSpec:
     # per SWA layer position (index into Layout.swa_layers): [(window index w, block id)]
     swa_blocks: dict[int, list[tuple[int, int]]]
     leases: list[int]
+    # generations of the pools the slots belong to (KVStoreClient checked them at acquire time)
+    global_gen: str = ""
+    swa_gen: str = ""
 
 
 @dataclass
@@ -217,7 +220,6 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         tag = self.identity.hex()[:24]
         self.pool_global, self.pool_swa = f"kv-{tag}-g", f"kv-{tag}-s"
         self.client = KVStoreClient(self.socket)
-        self._pools_open = False
         self._req: dict[str, _ReqState] = {}
         self._pending: dict[str, tuple] = {}  # req_id -> lookup result held until update_state_after_alloc
         self._loads: list[LoadSpec] = []
@@ -230,15 +232,17 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     # ------------------------------------------------------------------ shared
     def _open_pools(self) -> bool:
-        if self._pools_open:
+        """Both pools open on the client's current connection (it forgets them when the connection closes or the store
+        reports a stale generation, so this reopens after a store restart)."""
+        if self.client.pool(self.pool_global) is not None and self.client.pool(self.pool_swa) is not None:
             return True
         try:
             self.client.open_pool(self.pool_global, self.layout.global_slot_bytes, self.global_bytes)
             self.client.open_pool(self.pool_swa, self.layout.swa_slot_bytes, self.swa_bytes)
-            self._pools_open = True
+            return True
         except KVStoreError as e:
             logger.warning("TTKVStoreConnector: store unavailable (%s); running without it", e)
-        return self._pools_open
+            return False
 
     def _keys(self, tokens: list[int], cache_salt: str | None) -> list[bytes]:
         """Chained key of every full global block: key i covers tokens [0, (i + 1) * block)."""
@@ -299,24 +303,27 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             b = next((c for c, h in zip(cands, have) if h), 0)
             if b == 0 or (b - local) * bt < self.min_tokens:
                 return 0, False
+            lease_g = lease_s = 0
             lease_g, slots_g = self.client.acquire(self.pool_global, st.keys[local:b])
             lease_s, slots_s = self.client.acquire(self.pool_swa, [self._snapshot_key(st.keys, b)])
+            gens = (self.client.pool(self.pool_global).gen, self.client.pool(self.pool_swa).gen)
             if len(slots_g) != b - local or len(slots_s) != 1:  # evicted in between
-                self.client.release(lease_g)
-                self.client.release(lease_s)
+                self._release(lease_g)
+                self._release(lease_s)
                 return 0, False
         except KVStoreError as e:
             logger.warning("TTKVStoreConnector: lookup failed (%s)", e)
-            self._pools_open = False  # reopen (a restarted store has new pool files) on the next call
+            self._release(lease_g)
+            self._release(lease_s)
             return 0, False
-        self._pending[request.request_id] = (local, b, slots_g, slots_s[0], [lease_g, lease_s])
+        self._pending[request.request_id] = (local, b, slots_g, slots_s[0], [lease_g, lease_s], gens)
         return b * bt - num_computed_tokens, False
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         pend = self._pending.pop(request.request_id, None)
         if pend is None:
             return
-        local, b, slots_g, slot_s, leases = pend
+        local, b, slots_g, slot_s, leases, gens = pend
         if num_external_tokens == 0:
             for lease in leases:
                 self._release(lease)
@@ -332,6 +339,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 swa_slot=slot_s,
                 swa_blocks=self._swa_window(ids, b * bt),
                 leases=leases,
+                global_gen=gens[0],
+                swa_gen=gens[1],
             )
         )
         self._state(request).saved_blocks = b  # already in the store
@@ -401,6 +410,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def _release(self, lease: int) -> None:
+        if not lease:
+            return
         try:
             self.client.release(lease)
         except KVStoreError:
@@ -451,11 +462,11 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         _WORKER_READY.set()
         logger.info("TTKVStoreConnector: registered %d layers on %d devices", len(kv), ndev)
 
-    def _global_regions(self, slots: list[int], blocks: list[int]) -> dict[tuple[int, int], list[tuple]]:
+    def _global_regions(self, pool: Pool, slots: list[int], blocks: list[int]) -> dict[tuple[int, int], list[tuple]]:
         """{(layer, kv): [(device, byte offset, bytes, host address)]}: runs of consecutive slots and block ids are one
-        region per plane (pool layout: plane-major, plane = (device, global layer position, kv))."""
+        region per plane (pool layout: plane-major, plane = (device, global layer position, kv)). ``pool`` is the
+        mapping of the generation the slots were handed out in."""
         L = self.layout
-        pool = self.client._pools[self.pool_global]
         runs, i = [], 0
         while i < len(slots):
             j = i + 1
@@ -475,10 +486,9 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     plane_off += pool.num_slots * pb
         return out
 
-    def _swa_regions(self, slot: int, swa_blocks: dict[int, list[tuple[int, int]]]) -> dict[tuple[int, int], list]:
+    def _swa_regions(self, pool: Pool, slot: int, swa_blocks: dict[int, list[tuple[int, int]]]) -> dict[tuple[int, int], list]:
         """Snapshot slot layout: [swa layer position][kv][device][window index], each a page."""
         L = self.layout
-        pool = self.client._pools[self.pool_swa]
         base = pool.base + slot * pool.slot_bytes
         out: dict[tuple[int, int], list[tuple]] = {}
         off = 0
@@ -525,8 +535,10 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         for ld in meta.loads:
             t0 = time.perf_counter()
             try:
-                nb = self._copy(self._global_regions(ld.global_slots, ld.global_blocks), to_device=True)
-                nb += self._copy(self._swa_regions(ld.swa_slot, ld.swa_blocks), to_device=True)
+                pg = self._mapping(self.pool_global, ld.global_gen)
+                ps = self._mapping(self.pool_swa, ld.swa_gen)
+                nb = self._copy(self._global_regions(pg, ld.global_slots, ld.global_blocks), to_device=True)
+                nb += self._copy(self._swa_regions(ps, ld.swa_slot, ld.swa_blocks), to_device=True)
             finally:
                 for lease in ld.leases:
                     self._release(lease)
@@ -534,6 +546,26 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 "TTKVStoreConnector: loaded %d tokens of %s (%.1f MB) in %.1f ms",
                 ld.num_tokens, ld.req_id, nb / 1e6, (time.perf_counter() - t0) * 1e3,
             )
+
+    def _mapping(self, name: str, gen: str) -> Pool:
+        """The worker's mapping of the pool generation the scheduler acquired a load's slots in. If the worker's
+        mapping is of another generation it reopens the pool; if the store's current generation is still another (the
+        store restarted since the scheduler pinned the slots), the slots are gone: the step fails rather than copying
+        some other entry's bytes."""
+        pool = self.client.pool(name)
+        if pool is None or pool.gen != gen:
+            try:
+                size = self.layout.global_slot_bytes if name == self.pool_global else self.layout.swa_slot_bytes
+                cap = self.global_bytes if name == self.pool_global else self.swa_bytes
+                pool = self.client.open_pool(name, size, cap)
+            except KVStoreError as e:
+                raise RuntimeError(f"TTKVStoreConnector: pool {name} of a pinned load is unavailable: {e}") from e
+        if pool.gen != gen:
+            raise RuntimeError(
+                f"TTKVStoreConnector: pool {name} is generation {pool.gen}, the load was pinned in {gen} "
+                "(the store restarted): refusing to copy"
+            )
+        return pool
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -551,21 +583,22 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             nb = 0
             try:
                 if sv.global_keys:
+                    # reserve sends the mapping's generation and checks the answer's: the slots are in this mapping
                     res_g, slots = self.client.reserve(self.pool_global, sv.global_keys)
+                    pool = self.client.pool(self.pool_global)
                     pick = [(s, b) for s, b in zip(slots, sv.global_blocks) if s is not None]
                     if pick:
-                        nb += self._copy(self._global_regions([s for s, _ in pick], [b for _, b in pick]), False)
+                        nb += self._copy(self._global_regions(pool, [s for s, _ in pick], [b for _, b in pick]), False)
                 if sv.snapshot_key is not None:
                     res_s, slots = self.client.reserve(self.pool_swa, [sv.snapshot_key])
+                    pool = self.client.pool(self.pool_swa)
                     if slots and slots[0] is not None:
-                        nb += self._copy(self._swa_regions(slots[0], sv.swa_blocks), False)
+                        nb += self._copy(self._swa_regions(pool, slots[0], sv.swa_blocks), False)
                 # the copies above were blocking: the bytes are in place, publish
                 self.client.commit(res_g)
                 self.client.commit(res_s)
             except Exception as e:  # never fail the step for a cache
                 logger.warning("TTKVStoreConnector: save of %s failed: %s", sv.req_id, e)
-                if isinstance(e, KVStoreError):
-                    self._pools_open = False
                 for r in (res_g, res_s):
                     try:
                         self.client.abort(r)
