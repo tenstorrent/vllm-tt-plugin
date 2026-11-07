@@ -839,7 +839,8 @@ clear error before anything reaches the device:
   alignment that depends on the model's program config and on the length of
   each remaining span, and the tt-metal generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
-  chunk boundary.
+  chunk boundary. In Mamba cache mode `align` a request with an item longer
+  than one prefill step is rejected.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.

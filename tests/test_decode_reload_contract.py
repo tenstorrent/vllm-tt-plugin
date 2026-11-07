@@ -92,6 +92,7 @@ def _submission_input(
         block_tables=page_table,
         block_tables_per_group=[page_table],
         block_tables_per_layer=None,
+        mamba_state=None,
         unpadded_batch_size=1,
         tt_sampling_params=_sampling_params(),
         perform_device_sampling=device_sampling,

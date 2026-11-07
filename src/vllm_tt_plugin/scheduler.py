@@ -3,14 +3,16 @@
 
 import sys
 from enum import Enum
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -90,6 +92,12 @@ def get_tt_block_step_decisions(
 # The lane coordinator's per-step state; see ``lane_scheduler.py``.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
 
+# Request id -> ``((position, column), ...)``: the Mamba states a prefill
+# chunk must leave inside itself. The model writes the state after
+# ``position`` tokens into the block at block-table ``column`` of every Mamba
+# group (``TTScheduler._attach_mamba_checkpoints``).
+_TT_MAMBA_CHECKPOINTS_ATTR = "_tt_mamba_checkpoints"
+
 # Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
 # Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
 # carries them over with ``carry_tt_scheduler_output_fields``.
@@ -98,6 +106,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
     _TT_STEP_STATE_ATTR,
+    _TT_MAMBA_CHECKPOINTS_ATTR,
 )
 
 
@@ -111,6 +120,12 @@ def set_tt_scheduler_output_field(
             f"{TT_SCHEDULER_OUTPUT_FIELDS}"
         )
     setattr(scheduler_output, name, value)
+
+
+def get_tt_mamba_checkpoints(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    return dict(getattr(scheduler_output, _TT_MAMBA_CHECKPOINTS_ATTR, {}))
 
 
 def carry_tt_scheduler_output_fields(
@@ -378,9 +393,11 @@ class TTScheduler(AsyncScheduler):
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
+    _mamba_checkpoint_manager: Any = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._mamba_checkpoint_manager = self._mamba_checkpoint_registry()
         if self.aux_output_connector is not None:
             # The base update_from_output asserts an auxiliary output for every
             # request that emits tokens, and the TT model runner produces none.
@@ -415,6 +432,22 @@ class TTScheduler(AsyncScheduler):
             _validate_prefill_chunk_alignment(
                 self._prefill_chunk_alignment, self.scheduler_config
             )
+            # With partial hash hits vLLM's block-aligned split also stops at
+            # multiples of hash_block_size. One off the alignment grid is
+            # floored back below the chunk start, so the request never
+            # finishes its prefill.
+            if (
+                getattr(self, "mamba_partial_cache_hit", False)
+                and self.hash_block_size % self._prefill_chunk_alignment
+            ):
+                raise ValueError(
+                    f"cache_config.prefix_match_unit={self.hash_block_size} "
+                    "with mamba_cache_mode 'align' makes vLLM end prefill "
+                    "chunks on multiples of it, off the grid of "
+                    "additional_config['tt']['prefill_chunk_alignment']="
+                    f"{self._prefill_chunk_alignment}. Set prefix_match_unit "
+                    "to a multiple of the alignment."
+                )
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
@@ -802,19 +835,83 @@ class TTScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
         if getattr(self, "_base_need_mamba_split", False):
+            budget = num_new_tokens
             num_new_tokens = super()._mamba_block_aligned_split(
                 request,
                 num_new_tokens,
                 num_new_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        start = (
-            request.num_computed_tokens
-            + num_new_local_computed_tokens
-            + num_external_computed_tokens
-        )
+            num_new_tokens = self._keep_multimodal_items_whole(
+                request, start, num_new_tokens, budget
+            )
         return self._align_prefill_chunk_end(request, start, num_new_tokens)
+
+    def _keep_multimodal_items_whole(
+        self, request: Request, start: int, num_new_tokens: int, budget: int
+    ) -> int:
+        """Move a mode-align prefill chunk end out of every multimodal item.
+
+        Mode align does not allow vLLM's ``disable_chunked_mm_input``, so this
+        keeps each item in one chunk instead. ``budget`` is the chunk length
+        before vLLM's block-aligned split. When that split ends the chunk
+        inside an item, the chunk ends instead at, in order of preference:
+
+        1. the last block boundary before the item, so that boundary's state
+           can still be cached;
+        2. the end of the item, if the budget reaches it. The chunk then
+           crosses the block boundaries inside the item without stopping;
+           ``MambaManager`` keeps null blocks there, so they are only not
+           cacheable;
+        3. the start of the item;
+        4. nowhere: the request waits for a step with more budget.
+
+        ``TTPlatform.validate_request`` rejects an item longer than one step.
+        An item that skipped that check and is longer than a whole step is
+        split, with a warning, rather than stall the queue.
+        """
+        end = start + num_new_tokens
+        if num_new_tokens <= 0 or not request.mm_features:
+            return num_new_tokens
+        items = [
+            (f.mm_position.offset, f.mm_position.offset + f.mm_position.length)
+            for f in request.mm_features
+        ]
+
+        def inside_item(position: int) -> tuple[int, int] | None:
+            return next(((lo, hi) for lo, hi in items if lo < position < hi), None)
+
+        item = inside_item(end)
+        if item is None:
+            return num_new_tokens
+        lo, hi = item
+        block = self.cache_config.block_size
+        boundary = min(end - 1, lo) // block * block
+        while boundary > start:
+            if inside_item(boundary) is None:
+                return boundary - start
+            boundary -= block
+        if hi <= start + budget:
+            return hi - start
+        if lo > start:
+            return lo - start
+        if hi - start > self._full_step_prefill_cap():
+            logger.warning(
+                "Request %s: a multimodal item at tokens [%d, %d) does not fit "
+                "one prefill step from token %d; splitting it.",
+                request.request_id,
+                lo,
+                hi,
+                start,
+            )
+            return num_new_tokens
+        return 0
 
     def _align_prefill_chunk_end(
         self, request: Request, start: int, num_new_tokens: int
@@ -952,7 +1049,86 @@ class TTScheduler(AsyncScheduler):
         if pending_reset_discards:
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
+        self._attach_mamba_checkpoints(scheduler_output)
         return scheduler_output
+
+    def _mamba_checkpoint_registry(self) -> Any:
+        """The ``MambaManager`` of a Mamba group with prefill checkpoint
+        blocks, or ``None`` when no group has any.
+
+        Every Mamba group has the same block size and allocates alike, so one
+        group's row and ``_checkpoints`` entry stand for all.
+        """
+        manager = next(
+            (
+                m
+                for m in self.kv_cache_manager.coordinator.single_type_managers
+                if isinstance(m.kv_cache_spec, MambaSpec)
+                and m.kv_cache_spec.num_prefill_checkpoint_blocks
+            ),
+            None,
+        )
+        if manager is None:
+            return None
+        if not isinstance(getattr(manager, "_checkpoints", None), dict):
+            raise RuntimeError(
+                f"{type(manager).__name__} has MambaSpec prefill checkpoint "
+                "blocks but no _checkpoints map; the TT scheduler hands the "
+                "model vLLM's checkpoint positions from it. Update "
+                "TTScheduler._mamba_checkpoint_registry for this vLLM version"
+            )
+        return manager
+
+    def _attach_mamba_checkpoints(self, scheduler_output: SchedulerOutput) -> None:
+        """Hand the runner the Mamba states this step's prefill chunks must
+        leave inside themselves.
+
+        A block-table column that a chunk passes is the null block, except
+        where vLLM keeps a block: the prefill checkpoint it reserved
+        (``MambaManager._needs_internal_checkpoint``), and, on a later chunk
+        with a checkpoint, the previous chunk's draft blocks, which
+        ``allocate_new_blocks`` then leaves in place instead of relocating
+        them. vLLM can cache each such block, as the state at the checkpoint
+        position for the checkpoint column and as the state after the
+        column's block boundary otherwise, so the chunk must write them. The
+        runner's block table cannot tell a retained draft block from a
+        relocated one (the worker row is append-only), so the scheduler reads
+        vLLM's row. The allocation records a request's checkpoint for a step
+        that reserves one and drops it at the next step that reserves none,
+        so an entry is this step's only if it lies inside the step's tokens.
+        """
+        manager = self._mamba_checkpoint_manager
+        if manager is None:
+            return
+        block_size = manager.block_size
+        writes = {}
+        for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            end = request.num_computed_tokens
+            start = end - num_scheduled
+            first, running = start // block_size, cdiv(end, block_size) - 1
+            if start >= request.num_prompt_tokens or running <= first:
+                continue
+            blocks = manager.req_to_blocks.get(req_id, [])
+            checkpoint = manager._checkpoints.get(req_id)
+            entries = []
+            for column in range(first, min(running, len(blocks))):
+                if blocks[column].is_null:
+                    continue
+                position = (column + 1) * block_size
+                if (
+                    checkpoint is not None
+                    and checkpoint[1] == column
+                    and start < checkpoint[0] < end
+                ):
+                    position = checkpoint[0]
+                entries.append((position, column))
+            if entries:
+                writes[req_id] = tuple(entries)
+        if writes:
+            set_tt_scheduler_output_field(
+                scheduler_output, _TT_MAMBA_CHECKPOINTS_ATTR, writes
+            )
 
     def _schedule_prefill_only(self) -> SchedulerOutput:
         """Schedule prefill work: waiting requests and partial continuations.
