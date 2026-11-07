@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -51,6 +51,26 @@ if TYPE_CHECKING:
 
 # ``CacheConfig.mamba_cache_mode`` values the TT runner implements.
 SUPPORTED_MAMBA_CACHE_MODES = ("none", "align")
+
+
+class MambaTransition(NamedTuple):
+    """Mode ``align``: one request's state moves between a verify that
+    committed a given count and the next step (``MambaCacheGroups._transition``).
+    Copies are ``(src, dst)`` block pairs, one per Mamba group."""
+
+    # The verify's boundary copy; empty when the committed tokens reach no
+    # block boundary whose state vLLM keeps.
+    boundary_copies: list[tuple[int, int]]
+    # The next step's move into its running column; empty when the step stays
+    # in the verify's column.
+    column_moves: list[tuple[int, int]]
+    # The next step's running column.
+    column: int
+    # The next step's start state is in window column ``start_count - 1``.
+    start_count: int
+    # A copy put the start state into window column 0
+    # (``MambaCacheGroups.moved_to_window_start``).
+    moved_to_window_start: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,44 +494,46 @@ class MambaCacheGroups:
             if req_id in fresh or req_id in self.moved_to_window_start:
                 count = 1
             if self.mamba_cache_mode == "align":
-                moves, count = self._move_to_running_column(
-                    req_id,
+                column, moves, count = self._column_move(
                     requests[req_id].block_ids,
+                    self.state_columns.get(req_id),
                     num_computed[req_id],
                     num_scheduled,
                     count,
                 )
+                self.state_columns[req_id] = column
+                if moves:
+                    self.moved_to_window_start.add(req_id)
                 copies += moves
             self.step_accepted_counts[req_id] = count
         return copies
 
-    def _move_to_running_column(
+    def _column_move(
         self,
-        req_id: str,
         block_ids: Sequence[Sequence[int]],
+        prev: int | None,
         computed: int,
         num_scheduled: int,
         count: int,
-    ) -> tuple[list[tuple[int, int]], int]:
-        """Mode ``align``: a step's move into its running column.
+    ) -> tuple[int, list[tuple[int, int]], int]:
+        """Mode ``align``: a step's move into its running column. Pure.
 
-        Records the column and returns the copies, one per Mamba group, and the
-        step's start-state count (1 after a move).
+        ``prev`` is the running column before the step, ``None`` for a new or
+        resumed request. Returns the step's running column, the copies (one
+        per Mamba group, none when the column does not change) and the step's
+        start-state count (1 after a move).
         """
-        prev = self.state_columns.get(req_id)
         if prev is None:
-            # A new or resumed request; -1 when nothing is computed yet.
+            # -1 when nothing is computed yet.
             prev = (computed - 1) // self.block_size
         curr = cdiv(computed + num_scheduled, self.block_size) - 1
-        self.state_columns[req_id] = curr
         if prev == -1 or prev == curr:
-            return [], count
-        self.moved_to_window_start.add(req_id)
+            return curr, [], count
         moves = [
             (block_ids[g][prev + count - 1], block_ids[g][curr])
             for g in self.group_indices
         ]
-        return moves, 1
+        return curr, moves, 1
 
     def after_acceptance(
         self,
@@ -533,7 +555,8 @@ class MambaCacheGroups:
 
         A request whose next step was chained with its moves on the device
         (``plan_chained_step``) gets no copies here, because that step ran
-        them; its bookkeeping catches up with this commit and that step's move.
+        them; its bookkeeping catches up with this commit and that step's move,
+        through the same ``_transition`` that planned them.
         """
         for req_id in committed:
             self.moved_to_window_start.discard(req_id)
@@ -542,55 +565,88 @@ class MambaCacheGroups:
         copies: list[tuple[int, int]] = []
         for req_id, (position, count) in committed.items():
             block_ids = requests[req_id].block_ids
-            boundary = self._copy_boundary_state(req_id, block_ids, position, count)
+            column = self.state_columns.get(req_id)
+            if column is None:
+                raise RuntimeError(
+                    f"request {req_id} committed {count} tokens at position "
+                    f"{position} but begin_step recorded no running column for it"
+                )
             num_scheduled = self.deferred_chained_steps.pop(req_id, None)
             if num_scheduled is None:
+                boundary, moved = self._boundary_copies(
+                    block_ids, column, position, count
+                )
+                if moved:
+                    self.moved_to_window_start.add(req_id)
                 copies += boundary
                 continue
-            start_count = 1 if req_id in self.moved_to_window_start else count
-            self._move_to_running_column(
-                req_id, block_ids, position + count, num_scheduled, start_count
-            )
+            step = self._transition(block_ids, column, position, count, num_scheduled)
+            self.state_columns[req_id] = step.column
+            if step.moved_to_window_start:
+                self.moved_to_window_start.add(req_id)
         return copies
 
-    def _copy_boundary_state(
+    def _boundary_copies(
         self,
-        req_id: str,
         block_ids: Sequence[Sequence[int]],
+        column: int,
         position: int,
         count: int,
-    ) -> list[tuple[int, int]]:
-        """Mode ``align``: the boundary copies after a verify committed
-        ``count`` tokens from ``position``, one per Mamba group.
+    ) -> tuple[list[tuple[int, int]], bool]:
+        """Mode ``align``: the boundary copies after a verify that ran in
+        running column ``column`` committed ``count`` tokens from ``position``,
+        one per Mamba group. Pure.
 
         None at a boundary whose state vLLM does not keep
-        (``kept_boundary_interval``). The copy also moves the start state into
-        window column 0 when the boundary ends the running column, but then
-        the next step moves into a new column, and without the copy it reads
-        the same state from window column ``count - 1``.
+        (``kept_boundary_interval``). The second value is True when the copy
+        puts the start state into window column 0: the boundary ends the
+        running column. The next step then moves into a new column, and
+        without the copy it reads the same state from window column
+        ``count - 1``.
         """
-        src = self.state_columns.get(req_id)
-        if src is None:
-            raise RuntimeError(
-                f"request {req_id} committed {count} tokens at position "
-                f"{position} but begin_step recorded no running column for it"
-            )
         kept = self.kept_boundary_interval
         if not kept:
-            return []
+            return [], False
         running = position + 1
         aligned = (position + count) // self.block_size * self.block_size
         if aligned < running or aligned % kept:
-            return []
+            return [], False
         shift = aligned - running
         dst = aligned // self.block_size - 1
-        if src == dst:
-            self.moved_to_window_start.add(req_id)
-            if shift == 0:
-                return []
+        if column == dst and shift == 0:
+            return [], True
         return [
-            (block_ids[g][src + shift], block_ids[g][dst]) for g in self.group_indices
-        ]
+            (block_ids[g][column + shift], block_ids[g][dst])
+            for g in self.group_indices
+        ], column == dst
+
+    def _transition(
+        self,
+        block_ids: Sequence[Sequence[int]],
+        column: int,
+        position: int,
+        count: int,
+        num_scheduled: int,
+    ) -> MambaTransition:
+        """Mode ``align``: what the host runs between a verify and the next
+        step, if the verify committed ``count`` tokens. Pure.
+
+        The verify ran in running column ``column`` from ``position``; the
+        next step schedules ``num_scheduled`` tokens. This is the verify's
+        boundary copy (``after_acceptance``), then the next step's move into
+        its running column (``begin_step``).
+        """
+        boundary, moved = self._boundary_copies(block_ids, column, position, count)
+        next_column, moves, start_count = self._column_move(
+            block_ids, column, position + count, num_scheduled, 1 if moved else count
+        )
+        return MambaTransition(
+            boundary_copies=boundary,
+            column_moves=moves,
+            column=next_column,
+            start_count=start_count,
+            moved_to_window_start=moved or bool(moves),
+        )
 
     def plan_chained_step(
         self,
@@ -605,14 +661,13 @@ class MambaCacheGroups:
 
         Row ``i``'s pending verify starts at the row's committed length minus
         one (the verify before it has committed, ``chain_blocker``) and
-        commits ``c`` tokens, ``1 <= c <= 1 + K``. For each ``c`` this runs,
-        on the row's bookkeeping, what the host runs between two verifies, and
-        then restores it: the pending verify's boundary copy
-        (``after_acceptance``), and this step's move into its running column
-        (``begin_step``). The model runs the boundary copy itself before the
-        step, and reads the start state where the move would copy it from, so
-        the move needs no copy: the step writes window column 0 anyway. The
-        bookkeeping catches up when the pending verify commits.
+        commits ``c`` tokens, ``1 <= c <= 1 + K``. For each ``c`` this takes
+        what the host runs between two verifies (``_transition``): the pending
+        verify's boundary copy and this step's move into its running column.
+        The model runs the boundary copy itself before the step, and reads the
+        start state where the move would copy it from, so the move needs no
+        copy: the step writes window column 0 anyway. The bookkeeping changes
+        once, when the pending verify commits (``after_acceptance``).
         """
         width = 1 + self.num_speculative_blocks
         num_groups = len(self.group_indices)
@@ -639,28 +694,18 @@ class MambaCacheGroups:
             position = requests[req_id].num_tokens - 1
             num_scheduled = num_scheduled_tokens[req_id]
             column = self.state_columns[req_id]
-            moved = req_id in self.moved_to_window_start
             for c in range(1, width + 1):
-                self.moved_to_window_start.discard(req_id)
-                boundary = self._copy_boundary_state(req_id, block_ids, position, c)
-                start_count = 1 if req_id in self.moved_to_window_start else c
-                moves, start_count = self._move_to_running_column(
-                    req_id, block_ids, position + c, num_scheduled, start_count
-                )
-                first = (position + c + num_scheduled - 1) // self.block_size
+                step = self._transition(block_ids, column, position, c, num_scheduled)
                 for i, g in enumerate(self.group_indices):
-                    window = block_ids[g][first : first + width]
+                    window = block_ids[g][step.column : step.column + width]
                     windows[i][row][c - 1] = window
-                    if boundary:
-                        copies[i][row][c - 1] = boundary[i]
+                    if step.boundary_copies:
+                        copies[i][row][c - 1] = step.boundary_copies[i]
                     starts[i][row][c - 1] = (
-                        moves[i][0] if moves else window[start_count - 1]
+                        step.column_moves[i][0]
+                        if step.column_moves
+                        else window[step.start_count - 1]
                     )
-                self.state_columns[req_id] = column
-                if moved:
-                    self.moved_to_window_start.add(req_id)
-                else:
-                    self.moved_to_window_start.discard(req_id)
             self.deferred_chained_steps[req_id] = num_scheduled
         return tuple(
             MambaChainChoices(copies=c, start_blocks=s, windows=w)

@@ -339,21 +339,21 @@ def test_without_the_host_skip_a_late_boundary_copy_corrupts_the_state(monkeypat
     real = MambaCacheGroups.after_acceptance
 
     def after_acceptance(self, committed, requests):
+        # ``after_acceptance`` takes a chained row's bookkeeping from
+        # ``_transition``; this also runs that transition's boundary copy.
         late: list[tuple[int, int]] = []
-        deferred = set(self.deferred_chained_steps)
-        copy_boundary = self._copy_boundary_state
+        transition = self._transition
 
-        def capture(req_id, block_ids, position, count):
-            copies = copy_boundary(req_id, block_ids, position, count)
-            if req_id in deferred:
-                late.extend(copies)
-            return copies
+        def capture(*args):
+            step = transition(*args)
+            late.extend(step.boundary_copies)
+            return step
 
-        self._copy_boundary_state = capture
+        self._transition = capture
         try:
             return real(self, committed, requests) + late
         finally:
-            del self._copy_boundary_state
+            del self._transition
 
     monkeypatch.setattr(MambaCacheGroups, "after_acceptance", after_acceptance)
     run = _mamba_run(monkeypatch, "align")
