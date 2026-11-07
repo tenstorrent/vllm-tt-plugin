@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
@@ -103,6 +104,50 @@ def slice_tt_sampling_params(
         num_logprobs=num_logprobs,
         enable_log_probs=num_logprobs >= 0,
     )
+
+
+def build_mm_items(
+    req_id: str,
+    mm_features: list[MultiModalFeatureSpec] | None,
+    modalities: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """One prefill row's ``mm_items`` entry: the request's items, or ``None``.
+
+    Every prefill of the request carries all of its items in prompt order (vLLM
+    orders ``mm_features`` by placeholder offset), whichever part of the prompt
+    the prefill covers. ``offset`` and ``length`` are the item's placeholder
+    range in the whole prompt; ``is_embed`` marks the positions inside it that
+    take the item's embeddings, ``None`` meaning all of them; ``data`` holds the
+    processor's fields for the item, ``None`` when vLLM stripped them because
+    prefix caching covers the whole item.
+
+    Raises:
+        ValueError: an item's modality is not in ``modalities``. The platform
+            refuses such a request before admission
+            (``resolve_tt_mm_modalities``), so this is a broken invariant.
+    """
+    if not mm_features:
+        return None
+    items = []
+    for feature in mm_features:
+        position = feature.mm_position
+        if feature.modality not in modalities:
+            raise ValueError(
+                f"Request {req_id} carries a {feature.modality!r} item at prompt "
+                f"offset {position.offset}, but the model encodes only "
+                f"{sorted(modalities)}."
+            )
+        items.append(
+            {
+                "modality": feature.modality,
+                "identifier": feature.identifier,
+                "offset": position.offset,
+                "length": position.length,
+                "is_embed": position.is_embed,
+                "data": None if feature.data is None else feature.data.get_data(),
+            }
+        )
+    return items
 
 
 @dataclass(frozen=True)

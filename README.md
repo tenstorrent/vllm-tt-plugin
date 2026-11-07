@@ -307,6 +307,8 @@ For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
 base64 `data:image/...` URL or a real URL such as
 `https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg`.
+A request carrying a modality the TT model does not encode (video or audio, for
+a model that takes images only) is refused with HTTP 400.
 
 ## Configuration
 

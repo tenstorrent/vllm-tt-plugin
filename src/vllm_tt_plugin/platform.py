@@ -30,6 +30,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_mm_modalities,
     resolve_tt_scheduler_cls,
     resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
@@ -2029,6 +2030,7 @@ class TTPlatform(Platform):
             model_class, "model_capabilities", None
         )
 
+        resolve_tt_mm_modalities(vllm_config, model_capabilities, model_class)
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)

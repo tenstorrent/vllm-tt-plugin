@@ -154,6 +154,16 @@ Sources: [config.py](../src/vllm_tt_plugin/config.py),
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
+## Multimodal capability
+
+| `model_capabilities` key | Default when absent | Meaning and current validation |
+|---|---|---|
+| `mm_modalities` | `None` | Declares the modalities the model encodes, as a non-empty set of vLLM modality names (`"image"`, `"video"`, `"audio"`). A declaring model receives `mm_items` with every prefill instead of `pixel_values` and `image_grid_thw`; see [multimodal inputs](MODEL_EXECUTION.md#multimodal-inputs). `resolve_tt_mm_modalities` sets `--limit-mm-per-prompt` to 0 for every other modality the model's vLLM processor accepts, so vLLM refuses a request carrying one while parsing it (HTTP 400) and leaves the modality out of the encoder budget. A multimodal model without the declaration is gated the same way to `{"image"}`, the modality its `pixel_values` lists carry. The platform rejects a value that is not a non-empty set, list, or tuple of strings; a declaration on a model vLLM serves text-only (no multimodal processor registered on the class); an operator `--limit-mm-per-prompt` above 0 for a modality the model does not encode; and `--enable-mm-embeds` for a declaring model. |
+
+Sources: `resolve_tt_mm_modalities` in [config.py](../src/vllm_tt_plugin/config.py),
+`build_mm_items` in [model_input.py](../src/vllm_tt_plugin/model_input.py), and
+`_gather_multi_modal_inputs` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
+
 ## Speculative capabilities and admission
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |

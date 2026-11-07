@@ -45,6 +45,7 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
     get_tt_seeded_sampling_policy,
@@ -75,6 +76,7 @@ from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
+    build_mm_items,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
@@ -533,6 +535,7 @@ class TTModelRunner:
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
+        self.mm_modalities = get_tt_mm_modalities(vllm_config)
         self.supports_stage_outputs = get_tt_supports_stage_outputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
@@ -1280,8 +1283,10 @@ class TTModelRunner:
         """
         Gather and batch multi-modal inputs for the current persistent batch.
 
-        Currently only supports image inputs in the "pixel_values" and
-        "image_grid_thw" fields.
+        A model that declares ``model_capabilities["mm_modalities"]`` gets
+        ``{"mm_items": [...]}``: one entry per row of ``req_indices``, built by
+        ``build_mm_items``. Any other model gets image inputs only, in the
+        "pixel_values" and "image_grid_thw" fields described below.
 
         Returns a dict with keys "pixel_values" and "image_grid_thw".
         Each value is a list aligned with the persistent batch order
@@ -1308,13 +1313,23 @@ class TTModelRunner:
         }
         """
 
+        if req_indices is None:
+            req_indices = list(range(self.input_batch.num_reqs))
+        if self.mm_modalities is not None:
+            mm_items = []
+            for batch_index in req_indices:
+                req_id = self.input_batch.req_ids[batch_index]
+                mm_items.append(
+                    build_mm_items(
+                        req_id, self.requests[req_id].mm_features, self.mm_modalities
+                    )
+                )
+            return {"mm_items": mm_items}
+
         multi_modal_kwargs: dict[str, Any] = {
             "pixel_values": [],
             "image_grid_thw": [],
         }
-
-        if req_indices is None:
-            req_indices = list(range(self.input_batch.num_reqs))
         # The model input tensors are built in persistent batch order, so
         # multi-modal inputs must follow the same order (not just new reqs).
         for batch_index in req_indices:
