@@ -85,10 +85,11 @@ model), so a chunk can start or end inside one:
           ...}}                  # the processor's fields for this item
 ```
 
-`data` is `None` when prefix caching covers the whole item: vLLM strips its
-fields before the runner sees the request (`strip_covered_mm_data`). The
-platform refuses a request with any other modality at the API, so a model never
-receives one.
+`data` is present for every item, one that prefix caching covers whole
+included: vLLM strips such an item's fields (`strip_covered_mm_data`) because
+it schedules no encoder run for it, and `TTScheduler` hands them back, since a
+model may recompute positions in front of its chunk start. The platform refuses
+a request with any other modality at the API, so a model never receives one.
 
 A multimodal model without the declaration receives `pixel_values` and
 `image_grid_thw`: an image request has one tensor per image in each list, with

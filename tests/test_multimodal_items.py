@@ -34,6 +34,7 @@ from vllm.multimodal.processing.context import BaseProcessingInfo
 from vllm.multimodal.utils import strip_covered_mm_data
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm.v1.request import Request
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.config import get_tt_mm_modalities, resolve_tt_mm_modalities
@@ -45,6 +46,7 @@ from vllm_tt_plugin.input_batch import (
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_input import build_mm_items
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.scheduler import TTScheduler
 
 VOCAB_SIZE = 64
 BLOCK_SIZE = 16
@@ -351,27 +353,56 @@ def test_every_chunk_gets_all_items_whatever_part_of_the_prompt_it_covers():
         _assert_full_prompt_items(items)
 
 
-def test_an_item_prefix_caching_covers_arrives_without_its_data():
+def _prefix_hit_step(*, takes_mm_items: bool, computed: int) -> SchedulerOutput:
+    """A new request whose prefix-cache hit ends at ``computed``, as the TT
+    scheduler hands it to the runner: vLLM builds the scheduled request data
+    (``NewRequestData.from_request``), the TT scheduler finalizes the output."""
+    request = Request(
+        "mm",
+        list(range(PROMPT_LEN)),
+        SamplingParams(temperature=0.0),
+        None,
+        mm_features=_mm_features(),
+    )
+    request.num_computed_tokens = computed
+    output = _step(scheduled={"mm": PROMPT_LEN - computed})
+    output.scheduled_new_reqs = [NewRequestData.from_request(request, ([0, 1],))]
+
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler.requests = {"mm": request}
+    scheduler._takes_mm_items = takes_mm_items
+    return scheduler._finalize_scheduler_output(output, is_decode=False)
+
+
+def test_an_item_prefix_caching_covers_still_reaches_the_model_with_its_data():
     """vLLM strips the fields of an item wholly inside the cached prefix
-    (``strip_covered_mm_data``); the item itself still arrives, placed."""
-    runner = _runner(ALL_MODALITIES)
+    (``strip_covered_mm_data``); the model may recompute positions inside it."""
     computed = 16  # the image [4, 12) is covered; the video [14, 24) is not
-    stripped = strip_covered_mm_data(_mm_features(), computed)
+    runner = _runner(ALL_MODALITIES)
 
     kwargs = _run_prefill(
-        runner,
-        _step(
-            new=[_new_request("mm", stripped, num_computed_tokens=computed)],
-            scheduled={"mm": PROMPT_LEN - computed},
-        ),
+        runner, _prefix_hit_step(takes_mm_items=True, computed=computed)
     )
 
-    (items,) = kwargs["mm_items"]
     assert kwargs["start_pos"].tolist() == [computed]
-    assert [item["modality"] for item in items] == ["image", "video", "audio"]
-    assert items[0]["data"] is None
-    assert (items[0]["offset"], items[0]["length"]) == (4, 8)
-    assert items[1]["data"] is not None and items[2]["data"] is not None
+    (items,) = kwargs["mm_items"]
+    _assert_full_prompt_items(items)
+    assert torch.equal(items[0]["data"]["pixel_values"], torch.full((32, 6), 1.0))
+
+
+def test_a_model_on_the_pixel_values_lists_keeps_vllms_stripping():
+    step = _prefix_hit_step(takes_mm_items=False, computed=16)
+
+    image, video, audio = step.scheduled_new_reqs[0].mm_features
+    assert image.data is None
+    assert video.data is not None and audio.data is not None
+
+
+def test_an_item_without_its_fields_is_a_broken_invariant():
+    stripped = strip_covered_mm_data(_mm_features(), 16)
+
+    with pytest.raises(ValueError, match="'image' item at prompt offset 4"):
+        build_mm_items("r", stripped, ALL_MODALITIES)
 
 
 def test_a_speculative_launchs_prefill_gets_the_items_too():

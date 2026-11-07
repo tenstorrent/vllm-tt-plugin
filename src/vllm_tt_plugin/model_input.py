@@ -118,13 +118,14 @@ def build_mm_items(
     the prefill covers. ``offset`` and ``length`` are the item's placeholder
     range in the whole prompt; ``is_embed`` marks the positions inside it that
     take the item's embeddings, ``None`` meaning all of them; ``data`` holds the
-    processor's fields for the item, ``None`` when vLLM stripped them because
-    prefix caching covers the whole item.
+    processor's fields for the item, those of an item prefix caching covers
+    included (``TTScheduler._restore_prefix_cached_mm_data``).
 
     Raises:
-        ValueError: an item's modality is not in ``modalities``. The platform
-            refuses such a request before admission
-            (``resolve_tt_mm_modalities``), so this is a broken invariant.
+        ValueError: an item's modality is not in ``modalities``, or it has no
+            fields. The platform refuses such a modality before admission
+            (``resolve_tt_mm_modalities``) and the scheduler restores stripped
+            fields, so either is a broken invariant.
     """
     if not mm_features:
         return None
@@ -137,6 +138,12 @@ def build_mm_items(
                 f"offset {position.offset}, but the model encodes only "
                 f"{sorted(modalities)}."
             )
+        if feature.data is None:
+            raise ValueError(
+                f"Request {req_id}'s {feature.modality!r} item at prompt offset "
+                f"{position.offset} (identifier {feature.identifier}) arrived "
+                "without its processor fields."
+            )
         items.append(
             {
                 "modality": feature.modality,
@@ -144,7 +151,7 @@ def build_mm_items(
                 "offset": position.offset,
                 "length": position.length,
                 "is_embed": position.is_embed,
-                "data": None if feature.data is None else feature.data.get_data(),
+                "data": feature.data.get_data(),
             }
         )
     return items

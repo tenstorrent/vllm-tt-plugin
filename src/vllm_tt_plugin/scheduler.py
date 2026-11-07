@@ -19,6 +19,7 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
@@ -404,6 +405,7 @@ class TTScheduler(AsyncScheduler):
         # flight reaches their max_tokens; read at each schedule().
         self._finishing_candidates: list[str] = []
         self._widest_decode_batch_size = 0
+        self._takes_mm_items = get_tt_mm_modalities(self.vllm_config) is not None
         self._prefill_chunk_alignment = (
             get_tt_prefill_chunk_alignment(self.vllm_config)
             if self.scheduler_config.enable_chunked_prefill
@@ -943,6 +945,8 @@ class TTScheduler(AsyncScheduler):
                     rows,
                 )
             self._record_finishing_requests(scheduler_output)
+        if getattr(self, "_takes_mm_items", False):
+            self._restore_prefix_cached_mm_data(scheduler_output)
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -950,6 +954,22 @@ class TTScheduler(AsyncScheduler):
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
         return scheduler_output
+
+    def _restore_prefix_cached_mm_data(self, scheduler_output: SchedulerOutput) -> None:
+        """Give a newly scheduled request's items back the fields vLLM stripped.
+
+        ``NewRequestData.from_request`` drops the processor fields of every item
+        the request's prefix-cache hit covers whole (``strip_covered_mm_data``),
+        since vLLM schedules no encoder run for it. A model taking ``mm_items``
+        may still recompute positions inside such an item: it can move a chunk
+        start back onto its own alignment, or recompute a short prompt with a
+        prefix hit from position 0. The scheduler's request holds the fields for
+        its whole lifetime, so with the uniproc executor handing them on adds no
+        copy.
+        """
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.mm_features:
+                new_req.mm_features = list(self.requests[new_req.req_id].mm_features)
 
     def _record_finishing_requests(self, scheduler_output: SchedulerOutput) -> None:
         """Name the requests this decode step left out because they finish.
