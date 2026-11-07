@@ -788,26 +788,22 @@ class InputBatch:
         their underlying group is narrower. Columns past each row's live
         block count are zero.
         """
+        # An int64 index array: NumPy reads a one-element tensor selector as a
+        # scalar index, and the mask below would lose its row axis.
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        cols = np.arange(width)
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
-            bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            src = bt.get_cpu_tensor().numpy()
+            table = np.zeros((rows.shape[0], width), dtype=src.dtype)
+            n = min(src.shape[1], width)
+            table[:, :n] = src[rows, :n]
             # vLLM tracks only the live prefix of a row; the columns past it
             # keep earlier occupants' block ids (condense/move leave them), so a
             # consumer that writes padded rows would reach another request's
             # blocks. Zero them: 0 is the null block, never allocated.
-            # Index a tensor, not the NumPy array: NumPy turns a one-element tensor
-            # selector into scalar indexing and the mask below would lose its row axis.
-            live = torch.as_tensor(
-                np.asarray(bt.num_blocks_per_row), dtype=torch.int64
-            )[rows].reshape(-1)
-            cols = torch.arange(bt_cpu.shape[1], dtype=torch.int64)
-            bt_cpu[cols.unsqueeze(0) >= live.unsqueeze(1)] = 0
-            if bt_cpu.shape[1] < width:
-                pad = torch.zeros(
-                    bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
-                )
-                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
-            out.append(bt_cpu)
+            table[cols[None, :] >= bt.num_blocks_per_row[rows][:, None]] = 0
+            out.append(torch.from_numpy(table))
         return out
 
 

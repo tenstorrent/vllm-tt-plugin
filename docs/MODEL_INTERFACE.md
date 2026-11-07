@@ -55,7 +55,7 @@ admission tolerates absence, but runtime sampling reads the dictionary directly.
 
 An adapter that declares recurrent state through `MambaSpec` also needs
 `allocate_kv_cache_per_layer` and the block hooks `zero_kv_cache_blocks` and,
-with prefix caching, `copy_kv_cache_blocks`.
+with prefix caching, `copy_kv_cache_blocks`. Its prefill and decode receive `mamba_state`, one `MambaGroupState` per `MambaSpec` group (see [state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)).
 
 The execution page specifies when `read_decode_output` and
 `process_decode_output_host` are needed. Add extension hooks only with the

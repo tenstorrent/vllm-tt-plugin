@@ -346,7 +346,8 @@ def test_attention_only_page_table_width_is_unchanged():
     [
         # The launch speculates with 0 tokens here.
         (dict(num_speculative_blocks=1), "differs from the launch's 0"),
-        (dict(num_prefill_checkpoint_blocks=1), "prefill-checkpoint"),
+        # Mode none: vLLM places prefill checkpoints in mode align only.
+        (dict(num_prefill_checkpoint_blocks=1), "prefill checkpoints need mode"),
     ],
 )
 def test_unsupported_mamba_configs_fail_at_kv_cache_init(mamba_kwargs, match):
@@ -438,6 +439,7 @@ def test_state_block_selection_matches_upstream():
         spec = _layer_specs(mamba_cache_mode=mode)["model.layers.0.linear_attn"]
         groups = MambaCacheGroups(
             group_indices=(0,),
+            layer_names=(("model.layers.0.linear_attn",),),
             mamba_cache_mode=mode,
             block_size=spec.block_size,
             attention_group_index=1,
@@ -502,17 +504,25 @@ def _step(
     return output
 
 
+def _group_state(model_input, layer: int):
+    """The ``MambaGroupState`` whose layers include GDN layer ``layer``."""
+    name = f"model.layers.{layer}.linear_attn"
+    [group] = [g for g in model_input.mamba_state.groups if name in g.layer_names]
+    return group
+
+
 def _state_ids(model_input, layer: int) -> list[int]:
-    return model_input.state_block_ids_per_layer[layer].reshape(-1).tolist()
+    return _group_state(model_input, layer).windows[:, 0].tolist()
 
 
-def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
+def test_mode_none_reads_state_from_column_0():
     """Mode none: a request's single GDN block per group is its state block.
 
     Requests A and B prefill, then decode. Every GDN layer gets the block of
     its own group for each row, attention layers get none, and the padding
-    rows get the null block 0. vLLM's ``new_block_ids_to_zero`` reaches the
-    model before the forward.
+    rows get the null block 0. vLLM lists the new attention blocks in
+    ``new_block_ids_to_zero``, but no GDN group has owned them, so the model
+    zeroes none.
     """
     cfg = _vllm_config()
     model = _RecordingModel()
@@ -530,16 +540,17 @@ def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
         None,
     )
 
-    assert model.calls == [
-        ("zero_kv_cache_blocks", {"kv_cache": ["kv"], "block_ids": [20, 21, 40]})
+    assert model.calls == []
+    groups = runner.kv_cache_config.kv_cache_groups
+    assert [g.layer_names for g in prefill.mamba_state.groups] == [
+        tuple(groups[i].layer_names) for i in (0, 1, 2)
     ]
-    assert len(prefill.state_block_ids_per_layer) == NUM_LAYERS
+    assert prefill.mamba_state.accepted_counts is None
     for layer in range(NUM_LAYERS):
         if _is_attention(layer):
-            assert prefill.state_block_ids_per_layer[layer] is None
             continue
         group = layer % 4
-        assert prefill.state_block_ids_per_layer[layer].shape == (MAX_BATCH, 1)
+        assert _group_state(prefill, layer).windows.shape == (MAX_BATCH, 1)
         ids = _state_ids(prefill, layer)
         assert ids[:2] == [blocks_a[group][0], blocks_b[group][0]]
         assert set(ids[2:]) == {0}
@@ -547,7 +558,7 @@ def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
     runner.submit_prefill(prefill, [2])
     name, kwargs = model.calls[-1]
     assert name == "prefill_forward"
-    assert kwargs["state_block_ids_per_layer"] is prefill.state_block_ids_per_layer
+    assert kwargs["mamba_state"] is prefill.mamba_state
 
     decode = runner.build_model_input(
         _step({"a": 1, "b": 1}, cached=[("a", 1500, None), ("b", 700, None)]),
@@ -559,7 +570,114 @@ def test_mode_none_reads_state_from_column_0_and_zeroes_new_blocks():
     runner.async_decode.submit_decode(decode, read_from_device=True)
     name, kwargs = model.calls[-1]
     assert name == "decode_forward"
-    assert kwargs["state_block_ids_per_layer"] is decode.state_block_ids_per_layer
+    assert kwargs["mamba_state"] is decode.mamba_state
+
+
+def _zeroed(model) -> list[list[int]]:
+    return [
+        kwargs["block_ids"]
+        for name, kwargs in model.calls
+        if name == "zero_kv_cache_blocks"
+    ]
+
+
+def test_only_attention_blocks_a_gdn_group_owned_are_zeroed():
+    """vLLM lists every new attention block in ``new_block_ids_to_zero``.
+
+    The model allocates its KV buffers zeroed and attention writes finite
+    values, so only a block a GDN group owned since its last zeroing can read
+    as NaN at the positions attention masks, and only if the prefill that
+    gets it does not write it whole. The runner hands the model those blocks
+    and no others: a block passes from request A's GDN group 0 to request B's
+    attention group and is zeroed; a block that passes from A's attention
+    group to B's is not; a block zeroed once and kept by attention is not
+    zeroed again; a GDN block that a running request gets with its new blocks
+    counts too; a GDN block that a prefill chunk writes whole is not zeroed.
+    """
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    assert runner._mamba_groups.zeroes_only_state_blocks
+
+    runner.build_model_input(
+        _step(
+            {"a": 1500},
+            new=[_new_request("a", 1500, ([10], [11], [12], [20, 21]))],
+            zero=[20, 21],
+        ),
+        None,
+    )
+    assert _zeroed(model) == []
+
+    model.calls.clear()
+    step = _step(
+        {"b": 700},
+        new=[_new_request("b", 700, ([20], [30], [31], [10, 21]))],
+        zero=[10, 21],
+    )
+    step.finished_req_ids = {"a"}
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == [[10]]
+
+    model.calls.clear()
+    step = _step(
+        {"b": 1, "c": 700},
+        new=[_new_request("c", 700, ([50], [51], [52], [11, 12]))],
+        cached=[("b", 700, ([], [], [60], []))],
+        zero=[11, 12],
+    )
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == [[11, 12]]
+
+    model.calls.clear()
+    step = _step(
+        {"d": 700},
+        new=[_new_request("d", 700, ([70], [71], [72], [10, 20, 60]))],
+        zero=[10, 20, 60],
+    )
+    step.finished_req_ids = {"b", "c"}
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == [[20, 60]]
+
+    # Prefill chunks that write a block whole leave no position to read
+    # unwritten: D's GDN blocks 70 and 71 go to E's first chunk, and 72 to its
+    # second chunk, unzeroed.
+    model.calls.clear()
+    step = _step(
+        {"e": 2048},
+        new=[_new_request("e", 4096, ([90], [91], [92], [70, 71]))],
+        zero=[70, 71],
+    )
+    step.finished_req_ids = {"d"}
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == []
+
+    model.calls.clear()
+    step = _step(
+        {"e": 2048}, cached=[("e", 2048, ([], [], [], [72, 21]))], zero=[72, 21]
+    )
+    runner.build_model_input(step, None)
+    assert _zeroed(model) == []
+
+
+def test_mixed_attention_precision_zeroes_every_listed_block():
+    """Without ``zeroes_only_state_blocks`` (attention groups of different KV
+    precisions, which vLLM also zeroes for) the runner hands the model every
+    block vLLM lists."""
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    runner._mamba_groups.zeroes_only_state_blocks = False
+
+    runner.build_model_input(
+        _step(
+            {"a": 1500},
+            new=[_new_request("a", 1500, ([10], [11], [12], [20, 21]))],
+            zero=[20, 21],
+        ),
+        None,
+    )
+    assert _zeroed(model) == [[20, 21]]
 
 
 def test_page_table_is_the_attention_groups_table():
@@ -620,7 +738,70 @@ def test_attention_only_model_without_hooks_ignores_block_zeroing():
     )
 
     assert model.calls == []
-    assert model_input.state_block_ids_per_layer is None
+    assert model_input.mamba_state is None
+
+
+def test_a_prefill_hands_the_model_the_states_it_must_leave_inside_its_chunk():
+    """``MambaSpec`` prefill checkpoint blocks: the scheduler passes vLLM's
+    ``(position, column)`` list per request (``_attach_mamba_checkpoints``);
+    the prefill gets, per GDN layer, the block at each column of its group,
+    and the positions. A row without an entry holds block 0 and position 0,
+    and a step that is not a prefill carries neither keyword."""
+    cfg = _vllm_config("align")
+    model = _RecordingModel()
+    specs = _layer_specs(
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=128,
+    )
+    runner = _live_runner(cfg, specs, model)
+    assert runner._mamba_groups.prefill_checkpoints
+    step = _step(
+        {"a": 2500, "b": 700},
+        new=[
+            _new_request("a", 2500, ([0, 10, 11], [0, 20, 21], [0, 30, 31], [40])),
+            _new_request("b", 700, ([50], [60], [70], [80])),
+        ],
+    )
+    step._tt_mamba_checkpoints = {"a": ((2048, 1),)}
+    prefill = runner.build_model_input(step, None)
+
+    state = prefill.mamba_state
+    assert state.checkpoint_positions[:3].tolist() == [[2048], [0], [0]]
+    for layer in range(NUM_LAYERS):
+        if _is_attention(layer):
+            continue
+        ids = _group_state(prefill, layer).checkpoint_blocks
+        assert ids.shape == (MAX_BATCH, 1)
+        assert ids[:2, 0].tolist() == [(10, 20, 30)[layer % 4], 0]
+    runner.submit_prefill(prefill, [2, 0])
+    name, kwargs = model.calls[-1]
+    assert name == "prefill_forward"
+    assert kwargs["mamba_state"] is state
+
+    decode = runner.build_model_input(
+        _step({"a": 1, "b": 1}, cached=[("a", 2500, None), ("b", 700, None)]), None
+    )
+    assert decode.mamba_state.checkpoint_positions is None
+    assert all(g.checkpoint_blocks is None for g in decode.mamba_state.groups)
+
+
+@pytest.mark.parametrize(
+    ("mamba_kwargs", "match"),
+    [
+        (dict(num_prefill_checkpoint_blocks=1), "an alignment"),
+        (
+            dict(num_prefill_checkpoint_blocks=2, prefill_checkpoint_alignment=128),
+            "exactly 1 block",
+        ),
+    ],
+)
+def test_prefill_checkpoints_need_one_block_and_an_alignment(mamba_kwargs, match):
+    cfg = _vllm_config("align")
+    specs = _layer_specs(mamba_cache_mode="align", **mamba_kwargs)
+    kv_cache_config = _kv_cache_config(cfg, specs, 256)
+    with pytest.raises(ValueError, match=match):
+        TTModelRunner.initialize_kv_cache(_runner(cfg), kv_cache_config)
 
 
 def test_mode_align_moves_state_into_the_block_of_each_new_column():

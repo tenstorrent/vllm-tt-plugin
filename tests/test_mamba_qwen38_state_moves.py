@@ -29,12 +29,14 @@ layout, where each block holds one full state.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.config import (
@@ -54,6 +56,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    get_group_id,
     get_request_block_hasher,
     init_none_hash,
     resolve_kv_cache_block_sizes,
@@ -74,7 +77,9 @@ from tests.mamba_runner_reference import (
 from tests.test_mamba_kv_cache import (
     MAX_BATCH,
     _kv_cache_config,
+    _new_request,
     _RecordingModel,
+    _step,
     _vllm_config,
 )
 from vllm_tt_plugin import scheduler as scheduler_module
@@ -83,7 +88,7 @@ from vllm_tt_plugin.mamba_state import MambaCacheGroups, mamba_cache_groups
 from vllm_tt_plugin.model_input import TTModelInput
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import TTPlatform
-from vllm_tt_plugin.scheduler import TTScheduler
+from vllm_tt_plugin.scheduler import TTScheduler, get_tt_mamba_checkpoints
 from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     MODEL_OWNED_DRAFT_SENTINEL,
@@ -120,7 +125,10 @@ def _qwen38_specs(
     num_spec: int = K,
     block_size: int = BLOCK_SIZE,
     gdn_block_size: int | None = None,
+    checkpoint: bool = False,
 ) -> dict:
+    """``checkpoint``: GDN groups with one prefill checkpoint block, as a model
+    whose prefill writes the state at vLLM's checkpoint declares it."""
     attention = FullAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
@@ -138,6 +146,8 @@ def _qwen38_specs(
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         mamba_cache_mode=mode,
         num_speculative_blocks=num_spec,
+        num_prefill_checkpoint_blocks=int(checkpoint),
+        prefill_checkpoint_alignment=128 if checkpoint else None,
     )
     return {
         (
@@ -186,12 +196,16 @@ def _engine_config(
     prefix_match_unit: int | None = None,
     model_class: type = _StubModel,
     mamba_block_size: int | None = None,
+    max_model_len: int = MAX_MODEL_LEN,
+    block_size: int = BLOCK_SIZE,
+    long_prefill_token_threshold: int = 0,
+    tt_config: dict | None = None,
 ) -> VllmConfig:
     """A ``VllmConfig`` resolved by the TT platform hook for ``model_class``.
 
     The cache mode a hybrid model gets from vLLM's config resolution
     (``MambaModelConfig``) is set before the hook runs: mode align comes with
-    prefix caching.
+    prefix caching. ``tt_config`` is ``additional_config["tt"]``.
     """
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -199,17 +213,18 @@ def _engine_config(
         seed=42,
         skip_tokenizer_init=True,
     )
-    model_config.max_model_len = MAX_MODEL_LEN
+    model_config.max_model_len = max_model_len
     scheduler_config = SchedulerConfig(
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=max_num_batched_tokens,
-        max_model_len=MAX_MODEL_LEN,
+        max_model_len=max_model_len,
         enable_chunked_prefill=True,
+        long_prefill_token_threshold=long_prefill_token_threshold,
         async_scheduling=False,
         is_encoder_decoder=False,
     )
     cache_config = CacheConfig(
-        block_size=BLOCK_SIZE,
+        block_size=block_size,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=mode == "align",
@@ -240,6 +255,7 @@ def _engine_config(
             cache_config=cache_config,
             parallel_config=ParallelConfig(),
             device_config=DeviceConfig(device="cpu"),
+            additional_config={"tt": dict(tt_config)} if tt_config else {},
         )
 
 
@@ -250,12 +266,16 @@ def _scheduler(
     retention: int | None,
     max_num_batched_tokens: int,
     prefix_match_unit: int | None = None,
+    **engine_kwargs,
 ) -> TTScheduler:
     """A real ``TTScheduler`` over a real ``KVCacheManager``, started as
     ``EngineCore`` starts it: ``block_size`` is set from the groups and
     validated. The model declares chunked prefill and prefix caching.
+    ``engine_kwargs`` go to ``_engine_config``.
     """
-    config = _engine_config(mode, retention, max_num_batched_tokens, prefix_match_unit)
+    config = _engine_config(
+        mode, retention, max_num_batched_tokens, prefix_match_unit, **engine_kwargs
+    )
     cache_config = config.cache_config
     cache_config.num_gpu_blocks = kv_cache_config.num_blocks
     if num_spec:
@@ -346,6 +366,8 @@ class _Step:
     groups_post: list[tuple[int, int]] | None = None
     groups_windows: dict[str, dict[int, list[int]]] = field(default_factory=dict)
     groups_counts: dict[str, int] = field(default_factory=dict)
+    # Request id -> the positions of the states its prefill chunk left inside.
+    checkpoints: dict[str, list[int]] = field(default_factory=dict)
 
 
 class _Harness:
@@ -375,13 +397,26 @@ class _Harness:
         plugin: bool = False,
         plugin_groups: bool = True,
         prefix_match_unit: int | None = None,
+        checkpoint: bool = False,
+        block_size: int = BLOCK_SIZE,
     ):
         self.mode = mode
         self.num_spec = num_spec
         self.cfg = _planner_config(mode, retention)
         self.kv_cache_config = _kv_cache_config(
-            self.cfg, _qwen38_specs(mode, num_spec), NUM_BLOCKS
+            self.cfg,
+            _qwen38_specs(mode, num_spec, block_size=block_size, checkpoint=checkpoint),
+            NUM_BLOCKS,
         )
+        # A model that declares checkpoint blocks writes the checkpoint state;
+        # False stands for one that ignores the plugin's checkpoint inputs.
+        self.writes_checkpoints = True
+        # Mode align holds the running block and K draft blocks, plus a block
+        # passed until the next step frees it. With a checkpoint the step also
+        # holds the checkpoint block, and vLLM keeps the previous chunk's K
+        # draft blocks in place (``allocate_new_blocks`` relocates them only
+        # without a checkpoint) until the next step frees them.
+        self.max_live_state_blocks = 2 + num_spec + (1 + num_spec) * checkpoint
         self.scheduler = _scheduler(
             self.kv_cache_config,
             mode,
@@ -389,6 +424,7 @@ class _Harness:
             retention,
             max_num_batched_tokens,
             prefix_match_unit,
+            block_size=block_size,
         )
         self.reference = UpstreamMambaRunner(self.kv_cache_config)
         self.groups = self.reference.group_indices
@@ -409,7 +445,9 @@ class _Harness:
         self.plugin_groups = (
             mamba_cache_groups(
                 self.kv_cache_config.kv_cache_groups,
-                SimpleNamespace(mamba_cache_mode=mode),
+                SimpleNamespace(
+                    mamba_cache_mode=mode, prefix_cache_retention_interval=retention
+                ),
                 MAX_MODEL_LEN,
             )
             if plugin_groups
@@ -485,8 +523,7 @@ class _Harness:
         raise AssertionError("scenario did not finish")
 
     def _groups_step_inputs(self, out, req_ids: list[str], record: _Step) -> None:
-        """``MambaCacheGroups.step_inputs`` over this step's rows, one "layer"
-        per KV cache group."""
+        """``MambaCacheGroups.step_inputs`` over this step's rows."""
         width = self.plugin_groups.max_num_blocks(MAX_MODEL_LEN)
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         tables = [
@@ -497,27 +534,17 @@ class _Harness:
             for i, r in enumerate(req_ids):
                 row = self.req_states[r].block_ids[g]
                 tables[g][i, : len(row)] = torch.tensor(row, dtype=torch.int32)
-        inputs = self.plugin_groups.step_inputs(
+        windows, counts = self.plugin_groups.step_inputs(
             tables,
             req_ids,
-            self.req_states,
+            {r: self.req_states[r].num_computed_tokens for r in req_ids},
             out.num_scheduled_tokens,
-            list(range(num_groups)),
             len(req_ids),
         )
-        windows = (
-            inputs.state_block_windows_per_layer or inputs.state_block_ids_per_layer
-        )
+        by_group = dict(zip(self.plugin_groups.group_indices, windows))
         for i, r in enumerate(req_ids):
-            record.groups_windows[r] = {g: windows[g][i].tolist() for g in self.groups}
-            record.groups_counts[r] = (
-                1
-                if inputs.state_accepted_counts is None
-                else int(inputs.state_accepted_counts[i])
-            )
-            assert [
-                int(inputs.state_block_ids_per_layer[g][i, 0]) for g in self.groups
-            ] == [record.groups_windows[r][g][0] for g in self.groups]
+            record.groups_windows[r] = {g: by_group[g][i].tolist() for g in self.groups}
+            record.groups_counts[r] = 1 if counts is None else int(counts[i])
 
     def _runner_commit(self, model_input, sampled, req_ids, record: _Step) -> None:
         """``TTModelRunner.commit_spec_acceptance`` for a verify step, with
@@ -540,6 +567,29 @@ class _Harness:
             if name == "copy_kv_cache_blocks"
             for pair in kwargs["copies"]
         ]
+
+    def _write_checkpoint(self, out, req_id: str, tokens: list[int], record) -> None:
+        """The states a prefill chunk leaves inside itself: upstream's kernel
+        writes the state at each block boundary it passes into that column's
+        block; the TT model writes where ``MambaCacheGroups.checkpoint_inputs``
+        says. Only columns vLLM holds a block for matter."""
+        entries = get_tt_mamba_checkpoints(out).get(req_id, ())
+        for position, column in entries:
+            for g in self.groups:
+                block = self.req_states[req_id].block_ids[g][column]
+                self.ledger.write(g, [block], [label(tokens[:position])], False)
+        if not entries or self.plugin_groups is None or not self.writes_checkpoints:
+            return
+        blocks, positions = self.plugin_groups.checkpoint_inputs(
+            get_tt_mamba_checkpoints(out), [req_id], self.req_states, 1
+        )
+        for entry, position in enumerate(positions[0].tolist()):
+            if position:
+                for group_blocks in blocks:
+                    self.plugin_ledger.write(
+                        [int(group_blocks[0, entry])], [label(tokens[:position])]
+                    )
+        record.checkpoints[req_id] = [p for p, _ in entries]
 
     def step(self, accept: Callable[[str, int, list[int]], int]) -> bool:
         scheduler = self.scheduler
@@ -585,7 +635,10 @@ class _Harness:
         )
         if self.plugin_groups is not None:
             record.groups_pre = self.plugin_groups.begin_step(
-                out, self.req_states, self.plugin_counts
+                out,
+                self.req_states,
+                {r: self.req_states[r].num_computed_tokens for r in req_ids},
+                self.plugin_counts,
             )
             self.plugin_ledger.copy(record.groups_pre)
             self._groups_step_inputs(out, req_ids, record)
@@ -607,23 +660,20 @@ class _Harness:
                 for pair in kwargs["copies"]
             ]
             record.runner_copies = copies[len(vllm_copies) :]
-            layer_groups = self.runner._layer_to_group_idx
-            windows = model_input.state_block_windows_per_layer
+            state = model_input.mamba_state
+            group_states = dict(
+                zip(self.runner._mamba_groups.group_indices, state.groups)
+            )
             for row, req_id in enumerate(model_input.row_req_ids or []):
                 record.runner_state_ids[req_id] = {
-                    layer_groups[layer]: int(ids[row, 0])
-                    for layer, ids in enumerate(model_input.state_block_ids_per_layer)
-                    if ids is not None
+                    g: int(group.windows[row, 0]) for g, group in group_states.items()
                 }
-                if windows is not None:
+                if state.accepted_counts is not None:
                     record.runner_windows[req_id] = {
-                        layer_groups[layer]: ids[row].tolist()
-                        for layer, ids in enumerate(windows)
-                        if ids is not None
+                        g: group.windows[row].tolist()
+                        for g, group in group_states.items()
                     }
-                    record.runner_counts[req_id] = int(
-                        model_input.state_accepted_counts[row]
-                    )
+                    record.runner_counts[req_id] = int(state.accepted_counts[row])
 
         accepted: dict[str, int] = {}
         verified: dict[str, int] = {}
@@ -683,6 +733,7 @@ class _Harness:
                         )
                         assert got == expect, ("tt", req_id, g, nc, plugin_window)
                     self.plugin_ledger.write(plugin_window, labels)
+            self._write_checkpoint(out, req_id, tokens, record)
             record.rows.append(_Row(req_id, nc, ns, drafts, windows))
 
             emits_token = nc + ns - len(drafts) >= request.num_tokens
@@ -772,7 +823,7 @@ class _Harness:
                     if self.mode == "none":
                         assert live == 1 + self.num_spec, (req_id, g, live)
                     else:
-                        assert live <= 2 + self.num_spec, (req_id, g, live)
+                        assert live <= self.max_live_state_blocks, (req_id, g, live)
         self.steps.append(record)
         return True
 
@@ -1067,8 +1118,9 @@ def test_tt_runner_picks_upstream_state_blocks_without_drafts(mode):
 
     Request A (3500 tokens) prefills in chunks of 2048, 1024 and 428 tokens;
     request B (1020 tokens) prefills in one chunk and decodes across the 1024
-    boundary. In every step the TT runner's ``state_block_ids_per_layer``
-    equals the upstream window column, and in mode align its
+    boundary. In every step window column 0 of the TT runner's
+    ``MambaGroupState.windows`` equals the upstream window column, and in mode
+    align its
     ``copy_kv_cache_blocks`` pairs equal upstream ``preprocess_mamba``'s
     copies.
     """
@@ -1174,6 +1226,161 @@ def test_mode_align_moves_state_with_accepted_counts_and_boundary_copies():
     assert any(c.temporal_src != c.conv_src for c in pre + post)
 
 
+def test_retention_0_runs_no_boundary_copy_and_every_read_stays_exact():
+    """At retention 0 vLLM caches no decode-time boundary state, so the TT
+    runner's ``MambaCacheGroups`` skips upstream's boundary copies after
+    acceptance. Under the real scheduler and ``KVCacheManager`` the second
+    ledger still finds every state the TT layout reads, across block
+    boundaries with partial acceptance."""
+    h = _Harness("align", num_spec=K, retention=0, max_num_batched_tokens=2048)
+    assert h.plugin_groups.kept_boundary_interval == 0
+    h.add("a", _prompt(1, 1010), max_tokens=60)
+    h.add("bb", _prompt(2, 2030), max_tokens=60)
+    h.run(accept=_accept_pattern)
+    assert h.finished("a") and h.finished("bb")
+    assert any(s.post_copies for s in h.steps), "upstream copies at boundaries"
+    assert not any(s.groups_post for s in h.steps)
+
+
+def test_sparse_retention_copies_only_the_boundaries_vllm_keeps():
+    """Retention 2048 at block 1024: vLLM keeps A's decode-reached state at
+    2048 but not at 3072. Upstream copies at both boundaries; the TT
+    runner's ``MambaCacheGroups`` copies at 2048 only, every read stays
+    exact, and B's prefix hit lands on 2048 and reads the copied state."""
+    h = _Harness("align", num_spec=K, retention=2048)
+    assert h.plugin_groups.kept_boundary_interval == 2048
+    h.add("a", _prompt(1, 1900), max_tokens=1250)
+    h.run(max_steps=1500, accept=_accept_pattern, until=lambda: h.finished("a"))
+    upstream = [s for s in h.steps if s.post_copies]
+    plugin = [s for s in h.steps if s.groups_post]
+    assert len(upstream) == 2, "A passes 2048 and 3072"
+    assert plugin == upstream[:1]
+    h.add("b", h.tokens["a"][:3100], max_tokens=2)
+    h.run(accept=_accept_pattern)
+    hits = {r: n for s in h.steps for r, n in s.new_hits.items()}
+    assert hits["b"] == 2048
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+@pytest.mark.parametrize("variant", ["plugin", "no_zeroing", "every_block_written"])
+def test_attention_never_reads_a_position_that_holds_state(mode, variant):
+    """Blocks pass between the attention group and the GDN groups.
+
+    Waves of requests finish and new ones take their blocks from vLLM's pool,
+    so the real ``KVCacheManager`` gives the attention group blocks that a GDN
+    group owned and blocks that only attention owned. The test replays what
+    each position of each attention block holds:
+
+    1. a block in a GDN group's row can hold recurrent state in every
+       position, which reads as NaN in bf16;
+    2. ``zero_kv_cache_blocks`` clears a whole block;
+    3. a step writes the keys and values of its scheduled positions;
+    4. the step's attention then reads every position of every block up to
+       the one of its last position (masked positions included).
+
+    No read may find state, and the runner (``MambaCacheGroups.blocks_to_zero``)
+    zeroes only blocks that hold state. Both rules of the runner must matter:
+    some listed blocks held no state, and some held state but their prefill
+    wrote them whole. The variants are negative controls: a runner that zeroes
+    nothing, and one that counts every prefill block as written whole, each
+    lets a read find state.
+    """
+    h = _Harness(mode, num_spec=K, retention=0, plugin=True)
+    groups = h.runner._mamba_groups
+    if variant == "no_zeroing":
+        groups.blocks_to_zero = lambda scheduler_output, requests: []
+    elif variant == "every_block_written":
+        groups._add_written_blocks = (
+            lambda written, block_ids, first_columns, start, num_tokens: (
+                written.update(
+                    b for g in groups.attention_block_sizes for b in block_ids[g]
+                )
+            )
+        )
+    [attention] = groups.attention_block_sizes
+    zeroed: list[int] = []
+    real_zero = h.model.zero_kv_cache_blocks
+
+    def zero_kv_cache_blocks(**kwargs):
+        zeroed.extend(kwargs["block_ids"])
+        return real_zero(**kwargs)
+
+    h.model.zero_kv_cache_blocks = zero_kv_cache_blocks
+    steps = []
+    schedule = h.scheduler.schedule
+
+    def schedule_and_record(*args, **kwargs):
+        out = schedule(*args, **kwargs)
+        starts = {new.req_id: new.num_computed_tokens for new in out.scheduled_new_reqs}
+        cached = out.scheduled_cached_reqs
+        starts.update(zip(cached.req_ids, cached.num_computed_tokens))
+        # Taken before a request that finishes gives its blocks back.
+        gdn = {
+            b
+            for req_id in h.scheduler.requests
+            for g in h.groups
+            for b in h.manager_blocks(req_id, g)
+            if b
+        }
+        rows = {
+            req_id: (start, start + out.num_scheduled_tokens[req_id])
+            for req_id, start in starts.items()
+        }
+        attention_rows = {r: h.manager_blocks(r, attention) for r in rows}
+        steps.append((out, gdn, rows, attention_rows))
+        return out
+
+    h.scheduler.schedule = schedule_and_record
+    for i in range(16):
+        h.add(f"r{i}", _prompt(100 + i, 1100 + 97 * i), max_tokens=6)
+
+    state: dict[int, np.ndarray] = {}
+
+    def holds(block: int) -> np.ndarray:
+        return state.setdefault(block, np.zeros(BLOCK_SIZE, dtype=bool))
+
+    needed = skipped_clear = skipped_written = 0
+    for _ in range(400):
+        zeroed.clear()
+        if not h.step(_accept_pattern):
+            break
+        out, gdn, rows, attention_rows = steps[-1]
+        listed = out.new_block_ids_to_zero or []
+        for block in listed:
+            if not holds(block).any():
+                skipped_clear += 1
+            elif block in zeroed:
+                needed += 1
+            else:
+                skipped_written += 1
+        for block in zeroed:
+            assert holds(block).any(), f"block {block} held no state"
+            holds(block)[:] = False
+        for req_id, (start, end) in rows.items():
+            for position in range(start, end):
+                block = attention_rows[req_id][position // BLOCK_SIZE]
+                holds(block)[position % BLOCK_SIZE] = False
+        for req_id, (start, end) in rows.items():
+            for block in attention_rows[req_id][: (end - 1) // BLOCK_SIZE + 1]:
+                if holds(block).any():
+                    assert variant != "plugin", (
+                        f"{req_id} reads block {block} holding state at "
+                        f"{np.flatnonzero(holds(block))[:4].tolist()}"
+                    )
+                    return
+        for block in gdn:
+            holds(block)[:] = True
+    else:
+        raise AssertionError("scenario did not finish")
+    assert variant == "plugin", "no read found state: the scenario needs churn"
+    assert all(h.finished(f"r{i}") for i in range(16))
+    assert needed and skipped_clear and skipped_written, (
+        needed,
+        skipped_clear,
+        skipped_written,
+    )
+
+
 @pytest.mark.parametrize(
     ("retention", "b_hit"),
     [
@@ -1208,6 +1415,331 @@ def test_boundary_state_written_after_acceptance_serves_a_prefix_hit(retention, 
         for g in h.groups:
             copy = boundary_copies[(g, b_blocks[g][1])]
             assert copy.temporal_src != copy.dst
+
+
+def _last_writers(h: _Harness, prompt_lens: dict[str, int]) -> list[dict]:
+    """Replay which kind of step last wrote each GDN block, through the
+    plugin's copies; return, per step, that map before the step ran.
+
+    A row writes its state window from column 0: one state in a prefill
+    chunk, one per query token in a decode step. ``begin_step`` copies run
+    before the writes and ``after_acceptance`` copies after them.
+    """
+    writers: dict[int, str] = {}
+    before = []
+    for step in h.steps:
+        before.append(dict(writers))
+        for src, dst in step.groups_pre or ():
+            writers[dst] = writers.get(src)
+        for row in step.rows:
+            decode = row.num_computed >= prompt_lens[row.req_id]
+            written = row.num_scheduled if decode else 1
+            for window in step.groups_windows[row.req_id].values():
+                for block in window[:written]:
+                    writers[block] = "decode" if decode else "prefill"
+        for src, dst in step.groups_post or ():
+            writers[dst] = writers.get(src)
+    return before
+
+
+@pytest.mark.parametrize("retention", [0, None])
+def test_multi_turn_follow_ups_hit_decode_written_states_only_with_retention(
+    retention,
+):
+    """Turn 1 decodes across a block boundary; four follow-ups, one after the
+    other, extend its prompt and output with new text.
+
+    At retention 0 vLLM keeps a GDN state only at a request's replay boundary
+    (``KVCacheCoordinator.get_replay_boundaries``: the prompt length minus 1)
+    and at its junction (``KVCacheManager.get_computed_blocks``: the attention
+    hit of a request whose GDN hit is shorter). Both end a prefill chunk, so a
+    follow-up never reads a state that decoding wrote: the first follow-up
+    recomputes past turn 1's replay boundary and caches the junction, and the
+    other three hit that state, which the first follow-up's prefill wrote.
+    Turn 1's prompts put a block boundary inside its first verify or just
+    after it (1023 tokens: the state after the first query token is the
+    boundary state). With dense retention the follow-ups hit the boundary
+    states turn 1's decode left, which the plugin's boundary copies keep.
+    Every read is exact either way (the harness ledgers).
+    """
+    h = _Harness("align", num_spec=K, retention=retention)
+    prompt_lens: dict[str, int] = {}
+    turn_1 = {"t1": 1023, "t2": 1022, "t3": 1021, "t4": 2047}
+    for name, length in turn_1.items():
+        prompt_lens[name] = length
+        h.add(name, _prompt(length, length), max_tokens=60)
+    h.run(max_steps=400, accept=_accept_pattern)
+    for i in range(4):
+        for name in turn_1:
+            follow_up = f"{name}-f{i}"
+            prompt = h.tokens[name] + _prompt(100 * i + len(name), 300)
+            prompt_lens[follow_up] = len(prompt)
+            h.add(follow_up, prompt, max_tokens=4)
+        h.run(max_steps=400, accept=_accept_pattern)
+
+    writers = _last_writers(h, prompt_lens)
+    hit_writers = {}
+    for step, before in zip(h.steps, writers):
+        for req_id, hit in step.new_hits.items():
+            if hit:
+                hit_writers[req_id] = (
+                    hit,
+                    {
+                        before.get(step.new_block_ids[req_id][g][hit // BLOCK_SIZE - 1])
+                        for g in h.groups
+                    },
+                )
+    follow_ups = {r: v for r, v in hit_writers.items() if "-f" in r}
+    if retention == 0:
+        assert all(kinds == {"prefill"} for _, kinds in follow_ups.values()), follow_ups
+        for name in turn_1:
+            # The first follow-up caches the junction; the other three hit it.
+            junction = len(h.tokens[name]) // BLOCK_SIZE * BLOCK_SIZE
+            later = [follow_ups.get(f"{name}-f{i}", (0,))[0] for i in range(1, 4)]
+            assert later == [junction] * 3, follow_ups
+    else:
+        assert any("decode" in kinds for _, kinds in follow_ups.values()), follow_ups
+
+
+def _continue_text(h: _Harness, text: list[int]) -> None:
+    """Make a request whose tokens are a prefix of ``text`` continue it: its
+    drafts and its sampled tokens are the next tokens of ``text``, as greedy
+    decoding of a passage the model reproduces."""
+    scheduler = h.scheduler
+    update_from_output = scheduler.update_from_output
+    update_draft_token_ids = scheduler.update_draft_token_ids
+
+    def next_tokens(req_id: str, tokens: list[int]) -> list[int]:
+        request = scheduler.requests[req_id]
+        if list(request.all_token_ids) != text[: request.num_tokens]:
+            return list(tokens)
+        return text[request.num_tokens : request.num_tokens + len(tokens)]
+
+    def update(out, model_runner_output):
+        sampled = [
+            next_tokens(r, t) if t else t
+            for r, t in zip(
+                model_runner_output.req_ids, model_runner_output.sampled_token_ids
+            )
+        ]
+        return update_from_output(
+            out, dataclasses.replace(model_runner_output, sampled_token_ids=sampled)
+        )
+
+    def drafts(draft_token_ids):
+        return update_draft_token_ids(
+            DraftTokenIds(
+                draft_token_ids.req_ids,
+                [
+                    next_tokens(r, d)
+                    for r, d in zip(
+                        draft_token_ids.req_ids, draft_token_ids.draft_token_ids
+                    )
+                ],
+            )
+        )
+
+    scheduler.update_from_output = update
+    scheduler.update_draft_token_ids = drafts
+
+
+@pytest.mark.parametrize("same_text", [True, False])
+def test_follow_ups_of_one_text_hit_the_first_follow_ups_junction(same_text):
+    """A device check at retention 0 and block 2048 saw follow-ups hit the
+    state at 2048 for turn-1 prompts of 2043, 2045 and 2047 tokens of one
+    article, but not for 2040, all on one server. Turn 1's decode crosses
+    2048; each follow-up is turn 1's first 2088 tokens plus a question.
+
+    Here at block 1024: when the model continues the article word for word,
+    every turn 1 decodes the same tokens, so every follow-up starts with the
+    same 1024 tokens. The first follow-up (prompt 1016) has no GDN hit, so it
+    recomputes and caches the state at its junction (1024) from its prefill;
+    the later follow-ups hit that state. No hit reads a state turn 1's decode
+    wrote, and every read is exact although the plugin runs no boundary copy
+    at retention 0. With a different text per turn, no follow-up hits.
+    """
+    h = _Harness("align", num_spec=K, retention=0)
+    text = _prompt(7, 4000)
+    _continue_text(h, text)
+    prompt_lens: dict[str, int] = {}
+    hits = {}
+    for i, length in enumerate((1016, 1019, 1021, 1023)):
+        turn = text if same_text else _prompt(100 + i, 4000)
+        first, follow_up = f"a{length}", f"b{length}"
+        prompt_lens[first] = length
+        h.add(first, turn[:length], max_tokens=1088 - length)
+        h.run(400, _accept_pattern, until=lambda r=first: h.finished(r))
+        prompt = h.tokens[first][:1064] + _prompt(99, 7)
+        prompt_lens[follow_up] = len(prompt)
+        h.add(follow_up, prompt, max_tokens=4)
+        h.run(400, _accept_pattern, until=lambda r=follow_up: h.finished(r))
+        hits[length] = next(
+            (s.new_hits[follow_up] for s in h.steps if follow_up in s.new_hits), None
+        )
+    if not same_text:
+        assert hits == {1016: 0, 1019: 0, 1021: 0, 1023: 0}, hits
+        return
+    assert hits == {1016: 0, 1019: 1024, 1021: 1024, 1023: 1024}, hits
+    for step, before in zip(h.steps, _last_writers(h, prompt_lens)):
+        for req_id, hit in step.new_hits.items():
+            if hit:
+                writers = {
+                    before.get(step.new_block_ids[req_id][g][hit // BLOCK_SIZE - 1])
+                    for g in h.groups
+                }
+                assert writers == {"prefill"}, (req_id, hit, writers)
+
+
+def _checkpoint_scenario(
+    retention, checkpoint: bool, writes_checkpoints=True, block_size=BLOCK_SIZE
+):
+    """Prompts below, at and past block boundaries, each served alone, then
+    follow-ups that repeat each prompt and add text, so they hit its cached
+    GDN state. 3100 tokens follow a 1024-token request at once, so their
+    first chunk is the rest of a step's budget and their second chunk runs
+    past a block boundary on a running request."""
+    h = _Harness(
+        "align",
+        num_spec=K,
+        retention=retention,
+        max_num_batched_tokens=4096,
+        checkpoint=checkpoint,
+        block_size=block_size,
+    )
+    h.writes_checkpoints = writes_checkpoints
+    prompts = {f"a{n}": _prompt(n, n) for n in (900, 1500, 2048, 2049, 3000)}
+    for req_id, prompt in prompts.items():
+        h.add(req_id, prompt, max_tokens=4)
+        h.run(accept=_accept_pattern)
+    prompts["c1024"], prompts["a3100"] = _prompt(7, 3072), _prompt(3100, 3100)
+    h.add("c1024", prompts["c1024"], max_tokens=4)
+    h.add("a3100", prompts["a3100"], max_tokens=4)
+    h.run(accept=_accept_pattern)
+    for req_id, prompt in list(prompts.items()):
+        prompts["b" + req_id] = prompt + _prompt(len(prompt) + 1, 300)
+        h.add("b" + req_id, prompts["b" + req_id], max_tokens=4)
+        h.run(accept=_accept_pattern)
+    chunks: dict[str, int] = {}
+    for step in h.steps:
+        for row in step.rows:
+            if row.num_computed < len(prompts[row.req_id]):
+                chunks[row.req_id] = chunks.get(row.req_id, 0) + 1
+    hits = {r: n for step in h.steps for r, n in step.new_hits.items()}
+    pool = h.scheduler.kv_cache_manager.block_pool
+    cached = {
+        (get_group_id(block.block_hash), block.block_hash_num_tokens)
+        for block in pool.blocks
+        if block.block_hash is not None and get_group_id(block.block_hash) in h.groups
+    }
+    return h, chunks, hits, cached, prompts
+
+
+@pytest.mark.parametrize("block_size", [896, BLOCK_SIZE])
+@pytest.mark.parametrize("retention", [0, None])
+def test_prefill_checkpoints_keep_the_split_prefix_cache(retention, block_size):
+    """``MambaSpec.num_prefill_checkpoint_blocks``: vLLM no longer ends a
+    prefill chunk at the prompt's last cacheable boundary; it reserves a block
+    for the state there, and the TT model writes it from
+    ``MambaCacheGroups.checkpoint_inputs``.
+
+    Against the same requests without checkpoint blocks: fewer prefill
+    chunks, a hit at least as long for every follow-up, every cached GDN
+    state of the split version cached too (group and tokens), and every read
+    exact (the harness ledgers), with upstream's kernel and the TT model each
+    writing the states. At retention 0 vLLM keeps the prompt's own
+    checkpoint (``is_prompt_checkpoint`` in
+    ``MambaManager._cache_partial_tail_block``), so follow-ups hit it."""
+    _, split_chunks, split_hits, split_cached, _ = _checkpoint_scenario(
+        retention, False, block_size=block_size
+    )
+    h, chunks, hits, cached, prompts = _checkpoint_scenario(
+        retention, True, block_size=block_size
+    )
+    assert any(step.checkpoints for step in h.steps)
+    # A first prompt that fits one chunk takes one. A follow-up whose GDN hit
+    # is shorter than its attention hit still stops a chunk at the junction
+    # (vLLM's ``junction_stop``), as without checkpoint blocks.
+    firsts = [r for r in chunks if not r.startswith("b") and r != "a3100"]
+    assert all(chunks[r] == 1 for r in firsts), chunks
+    assert all(chunks[r] <= split_chunks[r] for r in chunks), (chunks, split_chunks)
+    assert sum(chunks.values()) < sum(split_chunks.values())
+    # At least the split version's hits and cached states. A prompt of whole
+    # blocks runs as one chunk either way, and only the checkpoint leaves the
+    # state at its replay boundary; with a checkpoint on a running request
+    # vLLM also keeps the previous chunk's draft blocks, which dense
+    # retention caches.
+    assert all(hits[r] >= split_hits[r] for r in hits), (hits, split_hits)
+    whole_blocks = {"b" + r for r, p in prompts.items() if len(p) % block_size == 0}
+    assert {r for r in hits if hits[r] > split_hits[r]} <= whole_blocks
+    assert split_cached <= cached
+
+
+@pytest.mark.parametrize("retention", [0, None])
+def test_hits_inside_a_checkpointed_second_chunk_read_written_states(retention):
+    """A prompt whose second chunk runs on a running request and holds a
+    checkpoint (``a3100`` in ``_checkpoint_scenario``) passes block boundaries
+    whose blocks vLLM keeps: the previous chunk's draft blocks, which
+    ``allocate_new_blocks`` does not relocate in a step that reserves a
+    checkpoint. Follow-ups that share the prompt only up to each of those
+    boundaries read whatever vLLM cached there, and every read must be exact
+    (the harness ledgers)."""
+    h, _, _, _, prompts = _checkpoint_scenario(retention, True)
+    long_prompt = prompts["a3100"]
+    for boundary in range(BLOCK_SIZE, len(long_prompt), BLOCK_SIZE):
+        req_id = f"d{boundary}"
+        h.add(req_id, long_prompt[:boundary] + _prompt(boundary + 7, 200), 4)
+        h.run(accept=_accept_pattern)
+    hits = {r: n for s in h.steps for r, n in s.new_hits.items() if r[0] == "d"}
+    assert len(hits) == len(range(BLOCK_SIZE, len(long_prompt), BLOCK_SIZE))
+
+
+def test_a_model_that_ignores_the_checkpoint_inputs_serves_stale_hits():
+    """Negative control: a follow-up that hits a checkpoint block reads the
+    state its prefill was to write; without the write the ledger finds the
+    block empty."""
+    with pytest.raises(AssertionError, match="tt"):
+        _checkpoint_scenario(0, True, writes_checkpoints=False)
+    with pytest.raises(AssertionError, match="tt"):
+        _checkpoint_scenario(0, True, writes_checkpoints=False, block_size=896)
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_dp_engines_keep_their_own_gdn_state(checkpoint):
+    """Standard multi-process DP, as the Galaxy runs ``data_parallel_size`` 4:
+    each engine has its own ``TTScheduler``, ``KVCacheManager`` and
+    ``MambaCacheGroups``. vLLM's balancer picks an engine by load only
+    (``DPLBAsyncMPClient.get_core_engine_for_request``), not by cached prefix.
+
+    Four engines here, in one process, step in lockstep with different
+    prompts, and every read stays exact (each engine's ledgers). Then one
+    follow-up of engine 2's prompt runs on every engine, and only engine 2
+    serves it a prefix hit."""
+    engines = [
+        _Harness(
+            "align",
+            num_spec=K,
+            retention=0,
+            max_num_batched_tokens=4096,
+            checkpoint=checkpoint,
+        )
+        for _ in range(4)
+    ]
+    prompts = [_prompt(500 + i, 1500 + 700 * i) for i in range(4)]
+    for i, (h, prompt) in enumerate(zip(engines, prompts)):
+        h.add(f"e{i}", prompt, max_tokens=8)
+    for _ in range(400):
+        if not any([h.step(_accept_pattern) for h in engines]):
+            break
+    assert all(h.finished(f"e{i}") for i, h in enumerate(engines))
+
+    follow_up = prompts[2] + _prompt(9, 300)
+    for h in engines:
+        h.add("f", follow_up, max_tokens=2)
+        h.run(accept=_accept_pattern)
+    hits = [
+        next(s.new_hits["f"] for s in h.steps if "f" in s.new_hits) for h in engines
+    ]
+    assert hits[2] > 0 and hits[:2] + hits[3:] == [0, 0, 0]
 
 
 def test_mode_none_needs_a_gdn_block_size_of_max_model_len():
@@ -1264,6 +1796,7 @@ def test_tt_runner_state_window_has_1_plus_k_columns():
     spec = _qwen38_specs("align", num_spec=K)["model.layers.0.linear_attn"]
     groups = MambaCacheGroups(
         group_indices=(0,),
+        layer_names=(("model.layers.0.linear_attn",),),
         mamba_cache_mode="align",
         block_size=BLOCK_SIZE,
         attention_group_index=3,
@@ -1355,19 +1888,18 @@ def test_tt_runner_moves_with_drafts_match_upstream(mode):
 
 
 def test_state_windows_and_counts_reach_the_model():
-    """Prefill and decode get ``state_block_windows_per_layer`` and
-    ``state_accepted_counts`` next to ``state_block_ids_per_layer``."""
+    """Prefill and decode get ``mamba_state`` with ``1 + K`` window columns per
+    group and the start-state counts."""
     h = _Harness("align", num_spec=K, retention=None, plugin=True)
     h.add("a", _prompt(1, 1010), max_tokens=8)
     h.run(accept=_accept_pattern)
     prefill = h.steps[0].runner_input
     decode = next(s.runner_input for s in h.steps if s.runner_input.spec_mode)
-    windows = prefill.state_block_windows_per_layer
-    assert len(windows) == NUM_LAYERS
-    assert all((w is None) == _is_attention(i) for i, w in enumerate(windows))
-    assert windows[0].shape == (MAX_BATCH, 1 + K)
+    groups = prefill.mamba_state.groups
+    assert len(groups) == 3
+    assert {g.windows.shape for g in groups} == {(MAX_BATCH, 1 + K)}
     assert torch.equal(
-        prefill.state_accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32)
+        prefill.mamba_state.accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32)
     )
 
     h.model.calls.clear()
@@ -1378,11 +1910,136 @@ def test_state_windows_and_counts_reach_the_model():
         h.runner.async_decode.submit_decode(decode, read_from_device=True)
     forwards = {name: kwargs for name, kwargs in h.model.calls}
     for name, model_input in (("prefill_forward", prefill), ("decode_forward", decode)):
-        kwargs = forwards[name]
-        assert kwargs["state_block_windows_per_layer"] is (
-            model_input.state_block_windows_per_layer
+        assert forwards[name]["mamba_state"] is model_input.mamba_state
+
+
+def _batch_rows(rows: list[list[int]], *shape: int) -> torch.Tensor:
+    """``rows`` as the first rows of an int32 ``[MAX_BATCH, *shape]`` tensor;
+    the padding rows hold block 0."""
+    out = torch.zeros((MAX_BATCH, *shape), dtype=torch.int32)
+    for i, row in enumerate(rows):
+        out[i] = torch.tensor(row, dtype=torch.int32).reshape(shape)
+    return out
+
+
+def _assert_packed(state, kv_cache_config, expected: dict[int, dict]) -> None:
+    """``state`` holds one ``MambaGroupState`` per GDN group, in KV cache group
+    order, and each GDN layer finds in the group that names it exactly the
+    tensors of its own KV cache group: ``expected[g]`` maps a
+    ``MambaGroupState`` field to its value for group ``g``."""
+    groups = kv_cache_config.kv_cache_groups
+    gdn = [i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)]
+    assert [g.layer_names for g in state.groups] == [
+        tuple(groups[i].layer_names) for i in gdn
+    ]
+    owner = {name: i for i in gdn for name in groups[i].layer_names}
+    by_layer = {name: g for g in state.groups for name in g.layer_names}
+    assert by_layer.keys() == owner.keys()
+    assert sum(len(g.layer_names) for g in state.groups) == len(owner)
+    for name, group_state in by_layer.items():
+        want = expected[owner[name]]
+        for field_name in ("windows", "checkpoint_blocks"):
+            got, value = getattr(group_state, field_name), want.get(field_name)
+            if value is None:
+                assert got is None, (name, field_name)
+                continue
+            assert got.dtype == torch.int32 and got.device.type == "cpu"
+            assert torch.equal(got, value), (name, field_name, got, value)
+
+
+def test_mamba_state_gives_each_gdn_layer_its_own_groups_tensors():
+    """``mamba_state`` packs each GDN group's state inputs once, with the
+    group's ``layer_names``: three GDN groups, K=3, mode align, a prefill with
+    a checkpoint block and a verify.
+
+    Every GDN group's row holds different blocks, so a tensor packed for the
+    wrong group, or a group with another group's layer names, fails. The
+    expected values come from the block ids alone: the windows from upstream
+    ``mamba_get_block_table_tensor`` (``state_window``) and the checkpoint
+    from the scheduler's ``(position, column)`` entry.
+    """
+    cfg = _planner_config("align", retention=None)
+    kv_cache_config = _kv_cache_config(
+        cfg, _qwen38_specs("align", K, checkpoint=True), NUM_BLOCKS
+    )
+    model = _RecordingModel()
+    runner = _tt_runner(cfg, kv_cache_config, model, num_spec=K)
+    groups = kv_cache_config.kv_cache_groups
+    gdn = [i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)]
+    assert len(gdn) == 3
+    spec = groups[gdn[0]].kv_cache_spec
+    width = runner._mamba_groups.max_num_blocks(MAX_MODEL_LEN)
+    # A full block-table row per GDN group and request, distinct block ids.
+    blocks = iter(range(1, NUM_BLOCKS))
+    rows = {
+        r: {g: [next(blocks) for _ in range(width)] for g in gdn} for r in ("a", "b")
+    }
+    attention = {"a": [next(blocks) for _ in range(3)], "b": [next(blocks)]}
+
+    def block_ids(r):
+        return tuple(
+            rows[r][g] if g in gdn else attention[r] for g in range(len(groups))
         )
-        assert kwargs["state_accepted_counts"] is model_input.state_accepted_counts
+
+    def windows(seq_lens):
+        return {
+            g: _batch_rows(
+                [
+                    state_window(rows[r][g], seq_len, spec, width)
+                    for r, seq_len in seq_lens.items()
+                ],
+                1 + K,
+            )
+            for g in gdn
+        }
+
+    # The prefill: a (2045 tokens) leaves the state after 1024 tokens in
+    # block-table column 0; b (700 tokens) leaves none.
+    step = _step(
+        {"a": 2045, "b": 700},
+        new=[
+            _new_request("a", 2045, block_ids("a")),
+            _new_request("b", 700, block_ids("b")),
+        ],
+    )
+    step._tt_mamba_checkpoints = {"a": ((1024, 0),)}
+    prefill = runner.build_model_input(step, None)
+    assert prefill.row_req_ids[:2] == ["a", "b"]
+    state = prefill.mamba_state
+    assert torch.equal(state.accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32))
+    assert torch.equal(state.checkpoint_positions, _batch_rows([[1024], [0]], 1))
+    expected_windows = windows({"a": 2045, "b": 700})
+    _assert_packed(
+        state,
+        kv_cache_config,
+        {
+            g: {
+                "windows": expected_windows[g],
+                "checkpoint_blocks": _batch_rows([[rows["a"][g][0]], [0]], 1),
+            }
+            for g in gdn
+        },
+    )
+    runner.submit_prefill(prefill, [2])
+    assert model.calls[-1][0] == "prefill_forward"
+    assert model.calls[-1][1]["mamba_state"] is state
+
+    # The verify: one sampled token each, then 1 + K tokens from 2045 and 700.
+    runner._apply_sampled_tokens_to_state(
+        torch.tensor([[11], [12]], dtype=torch.int32), req_ids=["a", "b"]
+    )
+    step = _step({"a": 1 + K, "b": 1 + K}, cached=[("a", 2045, None), ("b", 700, None)])
+    step.scheduled_spec_decode_tokens = {"a": [21, 22, 23], "b": [31, 32, 33]}
+    verify = runner.build_model_input(step, None)
+    assert verify.spec_mode is not None
+    assert verify.row_req_ids[:2] == ["a", "b"]
+    state = verify.mamba_state
+    assert torch.equal(state.accepted_counts, torch.ones(MAX_BATCH, dtype=torch.int32))
+    assert state.checkpoint_positions is None
+    expected_windows = windows({"a": 2045 + 1 + K, "b": 700 + 1 + K})
+    _assert_packed(
+        state, kv_cache_config, {g: {"windows": expected_windows[g]} for g in gdn}
+    )
 
 
 def test_speculative_rows_are_sized_like_upstream():

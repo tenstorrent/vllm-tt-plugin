@@ -185,8 +185,10 @@ Declaration rules:
   `unify_kv_cache_spec_page_size` pads a smaller `MambaSpec` page to the
   largest page. For a smaller attention page, it multiplies the attention
   `block_size` when the attention page divides the largest page, and pads the
-  attention page otherwise. TT skips `Platform._align_hybrid_block_size`, so
-  the adapter chooses the attention `block_size` itself: choose one that TT
+  attention page otherwise. vLLM's `Platform.update_block_size_for_backend`
+  returns before `_align_hybrid_block_size` on TT, because a TT model registers
+  no vLLM attention layer for `_find_non_ssm_backend` to find, so the adapter
+  chooses the attention `block_size` itself: choose one that TT
   paged attention supports and whose page is at least the recurrent state.
 - `MambaSpec.mamba_cache_mode` must equal the resolved
   `cache_config.mamba_cache_mode`. vLLM's `MambaModelConfig` selects `none`
@@ -204,9 +206,20 @@ Declaration rules:
   `cache_config.prefix_match_unit` must be a multiple of
   `additional_config['tt']['prefill_chunk_alignment']`, because with partial
   hash hits vLLM also ends chunks on its multiples.
-- `TTModelRunner` supports modes `none` and `align`. It requires
-  `MambaSpec.num_prefill_checkpoint_blocks == 0`, and one `block_size` and
-  one `num_speculative_blocks` for all `MambaSpec` groups.
+- `TTModelRunner` supports modes `none` and `align`, and one `block_size`,
+  one `num_speculative_blocks` and one `num_prefill_checkpoint_blocks` for all
+  `MambaSpec` groups.
+- `MambaSpec.num_prefill_checkpoint_blocks` is 0, or 1 in mode `align` with a
+  `MambaSpec.prefill_checkpoint_alignment`. With 1, vLLM no longer ends a
+  prefill chunk at the prompt's last cacheable block boundary: a prompt that
+  fits one chunk is one prefill step instead of two, and vLLM reserves a
+  block inside the chunk for the state at its checkpoint position
+  (`get_mamba_prefill_checkpoint_position`). The prefill must then write
+  the states named by `MambaGroupState.checkpoint_blocks`; see
+  [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks). vLLM
+  places a checkpoint only where its offset from the chunk start is a
+  multiple of `prefill_checkpoint_alignment`, so declare the granularity at
+  which the prefill can stop to write a state.
 - `MambaSpec.num_speculative_blocks` must equal the launch's draft length K
   (0 without speculative decoding), as upstream sets it from
   `num_speculative_tokens`. A request then holds `1 + K` state blocks per
@@ -216,7 +229,7 @@ Declaration rules:
   `ceil(max_model_len / block_size) + K` in mode `align`.
 - The adapter must implement `zero_kv_cache_blocks`, and in mode `align` also
   `copy_kv_cache_blocks`. See [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
-  Prefill and decode receive `state_block_ids_per_layer`; see
+  Prefill and decode receive `mamba_state`; see
   [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks).
 - Lane-DP and block-output models do not support `MambaSpec` groups.
 

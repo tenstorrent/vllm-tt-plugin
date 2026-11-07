@@ -81,6 +81,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import get_tt_mamba_checkpoints
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -695,6 +696,9 @@ class TTModelRunner:
                     f"{self._mamba_groups.mamba_cache_mode!r} but does not "
                     f"implement {missing_hooks}"
                 )
+            self._mamba_groups.zeroes_only_state_blocks = not getattr(
+                kv_cache_config, "has_mixed_precision_kv_cache", True
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -771,7 +775,9 @@ class TTModelRunner:
         )
         if self._mamba_groups is not None:
             # A MambaSpec model sets its block sizes in ``get_kv_cache_spec``
-            # (TT skips upstream's ``_align_hybrid_block_size``), so
+            # (upstream's ``update_block_size_for_backend`` returns before
+            # ``_align_hybrid_block_size``: a TT model registers no vLLM
+            # attention layer for ``_find_non_ssm_backends`` to find), so
             # ``cache_config.block_size`` need not be any group's block size:
             # size the table from the groups. TT chunked SDPA requires a
             # page-table row of a multiple of 32 bytes, so 8 int32 columns.
@@ -907,7 +913,6 @@ class TTModelRunner:
         """
         if self._layer_to_group_idx is None:
             return None
-        result = [block_tables_per_group[g] for g in self._layer_to_group_idx]
         # Pad to the warmup shape ``[max_batch, max_num_blocks_per_req]``.
         # The model side (``Transformer._page_tables_to_ttnn``) allocates
         # *persistent* ttnn device tensors at this shape during warmup so
@@ -917,14 +922,12 @@ class TTModelRunner:
         # tables push their content into those buffers. Padding rows with
         # zeros is harmless — the kernel only reads up to each layer's
         # active block count.
+        # The layers of a group share its padded table.
         max_batch = self.tt_max_batch_size
         target_shape = (max_batch, self.max_num_blocks_per_req)
         padded = []
-        for bt in result:
-            if bt is None:
-                padded.append(None)
-                continue
-            if bt.shape == target_shape:
+        for bt in block_tables_per_group:
+            if bt is None or bt.shape == target_shape:
                 padded.append(bt)
                 continue
             full = torch.zeros(target_shape, dtype=bt.dtype)
@@ -932,7 +935,7 @@ class TTModelRunner:
             cols = min(bt.shape[1], target_shape[1])
             full[:rows, :cols] = bt[:rows, :cols]
             padded.append(full)
-        return padded
+        return list(map(padded.__getitem__, self._layer_to_group_idx))
 
     def _build_per_layer_specs(
         self, kv_cache_config: KVCacheConfig, num_layers: int
@@ -2995,40 +2998,79 @@ class TTModelRunner:
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps()
         self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
-        if self._mamba_groups is not None:
-            # After the drain: an asynchronous verify commits there, and its
-            # accepted counts and boundary copies precede this step's state
-            # moves, as upstream's postprocess precedes the next preprocess.
-            self._copy_kv_cache_blocks(
-                self._mamba_groups.begin_step(
-                    scheduler_output, self.requests, self._req_accepted_counts
-                )
-            )
         if not scheduler_output.total_num_scheduled_tokens:
+            if self._mamba_groups is not None:
+                # Forget finished and preempted requests; nothing is scheduled.
+                self._mamba_groups.begin_step(scheduler_output, self.requests, {})
             return None
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
         if self._mamba_groups is not None:
-            state = self._mamba_groups.step_inputs(
-                model_input.block_tables_per_group,
-                model_input.row_req_ids or [],
-                self.requests,
-                scheduler_output.num_scheduled_tokens,
-                self._layer_to_group_idx or [],
-                self.tt_max_batch_size,
+            model_input = self._attach_mamba_state(scheduler_output, model_input)
+        return model_input
+
+    def _attach_mamba_state(
+        self, scheduler_output: SchedulerOutput, model_input: TTModelInput
+    ) -> TTModelInput:
+        """Run this step's Mamba state moves and add the state inputs.
+
+        An asynchronous verify commits in
+        ``apply_completed_decode_steps_before_build``, before this, so its
+        boundary copies precede this step's moves, as upstream's postprocess
+        precedes the next preprocess. After ``_prepare_model_inputs``, so the
+        counts and positions are the ones the step is built with: the spec
+        ``accepted_counts`` and each row's first query position.
+        """
+        row_req_ids = model_input.row_req_ids or []
+        groups = self._mamba_groups
+        # A prefill's positions are a numpy array, a decode's a tensor.
+        positions = torch.as_tensor(model_input.input_positions)
+        first = positions if positions.dim() == 1 else positions[:, 0]
+        first = first[: len(row_req_ids)].tolist()
+        num_computed = {
+            req_id: int(first[row]) for row, req_id in enumerate(row_req_ids)
+        }
+        accepted_counts = {}
+        if model_input.accepted_counts is not None:
+            counts = model_input.accepted_counts[: len(row_req_ids)].tolist()
+            accepted_counts = {
+                req_id: int(counts[row]) for row, req_id in enumerate(row_req_ids)
+            }
+        self._copy_kv_cache_blocks(
+            self._mamba_groups.begin_step(
+                scheduler_output, self.requests, num_computed, accepted_counts
             )
-            # Group 0 can be a MambaSpec group, so ``page_table`` is the first
-            # attention group's table instead.
-            model_input = replace(
-                model_input,
-                block_tables=model_input.block_tables_per_group[
-                    self._mamba_groups.attention_group_index
-                ],
-                state_block_ids_per_layer=state.state_block_ids_per_layer,
-                state_block_windows_per_layer=state.state_block_windows_per_layer,
-                state_accepted_counts=state.state_accepted_counts,
+        )
+        windows, start_counts = self._mamba_groups.step_inputs(
+            model_input.block_tables_per_group,
+            row_req_ids,
+            num_computed,
+            scheduler_output.num_scheduled_tokens,
+            self.tt_max_batch_size,
+        )
+        checkpoint_blocks = checkpoint_positions = None
+        checkpoints = get_tt_mamba_checkpoints(scheduler_output)
+        if model_input.prompt_lens is not None and groups.prefill_checkpoints:
+            checkpoint_blocks, checkpoint_positions = groups.checkpoint_inputs(
+                checkpoints, row_req_ids, self.requests, self.tt_max_batch_size
             )
+        elif checkpoints:
+            raise RuntimeError(
+                f"vLLM reserved Mamba prefill checkpoints {checkpoints} for a "
+                "step that is not a prefill"
+            )
+        # Group 0 can be a MambaSpec group, so ``page_table`` is the first
+        # attention group's table instead.
+        model_input = replace(
+            model_input,
+            block_tables=model_input.block_tables_per_group[
+                self._mamba_groups.attention_group_index
+            ],
+            mamba_state=groups.step_state(
+                windows, start_counts, checkpoint_blocks, checkpoint_positions
+            ),
+        )
         return model_input
 
     def _apply_kv_cache_block_ops(self, scheduler_output: SchedulerOutput) -> None:
@@ -3037,12 +3079,20 @@ class TTModelRunner:
         The upstream GPU runner zeroes ``new_block_ids_to_zero`` and applies
         ``kv_cache_block_copies`` before the forward. The TT model owns the
         device buffers, so the runner calls ``zero_kv_cache_blocks`` and
-        ``copy_kv_cache_blocks``, zeroing first. ``initialize_kv_cache``
+        ``copy_kv_cache_blocks``, zeroing first. With MambaSpec groups it
+        zeroes only the listed blocks that ``MambaCacheGroups.blocks_to_zero``
+        selects: those attention can still read unwritten while they hold
+        recurrent state. ``initialize_kv_cache``
         requires these hooks of a model with MambaSpec groups. For a model
         without MambaSpec groups and without a hook, the runner skips that
         operation. The Mamba state copies follow in ``build_model_input``.
         """
-        block_ids = scheduler_output.new_block_ids_to_zero
+        if self._mamba_groups is not None:
+            block_ids = self._mamba_groups.blocks_to_zero(
+                scheduler_output, self.requests
+            )
+        else:
+            block_ids = scheduler_output.new_block_ids_to_zero
         zero_blocks = getattr(self.model, "zero_kv_cache_blocks", None)
         if block_ids and callable(zero_blocks):
             zero_blocks(kv_cache=self.kv_caches, block_ids=list(block_ids))
@@ -4303,13 +4353,8 @@ class TTModelRunner:
         # and never see the kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
-        if model_input.state_block_ids_per_layer is not None:
-            kwargs["state_block_ids_per_layer"] = model_input.state_block_ids_per_layer
-        if model_input.state_block_windows_per_layer is not None:
-            kwargs["state_block_windows_per_layer"] = (
-                model_input.state_block_windows_per_layer
-            )
-            kwargs["state_accepted_counts"] = model_input.state_accepted_counts
+        if model_input.mamba_state is not None:
+            kwargs["mamba_state"] = model_input.mamba_state
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
