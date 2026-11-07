@@ -23,6 +23,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
@@ -267,11 +268,15 @@ def _apply_chunked_prefill_policy(
         _disable_chunked_prefill(vllm_config, reason)
         return
 
-    # A chunk boundary inside a multimodal item would split its embeddings from
-    # their positions. Only meaningful while prefill can be split, and vLLM
-    # rejects the flag outright when one item exceeds the token budget, so it
-    # stays off for every model that does not reach here.
-    scheduler_config.disable_chunked_mm_input = True
+    # The pixel_values lists carry no placeholder positions, so a chunk boundary
+    # inside an item would split its embeddings from their positions. A model
+    # taking mm_items gets every item's whole-prompt range with every chunk and
+    # embeds the rows a chunk covers itself, so its items may straddle chunks:
+    # vLLM's setting stands. Only meaningful while prefill can be split, and
+    # vLLM rejects the flag outright when one item exceeds the token budget, so
+    # it stays off for every model that does not reach here.
+    if get_tt_mm_modalities(vllm_config) is None:
+        scheduler_config.disable_chunked_mm_input = True
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an

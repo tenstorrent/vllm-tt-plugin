@@ -652,3 +652,50 @@ def test_the_platform_resolves_the_declaration_at_config_time(
 
     assert get_tt_mm_modalities(vllm_config) == frozenset({"image", "video"})
     assert mm_config.get_limit_per_prompt("audio") == 0
+
+
+# MiMo-V2.6-Flash's processor at max_model_len 65536 (MiMoV2OmniProcessingInfo.
+# get_mm_max_tokens_per_item): an image of up to 8192 tokens, a video up to the
+# whole context. Its chunked prefill runs at max_num_batched_tokens 4096.
+MAX_TOKENS_PER_ITEM = {"image": 8192, "video": 65536}
+CHUNK_BUDGET = 4096
+
+
+@pytest.mark.parametrize(
+    "capabilities, items_may_straddle",
+    [({"mm_modalities": ALL_MODALITIES}, True), ({}, False)],
+    ids=["mm_items", "pixel_values"],
+)
+def test_items_larger_than_the_chunk_budget_need_items_that_straddle_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config,
+    processor_modalities,
+    capabilities,
+    items_may_straddle,
+):
+    """vLLM's encoder budget refuses to start a launch that keeps items whole
+    when one item exceeds the chunk; a model taking mm_items lets them straddle."""
+    from vllm.v1.core.encoder_cache_manager import compute_mm_encoder_budget
+
+    vllm_config.model_config.multimodal_config = MultiModalConfig()
+    vllm_config.scheduler_config.enable_chunked_prefill = True
+    vllm_config.scheduler_config.max_num_batched_tokens = CHUNK_BUDGET
+    vllm_config.scheduler_config.long_prefill_token_threshold = 0
+    vllm_config.scheduler_config.disable_chunked_mm_input = False
+    vllm_config.scheduler_config.max_num_encoder_input_tokens = CHUNK_BUDGET
+    vllm_config.scheduler_config.encoder_cache_size = CHUNK_BUDGET
+
+    _check_and_update_config(
+        monkeypatch,
+        vllm_config,
+        _model_class({"supports_chunked_prefill": True, **capabilities}),
+    )
+
+    scheduler_config = vllm_config.scheduler_config
+    assert scheduler_config.disable_chunked_mm_input is not items_may_straddle
+    if items_may_straddle:
+        budget, cache = compute_mm_encoder_budget(scheduler_config, MAX_TOKENS_PER_ITEM)
+        assert budget == cache == 65536
+    else:
+        with pytest.raises(ValueError, match="Chunked MM input disabled"):
+            compute_mm_encoder_budget(scheduler_config, MAX_TOKENS_PER_ITEM)

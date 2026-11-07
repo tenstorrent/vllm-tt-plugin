@@ -71,7 +71,9 @@ both arrive with every prefill of a request, chunked or resumed.
 A model that declares `mm_modalities` receives `mm_items`. A request's entry
 lists all of its items in prompt order, whichever part of the prompt the
 prefill covers, so the model selects the rows that fall inside
-`[start_pos, prompt_lens)` itself:
+`[start_pos, prompt_lens)` itself. Chunked prefill may split an item across
+chunks (the platform leaves `disable_chunked_mm_input` to vLLM for such a
+model), so a chunk can start or end inside one:
 
 ```python
 {"modality": "video",            # one of the declared modalities
