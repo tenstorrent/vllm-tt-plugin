@@ -230,6 +230,18 @@ def test_a_load_pinned_in_another_pool_generation_is_refused(connector):
     assert c.client.pool(c.pool_global).gen == "g2", "it reopened the pool and found a new generation"
 
 
+def test_a_store_error_during_lookup_is_a_miss(connector):
+    """The store restarting under an engine (its connection drops mid-lookup) must cost a miss, not the engine."""
+    c = connector()
+
+    def broken(*a, **k):
+        raise kvc.KVStoreError("lookup: [Errno 32] Broken pipe")
+
+    c.client.lookup = broken
+    tokens = list(range(4096))
+    assert c.get_num_new_matched_tokens(request("r", tokens), 0) == (0, False)
+
+
 def test_a_failed_release_is_logged_not_swallowed(connector, caplog):
     c = connector()
 

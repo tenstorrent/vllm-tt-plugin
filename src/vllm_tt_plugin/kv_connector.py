@@ -297,6 +297,7 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         local = num_computed_tokens // bt
         if nmax <= local:
             return 0, False
+        lease_g = lease_s = 0
         try:
             n = self.client.lookup(self.pool_global, st.keys[:nmax])
             cands = list(range(n, local, -1))
@@ -304,7 +305,6 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             b = next((c for c, h in zip(cands, have) if h), 0)
             if b == 0 or (b - local) * bt < self.min_tokens:
                 return 0, False
-            lease_g = lease_s = 0
             lease_g, slots_g = self.client.acquire(self.pool_global, st.keys[local:b])
             lease_s, slots_s = self.client.acquire(self.pool_swa, [self._snapshot_key(st.keys, b)])
             gens = (self.client.pool(self.pool_global).gen, self.client.pool(self.pool_swa).gen)
