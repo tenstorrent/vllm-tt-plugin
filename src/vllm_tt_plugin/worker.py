@@ -501,6 +501,7 @@ class TTWorker(WorkerBase):
             pending = background_warmup.pending(self.model_runner.model)
             if pending:
                 background_warmup.install()
+                background_warmup.started()
                 logger.info("%d warmup units deferred until the engine is idle", pending)
             background_warmup.write_readiness(pending)
 
@@ -526,6 +527,8 @@ class TTWorker(WorkerBase):
         the worker does not need to know which is active.
         """
         assert self.is_driver_worker, "There should only be one Worker for TT"
+        # Deferred warmup also progresses on a busy engine: one unit per interval, before this step's forward.
+        background_warmup.busy_step(self.model_runner.model)
         return self.model_runner.execute_model(scheduler_output)
 
     def sample_tokens(
