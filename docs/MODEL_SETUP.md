@@ -200,9 +200,12 @@ Declaration rules:
   every `MambaSpec` group. In mode `align`, block-table column `p` of a group
   holds the state after `(p + 1) * block_size` tokens, and `MambaSpec.block_size`
   must equal the attention `block_size`: the scheduler ends prefill chunks on
-  multiples of the smallest group `block_size`. Where such a chunk end falls
-  inside a multimodal item, `TTScheduler` moves it out of the item; a block
-  boundary the chunk then crosses keeps no state for prefix caching. A
+  multiples of the smallest group `block_size`. `TTScheduler` schedules a
+  multimodal prompt that fits one step as one chunk. Where a chunk end of a
+  longer one falls inside a multimodal item, `TTScheduler` moves it out of
+  the item; a block boundary the chunk then crosses keeps no state for prefix
+  caching. A multimodal request never reads the prefix cache (see
+  [Chunked prefill](SCHEDULING.md#chunked-prefill)). A
   `cache_config.prefix_match_unit` must be a multiple of
   `additional_config['tt']['prefill_chunk_alignment']`, because with partial
   hash hits vLLM also ends chunks on its multiples.

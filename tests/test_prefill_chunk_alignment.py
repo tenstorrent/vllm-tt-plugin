@@ -84,13 +84,12 @@ def test_a_resumed_replay_past_the_prompt_stays_on_the_grid():
     assert s._mamba_block_aligned_split(resumed, 172) == 172
 
 
-def test_decode_and_multimodal_requests_are_untouched():
+def test_decode_requests_are_untouched():
     s = _scheduler()
     decode = SimpleNamespace(
         num_prompt_tokens=300, num_tokens=310, num_computed_tokens=309, mm_features=[]
     )
     assert s._mamba_block_aligned_split(decode, 1) == 1
-    assert s._mamba_block_aligned_split(_request(32612, mm=True), 157) == 157
 
 
 def test_zero_disables_and_the_hook_is_only_armed_when_needed():

@@ -265,3 +265,21 @@ def test_decode_only_hides_continuations_and_restores_them(monkeypatch):
 
     assert seen["running"] == [decode]
     assert scheduler.running == [decode, continuation]
+
+
+def test_add_request_skips_prefix_cache_read_for_multimodal(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        AsyncScheduler, "add_request", lambda self, request: seen.append(request)
+    )
+    scheduler = TTScheduler.__new__(TTScheduler)
+    scheduler._is_block_output_model = False
+
+    mm = SimpleNamespace(mm_features=[object()], skip_reading_prefix_cache=False)
+    text = SimpleNamespace(mm_features=[], skip_reading_prefix_cache=False)
+    scheduler.add_request(mm)
+    scheduler.add_request(text)
+
+    assert mm.skip_reading_prefix_cache is True
+    assert text.skip_reading_prefix_cache is False
+    assert seen == [mm, text]

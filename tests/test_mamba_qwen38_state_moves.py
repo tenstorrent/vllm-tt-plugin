@@ -1033,29 +1033,32 @@ def _chunk_ends(h: _Harness, req_id: str) -> list[int]:
 
 
 @pytest.mark.parametrize(
-    ("images", "max_num_batched_tokens", "chunks", "repeat_hit"),
+    ("images", "max_num_batched_tokens", "chunks"),
     [
-        # vLLM's split would end the first chunk at 2048, inside the image; the
-        # chunk ends at the block boundary before it instead.
-        ([(1500, 1100)], 2048, [1024, 2048, 428], 3072),
+        # The prompt is longer than a step. vLLM's split would end the first
+        # chunk at 2048, inside the image; the chunk ends at the block boundary
+        # before it instead. The rest fits a step and is one chunk.
+        ([(1500, 1100)], 2048, [1024, 2048, 428]),
         # No block boundary before the image: the first chunk ends at its start,
         # the second takes the whole image, crossing the 1024 and 2048
-        # boundaries without stopping.
-        ([(900, 1400)], 2048, [900, 1400, 772, 428], 3072),
+        # boundaries without stopping. The rest fits a step and is one chunk,
+        # past the prompt's last block boundary.
+        ([(900, 1400)], 2048, [900, 1400, 1200]),
         # Two images back to back, each taken whole.
-        ([(1000, 1000), (2000, 1000)], 2048, [2000, 1000, 72, 428], 3072),
-        # The image covers the prompt's last block boundary, vLLM's mandatory
-        # stop for the prefix-cache state. The chunk crosses it, so that state
-        # is never written and a repeat of the prompt hits nothing.
-        ([(2900, 400)], 4096, [2048, 1252, 200], 0),
+        ([(1000, 1000), (2000, 1000)], 2048, [2000, 1500]),
+        # The prompt fits a step: one prefill step, although vLLM's split
+        # would stop it at a block boundary.
+        ([(2900, 400)], 4096, [3500]),
     ],
 )
 def test_multimodal_item_is_never_split_in_mode_align(
-    images, max_num_batched_tokens, chunks, repeat_hit
+    images, max_num_batched_tokens, chunks
 ):
-    """``TTScheduler._keep_multimodal_items_whole`` moves every chunk end out
-    of the images, and the GDN state reads stay exact (``StateLedger`` and
-    ``BlockLedger``), also for a repeat of the prompt that hits the cache."""
+    """``TTScheduler`` schedules a multimodal prompt that fits a step as one
+    chunk (``_mm_no_split_grant``) and moves every chunk end of a longer one
+    out of the images (``_keep_multimodal_items_whole``). The GDN state reads
+    stay exact (``StateLedger`` and ``BlockLedger``). A repeat of the prompt
+    reads no prefix cache and prefills in the same chunks."""
     h = _Harness("align", num_spec=0, max_num_batched_tokens=max_num_batched_tokens)
     prompt = _prompt(1, 3500)
     h.add("a", prompt, max_tokens=1, images=images)
@@ -1066,10 +1069,8 @@ def test_multimodal_item_is_never_split_in_mode_align(
     h.add("b", list(prompt), max_tokens=1, images=images)
     h.run()
     assert h.finished("b")
-    assert {r: n for s in h.steps for r, n in s.new_hits.items()} == {
-        "a": 0,
-        "b": repeat_hit,
-    }
+    assert {r: n for s in h.steps for r, n in s.new_hits.items()} == {"a": 0, "b": 0}
+    assert [s.num_scheduled["b"] for s in h.steps if "b" in s.num_scheduled] == chunks
 
 
 def test_multimodal_item_longer_than_a_step_is_split_with_a_warning():
@@ -1081,7 +1082,9 @@ def test_multimodal_item_longer_than_a_step_is_split_with_a_warning():
         h.run()
     assert h.finished("a")
     assert [s.num_scheduled["a"] for s in h.steps] == [500, 524, 2048, 428]
-    assert warning.call_count == 1
+    # One warning for the prompt longer than a step (``_mm_no_split_grant``,
+    # once per scheduler) and one for the item.
+    assert warning.call_count == 2
 
 
 @pytest.mark.parametrize(

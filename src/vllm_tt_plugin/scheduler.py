@@ -452,6 +452,10 @@ class TTScheduler(AsyncScheduler):
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
             )
+        # Rows (tokens plus draft slots) granted in the current step; see
+        # _mm_no_split_grant.
+        self._step_granted_rows = 0
+        self._warned_mm_over_step = False
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
@@ -570,7 +574,17 @@ class TTScheduler(AsyncScheduler):
         normally; the caller is not told. Because the change is silent, the
         Rust frontend stays refused: it would send all traffic down this path
         instead of rejecting unsupported requests.
+
+        A multimodal request never reads the prefix cache. The runner hands
+        the model the pixels of every item on each prefill, and the Qwen3.8
+        MTP adapter recomputes a multimodal prompt from token 0. vLLM's
+        ``strip_covered_mm_data`` drops the pixels of an item that a prefix
+        hit covers, which leaves the model nothing to encode.
         """
+        if request.mm_features:
+            # Request.__init__ derives the flag once; the KV cache manager
+            # reads it in get_computed_blocks.
+            request.skip_reading_prefix_cache = True
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
@@ -840,26 +854,113 @@ class TTScheduler(AsyncScheduler):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        if getattr(self, "_base_need_mamba_split", False):
-            budget = num_new_tokens
-            num_new_tokens = super()._mamba_block_aligned_split(
-                request,
-                num_new_tokens,
-                num_new_local_computed_tokens,
-                num_external_computed_tokens,
+        grant = self._mm_no_split_grant(request, start, num_new_tokens)
+        if grant is None:
+            if getattr(self, "_base_need_mamba_split", False):
+                budget = num_new_tokens
+                num_new_tokens = super()._mamba_block_aligned_split(
+                    request,
+                    num_new_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
+                num_new_tokens = self._keep_multimodal_items_whole(
+                    request, start, num_new_tokens, budget
+                )
+            grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
+        if grant > 0:
+            self._step_granted_rows = (
+                getattr(self, "_step_granted_rows", 0) + grant + self._draft_slots()
             )
-            num_new_tokens = self._keep_multimodal_items_whole(
-                request, start, num_new_tokens, budget
-            )
-        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+        return grant
+
+    @staticmethod
+    def _prefill_end(request: Request) -> int:
+        """First position that is not prompt prefill (a resumed request
+        replays its output tokens)."""
+        return max(request.num_prompt_tokens, request.num_tokens - 1)
+
+    def _draft_slots(self) -> int:
+        """Input rows vLLM reserves per scheduled request beyond its tokens."""
+        spec = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+        return spec.max_num_new_slots_for_drafting if spec is not None else 0
+
+    def _step_row_cap(self) -> int:
+        """Input rows one step holds, ignoring ``long_prefill_token_threshold``.
+
+        vLLM takes each scheduled request's tokens out of
+        ``max_num_scheduled_tokens`` and its tokens plus draft slots out of
+        ``max_num_batched_tokens``; the smaller limit bounds both.
+        """
+        cfg = getattr(self, "scheduler_config", None)
+        if cfg is None:
+            return sys.maxsize
+        batched = int(getattr(cfg, "max_num_batched_tokens", 0) or 0) or sys.maxsize
+        scheduled = getattr(self, "max_num_scheduled_tokens", None)
+        if scheduled is None:
+            scheduled = getattr(cfg, "max_num_scheduled_tokens", None)
+        return min(int(scheduled), batched) if scheduled is not None else batched
+
+    def _mm_no_split_grant(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int | None:
+        """Tokens to grant the prefill of a multimodal request, or ``None``.
+
+        The Qwen3.8 MTP adapter cannot prefill a multimodal prompt in chunks
+        (``prefill_forward`` raises on a non-final chunk that carries visual
+        data), so a multimodal prompt is scheduled whole or not at all:
+
+        - the rest of the prompt fits what is left of this step: grant all of
+          it, past ``long_prefill_token_threshold``, which vLLM applied before
+          this hook. What is left is counted from the grants of this step
+          (``_step_granted_rows``, tokens plus draft slots), a lower bound of
+          vLLM's own budgets, so a grant never overdraws them;
+        - it fits an empty step but not this one: 0. vLLM then stops admitting
+          for this step (a waiting request stays at the head of the queue) or
+          skips the running request, and the request gets a fresh step next;
+        - it exceeds an empty step: ``None``. The caller splits it like a text
+          prompt and keeps each item in one chunk
+          (``_keep_multimodal_items_whole`` in mode align, vLLM's
+          ``disable_chunked_mm_input`` otherwise). A model that cannot
+          prefill a multimodal prompt in chunks then raises.
+
+        ``None`` also for a text request and for a request past its prefill.
+        """
+        if num_new_tokens <= 0 or start >= self._prefill_end(request):
+            return None
+        if not (
+            getattr(request, "mm_features", None)
+            or getattr(request, "has_encoder_inputs", False)
+        ):
+            return None
+        remaining = request.num_tokens - start
+        rows = remaining + self._draft_slots()
+        cap = self._step_row_cap()
+        if rows > cap:
+            if not getattr(self, "_warned_mm_over_step", False):
+                self._warned_mm_over_step = True
+                logger.warning(
+                    "TT scheduler: a multimodal prompt needs %d prefill tokens "
+                    "plus %d draft slots, more than one step holds (%d); it is "
+                    "split.",
+                    remaining,
+                    rows - remaining,
+                    cap,
+                )
+            return None
+        if rows <= cap - getattr(self, "_step_granted_rows", 0):
+            return remaining
+        return 0
 
     def _keep_multimodal_items_whole(
         self, request: Request, start: int, num_new_tokens: int, budget: int
     ) -> int:
         """Move a mode-align prefill chunk end out of every multimodal item.
 
-        Mode align does not allow vLLM's ``disable_chunked_mm_input``, so this
-        keeps each item in one chunk instead. ``budget`` is the chunk length
+        Only a multimodal prompt longer than a whole step reaches here
+        (``_mm_no_split_grant``). Mode align does not allow vLLM's
+        ``disable_chunked_mm_input``, so this keeps each item in one chunk
+        instead. ``budget`` is the chunk length
         before vLLM's block-aligned split. When that split ends the chunk
         inside an item, the chunk ends instead at, in order of preference:
 
@@ -963,6 +1064,7 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
+        self._step_granted_rows = 0
         has_pending_prefill = self._has_pending_prefill()
         # A partial prefill occupies ``running`` but cannot produce a decode
         # token, so it must not make the decode fallback below look viable.

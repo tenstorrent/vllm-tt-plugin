@@ -220,6 +220,21 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+A multimodal request is handled differently:
+
+- `TTScheduler.add_request` sets `skip_reading_prefix_cache` on it, so it
+  never reads the prefix cache. The runner hands the model the pixels of every
+  item on each prefill, and the Qwen3.8 MTP adapter recomputes a multimodal
+  prompt from token 0. vLLM's `strip_covered_mm_data` drops the pixels of an
+  item that a prefix hit covers.
+- `TTScheduler._mm_no_split_grant` schedules a multimodal prompt whole when the
+  rest of it, plus vLLM's draft slots, fits what is left of the step, past
+  `long_prefill_token_threshold`. When it fits an empty step but not this one,
+  the request waits for the next step. Only a prompt longer than a whole step
+  is split, with a warning. The Qwen3.8 MTP adapter cannot prefill a
+  multimodal prompt in chunks: its `prefill_forward` then raises, which stops
+  the engine.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.
