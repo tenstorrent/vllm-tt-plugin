@@ -61,6 +61,7 @@ from .test_spec_chain_async import (
     SAMPLED,
     ChainSampledTarget,
     Engine,
+    _chain_off,
     _controller,
     _decode_so,
     _make_runner,
@@ -79,18 +80,6 @@ from .test_spec_sampled_runner import (
 )
 
 M = 32  # candidates per position the fake model returns
-
-
-@pytest.fixture(autouse=True)
-def _env(monkeypatch):
-    for name in (
-        "VLLM_TT_SPEC_FUSED",
-        "VLLM_TT_SPEC_FUSED_SAMPLED",
-        "VLLM_TT_SPEC_CHAIN",
-        "VLLM_TT_SPEC_CHAIN_SAMPLED",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
 
 
 def _caps(runner, logprobs: bool, top_p: bool, mode: str = "raw_logprobs"):
@@ -863,12 +852,10 @@ def test_the_capabilities_are_read_at_load_and_default_to_false():
 
 def _lp_run(monkeypatch, *, device, chain=True, steps=14):
     """Greedy rows asking N = 0, 5, 20 and one asking none, over a chained run."""
-    if chain:
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-        # a logprobs step carries spec_sampling: it chains as a sampled step does
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     model = LogprobsTarget()
     runner = _lp_runner(model, logprobs=device, top_p=device)
+    if not chain:
+        _chain_off(runner)
     engine = LogprobsEngine(runner)
     engine.add("g0", 1, _params(logprobs=0))
     engine.add("g5", 9, _params(logprobs=5))
@@ -929,9 +916,6 @@ def test_the_sync_path_equals_the_host_path_too(monkeypatch):
 
 
 def test_the_blocker_reasons_for_logprobs_and_certificate_rows(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
-
     def blocker(params, caps, rows=("a", "x")):
         runner = _lp_runner()
         _caps(runner, *caps)
@@ -962,8 +946,6 @@ def test_the_blocker_reasons_for_logprobs_and_certificate_rows(monkeypatch):
 
 def test_a_certificate_step_is_sync_and_logprobs_steps_stay_deferred(monkeypatch):
     before = device_logprob_stats()
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     model = LogprobsTarget()
     runner = _lp_runner(model)
     engine = LogprobsEngine(runner)
@@ -1043,8 +1025,6 @@ def test_with_the_capabilities_off_nothing_new_is_sent_and_the_old_modes_stay(
     monkeypatch,
 ):
     before = device_logprob_stats()
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     model = LogprobsTarget()
     runner = _lp_runner(model, logprobs=False, top_p=False)
     engine = LogprobsEngine(runner)

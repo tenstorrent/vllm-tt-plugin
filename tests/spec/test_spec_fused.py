@@ -29,8 +29,6 @@ from vllm_tt_plugin.model_runner import TTModelRunner, fused_spec_sampling
 from vllm_tt_plugin.spec_accept import (
     SpecSamplingInputs,
     accept_sampled_support,
-    fused_sample_enabled,
-    fused_sampled_enabled,
     predraw_uniforms,
 )
 from vllm_tt_plugin.spec_decode import (
@@ -84,11 +82,6 @@ def _with_modes(runner, model):
     return runner
 
 
-@pytest.fixture(autouse=True)
-def _fused_env(monkeypatch):
-    monkeypatch.delenv("VLLM_TT_SPEC_FUSED", raising=False)
-
-
 # region Mode choice
 
 
@@ -112,19 +105,6 @@ def test_one_sampled_row_falls_back_to_logits():
     mode = TTModelRunner._spec_mode_for_step(runner, ["a", "b"])
 
     assert mode == ACCEPT_MODE_LOGITS
-
-
-def test_env_flag_turns_fused_off(monkeypatch):
-    model = _fused_model()
-    runner = _with_modes(_runner(model), model)
-    _add_request(runner, "a")
-    monkeypatch.setenv("VLLM_TT_SPEC_FUSED", "0")
-
-    assert not fused_sample_enabled()
-    assert TTModelRunner._spec_mode_for_step(runner, ["a"]) == ACCEPT_MODE_ARGMAX_IDS
-    monkeypatch.setenv("VLLM_TT_SPEC_FUSED", "1")
-    assert fused_sample_enabled()
-    assert TTModelRunner._spec_mode_for_step(runner, ["a"]) == ACCEPT_MODE_FUSED_SAMPLE
 
 
 def test_a_model_without_the_mode_never_gets_it():
@@ -406,8 +386,13 @@ def spec_logits(tokens, start_pos):
     return rule_logits(tokens, start_pos)
 
 
-def _fused_target_runner():
-    return _topk_runner(_FusedTopkTarget())
+def _fused_target_runner(*, without=()):
+    """The fused target's runner, on a launch whose plan leaves out ``without``."""
+    model, runner = _topk_runner(_FusedTopkTarget())
+    runner._spec_accept_modes = tuple(
+        mode for mode in runner._spec_accept_modes if mode not in without
+    )
+    return model, runner
 
 
 SEEDED = SamplingParams(temperature=0.9, top_k=6, seed=11, ignore_eos=True)
@@ -452,17 +437,14 @@ def test_s2_greedy_only_step_sends_no_spec_sampling():
 
 
 @pytest.mark.parametrize(
-    "env, expected",
+    "without, expected",
     [
-        ({"VLLM_TT_SPEC_FUSED_SAMPLED": "0"}, ACCEPT_MODE_TOPK),
-        ({"VLLM_TT_SPEC_FUSED": "0"}, ACCEPT_MODE_TOPK),
-        ({"VLLM_TT_SPEC_DEVICE_TOPK": "0"}, ACCEPT_MODE_LOGITS),
+        ((ACCEPT_MODE_FUSED_SAMPLE,), ACCEPT_MODE_TOPK),
+        ((ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_TOPK), ACCEPT_MODE_LOGITS),
     ],
 )
-def test_s2_flags_keep_the_old_modes(monkeypatch, env, expected):
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    model, runner = _fused_target_runner()
+def test_s2_a_plan_without_the_modes_keeps_the_old_ones(without, expected):
+    model, runner = _fused_target_runner(without=without)
     _add_sampled_request(runner, "g", GREEDY, first_token=1)
     _add_sampled_request(runner, "s", SEEDED, first_token=9)
     assert _mode_after_first_step(runner, "g", "s").spec_mode == expected
@@ -502,7 +484,6 @@ def test_s2_a_seeded_row_with_no_drafts_keeps_topk():
     assert (
         runner._spec_mode_for_step(["s", "u"], torch.tensor([0, 2])) == ACCEPT_MODE_TOPK
     )
-    assert fused_sampled_enabled()
 
 
 class _RecordTable:
@@ -607,10 +588,11 @@ def _speculate_rows(runner, reqs, count):
     return {r: _output(runner, r)[:count] for r in reqs}
 
 
-def test_s2_fused_commits_what_topk_commits_with_the_same_seeds(monkeypatch):
+def test_s2_fused_commits_what_topk_commits_with_the_same_seeds():
     def run(fused_sampled):
-        monkeypatch.setenv("VLLM_TT_SPEC_FUSED_SAMPLED", "1" if fused_sampled else "0")
-        model, runner = _fused_target_runner()
+        model, runner = _fused_target_runner(
+            without=() if fused_sampled else (ACCEPT_MODE_FUSED_SAMPLE,)
+        )
         torch.manual_seed(2024)
         _add_sampled_request(runner, "g", GREEDY, first_token=1)
         _add_sampled_request(runner, "s", SEEDED, first_token=9)

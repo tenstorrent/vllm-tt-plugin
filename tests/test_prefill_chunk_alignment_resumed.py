@@ -3,8 +3,8 @@
 """Every intermediate prefill chunk ends on the alignment grid, also for
 preempted / resumed requests and prefix-cache hits on 64-token blocks.
 
-Production 2026-11-03 20:15:28Z (Qwen3.8, block_size 64, cap table
-[[0, 16384], [131072, 8192]]): a request preempted at 96 % KV usage came back
+Production 2026-11-03 20:15:28Z (Qwen3.8, block_size 64, chunks of at most
+16384 tokens): a request preempted at 96 % KV usage came back
 with 67439 prompt + 7587 output tokens (num_tokens 75026) and a 54080-token
 prefix hit. Its chunk [54080, 70464) ended past the prompt, so the scheduler
 skipped the alignment, but below num_tokens, so the model runner flagged it
@@ -16,18 +16,15 @@ from types import SimpleNamespace
 
 import vllm  # noqa: F401  (resolve the platform plugin before importing ours)
 
-from vllm_tt_plugin.config import parse_prefill_chunk_cap_table
 from vllm_tt_plugin.scheduler import TTScheduler
 
 ALIGN = 128
-PROD_CAPS = parse_prefill_chunk_cap_table([[0, 16384], [131072, 8192]], ALIGN)
 
 
-def _scheduler(caps=PROD_CAPS, step=525312, threshold=16384):
+def _scheduler(step=525312, threshold=16384):
     s = TTScheduler.__new__(TTScheduler)
     s._prefill_chunk_alignment = ALIGN
     s.need_mamba_block_aligned_split = False
-    s._prefill_chunk_cap_table = tuple(caps)
     s.scheduler_config = SimpleNamespace(
         max_num_batched_tokens=step,
         max_num_scheduled_tokens=None,

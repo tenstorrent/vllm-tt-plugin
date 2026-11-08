@@ -259,9 +259,10 @@ class TTModelInput:
     # composed token mask at ``sample_tokens``. ``None`` for every other step.
     spec_mask: SpecMaskPlan | None = None
 
-    # Chain mode only (VLLM_TT_SPEC_CHAIN, a fused verify submitted while the
-    # previous one is still in flight). ``chain_rows`` is bool ``[total_B]``:
-    # the rows whose next inputs the device builds from the pending step. For
+    # Chain mode only (``TTAsyncDecodeController.chain_enabled``: a fused
+    # verify submitted while the previous one is still in flight).
+    # ``chain_rows`` is bool ``[total_B]``: the rows whose next inputs the
+    # device builds from the pending step. For
     # them ``input_tokens`` is the placeholder -1 in every column,
     # ``input_positions`` the runner's optimistic provisional positions and
     # ``accepted_counts`` -1; other rows are built from host state as ever.

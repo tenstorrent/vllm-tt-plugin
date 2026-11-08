@@ -1,8 +1,8 @@
 """The support table of the top-k/top-p modes equals vLLM's sorted reference.
 
-``_constrained_table`` builds, from full logits, the table the ``topk`` and
-``fused_sample`` modes build from a verify's top-M support; ``_walk_table`` is
-the walk both modes run over it.
+``support_table_reference.constrained_table`` builds, from full logits, the
+table the ``topk`` and ``fused_sample`` modes build from a verify's top-M
+support; ``_walk_table`` is the walk both modes run over it.
 """
 
 import pytest
@@ -11,13 +11,12 @@ import torch
 from vllm_tt_plugin import spec_accept
 from vllm_tt_plugin.spec_accept import (
     SpecSamplingInputs,
-    _constrained_table,
     _expand_to_columns,
     _reference_rows,
     _safe_temperature,
 )
 
-from .test_spec_device_topk import full_logits_walk
+from .support_table_reference import constrained_table, full_logits_walk
 
 V = 4096
 
@@ -36,27 +35,33 @@ def _reference(logits, temperature, top_k, top_p):
 
 def _table(logits, temperature, top_k, top_p):
     rows, width, vocab = logits.shape
-    table = _constrained_table(logits, temperature, top_k, top_p)
+    table = constrained_table(logits, temperature, top_k, top_p)
     return table.to_dense().reshape(rows, width, vocab)
 
 
-def _both(monkeypatch, logits, temperature, top_k, top_p):
-    ref = _reference(logits, temperature, top_k, top_p)
-    # The reference breaks a top-p cut inside a tie group by its unstable sort;
-    # these comparisons pin the table to it, so they ask for that choice.
-    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "1")
-    fast = _table(logits, temperature, top_k, top_p)
-    return ref, fast
+def _both(logits, temperature, top_k, top_p):
+    return (
+        _reference(logits, temperature, top_k, top_p),
+        _table(logits, temperature, top_k, top_p),
+    )
 
 
 def _check(ref, fast):
-    assert torch.equal(ref > 0, fast > 0)
-    assert torch.allclose(ref, fast, rtol=1e-6, atol=1e-9)
+    """Every position keeps as many tokens with the same probabilities.
+
+    The reference breaks a top-p cut inside a tie group by its unstable sort
+    and the table keeps the group's lowest ids, so only which of the
+    equal-logit tokens holds a probability can differ.
+    """
+    assert torch.equal((ref > 0).sum(-1), (fast > 0).sum(-1))
+    assert torch.allclose(
+        ref.sort(dim=-1).values, fast.sort(dim=-1).values, rtol=1e-6, atol=1e-9
+    )
 
 
 @pytest.mark.parametrize("bf16", [False, True])
 @pytest.mark.parametrize("seed", range(40))
-def test_mixed_rows_match_reference(monkeypatch, bf16, seed):
+def test_mixed_rows_match_reference(bf16, seed):
     g = torch.Generator().manual_seed(seed)
     rows, width = 6, 4
     logits = torch.randn(rows, width, V, generator=g) * 3
@@ -65,12 +70,12 @@ def test_mixed_rows_match_reference(monkeypatch, bf16, seed):
     temperature = torch.tensor([0.6, 1.0, 0.0, 0.8, 0.6, 1.3])
     top_k = torch.tensor([20, 1, 20, V, 50, 1024], dtype=torch.int32)
     top_p = torch.tensor([0.95, 0.95, 1.0, 0.95, 1.0, 0.5])
-    ref, fast = _both(monkeypatch, logits, temperature, top_k, top_p)
+    ref, fast = _both(logits, temperature, top_k, top_p)
     _check(ref, fast)
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_top_k_disabled_with_top_p_falls_back(monkeypatch, bf16):
+def test_top_k_disabled_with_top_p_falls_back(bf16):
     g = torch.Generator().manual_seed(11)
     logits = torch.randn(3, 4, V, generator=g) * 2
     if bf16:
@@ -78,29 +83,29 @@ def test_top_k_disabled_with_top_p_falls_back(monkeypatch, bf16):
     temperature = torch.full((3,), 0.6)
     top_k = torch.tensor([V, 20, V], dtype=torch.int32)
     top_p = torch.tensor([0.95, 0.95, 1.0])
-    ref, fast = _both(monkeypatch, logits, temperature, top_k, top_p)
+    ref, fast = _both(logits, temperature, top_k, top_p)
     _check(ref, fast)
-    ref, fast = _both(monkeypatch, logits, temperature, None, top_p)
+    ref, fast = _both(logits, temperature, None, top_p)
     _check(ref, fast)
-    ref, fast = _both(monkeypatch, logits, temperature, top_k, None)
+    ref, fast = _both(logits, temperature, top_k, None)
     _check(ref, fast)
 
 
-def test_top_k_above_cap_falls_back(monkeypatch):
+def test_top_k_above_cap_falls_back():
     logits = torch.randn(2, 3, V, generator=torch.Generator().manual_seed(2))
     top_k = torch.tensor([2000, 20], dtype=torch.int32)
     top_p = torch.tensor([0.9, 0.9])
-    ref, fast = _both(monkeypatch, logits, torch.ones(2), top_k, top_p)
+    ref, fast = _both(logits, torch.ones(2), top_k, top_p)
     _check(ref, fast)
 
 
-def test_ties_beyond_the_margin_fall_back(monkeypatch):
+def test_ties_beyond_the_margin_fall_back():
     logits = torch.randn(2, 2, V, generator=torch.Generator().manual_seed(3))
     # 500 logits tie at the k-th value: far more than the margin holds.
     logits[0, :, :500] = 10.0
     top_k = torch.tensor([20, 20], dtype=torch.int32)
     top_p = torch.tensor([1.0, 0.95])
-    ref, fast = _both(monkeypatch, logits, torch.ones(2), top_k, top_p)
+    ref, fast = _both(logits, torch.ones(2), top_k, top_p)
     assert int((ref[0, 0] > 0).sum()) == 500
     _check(ref, fast)
 
@@ -296,7 +301,6 @@ def test_tie_cut_keeps_lowest_ids_without_a_full_sort(monkeypatch):
     top_k = torch.tensor([20], dtype=torch.int32)
     top_p = torch.tensor([0.5])
     ref = _reference(logits, temperature, top_k, top_p)
-    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
     _no_reference(monkeypatch)
     fast = _table(logits, temperature, top_k, top_p)
     kept = (fast[0, 0] > 0).nonzero().squeeze(1).tolist()
@@ -317,7 +321,6 @@ def test_bf16_rows_need_no_full_sort_and_keep_the_reference_masses(monkeypatch, 
     top_k = torch.full((4,), 20, dtype=torch.int32)
     top_p = torch.full((4,), 0.95)
     ref = _reference(logits, temperature, top_k, top_p)
-    monkeypatch.setenv("VLLM_TT_SPEC_TIE_EXACT", "0")
     _no_reference(monkeypatch)
     fast = _table(logits, temperature, top_k, top_p)
     # Same probability values per position; only which equal-logit token

@@ -1202,18 +1202,6 @@ DRAFT_LEN = sync_harness.DRAFT_LEN
 GREEDY = sync_harness.GREEDY
 
 
-@pytest.fixture(autouse=True)
-def _env(monkeypatch):
-    for name in (
-        "VLLM_TT_SPEC_FUSED",
-        "VLLM_TT_SPEC_FUSED_SAMPLED",
-        "VLLM_TT_SPEC_CHAIN",
-        "VLLM_TT_SPEC_CHAIN_SAMPLED",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
-
-
 def _mask_runner(*, mask=True, logprobs=False, top_p=False, penalties=False):
     """A synchronous runner over the controls harness, on the mask-capable fake."""
     model = MaskTarget()
@@ -1608,8 +1596,6 @@ def _mask_params(case: str) -> SamplingParams:
 
 
 def _async_run(monkeypatch, *, mask, case="allowed", steps=16, stop_after=None):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     torch.manual_seed(5)
     model = MaskTarget()
     runner = _make_runner(model)
@@ -1708,7 +1694,6 @@ def test_a_grammar_step_hands_the_drafts_it_verifies_to_the_scheduler(monkeypatc
 
 def test_an_async_grammar_row_with_no_grammar_output_is_left_unconstrained(monkeypatch):
     """A request an abort removed is absent from the grammar output: no raise."""
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = MaskTarget()
     runner = _make_runner(model)
     runner._spec_device_mask = True
@@ -1723,7 +1708,6 @@ def test_an_async_grammar_row_with_no_grammar_output_is_left_unconstrained(monke
 
 def test_a_second_begin_before_the_finish_is_the_models_error(monkeypatch):
     """One split step at a time: the runner finishes each step in ``sample_tokens``."""
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = MaskTarget()
     runner = _make_runner(model)
     runner._spec_device_mask = True

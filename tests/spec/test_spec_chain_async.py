@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """Stage S4: a fused verify submitted while the previous one is in flight.
 
-With ``VLLM_TT_SPEC_CHAIN`` on and a model that declares
+Under async scheduling with a model that declares
 ``supports_async_spec_decode`` (it runs chain and fused), the runner builds step
 n+1 without step n's committed tokens (placeholders, optimistic positions), the
 device builds the real inputs from step n, and step n's result is read on the
@@ -20,7 +20,6 @@ therefore already been scheduled into n+1, which is the stop lag under test.
 from __future__ import annotations
 
 import dataclasses
-import logging
 import threading
 from collections import deque
 
@@ -32,7 +31,6 @@ from vllm.v1.core.sched.output import NewRequestData
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.spec_accept import spec_chain_enabled, spec_chain_sampled_enabled
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_FUSED_SAMPLE,
     PLACEHOLDER_TOKEN_ID,
@@ -60,18 +58,6 @@ from .test_spec_device_topk import exact_support
 from .test_spec_fused import _FusedTopkTarget
 
 K = DRAFT_LEN
-
-
-@pytest.fixture(autouse=True)
-def _env(monkeypatch):
-    for name in (
-        "VLLM_TT_SPEC_FUSED",
-        "VLLM_TT_SPEC_FUSED_SAMPLED",
-        "VLLM_TT_SPEC_CHAIN",
-        "VLLM_TT_SPEC_CHAIN_SAMPLED",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
 
 
 # region Harness
@@ -125,6 +111,16 @@ def _make_runner(model):
     runner.note_decode_state_slots_settled = (
         TTModelRunner.note_decode_state_slots_settled.__get__(runner)
     )
+    return runner
+
+
+def _chain_off(runner):
+    """A launch that does not chain: every verify drains the one before it.
+
+    What a model without ``supports_async_spec_decode`` gets; set on the
+    controller so the same chain-capable fake serves both arms of a comparison.
+    """
+    runner.async_decode.chain_enabled = lambda: False
     return runner
 
 
@@ -318,13 +314,11 @@ def _decode_so(runner, live, **kw):
 
 def _joins_and_finish_run(monkeypatch, chain, *, threaded=False, hold=False, **knobs):
     """Two greedy requests, a join, and a finish, on the chain-capable fake."""
-    if chain:
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    else:
-        monkeypatch.delenv("VLLM_TT_SPEC_CHAIN", raising=False)
     model = _chain_model(accept_cycle=(3, 0, 1, 2), **knobs)
     model.hold_reads = hold
     runner = _make_runner(model)
+    if not chain:
+        _chain_off(runner)
     engine = Engine(runner, threaded=threaded)
     engine.add("a", 1)
     engine.add("b", 40, stop_after=9)
@@ -366,7 +360,6 @@ def test_t3_a_chained_step_carries_placeholders_and_optimistic_positions(monkeyp
 
 
 def test_t3_the_chain_length_is_an_upper_bound_until_the_commit_lands(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model()
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -426,7 +419,6 @@ def test_t4_chained_steps_read_on_the_reader_thread_and_finish_on_the_engine_thr
 
 
 def test_t4_a_step_is_submitted_before_the_previous_one_is_read(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model()
     model.hold_reads = True
     runner = _make_runner(model)
@@ -444,7 +436,6 @@ def test_t4_a_step_is_submitted_before_the_previous_one_is_read(monkeypatch):
 
 
 def test_t4_a_wrong_chain_tip_is_refused_by_the_model(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model()
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -514,7 +505,6 @@ def test_t6_a_join_breaks_the_chain_and_the_stream_is_unchanged(monkeypatch):
 
 
 def test_t6_the_blockers_by_reason(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model()
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -538,7 +528,7 @@ def test_t6_the_blockers_by_reason(monkeypatch):
     assert controller.chain_blocker(forced) == "forced_reset"
     real = _decode_so(runner, live, drafts={"a": [1, 2, 3], "b": [1, 2, 3]})
     assert controller.chain_blocker(real) == "real_drafts"
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "0")
+    _chain_off(runner)
     assert controller.chain_blocker(so()) == "disabled"
 
 
@@ -548,18 +538,19 @@ PREFILL_CAPS = {
     "supports_async_spec_decode": True,
     "supports_prefill_over_pending_spec": True,
 }
+NO_OVERLAP_CAPS = {
+    k: v for k, v in PREFILL_CAPS.items() if k != "supports_prefill_over_pending_spec"
+}
 
 
 def _prefill_run(
-    monkeypatch, *, overlap="1", caps=PREFILL_CAPS, news, resumed=(), cycle=(3, 0, 1, 2)
+    monkeypatch, *, caps=PREFILL_CAPS, news, resumed=(), cycle=(3, 0, 1, 2)
 ):
     """Two requests decoding, a prefill step over the pending verify, more steps.
 
     Returns the engine, the controller and the number of waits the controller
     made during the prefill step.
     """
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_PREFILL_OVERLAP", overlap)
     model = _chain_model(accept_cycle=cycle, model_capabilities=caps)
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -600,7 +591,7 @@ def test_prefill_overlap_a_prefill_does_not_drain_the_pending_verify(
     assert controller._overlapped_unsafe_submissions == 0
     assert "prefill_overlap=1" in controller._chain_report()
     off, off_controller, off_waits = _prefill_run(
-        monkeypatch, overlap="0", news=news, cycle=cycle
+        monkeypatch, caps=NO_OVERLAP_CAPS, news=news, cycle=cycle
     )
     assert off_waits >= 1
     assert off.prefill_log == [0]
@@ -630,19 +621,9 @@ def test_prefill_overlap_a_prefill_does_not_drain_the_pending_verify(
 
 
 def test_prefill_overlap_needs_the_capability(monkeypatch):
-    caps = {
-        k: v
-        for k, v in PREFILL_CAPS.items()
-        if k != "supports_prefill_over_pending_spec"
-    }
-    engine, controller, waits = _prefill_run(monkeypatch, caps=caps, news=[("c", 80)])
-    assert waits >= 1
-    assert engine.prefill_log == [0]
-    assert controller._prefill_overlap_steps == 0
-
-
-def test_prefill_overlap_kill_switch_drains(monkeypatch):
-    engine, controller, waits = _prefill_run(monkeypatch, overlap="0", news=[("c", 80)])
+    engine, controller, waits = _prefill_run(
+        monkeypatch, caps=NO_OVERLAP_CAPS, news=[("c", 80)]
+    )
     assert waits >= 1
     assert engine.prefill_log == [0]
     assert controller._prefill_overlap_steps == 0
@@ -658,7 +639,6 @@ def test_prefill_overlap_a_resumed_request_still_drains(monkeypatch):
 
 
 def test_t6_a_second_pending_step_blocks_the_chain(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model()
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -699,7 +679,6 @@ def test_t6_a_second_pending_step_blocks_the_chain(monkeypatch):
 def test_t6_a_logprobs_penalty_or_allowlist_row_does_not_chain(
     monkeypatch, params, reason
 ):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     runner = _make_runner(_chain_model())
     engine = Engine(runner)
     engine.add("a", 1)
@@ -710,7 +689,6 @@ def test_t6_a_logprobs_penalty_or_allowlist_row_does_not_chain(
 
 def test_t6_a_row_that_is_not_fused_eligible_does_not_chain(monkeypatch):
     # a sampled row on a model that serves no topk keeps the logits walk
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     runner = _make_runner(_chain_model())
     engine = Engine(runner)
     engine.add("a", 1)
@@ -723,12 +701,10 @@ def test_t6_a_row_that_is_not_fused_eligible_does_not_chain(monkeypatch):
 def test_t6_the_length_cap_breaks_the_chain_and_the_stream_is_unchanged(monkeypatch):
     results = {}
     for chain in (False, True):
-        if chain:
-            monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-        else:
-            monkeypatch.delenv("VLLM_TT_SPEC_CHAIN", raising=False)
         model = _chain_model(max_model_len=MAX_MODEL_LEN)
         runner = _make_runner(model)
+        if not chain:
+            _chain_off(runner)
         engine = Engine(runner)
         engine.add("a", 1, stop_after=MAX_MODEL_LEN - PROMPT_LEN - 1)
         for _ in range(80):
@@ -751,7 +727,6 @@ def test_t6_the_length_cap_breaks_the_chain_and_the_stream_is_unchanged(monkeypa
 
 
 def test_t7_a_stored_proposal_is_never_verified_for_a_chained_row(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model()
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -779,7 +754,6 @@ def test_t7_a_length_hint_is_not_verified_by_an_unchained_build(monkeypatch):
 
 
 def test_t7_a_chained_commit_publishes_only_hints_and_a_final_one_real_ids(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = _chain_model(accept_cycle=(3, 1, 2))
     runner = _make_runner(model)
     published: list[tuple[str, list[int], bool]] = []
@@ -828,45 +802,9 @@ def test_t8_the_chain_fake_declares_what_the_gate_reads():
     assert not FakeSpecModel.model_capabilities.get("supports_async_spec_decode")
 
 
-@pytest.mark.parametrize("chain_env, warns", [(None, True), ("0", True), ("1", False)])
-def test_t8_async_spec_warns_without_chain_and_keeps_the_gate(
-    monkeypatch, vllm_config, chain_env, warns
-):
-    from tests.spec.test_spec_platform_integration import _run_hook, _speculative
-
-    if chain_env is None:
-        monkeypatch.delenv("VLLM_TT_SPEC_CHAIN", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", chain_env)
-    vllm_config.scheduler_config.async_scheduling = True
-    model = make_fake_spec_model(
-        serve_chain=True, max_supported_num_seqs=4, supported_k=(3, 7)
-    )
-    from vllm_tt_plugin import platform as platform_module
-
-    class _Collect(logging.Handler):
-        def __init__(self):
-            super().__init__(logging.WARNING)
-            self.records = []
-
-        def emit(self, record):
-            self.records.append(record)
-
-    collector = _Collect()
-    platform_module.logger.addHandler(collector)
-    try:
-        _run_hook(monkeypatch, _speculative(vllm_config), model)
-    finally:
-        platform_module.logger.removeHandler(collector)
-    assert vllm_config.scheduler_config.async_scheduling is True
-    messages = [r.getMessage() for r in collector.records]
-    assert any("VLLM_TT_SPEC_CHAIN" in m for m in messages) is warns
-
-
 def test_t8_no_capability_is_still_refused(monkeypatch, vllm_config):
     from tests.spec.test_spec_platform_integration import _run_hook, _speculative
 
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     vllm_config.scheduler_config.async_scheduling = True
     model = make_fake_spec_model(
         max_supported_num_seqs=4,
@@ -877,10 +815,6 @@ def test_t8_no_capability_is_still_refused(monkeypatch, vllm_config):
     )
     with pytest.raises(ValueError, match="supports_async_spec_decode"):
         _run_hook(monkeypatch, _speculative(vllm_config), model)
-
-
-def test_t8_the_gate_defaults_off():
-    assert spec_chain_enabled() is False
 
 
 # endregion
@@ -1029,13 +963,11 @@ class ChainSampledTarget(ChainFusedMixin, ChainReadMixin, _FusedTopkTarget):
 
 
 def _sampled_run(monkeypatch, chain, late_sampled=False):
-    if chain:
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    else:
-        monkeypatch.delenv("VLLM_TT_SPEC_CHAIN", raising=False)
     torch.manual_seed(2024)
     model = ChainSampledTarget()
     runner = _make_runner(model)
+    if not chain:
+        _chain_off(runner)
     engine = Engine(runner)
     # greedy, unseeded sampled, seeded sampled, and a greedy that finishes early
     engine.add("g1", 1)
@@ -1057,7 +989,6 @@ def _sampled_run(monkeypatch, chain, late_sampled=False):
 
 
 def test_a_mixed_run_has_the_same_streams_with_and_without_chaining(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     model_c, runner_c, chained = _sampled_run(monkeypatch, chain=True)
     rng_c = torch.get_rng_state()
     model_p, runner_p, plain = _sampled_run(monkeypatch, chain=False)
@@ -1080,45 +1011,17 @@ def test_a_mixed_run_has_the_same_streams_with_and_without_chaining(monkeypatch)
     assert _controller(runner_p)._chained_submissions == 0
 
 
-def test_t9_chain_sampled_off_keeps_sampled_steps_synchronous(monkeypatch):
-    assert spec_chain_sampled_enabled() is False
-    model_c, runner_c, chained = _sampled_run(
-        monkeypatch, chain=True, late_sampled=True
-    )
-    rng_c = torch.get_rng_state()
-    model_p, runner_p, plain = _sampled_run(monkeypatch, chain=False, late_sampled=True)
-    rng_p = torch.get_rng_state()
-    assert set(chained.outputs) == {"g1", "g2", "s1", "s2", "j1", "j2"}
-    assert chained.outputs == plain.outputs
-    assert chained.published == plain.published
-    assert torch.equal(rng_c, rng_p)
-    # no step that carries spec_sampling was deferred or chained
-    sampled_calls = [c for c in model_c.fused_log if c[1]]
-    assert sampled_calls
-    assert all(not deferred and not chained for deferred, _, chained in sampled_calls)
-    # greedy-only steps still defer and chain
-    controller = _controller(runner_c)
-    assert any(c[0] and not c[1] for c in model_c.fused_log)
-    assert controller._chained_submissions >= 1
-    assert controller._overlapped_unsafe_submissions == 0
-
-
-def test_t9_the_blocker_names_a_sampled_row(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
+def test_t9_a_sampled_row_does_not_block_the_chain():
     model = ChainSampledTarget()
     runner = _make_runner(model)
     engine = Engine(runner)
     engine.add("a", 1)
     engine.add("s", 40, SAMPLED)
     so = _decode_so(runner, ("a", "s"))
-    assert runner._chain_rows_blocker(["a", "s"], so, 1)[0] == "sampled"
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     assert runner._chain_rows_blocker(["a", "s"], so, 1)[0] is None
 
 
-def test_t9_chain_sampled_on_defers_sampled_steps(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
-    assert spec_chain_sampled_enabled() is True
+def test_t9_sampled_steps_defer_and_chain(monkeypatch):
     model, runner, _ = _sampled_run(monkeypatch, chain=True, late_sampled=True)
     sampled_calls = [c for c in model.fused_log if c[1]]
     assert sampled_calls and any(c[0] for c in sampled_calls)

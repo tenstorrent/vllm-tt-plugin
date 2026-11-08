@@ -50,13 +50,6 @@ DRAFT_LEN = async_harness.DRAFT_LEN
 SEEDED = SamplingParams(temperature=1.0, top_k=3, seed=41, ignore_eos=True)
 
 
-@pytest.fixture
-def topk_on(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
-    monkeypatch.delenv("VLLM_TT_SPEC_FAST_TOPK", raising=False)
-    monkeypatch.delenv("VLLM_TT_SPEC_TIE_EXACT", raising=False)
-
-
 class _ConvertingTopkTarget(_TopkTarget):
     """``_TopkTarget`` with the base generator's host conversion hook.
 
@@ -171,8 +164,8 @@ def _generator_state(runner, req_id: str) -> torch.Tensor:
 # region The synchronous route: _forward_with_model_input
 
 
-def test_a_topk_verify_finalizes_as_its_verify_output(topk_on, monkeypatch):
-    """The server's synchronous route, in both modes, from one seed.
+def test_a_topk_verify_finalizes_as_its_verify_output():
+    """The server's synchronous route, on plans with and without ``topk``.
 
     ``finalize_decode`` hands the ``VerifyOutput`` to the walk as it is, never
     to the model's conversion hook, and the seeded stream repeats.
@@ -186,8 +179,10 @@ def test_a_topk_verify_finalizes_as_its_verify_output(topk_on, monkeypatch):
         assert model.host_conversions == []
     assert streams[0] == streams[1]
 
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "0")
     model, runner = _sync_runner()
+    runner._spec_accept_modes = tuple(
+        mode for mode in runner._spec_accept_modes if mode != ACCEPT_MODE_TOPK
+    )
     sync_harness._add_request(runner, "s", SEEDED)
     assert len(_serve(runner, "s", 30)) == 30
 
@@ -199,9 +194,7 @@ class _DeviceHandle:
     """Stands for a ttnn tensor a model forgot to read back."""
 
 
-def test_a_topk_verify_with_unread_fields_is_refused_before_any_conversion(
-    topk_on,
-):
+def test_a_topk_verify_with_unread_fields_is_refused_before_any_conversion():
     """A field left on the device is named, not handed to the model's hook.
 
     ``process_decode_output_host`` converts a plain decode's output and knows
@@ -228,7 +221,7 @@ def test_a_topk_verify_with_unread_fields_is_refused_before_any_conversion(
 # region The asynchronous route: complete_spec_decode_step
 
 
-def test_a_held_topk_verify_is_walked_only_once_its_readback_completes(topk_on):
+def test_a_held_topk_verify_is_walked_only_once_its_readback_completes():
     """The deferred route reads the ``VerifyOutput`` back through the model.
 
     ``read_decode_output`` is handed the ``VerifyOutput`` and returns one whose
@@ -261,9 +254,7 @@ def test_a_held_topk_verify_is_walked_only_once_its_readback_completes(topk_on):
     assert runner.requests["s"].output_token_ids == committed
 
 
-def test_a_deferred_topk_verify_commits_what_the_synchronous_route_commits(
-    topk_on,
-):
+def test_a_deferred_topk_verify_commits_what_the_synchronous_route_commits():
     """Same seed, same drafts, same tokens, whichever route finalizes."""
     params = SamplingParams(temperature=1.1, top_k=5, seed=19, ignore_eos=True)
 

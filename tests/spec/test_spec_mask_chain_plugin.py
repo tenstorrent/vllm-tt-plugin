@@ -68,7 +68,6 @@ from vllm_tt_plugin.spec_masks import (
 from .fake_spec_model import make_fake_spec_model
 from .test_spec_async import BLOCK_SIZE, MAX_MODEL_LEN, MAX_NUM_REQS
 from .test_spec_chain_async import Engine, K, _decode_so, _make_runner
-from .test_spec_chain_async import _env as _chain_env  # noqa: F401  (autouse)
 from .test_spec_device_mask_plugin import (
     EVENS,
     REAL_VOCAB,
@@ -136,7 +135,6 @@ class DraftsModel(make_fake_spec_model(serve_chain=True)):
 
 
 def _engine(monkeypatch, *, with_drafts=True, hold=False, steps=0, **knobs):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = DraftsModel()
     model.with_drafts = with_drafts
     model.hold_reads = hold
@@ -342,7 +340,6 @@ def test_d_the_readout_drafts_are_checked_like_the_candidates():
 
 
 def test_e_the_commit_view_equals_the_state_after_the_commit(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
     model = DraftsModel()
     runner = _make_runner(model)
     engine = Engine(runner)
@@ -571,8 +568,6 @@ def _masked_runner(
     engine_cls=MaskEngine,
     procs=(MinTokensLogitsProcessor,),
 ):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     torch.manual_seed(5)
     model = MaskTarget()
     model.with_drafts = with_drafts

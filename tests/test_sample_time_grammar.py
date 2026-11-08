@@ -168,6 +168,7 @@ def test_execute_model_defers_structured_device_sampling_until_sample_tokens(
         can_attempt_steady_decode_from_scheduler=lambda _output: False,
         must_drain_pending_async_steps=lambda *_args: False,
         mask_pending=lambda: False,
+        chain_enabled=lambda: False,
         wait_for_all_pending_async_steps=lambda: events.append("drain"),
         submit_async_decode=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("structured device sampling must not use async overlap")
@@ -580,6 +581,7 @@ def _real_deferred_grammar_tail(
         wait_for_all_pending_async_steps=lambda: None,
         complete_deferred_device_sampling=controller.complete_deferred_device_sampling,
         mask_pending=controller.mask_pending,
+        chain_enabled=controller.chain_enabled,
     )
     return received, controller
 

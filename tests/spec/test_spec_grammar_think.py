@@ -66,11 +66,6 @@ FUSED_MODES = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS, ACCEPT_MODE_FUSED_SAM
 BITMASK_WORDS = 4
 
 
-@pytest.fixture(autouse=True)
-def _fused_env(monkeypatch):
-    monkeypatch.delenv("VLLM_TT_SPEC_FUSED", raising=False)
-
-
 def _runner():
     model = make_fake_spec_model(serve_fused=True, accept_modes=FUSED_MODES)()
     runner = _model_drafter_runner(model)

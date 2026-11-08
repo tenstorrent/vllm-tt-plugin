@@ -604,7 +604,6 @@ class _SupportFallbackStats:
         "support_positions",
         "overflow_positions",
         "fetch_calls",
-        "audit_steps",
     )
 
     def __init__(self) -> None:
@@ -648,12 +647,11 @@ def accept_sampled_support(
 
     ``topk_values`` and ``topk_ids`` are ``[B, 1+K, M]``: every column's M
     largest raw logits and their token ids, sorted by value descending then
-    token id ascending. That is exactly what ``_constrained_table`` builds for
-    itself from full logits (the top ``k + margin`` candidates in the same tie
-    order), so the table this builds holds the same ids and the same
-    probabilities for every position the support can decide. The walk after it
-    is ``_walk_table``, whose draws ``predraw_uniforms`` reproduces for a
-    ``fused_sample`` model.
+    token id ascending. For every position the support can decide, the table
+    this builds (``_support_table``) holds the ids and probabilities the same
+    top-k and top-p cut keeps over the full logits, a top-p cut inside a tie
+    group keeping its lowest ids. The walk after it is ``_walk_table``, whose
+    draws ``predraw_uniforms`` reproduces for a ``fused_sample`` model.
 
     Greedy rows accept by comparing ids with ``argmax_ids``, which is the
     verify's own argmax of the same logits. Random rows need a top_k in
@@ -663,9 +661,6 @@ def accept_sampled_support(
     reference path, called at most once per step. The penalties, the token
     filters, the grammar and logprobs all need the full vocabulary and are
     refused here: ``params_support_servable`` keeps such rows off this walk.
-
-    VLLM_TT_SPEC_TOPK_AUDIT=1 fetches the full logits on every step and checks
-    the support table against the full-logits table, for device validation.
 
     ``uniforms`` (``[rows, 1+K+1]``, ``predraw_uniforms``' table) replaces every
     draw the walk would make: nothing is drawn and no generator advances. It is
@@ -703,9 +698,6 @@ def accept_sampled_support(
             vocab,
             fetch,
         )
-        if _audit_enabled():
-            _SUPPORT_STATS.add(audit_steps=1)
-            _audit_support_table(table, fetch, is_greedy, sampling, rows, width, m)
         random = _walk_table(
             table,
             draft_token_ids,
@@ -876,76 +868,6 @@ def params_fused_servable(
     return _controls_servable(params, output_len, grammar_ok)
 
 
-def device_topk_enabled() -> bool:
-    """Whether the runner may ask for the ``topk`` accept mode.
-
-    VLLM_TT_SPEC_DEVICE_TOPK (default 1; 0 turns it off)
-    opts out; the support walk is the fast path's arithmetic, so it also needs
-    the fast path on and the reference tie order off.
-    """
-    return (
-        os.environ.get("VLLM_TT_SPEC_DEVICE_TOPK", "1") != "0"
-        and _fast_enabled()
-        and not _tie_exact()
-    )
-
-
-def fused_sample_enabled() -> bool:
-    """Whether the runner may ask for the ``fused_sample`` accept mode.
-
-    VLLM_TT_SPEC_FUSED (default 1; 0 turns it off). The model must also offer
-    the mode, and the step's rows must all be greedy (stage S1).
-    """
-    return os.environ.get("VLLM_TT_SPEC_FUSED", "1") != "0"
-
-
-def fused_sampled_enabled() -> bool:
-    """Whether a ``fused_sample`` step may also carry sampled rows (stage S2).
-
-    VLLM_TT_SPEC_FUSED_SAMPLED (default 1; 0 keeps every step with a sampled
-    row on the ``topk`` / ``logits`` modes). Read only for steps that have a
-    sampled row; a greedy-only step is stage S1 whatever this says.
-    """
-    return os.environ.get("VLLM_TT_SPEC_FUSED_SAMPLED", "1") != "0"
-
-
-def spec_chain_enabled() -> bool:
-    """Whether the runner may chain a fused verify onto the one still in flight.
-
-    VLLM_TT_SPEC_CHAIN (default 0; 1 turns it on). Stage S4: the device builds
-    the next verify's inputs from the pending one, so the host submits step n+1
-    before step n's result is read. Off, nothing in the runner or the async
-    controller changes: every verify drains its predecessor as before. The
-    model must also declare ``supports_async_spec_decode``, which it does only
-    when it runs chain and fused.
-    """
-    return os.environ.get("VLLM_TT_SPEC_CHAIN", "0") not in ("", "0")
-
-
-def spec_prefill_overlap_enabled() -> bool:
-    """Whether a prefill step may be submitted behind a pending fused verify.
-
-    VLLM_TT_SPEC_PREFILL_OVERLAP (default 1; 0 turns it off). Chain mode only.
-    A prefill reads nothing the in-flight verify produces, the device queue is
-    in order and vLLM returns the verify output first, so the runner need not
-    drain the verify before it builds and submits the prefill. Off, every
-    prefill drains the verify as before. The model must also declare
-    ``supports_prefill_over_pending_spec``.
-    """
-    return os.environ.get("VLLM_TT_SPEC_PREFILL_OVERLAP", "1") != "0"
-
-
-def spec_chain_sampled_enabled() -> bool:
-    """Whether a fused step with a sampled row may be chained or deferred.
-
-    VLLM_TT_SPEC_CHAIN_SAMPLED (default 0; 1 allows it, stage S4a). Until
-    sampled overflow is handled for deferred steps, 0 keeps every fused step
-    with a non-greedy row synchronous (stage S2, host overflow redo) and
-    refuses to chain onto or from one. Greedy-only steps are unaffected.
-    """
-    return os.environ.get("VLLM_TT_SPEC_CHAIN_SAMPLED", "0") not in ("", "0")
-
-
 def predraw_uniforms(
     generators: dict[int, torch.Generator],
     rows: int,
@@ -1004,10 +926,6 @@ def predraw_uniforms(
         )[0]
     table = torch.cat([draws[:, :1], accepts, draws[:, 1:2]], dim=1).to(torch.float32)
     return table.clamp(max=float(torch.nextafter(torch.tensor(1.0), torch.tensor(0.0))))
-
-
-def _audit_enabled() -> bool:
-    return os.environ.get("VLLM_TT_SPEC_TOPK_AUDIT", "0") == "1"
 
 
 def _commit_walks(
@@ -1142,24 +1060,6 @@ def _random_walk(
     return accepted, candidates
 
 
-def _fast_enabled() -> bool:
-    return os.environ.get("VLLM_TT_SPEC_FAST_TOPK", "1") != "0"
-
-
-def _tie_exact() -> bool:
-    """True when a top-p cut inside a tie group must follow the reference sort.
-
-    The reference sort is unstable, so which members of a tie group survive a
-    top-p cut is an accident of the sort. Matching it needs a full-vocabulary
-    sort (about 20 ms per position on the host), and bf16 logits tie often
-    enough that most live steps paid it. Off by default: the cut then keeps
-    the lowest token ids of the group. The kept probabilities are the same
-    values as the reference's, and only which of the equal-logit tokens holds
-    them can differ. Set VLLM_TT_SPEC_TIE_EXACT=1 for the reference's choice.
-    """
-    return os.environ.get("VLLM_TT_SPEC_TIE_EXACT", "0") == "1"
-
-
 def _constrained_probs(
     target_logits: torch.Tensor,
     temperature: torch.Tensor,
@@ -1266,20 +1166,13 @@ def _reference_top_k_top_p(
     return apply_top_k_top_p_pytorch(flat, k, p)
 
 
-# Largest top_k the fast path serves, and the extra candidates it keeps so
-# that ties at the k-th value are seen. A row whose ties overflow the margin
-# takes the reference path.
-_FAST_TOPK_MAX = 1024
-_FAST_TOPK_MARGIN = 64
-
-
 class _ProbTable:
     """Per-position target probabilities, stored by support where it is small.
 
     ``N = rows * width`` flat positions. A sparse position keeps its candidate
     token ids and their probabilities (everything else is exactly 0). A dense
-    position keeps all ``vocab`` probabilities; those are rows with no top-k
-    (or one the fast path cannot serve) and cost what the old path cost.
+    position keeps all ``vocab`` probabilities: a position the support cannot
+    decide, taken from the fetched full logits.
     """
 
     def __init__(self, n: int, vocab: int):
@@ -1383,76 +1276,6 @@ def _inverse_cdf(weights: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     return torch.minimum(pick, last_positive)
 
 
-def _constrained_table(
-    target_logits: torch.Tensor,
-    temperature: torch.Tensor,
-    top_k: torch.Tensor | None,
-    top_p: torch.Tensor | None,
-) -> _ProbTable:
-    """The same probabilities as the reference path, without full-vocab work.
-
-    Same masks as ``apply_top_k_top_p_pytorch`` followed by a softmax: top-k
-    keeps every logit ``>=`` the k-th largest (ties kept), then top-p drops
-    the ascending-cumsum prefix ``<= 1 - p`` but always keeps the largest. Both
-    are evaluated on the top ``k_max + margin`` candidates only, which holds
-    every survivor of top-k. Temperature is applied to the candidates, which is
-    the same division of the same values; it is monotone, so the candidates of
-    the raw logits are the candidates of the tempered ones. Rows the candidates
-    cannot decide (top-k off or above the cap with top-p active, tie overflow,
-    a top-p cut inside a group of equal logits) use the reference path.
-    """
-    rows, width, vocab = target_logits.shape
-    n = rows * width
-    flat = target_logits.reshape(n, vocab)
-    temp = _expand_to_columns(_safe_temperature(temperature), width).to(torch.float32)
-    k = None if top_k is None else _expand_to_columns(top_k, width)
-    p = None if top_p is None else _expand_to_columns(top_p, width)
-
-    off = torch.zeros(n, dtype=torch.bool)
-    k_on = off if k is None else (k > 0) & (k < vocab)
-    p_on = off if p is None else p < 1.0
-    active = k_on | p_on
-    fast = off if k is None else k_on & (k <= _FAST_TOPK_MAX)
-    fallback = active & ~fast
-
-    table = _ProbTable(n, vocab)
-    dense_ids = (~active).nonzero().squeeze(1)
-    dense_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
-    if dense_ids.numel():
-        sub = flat[dense_ids].to(torch.float32) / temp[dense_ids].unsqueeze(1)
-        dense_rows.append((dense_ids, sub.softmax(dim=-1)))
-
-    if bool(fast.any()):
-        ids = fast.nonzero().squeeze(1)
-        sub = flat if ids.numel() == n else flat[ids]
-        k_f = k[ids].to(torch.long)
-        cand = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
-        vals, idx = torch.topk(sub, cand, dim=-1)
-        vals, idx, overflow = _support_cut(
-            vals, idx, temp[ids], k_f, None if p is None else p[ids], cand < vocab
-        )
-        ok = ~overflow
-        if bool(ok.any()):
-            table.set_sparse(
-                ids[ok], idx[ok], vals[ok].softmax(dim=-1, dtype=torch.float32)
-            )
-        if bool(overflow.any()):
-            fallback = fallback.clone()
-            fallback[ids[overflow]] = True
-
-    if bool(fallback.any()):
-        ids = fallback.nonzero().squeeze(1)
-        k_ref = None if k is None else torch.where(k_on, k, vocab)[ids]
-        p_ref = None if p is None else p[ids]
-        dense_rows.append((ids, _reference_rows(flat[ids], temp[ids], k_ref, p_ref)))
-
-    if dense_rows:
-        table.set_dense(
-            torch.cat([i for i, _ in dense_rows]), torch.cat([d for _, d in dense_rows])
-        )
-    return table
-
-
 def _support_cut(
     vals: torch.Tensor,
     idx: torch.Tensor,
@@ -1472,14 +1295,13 @@ def _support_cut(
     members past it, unless ``can_overflow`` says the candidates are the
     whole vocabulary (or, per position, that the cut is not read at all).
     """
-    cand = int(vals.shape[1])
-    if not _tie_exact():
-        # A fixed tie order: value descending, token id ascending. The
-        # top-p cut below then drops the highest ids of a tie group first.
-        by_id = idx.argsort(dim=1)
-        idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
-        vals, by_value = vals.sort(dim=1, descending=True, stable=True)
-        idx = idx.gather(1, by_value)
+    # A fixed tie order: value descending, token id ascending. The top-p cut
+    # below then drops the highest ids of a tie group first, which is the
+    # order a ``topk`` or ``fused_sample`` verify's support arrives in.
+    by_id = idx.argsort(dim=1)
+    idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
+    vals, by_value = vals.sort(dim=1, descending=True, stable=True)
+    idx = idx.gather(1, by_value)
     vals = vals.to(torch.float32) / temp.unsqueeze(1)
     kth = vals.gather(1, (k - 1).unsqueeze(1))
     keep = vals >= kth
@@ -1493,14 +1315,6 @@ def _support_cut(
         cum = torch.cumsum(vals.softmax(dim=-1).flip(-1), dim=-1).flip(-1)
         drop = cum <= (1 - p).unsqueeze(1)
         drop[:, 0] = False
-        if _tie_exact():
-            # The reference sort is not stable, so when the cut falls
-            # inside a group of equal logits it keeps an arbitrary member
-            # of the group. Such a row takes the reference path to match.
-            kept = (~drop).sum(dim=1, keepdim=True)
-            nxt = vals.gather(1, kept.clamp(max=cand - 1))
-            last = vals.gather(1, kept - 1)
-            overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
         vals = vals.masked_fill(drop, float("-inf"))
     return vals, idx, overflow
 
@@ -1563,15 +1377,14 @@ def _support_table(
     vocab: int,
     fetch: _FetchOnce | None,
 ) -> _ProbTable:
-    """``_constrained_table`` from a verify's exact top-M support.
+    """The walk's probability table from a verify's exact top-M support.
 
-    The candidates are already the top M by value in the fixed tie order, so
-    ``_support_cut`` applies the same top-k, overflow and top-p arithmetic to
-    them as the fast path applies to its own ``torch.topk`` candidates; the
-    kept prefix of a decidable position is the same ids with the same
-    tempered values, so its softmax is bit-identical. A position the support
-    cannot decide is sampled from the fetched full logits by the reference
-    path, as the fast path's own overflow rows are.
+    The candidates are already the top M by value in the fixed tie order, and
+    ``_support_cut`` applies top-k, the overflow rule and top-p to them. The
+    kept prefix of a decidable position holds the ids and tempered values the
+    same cut would keep over the full logits, so its softmax is the same. A
+    position the support cannot decide is taken from the fetched full logits
+    through vLLM's sorted top-k/top-p (``_reference_rows``).
 
     Greedy positions (temperature 0) take part so that the batched draws of
     the walk stay in step with the full-logits walk; their results are
@@ -1623,49 +1436,6 @@ def _support_table(
         p_ref = None if p is None else p[ids]
         table.set_dense(ids, _reference_rows(full[ids], temp[ids], k_ref, p_ref))
     return table
-
-
-def _audit_support_table(
-    table: _ProbTable,
-    fetch: _FetchOnce | None,
-    is_greedy: torch.Tensor,
-    sampling: SpecSamplingInputs,
-    rows: int,
-    width: int,
-    m: int,
-) -> None:
-    """VLLM_TT_SPEC_TOPK_AUDIT: the support table equals the full-logits table.
-
-    For every sampled position the kept token set must be identical and the
-    probabilities equal (bit-identical where both are sparse; the reference
-    path's dense rows differ by rounding). Raises with the first offending
-    position; costs a full-logits readback per step, so it is a validation
-    switch, not a serving mode.
-    """
-    if fetch is None:
-        raise ValueError(
-            "VLLM_TT_SPEC_TOPK_AUDIT=1 needs a verify that offers fetch_logits"
-        )
-    full = fetch()
-    reference = _constrained_table(
-        full, sampling.temperature, sampling.top_k, sampling.top_p
-    ).to_dense()
-    got = table.to_dense()
-    sampled = _expand_to_columns(~is_greedy, width)
-    for flat in sampled.nonzero().view(-1).tolist():
-        want, have = reference[flat], got[flat]
-        if not torch.equal(want > 0, have > 0) or not torch.allclose(
-            want, have, rtol=1e-6, atol=1e-9
-        ):
-            diff = (want - have).abs()
-            token = int(diff.argmax())
-            raise AssertionError(
-                f"topk audit: row {flat // width} column {flat % width} differs "
-                f"from the full-logits table at token {token}: support "
-                f"{float(have[token]):.9g} vs full {float(want[token]):.9g} "
-                f"(support size {int((have > 0).sum())}, full {int((want > 0).sum())}, "
-                f"M={m})"
-            )
 
 
 def _walk_table(
@@ -2175,12 +1945,6 @@ def _check_support_inputs(
             "whole vocabulary; the runner asks for the topk mode only when no "
             "live row carries them (params_support_servable)"
         )
-    if not _fast_enabled() or _tie_exact():
-        raise ValueError(
-            "accept_sampled_support is the fast top-k path's arithmetic; a "
-            "launch with VLLM_TT_SPEC_FAST_TOPK=0 or VLLM_TT_SPEC_TIE_EXACT=1 "
-            "must not ask for the topk mode (device_topk_enabled)"
-        )
     return rows, width, m, vocab
 
 
@@ -2348,7 +2112,6 @@ __all__ = [
     "apply_speculative_penalties",
     "apply_speculative_token_filters",
     "committed_logprobs",
-    "device_topk_enabled",
     "params_fused_servable",
     "params_support_servable",
 ]

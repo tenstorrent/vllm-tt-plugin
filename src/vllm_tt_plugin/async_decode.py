@@ -22,9 +22,6 @@ from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
 )
 from vllm_tt_plugin.spec_accept import (
-    spec_chain_enabled,
-    spec_chain_sampled_enabled,
-    spec_prefill_overlap_enabled,
     support_fallback_stats,
 )
 from vllm_tt_plugin.spec_decode import (
@@ -516,7 +513,7 @@ class TTAsyncDecodeController:
         self._logits_verify_submissions = 0
         self._topk_verify_submissions = 0
         self._fused_verify_submissions = 0
-        # Chain mode (VLLM_TT_SPEC_CHAIN). The newest fused step that was
+        # Chain mode (``chain_enabled``). The newest fused step that was
         # submitted with a deferred handle, its rows and its tip id: the only
         # step a following verify may chain onto. Cleared by any later step.
         self._last_fused_step: DeferredDecodeOutput | None = None
@@ -543,7 +540,7 @@ class TTAsyncDecodeController:
         self._chain_breaks: Counter[str] = Counter()
         self._pending_break_reason: str | None = None
         # Prefill steps that did not drain a pending fused verify
-        # (VLLM_TT_SPEC_PREFILL_OVERLAP).
+        # (``prefill_overlap_allowed``).
         self._prefill_overlap_steps = 0
         # The verify a prefill was submitted behind: its rows left the
         # persistent batch at that prefill, so nothing may chain onto it.
@@ -850,18 +847,16 @@ class TTAsyncDecodeController:
             return True
         return self.plan_decode_reload(model_input).overlap_safe
 
-    # region Chain mode (VLLM_TT_SPEC_CHAIN)
+    # region Chain mode
 
     def chain_enabled(self) -> bool:
         """Whether this launch may chain a fused verify onto the one in flight.
 
-        The env gate, async scheduling with speculation, and a model that
-        declares ``supports_async_spec_decode``, which by contract it does only
-        when it runs chain and fused. Checked first so that with the gate off
-        nothing below runs.
+        Async scheduling with speculation, and a model that declares
+        ``supports_async_spec_decode``, which by contract it does only when it
+        runs chain and fused. Checked first so that without it nothing below
+        runs.
         """
-        if not spec_chain_enabled():
-            return False
         runner = self.runner
         if not getattr(runner, "async_decode_scheduling", False):
             return False
@@ -958,14 +953,12 @@ class TTAsyncDecodeController:
 
         Asked only once ``chain_blocker`` has answered "prefill". The step must
         be all prefill with no resumed request and no multimodal input, the
-        model must declare ``supports_prefill_over_pending_spec`` and
-        VLLM_TT_SPEC_PREFILL_OVERLAP must not be 0. A resumed request still
+        model must declare ``supports_prefill_over_pending_spec``. A resumed
+        request still
         drains: ``apply_ready_completed_decode_steps`` assumes its completed
         steps are ordered oldest to newest for the forced-reset discard counts.
         """
         if scheduler_output is None or not self.chain_enabled():
-            return False
-        if not spec_prefill_overlap_enabled():
             return False
         runner = self.runner
         capabilities = getattr(runner.model, "model_capabilities", {}) or {}
@@ -2131,17 +2124,9 @@ class TTAsyncDecodeController:
             if (
                 async_read
                 and self.chain_enabled()
-                # A sampled step stays synchronous (stage S2, host overflow
-                # redo) until deferred steps handle sampled overflow. A
-                # certificate row (top_k 0) can fail and be redone on the
-                # host, so it stays synchronous even when sampled steps chain.
-                and (
-                    spec_sampling is None
-                    or (
-                        spec_chain_sampled_enabled()
-                        and not spec_sampling_has_certificate_row(spec_sampling)
-                    )
-                )
+                # A certificate row (top_k 0) can fail and be redone on the
+                # host, so a step that carries one stays synchronous.
+                and not spec_sampling_has_certificate_row(spec_sampling)
             ):
                 # Chain mode: enqueue only, the reader thread waits on the
                 # returned handle. Sent on every fused step, not only a chained

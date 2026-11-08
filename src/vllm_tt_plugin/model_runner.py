@@ -89,16 +89,11 @@ from vllm_tt_plugin.spec_accept import (
     AcceptResult,
     accept_sampled_drafts,
     accept_sampled_support,
-    device_topk_enabled,
-    fused_sample_enabled,
-    fused_sampled_enabled,
     has_mask_control,
     mask_row_refusal,
     params_fused_servable,
     params_support_servable,
     predraw_uniforms,
-    spec_chain_enabled,
-    spec_chain_sampled_enabled,
     spec_sampling_inputs,
 )
 from vllm_tt_plugin.spec_admission import method_requirements
@@ -760,7 +755,8 @@ class TTModelRunner:
         # consumes them in _drafts_to_verify within the scheduled lookahead
         # reservation. Each consumer takes a proposal only once.
         self._proposed_draft_token_ids: dict[str, list[int]] = {}
-        # Chain mode only (VLLM_TT_SPEC_CHAIN). ``_chain_len`` is a request's
+        # Chain mode only (``TTAsyncDecodeController.chain_enabled``).
+        # ``_chain_len`` is a request's
         # optimistic length at its newest chained build: the applied length plus
         # K+1 per verify still in flight, an upper bound of the real one, so a
         # provisional position never falls below the real position.
@@ -2017,11 +2013,6 @@ class TTModelRunner:
             # The certificate can fail; the model redoes that step on the host
             # before the next one is enqueued, so it runs synchronously.
             return "device_top_p", None
-        if not spec_chain_sampled_enabled() and not all(
-            self._request_is_argmax_certifiable(r) for r in req_ids
-        ):
-            # A sampled row runs the synchronous S2 step (host overflow redo).
-            return "sampled", None
         if self._spec_supports_narrow_decode and not any(hints.values()):
             return "no_drafts", None
         return None, (chain_len, hints)
@@ -2049,6 +2040,15 @@ class TTModelRunner:
             if worst_case_row_empty(params, output_len, vocab_size):
                 return "mask_empty_risk"
         return None
+
+    def _chain_enabled(self) -> bool:
+        """Whether this launch chains fused verifies (``chain_enabled``).
+
+        Called unbound: a synchronous runner double in the host tests has no
+        async controller, and such a runner never chains.
+        """
+        controller = getattr(self, "async_decode", None)
+        return controller is not None and controller.chain_enabled()
 
     def _chain_build_plan(
         self, scheduler_output: SchedulerOutput, row_req_ids: list[str]
@@ -2258,10 +2258,10 @@ class TTModelRunner:
         ids rather than ``[B, 1+K, V]`` logits. One row that needs its target
         distribution makes the whole step ``logits``: the mode is per step, and
         that row would otherwise commit the argmax even with no draft of its
-        own. Between the two, ``topk`` (offered by the model and opted in with
-        VLLM_TT_SPEC_DEVICE_TOPK) when every row is either certifiable or
-        support-servable (``_request_is_support_servable``): it reads back
-        ``[B, 1+K, M]`` candidates and commits what ``logits`` would.
+        own. Between the two, ``topk`` (when the model offers it) when every
+        row is either certifiable or support-servable
+        (``_request_is_support_servable``): it reads back ``[B, 1+K, M]``
+        candidates and samples from them (``accept_sampled_support``).
 
         A structured row makes the step ``logits`` (the walk applies its
         bitmask) except while its reasoning phase is open and none of this
@@ -2290,7 +2290,7 @@ class TTModelRunner:
             self._request_is_argmax_certifiable(r, grammar_ok=r in grammar_ok)
             for r in row_req_ids
         ]
-        topk_offered = ACCEPT_MODE_TOPK in modes and device_topk_enabled()
+        topk_offered = ACCEPT_MODE_TOPK in modes
         support_ok = topk_offered and all(
             ok
             or self._request_is_support_servable(
@@ -2310,7 +2310,7 @@ class TTModelRunner:
             )
             for ok, req_id in zip(certifiable, row_req_ids)
         )
-        if ACCEPT_MODE_FUSED_SAMPLE in modes and fused_sample_enabled():
+        if ACCEPT_MODE_FUSED_SAMPLE in modes:
             if all(certifiable):
                 # Stage S1: greedy rows only. The device accepts and commits,
                 # and the runner reads back ids and counts.
@@ -2321,8 +2321,7 @@ class TTModelRunner:
                 # (``_request_is_fused_servable``). The runner draws the
                 # uniforms (``fused_spec_sampling``); a seeded row with no
                 # draft needs the full-vocabulary race.
-                fused_sampled_enabled()
-                and fused_ok
+                fused_ok
                 and not self._seeded_row_without_drafts(row_req_ids, num_valid_drafts)
             ):
                 return ACCEPT_MODE_FUSED_SAMPLE
@@ -3464,7 +3463,7 @@ class TTModelRunner:
             device_sampled = None  # a prefill step decides at its submission
         else:
             chain = None
-            if self._num_speculative_tokens and spec_chain_enabled():
+            if self._num_speculative_tokens and TTModelRunner._chain_enabled(self):
                 # May apply a step that resolved since the pre-build apply, so
                 # the lengths are read after it.
                 chain = self._chain_build_plan(scheduler_output, row_req_ids)
@@ -3958,12 +3957,7 @@ class TTModelRunner:
         seeded row with no draft, then the sampled-fused switch.
         """
         modes = getattr(self, "_spec_accept_modes", ()) or ()
-        if not (
-            ACCEPT_MODE_FUSED_SAMPLE in modes
-            and fused_sample_enabled()
-            and ACCEPT_MODE_TOPK in modes
-            and device_topk_enabled()
-        ):
+        if not (ACCEPT_MODE_FUSED_SAMPLE in modes and ACCEPT_MODE_TOPK in modes):
             count_logits_reason("launch_off")
             return
         plan = getattr(self, "_spec_plan", None)
@@ -3995,8 +3989,6 @@ class TTModelRunner:
                 return
         if self._seeded_row_without_drafts(row_req_ids, num_valid_drafts):
             count_logits_reason("seed_no_draft")
-        elif not fused_sampled_enabled():
-            count_logits_reason("sampled_off")
         else:
             count_logits_reason("other")
 
@@ -4068,7 +4060,7 @@ class TTModelRunner:
             # declares ``supports_async_spec_decode`` follows its rows through
             # the slot remap, and it owns no reset_batch for a verify.
             and (
-                not spec_chain_enabled()
+                not TTModelRunner._chain_enabled(self)
                 or self.async_decode.chain_forces_drain(scheduler_output)
             )
         ):
@@ -4410,7 +4402,7 @@ class TTModelRunner:
         )
         # Chain mode: before anything may drain, remember who finished, so the
         # late output of a verify already in flight for them is discarded.
-        if spec_chain_enabled():
+        if TTModelRunner._chain_enabled(self):
             self.async_decode.note_finished_requests(scheduler_output.finished_req_ids)
         if self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output

@@ -52,6 +52,7 @@ from .test_spec_chain_async import (
     GREEDY,
     SAMPLED,
     Engine,
+    _chain_off,
     _controller,
     _decode_so,
     _make_runner,
@@ -73,14 +74,6 @@ CAND = 8
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    for name in (
-        "VLLM_TT_SPEC_FUSED",
-        "VLLM_TT_SPEC_FUSED_SAMPLED",
-        "VLLM_TT_SPEC_CHAIN",
-        "VLLM_TT_SPEC_CHAIN_SAMPLED",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
     reset_device_penalty_stats()
 
 
@@ -525,8 +518,6 @@ def _blocker(params, *, cap=True, current=True, rows=("a", "p")):
 
 
 def test_penalty_rows_chain_only_with_the_capability_and_a_current_state(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     assert _blocker(_params(presence_penalty=0.5)) is None
     assert _blocker(_params(repetition_penalty=1.2, temperature=0.8, top_k=5)) is None
     assert _blocker(_params(presence_penalty=0.5), cap=False) == "penalties"
@@ -641,11 +632,10 @@ def _truth(runner):
 
 
 def _run(monkeypatch, *, steps=16, chain=True):
-    if chain:
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-        monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     model = PenaltyTarget()
     runner = _make_runner(model)
+    if not chain:
+        _chain_off(runner)
     _caps(runner, False, False)
     _pen_caps(runner, True)
     model.truth = _truth(runner)
@@ -692,7 +682,7 @@ def test_the_sync_path_keeps_the_same_invariant(monkeypatch):
 
 def test_a_logits_step_in_between_makes_the_next_fused_step_rebuild(monkeypatch):
     model = PenaltyTarget()
-    runner = _make_runner(model)
+    runner = _chain_off(_make_runner(model))
     _caps(runner, False, False)
     _pen_caps(runner, True)
     model.truth = _truth(runner)
@@ -726,8 +716,6 @@ def test_a_logits_step_in_between_makes_the_next_fused_step_rebuild(monkeypatch)
 def test_with_the_capability_off_a_penalty_run_never_reaches_the_fused_path(
     monkeypatch,
 ):
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN_SAMPLED", "1")
     model = PenaltyTarget()
     runner = _make_runner(model)
     _caps(runner, False, False)

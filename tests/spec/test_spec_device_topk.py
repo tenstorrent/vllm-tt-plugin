@@ -6,9 +6,9 @@ A ``topk`` verify returns, per candidate column, the M largest raw logits
 and their token ids in the support table's tie order (value descending, token
 id ascending) plus the verify argmax and a lazy full-logits fetch. These tests
 hold the support walk to the same walk over the table built from the full
-logits (``_constrained_table``): the same probability table for every
-position the support can decide, the same committed tokens and the same
-consumption of every generator, bit for bit; one full-logits fetch for the
+logits (``support_table_reference.constrained_table``): the same probability
+table for every position the support can decide, the same committed tokens
+and the same consumption of every generator, bit for bit; one full-logits fetch for the
 positions it cannot decide; and refusal of every row the runner must not
 route here. The runner tests hold ``_spec_mode_for_step`` to the eligibility
 rules and the flags, and drive a seeded sampled request through the topk mode
@@ -28,14 +28,9 @@ from vllm_tt_plugin.spec_accept import (
     SpecPenalties,
     SpecSamplingInputs,
     SpecTokenFilters,
-    _commit_walks,
-    _constrained_table,
     _FetchOnce,
-    _greedy_walk,
     _support_table,
-    _walk_table,
     accept_sampled_support,
-    device_topk_enabled,
     params_support_servable,
 )
 from vllm_tt_plugin.spec_admission import resolve_speculative_plan
@@ -51,6 +46,7 @@ from vllm_tt_plugin.spec_decode import (
 )
 
 from .sampled_target import SampledTarget
+from .support_table_reference import constrained_table, full_logits_walk
 from .test_spec_sampled_runner import (
     DRAFT_LEN,
     GREEDY,
@@ -136,27 +132,6 @@ def sampling_inputs(rows, temperature, top_k, top_p, seeds) -> SpecSamplingInput
     )
 
 
-def full_logits_walk(
-    logits: torch.Tensor,
-    drafts: torch.Tensor,
-    num_valid: torch.Tensor,
-    sampling: SpecSamplingInputs,
-):
-    """The support modes' walk over the table built from the full logits."""
-    rows, width, vocab = logits.shape
-    is_greedy = sampling.temperature <= 0.0
-    greedy = _greedy_walk(logits, drafts, width - 1) if bool(is_greedy.any()) else None
-    random = None
-    if bool((~is_greedy).any()):
-        table = _constrained_table(
-            logits, sampling.temperature, sampling.top_k, sampling.top_p
-        )
-        random = _walk_table(
-            table, drafts, num_valid, sampling.generators, rows, width - 1, vocab
-        )
-    return _commit_walks(is_greedy, greedy, random, num_valid, rows, width)
-
-
 def generator_states(sampling: SpecSamplingInputs) -> dict[int, torch.Tensor]:
     return {row: g.get_state().clone() for row, g in sampling.generators.items()}
 
@@ -174,7 +149,7 @@ def test_the_support_table_is_the_full_logits_table_bit_for_bit(seed):
     temperature, top_k, top_p = controls(rows)
     values, ids = exact_support(logits, M)
 
-    reference = _constrained_table(logits, temperature, top_k, top_p)
+    reference = constrained_table(logits, temperature, top_k, top_p)
     fetch = _FetchOnce(lambda: logits, rows, width, V)
     table = _support_table(values, ids, temperature, top_k, top_p, V, fetch)
 
@@ -319,7 +294,7 @@ def test_a_tie_group_ending_exactly_at_the_support_boundary_is_undecidable():
     assert fetch.calls == 1, "a tie reaching the last candidate must fall back"
     assert torch.allclose(
         table.to_dense(),
-        _constrained_table(logits, temperature, top_k, None).to_dense(),
+        constrained_table(logits, temperature, top_k, None).to_dense(),
     )
     # Two tie members fewer: the group now ends at the 63rd candidate, the 64th
     # is strictly below the k-th value, and the column is decided from the
@@ -332,7 +307,7 @@ def test_a_tie_group_ending_exactly_at_the_support_boundary_is_undecidable():
     assert fetch.calls == 0
     assert torch.equal(
         table.to_dense(),
-        _constrained_table(logits, temperature, top_k, None).to_dense(),
+        constrained_table(logits, temperature, top_k, None).to_dense(),
     )
 
 
@@ -444,26 +419,6 @@ def test_controls_that_need_the_vocabulary_are_refused(field, value):
         )
 
 
-@pytest.mark.parametrize(
-    "env", [("VLLM_TT_SPEC_FAST_TOPK", "0"), ("VLLM_TT_SPEC_TIE_EXACT", "1")]
-)
-def test_the_support_walk_refuses_a_launch_without_the_fast_path(monkeypatch, env):
-    monkeypatch.setenv(*env)
-    rows, width = 1, K + 1
-    logits = tied_logits(4, rows, width)
-    values, ids = exact_support(logits, M)
-    drafts, num_valid = drafts_for(logits, 4)
-    sampling = SpecSamplingInputs(
-        vocab_size=V,
-        temperature=torch.ones(1),
-        top_k=torch.tensor([20], dtype=torch.int32),
-    )
-    with pytest.raises(ValueError, match="must not ask for the topk mode"):
-        accept_sampled_support(
-            logits.argmax(-1).to(torch.int32), values, ids, drafts, num_valid, sampling
-        )
-
-
 def test_malformed_support_tensors_are_refused_by_name():
     rows, width = 2, K + 1
     logits = tied_logits(6, rows, width)
@@ -487,37 +442,6 @@ def test_malformed_support_tensors_are_refused_by_name():
     bad[0, 0, 0] = V
     with pytest.raises(ValueError, match="topk_ids must lie in"):
         accept_sampled_support(argmax_ids, values, bad, drafts, num_valid, sampling)
-
-
-def test_the_audit_passes_on_a_matching_support_and_catches_a_wrong_one(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_TOPK_AUDIT", "1")
-    rows, width = 2, K + 1
-    logits = tied_logits(8, rows, width)
-    values, ids = exact_support(logits, M)
-    drafts, num_valid = drafts_for(logits, 8)
-    temperature, top_k, top_p = controls(rows)
-    argmax_ids = logits.argmax(-1).to(torch.int32)
-    accept_sampled_support(
-        argmax_ids,
-        values,
-        ids,
-        drafts,
-        num_valid,
-        sampling_inputs(rows, temperature, top_k, top_p, {}),
-        lambda: logits,
-    )
-    wrong = values.clone()
-    wrong[0, 0, 0] += 1.0  # a value the full logits do not hold
-    with pytest.raises(AssertionError, match="topk audit: row 0 column 0"):
-        accept_sampled_support(
-            argmax_ids,
-            wrong,
-            ids,
-            drafts,
-            num_valid,
-            sampling_inputs(rows, temperature, top_k, top_p, {}),
-            lambda: logits,
-        )
 
 
 # endregion
@@ -565,28 +489,6 @@ def _params(**kw) -> SamplingParams:
 )
 def test_params_support_servable(params, output_len, servable):
     assert params_support_servable(params, output_len, M) is servable
-
-
-@pytest.mark.parametrize(
-    "env, enabled",
-    [
-        ({}, True),
-        ({"VLLM_TT_SPEC_DEVICE_TOPK": "1"}, True),
-        ({"VLLM_TT_SPEC_DEVICE_TOPK": "0"}, False),
-        ({"VLLM_TT_SPEC_DEVICE_TOPK": "1", "VLLM_TT_SPEC_FAST_TOPK": "0"}, False),
-        ({"VLLM_TT_SPEC_DEVICE_TOPK": "1", "VLLM_TT_SPEC_TIE_EXACT": "1"}, False),
-    ],
-)
-def test_device_topk_enabled_reads_the_three_flags(monkeypatch, env, enabled):
-    for name in (
-        "VLLM_TT_SPEC_DEVICE_TOPK",
-        "VLLM_TT_SPEC_FAST_TOPK",
-        "VLLM_TT_SPEC_TIE_EXACT",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    assert device_topk_enabled() is enabled
 
 
 # endregion
@@ -725,44 +627,30 @@ def test_admission_refuses_topk_without_logits():
 SAMPLED = SamplingParams(temperature=1.0, top_k=5, seed=3, ignore_eos=True)
 
 
-@pytest.fixture
-def topk_on(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
-    monkeypatch.delenv("VLLM_TT_SPEC_FAST_TOPK", raising=False)
-    monkeypatch.delenv("VLLM_TT_SPEC_TIE_EXACT", raising=False)
-
-
 def _mode_for(runner, *req_ids) -> str:
     _step(runner, *req_ids)
     return _build(runner, *req_ids).spec_mode
 
 
-def test_a_servable_sampled_row_makes_the_verify_ask_for_topk(topk_on):
+def test_a_servable_sampled_row_makes_the_verify_ask_for_topk():
     model, runner = _topk_runner()
     _add_request(runner, "s", SAMPLED)
     assert _mode_for(runner, "s") == ACCEPT_MODE_TOPK
 
 
-def test_the_flag_off_keeps_the_verify_in_logits_mode(monkeypatch):
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "0")
-    model, runner = _topk_runner()
-    _add_request(runner, "s", SAMPLED)
-    assert _mode_for(runner, "s") == ACCEPT_MODE_LOGITS
-
-
-def test_a_model_without_topk_is_asked_for_logits(topk_on):
+def test_a_model_without_topk_is_asked_for_logits():
     model, runner = _topk_runner(SampledTarget())
     _add_request(runner, "s", SAMPLED)
     assert _mode_for(runner, "s") == ACCEPT_MODE_LOGITS
 
 
-def test_a_greedy_batch_still_asks_for_argmax_ids(topk_on):
+def test_a_greedy_batch_still_asks_for_argmax_ids():
     model, runner = _topk_runner()
     _add_request(runner, "g", GREEDY)
     assert _mode_for(runner, "g") == ACCEPT_MODE_ARGMAX_IDS
 
 
-def test_a_greedy_row_beside_a_servable_sampled_row_keeps_topk(topk_on):
+def test_a_greedy_row_beside_a_servable_sampled_row_keeps_topk():
     model, runner = _topk_runner()
     _add_request(runner, "g", GREEDY, first_token=1)
     _add_request(runner, "s", SAMPLED, first_token=9)
@@ -801,7 +689,7 @@ def test_a_greedy_row_beside_a_servable_sampled_row_keeps_topk(topk_on):
         "min_tokens",
     ],
 )
-def test_one_row_the_support_cannot_serve_makes_the_whole_step_logits(topk_on, params):
+def test_one_row_the_support_cannot_serve_makes_the_whole_step_logits(params):
     model, runner = _topk_runner()
     _add_request(runner, "s", SAMPLED, first_token=1)
     _add_request(runner, "x", params, first_token=9)
@@ -818,9 +706,8 @@ def _speculate(runner, req_id: str, count: int) -> tuple[list[int], list[int]]:
     return _output(runner, req_id)[:count], widths
 
 
-def test_topk_speculation_repeats_a_seeded_stream(monkeypatch):
+def test_topk_speculation_repeats_a_seeded_stream():
     """The same seeded request, drafted the same way, twice in topk mode."""
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
     streams = []
     for _ in range(2):
         model, runner = _topk_runner()
@@ -839,7 +726,7 @@ def test_topk_speculation_repeats_a_seeded_stream(monkeypatch):
     assert streams[0] == streams[1]
 
 
-def test_padding_rows_commit_the_verify_argmax_in_topk_mode(topk_on):
+def test_padding_rows_commit_the_verify_argmax_in_topk_mode():
     model, runner = _topk_runner()
     _add_request(runner, "s", SAMPLED)
     _step(runner, "s")
@@ -862,7 +749,7 @@ def test_padding_rows_commit_the_verify_argmax_in_topk_mode(topk_on):
     assert 1 <= int(counts[0]) <= width
 
 
-def test_a_support_of_the_wrong_width_is_refused_by_name(topk_on):
+def test_a_support_of_the_wrong_width_is_refused_by_name():
     model, runner = _topk_runner()
     _add_request(runner, "s", SAMPLED)
     _step(runner, "s")
@@ -886,7 +773,7 @@ def test_a_support_of_the_wrong_width_is_refused_by_name(topk_on):
         runner.walk_spec_acceptance(model_input, verify.topk_values)
 
 
-def test_a_topk_verify_disables_device_sampling(topk_on):
+def test_a_topk_verify_disables_device_sampling():
     model, runner = _topk_runner()
     _add_request(runner, "s", SAMPLED)
     _step(runner, "s")

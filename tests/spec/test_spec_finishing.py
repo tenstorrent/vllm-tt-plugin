@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -41,15 +40,6 @@ from .test_spec_chain_async import (
     _decode_so,
     _make_runner,
 )
-
-
-@pytest.fixture(autouse=True)
-def _env(monkeypatch):
-    for name in ("VLLM_TT_SPEC_FUSED", "VLLM_TT_SPEC_FUSED_SAMPLED"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
-
 
 # region Detection (the vLLM skip condition)
 

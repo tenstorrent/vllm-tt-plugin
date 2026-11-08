@@ -80,8 +80,8 @@ serve speculative decoding within the following execution limits:
   them; `fused_sample` (stage S1) is an extra mode, never enough alone. An ordinary narrow decode does not
   send `spec_mode`. A model offering `logits` may also offer **`topk`**: the
   exact top-M candidates of every column instead of the full vocabulary, which
-  the runner asks for, unless `VLLM_TT_SPEC_DEVICE_TOPK=0`, on a sampled step
-  whose rows the support can serve (section 4j).
+  the runner asks for on a sampled step whose rows the support can serve
+  (section 4j).
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
@@ -167,7 +167,7 @@ launches without `speculative_config`.
 | `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
-| `supports_prefill_over_pending_spec` | `False` | `prefill_forward` may run while one deferred fused verify is in flight, and that verify stays readable afterwards: see section 4k. Only used with `VLLM_TT_SPEC_CHAIN=1`. |
+| `supports_prefill_over_pending_spec` | `False` | `prefill_forward` may run while one deferred fused verify is in flight, and that verify stays readable afterwards: see section 4k. Only used in chain mode. |
 | `supports_spec_device_logprobs` | `False` | A `fused_sample` verify returns `SpecCandidates` for a step with a logprobs row: see section 4l. |
 | `supports_spec_device_top_p` | `False` | A `fused_sample` verify serves a sampled row with `top_k` off and `top_p < 1` under a certificate: see section 4l. |
 | `supports_spec_device_penalties` | `False` | A `fused_sample` verify applies repetition, presence and frequency penalties on the device and keeps their state: see section 4m. |
@@ -294,8 +294,8 @@ step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 every live batch size the launch admits has a draft cap.
 
 **`fused_sample`, stage S1 (greedy rows only).** The runner asks for
-`fused_sample` on a step when the model offers it, `VLLM_TT_SPEC_FUSED` is not
-`0` (default `1`), and every live row is greedy-certifiable (the same test that
+`fused_sample` on a step when the model offers it and every live row is
+greedy-certifiable (the same test that
 gates `argmax_ids`); one other row sends the whole step to `topk` or `logits`
 as before, so a plan offering `fused_sample` must also offer `argmax_ids` or
 `logits`. The call is `decode_forward` exactly as for `argmax_ids`, with
@@ -307,8 +307,7 @@ commits the fields as given, under `AcceptResult`'s rules, then calls
 `propose_draft_tokens` as for any other mode.
 
 **`fused_sample`, stage S2 (sampled rows).** The same mode also serves a step
-with sampled rows when the model offers `topk` too, `VLLM_TT_SPEC_FUSED_SAMPLED`
-is not `0` (default `1`), every row is greedy-certifiable or support-servable
+with sampled rows when the model offers `topk` too, every row is greedy-certifiable or support-servable
 (the rule that gates `topk`, so `top_k` is in `[1, topk_candidates - 1]` on a
 sampled row), and no seeded row has zero valid drafts (that bonus is a
 full-vocabulary exponential race the device cannot run; such a step keeps
@@ -1271,10 +1270,10 @@ admission.
 A `logits` verify moves `B x (1+K) x V` values to the host on every sampled
 step. For a model whose verify logits are vocabulary-sharded over its devices,
 the exact per-column top-M can be computed and gathered on the device
-instead, and a row with a top_k below M can be sampled from that support
-with the arithmetic the `logits` walk's fast path already uses. The `topk`
-mode carries that: it is a readback optimisation of `logits`, not a new
-sampling semantics, and a plan offering it must offer `logits` too
+instead, and a row with a top_k below M can be sampled from that support.
+The `topk` mode carries that: it samples the target distribution `logits`
+samples, so it is a readback optimisation of `logits`, not a new sampling
+semantics, and a plan offering it must offer `logits` too
 (`resolve_speculative_plan` refuses `topk` without it).
 
 **What the model declares.** `topk` in `SpecPlan.accept_modes` and
@@ -1283,10 +1282,8 @@ sampling semantics, and a plan offering it must offer `logits` too
 
 **When the runner asks for it.** `TTModelRunner._spec_mode_for_step` asks
 for `argmax_ids` while every live row is certifiable by id equality, as
-before. Otherwise it asks for `topk` when the plan offers it,
-`VLLM_TT_SPEC_DEVICE_TOPK` is not `0` (the default is `1`; the device
-path is validated), the fast path is on (`VLLM_TT_SPEC_FAST_TOPK` not `0`,
-`VLLM_TT_SPEC_TIE_EXACT` not `1`), and every live row is either certifiable or
+before. Otherwise it asks for `topk` when the plan offers it and every live
+row is either certifiable or
 *support-servable*; otherwise it asks for `logits`. A row is support-servable
 (`spec_accept.params_support_servable`, plus the batch's penalty sets) when
 its top_k is in `[1, M - 1]`, with any top_p and any temperature, and it
@@ -1316,23 +1313,20 @@ when the model cannot supply the full logits; an undecidable position (below)
 then raises.
 
 **What the host computes.** `spec_accept.accept_sampled_support` builds the
-same probability table `accept_sampled_drafts` builds from full logits. The
-fast path keeps the top `k + 64` candidates of each column in the order
-(value descending, token id ascending), keeps every candidate whose tempered
-value is at least the k-th, applies top-p to them and softmaxes the kept set;
-the support is that same candidate list cut at M, so for a column it can
-decide the kept ids, the kept tempered values and their softmax are identical
-bit for bit, and the walk after the table (`_walk_table`) is the same code.
-Committed tokens, accepted counts and the consumption of every seeded
-generator and of the global stream therefore equal the `logits` walk's. A
-column is *undecidable* when its tie group at the k-th value reaches the M-th
-candidate: a member may lie past the support, so that column is sampled from
-`fetch_logits()` by the reference path (`apply_top_k_top_p_pytorch` on the
-whole vocabulary), as the fast path samples its own overflow columns. The
-reference path draws the same distribution through a different inverse CDF,
-so on such a step a seeded stream may differ from the `logits` walk's while
-staying distributed as the target. Greedy rows commit by comparing drafts
-with `argmax_ids`. Padding rows commit `argmax_ids[:, 0]`.
+probability table of the support (`_support_table`): each column's candidates
+in the order (value descending, token id ascending), every candidate whose
+tempered value is at least the k-th kept, top-p applied to them (a cut inside
+a tie group keeps the group's lowest ids), and the kept set softmaxed. For a
+column the support can decide, the kept ids and probabilities are those the
+same cut keeps over the full vocabulary. A column is *undecidable* when its
+tie group at the k-th value reaches the M-th candidate: a member may lie past
+the support, so that column is taken from `fetch_logits()` through vLLM's
+sorted top-k/top-p over the whole vocabulary (`_reference_rows`). The walk over
+the table (`_walk_table`) draws uniforms, in the order `predraw_uniforms`
+reproduces for `fused_sample`. The `logits` walk draws exponential races
+instead, so a seeded request's stream depends on the mode each step ran in,
+while every mode draws from the target distribution. Greedy rows commit by
+comparing drafts with `argmax_ids`. Padding rows commit `argmax_ids[:, 0]`.
 
 **Exactness.** The device returns each vocabulary shard's top-M; the host
 merges the shards' lists under the same order. A token among the global top-M
@@ -1340,10 +1334,7 @@ has fewer than M tokens above it in its own shard, so it is in that shard's
 list, whatever order the device breaks ties in; a tie group truncated at a
 shard's cut can only be missing members whose value equals the merged M-th
 value, and the overflow rule above routes every column where that value
-reaches the request's k-th to the full logits. `VLLM_TT_SPEC_TOPK_AUDIT=1`
-fetches the full logits on every step and asserts the support table against
-the full-logits table (support set identical, probabilities equal); it is a
-validation switch for a new device path, not a serving mode.
+reaches the request's k-th to the full logits.
 
 **Not served.** Logprobs need the row's logsumexp and rank, and the
 penalties, grammar and token filters need the vocabulary: such rows keep the
@@ -1351,9 +1342,9 @@ step in `logits` mode.
 
 ## 4k. Chain mode: a fused verify submitted over the one in flight
 
-Opt-in, `VLLM_TT_SPEC_CHAIN=1` on the plugin (default `0`; off changes nothing)
-and `model_capabilities['supports_async_spec_decode']`, which a model declares
-only when it runs chain and fused. With async scheduling the runner then builds
+On whenever async scheduling serves a speculating launch of a model that
+declares `model_capabilities['supports_async_spec_decode']`, which a model
+declares only when it runs chain and fused. With async scheduling the runner then builds
 step n+1 without step n's committed tokens and submits it before step n is
 read; the device builds the real inputs from step n.
 
@@ -1402,8 +1393,7 @@ With chain mode on and the key declared, the runner then does not drain the
 verify before an all-prefill step with no resumed request and no multimodal
 input; it submits the prefill behind the verify and finalizes the verify later,
 before the next decode build. A step after such a prefill does not chain onto
-the verify it overtook. `VLLM_TT_SPEC_PREFILL_OVERLAP=0` (default `1`) turns it
-off. A resumed request, a multimodal request or a model without the key still
+the verify it overtook. A resumed request, a multimodal request or a model without the key still
 drains first.
 
 ## 4l. Device logprobs and the device top-p certificate
@@ -1472,8 +1462,7 @@ receives `top_k` 0 on a deferred step may raise.
 loaded model's `model_capabilities` into `_spec_device_logprobs` and
 `_spec_device_top_p` (absent is `False`). No environment variable and no
 `--additional-config` key is read for either. In chain mode a logprobs row
-chains as any sampled step does (it carries `spec_sampling`, so
-`VLLM_TT_SPEC_CHAIN_SAMPLED=1` is needed); only a logprobs row the model cannot
+chains as any sampled step does (it carries `spec_sampling`); only a logprobs row the model cannot
 serve keeps the `logprobs` chain blocker.
 
 ## 4m. Device penalties
@@ -1489,7 +1478,7 @@ logprobs (the raw logprobs come before the penalties; the model returns the
 penalized candidates). A penalty row beside a logprobs row of another request is
 fine. `grammar` rows, `allowed_token_ids`, `bad_words` and a pending
 `min_tokens` keep the `logits` mode as before, unless the model also declares `supports_spec_device_mask` (section 4n). In chain mode a penalty row
-chains like any sampled row (`VLLM_TT_SPEC_CHAIN_SAMPLED=1` is needed); the chain
+chains like any sampled row; the chain
 blocker reasons are `penalties` (a penalty row the model cannot serve) and
 `pen_state` (see below).
 

@@ -368,8 +368,6 @@ def _runner_double(*, certifiable=(), drafts_seeded=False, **attrs):
 
 
 def _count_runner_reason(monkeypatch, runner, rows):
-    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "1")
-    monkeypatch.delenv("VLLM_TT_SPEC_FUSED", raising=False)
     TTModelRunner._count_logits_step_reason(runner, rows, None, None)
     return specials_stats()["logits_reasons"]
 
@@ -405,7 +403,7 @@ def test_runner_names_launch_and_seed_reasons(monkeypatch):
     runner = _runner_double(requests=requests, drafts_seeded=True)
     assert _count_runner_reason(monkeypatch, runner, ["a"]) == {"seed_no_draft": 1}
     reset_specials_stats()
-    monkeypatch.setenv("VLLM_TT_SPEC_FUSED", "0")
+    runner._spec_accept_modes = (ACCEPT_MODE_LOGITS, ACCEPT_MODE_TOPK)
     TTModelRunner._count_logits_step_reason(runner, ["a"], None, None)
     assert specials_stats()["logits_reasons"] == {"launch_off": 1}
 
