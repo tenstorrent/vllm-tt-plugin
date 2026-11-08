@@ -205,6 +205,57 @@ def test_a_prefill_chunk_saves_its_blocks_and_a_window_snapshot(connector):
     assert sv2.global_blocks == list(range(33, 40)) and sv2.snapshot_key is None
 
 
+
+def test_the_chunk_that_completes_a_prompt_snapshots_its_last_block_boundary(connector):
+    """A prompt prefilled for another engine (prefill / decode disaggregation) can be continued from its last block
+    boundary: the final, unaligned chunk saves a window snapshot there, from its own SWA blocks."""
+    c = connector()
+    tokens = list(range(5000))
+    c.get_num_new_matched_tokens(request("r", tokens), 0)
+    swa_ids = [list(range(100 * g, 100 * g + 79)) for g in range(1, 6)]  # 79 blocks of 64: positions up to 5056
+    ids = tuple([list(range(1, 33))] + [x[:64] for x in swa_ids])
+    new = SimpleNamespace(req_id="r", prompt_token_ids=tokens, block_ids=ids, num_computed_tokens=0)
+    empty = SimpleNamespace(req_ids=[], new_block_ids=[], resumed_req_ids=set(), num_computed_tokens=[])
+    c.build_connector_meta(SimpleNamespace(scheduled_new_reqs=[new], scheduled_cached_reqs=empty,
+                                           num_scheduled_tokens={"r": 4096}, finished_req_ids=set()))
+    so2 = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r"], new_block_ids=[tuple([list(range(33, 41))] + [x[64:] for x in swa_ids])],
+            resumed_req_ids=set(), num_computed_tokens=[4096]),
+        num_scheduled_tokens={"r": 904},
+        finished_req_ids=set(),
+    )
+    (sv2,) = c.build_connector_meta(so2).saves
+    assert sv2.global_blocks == list(range(33, 40))  # 39 full blocks in all: tokens [0, 4992)
+    assert sv2.snapshot_key == c._snapshot_key(c._req["r"].keys, 39)
+    # the window [4736, 4992): SWA blocks 74..77 of group 1
+    assert sv2.swa_blocks[0] == [(0, 174), (1, 175), (2, 176), (3, 177)]
+    # off: no snapshot at the prompt end
+    c2 = connector()
+    c2.snapshot_prompt_end = False
+    c2.get_num_new_matched_tokens(request("r", tokens), 0)
+    c2.build_connector_meta(SimpleNamespace(scheduled_new_reqs=[new], scheduled_cached_reqs=empty,
+                                            num_scheduled_tokens={"r": 4096}, finished_req_ids=set()))
+    (sv3,) = c2.build_connector_meta(so2).saves
+    assert sv3.snapshot_key is None
+
+
+def test_a_tail_after_a_loaded_boundary_snapshots_nothing_new(connector):
+    """The decoding engine of a disaggregated prompt computes only the tail past the loaded boundary: its chunk starts
+    at that boundary, so it asks for no snapshot (the store already has it)."""
+    c = connector()
+    tokens = list(range(5000))
+    c.get_num_new_matched_tokens(request("r", tokens), 0)
+    swa_ids = [list(range(100 * g, 100 * g + 79)) for g in range(1, 6)]
+    ids = tuple([list(range(1, 41))] + swa_ids)
+    new = SimpleNamespace(req_id="r", prompt_token_ids=tokens, block_ids=ids, num_computed_tokens=4992)
+    empty = SimpleNamespace(req_ids=[], new_block_ids=[], resumed_req_ids=set(), num_computed_tokens=[])
+    c._req["r"].saved_blocks = 39  # as after a load of 39 blocks
+    meta = c.build_connector_meta(SimpleNamespace(scheduled_new_reqs=[new], scheduled_cached_reqs=empty,
+                                                  num_scheduled_tokens={"r": 8}, finished_req_ids=set()))
+    assert meta.saves == []
+
 def test_global_regions_coalesce_runs(connector):
     c = connector(role=KVConnectorRole.WORKER)
     regs = c._global_regions(c.client.pool(c.pool_global), [3, 4, 5, 9], [10, 11, 12, 20])

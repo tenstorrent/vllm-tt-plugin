@@ -13,8 +13,11 @@ What is stored, per prompt prefix:
   V, on every chip, as raw device bytes (BFP8 tiles), laid out plane-major (plane = chip x layer x K/V) in the pool,
   so a run of consecutive slots is one byte range per plane.
 * sliding-window groups: only a snapshot of the last window (4 blocks of 64 tokens: vLLM keeps 255 positions) at the
-  boundaries where a prefill chunk ended on a block boundary. A prefix can be loaded up to such a boundary only: the
-  SWA layers' KV before the window cannot be recomputed from the global KV alone.
+  boundaries where a prefill chunk ended on a block boundary, and at the last block boundary of the prompt (inside its
+  final chunk, ``snapshot_prompt_end``). A prefix can be loaded up to such a boundary only: the SWA layers' KV before
+  the window cannot be recomputed from the global KV alone. The prompt-end snapshot is what lets another engine
+  continue a prompt this engine prefilled (prefill / decode disaggregation: a proxy sends the prompt here with
+  ``max_tokens`` 1, then to a decoding engine) after recomputing fewer than one block of tokens.
 
 Load (scheduler: ``get_num_new_matched_tokens`` finds the deepest boundary B with every global block up to B and a
 snapshot at B, pins them; worker: ``start_load_kv`` copies them into the blocks vLLM allocated, before the step's
@@ -30,7 +33,8 @@ Configuration (``--kv-transfer-config``)::
     {"kv_connector": "TTKVStoreConnector", "kv_connector_module_path": "vllm_tt_plugin.kv_connector",
      "kv_role": "kv_both",
      "kv_connector_extra_config": {"socket": "/tmp/ttserve-kvstore.sock", "global_gib": 48, "swa_gib": 8,
-                                   "min_tokens": 1024, "load": true, "save": true}}
+                                   "min_tokens": 1024, "load": true, "save": true,
+                                   "snapshot_prompt_end": true}}
 """
 
 from __future__ import annotations
@@ -206,6 +210,7 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.min_tokens = int(extra.get("min_tokens", 1024))
         self.do_load = bool(extra.get("load", True))
         self.do_save = bool(extra.get("save", True))
+        self.snapshot_prompt_end = bool(extra.get("snapshot_prompt_end", True))
         self.layout = Layout.from_config(kv_cache_config, int(extra.get("num_devices", 8)))
         ident = {
             "model": vllm_config.model_config.model,
@@ -393,11 +398,15 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     ids = st.block_ids[self.layout.global_group]
                     save = SaveSpec(rid, st.keys[st.saved_blocks : nb], ids[st.saved_blocks : nb], None, None)
                     st.saved_blocks = nb
-                if end % bt == 0 and nb >= 1:
+                # A snapshot where the chunk ends on a block boundary, and at the prompt's last block boundary when this
+                # chunk completes the prompt past it (the window before it is still allocated: it is this chunk's).
+                boundary = nb * bt
+                at_end = self.snapshot_prompt_end and end == len(st.tokens) and boundary > start
+                if nb >= 1 and (end % bt == 0 or at_end):
                     try:
-                        swa = self._swa_window(st.block_ids, end)
+                        swa = self._swa_window(st.block_ids, boundary)
                     except ValueError as e:
-                        logger.debug("no SWA snapshot at %d for %s: %s", end, rid, e)
+                        logger.debug("no SWA snapshot at %d for %s: %s", boundary, rid, e)
                         swa = None
                     if swa is not None:
                         save = save or SaveSpec(rid, [], [], None, None)
