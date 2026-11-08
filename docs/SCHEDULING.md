@@ -226,27 +226,36 @@ Two things follow for the TT execution path:
   (`_alloc_prefill_state_slots`). The persistent-batch row of a partial prefill
   changes between chunks, so the slot cannot follow the row.
 
-#### Multimodal requests are never split
+#### Multimodal requests
+
+A multimodal request never reads the prefix cache: `TTScheduler.add_request`
+sets `skip_reading_prefix_cache` on it. The runner hands the model the pixels
+of every item on each prefill, and the Qwen3.8 MTP adapter recomputes a
+multimodal prompt from token 0, while vLLM's `strip_covered_mm_data` drops the
+pixels of an item that a prefix hit covers.
 
 A chunk end inside or between a request's multimodal items would split its
-embeddings from their positions. In Mamba `align` cache mode (prefix caching on
-a hybrid model) vLLM requires `disable_chunked_mm_input=False`, so the platform
-leaves it `False` there and `TTScheduler` enforces the rule itself, in
-`_mamba_block_aligned_split` / `_align_prefill_chunk_end`
-(`_mm_no_split_grant`). A request with `mm_features` or encoder inputs gets
-either all its remaining tokens or nothing:
+embeddings from their positions. `TTScheduler._mm_no_split_grant` (called from
+`_mamba_block_aligned_split`) gives a request with `mm_features` or encoder
+inputs either all its remaining tokens or nothing:
 
-- They fit in what is left of the step budget: they are granted, ignoring
-  `long_prefill_token_threshold` and vLLM's block-aligned clipping. The
-  leftover budget is the step cap minus the grants already made in this step,
-  so a grant never exceeds the real budget.
+- They fit, with vLLM's draft slots, in what is left of the step budget: they
+  are granted, ignoring `long_prefill_token_threshold` and vLLM's
+  block-aligned clipping. The leftover budget is the step cap minus the rows
+  (tokens plus draft slots) already granted to prefills in this step, so a
+  grant never exceeds the real budget.
 - They fit a step, but not what is left: the hook returns 0. The waiting loop
   stops admitting and retries the request next step, with a fresh budget; the
   running loop skips it. It cannot starve: requests ahead of it finish their
   chunks, and nothing is admitted behind it.
-- They exceed a whole step (`max_num_scheduled_tokens`, else
+- They exceed a whole step (the smaller of `max_num_scheduled_tokens` and
   `max_num_batched_tokens`): splitting is unavoidable. The scheduler logs one
-  warning and splits the request on the alignment grid like a text request.
+  warning. In Mamba `align` cache mode (prefix caching on a hybrid model)
+  vLLM requires `disable_chunked_mm_input=False`, so the platform clears it
+  there and `_keep_multimodal_items_whole` keeps each chunk end out of the
+  items; otherwise vLLM's `disable_chunked_mm_input` does. A model that
+  cannot prefill a multimodal prompt in chunks (the Qwen3.8 MTP adapter)
+  then raises.
 
 Text requests behind a waiting multimodal request wait with it (FCFS).
 

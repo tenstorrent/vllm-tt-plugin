@@ -555,7 +555,9 @@ class TTScheduler(AsyncScheduler):
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
             )
-        self._step_prefill_tokens = 0
+        # Rows (tokens plus draft slots) granted to prefills in the current
+        # step; see _mm_no_split_grant.
+        self._step_granted_rows = 0
         self._warned_mm_over_step = False
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
@@ -973,7 +975,9 @@ class TTScheduler(AsyncScheduler):
                 )
             grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
         if grant > 0 and start < self._prefill_end(request):
-            self._step_prefill_tokens = getattr(self, "_step_prefill_tokens", 0) + grant
+            self._step_granted_rows = (
+                getattr(self, "_step_granted_rows", 0) + grant + self._draft_slots()
+            )
         return grant
 
     @staticmethod
@@ -990,9 +994,18 @@ class TTScheduler(AsyncScheduler):
             or getattr(request, "has_encoder_inputs", False)
         )
 
-    def _step_token_cap(self) -> int:
-        """Prompt tokens one step can schedule in total, ignoring the per-request
-        ``long_prefill_token_threshold``."""
+    def _draft_slots(self) -> int:
+        """Input rows vLLM reserves per scheduled request beyond its tokens."""
+        spec = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+        return spec.max_num_new_slots_for_drafting if spec is not None else 0
+
+    def _step_row_cap(self) -> int:
+        """Input rows one step holds, ignoring ``long_prefill_token_threshold``.
+
+        vLLM takes each scheduled request's tokens out of
+        ``max_num_scheduled_tokens`` and its tokens plus draft slots out of
+        ``max_num_batched_tokens``; the smaller limit bounds both.
+        """
         cfg = getattr(self, "scheduler_config", None)
         if cfg is None:
             return sys.maxsize
@@ -1011,18 +1024,22 @@ class TTScheduler(AsyncScheduler):
         embeddings from their positions, and the model keeps no chunk state for
         such a request. So a multimodal prompt is scheduled whole or not at all:
 
-        - all remaining tokens fit in what is left of this step's budget: grant
-          them, ignoring ``long_prefill_token_threshold`` (vLLM clips by it
-          before this hook runs; the leftover budget is tracked here from the
-          grants made earlier in the step, which is a lower bound of the real
-          one, so a grant never overshoots the step budget);
+        - all remaining tokens, plus vLLM's draft slots, fit in what is left of
+          this step's budget: grant them, ignoring
+          ``long_prefill_token_threshold`` (vLLM clips by it before this hook
+          runs; the leftover budget is tracked here from the grants made
+          earlier in the step, tokens plus draft slots, which is a lower bound
+          of the real one, so a grant never overshoots the step budget);
         - they fit a step, but not what is left of this one: return 0. vLLM's
           waiting loop then stops admitting (the request stays at the head of
           the queue and gets a fresh budget next step) and its running loop
           skips the request. Progress is guaranteed because the requests ahead
           of it finish their chunks and nothing new is admitted behind it;
-        - they exceed even a whole step: ``None``. Splitting is unavoidable,
-          so the caller treats the request like a text one (aligned chunks).
+        - they exceed even a whole step: ``None``. Splitting is unavoidable;
+          the caller keeps each item in one chunk
+          (``_keep_multimodal_items_whole`` in mode align, vLLM's
+          ``disable_chunked_mm_input`` otherwise). A model that cannot prefill
+          a multimodal prompt in chunks then raises.
 
         ``None`` is also returned for text requests and for requests past their
         prefill, which take the normal path.
@@ -1032,18 +1049,21 @@ class TTScheduler(AsyncScheduler):
         if start >= self._prefill_end(request):
             return None
         remaining = request.num_tokens - start
-        cap = self._step_token_cap()
-        if remaining > cap:
+        rows = remaining + self._draft_slots()
+        cap = self._step_row_cap()
+        if rows > cap:
             if not getattr(self, "_warned_mm_over_step", False):
                 self._warned_mm_over_step = True
                 logger.warning(
-                    "TT scheduler: a multimodal prompt needs %d prefill tokens, "
-                    "more than one step can schedule (%d); it is split.",
+                    "TT scheduler: a multimodal prompt needs %d prefill tokens "
+                    "plus %d draft slots, more than one step holds (%d); it is "
+                    "split.",
                     remaining,
+                    rows - remaining,
                     cap,
                 )
             return None
-        if remaining <= cap - getattr(self, "_step_prefill_tokens", 0):
+        if rows <= cap - getattr(self, "_step_granted_rows", 0):
             return remaining
         return 0
 
@@ -1168,7 +1188,7 @@ class TTScheduler(AsyncScheduler):
         # mutates anything: the skip condition is a pure function of request
         # state, and the loop advances ``num_computed_tokens`` of the requests
         # it does schedule.
-        self._step_prefill_tokens = 0
+        self._step_granted_rows = 0
         self._finishing_candidates = [
             request.request_id
             for request in self.running
