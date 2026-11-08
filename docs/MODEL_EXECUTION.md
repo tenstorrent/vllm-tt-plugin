@@ -177,6 +177,9 @@ reaches it anyway.
    `process_decode_output_host(output_handles, is_tokens=perform_device_sampling)`.
    The adapter returns host logits or sampled IDs. Synchronous decode uses
    this conversion too when `decode_forward` returns adapter-specific output.
+   A `VerifyOutput` whose fields are host tensors is host output and goes to
+   the accept walk as it is; one whose fields are not is refused by name,
+   never converted (see the speculative contract, section 4j).
 4. `TTModelRunner` uses the last position in host logits `[B, S, V]`, commonly
    `[B, 1, V]`, for sampling, or consumes device-sampled IDs `[B, 1]`.
    For `output_tokens_per_step > 1`, the adapter returns

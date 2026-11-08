@@ -38,6 +38,7 @@ from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_INTERNAL,
     PLACEHOLDER_TOKEN_ID,
@@ -346,6 +347,28 @@ def test_a_lane_verify_keeps_each_request_at_its_slot():
         (drafts["s"][-1] + 1) % FAKE_VOCAB_SIZE
     ]
     assert set(runner._proposed_draft_token_ids) == {"a", "s"}
+
+
+def test_a_lane_step_refuses_a_fused_sample_verify():
+    """A lane block keeps each request at its slot, and the fused_sample and topk
+    walks read the live rows as the block's first rows, so a lane step that
+    resolves either mode fails before the model is called."""
+    model = make_fake_spec_model(
+        serve_fused=True,
+        accept_modes=(
+            ACCEPT_MODE_ARGMAX_IDS,
+            ACCEPT_MODE_LOGITS,
+            ACCEPT_MODE_FUSED_SAMPLE,
+        ),
+    )()
+    runner = _lane_runner(model)
+    _place(runner, "a", 0, first_token=1)
+    _place(runner, "b", 3, first_token=21)
+    drafts = {"a": _agreed_drafts(runner, "a"), "b": _agreed_drafts(runner, "b")}
+
+    with pytest.raises(RuntimeError, match="lane mode walks argmax_ids and logits"):
+        _lane_step(runner, "a", "b", drafts=drafts)
+    assert model.verify_calls == []
 
 
 def test_the_candidate_block_pads_the_empty_slots():

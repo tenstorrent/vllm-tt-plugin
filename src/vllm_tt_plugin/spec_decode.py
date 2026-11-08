@@ -23,7 +23,7 @@ only surfaces inside an accept walk: the inclusive range a valid
 the fields a verify return must carry for it.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -52,11 +52,32 @@ if TYPE_CHECKING:
 #                  describes. It is the only mode that may be followed by a
 #                  verify with accepted_counts=None, because it is the only one
 #                  that leaves an authoritative count on the device.
+#   "topk"         returns the verify argmax ids [B, 1+K] plus, per candidate
+#                  column, the exact top-M logits and their token ids
+#                  [B, 1+K, M], sorted by value descending then token id
+#                  ascending, and a callable that fetches the full [B, 1+K, V]
+#                  logits lazily. The host samples on that support with the
+#                  same arithmetic as the "logits" walk's fast path, so a row
+#                  whose top_k is in [1, M-1] and carries no penalty, filter,
+#                  grammar or logprobs request commits exactly what "logits"
+#                  would, at a readback of 2 x B x (1+K) x M values instead of
+#                  B x (1+K) x V. A row the support cannot decide (a tie group
+#                  at its k-th value reaching the M-th candidate) is sampled
+#                  from the fetched full logits. The runner asks for it only
+#                  when every live row is greedy-certifiable or support-servable
+#                  (section 4j of docs/SPEC_DECODE_CONTRACT.md); a plan offering
+#                  it must offer "logits" too, for the rows that are not.
 ACCEPT_MODE_LOGITS = "logits"
 ACCEPT_MODE_ARGMAX_IDS = "argmax_ids"
 ACCEPT_MODE_FUSED_SAMPLE = "fused_sample"
+ACCEPT_MODE_TOPK = "topk"
 ACCEPT_MODES = frozenset(
-    {ACCEPT_MODE_LOGITS, ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_FUSED_SAMPLE}
+    {
+        ACCEPT_MODE_LOGITS,
+        ACCEPT_MODE_ARGMAX_IDS,
+        ACCEPT_MODE_FUSED_SAMPLE,
+        ACCEPT_MODE_TOPK,
+    }
 )
 
 # Where a drafter's own state lives. The first two describe a cost the runner
@@ -143,6 +164,7 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     ACCEPT_MODE_LOGITS: ("logits",),
     ACCEPT_MODE_ARGMAX_IDS: ("argmax_ids",),
     ACCEPT_MODE_FUSED_SAMPLE: ("accepted_token_ids", "accepted_counts"),
+    ACCEPT_MODE_TOPK: ("argmax_ids", "topk_values", "topk_ids"),
 }
 
 
@@ -198,6 +220,11 @@ class SpecPlan:
     # stays ``1 + effective_k`` wide either way. Empty means ``effective_k`` at
     # every batch size.
     k_by_rows: tuple[tuple[int, int], ...] = ()
+    # Candidates per column a "topk" verify returns (the M of its
+    # ``[B, 1+K, M]`` fields), and so the largest request top_k the support
+    # can serve plus one. Required with "topk" among accept_modes, None
+    # otherwise.
+    topk_candidates: int | None = None
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
@@ -277,6 +304,22 @@ class SpecPlan:
                 f"{k_by_rows!r}"
             )
         object.__setattr__(self, "k_by_rows", k_by_rows)
+
+        offers_topk = ACCEPT_MODE_TOPK in modes
+        if offers_topk and (
+            not _is_int(self.topk_candidates) or self.topk_candidates < 2
+        ):
+            raise ValueError(
+                "SpecPlan.topk_candidates must be an integer of at least 2 when "
+                f"accept_modes offers {ACCEPT_MODE_TOPK!r} (a support of M "
+                "candidates serves top_k up to M-1), got "
+                f"{self.topk_candidates!r}"
+            )
+        if not offers_topk and self.topk_candidates is not None:
+            raise ValueError(
+                f"SpecPlan.topk_candidates={self.topk_candidates!r} is meaningful "
+                f"only with {ACCEPT_MODE_TOPK!r} among accept_modes {list(modes)}"
+            )
 
     @property
     def accepted_counts_range(self) -> tuple[int, int]:
@@ -384,6 +427,77 @@ class DraftOutput:
     draft_scores: "torch.Tensor | None" = None
 
 
+# The largest ``num_logprobs`` (top-N) a ``fused_sample`` step serves from
+# ``SpecCandidates``: the candidates hold at least this many plus the sampled
+# token, so a request above it (or ``logprobs=-1``) takes the ``logits`` mode.
+MAX_DEVICE_LOGPROBS = 20
+
+
+@dataclass(frozen=True)
+class SpecCandidates:
+    """The top candidates of every verify position, for device logprobs.
+
+    A ``fused_sample`` model that declares ``supports_spec_device_logprobs``
+    returns this beside the committed ids when a row of the step asked for
+    logprobs (``spec_sampling["num_logprobs"] >= 0``). ``B`` rows, ``T = 1+K``
+    verify positions, ``M`` candidates per position:
+
+    - ``ids`` ``[B, T, M]`` integer: the ``M`` token ids with the largest raw
+      logits of the whole vocabulary, ordered by logit descending, then id
+      ascending.
+    - ``values`` ``[B, T, M]`` float32: the raw logits of those ids (the
+      logits the model's verify produced, before temperature, grammar and
+      penalties), in the same order.
+    - ``lse`` ``[B, T]`` float32: the raw ``logsumexp`` of the whole
+      vocabulary at each position.
+
+    A token's raw logprob is ``value - lse``. The plugin reads only the
+    positions a row committed. ``M`` is at least the largest ``num_logprobs``
+    plus 1 of the step; a model built on the top-64 gives ``M = 64``.
+    """
+
+    ids: "torch.Tensor"
+    values: "torch.Tensor"
+    lse: "torch.Tensor"
+
+    def __post_init__(self) -> None:
+        import torch
+
+        for name, tensor in (
+            ("ids", self.ids),
+            ("values", self.values),
+            ("lse", self.lse),
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"SpecCandidates.{name} must be a host tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+        if self.ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                f"SpecCandidates.ids must be int32 or int64, got {self.ids.dtype}"
+            )
+        for name, tensor in (("values", self.values), ("lse", self.lse)):
+            if tensor.dtype != torch.float32:
+                raise ValueError(
+                    f"SpecCandidates.{name} must be float32, got {tensor.dtype}"
+                )
+        if self.ids.dim() != 3:
+            raise ValueError(
+                f"SpecCandidates.ids must be [B, 1+K, M], got {tuple(self.ids.shape)}"
+            )
+        if self.values.shape != self.ids.shape:
+            raise ValueError(
+                f"SpecCandidates.values must match ids {tuple(self.ids.shape)}, "
+                f"got {tuple(self.values.shape)}"
+            )
+        if tuple(self.lse.shape) != tuple(self.ids.shape[:2]):
+            raise ValueError(
+                f"SpecCandidates.lse must be [B, 1+K] = {tuple(self.ids.shape[:2])}, "
+                f"got {tuple(self.lse.shape)}"
+            )
+
+
 @dataclass(frozen=True)
 class VerifyOutput:
     """What one verify call returns, and the mode that says which fields apply.
@@ -409,20 +523,128 @@ class VerifyOutput:
     # handed back to propose_draft_tokens uninterpreted. None when the model
     # retains it on device.
     hidden: HiddenHandle = None
+    # [B, 1+K, M] for "topk": the exact top-M raw logit values (floating point)
+    # and their token ids (integer) of every candidate column, sorted by value
+    # descending then token id ascending, M = SpecPlan.topk_candidates.
+    topk_values: "torch.Tensor | None" = None
+    topk_ids: "torch.Tensor | None" = None
+    # For "topk": fetches this step's full [B, 1+K, V] logits (floating point,
+    # every submitted row), for rows the support cannot decide. Called at most
+    # once per step, on the thread that walks acceptance, before the next
+    # decode call; a model that re-reads the device here therefore needs the
+    # verify's rows to be intact until then, which a synchronous spec launch
+    # (no supports_async_spec_decode) guarantees. None when the model cannot
+    # supply them, in which case an undecidable row is an error.
+    fetch_logits: "Callable[[], torch.Tensor] | None" = None
+    # For a deferred "fused_sample" verify (``decode_forward(defer_read=True)``,
+    # chain mode): an opaque handle to a step whose result is still on the
+    # device. The step carries NO host tensors; the reader thread resolves the
+    # handle with ``model.read_decode_output(handle)`` (or ``handle.wait()``),
+    # which blocks on a device event and returns a ``FusedReadout``. The same
+    # handle is later passed to ``propose_draft_tokens`` as ``hidden`` on the
+    # engine thread. ``tip_id`` (an int attribute) names the step for
+    # ``chain_tip``.
+    handle: Any = None
+    # For "fused_sample" on a model that declares supports_spec_device_logprobs:
+    # the candidates of every position, present exactly when a row of the step
+    # asked for logprobs (spec_sampling["num_logprobs"] >= 0). A deferred
+    # verify carries it in its FusedReadout instead. See SpecCandidates.
+    candidates: "SpecCandidates | None" = None
 
     def __post_init__(self) -> None:
+        if self.candidates is not None:
+            if not isinstance(self.candidates, SpecCandidates):
+                raise TypeError(
+                    "VerifyOutput.candidates must be a SpecCandidates, got "
+                    f"{type(self.candidates).__name__}"
+                )
+            if self.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+                raise ValueError(
+                    "VerifyOutput.candidates is only defined for spec_mode "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r}, got {self.spec_mode!r}"
+                )
         required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
         if required is None:
             raise ValueError(
                 f"VerifyOutput.spec_mode {self.spec_mode!r} is not one of "
                 f"{sorted(ACCEPT_MODES)}"
             )
+        if self.handle is not None:
+            if self.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+                raise ValueError(
+                    "VerifyOutput.handle is only defined for spec_mode "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r}, got {self.spec_mode!r}"
+                )
+            # The deferred form: ids and counts arrive with the handle's read,
+            # both or neither.
+            if (self.accepted_token_ids is None) != (self.accepted_counts is None):
+                raise ValueError(
+                    "a deferred fused_sample VerifyOutput carries both "
+                    "accepted_token_ids and accepted_counts or neither"
+                )
+            return
         missing = [name for name in required if getattr(self, name) is None]
         if missing:
             raise ValueError(
                 f"VerifyOutput for spec_mode {self.spec_mode!r} must carry "
                 f"{list(required)}, missing {missing}"
             )
+
+
+@dataclass(frozen=True)
+class FusedReadout:
+    """What reading a deferred fused verify's handle returns.
+
+    ``accepted_token_ids`` is ``[B, 1+K]`` int32 (placeholder past each row's
+    count), ``accepted_counts`` ``[B]`` int32 in ``[1, 1+K]``, and ``p0`` ``[B]``
+    int32: the ACTUAL position of each row's column 0, which differs from the
+    runner's provisional one for a chained row. A padding row reports a
+    negative ``p0``. A model may return a 3-tuple in this order instead, which
+    carries no ``candidates``.
+
+    ``candidates`` is the step's ``SpecCandidates`` when a row of the step asked
+    for logprobs, else None.
+
+    ``drafts`` is ``[B, K]`` int32 in the runner's row order: the drafts the
+    NEXT chained step verifies as its columns 1..K, before the host's length
+    hint trims them. A model that declares ``supports_spec_device_mask`` returns
+    it, because a chained masked step hands them to the scheduler (the grammar
+    rows are made from them). None for a model that does not.
+    """
+
+    accepted_token_ids: "torch.Tensor"
+    accepted_counts: "torch.Tensor"
+    p0: "torch.Tensor"
+    candidates: "SpecCandidates | None" = None
+    drafts: "torch.Tensor | None" = None
+
+    def __post_init__(self) -> None:
+        if self.candidates is not None and not isinstance(
+            self.candidates, SpecCandidates
+        ):
+            raise TypeError(
+                "FusedReadout.candidates must be a SpecCandidates, got "
+                f"{type(self.candidates).__name__}"
+            )
+        if self.drafts is not None:
+            import torch
+
+            drafts = self.drafts
+            if (
+                not isinstance(drafts, torch.Tensor)
+                or drafts.dtype != torch.int32
+                or drafts.dim() != 2
+            ):
+                raise TypeError(
+                    "FusedReadout.drafts must be a 2-D int32 tensor [B, K], got "
+                    f"{type(drafts).__name__} {getattr(drafts, 'dtype', None)} "
+                    f"{tuple(getattr(drafts, 'shape', ()))}"
+                )
+            if int(drafts.shape[0]) != int(self.accepted_counts.shape[0]):
+                raise ValueError(
+                    f"FusedReadout.drafts has {int(drafts.shape[0])} rows but "
+                    f"accepted_counts has {int(self.accepted_counts.shape[0])}"
+                )
 
 
 def normalize_declared_values(
@@ -595,6 +817,7 @@ __all__ = [
     "ACCEPT_MODE_ARGMAX_IDS",
     "ACCEPT_MODE_FUSED_SAMPLE",
     "ACCEPT_MODE_LOGITS",
+    "ACCEPT_MODE_TOPK",
     "DRAFTER_STATES",
     "DRAFTER_STATE_SHARED_WITH_TARGET",
     "DRAFTER_STATE_INTERNAL",
@@ -603,6 +826,7 @@ __all__ = [
     "DRAFTER_TARGET_CACHE_NAMED_LAYER_CACHES",
     "DRAFTER_TARGET_CACHE_REQUIREMENTS",
     "HIDDEN_HANDOFFS",
+    "MAX_DEVICE_LOGPROBS",
     "HIDDEN_HANDOFF_ON_DEVICE",
     "HIDDEN_HANDOFF_ROUNDTRIP",
     "SPEC_REQUIREMENTS",
@@ -611,9 +835,11 @@ __all__ = [
     "SPEC_REQUIREMENT_HIDDEN_FEED",
     "SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE",
     "DraftOutput",
+    "FusedReadout",
     "MODE_REQUIRED_FIELDS",
     "PLACEHOLDER_TOKEN_ID",
     "HiddenHandle",
+    "SpecCandidates",
     "SpecPlan",
     "SpecReject",
     "VerifyOutput",

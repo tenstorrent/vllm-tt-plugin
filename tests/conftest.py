@@ -77,6 +77,53 @@ def reset_tt_platform_class_state():
         )
     }
 
+    # tool_call_fixes replaces attributes of these owners and sets a
+    # `_tt_original_*` marker on each; a leaked wrapper changes parsing and
+    # finish_reason in every later test.
+    import vllm.parser.qwen3 as qwen3
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.parser.engine import adapters, parser_engine, streaming_parser_engine
+
+    tool_call_targets = (
+        (parser_engine, "find_tool_properties", "_tt_original_find_tool_properties"),
+        (parser_engine, "coerce_to_schema_type", "_tt_original_coerce_to_schema_type"),
+        (qwen3, "_qwen3_arg_converter", "_tt_original_qwen3_arg_converter"),
+        (
+            parser_engine.ParserEngine,
+            "_compute_arg_delta",
+            "_tt_original_compute_arg_delta",
+        ),
+        (
+            adapters.ParserEngineReasoningAdapter,
+            "count_reasoning_tokens",
+            "_tt_original_count_reasoning_tokens",
+        ),
+        (
+            streaming_parser_engine.StreamingParserEngine,
+            "_on_terminal",
+            "_tt_original_on_terminal",
+        ),
+        (
+            streaming_parser_engine.StreamingParserEngine,
+            "_emit_for_state",
+            "_tt_original_emit_for_state",
+        ),
+        (
+            OpenAIServingChat,
+            "chat_completion_stream_generator",
+            "_tt_original_chat_completion_stream_generator",
+        ),
+        (
+            OpenAIServingChat,
+            "chat_completion_full_generator",
+            "_tt_original_chat_completion_full_generator",
+        ),
+    )
+    saved_tool_call_targets = [
+        (owner, attr, owner.__dict__[attr], marker, marker in owner.__dict__)
+        for owner, attr, marker in tool_call_targets
+    ]
+
     yield
 
     for name, value in saved_dp_client_methods.items():
@@ -90,6 +137,11 @@ def reset_tt_platform_class_state():
             core_client.__dict__.pop(name, None)
         else:
             setattr(core_client, name, value)
+    for owner, attr, value, marker, had_marker in saved_tool_call_targets:
+        setattr(owner, attr, value)
+        if not had_marker and marker in owner.__dict__:
+            delattr(owner, marker)
+    qwen3.qwen3_config.cache_clear()
 
     server_utils.lifespan = saved_lifespan
     for name in ("vllm.entrypoints.launchers.app",):

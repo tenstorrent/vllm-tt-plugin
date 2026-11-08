@@ -608,12 +608,13 @@ def test_a_non_speculating_decode_is_unchanged():
 
 
 def test_a_prefill_drops_stale_speculative_state():
-    """A prefilling row's pending drafts are dropped and its count reset to 1.
+    """A prefilling row's placeholder drafts are dropped and its count reset to 1.
 
-    A request resumed from preemption replays its own history, so drafts
-    proposed against the pre-preemption state no longer sit at the positions
-    they were drafted for. A prefill build carries no candidate block, so the
-    side tensors are absent from it.
+    A request resumed from preemption replays its own history, so a count left
+    from the pre-preemption state no longer describes it. vLLM schedules a
+    prompt row no real draft, only the placeholder slots it pads a waiting
+    request with, which are not prompt tokens. A prefill build carries no
+    candidate block, so the side tensors are absent from it.
     """
     batch = _batch()
     request = _request("r", num_computed_tokens=0)
@@ -621,7 +622,12 @@ def test_a_prefill_drops_stale_speculative_state():
     accepted_counts = {"r": 3}
     runner = _fake_runner(batch, {"r": request}, accepted_counts=accepted_counts)
 
-    model_input = _prepare(runner, ("r", PROMPT_LEN, 0), drafts=_drafts(r=[11, 12, 13]))
+    placeholders = [PLACEHOLDER_TOKEN_ID] * 3
+    model_input = _prepare(
+        runner,
+        ("r", PROMPT_LEN + len(placeholders), 0),
+        drafts=_drafts(r=placeholders),
+    )
 
     assert model_input.prompt_lens.tolist() == [PROMPT_LEN]
     assert model_input.num_valid_drafts is None

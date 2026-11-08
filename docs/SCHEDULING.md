@@ -219,6 +219,103 @@ Two things follow for the TT execution path:
   (device sampling would advance device RNG state for them), get a generator
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
+- A model that declares `accepts_intermediate_prefill_mask` also receives that
+  mask as the `prefill_forward` keyword `intermediate_prefill_mask`
+  (`list[bool]`, `True` = not the last chunk).
+- A continuation chunk reuses the device state slot its first chunk was given
+  (`_alloc_prefill_state_slots`). The persistent-batch row of a partial prefill
+  changes between chunks, so the slot cannot follow the row.
+
+#### Multimodal requests are never split
+
+A chunk end inside or between a request's multimodal items would split its
+embeddings from their positions. In Mamba `align` cache mode (prefix caching on
+a hybrid model) vLLM requires `disable_chunked_mm_input=False`, so the platform
+leaves it `False` there and `TTScheduler` enforces the rule itself, in
+`_mamba_block_aligned_split` / `_align_prefill_chunk_end`
+(`_mm_no_split_grant`). A request with `mm_features` or encoder inputs gets
+either all its remaining tokens or nothing:
+
+- They fit in what is left of the step budget: they are granted, ignoring
+  `long_prefill_token_threshold` and vLLM's block-aligned clipping. The
+  leftover budget is the step cap minus the grants already made in this step,
+  so a grant never exceeds the real budget.
+- They fit a step, but not what is left: the hook returns 0. The waiting loop
+  stops admitting and retries the request next step, with a fresh budget; the
+  running loop skips it. It cannot starve: requests ahead of it finish their
+  chunks, and nothing is admitted behind it.
+- They exceed a whole step (`max_num_scheduled_tokens`, else
+  `max_num_batched_tokens`): splitting is unavoidable. The scheduler logs one
+  warning and splits the request on the alignment grid like a text request.
+
+Text requests behind a waiting multimodal request wait with it (FCFS).
+
+#### Depth-dependent chunk cap
+
+Attention cost per chunk grows with the depth it starts at, so a fixed chunk
+size gives steps of very different length. `additional_config["tt"]` accepts
+
+- `prefill_chunk_cap_table`: a list of `[start_tokens, max_chunk_tokens]`
+  pairs. A text chunk that starts at `start` holds at most the
+  `max_chunk_tokens` of the entry with the largest `start_tokens <= start`; a
+  chunk that starts below every entry is not capped. Default: empty, no cap.
+  Every cap must be a positive multiple of `prefill_chunk_alignment` (128 by
+  default); anything else is rejected at startup. Multimodal requests are never
+  capped. The cap runs in `_cap_prefill_chunk`, before the alignment step.
+
+A model may declare the same table as `model_capabilities["prefill_chunk_cap_table"]`;
+the platform copies it into `additional_config["tt"]` unless the operator set the key.
+
+Example: `{"tt": {"prefill_chunk_cap_table": [[0, 8192], [65536, 4096], [131072, 2048]]}}`.
+
+#### FCFS limit for multi-chunk prefills
+
+vLLM caps a prefill chunk per request (`long_prefill_token_threshold`), not per
+step, and the TT step budget is large. So every running partial prefill and
+every waiting prompt gets a chunk each step: N long prompts on a rank advance
+round-robin and all finish together, so the first one's first token waits for
+the work of all N. Without chunking they ran first come, first served.
+
+`additional_config["tt"]["max_concurrent_partial_prefills"]` (integer >= 0,
+default 0 = unlimited, validated at startup) restores FCFS. With a limit L > 0,
+a prefill step advances at most L requests that *need more than one chunk*:
+requests whose uncached rest of the prompt exceeds the chunk cap for this step
+(`_chunk_cap_for`: step budget, `long_prefill_token_threshold`, and the
+`prefill_chunk_cap_table` entry for the request's depth; a multimodal request
+is never split, so its cap is a whole step). A request whose rest fits one
+chunk (a short prompt, or the final chunk of a long one) is always admitted as
+before, subject to the normal budget, so shorts never wait behind a long one.
+
+Order is first come, first served: running partial prefills first, in running
+(admission) order, then waiting requests in queue order. `_schedule_prefill_only`
+hides the surplus for that one base `schedule()` call:
+
+- Running surplus leaves `self.running`, so the base loop cannot schedule,
+  preempt, or free it. Its `num_computed_tokens`, blocks and state slot are
+  untouched. It goes back at its original position afterwards, ahead of
+  requests admitted in the same call. It still holds a running slot, so
+  `max_num_running_reqs` is reduced for the call.
+- Waiting surplus leaves `self.waiting` and returns in its original order
+  (requests the base call preempted stay in front).
+
+Hiding exists only inside that call. `_has_pending_prefill`, the interleave
+policy and the decode-only paths see every partial prefill as pending work, so
+decode interleave and the decode fallback behave as without the limit. Only
+`waiting` is limited; `kv_holding_waiting` (requests that still hold KV
+blocks, such as a streaming-input session) is not. A waiting request's cached prefix is not counted until it
+is admitted, unless the scheduler can estimate it read-only.
+
+With `long_prefill_alone_threshold` (long-prompt-alone admission, load-balancing
+branch) both apply in sequence: first the alone rule hides longs or shorts from
+`waiting`, then this limit hides surplus multi-chunk requests among what is
+left. A step then holds at most L multi-chunk prefills, and a long prompt is
+not mixed with short ones while the alone rule defers it. The alone rule
+judges a prompt by its whole pending size; this limit judges it by chunk
+count. The two do not conflict: each only removes requests from this step.
+
+Example: with L=1 and three 20k prompts at a 4096-token chunk, the first runs
+alone until it finishes (about 5 steps), then the second, then the third; its
+first token arrives after 5 steps, not 15.
 
 ### Decode interleave
 
@@ -349,6 +446,49 @@ inserts a decode step when some lane has a decode that a decode step can
 advance. Every lane executes the one negotiated mode, so a per-lane decision
 would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
 each rank runs the policy on its own scheduler state.
+
+### Prefill-aware DP load and long-prompt-alone admission
+
+Both are opt-in (`additional_config["tt"]`) and off by default.
+
+The vLLM DP load balancer scores a rank by request counts, and an engine
+publishes them only before and after a step. A rank inside a one-minute prefill
+publishes nothing, and a rank holding one long prompt counts the same as one
+holding a short prompt. Two keys address that:
+
+- `dp_load_prefill_aware` (default `false`): `TTScheduler.get_request_counts`
+  returns `(num_running, num_waiting + penalty)`, with
+  `penalty = ceil(pending_prefill_tokens / dp_load_prefill_tokens_per_unit)`.
+  `pending_prefill_tokens` sums `max(0, num_prompt_tokens - max(num_computed_tokens,
+  num_cached_tokens))` over waiting requests and running partial prefills. A
+  waiting request has not been through the scheduler's prefix-cache lookup, so
+  its cached prefix is estimated with a read-only walk of `request.block_hashes`
+  over `BlockPool.get_cached_block` (a dict read: no ref counts, free-queue
+  moves, or prefix-cache stats). The estimate is capped at
+  `num_prompt_tokens - 1`, is 0 when prefix caching is off, the request skips
+  the cache (prompt logprobs), or the hash block size differs from the
+  scheduler block size. The cache can change before the request is admitted, so
+  it is an estimate. Running partial prefills use their real computed count.
+- `dp_load_prefill_tokens_per_unit` (default 2048, integer >= 1).
+- `dp_load_prefill_min_tokens` (default 8192, integer >= 0): a request adds to
+  `pending_prefill_tokens` only if its own pending tokens are at least this
+  value; smaller requests add 0. Ordinary 1-10K prompts then publish exactly
+  vLLM's base counts and do not change DP routing (a penalty on every request
+  broke the rank affinity of multi-turn follow-ups). The per-unit rounding
+  applies to the sum over the requests that count. 0 counts every request.
+- `long_prefill_alone_threshold` (default 0 = off, integer >= 0): a prompt
+  whose pending tokens exceed this is "long". When a prefill step is built and
+  the waiting queue holds both long and short requests, only the short ones are
+  admitted; a long request runs in a step with no short waiting request. FCFS
+  holds inside each class.
+- `long_prefill_alone_max_defer_steps` (default 8, integer >= 1): a long request
+  is hidden for at most this many consecutive prefill steps. After that the
+  shorts are hidden for one step and the longs run alone, so a long request
+  cannot starve.
+
+Limits: a decode already running on a stalled rank still waits, an external
+router that pins ranks bypasses the load score, and a long request that the
+base scheduler splits into chunks lets short requests join its later chunks.
 
 ### Generic speculative decoding
 

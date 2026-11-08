@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
+from vllm_tt_plugin.spec_masks import SpecMaskPlan
+
 
 @dataclass(frozen=True)
 class TTCompactedHostLogits:
@@ -249,6 +251,34 @@ class TTModelInput:
     # time, because the walk may run on the readback thread after the
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+    # ``fused_sample`` verify only, on a model that declares
+    # ``supports_spec_device_mask``. Set when a row carries a control that rules
+    # tokens out (grammar, allowed_token_ids, bad_words, min_tokens): the step
+    # is then submitted in two halves, the forward at ``execute_model`` and the
+    # composed token mask at ``sample_tokens``. ``None`` for every other step.
+    spec_mask: SpecMaskPlan | None = None
+
+    # Chain mode only (VLLM_TT_SPEC_CHAIN, a fused verify submitted while the
+    # previous one is still in flight). ``chain_rows`` is bool ``[total_B]``:
+    # the rows whose next inputs the device builds from the pending step. For
+    # them ``input_tokens`` is the placeholder -1 in every column,
+    # ``input_positions`` the runner's optimistic provisional positions and
+    # ``accepted_counts`` -1; other rows are built from host state as ever.
+    # ``chain_tip`` is the id of the pending fused step being chained onto,
+    # which the model checks against its own. Both ``None`` otherwise.
+    chain_rows: torch.Tensor | None = None
+    chain_tip: int | None = None
+
+    # Decode only, async chain mode. Runner state slots of requests this step
+    # leaves out ONLY because vLLM knows their in-flight step reaches
+    # ``max_tokens`` (``TTScheduler``, ``request_will_reach_max_tokens``). The
+    # model frees them like finished requests (no park, no save) and treats
+    # them as finished rows of the chain overlay. Sent once per request: the
+    # runner drops the request's slot claim when it builds this, and the model
+    # raises if a finishing slot's request is ever scheduled again. ``None``
+    # unless the model declares ``supports_finishing_slots``.
+    finishing_slots: list[int] | None = None
 
 
 def live_row_index(

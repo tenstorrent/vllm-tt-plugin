@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import itertools
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
+from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -19,8 +21,12 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_dp_load_config,
+    get_tt_long_prefill_alone_config,
+    get_tt_max_concurrent_partial_prefills,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefill_chunk_cap_table,
     get_tt_spec_plan,
     get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
@@ -43,6 +49,42 @@ logger = init_tt_logger(__name__)
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
 _TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
+# Requests the base scheduler's running loop left out of a decode step only
+# because their in-flight step is sure to reach ``max_tokens``. Attached to the
+# SchedulerOutput like the attributes above; ``TTModelRunner`` reads it to tell
+# the model those slots are finishing.
+_TT_FINISHING_REQ_IDS_ATTR = "_tt_finishing_req_ids"
+# Per-request count of real drafts the runner verified, attached to the
+# ModelRunnerOutput by the async controller; read by ``update_from_output``.
+TT_VALID_DRAFTS_ATTR = "_tt_valid_drafts"
+_TT_SEED_REQ_IDS_ATTR = "_tt_seed_req_ids"
+
+
+def set_tt_finishing_req_ids(
+    scheduler_output: SchedulerOutput, req_ids: tuple[str, ...] | list[str]
+) -> None:
+    if req_ids:
+        setattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, tuple(req_ids))
+
+
+def get_tt_finishing_req_ids(scheduler_output: SchedulerOutput) -> tuple[str, ...]:
+    return tuple(getattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, ()))
+
+
+def request_will_reach_max_tokens(request: Request) -> bool:
+    """The vLLM 0.31 running-loop skip condition, verbatim.
+
+    ``vllm/v1/core/sched/scheduler.py:635-649``: an async step is already in
+    flight (``num_output_placeholders > 0``) and, even if every draft of it is
+    rejected, it commits the request's last allowed token. The base loop then
+    does not schedule the request again, though the scheduler has not seen the
+    output and the request is still in ``running``.
+    """
+    return (
+        request.num_output_placeholders > 0
+        and request.num_computed_tokens + 2 - request.num_output_placeholders
+        >= request.num_prompt_tokens + request.max_tokens
+    )
 
 
 def set_tt_forced_reset_discard_counts(
@@ -87,6 +129,64 @@ def get_tt_block_step_decisions(
     return dict(getattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, {}))
 
 
+# Per structured request, the reasoning phase as the scheduler sees it:
+# ``(ended, end_token_ids)``. ``ended`` is vLLM's ``reasoning_ended`` rule at
+# schedule time (True when the grammar already applies to the first token);
+# ``end_token_ids`` is the reasoning parser's end set. The worker has neither
+# the parser nor ``include_reasoning``, so it takes both from here. See
+# ``structured_output.ReasoningPhase``.
+_TT_REASONING_START_ATTR = "_tt_reasoning_start"
+
+
+def set_tt_reasoning_start(
+    scheduler_output: SchedulerOutput,
+    start: dict[str, tuple[bool, tuple[int, ...]]],
+) -> None:
+    set_tt_scheduler_output_field(
+        scheduler_output, _TT_REASONING_START_ATTR, dict(start)
+    )
+
+
+def get_tt_reasoning_start(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, tuple[bool, tuple[int, ...]]]:
+    value = getattr(scheduler_output, _TT_REASONING_START_ATTR, None)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def reasoning_start_for_request(
+    manager, request: Request
+) -> tuple[bool, tuple[int, ...]] | None:
+    """``(ended, end_ids)`` for a structured request, or None for any other.
+
+    Follows ``StructuredOutputManager._get_constraint_start`` up to the point
+    where it looks at drafts: ended when the grammar applies from the first
+    token (``enable_in_reasoning``, a latched ``reasoning_ended`` such as
+    ``include_reasoning=false``, no reasoning parser, or a prompt that already
+    closed reasoning, which is thinking off). An open phase whose parser has no
+    end ids is reported with an empty set, and the worker then keeps the row on
+    the logits path.
+    """
+    structured = getattr(request, "structured_output_request", None)
+    if structured is None or manager is None:
+        return None
+    if getattr(manager, "enable_in_reasoning", False) or structured.reasoning_ended:
+        return True, ()
+    reasoner = manager._get_reasoner(request)
+    if reasoner is None:
+        return True, ()
+    if structured.reasoning_ended is None and reasoner.is_reasoning_end(
+        request.prompt_token_ids or []
+    ):
+        return True, ()
+    end_ids = (
+        reasoner.reasoning_end_token_ids
+        if isinstance(reasoner, ParserEngineReasoningAdapter)
+        else ()
+    )
+    return False, tuple(sorted(int(t) for t in end_ids))
+
+
 # The lane coordinator's per-step state; see ``lane_scheduler.py``.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
 
@@ -97,6 +197,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_FORCED_RESET_DISCARD_COUNTS_ATTR,
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
+    _TT_REASONING_START_ATTR,
     _TT_STEP_STATE_ATTR,
 )
 
@@ -375,6 +476,9 @@ class TTScheduler(AsyncScheduler):
       prefill cannot make progress and running decode requests exist.
     """
 
+    # Class default: a scheduler built without __init__ (tests) is unlimited.
+    _max_partial_prefills = 0
+
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
@@ -393,6 +497,21 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
+        (
+            self._dp_load_prefill_aware,
+            self._dp_load_tokens_per_unit,
+            self._dp_load_min_tokens,
+        ) = get_tt_dp_load_config(self.vllm_config)
+        (
+            self._long_prefill_threshold,
+            self._long_prefill_max_defer,
+        ) = get_tt_long_prefill_alone_config(self.vllm_config)
+        # Consecutive prefill steps that hid a long prompt behind short ones.
+        self._long_prefill_defer_steps = 0
+        self._long_prefill_hidden_ids: set[str] = set()
+        self._max_partial_prefills = get_tt_max_concurrent_partial_prefills(
+            self.vllm_config
+        )
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -405,6 +524,11 @@ class TTScheduler(AsyncScheduler):
         # _mirror_spec_session). Only its owner can emit a block.
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
+        # Requests that already had a speculative (placeholder-carrying) decode
+        # step scheduled since their last prefill. The first one is the seed
+        # step, which verifies no real draft (see update_from_output).
+        self._spec_step_seen: set[str] = set()
+        self._finishing_candidates: list[str] = []
         self._widest_decode_batch_size = 0
         self._prefill_chunk_alignment = (
             get_tt_prefill_chunk_alignment(self.vllm_config)
@@ -419,6 +543,19 @@ class TTScheduler(AsyncScheduler):
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
             )
+        self._prefill_chunk_cap_table = (
+            get_tt_prefill_chunk_cap_table(self.vllm_config)
+            if self._prefill_chunk_alignment > 1
+            else ()
+        )
+        if self._prefill_chunk_cap_table:
+            logger.info(
+                "TT scheduler: depth-dependent prefill chunk caps "
+                "[start_tokens, max_chunk_tokens]: %s",
+                [list(entry) for entry in self._prefill_chunk_cap_table],
+            )
+        self._step_prefill_tokens = 0
+        self._warned_mm_over_step = False
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
@@ -538,6 +675,13 @@ class TTScheduler(AsyncScheduler):
         Rust frontend stays refused: it would send all traffic down this path
         instead of rejecting unsupported requests.
         """
+        if request.mm_features:
+            # The TT runner re-runs the vision tower from token 0 on every
+            # prefill, but vLLM's strip_covered_mm_data drops the pixel payload
+            # of any mm item fully covered by a prefix-cache hit. Never read
+            # the prefix cache for multimodal requests so payloads stay intact.
+            # (A plain attribute, derived once in Request.__init__.)
+            request.skip_reading_prefix_cache = True
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
@@ -765,6 +909,80 @@ class TTScheduler(AsyncScheduler):
                 ", ".join(stripped),
             )
 
+    def _estimate_cached_prefix_tokens(self, request: Request) -> int:
+        """Estimate the prefix-cache hit of a request, with no side effects.
+
+        Mirrors ``KVCacheManager.get_computed_blocks`` for one full-attention
+        group: walk ``request.block_hashes`` from the start and count leading
+        hashes that ``BlockPool.get_cached_block`` finds. That call is a plain
+        dict read. It does not touch ref counts, the free queue, or the
+        prefix-cache stats, which ``get_computed_blocks`` and
+        ``record_prefix_cache_stats`` would. The hit is capped at
+        ``num_prompt_tokens - 1`` (vLLM always recomputes the last token) and
+        rounded down to whole blocks. Returns 0 when caching is off, the request
+        skips the cache, or anything needed is missing.
+        """
+        try:
+            manager = self.kv_cache_manager
+            if not manager.prefix_cache_lookup_enabled(request):
+                return 0
+            pool = manager.block_pool
+            block_size = int(self.block_size)
+            if block_size <= 0 or int(pool.hash_block_size) != block_size:
+                return 0
+            max_blocks = (int(request.num_prompt_tokens) - 1) // block_size
+            hits = 0
+            for block_hash in itertools.islice(request.block_hashes, max_blocks):
+                if not pool.get_cached_block(block_hash, [0]):
+                    break
+                hits += 1
+            return hits * block_size
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return 0
+
+    def _pending_prefill_tokens(self, request: Request, waiting: bool = False) -> int:
+        """Prompt tokens a request still has to prefill, as far as known now.
+
+        A waiting request has not been through the scheduler's prefix-cache
+        lookup (``num_computed_tokens`` is 0), so with ``waiting=True`` its
+        cached prefix is estimated read-only. Running partial prefills pass
+        ``waiting=False`` and use their real computed count.
+        """
+        done = max(
+            int(getattr(request, "num_computed_tokens", 0) or 0),
+            int(getattr(request, "num_cached_tokens", -1) or 0),
+        )
+        if waiting and done == 0:
+            done = self._estimate_cached_prefix_tokens(request)
+        return max(0, int(request.num_prompt_tokens) - done)
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Return ``(num_running, num_waiting)`` as the DP load balancer reads it.
+
+        With ``dp_load_prefill_aware`` the waiting count grows by one unit per
+        ``dp_load_prefill_tokens_per_unit`` pending prefill tokens (waiting
+        requests and running partial prefills), so a rank facing a long prefill
+        looks busy before the blocking step starts. A request counts only if
+        its pending tokens are at least ``dp_load_prefill_min_tokens``; with
+        none above it the base counts are returned unchanged.
+        """
+        running, waiting = super().get_request_counts()
+        if not getattr(self, "_dp_load_prefill_aware", False):
+            return running, waiting
+        min_tokens = self._dp_load_min_tokens
+        pending = 0
+        for r in itertools.chain(self.waiting, self.kv_holding_waiting):
+            n = self._pending_prefill_tokens(r, True)
+            if n >= min_tokens:
+                pending += n
+        for r in self.running:
+            if r.is_prefill_chunk:
+                n = self._pending_prefill_tokens(r)
+                if n >= min_tokens:
+                    pending += n
+        penalty = -(-pending // self._dp_load_tokens_per_unit)
+        return running, waiting + penalty
+
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 
@@ -802,54 +1020,169 @@ class TTScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        if getattr(self, "_base_need_mamba_split", False):
-            num_new_tokens = super()._mamba_block_aligned_split(
-                request,
-                num_new_tokens,
-                num_new_local_computed_tokens,
-                num_external_computed_tokens,
-            )
         start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+        # A multimodal request is never split, so vLLM's own block-aligned
+        # clipping (which would end a chunk at the last cacheable block) does
+        # not apply to it either.
+        grant = self._mm_no_split_grant(request, start, num_new_tokens)
+        if grant is None:
+            if getattr(self, "_base_need_mamba_split", False):
+                num_new_tokens = super()._mamba_block_aligned_split(
+                    request,
+                    num_new_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
+            num_new_tokens = self._cap_prefill_chunk(request, start, num_new_tokens)
+            grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
+        if grant > 0 and start < self._prefill_end(request):
+            self._step_prefill_tokens = getattr(self, "_step_prefill_tokens", 0) + grant
+        return grant
+
+    @staticmethod
+    def _prefill_end(request: Request) -> int:
+        """First position that is not prompt prefill.
+
+        A request resumed from preemption replays its output tokens too."""
+        return max(request.num_prompt_tokens, request.num_tokens - 1)
+
+    @staticmethod
+    def _has_mm_inputs(request: Request) -> bool:
+        return bool(
+            getattr(request, "mm_features", None)
+            or getattr(request, "has_encoder_inputs", False)
+        )
+
+    def _step_token_cap(self) -> int:
+        """Prompt tokens one step can schedule in total, ignoring the per-request
+        ``long_prefill_token_threshold``."""
+        cfg = getattr(self, "scheduler_config", None)
+        if cfg is None:
+            return sys.maxsize
+        scheduled = getattr(self, "max_num_scheduled_tokens", None)
+        if scheduled is None:
+            scheduled = getattr(cfg, "max_num_scheduled_tokens", None)
+        batched = int(getattr(cfg, "max_num_batched_tokens", 0) or 0) or sys.maxsize
+        return min(int(scheduled), batched) if scheduled is not None else batched
+
+    def _mm_no_split_grant(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int | None:
+        """Tokens to grant a multimodal prefill that must not be split.
+
+        A chunk end inside (or between) a request's multimodal items splits its
+        embeddings from their positions, and the model keeps no chunk state for
+        such a request. So a multimodal prompt is scheduled whole or not at all:
+
+        - all remaining tokens fit in what is left of this step's budget: grant
+          them, ignoring ``long_prefill_token_threshold`` (vLLM clips by it
+          before this hook runs; the leftover budget is tracked here from the
+          grants made earlier in the step, which is a lower bound of the real
+          one, so a grant never overshoots the step budget);
+        - they fit a step, but not what is left of this one: return 0. vLLM's
+          waiting loop then stops admitting (the request stays at the head of
+          the queue and gets a fresh budget next step) and its running loop
+          skips the request. Progress is guaranteed because the requests ahead
+          of it finish their chunks and nothing new is admitted behind it;
+        - they exceed even a whole step: ``None``. Splitting is unavoidable,
+          so the caller treats the request like a text one (aligned chunks).
+
+        ``None`` is also returned for text requests and for requests past their
+        prefill, which take the normal path.
+        """
+        if num_new_tokens <= 0 or not self._has_mm_inputs(request):
+            return None
+        if start >= self._prefill_end(request):
+            return None
+        remaining = request.num_tokens - start
+        cap = self._step_token_cap()
+        if remaining > cap:
+            if not getattr(self, "_warned_mm_over_step", False):
+                self._warned_mm_over_step = True
+                logger.warning(
+                    "TT scheduler: a multimodal prompt needs %d prefill tokens, "
+                    "more than one step can schedule (%d); it is split.",
+                    remaining,
+                    cap,
+                )
+            return None
+        if remaining <= cap - getattr(self, "_step_prefill_tokens", 0):
+            return remaining
+        return 0
+
+    def _cap_prefill_chunk(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Cap a text prefill chunk by the prompt depth it starts at.
+
+        ``prefill_chunk_cap_table`` is a step function: the entry with the
+        largest ``start_tokens <= start`` gives the most tokens one chunk may
+        hold, so deep chunks (costly: attention grows with depth) stay short
+        enough to bound a step's duration. Multimodal requests are never split,
+        so never capped. Caps are multiples of the chunk alignment, so a capped
+        chunk from an aligned start ends on the grid.
+        """
+        table = getattr(self, "_prefill_chunk_cap_table", ())
+        if not table or num_new_tokens <= 0:
+            return num_new_tokens
+        if self._has_mm_inputs(request) or start >= self._prefill_end(request):
+            return num_new_tokens
+        cap = None
+        for entry_start, entry_cap in table:
+            if entry_start > start:
+                break
+            cap = entry_cap
+        if cap is None:
+            return num_new_tokens
+        return min(num_new_tokens, cap)
 
     def _align_prefill_chunk_end(
         self, request: Request, start: int, num_new_tokens: int
     ) -> int:
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
-        Chunks that finish the prompt, decode steps and multimodal prompts are
-        left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request that cannot reach the grid ends its
-        chunk on a KV block instead, and waits a step if that is empty too.
+        Chunks that finish the prefill and decode steps are left alone. The
+        prefill of a request resumed after preemption replays its output tokens
+        too, so it is finished only at ``request.num_tokens`` (the model runner
+        flags every chunk ending below that as intermediate), not at the prompt
+        end. A multimodal prompt is never split (``_mm_no_split_grant``); only
+        one that cannot fit a whole step falls through to the alignment.
+
+        A chunk too short to reach the grid waits for the next step when it
+        starts on the grid or the request is being admitted (new, resumed, or
+        a prefix-cache hit at any block boundary). A running request that
+        already sits off the grid ends its chunk on a KV block instead, and
+        waits a step if that is empty too. Either way a permanent per-step cap
+        below the alignment still makes progress.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
-        if align <= 1 or num_new_tokens <= 0:
+        if num_new_tokens <= 0:
+            return num_new_tokens
+        grant = self._mm_no_split_grant(request, start, num_new_tokens)
+        if grant is not None:
+            return grant
+        if align <= 1:
+            return num_new_tokens
+        if start >= self._prefill_end(request):
             return num_new_tokens
         end = start + num_new_tokens
-        # A request resumed from preemption replays its output tokens too, so
-        # only a chunk that reaches the end of the sequence is the last one.
         if end >= request.num_tokens:
-            return num_new_tokens
-        if getattr(request, "mm_features", None) or getattr(
-            request, "has_encoder_inputs", False
-        ):
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
-            if start != 0:
+            admitting = request.num_computed_tokens == 0
+            if not admitting and start % align != 0:
                 # The next chunk resumes where this one ends, and the model
-                # takes a resume offset only on a KV block boundary. A running
-                # request whose chunk cannot reach the grid still ends on a
-                # block, or waits for the next step's budget.
+                # takes a resume offset only on a KV block boundary.
                 block = self.block_size
                 return max(end // block * block - start, 0)
-            # A new request waits only when this step's leftover budget is what
-            # stopped it. If a full step could not reach the grid either (a
-            # permanent cap below the alignment), it must still make progress.
+            # Wait only when this step's leftover budget is what stopped it. If
+            # a full step could not reach the grid either (a permanent cap below
+            # the alignment), it must still make progress.
             return (
                 0 if num_new_tokens < self._full_step_prefill_cap() else num_new_tokens
             )
@@ -864,6 +1197,20 @@ class TTScheduler(AsyncScheduler):
         return limit
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Evaluated on the state the base running loop will see, before it
+        # mutates anything: the skip condition is a pure function of request
+        # state, and the loop advances ``num_computed_tokens`` of the requests
+        # it does schedule.
+        self._step_prefill_tokens = 0
+        self._finishing_candidates = [
+            request.request_id
+            for request in self.running
+            if getattr(request, "num_output_placeholders", 0) > 0
+            and request_will_reach_max_tokens(request)
+        ]
+        return self._schedule_mode()
+
+    def _schedule_mode(self) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
         has_pending_prefill = self._has_pending_prefill()
@@ -946,6 +1293,25 @@ class TTScheduler(AsyncScheduler):
                     "TT scheduler: widest decode batch reached %d request row(s)",
                     rows,
                 )
+        if is_decode and self._finishing_candidates:
+            # A candidate counts only if this step really left it out and it
+            # is still a running request: not scheduled, and not preempted or
+            # finished by this very schedule (a preempted request resumes and
+            # is scheduled again, which a finishing slot must never be).
+            gone = set(scheduler_output.preempted_req_ids or ()) | set(
+                scheduler_output.finished_req_ids
+            )
+            finishing = tuple(
+                req_id
+                for req_id in self._finishing_candidates
+                if req_id not in scheduler_output.num_scheduled_tokens
+                and req_id not in gone
+                and req_id in self.requests
+                and self.requests[req_id].status == RequestStatus.RUNNING
+            )
+            if finishing:
+                setattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, finishing)
+        self._finishing_candidates = []
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -972,13 +1338,186 @@ class TTScheduler(AsyncScheduler):
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
         self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
+        hidden = self._hide_for_long_prefill_alone()
+        hidden_running, slots = self._hide_running_multi_chunk()
+        # Hidden partial prefills still hold a running slot.
+        self.max_num_running_reqs = max(
+            0, self.max_num_running_reqs - len(hidden_running)
+        )
+        self.max_num_active_reqs = max(
+            0, self.max_num_active_reqs - len(hidden_running)
+        )
+        hidden_waiting = self._hide_waiting_multi_chunk(slots)
         try:
             result = super().schedule()
         finally:
+            self._restore_waiting_multi_chunk(hidden_waiting)
+            self._restore_running_multi_chunk(partial_prefills, hidden_running)
+            self._restore_hidden_waiting(hidden)
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
             self.max_num_active_reqs = saved_active
         return result
+
+    def _hide_for_long_prefill_alone(self) -> list[Request] | None:
+        """Hide part of the waiting queue so a step never mixes long and short.
+
+        Returns the original waiting order when something was hidden, else
+        ``None``. Longs (pending prompt tokens above the threshold) wait while a
+        short one is waiting, for at most ``long_prefill_alone_max_defer_steps``
+        consecutive steps; after that the shorts wait and the longs run alone,
+        which bounds a long prompt's delay. FCFS holds within each class.
+        """
+        threshold = getattr(self, "_long_prefill_threshold", 0)
+        if threshold <= 0:
+            return None
+        original = list(self.waiting)
+        longs = [
+            r for r in original if self._pending_prefill_tokens(r, True) > threshold
+        ]
+        if not longs or len(longs) == len(original):
+            self._long_prefill_defer_steps = 0
+            return None
+        if self._long_prefill_defer_steps < self._long_prefill_max_defer:
+            self._long_prefill_defer_steps += 1
+            hide = longs
+        else:
+            self._long_prefill_defer_steps = 0
+            long_ids = {r.request_id for r in longs}
+            hide = [r for r in original if r.request_id not in long_ids]
+        self.waiting.remove_requests(set(hide))
+        self._long_prefill_hidden_ids = {r.request_id for r in hide}
+        return original
+
+    def _restore_hidden_waiting(self, original: list[Request] | None) -> None:
+        """Put hidden requests back, in their original order within ``waiting``.
+
+        Requests the base scheduler prepended meanwhile (preemptions) stay in
+        front; requests it scheduled or moved elsewhere are not re-added.
+        """
+        if original is None:
+            return
+        hidden_ids = self._long_prefill_hidden_ids
+        self._long_prefill_hidden_ids = set()
+        original_ids = {r.request_id for r in original}
+        remaining = list(self.waiting)
+        remaining_ids = {r.request_id for r in remaining}
+        extras = [r for r in remaining if r.request_id not in original_ids]
+        ordered = [
+            r
+            for r in original
+            if r.request_id in hidden_ids or r.request_id in remaining_ids
+        ]
+        self.waiting.remove_requests(set(remaining))
+        for request in extras + ordered:
+            self.waiting.add_request(request)
+
+    def _chunk_cap_for(self, request: Request, start: int) -> int:
+        """Most prompt tokens the next chunk of ``request`` can hold."""
+        if self._has_mm_inputs(request):
+            # Never split unless it exceeds a whole step.
+            return self._step_token_cap()
+        return self._cap_prefill_chunk(request, start, self._full_step_prefill_cap())
+
+    def _needs_multiple_chunks(self, request: Request, waiting: bool) -> bool:
+        """Whether the uncached rest of the prompt exceeds one chunk."""
+        done = int(getattr(request, "num_computed_tokens", 0) or 0)
+        if waiting and done == 0:
+            # Cache-aware when the scheduler can estimate a prefix hit.
+            estimate = getattr(self, "_estimate_cached_prefix_tokens", None)
+            done = estimate(request) if estimate is not None else 0
+        remaining = self._prefill_end(request) - done
+        return remaining > self._chunk_cap_for(request, done)
+
+    def _hide_running_multi_chunk(self) -> tuple[list[Request], int]:
+        """Hide running partial prefills beyond the multi-chunk limit.
+
+        Walks ``self.running`` (partial prefills only, in running order, which
+        is admission order) and keeps the first ``limit`` that still need more
+        than one chunk; every request that finishes in one chunk stays. Hidden
+        requests leave ``self.running`` for this base call only, so the base
+        loop neither schedules, preempts, nor frees them; their
+        ``num_computed_tokens`` and blocks are untouched. Returns the hidden
+        requests and the multi-chunk slots left for waiting requests.
+        """
+        limit = self._max_partial_prefills
+        if limit <= 0:
+            return [], sys.maxsize
+        slots = limit
+        hidden: list[Request] = []
+        keep: list[Request] = []
+        for r in self.running:
+            if self._needs_multiple_chunks(r, waiting=False):
+                if slots > 0:
+                    slots -= 1
+                else:
+                    hidden.append(r)
+                    continue
+            keep.append(r)
+        self.running = keep
+        return hidden, slots
+
+    def _restore_running_multi_chunk(
+        self, original: list[Request], hidden: list[Request]
+    ) -> None:
+        """Put hidden partial prefills back at their original running position."""
+        if not hidden:
+            return
+        hidden_ids = {r.request_id for r in hidden}
+        live = {r.request_id for r in self.running}
+        ordered = [
+            r for r in original if r.request_id in hidden_ids or r.request_id in live
+        ]
+        known = {r.request_id for r in original}
+        extras = [r for r in self.running if r.request_id not in known]
+        self.running = ordered + extras
+
+    def _hide_waiting_multi_chunk(
+        self, slots: int
+    ) -> tuple[list[Request], set[str]] | None:
+        """Hide waiting multi-chunk requests beyond the slots left (FCFS).
+
+        Waiting requests that fit in one chunk are never hidden. Returns the
+        original queue order and the hidden ids, or ``None`` if nothing hid.
+        """
+        if self._max_partial_prefills <= 0:
+            return None
+        original = list(self.waiting)
+        hide: list[Request] = []
+        for r in original:
+            if self._needs_multiple_chunks(r, waiting=True):
+                if slots > 0:
+                    slots -= 1
+                else:
+                    hide.append(r)
+        if not hide:
+            return None
+        self.waiting.remove_requests(set(hide))
+        return original, {r.request_id for r in hide}
+
+    def _restore_waiting_multi_chunk(
+        self, saved: tuple[list[Request], set[str]] | None
+    ) -> None:
+        """Put hidden waiting requests back in their original queue order.
+
+        Requests the base scheduler prepended meanwhile (preemptions) stay in
+        front; requests it scheduled or moved elsewhere are not re-added.
+        """
+        if saved is None:
+            return
+        original, hidden_ids = saved
+        original_ids = {r.request_id for r in original}
+        remaining = list(self.waiting)
+        remaining_ids = {r.request_id for r in remaining}
+        extras = [r for r in remaining if r.request_id not in original_ids]
+        ordered = [
+            r
+            for r in original
+            if r.request_id in hidden_ids or r.request_id in remaining_ids
+        ]
+        self.waiting.remove_requests(set(remaining))
+        for request in extras + ordered:
+            self.waiting.add_request(request)
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
@@ -1066,6 +1605,18 @@ class TTScheduler(AsyncScheduler):
                         pending.get(request.request_id, 0) + frame_count
                     )
 
+    def _attach_reasoning_start(self, scheduler_output: SchedulerOutput) -> None:
+        """Tell the worker each scheduled structured request's reasoning phase."""
+        manager = getattr(self, "structured_output_manager", None)
+        start: dict[str, tuple[bool, tuple[int, ...]]] = {}
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.use_structured_output:
+                value = reasoning_start_for_request(manager, request)
+                if value is not None:
+                    start[req_id] = value
+        set_tt_reasoning_start(scheduler_output, start)
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Reserve the physical output each scheduled step will commit.
 
@@ -1089,6 +1640,8 @@ class TTScheduler(AsyncScheduler):
         set_tt_scheduler_output_field(
             scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids
         )
+        self._track_spec_seed_steps(scheduler_output)
+        self._attach_reasoning_start(scheduler_output)
         pending = getattr(self, "_pending_async_output_frames", None)
         if pending is None:
             pending = self._pending_async_output_frames = {}
@@ -1261,6 +1814,64 @@ class TTScheduler(AsyncScheduler):
             return None
         return super().make_stats(*args, **kwargs)
 
+    def _track_spec_seed_steps(self, scheduler_output: SchedulerOutput) -> None:
+        """Record which requests this step carries their first draft offer for.
+
+        Under async scheduling every decode step reserves ``[-1] * K`` for each
+        scheduled request, but a request's first decode step after a prefill
+        (the seed step) has no proposal to verify. A prefill step carries no
+        offer, so a request scheduled without one starts over. Meaningful only
+        where the scheduler itself reserves placeholders (async scheduling).
+        """
+        if not (self.num_spec_tokens and self.scheduler_config.async_scheduling):
+            return
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        seen = self.__dict__.setdefault("_spec_step_seen", set())
+        seed: set[str] = set()
+        for req_id in scheduler_output.num_scheduled_tokens:
+            if offered.get(req_id):
+                if req_id not in seen:
+                    seen.add(req_id)
+                    seed.add(req_id)
+            else:
+                seen.discard(req_id)
+        setattr(scheduler_output, _TT_SEED_REQ_IDS_ATTR, frozenset(seed))
+        seen.difference_update(scheduler_output.finished_req_ids)
+
+    def _mark_unoffered_drafts_invalid(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Keep vLLM's speculative metrics from counting unverified placeholders.
+
+        ``AsyncScheduler`` offers K placeholders to every scheduled request, so
+        a step that verified fewer real drafts (the seed step: none) would
+        count the rest as rejected. vLLM subtracts
+        ``scheduler_output.num_invalid_spec_tokens[req_id]`` from the proposed
+        count (``Scheduler.make_spec_decoding_stats``). The
+        runner reports each row's real draft count on the output; without a
+        report the seed step is taken to verify none.
+        """
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        if not offered:
+            return
+        valid = getattr(model_runner_output, TT_VALID_DRAFTS_ATTR, None) or {}
+        seed = getattr(scheduler_output, _TT_SEED_REQ_IDS_ATTR, frozenset())
+        invalid = dict(scheduler_output.num_invalid_spec_tokens or {})
+        for req_id, tokens in offered.items():
+            num_offered = len(tokens)
+            if req_id in valid:
+                extra = num_offered - int(valid[req_id])
+            elif req_id in seed:
+                extra = num_offered
+            else:
+                continue
+            extra = max(0, min(num_offered, extra))
+            if extra > invalid.get(req_id, 0):
+                invalid[req_id] = extra
+        scheduler_output.num_invalid_spec_tokens = invalid
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1270,6 +1881,7 @@ class TTScheduler(AsyncScheduler):
         its outputs, so ``_update_request_with_output`` reads the decision that
         produced THIS output rather than a later schedule's overwrite, and
         consume only the output frames this scheduled step reserved."""
+        self._mark_unoffered_drafts_invalid(scheduler_output, model_runner_output)
         if self._is_block_output_model:
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output

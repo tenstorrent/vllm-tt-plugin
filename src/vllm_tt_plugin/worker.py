@@ -13,7 +13,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import ttnn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import (
@@ -343,7 +343,11 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        self.model_runner.load_model()
+        # Publish the vLLM config while the model is built so model classes
+        # can read it (e.g. enable_prefix_caching); vLLM's own GPU worker does
+        # the same around load_model.
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     def take_draft_token_ids(self) -> "DraftTokenIds | None":
         """Hand the runner's proposed drafts to the engine.
