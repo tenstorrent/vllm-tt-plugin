@@ -478,14 +478,22 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def _global_regions(self, pool: Pool, slots: list[int], blocks: list[int]) -> dict[tuple[int, int], list[tuple]]:
         """{(layer, kv): [(device, byte offset, bytes, host address)]}: runs of consecutive slots and block ids are one
         region per plane (pool layout: plane-major, plane = (device, global layer position, kv)). ``pool`` is the
-        mapping of the generation the slots were handed out in."""
+        mapping of the generation the slots were handed out in.
+
+        The (block, slot) pairs are taken in block order, not in prompt order: an engine that has cycled through its
+        KV cache gets its blocks in descending runs (vLLM frees a request's blocks tail first, FIFO, and allocates
+        from the head), so in prompt order no two neighbours would be consecutive and every block would be its own
+        region (147K regions for a 128K-token load instead of 144 per run). In block order a descending run of blocks
+        whose slots descend with it (``wait_for_save`` reserves slots in block order) is one ascending run again.
+        The regions copy the same pages either way: they are disjoint, so their order does not matter."""
         L = self.layout
+        pairs = sorted(zip(blocks, slots))
         runs, i = [], 0
-        while i < len(slots):
+        while i < len(pairs):
             j = i + 1
-            while j < len(slots) and slots[j] == slots[j - 1] + 1 and blocks[j] == blocks[j - 1] + 1:
+            while j < len(pairs) and pairs[j][1] == pairs[j - 1][1] + 1 and pairs[j][0] == pairs[j - 1][0] + 1:
                 j += 1
-            runs.append((slots[i], blocks[i], j - i))
+            runs.append((pairs[i][1], pairs[i][0], j - i))
             i = j
         out: dict[tuple[int, int], list[tuple]] = {}
         plane_off = 0
@@ -609,7 +617,14 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 if sv.global_keys:
                     # reserve sends the mapping's generation and checks the answer's: the slots are in this mapping
                     t = time.perf_counter()
-                    res_g, slots = self.client.reserve(self.pool_global, sv.global_keys)
+                    # Keys in block order: the store hands out ascending slots in request order, so the slots follow
+                    # the block ids and a run of blocks (ascending or descending) is one region per plane, on this
+                    # save and on another engine's load whose blocks run the same way (_global_regions).
+                    order = sorted(range(len(sv.global_keys)), key=sv.global_blocks.__getitem__)
+                    res_g, got = self.client.reserve(self.pool_global, [sv.global_keys[i] for i in order])
+                    slots = [None] * len(order)
+                    for i, slot in zip(order, got):
+                        slots[i] = slot
                     pool = self.client.pool(self.pool_global)
                     pick = [(s, b) for s, b in zip(slots, sv.global_blocks) if s is not None]
                     t_store += time.perf_counter() - t

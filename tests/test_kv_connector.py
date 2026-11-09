@@ -216,6 +216,97 @@ def test_global_regions_coalesce_runs(connector):
     assert k[1] == (0, 20 * pb, pb, pool.base + 9 * pb)
 
 
+def _pages(regs, page_bytes):
+    """Every (layer, kv, device, device byte, host address) page a region list copies."""
+    out = set()
+    for (layer, kv), rs in regs.items():
+        pb = page_bytes[kv]
+        for dev, off, size, host in rs:
+            assert size % pb == 0
+            out.update((layer, kv, dev, off + k * pb, host + k * pb) for k in range(size // pb))
+    return out
+
+
+def _regions_in_prompt_order(c, pool, slots, blocks):
+    """The region lists as before block-order coalescing: runs only where prompt neighbours are consecutive."""
+    L = c.layout
+    runs, i = [], 0
+    while i < len(slots):
+        j = i + 1
+        while j < len(slots) and slots[j] == slots[j - 1] + 1 and blocks[j] == blocks[j - 1] + 1:
+            j += 1
+        runs.append((slots[i], blocks[i], j - i))
+        i = j
+    out, plane_off = {}, 0
+    for dev in range(L.num_devices):
+        for layer in L.global_layers:
+            for kv in (0, 1):
+                pb = L.page_bytes[kv]
+                regs = out.setdefault((layer, kv), [])
+                for slot, blk, n in runs:
+                    regs.append((dev, blk * pb, n * pb, pool.base + plane_off + slot * pb))
+                plane_off += pool.num_slots * pb
+    return out
+
+
+def test_regions_in_block_order_copy_the_same_pages(connector):
+    """Block-order coalescing changes how many regions there are, never which page goes where."""
+    import random
+
+    c = connector(role=KVConnectorRole.WORKER)
+    pool = c.client.pool(c.pool_global)
+    pb = c.layout.page_bytes
+    rng = random.Random(5)
+    for case in range(200):
+        n = rng.randint(1, 40)
+        blocks = rng.sample(range(1, 500), n) if case % 3 == 0 else list(range(300 + n, 300, -1))
+        slots = rng.sample(range(0, 64), n) if case % 4 == 0 else list(range(10, 10 + n))[:: rng.choice([1, -1])]
+        new = c._global_regions(pool, slots, blocks)
+        assert _pages(new, pb) == _pages(_regions_in_prompt_order(c, pool, slots, blocks), pb)
+
+
+def test_descending_blocks_with_descending_slots_are_one_region_per_plane(connector):
+    """An engine that cycled its KV cache gets descending block runs; slots reserved in block order descend with
+    them in prompt order: one region per plane, not one per block."""
+    c = connector(role=KVConnectorRole.WORKER)
+    pool = c.client.pool(c.pool_global)
+    blocks = list(range(131, 99, -1))  # 32 blocks, descending in prompt order
+    slots = list(range(40, 8, -1))
+    regs = c._global_regions(pool, slots, blocks)
+    assert sum(len(r) for r in regs.values()) == 8 * 9 * 2
+    assert len(_regions_in_prompt_order(c, pool, slots, blocks)[(GLOBAL[0], 0)]) == 8 * 32
+
+
+def test_a_save_reserves_keys_in_block_order(connector):
+    """wait_for_save hands the store the keys sorted by block id, so the slots ascend with the block ids, and maps
+    the slots back to prompt order."""
+    c = connector(role=KVConnectorRole.WORKER)
+    c._kv = [[object(), object()] for _ in range(48)]
+    seen = {}
+
+    def reserve(pool, keys):
+        seen["keys"] = list(keys)
+        return 7, list(range(20, 20 + len(keys)))
+
+    copied = []
+    c.client.reserve = reserve
+    c.client.commit = lambda r: 0
+    c._copy = lambda regs, to_device: copied.append(regs) or 0
+    keys = [bytes([i]) * 32 for i in range(4)]
+    sv = kvc.SaveSpec("r", keys, [53, 52, 51, 50], None, None)
+    c.bind_connector_metadata(kvc.TTKVMeta(saves=[sv]))
+    c.wait_for_save()
+    assert seen["keys"] == keys[::-1], "keys sent in ascending block order"
+    (regs,) = copied
+    pool = c.client.pool(c.pool_global)
+    k = regs[(GLOBAL[0], 0)]
+    assert len(k) == 8 and k[0] == (0, 50 * pb_k(), 4 * pb_k(), pool.base + 20 * pb_k()), "block 50 <-> slot 20"
+
+
+def pb_k():
+    return 12 * 1088
+
+
 def test_a_load_pinned_in_another_pool_generation_is_refused(connector):
     """The scheduler pinned the slots in generation g1; the store restarted (g2): copying through either mapping
     would read some other entry's bytes, so the step fails."""
