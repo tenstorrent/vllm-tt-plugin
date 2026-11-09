@@ -646,6 +646,7 @@ def test_structured_decode_submits_next_forward_before_readback(
     runner.__dict__.update(vars(_fake_runner(batch, request)))
     # Keep the existing input-batch setup, but use production sampling decisions.
     del runner.check_perform_device_sampling
+    del runner._decode_device_sampled
     del runner._sampling_params_for_padded_decode
     runner.model_config.logits_processors = []
     runner.model_config.max_model_len = MAX_MODEL_LEN
