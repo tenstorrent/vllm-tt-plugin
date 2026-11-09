@@ -21,7 +21,9 @@ from typing import TYPE_CHECKING, get_args
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
+    ACCEPT_MODE_TOPK,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
@@ -45,8 +47,13 @@ logger = init_tt_logger(__name__)
 #
 # ``argmax_ids`` certifies greedy rows only. ``logits`` certifies every row the
 # platform admits on a speculating launch, by rejection sampling on the host,
-# so a logits-only plan is runnable too. ``fused_sample`` has no runner path.
-_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
+# so a logits-only plan is runnable too. ``fused_sample`` (stage S1) commits
+# greedy rows only, so it is runnable but never enough alone: see below.
+_RUNNABLE_ACCEPT_MODES = (
+    ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_LOGITS,
+    ACCEPT_MODE_FUSED_SAMPLE,
+)
 
 # Upstream custom_class is a user-provided proposer extension that needs no
 # separate draft checkpoint configuration. The TT runner uses that category
@@ -297,6 +304,32 @@ def resolve_speculative_plan(
             f"{model_class.__name__}.spec_plan offers accept modes "
             f"{list(outcome.accept_modes)}, none of which the runner can "
             f"drive; it drives {list(_RUNNABLE_ACCEPT_MODES)}"
+        )
+    if not any(
+        mode in outcome.accept_modes
+        for mode in (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
+    ):
+        # ``fused_sample`` serves greedy rows only (stage S1); the runner falls
+        # back per step to another mode for every other row.
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan offers accept modes "
+            f"{list(outcome.accept_modes)}; {ACCEPT_MODE_FUSED_SAMPLE!r} "
+            "serves greedy rows only, so the plan must also offer "
+            f"{ACCEPT_MODE_LOGITS!r} (or {ACCEPT_MODE_ARGMAX_IDS!r} for a "
+            "greedy-only launch) for the steps it cannot serve"
+        )
+    if (
+        ACCEPT_MODE_TOPK in outcome.accept_modes
+        and ACCEPT_MODE_LOGITS not in outcome.accept_modes
+    ):
+        # The support walk serves a subset of the rows a logits walk serves;
+        # every other row of a sampled step, and every tie-overflow row, needs
+        # the full logits, so a plan cannot offer the support alone.
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan offers accept mode "
+            f"{ACCEPT_MODE_TOPK!r} without {ACCEPT_MODE_LOGITS!r}; the runner "
+            "asks for topk only on steps whose rows the support serves and "
+            "needs logits for every other sampled step"
         )
 
     # An ordinary decode returns no VerifyOutput, so it produces no hidden

@@ -12,6 +12,7 @@ adapter must provide.
 | Task | Reference |
 |---|---|
 | Register an adapter, construct the model, size and allocate KV storage | [Model setup](MODEL_SETUP.md) |
+| Declare recurrent state through `MambaSpec` and address its blocks | [Recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec), [state blocks](MODEL_EXECUTION.md#recurrent-state-blocks), [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations) |
 | Implement prefill, decode, sampling, and output conversion | [Model execution](MODEL_EXECUTION.md) |
 | Prepare traces and manage request state and shutdown | [Model lifecycle](MODEL_LIFECYCLE.md) |
 | Declare optional behavior and understand admission limits | [Model capabilities](MODEL_CAPABILITIES.md) |
@@ -51,6 +52,10 @@ An ordinary text adapter needs `initialize_vllm_model`, `prefill_forward`,
 `warmup_model_prefill` and `warmup_model_decode`. Supply `model_capabilities`
 on the class and instance, even when the dictionary is empty: platform
 admission tolerates absence, but runtime sampling reads the dictionary directly.
+
+An adapter that declares recurrent state through `MambaSpec` also needs
+`allocate_kv_cache_per_layer` and the block hooks `zero_kv_cache_blocks` and,
+with prefix caching, `copy_kv_cache_blocks`. Its prefill and decode receive `mamba_state`, one `MambaGroupState` per `MambaSpec` group; in mode `align` an adapter that chains verifies must apply `MambaGroupState.chain` (see [state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)).
 
 The execution page specifies when `read_decode_output` and
 `process_decode_output_host` are needed. Add extension hooks only with the

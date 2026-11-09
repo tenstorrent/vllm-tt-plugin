@@ -13,7 +13,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import ttnn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import (
@@ -26,9 +26,11 @@ from vllm.v1.core.kv_cache_utils import (
     get_uniform_page_size,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -343,7 +345,11 @@ class TTWorker(WorkerBase):
         )
 
     def load_model(self):
-        self.model_runner.load_model()
+        # Publish the vLLM config while the model is built so model classes
+        # can read it (e.g. enable_prefix_caching); vLLM's own GPU worker does
+        # the same around load_model.
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     def take_draft_token_ids(self) -> "DraftTokenIds | None":
         """Hand the runner's proposed drafts to the engine.
@@ -728,6 +734,97 @@ def _upstream_admission_blocks(
     return -(-one_request_bytes // bytes_per_block) + null_block
 
 
+def _raise_to_admission_floor(
+    vllm_config: VllmConfig,
+    kv_cache_specs: dict[str, KVCacheSpec],
+    num_tt_blocks: int,
+    output_reservation_blocks: int,
+) -> int:
+    """``num_tt_blocks``, raised to what upstream needs to admit one request.
+
+    The model budget can be smaller than what upstream needs to admit one
+    request at max_model_len (sliding groups retain blocks for in-flight
+    prefill, Mamba groups hold state blocks), and startup then fails in
+    get_kv_cache_configs. Raise the pool to upstream's admission requirement
+    plus the output reservation.
+    """
+    admission_floor = (
+        _upstream_admission_blocks(vllm_config, kv_cache_specs)
+        + output_reservation_blocks
+    )
+    if admission_floor <= num_tt_blocks:
+        return num_tt_blocks
+    # TT does not profile device memory, so nothing here checks that the
+    # larger pool fits; if it does not, KV allocation on the device fails at
+    # startup.
+    logger.warning(
+        "Raising the TT KV pool from %d to %d blocks: one request at "
+        "max_model_len=%d (max_in_flight_tokens=%d) needs %d blocks "
+        "upstream (including the null block) plus %d "
+        "output-reservation blocks, more than max_tokens_all_users "
+        "provides. Device memory for the larger pool is not checked.",
+        num_tt_blocks,
+        admission_floor,
+        vllm_config.model_config.max_model_len,
+        vllm_config.max_in_flight_tokens,
+        admission_floor - output_reservation_blocks,
+        output_reservation_blocks,
+    )
+    return admission_floor
+
+
+def _mamba_hybrid_num_blocks(
+    vllm_config: VllmConfig,
+    kv_cache_specs: dict[str, KVCacheSpec],
+    max_tokens_all_users: int,
+    max_batch: int,
+) -> tuple[int, int]:
+    """Pool size and output reservation, in blocks, for a MambaSpec model.
+
+    vLLM overlays every KV cache group on the same memory, so one block costs
+    one page in every layer slot, whichever group owns it. The page is the
+    unified page size of all groups: vLLM pads the smaller pages, which can be
+    the attention page. ``max_tokens_all_users`` counts attention tokens, so
+    this converts it to bytes per layer slot with the attention layers' bytes
+    per token and divides by the page. A token count divided by the block size
+    would ignore that padding.
+
+    On top of that come one block per running request in every attention
+    group, for the output reservation, and the blocks every running request
+    holds in each Mamba group, which the token budget does not count.
+    """
+    if is_tt_block_output_model(vllm_config):
+        raise ValueError(
+            "Block-output models (output_tokens_per_step > 1) do not support "
+            "MambaSpec KV cache groups"
+        )
+    _, groups = _kv_cache_groups_for_sizing(vllm_config, dict(kv_cache_specs))
+    page_size = get_uniform_page_size(group.kv_cache_spec for group in groups)
+    attention_specs = [
+        g.kv_cache_spec for g in groups if isinstance(g.kv_cache_spec, AttentionSpec)
+    ]
+    bytes_per_token = {
+        spec.real_page_size_bytes // spec.block_size for spec in attention_specs
+    }
+    if len(bytes_per_token) != 1:
+        raise ValueError(
+            "Sizing the TT KV pool of a MambaSpec model needs one attention "
+            "byte count per token and layer, got "
+            f"{sorted(bytes_per_token)} from attention specs {attention_specs}"
+        )
+    attention_blocks = -(-max_tokens_all_users * bytes_per_token.pop() // page_size)
+    output_reservation_blocks = max_batch * len(attention_specs)
+    mamba_blocks = max_batch * sum(
+        -(-g.kv_cache_spec.max_memory_usage_bytes(vllm_config) // page_size)
+        for g in groups
+        if isinstance(g.kv_cache_spec, MambaSpec)
+    )
+    return (
+        attention_blocks + output_reservation_blocks + mamba_blocks,
+        output_reservation_blocks,
+    )
+
+
 def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we
@@ -795,6 +892,20 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    auto_fit = getattr(model_config, "original_max_model_len", None) == -1
+    model_specs = kv_cache_spec_from_model_class(model_class, vllm_config)
+    # A model with MambaSpec layers is sized from bytes, not tokens.
+    if model_specs is not None and any(
+        isinstance(spec, MambaSpec) for spec in model_specs.values()
+    ):
+        num_tt_blocks, output_reservation_blocks = _mamba_hybrid_num_blocks(
+            vllm_config, model_specs, max_tokens_all_users, max_batch
+        )
+        if auto_fit:
+            return num_tt_blocks
+        return _raise_to_admission_floor(
+            vllm_config, model_specs, num_tt_blocks, output_reservation_blocks
+        )
     per_user_output_reservation = max(cache_config.block_size, output_tokens_per_step)
     max_tokens_all_users += per_user_output_reservation * max_batch
 
@@ -831,43 +942,17 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
-    # Hybrid models: the budget above can be smaller than what upstream needs
-    # to admit one request at max_model_len (sliding groups retain blocks for
-    # in-flight prefill), and startup then fails in get_kv_cache_configs.
-    # Raise the pool to upstream's admission requirement plus the output
-    # reservation. Auto-fit (-1) keeps the model budget: vLLM fits the length
-    # to it instead.
-    specs = (
-        kv_cache_spec_from_model_class(model_class, vllm_config)
-        if hybrid_kv_cache_groups_enabled
-        and getattr(model_config, "original_max_model_len", None) != -1
-        else None
-    )
+    # Hybrid models: raise the pool to what upstream needs to admit one request
+    # at max_model_len. Auto-fit (-1) keeps the model budget: vLLM fits the
+    # length to it instead.
+    specs = model_specs if hybrid_kv_cache_groups_enabled and not auto_fit else None
     if specs:
         output_reservation_blocks = (
             math.ceil(per_user_output_reservation / cache_config.block_size) * max_batch
         )
-        admission_floor = (
-            _upstream_admission_blocks(vllm_config, specs) + output_reservation_blocks
+        num_tt_blocks = _raise_to_admission_floor(
+            vllm_config, specs, num_tt_blocks, output_reservation_blocks
         )
-        if admission_floor > num_tt_blocks:
-            # TT does not profile device memory, so nothing here checks that
-            # the larger pool fits; if it does not, KV allocation on the
-            # device fails at startup.
-            logger.warning(
-                "Raising the TT KV pool from %d to %d blocks: one request at "
-                "max_model_len=%d (max_in_flight_tokens=%d) needs %d blocks "
-                "upstream (including the null block) plus %d "
-                "output-reservation blocks, more than max_tokens_all_users "
-                "provides. Device memory for the larger pool is not checked.",
-                num_tt_blocks,
-                admission_floor,
-                model_config.max_model_len,
-                vllm_config.max_in_flight_tokens,
-                admission_floor - output_reservation_blocks,
-                output_reservation_blocks,
-            )
-            num_tt_blocks = admission_floor
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step

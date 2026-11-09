@@ -11,6 +11,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from tests.spec.test_spec_final_audit import _chunked_scheduler
 from tests.test_block_scheduler import _request, _runner_output, _scheduler
 from tests.test_lane_scheduler import FakeLane, _make_coordinator
+from tests.test_mamba_qwen38_state_moves import K, _Harness, _prompt
 from vllm_tt_plugin.scheduler import (
     TT_SCHEDULER_OUTPUT_FIELDS,
     TTScheduler,
@@ -38,11 +39,22 @@ def _lane_step():
     return _make_coordinator([FakeLane(running=1), FakeLane()]).schedule()
 
 
+def _mamba_checkpoint_step():
+    """A 2045-token prefill whose state after 1024 tokens vLLM keeps in a
+    reserved Mamba prefill checkpoint block."""
+    harness = _Harness("align", num_spec=K, checkpoint=True)
+    harness.add("a", _prompt(1, 2045), max_tokens=4)
+    return harness.scheduler.schedule()
+
+
+_STEPS = (_block_step, _forced_reset_step, _lane_step, _mamba_checkpoint_step)
+
+
 def _tt_fields(scheduler_output):
     return {name for name in vars(scheduler_output) if name.startswith("_tt_")}
 
 
-@pytest.mark.parametrize("step", [_block_step, _forced_reset_step, _lane_step])
+@pytest.mark.parametrize("step", _STEPS)
 def test_the_tt_fields_a_step_sets_survive_a_rebuild_from_dataclass_fields(step):
     scheduler_output = step()
     attached = _tt_fields(scheduler_output)
@@ -64,9 +76,7 @@ def test_the_tt_fields_a_step_sets_survive_a_rebuild_from_dataclass_fields(step)
 
 
 def test_the_inventory_covers_every_tt_field_a_step_sets():
-    seen = set().union(
-        *(_tt_fields(step()) for step in (_block_step, _forced_reset_step, _lane_step))
-    )
+    seen = set().union(*(_tt_fields(step()) for step in _STEPS))
 
     assert seen == set(TT_SCHEDULER_OUTPUT_FIELDS)
 

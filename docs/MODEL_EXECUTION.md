@@ -21,9 +21,12 @@ The plugin rejects encoder-decoder models and `prompt_embeds` input.
 - `start_pos=-1` marks an inactive decode row. The model adapter must not
   interpret an inactive row as a live request or modify another request's state.
 - `page_table` is the first KV group's integer logical-to-physical block
-  table. If the resolved cache has multiple groups, the plugin also sends
-  `page_tables_per_layer`, ordered by attention-layer index. The model adapter
-  must use the page table for each layer. See [KV setup](MODEL_SETUP.md).
+  table. With `MambaSpec` groups it is the first attention group's table,
+  because group 0 can be a `MambaSpec` group. If the resolved cache has
+  multiple groups, the plugin also sends
+  `page_tables_per_layer`, ordered by attention-layer index, or by the index
+  of every layer when the cache has `MambaSpec` groups. The model adapter must
+  use the page table for each layer. See [KV setup](MODEL_SETUP.md).
 
 `TTModelInput` is an internal plugin payload. The model adapter receives the
 keyword arguments below, not a `TTModelInput` object. Source:
@@ -31,6 +34,120 @@ keyword arguments below, not a `TTModelInput` object. Source:
 `TTModelRunner._prepare_model_inputs` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py), and
 `TTLaneInputBatch` in [input_batch.py](../src/vllm_tt_plugin/input_batch.py).
+
+### Recurrent state blocks
+
+When the KV cache has `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)), prefill and decode also receive `mamba_state`, a `MambaStepState`. It holds one `MambaGroupState` per `MambaSpec` group, as upstream vLLM builds one attention metadata object per KV cache group (for GDN layers, `GDNAttentionMetadata` in `vllm/v1/attention/backends/gdn_attn.py`). The classes are frozen dataclasses in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py). Every tensor is a CPU int32 tensor with `tt_max_batch_size` rows, and row `i` belongs to submitted row `i`. K is `MambaSpec.num_speculative_blocks`, 0 without speculative decoding.
+
+| Field | Content |
+|---|---|
+| `MambaStepState.groups` | One `MambaGroupState` per `MambaSpec` KV cache group, in KV cache group order. |
+| `MambaGroupState.layer_names` | The group's layers, `KVCacheGroupSpec.layer_names`. The group's tensors apply to each of these layers. |
+| `MambaGroupState.windows` | `[tt_max_batch_size, 1 + K]`: row `i`'s state window in this group (`[tt_max_batch_size, 1]` when K is 0). Column 0 is the block that holds the row's running state. |
+| `MambaGroupState.checkpoint_blocks` | Prefill with prefill checkpoint blocks only, else `None`. See "States inside a prefill chunk" below. |
+| `MambaGroupState.chain` | A `MambaChainChoices` on a chained verify in mode `align` only, else `None`. See "Chained verifies in mode `align`" below. |
+| `MambaStepState.accepted_counts` | `[tt_max_batch_size]` when K > 0, else `None`. See below. |
+| `MambaStepState.checkpoint_positions` | Prefill with prefill checkpoint blocks only, else `None`. See "States inside a prefill chunk" below. |
+
+`TTModelRunner` fills `MambaGroupState.windows` and moves the state as follows:
+
+1. `TTModelRunner` selects window column 0 as upstream `mamba_get_block_table_tensor` does: column 0 of the group's block-table row in mode `none`, and column `(seq_len - 1) // block_size` in mode `align`. `seq_len` is the row's first query position (its `start_pos`) plus its scheduled tokens, drafts included. Under asynchronous scheduling the scheduler's `num_computed_tokens` still counts the drafts of a step in flight as accepted, so the runner does not use it.
+2. Before the forward, in mode `align`, `TTModelRunner` calls `copy_kv_cache_blocks` to copy the state from the previous column into the selected block when the request crosses into a new column. The block of the previous column keeps the state at that block boundary for prefix-cache hits.
+3. Without speculative decoding, the model reads each row's start state from window column 0 and writes the row's end state to the same block.
+
+With speculative decoding, K is the draft length (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)). `MambaGroupState.windows` then holds the columns from the column of step 1 on, `1 + K` of them, and `MambaStepState.accepted_counts` row `i` tells where row `i`'s start state is: in window column `accepted_counts[i] - 1`. The count is the count of tokens the row's previous step committed, as the verify's `accepted_counts`, but 1 after a prefill, after a step that did not verify, and after `TTModelRunner` copied the state into window column 0. Padding rows hold 1. A chained row (`chain_rows`, see [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4k) holds -1, as its `accepted_counts` does: the start column follows the accepted count of the pending verify, which only the device knows. In mode `none` the window does not depend on that count, so the model reads window column `c - 1`, with `c` its own accepted count of the pending verify. In mode `align` the chained verify also carries `MambaGroupState.chain`.
+
+The model writes the state after the row's query token `t` into window
+column `t`: a verify writes columns 0 to K, a prefill or an ordinary decode
+writes column 0. Each block stands for the full state (conv history and
+recurrent state) of one position. The model can keep part of that state
+outside the block while only the row's own next step reads it; the Qwen3.8
+adapter keeps a verify's conv history in a private window buffer. Before
+anything else reads the block, the state must be complete: a
+`copy_kv_cache_blocks` pair that takes the block as its source must give its
+destination the full state, and a block that vLLM can serve as a prefix-cache
+hit must hold the full state itself. See
+[block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations) for the copy
+order and lifetime rules. In mode `align` the state copies take the source from
+the accepted column: before the forward, column `prev + count - 1`, as
+upstream `preprocess_mamba`; and after a verify's acceptance,
+`commit_spec_acceptance` copies the state at a block boundary that the
+committed tokens reached into that boundary's own column, as upstream
+`postprocess_mamba_align_gpu` does. That copy runs only at a boundary whose
+state vLLM keeps (`MambaManager.reachable_block_mask`): every block boundary
+when `cache_config.prefix_cache_retention_interval` is `None` or one block,
+every multiple of the interval when it is larger, and none at 0 (vLLM's
+default), where vLLM caches a Mamba block only at a prompt's replay boundary
+or a shared-prefix junction, never at a boundary that decoding reaches. At
+any other boundary nothing reads the copy, and vLLM may already have freed
+its destination block. Upstream keeps the conv history of all `1 + K` positions in
+window column 0 instead; TT does not support that layout.
+
+**Chained verifies in mode `align`.** A chained verify (`chain_rows` set) is built before the pending verify (the one `chain_tip` names) commits, so the host cannot run the mode-`align` state moves between the two verifies: their source depends on the pending verify's accepted count. In mode `align`, each group's `MambaGroupState.chain` therefore holds a `MambaChainChoices` with these moves for every count the pending verify can accept. A `MambaSpec` model in mode `align` that chains verifies must apply `chain`. Index `[i, c - 1]` holds the values for row `i` when the pending verify accepted `c` tokens for that row, `1 <= c <= 1 + K`:
+
+- `MambaChainChoices.copies`: `[tt_max_batch_size, 1 + K, 2]`, a `(src, dst)` block pair. Before this step reads or writes any state, the model copies the full state (conv history and recurrent state) of block `src` into block `dst`. `src == dst` means no copy; padding rows and rows without a copy hold `(0, 0)`, as does every entry at a boundary whose state vLLM does not keep (every entry at retention 0). This is the pending verify's boundary copy (upstream `postprocess_mamba`); the runner does not run it again when that verify commits.
+- `MambaChainChoices.start_blocks`: `[tt_max_batch_size, 1 + K]`, the block that holds the row's start state, read after the copy. When the row crosses into a new block-table column, this is the block that the move into the new column would copy from (upstream `preprocess_mamba`), and no copy runs: the step writes window column 0 itself. The start block can be one of this step's window blocks; the model must read the start state before it writes that block.
+- `MambaChainChoices.windows`: `[tt_max_batch_size, 1 + K, 1 + K]`, the row's state window; entry `[i, c - 1, t]` is the block that takes the state after query token `t`.
+
+The model takes `c` from its own result of the pending verify, as it does for a chained row's `accepted_counts` (-1). `MambaGroupState.windows` holds the `c = 1 + K` entry and `MambaStepState.accepted_counts` holds -1. A pending row that the chained step leaves out (a request finishing at `max_tokens`) still breaks the chain near a boundary, since its boundary copy waits for the host commit.
+
+A row whose `start_pos` is 0 has no earlier state. The model must start that
+row from zero state and must not read its block: vLLM does not zero
+recurrent-state blocks, so the block can hold stale bytes.
+
+Padding rows have block 0, the null block. vLLM never allocates block 0 to a
+request, so the model can read or write block 0 without changing live state,
+and ignores the result. On the layer-slot overlay, padding rows write their
+state into block 0, so block 0 can hold any bytes, including fp32 state that
+reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+
+**States inside a prefill chunk.** With `MambaSpec.num_prefill_checkpoint_blocks` 1, the `mamba_state` of every prefill also carries two fields. Row `i` and entry `j`:
+
+- `MambaStepState.checkpoint_positions`: `[tt_max_batch_size, W]`; a token count `n`, or 0 for an unused entry.
+- `MambaGroupState.checkpoint_blocks`: `[tt_max_batch_size, W]`, the block of this group; 0 for an unused entry.
+
+The prefill writes the full state (conv history and recurrent state) after
+exactly `n` tokens of row `i` into that block, in every layer of the group's
+`MambaGroupState.layer_names`, in addition to the state at its chunk end. `start_pos[i] < n < prompt_lens[i]`,
+so the model writes these states while it runs the chunk, as upstream's
+kernel does at every block boundary inside a chunk. vLLM can cache each block
+as the state after `n` tokens. `W` is at least 1 and differs between steps.
+
+`TTScheduler._attach_mamba_checkpoints` takes the entries from vLLM's own
+allocation: every block-table column inside the chunk where vLLM keeps a
+block. That is the prefill checkpoint vLLM reserved
+(`MambaManager._needs_internal_checkpoint`), at its checkpoint position, and,
+on a later chunk of a prompt with a checkpoint, the previous chunk's draft
+blocks that `allocate_new_blocks` leaves in place, at their block boundary.
+A shared-prefix junction inside the chunk still ends a chunk, as without
+checkpoint blocks.
+
+vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers
+(`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`).
+A block that held Mamba state can be reassigned to an attention group, and its
+stale bytes then read as NaN or Inf at positions attention does not write.
+vLLM lists every block newly allocated to an attention group
+(`vllm/v1/core/single_type_kv_cache_manager.py:117-121`). This is why the
+adapter must implement `zero_kv_cache_blocks`; see
+[block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
+
+`TTModelRunner` passes on only the listed blocks that can still be read
+unwritten while they hold state (`MambaCacheGroups.blocks_to_zero`): a block
+that a `MambaSpec` group owned since its last zeroing, unless the prefill step
+that gets it writes all of its positions. This relies on two properties of the
+model:
+
+- It allocates its KV buffers zeroed, as upstream
+  `vllm.v1.worker.utils.allocate_kv_cache` does, so a block that only
+  attention used holds zeroes or finite values.
+- A step writes the keys and values of its scheduled positions before its
+  attention reads them from the cache.
+
+With attention groups of different KV precisions
+(`KVCacheConfig.has_mixed_precision_kv_cache`) the runner passes on every
+listed block.
+
+`TTModelRunner` derives `MambaGroupState.windows` from the page tables, so window column 0 changes only on a step whose page tables or batch layout change. Under the [decode reload contract](DECODE_RELOAD_CONTRACT.md), reload it when the page tables are reloaded.
 
 ## Prefill
 
@@ -45,6 +162,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `enable_trace` | True when `tt.trace_mode="all"`. |
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
+| `mamba_state` | Supplied for `MambaSpec` groups: a `MambaStepState`, one `MambaGroupState` per group. See [recurrent state blocks](#recurrent-state-blocks). |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
@@ -111,6 +229,7 @@ request-specific RoPE.
 | `enable_trace` | True for `tt.trace_mode="all"` or `"decode_only"`. |
 | `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling, selective readback, or a speculative verify, which is submitted as a front-packed verify is. The adapter must support the readback mode its execution path requests. |
 | `page_tables_per_layer` | Supplied for multiple KV groups. |
+| `mamba_state` | Supplied for `MambaSpec` groups: a `MambaStepState`, one `MambaGroupState` per group. See [recurrent state blocks](#recurrent-state-blocks). |
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
 | `prompt_tokens`, `output_tokens` | Supplied together when device sampling needs token history for penalties. Histories use `-1` padding. |
@@ -177,6 +296,9 @@ reaches it anyway.
    `process_decode_output_host(output_handles, is_tokens=perform_device_sampling)`.
    The adapter returns host logits or sampled IDs. Synchronous decode uses
    this conversion too when `decode_forward` returns adapter-specific output.
+   A `VerifyOutput` whose fields are host tensors is host output and goes to
+   the accept walk as it is; one whose fields are not is refused by name,
+   never converted (see the speculative contract, section 4j).
 4. `TTModelRunner` uses the last position in host logits `[B, S, V]`, commonly
    `[B, 1, V]`, for sampling, or consumes device-sampled IDs `[B, 1]`.
    For `output_tokens_per_step > 1`, the adapter returns

@@ -1,3 +1,52 @@
+**Chain mode.** A masked step chains like any fused step, and is a chain tip once
+its finish is called. A step chained on the step before it (`chain_rows` set) is
+begun before that step is read, so its drafts are on the device only. That adds two
+items to the `supports_spec_device_mask` contract, both optional elsewhere:
+
+- `decode_forward_begin(..., chain_rows=None, chain_tip=None)`, as above;
+- `FusedHandle.drafts()` -> int32 `[B, K]` in runner slots: the drafts the next
+  chained step verifies (the host view of the drafter output the reader already
+  parsed). The adapter puts it in `FusedReadout.drafts` (optional, int32 `[B, K]`,
+  rows equal to `accepted_counts` rows; a plain 3-tuple readout has none).
+
+The reader thread keeps, per tip, a record of the drafts and of each row's
+committed prefix (`ChainResolved`, written under a lock by whichever thread
+resolves the step, before its output is returned). A chained masked build:
+
+- makes every structured row a grammar row (no "reasoning row": the drafts are
+  unknown at build, and the scheduler's rows are all ones up to the end token), so
+  a thinking-only batch gives all-ones rows, `step_mask` returns None and
+  `decode_forward_finish(handle, None)` runs with no mask trace;
+- records `(chain_tip, {request: hint})` for the structured rows
+  (`runner._chain_handoff`); `take_draft_token_ids` then hands over
+  `drafts[row][:hint]` from the tip's record, waiting for the step when the reader
+  has not resolved it (exactly once). The scheduler cuts and pads them as for any
+  draft. A structured row with hint above 0 that the scheduler constrains and that
+  was not handed over raises at `sample_tokens`; a row the scheduler no longer
+  holds is unconstrained;
+- builds the non-grammar part at `sample_tokens` from the output as it is once the
+  step before has committed (`commit_view`: the applied output plus that step's
+  committed prefix; a pure read) and the device drafts. It waits for the step
+  before (`wait_resolved`) only when that part depends on its commit: a pending
+  `min_tokens`, or a bad word of more than one token. `allowed_token_ids` and
+  one-token bad words need no wait.
+
+Chain blockers with the capability: `grammar`, `allowed_token_ids`, `bad_words`
+and `min_tokens` are no blockers (the `min_tokens` processor is ignored in the
+`logitsprocs` check; `min_p` and `logit_bias` still block). Kept: penalties and
+their state rules, `logprobs`, `real_drafts`, `device_top_p` (a certificate step is
+synchronous), `grammar_with_controls` (a live grammar row with any other control)
+and `logprobs_with_controls` (reported as `logprobs`). New: `no_device_drafts`
+(until a fused readout carried `drafts`, and again after one that did not), and
+`mask_empty_risk` (the worst-case static row, with `min_tokens` pending at build,
+every one-token bad word and the last token of every longer one banned and the
+allowed ids applied, can allow no token). A row that is empty at sample time
+anyway raises, naming the request. With the capability absent every blocker is as
+it was. `device_mask_stats()` adds `chained` (chained masked steps), `late`
+(masks that reached the device after its forward ended, written by the server
+bench) and `waits`; the submission line prints them after "device masks" when one
+is above 0.
+
 # Speculative decoding: what a tt-metal model must implement
 
 This is the model-side contract the plugin admits against. A tt-metal model
@@ -28,8 +77,11 @@ serve speculative decoding within the following execution limits:
   nothing.
 - two accept modes, **`argmax_ids`** and **`logits`**, chosen per step from
   what the model declares (section 4h). A plan must offer at least one of
-  them; `fused_sample` has no runner path. An ordinary narrow decode does not
-  send `spec_mode`.
+  them; `fused_sample` (stage S1) is an extra mode, never enough alone. An ordinary narrow decode does not
+  send `spec_mode`. A model offering `logits` may also offer **`topk`**: the
+  exact top-M candidates of every column instead of the full vocabulary, which
+  the runner asks for on a sampled step whose rows the support can serve
+  (section 4j).
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
@@ -88,7 +140,7 @@ exception does not raise: on a model that does not serve `logits` but declares
 and keep every step they are part of an ordinary decode, which uses the
 selected model's normal sampling path (section 4d). Separately, `TTPlatform`
 can disable async scheduling when `supports_async_decode` is absent (section
-4c). `fused_sample`, use of `DraftOutput.draft_scores` and a scheduler-owned
+4c). Use of `DraftOutput.draft_scores` and a scheduler-owned
 paged drafter cache each need their own execution path before the matching
 refusal can go.
 
@@ -115,6 +167,11 @@ launches without `speculative_config`.
 | `spec_ids_are_sampled` | `False` | On a device-sampled step an `argmax_ids` verify returns the device sampler's draws: for a drafted row one draw per candidate column under the row's own temperature, top-k, top-p and seed, for an undrafted row the plain decode's own draw. The id walk is then exact rejection sampling against the drafts, so a sampled request is speculable on such a step (a penalised one stays plain: the draws carry no penalty history). On a model that serves both modes the device draws take precedence over the host `logits` walk on a device-sampled step: `_spec_mode_for_step` picks `argmax_ids` where it picked `logits` before (section 4d, rule 2). Greedy rows stay the target argmax; a host-sampled step certifies nothing it did not before. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
+| `supports_prefill_over_pending_spec` | `False` | `prefill_forward` may run while one deferred fused verify is in flight, and that verify stays readable afterwards: see section 4k. Only used in chain mode. |
+| `supports_spec_device_logprobs` | `False` | A `fused_sample` verify returns `SpecCandidates` for a step with a logprobs row: see section 4l. |
+| `supports_spec_device_top_p` | `False` | A `fused_sample` verify serves a sampled row with `top_k` off and `top_p < 1` under a certificate: see section 4l. |
+| `supports_spec_device_penalties` | `False` | A `fused_sample` verify applies repetition, presence and frequency penalties on the device and keeps their state: see section 4m. |
+| `supports_spec_device_mask` | `False` | A `fused_sample` verify applies a packed token mask (grammar, `allowed_token_ids`, `bad_words`, `min_tokens`) on the device and offers the two-call step `decode_forward_begin` / `decode_forward_finish`: see section 4n. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -229,12 +286,55 @@ model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids` or `logits`, the return formats the
-runner executes. A model may also declare `fused_sample`, but that declaration
-enables no execution path. Declaring `logits` enables sampled speculation for
+runner executes. A model may also declare `fused_sample` (stages S1 and S2, below).
+Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
 every live batch size the launch admits has a draft cap.
+
+**`fused_sample`, stage S1 (greedy rows only).** The runner asks for
+`fused_sample` on a step when the model offers it and every live row is
+greedy-certifiable (the same test that
+gates `argmax_ids`); one other row sends the whole step to `topk` or `logits`
+as before, so a plan offering `fused_sample` must also offer `argmax_ids` or
+`logits`. The call is `decode_forward` exactly as for `argmax_ids`, with
+`spec_mode="fused_sample"`. The model returns `VerifyOutput` with
+`accepted_token_ids` `[B, 1+K]` int32 (`-1` past the count), `accepted_counts`
+`[B]` int32 in `[1, 1+K]`, and optionally `argmax_ids` for debugging, all as
+host tensors. A padding row returns count 1 and its column-0 argmax. The runner
+commits the fields as given, under `AcceptResult`'s rules, then calls
+`propose_draft_tokens` as for any other mode.
+
+**`fused_sample`, stage S2 (sampled rows).** The same mode also serves a step
+with sampled rows when the model offers `topk` too, every row is greedy-certifiable or support-servable
+(the rule that gates `topk`, so `top_k` is in `[1, topk_candidates - 1]` on a
+sampled row), and no seeded row has zero valid drafts (that bonus is a
+full-vocabulary exponential race the device cannot run; such a step keeps
+`topk` / `logits`). The runner then adds the kwarg `spec_sampling` to
+`decode_forward`: a dict of host tensors over the PADDED rows `B` (width
+`1+K`): `temperature` fp32 `[B]` (0 = greedy), `top_k` int32 `[B]` (1 on a
+greedy row), `top_p` fp32 `[B]` (1.0 = off), `greedy` bool `[B]`, `uniforms`
+fp32 `[B, K+2]` (column 0 bonus, 1..K the accept draws of draft columns
+0..K-1, K+1 the correction; zero on padding rows). A greedy-only step sends no
+`spec_sampling`. With the optional capabilities of sections 4l and 4m the dict
+also carries `num_logprobs` and `penalties`; a masked step (section 4n) always carries the dict, whatever its rows. The runner draws the uniforms before the call
+(`spec_accept.predraw_uniforms`), from each seeded row's own generator and the
+global stream, in the order `_walk_table` draws them, so a request's stream and
+the global stream end where the `topk` walk would leave them; the model draws
+nothing. The model accepts on its top-M support exactly as `accept_sampled_support`
+does with those uniforms (draft accepted when its probability is positive and at
+least its uniform; first rejection takes the correction from the distribution
+without the draft with the correction uniform; full acceptance takes the bonus
+with column 0; inverse CDF over the (value desc, id asc) support) and returns the
+same fields as S1. A position whose top-k tie group reaches the last candidate
+cannot be decided from the support: the model redoes that step itself from the
+full logits with the same uniforms. The runner's walk is unchanged: it reads
+`accepted_token_ids` and `accepted_counts`. Float32 rounding of the uniforms and
+of the device arithmetic can flip a decision only when a draft probability lies
+within about 1e-6 of its uniform.
+
+Section 4l adds two optional capabilities to this stage: logprobs rows and `top_k` 0 rows.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -573,7 +673,10 @@ Two demands nevertheless reach the model, and they are what
    the `VerifyOutput`, so the hook is handed the mode's `[B, 1+K]` ids or
    `[B, 1+K, V]` logits rather than a decode's single column, and the number
    of tokens per row that will be committed out of it is decided by the host
-   after the forward returns. For `logits`, the host also samples there.
+   after the forward returns. For `logits`, the host also samples there. For
+   `topk` the hook is handed the `VerifyOutput` itself and returns one whose
+   `argmax_ids`, `topk_values` and `topk_ids` are host buffers; the runner
+   waits for the read events and hands that output to the walk unconverted.
 2. **The hidden handle outlives the step's submission.** The model returns it
    from `decode_forward`, the runner carries it across the readback and a
    queue, and `propose_draft_tokens` receives it at the next step's drain. A
@@ -1161,6 +1264,420 @@ a host-sampled step that verify would commit the target argmax, and the
 runner cannot promise every step samples on the device. The capability lifts
 the temperature rule for draft publication and the per-step mode, not for
 admission.
+
+## 4j. The `topk` accept mode
+
+A `logits` verify moves `B x (1+K) x V` values to the host on every sampled
+step. For a model whose verify logits are vocabulary-sharded over its devices,
+the exact per-column top-M can be computed and gathered on the device
+instead, and a row with a top_k below M can be sampled from that support.
+The `topk` mode carries that: it samples the target distribution `logits`
+samples, so it is a readback optimisation of `logits`, not a new sampling
+semantics, and a plan offering it must offer `logits` too
+(`resolve_speculative_plan` refuses `topk` without it).
+
+**What the model declares.** `topk` in `SpecPlan.accept_modes` and
+`SpecPlan.topk_candidates = M`, the candidates per column its verify returns
+(at least 2). The support serves a request top_k of at most `M - 1`.
+
+**When the runner asks for it.** `TTModelRunner._spec_mode_for_step` asks
+for `argmax_ids` while every live row is certifiable by id equality, as
+before. Otherwise it asks for `topk` when the plan offers it and every live
+row is either certifiable or
+*support-servable*; otherwise it asks for `logits`. A row is support-servable
+(`spec_accept.params_support_servable`, plus the batch's penalty sets) when
+its top_k is in `[1, M - 1]`, with any top_p and any temperature, and it
+carries none of the controls that move or mask tokens outside the support:
+the three penalties, logprobs, structured output, `allowed_token_ids`,
+`bad_words`, or a `min_tokens` the output has not reached. The step runs
+with `perform_device_sampling=False`, as a `logits` step does. The runner's
+`TT submissions:` log line counts `topk` verifies after the `logits` count.
+
+**What the model returns.** `VerifyOutput(spec_mode="topk", argmax_ids,
+topk_values, topk_ids, fetch_logits)`: `argmax_ids` `[B, 1+K]` as in
+`argmax_ids` mode; `topk_values` a floating point `[B, 1+K, M]` of each
+column's M largest raw logits (no temperature) and `topk_ids` the matching
+integer token ids, both sorted by value descending then token id ascending,
+every submitted row included; and `fetch_logits`, a callable returning the
+step's full `[B, 1+K, V]` floating point logits. The runner checks the three
+shapes against the submitted block and `topk_candidates` and raises naming
+the field. The three tensors are host tensors: the runner hands the
+`VerifyOutput` to the accept walk as it is, never to
+`process_decode_output_host`, which converts a plain decode's device output,
+and refuses a field that is not a host tensor by name (`finalize_decode`).
+`fetch_logits` is called at most once per step, on the thread that
+walks acceptance, before the next decode call; a model that re-reads the
+device for it needs the verify's rows intact until then, which a synchronous
+launch (`supports_async_spec_decode` absent) guarantees. `None` is allowed
+when the model cannot supply the full logits; an undecidable position (below)
+then raises.
+
+**What the host computes.** `spec_accept.accept_sampled_support` builds the
+probability table of the support (`_support_table`): each column's candidates
+in the order (value descending, token id ascending), every candidate whose
+tempered value is at least the k-th kept, top-p applied to them (a cut inside
+a tie group keeps the group's lowest ids), and the kept set softmaxed. For a
+column the support can decide, the kept ids and probabilities are those the
+same cut keeps over the full vocabulary. A column is *undecidable* when its
+tie group at the k-th value reaches the M-th candidate: a member may lie past
+the support, so that column is taken from `fetch_logits()` through vLLM's
+sorted top-k/top-p over the whole vocabulary (`_reference_rows`). The walk over
+the table (`_walk_table`) draws uniforms, in the order `predraw_uniforms`
+reproduces for `fused_sample`. The `logits` walk draws exponential races
+instead, so a seeded request's stream depends on the mode each step ran in,
+while every mode draws from the target distribution. Greedy rows commit by
+comparing drafts with `argmax_ids`. Padding rows commit `argmax_ids[:, 0]`.
+
+**Exactness.** The device returns each vocabulary shard's top-M; the host
+merges the shards' lists under the same order. A token among the global top-M
+has fewer than M tokens above it in its own shard, so it is in that shard's
+list, whatever order the device breaks ties in; a tie group truncated at a
+shard's cut can only be missing members whose value equals the merged M-th
+value, and the overflow rule above routes every column where that value
+reaches the request's k-th to the full logits.
+
+**Not served.** Logprobs need the row's logsumexp and rank, and the
+penalties, grammar and token filters need the vocabulary: such rows keep the
+step in `logits` mode.
+
+## 4k. Chain mode: a fused verify submitted over the one in flight
+
+On whenever async scheduling serves a speculating launch of a model that
+declares `model_capabilities['supports_async_spec_decode']`, which a model
+declares only when it runs chain and fused. With async scheduling the runner then builds
+step n+1 without step n's committed tokens and submits it before step n is
+read; the device builds the real inputs from step n.
+
+A fused verify in this mode is called with `defer_read=True` (every fused step,
+chained or not) and returns `VerifyOutput(spec_mode="fused_sample",
+handle=<opaque>)` with no host tensors; the handle has an int `tip_id`. A step
+chained onto the pending one also carries:
+
+- `chain_rows`: bool `[B]`, the rows whose inputs the device builds. For them
+  `tokens` is `-1` in every column, `start_pos` holds optimistic provisional
+  positions (applied length plus `K+1` per verify in flight, minus 1, an upper
+  bound of the real position), and `accepted_counts` is `-1`. Other rows are
+  built from host state as ever (padding rows included).
+- `chain_tip`: the `tip_id` of the pending step. The model raises on mismatch.
+- `num_valid_drafts`: an upper bound for chain rows (the scheduler's
+  reservation, the plan's draft cap, and the room left under `max_model_len`
+  from the optimistic length). The model uses the smaller of it and its own
+  count. A seeded row chains only while the hint is the full count, because the
+  host draws that many uniforms from the row's generator.
+- `slot_remap`: as on any decode. Row `i` of a chained step reads the state of
+  slot `slot_remap[i]` (identity when absent), so a batch that condensed after a
+  request finished still maps to the right device state.
+
+The reader thread calls `model.read_decode_output(handle)` (or `handle.wait()`),
+which blocks on a device event and returns `FusedReadout(accepted_token_ids,
+accepted_counts, p0)` (plus `candidates` for a step with a logprobs row, section 4l, and `drafts` for a model that declares `supports_spec_device_mask`, section 4n) or the plain 3-tuple. `p0` is `[B]` int32, the actual position
+of each row's column 0; the committed-prefix length cap uses it, not the
+provisional position. `propose_draft_tokens(..., hidden=handle)` runs later on
+the engine thread, after the read, once per step, and returns `num_valid`; for
+a step whose drafts a chained step already consumed on the device the runner
+reads only `num_valid` and publishes a length hint, never ids.
+
+The runner chains only when exactly one verify is unresolved and it is the
+newest fused step; the scheduled requests are its rows less the finished ones;
+no prefill chunk, forced reset, grammar, penalties or allowlist (with `supports_spec_device_mask` the grammar, allowlist, bad words and `min_tokens` are served by the token mask, section 4n), and no logprobs row the model cannot serve (section 4l); every
+row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. With `MambaSpec` groups in mode `align` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)), the state copies at a block boundary take their source from the pending verify's accepted count, which the host has only after the commit. A chained verify therefore carries these moves for every count the pending verify can accept (`MambaGroupState.chain` in `mamba_state`), and a `MambaSpec` model in mode `align` that chains verifies must apply them. A row of the pending verify that the chained step leaves out (a finishing row) may not be able to reach a block boundary before the pending verify commits (blocker `mamba_boundary`), since its boundary copy waits for the host commit. Only a boundary whose state vLLM keeps has a boundary copy and blocks: with `prefix_cache_retention_interval` 0 none does, above one block only its multiples do. Anything
+else drains first. A request finished at step n has already been scheduled into
+n+1: that output is discarded and the row is absent from n+2.
+
+**`supports_prefill_over_pending_spec`** is a `model_capabilities` key
+(default `False`). It promises that `prefill_forward` may be called while one
+deferred fused verify is still in flight: the prefill touches no state that
+verify reads, the device queue is in order, and the pending handle stays
+readable (and its `propose_draft_tokens` callable) after the prefill returns.
+With chain mode on and the key declared, the runner then does not drain the
+verify before an all-prefill step with no resumed request and no multimodal
+input; it submits the prefill behind the verify and finalizes the verify later,
+before the next decode build. A step after such a prefill does not chain onto
+the verify it overtook. A resumed request, a multimodal request or a model
+without the key still drains first, as does a pending verify with a row that
+can reach a `MambaSpec` block boundary whose state vLLM keeps in mode `align`
+(`mamba_boundary`; never at retention 0, where no boundary copy runs).
+
+## 4l. Device logprobs and the device top-p certificate
+
+Two optional capabilities of a `fused_sample` model, both default `False`,
+both approved by a human on 2026-10-28. With neither declared nothing in this
+section applies and every step is built as before. They extend section 4j's
+support rule, `top_k` in `[1, topk_candidates - 1]`, to two more row types.
+
+**Logprobs, `supports_spec_device_logprobs`.** A request with `logprobs` of 0
+to 20 (`MAX_DEVICE_LOGPROBS`) is carried by a `fused_sample` step, greedy or
+sampled, when `logprobs_mode` is `raw_logprobs` and the row has no penalty,
+grammar (outside an open reasoning phase), allowlist, bad word or pending
+`min_tokens`. `logprobs=-1`, more than 20, and the other `logprobs_mode`
+values keep the `logits` mode. The step's `spec_sampling` then carries
+`num_logprobs` int32 `[B]`: `-2` for a row that asked for none and for a
+padding row, else its top-N. The key is absent when no row asked. A step whose
+rows are all greedy still carries `spec_sampling` (a dict with all rows
+greedy, zero `uniforms`, nothing drawn) when a row asked for logprobs.
+
+The model returns, in `VerifyOutput.candidates` (a synchronous step) or
+`FusedReadout.candidates` (a deferred step), a `SpecCandidates` for the whole
+block, exactly when `num_logprobs >= 0` on some row:
+
+- `ids` `[B, 1+K, M]` int32 or int64: the `M` token ids with the largest raw
+  logits at each position, ordered by logit descending, then id ascending;
+- `values` `[B, 1+K, M]` float32: those raw logits (the verify's own logits,
+  before temperature, penalties and grammar);
+- `lse` `[B, 1+K]` float32: the raw logsumexp over the whole vocabulary.
+
+`M` must be at least the largest `num_logprobs` of the step and at least 1; a
+model on the top-64 gives 64. The plugin builds, for every live row's committed
+columns, the row `LogprobsTensors` the `logits` mode builds
+(`spec_accept.committed_logprobs`): column 0 is the committed token with its
+logprob `value - lse` and its rank (the number of candidate values at or above
+its own, as vLLM counts), columns `1..N` the top-N ids and logprobs, `N` the
+largest `num_logprobs` of the step. The published-prefix cut is the existing
+one. A committed token must be among the candidates: this holds for a greedy
+row (its argmax is the first candidate) and for a sampled row inside the support
+rule or the certificate. If it is not, the plugin reports the last candidate's
+value as an upper bound and rank `M + 1` and counts it
+(`TTModelRunner.spec_logprobs_missing_id`, with a warning). When the chosen
+value equals the last candidate's value, tokens past `M` may tie with it: the
+rank is a lower bound and the plugin counts it
+(`spec_logprobs_rank_lower_bound`); the logprob is exact. Ties inside the top-N
+list resolve to the lower id. A step that asked for logprobs and returns no
+`candidates`, or `candidates` of another block shape, raises. Dtype and shape
+of `SpecCandidates` are checked at construction.
+
+**Top-p certificate, `supports_spec_device_top_p`.** A sampled request whose
+`top_k` is off (0, negative, or at least the vocabulary size) and whose `top_p`
+is below 1 is carried by a `fused_sample` step. The plugin sends it with
+`top_k` 0 in `spec_sampling` (the key is otherwise 1 for greedy rows and
+`1..M-1` for sampled rows). The model samples the full-vocabulary nucleus from
+its top `M` candidates when the candidates hold enough probability mass to
+decide the nucleus exactly (the certificate), and otherwise redoes that row
+itself from the full logits; it never returns an approximate result. A finite
+`top_k` of `topk_candidates` or more with `top_p < 1`, and `top_p == 1` with
+`top_k` off, are not served (`logits` mode). Because a failed certificate is
+redone before the next step is enqueued, a step with such a row is
+synchronous: the runner does not pass `defer_read`, and the chain blocker
+reason `device_top_p` stops chaining onto a step that has one. A model that
+receives `top_k` 0 on a deferred step may raise.
+
+**What the runner reads.** `TTModelRunner.load_model` reads both keys from the
+loaded model's `model_capabilities` into `_spec_device_logprobs` and
+`_spec_device_top_p` (absent is `False`). No environment variable and no
+`--additional-config` key is read for either. In chain mode a logprobs row
+chains as any sampled step does (it carries `spec_sampling`); only a logprobs row the model cannot
+serve keeps the `logprobs` chain blocker.
+
+## 4m. Device penalties
+
+One optional capability of a `fused_sample` model, `supports_spec_device_penalties`,
+default `False`, approved by a human on 2026-10-28. With it absent nothing in
+this section applies: a request with a presence, frequency or repetition penalty
+keeps the `logits` mode, and no step is built differently.
+
+**Which rows.** A request with any penalty is carried by a `fused_sample` step
+when the rest of section 4j's and 4l's rules hold for it and it asks for no
+logprobs (the raw logprobs come before the penalties; the model returns the
+penalized candidates). A penalty row beside a logprobs row of another request is
+fine. `grammar` rows, `allowed_token_ids`, `bad_words` and a pending
+`min_tokens` keep the `logits` mode as before, unless the model also declares `supports_spec_device_mask` (section 4n). In chain mode a penalty row
+chains like any sampled row; the chain
+blocker reasons are `penalties` (a penalty row the model cannot serve) and
+`pen_state` (see below).
+
+**What the step carries.** `spec_sampling["penalties"]` is present exactly when
+some live row has a non-neutral penalty (neutral: repetition 1, frequency 0,
+presence 0). It is a dict:
+
+- `repetition`, `frequency`, `presence`: float32 `[B]`, one value per runner slot
+  (padding rows neutral);
+- `rebuild` (optional): `{runner slot: (prompt_ids, output_ids)}`, two 1-D int32
+  tensors, for each penalty row whose state on the device is not current.
+
+A row with a non-neutral penalty is a sampled row in the step (`greedy` False): a
+greedy request is sent with `temperature` 1, `top_k` 1 and `top_p` 0, because the
+verify's argmax is taken before the penalties. Such a step draws no uniform when
+every other row is greedy. A greedy-flagged penalty row, or a row that also asks
+for logprobs, is a `ValueError` in the adapter.
+
+**Semantics.** Column `j` of a row is scored with the row's committed output plus
+its first `j` drafts as history (the plugin's `apply_speculative_penalties`, vLLM's
+`apply_all_penalties`): repetition first (`x > 0 ? x / r : x * r` on a token in the
+prompt or in the history), then frequency (`x - f * count`), then presence
+(`x - p * (count > 0)`), on the raw logits, before temperature, top-k and top-p.
+Prompt tokens count only for repetition; output tokens count for all three. The
+model keeps the output counts and the prompt mask per row, adds each step's
+committed tokens to the counts itself, also when it walks a step on the host
+(fallback or exact redo), and replaces the state of the rows named in `rebuild`
+before the step.
+
+**Exactness.** The model computes the penalty in float32 and rounds the result
+once to bfloat16, because the verify's top-k and accept read bfloat16. A penalized
+token can differ from the host reference by about half a bfloat16 ulp (measured
+below 0.6 ulp); a token with no penalty is bit-identical. The output of a penalty
+request is therefore equal to the `logits` mode in distribution, not token for
+token. A host walk of the model (fallback, exact redo) uses the float32 reference
+without the rounding.
+
+**When the plugin rebuilds a row.** The plugin tracks the requests the model's
+state is current for (`spec_device_penalties.SpecPenaltyTracker`). A request is
+current from a step that carried its `rebuild` entry, for as long as every
+verify it takes part in is a `fused_sample` verify. It stops being current when
+it finishes, is preempted, is prefilled again, takes part in any other decode step
+(`logits`, `topk`, `argmax_ids`, an ordinary decode: the model never sees those
+commits), or its output is discarded by a forced reset. A step that is not chained
+sends a `rebuild` entry for each penalty row that is not current or that sits in
+another runner slot than the one it was last sent in (a slot remap is applied by the
+model before it reads `spec_sampling`, so the keys are in the new numbering). A
+chained step sends none: it follows a step that carried every one of its rows, and
+the model's rows follow their requests through `slot_remap`. A chained step that
+would need a rebuild is refused by the chain blocker `pen_state` and is built from
+host state. A model that cannot follow a request through `slot_remap` (the device
+slot remap, not the host slot map) gets a `rebuild` after every remap, as above.
+
+**What the runner reads.** `TTModelRunner.load_model` reads the key from the loaded
+model's `model_capabilities` into `_spec_device_penalties` (absent is `False`). No
+environment variable and no `--additional-config` key is read.
+
+## 4n. Device token masks
+
+One optional capability of a `fused_sample` model, `supports_spec_device_mask`,
+default `False`, approved by a human on 2026-10-28 (atupe, by name). With it
+absent nothing in this section applies: a request with a grammar,
+`allowed_token_ids`, `bad_words` or a pending `min_tokens` keeps the `logits`
+mode, and no step is built differently. The plugin reads no environment variable
+and no `--additional-config` key for it.
+
+**Which rows.** With the capability, a request with any of those controls is
+carried by a `fused_sample` step when the rest of section 4j's and 4l's rules
+hold for it (sampled `top_k` in `[1, topk_candidates - 1]`, or greedy, or a
+certificate row of section 4l, which makes the step synchronous). Penalties
+follow section 4m (the penalty capability decides; the model applies the mask
+and the penalties in either order, since a masked logit stays masked). Two
+combinations keep the `logits` mode, each decided when the step is built:
+
+- a grammar row that can constrain the step together with another control
+  (`allowed_token_ids`, `bad_words`, a pending `min_tokens`). The grammar rows
+  arrive only at `sample_tokens`, when the step is already submitted, and the AND
+  of the two can be empty; the plugin cannot send a submitted step to `logits`;
+- a logprobs row with `allowed_token_ids`, `bad_words` or a pending `min_tokens`.
+  The raw logprobs are taken after the grammar and before those controls, and the
+  one composed mask applies them first. A logprobs row with a grammar-only mask is
+  served: the model's payload (section 4l) is taken after the mask.
+
+A step whose controls leave no allowed token at some column (for example an
+allowlist inside the stop ids that `min_tokens` still holds back) also runs in
+`logits` mode. One row that cannot be served sends the whole step to `logits`,
+as in every other mode. `spec_masks.device_mask_stats()` counts masked steps,
+constrained rows and the logits fallbacks by reason (`grammar_with_controls`,
+`logprobs_with_controls`, `empty_row`, `other`); the submission line prints them
+after "device masks".
+
+**The mask.** One int32 tensor `[B, 1+K, W]` over the padded rows in runner slot
+order (the order of `spec_sampling`), `W = ceil(vocab_size / 32)`. Row `u`, column
+`j` is the mask of the token decided at column `j` of request `u`: bit `v % 32` of
+word `v // 32` is 1 where token `v` is allowed, and a row of -1 words is "no
+constraint". It is the AND of
+
+- the scheduler's grammar row `j` (the scheduler writes row `j` after the
+  request's committed output and its first `j` scheduled drafts; a row after the
+  first draft the grammar refuses, a bonus row after one, and a column past the
+  request's own rows are all ones), zero-padded to `W`;
+- `allowed_token_ids` (a static row, cached per request);
+- NOT every `bad_words` last token whose earlier tokens end the history of column
+  `j` (committed output plus the first `min(j, valid)` drafts); a one-token word
+  is static and cached;
+- NOT the stop ids while `j < remaining`, where `remaining = min_tokens - len(output)`.
+
+These are the rules of the plugin's own `logits` walk
+(`spec_accept.apply_speculative_token_filters`), not vLLM's `min_tokens`
+restore rule. Bits past the vocabulary are cleared on a constrained row, and a
+row or column without a control is all ones, so a padding row and an unconstrained
+request are all ones. The model treats a mask in which no row is constrained as no
+mask, and raises `ValueError` for a row of all-zero words; the plugin never sends
+one (it raises first, naming the request). A request the grammar output leaves out
+(it finished in the step before) is unconstrained.
+
+**The two-call step.** A masked step does not use `decode_forward`:
+
+1. `execute_model` builds the step and calls `decode_forward_begin(**kwargs)`,
+   with the arguments of a `fused_sample` `decode_forward`, except that
+   `spec_sampling` is required (it is the sampled step's dict, with no `mask`
+   key; a greedy-only masked step sends greedy rows and no draws). It enqueues
+   the forward and returns `VerifyOutput(spec_mode="fused_sample", handle=<pending
+   handle>)`. `defer_read` means what it means for `decode_forward`. `chain_rows`
+   and `chain_tip` mean what they mean for `decode_forward` (section 4k) and need
+   `defer_read=True`: a chained begin enqueues the chain trace and the forward
+   only, and `decode_forward_finish` enqueues the rest. The pending handle of a
+   deferred begin carries its `tip_id` (the forward is queued).
+2. `sample_tokens(grammar_output)` composes the mask and calls
+   `decode_forward_finish(tt_out, mask)`, with the first call's return value. The
+   model enqueues the rest of the step. With `defer_read` it returns
+   `VerifyOutput(handle=<the same handle>)`, now readable by the reader thread;
+   otherwise the full synchronous `VerifyOutput`. `mask` may be None.
+
+A step with only `allowed_token_ids`, `bad_words` or `min_tokens` rows has no
+grammar output: vLLM calls `sample_tokens` at once and the finish follows the
+begin (a chained one waits there for the step before only when its static part
+depends on that step's commit, see Chain mode). Nothing else may reach the model between the two calls (no second begin,
+no `decode_forward`, no prefill), and the reader thread must not wait on the
+handle before the finish: the plugin keeps the step's submission pending
+(`TTDecodeSubmission.mask_pending`) and raises on any read of it. A step with no
+masked row keeps the one-call path exactly (no begin, no finish, `spec_sampling`
+as before).
+
+```
+execute_model                          sample_tokens(grammar_output)
+  build (drain, drafts, mask plan)       reorder scheduler rows to runner rows
+  spec_sampling (no mask key)            mask = static AND grammar rows
+  decode_forward_begin  --forward-->     decode_forward_finish(handle, mask)
+  [take_draft_token_ids: the build's       mask H2D + mask trace, top-k, accept,
+   drafts, for a grammar row]              drafter, reads, event
+  scheduler: bitmask from those drafts   return the wrapper (reader thread reads)
+```
+
+The finish of step N+1 is called before the begin of step N+2: the chain trace of
+N+2 rewrites the token buffer and the packed aux that N+1's accept reads. The
+model raises on a begin while a split step is pending, and the plugin raises in
+`execute_model` while a masked submission is pending (`chain_evaluate` gives the
+reason `mask_pending` meanwhile).
+
+**Greedy rows.** A greedy row is sent greedy. The model rewrites a greedy row that
+has a constrained mask row as a sampled row (temperature 1, `top_k` 1, `top_p` 0)
+when it learns the mask, because the argmax of the main trace is not masked. The
+plugin does not rewrite it (the penalty rule of section 4m, a greedy penalty row
+sent as sampled, is the plugin's own and happens before).
+
+**Drafts and the scheduler.** The scheduler fills grammar rows `1..K` from the
+drafts the worker hands over (`take_draft_token_ids`, called while the step is
+pending). For a masked step with a grammar row the runner hands over the drafts
+the step verifies, which are the ones in the begin call (for a chained step, the
+device drafts of the step before it: see Chain mode); a draft the grammar
+refuses is cut by the scheduler, padded with -1, and the walk rejects it on the
+device (its row disallows it). Rows after it are all ones and never examined.
+
+**The reasoning phase.** A structured row whose reasoning phase is open and whose
+drafts hold no reasoning-end id (`ReasoningPhase.fused_safe`) is not a grammar
+row: its scheduler rows are all ones, and on its own it needs no mask and keeps
+the one-call step. In a masked step it is a "reasoning row": the plugin raises if
+the scheduler holds a cleared bit for it. A row whose drafts hold an end id (the
+boundary step) is a grammar row with the capability: the scheduler's rows are all
+ones up to and including the end id and hold the grammar's start state after it.
+Without the capability the boundary step keeps the `logits` mode.
+
+**Logprobs.** The model's payload of a masked logprobs row is taken after the
+mask. A top-N entry the mask ruled out comes back with a value far below any logit
+(the mask value); the plugin turns a value below `-1e20` into -inf, as the host
+path gives.
+
+**Chain mode.** A masked step is never chained and never a chain tip. The
+blockers `grammar`, `allowed_token_ids`, `bad_words` and `logitsprocs` (the
+`min_tokens` processor) stay as they were; `min_tokens` is the capability's own
+blocker for a row whose stop ids are still held back. A masked step costs the
+chain its overlap, as a `logits` grammar step did, but keeps the fused path.
+
+**What the runner reads.** `TTModelRunner.load_model` reads the key into
+`_spec_device_mask` (absent is `False`), and `warmup_model` reads it again. No
+environment variable and no `--additional-config` key is read.
 
 ## 5. One request, from prefill to release
 

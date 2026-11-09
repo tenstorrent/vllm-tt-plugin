@@ -9,6 +9,7 @@ from vllm_tt_plugin.platform import (
     register_tt_models,
     register_tt_test_models,
 )
+from vllm_tt_plugin.tool_call_fixes import install_tool_call_fixes
 
 __all__ = [
     "register_tt_models",
@@ -44,3 +45,8 @@ def register_tt_models_from_plugin() -> None:
     # launch fails upstream's async gate there after KV cache allocation.
     _install_tt_async_spec_method_patch()
     _install_torch_accelerator_cleanup_patch()
+    # The OpenAI frontend lives in the API-server process, which loads general
+    # plugins while it builds its argument parser, before the serving module
+    # is first used. The patches target classes and module attributes, so they
+    # also work when those modules are already imported.
+    install_tool_call_fixes()

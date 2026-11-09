@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from threading import Lock
 
 import torch
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.v1.sample.ops.topk_topp_sampler import (
     TopKTopPSampler,
     apply_top_k_top_p,
+    random_sample,
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import Sampler
@@ -24,6 +26,10 @@ class _PrefetchedNoise:
     vocab: int
     size_bytes: int
     future: Future
+
+
+_TOP_K_CANDIDATE_MARGIN = 64
+_TOP_K_CANDIDATE_MAX_K = 1024
 
 
 class TTTopKTopPSampler(TopKTopPSampler):
@@ -52,7 +58,44 @@ class TTTopKTopPSampler(TopKTopPSampler):
             state, vocab, size, self._sampling_pool.submit(generate)
         )
 
+    def _top_k_candidates(self, logits, k, p):
+        """Return (filtered candidate logits, candidate ids), or None.
+
+        Exact: vLLM keeps every logit >= the k-th largest, so all logits
+        outside the top C candidates are below the k-th value and the full
+        vocabulary path would set them to -inf. The same apply_top_k_top_p on
+        the candidates keeps the same set with the same probabilities. A tie
+        at the k-th value that reaches the last candidate may extend past
+        them, so that case returns None and uses the full path.
+        """
+        if (
+            k is None
+            or logits.device.type != "cpu"
+            or logits.dim() != 2
+            or logits.shape[0] == 0
+            or self.logprobs_mode in PROCESSED_LOGPROBS_MODES
+        ):
+            return None
+        kmax, kmin = int(k.max()), int(k.min())
+        if kmax > _TOP_K_CANDIDATE_MAX_K or kmin < 1:
+            return None
+        vocab = logits.shape[1]
+        count = min(vocab, kmax + _TOP_K_CANDIDATE_MARGIN)
+        values, ids = logits.topk(count, dim=-1)
+        if count < vocab:
+            kth = values.gather(1, (k.long() - 1).unsqueeze(1)).squeeze(1)
+            if (values[:, count - 1] >= kth).any():
+                return None
+        return apply_top_k_top_p(values.clone(), k, p), ids
+
     def forward_native(self, logits, generators, k, p):
+        if not generators:
+            candidates = self._top_k_candidates(logits, k, p)
+            if candidates is not None:
+                values, ids = candidates
+                probs = values.softmax(dim=-1, dtype=torch.float32)
+                picked = random_sample(probs, {}, self.use_fp64_gumbel)
+                return ids.gather(1, picked.unsqueeze(1)).squeeze(1), None
         batch, vocab = logits.shape
         if (
             logits.device.type != "cpu"

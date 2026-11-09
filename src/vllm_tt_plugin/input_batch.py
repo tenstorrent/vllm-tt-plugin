@@ -32,7 +32,8 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_specials import classify_params, count_request_specials
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
     has_structured_outputs,
@@ -113,6 +114,9 @@ class TTCachedRequestState(CachedRequestState):
     # exactly as long as the cached state: kept across preemption, so a resumed
     # prefill sees it again, and dropped on finish or abort.
     stage_inputs: Any = None
+    # The special sampling features the request carries, classified once when it
+    # is admitted (``spec_specials.classify_params``); read by the step counter.
+    specials: tuple[str, ...] = ()
 
 
 def _decode_stage_inputs(payload: Any) -> dict | None:
@@ -129,7 +133,7 @@ def _decode_stage_inputs(payload: Any) -> dict | None:
 
 
 def build_cached_request_state(
-    new_req_data, *, supports_stage_inputs: bool
+    new_req_data, *, supports_stage_inputs: bool, vocab_size: int | None = None
 ) -> TTCachedRequestState:
     """Build the cached state for one newly-scheduled request.
 
@@ -158,6 +162,12 @@ def build_cached_request_state(
         stage_inputs = _decode_stage_inputs(
             getattr(new_req_data, "additional_information", None)
         )
+    specials = classify_params(
+        sampling_params,
+        vocab_size,
+        has_images=bool(getattr(new_req_data, "mm_features", None)),
+    )
+    count_request_specials(specials)
     return TTCachedRequestState(
         req_id=new_req_data.req_id,
         prompt_token_ids=new_req_data.prompt_token_ids,
@@ -171,6 +181,7 @@ def build_cached_request_state(
         lora_request=new_req_data.lora_request,
         prompt_embeds=new_req_data.prompt_embeds,
         stage_inputs=stage_inputs,
+        specials=specials,
     )
 
 
@@ -258,14 +269,21 @@ class SamplingInputBatch:
         # req_index -> bad_words_token_ids
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
-    def has_active_logitsprocs(self) -> bool:
-        """True if any logits processors have active per-request state."""
+    def has_active_logitsprocs(self, *, ignore_min_tokens: bool = False) -> bool:
+        """True if any logits processors have active per-request state.
+
+        ``ignore_min_tokens`` leaves the min_tokens processor out, for a model
+        whose device token mask applies ``min_tokens`` itself."""
         for proc in self.logitsprocs.all:
             if isinstance(proc, MinPLogitsProcessor) and proc.min_p_count:
                 return True
             if isinstance(proc, LogitBiasLogitsProcessor) and proc.biases:
                 return True
-            if isinstance(proc, MinTokensLogitsProcessor) and proc.min_toks:
+            if (
+                isinstance(proc, MinTokensLogitsProcessor)
+                and proc.min_toks
+                and not ignore_min_tokens
+            ):
                 return True
         return False
 
@@ -303,6 +321,7 @@ class InputBatch:
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
+        max_num_blocks: list[int] | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -341,7 +360,8 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             # Per-group max blocks per request; TT runs without context
             # parallelism (cp_world_size == 1).
-            max_num_blocks=[cdiv(max_model_len, bs) for bs in block_sizes],
+            max_num_blocks=max_num_blocks
+            or [cdiv(max_model_len, bs) for bs in block_sizes],
         )
 
         self.req_output_token_ids: list[list[int] | None] = []
@@ -786,26 +806,22 @@ class InputBatch:
         their underlying group is narrower. Columns past each row's live
         block count are zero.
         """
+        # An int64 index array: NumPy reads a one-element tensor selector as a
+        # scalar index, and the mask below would lose its row axis.
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        cols = np.arange(width)
         out: list[torch.Tensor] = []
         for bt in self.block_table.block_tables:
-            bt_cpu = bt.get_cpu_tensor()[rows, :width].clone()
+            src = bt.get_cpu_tensor().numpy()
+            table = np.zeros((rows.shape[0], width), dtype=src.dtype)
+            n = min(src.shape[1], width)
+            table[:, :n] = src[rows, :n]
             # vLLM tracks only the live prefix of a row; the columns past it
             # keep earlier occupants' block ids (condense/move leave them), so a
             # consumer that writes padded rows would reach another request's
             # blocks. Zero them: 0 is the null block, never allocated.
-            # Index a tensor, not the NumPy array: NumPy turns a one-element tensor
-            # selector into scalar indexing and the mask below would lose its row axis.
-            live = torch.as_tensor(
-                np.asarray(bt.num_blocks_per_row), dtype=torch.int64
-            )[rows].reshape(-1)
-            cols = torch.arange(bt_cpu.shape[1], dtype=torch.int64)
-            bt_cpu[cols.unsqueeze(0) >= live.unsqueeze(1)] = 0
-            if bt_cpu.shape[1] < width:
-                pad = torch.zeros(
-                    bt_cpu.shape[0], width - bt_cpu.shape[1], dtype=bt_cpu.dtype
-                )
-                bt_cpu = torch.cat([bt_cpu, pad], dim=1)
-            out.append(bt_cpu)
+            table[cols[None, :] >= bt.num_blocks_per_row[rows][:, None]] = 0
+            out.append(torch.from_numpy(table))
         return out
 
 
@@ -1018,7 +1034,9 @@ class TTLaneInputBatch(InputBatch):
             # Lane mode refuses supports_stage_inputs at config time: its prefill
             # inputs carry no per-row stage inputs.
             requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=False
+                new_req_data,
+                supports_stage_inputs=False,
+                vocab_size=self.vocab_size,
             )
             req_ids_to_add.append(req_id)
 
@@ -1400,6 +1418,13 @@ class TTLaneInputBatch(InputBatch):
             live_rows=scheduled_rows,
             device_sampled=device_sampled,
         )
+        if spec.spec_mode not in (None, ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS):
+            # The topk and fused_sample walks read the live rows as the first
+            # rows of the block, which a lane block does not keep.
+            raise RuntimeError(
+                f"a lane step resolved the {spec.spec_mode!r} accept mode; lane "
+                "mode walks argmax_ids and logits verifies only"
+            )
         input_tokens, input_positions = spec.input_tokens, spec.input_positions
         # A ``logits`` verify is walked on the host from the step's own copies
         # of the live rows' sampling (``spec_sampling_inputs``), so it is
