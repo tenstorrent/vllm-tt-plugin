@@ -244,6 +244,11 @@ def merge_lane_scheduler_outputs(
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
     set_tt_forced_reset_discard_counts(merged, forced_reset_discard_counts)
+    # KV connector metadata: each lane scheduler owns its connector; with one lane (one engine per row) its
+    # metadata is the step's. Several lanes would need one connector per lane on the worker side too.
+    metas = [out.kv_connector_metadata for out in lane_outputs if out.kv_connector_metadata is not None]
+    if len(lane_outputs) == 1 and metas:
+        merged.kv_connector_metadata = metas[0]
     if finishing_req_ids:
         set_tt_scheduler_output_field(
             merged, _TT_FINISHING_REQ_IDS_ATTR, tuple(finishing_req_ids)
@@ -293,7 +298,7 @@ class TTLaneCoordinator(SchedulerInterface):
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
-        # No KV or encoder-cache connector on TT; EngineCore reads both.
+        # EngineCore reads both. A KV connector (one per lane scheduler) is exposed only with one lane.
         self.connector: KVConnectorBase_V1 | None = None
         self.ec_connector: ECConnectorBase | None = None
         # One policy for the whole step, not one per lane. Every lane executes
@@ -341,6 +346,10 @@ class TTLaneCoordinator(SchedulerInterface):
         # which drops them with stats off; the lanes keep them for make_stats.
         for sched in self.lanes:
             sched.collect_spec_decoding_stats = log_stats
+        if vllm_config.kv_transfer_config is not None:
+            if self.num_lanes != 1:
+                raise ValueError("a KV connector needs one lane per engine (--data-parallel-size 1)")
+            self.connector = self.lanes[0].connector
 
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
         """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
@@ -913,4 +922,4 @@ class TTLaneCoordinator(SchedulerInterface):
             sched.shutdown()
 
     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
-        return None
+        return self.connector
