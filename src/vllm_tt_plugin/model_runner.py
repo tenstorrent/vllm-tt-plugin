@@ -3260,9 +3260,12 @@ class TTModelRunner:
         if connector is None or meta is None:
             return TTModelRunner._execute_model_step(self, scheduler_output)
         connector.bind_connector_metadata(meta)
+        self._step_prefill_error_ids = set()
         try:
             connector.start_load_kv(None)
             out = TTModelRunner._execute_model_step(self, scheduler_output)
+            # A row the model could not serve ran on placeholder embeddings: its KV must not reach the store.
+            connector.skip_save_req_ids = set(self._step_prefill_error_ids)
             connector.wait_for_save()
         finally:
             connector.clear_connector_metadata()
@@ -4474,6 +4477,8 @@ class TTModelRunner:
                 )
             req_id = row_req_ids[int(row)]
             model_input.prefill_errors[req_id] = reason
+            if getattr(self, "_step_prefill_error_ids", None) is not None:
+                self._step_prefill_error_ids.add(req_id)  # read by execute_model for the KV connector
             logger.error(
                 "Request %s fails: its prefill (row %d) could not be served: %s",
                 req_id,

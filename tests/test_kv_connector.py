@@ -381,3 +381,55 @@ def test_client_checks_generations_and_forgets_pools_on_reconnect():
         assert c.open_pool("p", 4096, 4096).gen == "g2"
         with pytest.raises(KVStoreError):
             c.release(9)
+
+
+def _item(identifier, offset, length):
+    return SimpleNamespace(identifier=identifier, mm_position=SimpleNamespace(offset=offset, length=length))
+
+
+def test_keys_carry_the_items_behind_identical_placeholder_tokens(connector):
+    """Two images of one size are the same placeholder tokens: their blocks must not share keys."""
+    c = connector()
+    tokens = [7] * 100 + [151655] * 300 + [9] * 240  # 5 blocks of 128; the item covers [100, 400): blocks 0-3
+    text = c._keys(tokens, None)
+    a = c._keys(tokens, None, [_item("img-a", 100, 300)])
+    b = c._keys(tokens, None, [_item("img-b", 100, 300)])
+    assert len(text) == len(a) == len(b) == 5
+    assert a == c._keys(tokens, None, [_item("img-a", 100, 300)])  # the same image: the same keys
+    assert all(x != y for x, y in zip(a, b))  # every block from the first one the item touches differs
+    assert all(x != y for x, y in zip(a, text))
+    # an item that starts in a later block leaves the blocks before it as a text prompt's
+    late = c._keys(tokens, None, [_item("img-a", 300, 100)])
+    assert late[:2] == text[:2] and late[2] != text[2]
+    # the same item at another offset is another prefix
+    assert c._keys(tokens, None, [_item("img-a", 101, 300)])[0] != a[0]
+    # no identifier: the request is not keyed at all
+    assert c._keys(tokens, None, [_item(None, 100, 300)]) is None
+
+
+def test_a_request_with_an_unidentified_item_is_neither_loaded_nor_saved(connector):
+    c = connector()
+    tokens = list(range(5000))
+    req = SimpleNamespace(request_id="r", prompt_token_ids=tokens, cache_salt=None,
+                          mm_features=[_item(None, 10, 50)])
+    assert c.get_num_new_matched_tokens(req, 0) == (0, False)
+    ids = tuple([list(range(1, 33))] + [list(range(100 * g, 100 * g + 64)) for g in range(1, 6)])
+    new = SimpleNamespace(req_id="r", prompt_token_ids=tokens, block_ids=ids, num_computed_tokens=0)
+    empty = SimpleNamespace(req_ids=[], new_block_ids=[], resumed_req_ids=set(), num_computed_tokens=[])
+    meta = c.build_connector_meta(SimpleNamespace(scheduled_new_reqs=[new], scheduled_cached_reqs=empty,
+                                                  num_scheduled_tokens={"r": 4096}, finished_req_ids=set()))
+    assert meta.saves == []
+
+
+def test_a_failed_prefill_row_is_not_saved(connector, caplog):
+    c = connector(role=KVConnectorRole.WORKER)
+    c._kv = object()
+    reserved = []
+    c.client.reserve = lambda pool, keys: reserved.append(keys) or (1, [None] * len(keys))
+    c.client.commit = lambda r: None
+    saves = [kvc.SaveSpec("bad", [b"k1"], [5], None, None), kvc.SaveSpec("good", [b"k2"], [6], None, None)]
+    c._get_connector_metadata = lambda: kvc.TTKVMeta(saves=saves)
+    c.skip_save_req_ids = {"bad"}
+    c.wait_for_save()
+    assert reserved == [[b"k2"]]  # only the good request reached the store
+    assert c.skip_save_req_ids == set()  # consumed: the next step saves again

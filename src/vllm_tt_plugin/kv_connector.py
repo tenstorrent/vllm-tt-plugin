@@ -28,6 +28,13 @@ snapshot there. Both are synchronous (no async load), so a load is part of the s
 The keys chain an identity (model, tt-metal build, plugin, layout, KV dtype) into every hash and the pool names
 carry it, so an engine of a different build never reads these pages.
 
+Multimodal prompts: an image, video or audio item is a run of identical placeholder tokens, so the token ids alone
+do not identify a block's KV. A block's key also chains the identifier (vLLM's content hash, or the caller's uuid) and
+the relative offset of every item whose placeholders overlap the block, as vLLM's own prefix-cache block hash does;
+blocks of text-only prompts keep the keys they had. A request with an item that has no identifier is neither loaded
+nor saved. A prefill step in which the model reported a row it could not serve (``reports_prefill_errors``: e.g. an
+item's encoder failed, so the row ran on placeholder embeddings) saves nothing for that request.
+
 Configuration (``--kv-transfer-config``)::
 
     {"kv_connector": "TTKVStoreConnector", "kv_connector_module_path": "vllm_tt_plugin.kv_connector",
@@ -195,7 +202,7 @@ class TTKVMeta(KVConnectorMetadata):
 @dataclass
 class _ReqState:
     tokens: list[int]
-    keys: list[bytes]
+    keys: list[bytes] | None  # None: the request cannot be keyed (an item without an identifier): no load, no save
     block_ids: list[list[int]]
     saved_blocks: int = 0
 
@@ -230,6 +237,9 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self._loads: list[LoadSpec] = []
         self._kv = None  # worker: per layer [K, V] ttnn tensors
         self.release_errors = 0
+        # Worker side, set by the TT model runner before wait_for_save: requests whose prefill rows the model could
+        # not serve in this step. Their blocks hold KV computed from placeholder embeddings: never published.
+        self.skip_save_req_ids: set[str] = set()
         logger.info(
             "TTKVStoreConnector (%s): identity %s, pools %s / %s, global slot %d B, SWA slot %d B, layout %s",
             role.name, tag, self.pool_global, self.pool_swa, self.layout.global_slot_bytes,
@@ -250,15 +260,27 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             logger.warning("TTKVStoreConnector: store unavailable (%s); running without it", e)
             return False
 
-    def _keys(self, tokens: list[int], cache_salt: str | None) -> list[bytes]:
-        """Chained key of every full global block: key i covers tokens [0, (i + 1) * block)."""
+    def _keys(self, tokens: list[int], cache_salt: str | None, mm_features=None) -> list[bytes] | None:
+        """Chained key of every full global block: key i covers tokens [0, (i + 1) * block) and the multimodal items
+        whose placeholders overlap them (module docstring). None when an item has no identifier."""
         bt = self.layout.global_block_tokens
         raw = array("I", tokens).tobytes()  # 4 bytes per token id
         step = 4 * bt
+        nblocks = len(tokens) // bt
+        items: dict[int, list[tuple[str, int]]] = {}  # block -> [(identifier, offset relative to the block)]
+        for feature in sorted(mm_features or [], key=lambda f: f.mm_position.offset):
+            if feature.identifier is None:
+                return None
+            offset, length = feature.mm_position.offset, feature.mm_position.length
+            for i in range(offset // bt, min(nblocks, -(-(offset + length) // bt))):
+                items.setdefault(i, []).append((str(feature.identifier), offset - i * bt))
         h = hashlib.sha256(self.identity + (cache_salt or "").encode()).digest()
         out = []
-        for i in range(len(tokens) // bt):
-            h = hashlib.sha256(h + raw[i * step : (i + 1) * step]).digest()
+        for i in range(nblocks):
+            block = raw[i * step : (i + 1) * step]
+            if i in items:
+                block += b"\x00mm" + json.dumps(items[i]).encode()
+            h = hashlib.sha256(h + block).digest()
             out.append(h)
         return out
 
@@ -292,8 +314,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         tokens = request.prompt_token_ids or []
         if len(tokens) < self.min_tokens:
             return 0, False
-        st = self._state(request)  # keys with the request's cache salt, for the saves too
-        if not self.do_load or not _WORKER_READY.is_set() or not self._open_pools():
+        st = self._state(request)  # keys with the request's cache salt and items, for the saves too
+        if st.keys is None or not self.do_load or not _WORKER_READY.is_set() or not self._open_pools():
             return 0, False
         bt = self.layout.global_block_tokens
         if num_computed_tokens % bt:
@@ -355,7 +377,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         st = self._req.get(request.request_id)
         if st is None:
             tokens = list(request.prompt_token_ids or [])
-            st = _ReqState(tokens=tokens, keys=self._keys(tokens, getattr(request, "cache_salt", None)), block_ids=[])
+            keys = self._keys(tokens, getattr(request, "cache_salt", None), getattr(request, "mm_features", None))
+            st = _ReqState(tokens=tokens, keys=keys, block_ids=[])
             self._req[request.request_id] = st
         return st
 
@@ -368,7 +391,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             st = self._req.get(r.req_id)
             if st is None:
                 tokens = list(r.prompt_token_ids or [])
-                st = self._req[r.req_id] = _ReqState(tokens=tokens, keys=self._keys(tokens, None), block_ids=[])
+                keys = self._keys(tokens, None, getattr(r, "mm_features", None))
+                st = self._req[r.req_id] = _ReqState(tokens=tokens, keys=keys, block_ids=[])
             st.block_ids = [list(x) for x in r.block_ids]
             starts[r.req_id] = r.num_computed_tokens
         cached = scheduler_output.scheduled_cached_reqs
@@ -387,7 +411,9 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             for rid, n in scheduler_output.num_scheduled_tokens.items():
                 st = self._req.get(rid)
                 start = starts.get(rid)
-                if st is None or start is None or len(st.tokens) < self.min_tokens or start >= len(st.tokens):
+                if st is None or st.keys is None or start is None:
+                    continue
+                if len(st.tokens) < self.min_tokens or start >= len(st.tokens):
                     continue
                 end = start + n
                 if end > len(st.tokens):
@@ -590,7 +616,11 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         meta = self._get_connector_metadata()
         if self._kv is None or not isinstance(meta, TTKVMeta) or not meta.saves or not self._open_pools():
             return
+        skip, self.skip_save_req_ids = self.skip_save_req_ids, set()
         for sv in meta.saves:
+            if sv.req_id in skip:
+                logger.warning("TTKVStoreConnector: not saving %s: its prefill could not be served", sv.req_id)
+                continue
             t0 = time.perf_counter()
             res_g = res_s = 0
             nb = 0
