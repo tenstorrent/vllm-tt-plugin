@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Host-only tests for the logits-shape guard on the host-sampling paths.
+"""Host-only tests for model-output shape validation.
 
 A TT model returns host logits as ``[rows, 1, vocab]``, and host sampling
 reads token ids straight out of the last dimension. A model adapter that folds
@@ -10,6 +10,7 @@ the vocabulary and answers with tokens that were never compared against the
 rest of it. ``TTModelRunner._check_host_logits`` refuses such a tensor on both
 host-sampling paths: ``_get_output_tokens`` (decode and prefill) and
 ``TTLaneInputBatch.extract_output`` (lane decode and lane prefill).
+Device-sampled token outputs are checked for missing rows before indexing.
 
 No device execution: the model output is a plain tensor and the host sampler
 is a fake that records the logits it is handed.
@@ -101,12 +102,14 @@ def _extract(
     is_decode: bool = True,
     captured: dict | None = None,
 ):
+    model_input = _model_input()
+    model_input.row_req_ids = [f"request-{row}" for row in range(live_rows)]
     return TTModelRunner._get_output_tokens(
         _runner(captured if captured is not None else {}),
         tt_out,
         None,
         _sampling_params(live_rows),
-        _model_input(),
+        model_input,
         [live_rows],
         perform_device_sampling=device_sampling,
         is_decode=is_decode,
@@ -174,6 +177,39 @@ def test_host_sampling_rejects_fewer_rows_than_the_step_reads():
 
     message = str(excinfo.value)
     assert "it holds 1 rows, fewer than the 2 rows the step reads" in message
+
+
+@pytest.mark.parametrize("shape", [(), (0, 1), (1, 1)])
+def test_device_sampling_identifies_missing_output_rows(shape):
+    """Check the error when device output lacks a row for each request.
+
+    Try to extract tokens for two requests from a scalar tensor or a tensor
+    with zero or one row.
+    Check that extraction raises ValueError describing the returned shape
+    and the requests whose rows were expected.
+    """
+    # region Try to extract two request rows from an undersized output
+    with pytest.raises(ValueError) as raised:
+        _extract(
+            torch.zeros(shape, dtype=torch.int32), live_rows=2, device_sampling=True
+        )
+    # endregion
+
+    # region Check the error identifies the output and submitted requests
+    message = str(raised.value)
+    assert f"shape={shape}" in message, (
+        "Error should report the shape of the returned device output."
+    )
+    assert "requires rows [0, 2)" in message, (
+        "Error should identify the two rows required for token extraction."
+    )
+    assert "batch_size_per_dp=[2]" in message, (
+        "Error should report the submitted batch size per DP segment."
+    )
+    assert "submitted_request_ids=['request-0', 'request-1']" in message, (
+        "Error should identify the requests whose output rows were expected."
+    )
+    # endregion
 
 
 def test_lane_host_sampling_rejects_narrow_vocabulary():

@@ -25,7 +25,10 @@ from vllm_tt_plugin.spec_decode import (
     VerifyOutput,
 )
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
-from vllm_tt_plugin.structured_output import has_structured_outputs
+from vllm_tt_plugin.structured_output import (
+    has_scheduled_structured_outputs,
+    has_structured_outputs,
+)
 
 
 def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
@@ -583,6 +586,20 @@ class TTAsyncDecodeController:
         *,
         decode_layout_changed: bool | None = None,
     ) -> bool:
+        """Check overlap prerequisites before batch mutation and input construction.
+
+        Reject new/resumed requests, sticky layout changes, penalties, token
+        filters, logits processors, and logprobs. Contract v1 additionally requires
+        decode-only work and a valid device-sampled chain; use the supplied
+        layout flag for lanes or infer changes from front-packed membership.
+        Legacy adapters retain their existing reload policy.
+
+        Admit structured decode through real device-sampling eligibility using
+        request metadata, since its grammar mask arrives at sample time. A
+        pending grammar flag without a scheduled structured request is rejected.
+        True permits an overlap attempt. Async/tracing gating, pending-step
+        safety, and prepared-input reload checks are separate.
+        """
         runner = self.runner
         input_batch = runner.input_batch
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -605,14 +622,17 @@ class TTAsyncDecodeController:
                 )
             if decode_layout_changed:
                 return False
-        # Structured outputs are detected from the scheduler state, not from a
-        # prepared bitmask: grammar is applied at sample time, so no bitmask
-        # exists yet when this runs. Either signal disables steady decode so the
-        # grammar constraint is never skipped by an overlapped step.
-        if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
-            runner.requests, scheduler_output, None
+
+        # Grammar is supplied at sample time. Check device-grammar admission
+        # from request/scheduler state before building a mask or a model input.
+        has_structured = has_structured_outputs(runner.requests, scheduler_output, None)
+        if has_structured and not has_scheduled_structured_outputs(
+            runner.requests, scheduler_output
         ):
+            # Pending flag without a submitted structured request does not enter
+            # deferred device sampling.
             return False
+
         if not input_batch.no_penalties:
             return False
         if not input_batch.no_allowed_token_ids:
@@ -630,7 +650,7 @@ class TTAsyncDecodeController:
             return False
         return runner.check_perform_device_sampling(
             is_decode=True,
-            has_structured_outputs=False,
+            has_structured_outputs=has_structured,
         )
 
     def can_attempt_steady_decode_from_scheduler(
@@ -666,7 +686,12 @@ class TTAsyncDecodeController:
             decode_layout_changed=decode_layout_changed,
         )
 
-    def can_use_steady_decode_fast_path(self, model_input: TTModelInput) -> bool:
+    def can_use_steady_decode_fast_path(
+        self,
+        model_input: TTModelInput,
+        *,
+        reload_plan: TTDecodeReloadPlan | None = None,
+    ) -> bool:
         if not self.steady_decode_base_enabled():
             return False
         if model_input.prompt_lens is not None:
@@ -674,8 +699,6 @@ class TTAsyncDecodeController:
         if not model_input.perform_device_sampling:
             return False
         if model_input.decode_layout_changed:
-            return False
-        if getattr(model_input, "defer_device_sampling", False):
             return False
         if (
             model_input.prompt_tokens is not None
@@ -691,7 +714,11 @@ class TTAsyncDecodeController:
             return False
         if self.decode_input_update_contract_version() < 1:
             return True
-        return self.plan_decode_reload(model_input).overlap_safe
+        return (
+            reload_plan
+            if reload_plan is not None
+            else self.plan_decode_reload(model_input)
+        ).overlap_safe
 
     def enqueue_completed_decode_step(self, completed: CompletedDecodeStep) -> None:
         with self.runner._steady_decode_lock:
@@ -1035,6 +1062,13 @@ class TTAsyncDecodeController:
         batch is read back via ``TTLaneInputBatch.extract_output``. Otherwise it
         is a plain single-process step read back via ``_get_output_tokens``.
         """
+        if getattr(model_input, "defer_device_sampling", False):
+            # The sample-time tail already applied grammar on device. Output
+            # extraction must see tokens with no remaining sampling work.
+            model_input = replace(
+                model_input, grammar_bitmask=[None], defer_device_sampling=False
+            )
+
         finalized = self.finalize_decode(submission, sampling_rows=scheduled_rows)
         if finalized is None:
             sampled_token_ids = torch.empty((0, 1), dtype=torch.int32)
@@ -1557,21 +1591,24 @@ class TTAsyncDecodeController:
             host_answered=host_answered,
         )
 
+    def fail_deferred_device_sampling(self) -> None:
+        """Mark deferred device sampling as failed and reset relevant state."""
+        self._decode_chain_valid = False
+        self._submitted_page_tables = None
+        self.runner._poison_device_grammar()
+
     def complete_deferred_device_sampling(
         self,
         submission: TTDecodeSubmission,
         model_input: TTModelInput,
-    ) -> TTFinalizedDecode:
-        """Sample on device with the step's bitmask, if any; finalize the tokens.
+        async_read: bool = False,
+        scheduled_rows: list[int] | None = None,
+    ) -> TTFinalizedDecode | AsyncTTModelRunnerOutput:
+        """Sample with the step's mask; finalize now or defer token readback.
 
         A step with no structured request left, such as when every one finished
         in flight, samples without a bitmask.
         """
-
-        def fail_deferred() -> None:
-            self._decode_chain_valid = False
-            self._submitted_page_tables = None
-            self.runner._poison_device_grammar()
 
         if not submission.deferred_device_sampling:
             raise ValueError(
@@ -1589,7 +1626,7 @@ class TTAsyncDecodeController:
             )
         grammar_bitmask = model_input.grammar_bitmask[0]
         if grammar_bitmask is None and model_input.structured_output_req_ids:
-            fail_deferred()
+            self.fail_deferred_device_sampling()
             raise RuntimeError(
                 "structured decode reached deferred device sampling without "
                 "a sample-time grammar bitmask: "
@@ -1598,11 +1635,12 @@ class TTAsyncDecodeController:
 
         sample_deferred = getattr(self.runner.model, "sample_deferred_decode", None)
         if not callable(sample_deferred):
-            fail_deferred()
+            self.fail_deferred_device_sampling()
             raise AttributeError(
                 "TT model declares device grammar support but does not implement "
                 "sample_deferred_decode()"
             )
+
         try:
             sampled = sample_deferred(
                 submission.tt_out,
@@ -1615,17 +1653,69 @@ class TTAsyncDecodeController:
                 read_events=None,
                 deferred_device_sampling=False,
             )
-            finalized = self.finalize_decode(completed_submission)
+
+            if async_read:
+                if hasattr(self.runner.model, "read_decode_output"):
+                    host_output, read_events = self.runner.model.read_decode_output(
+                        sampled, async_read=True
+                    )
+                elif _is_host_decode_output(sampled):
+                    host_output, read_events = sampled, None
+                else:
+                    raise AttributeError(
+                        "TT model must implement read_decode_output() "
+                        "unless sampling already returns host tensors"
+                    )
+
+                completed_submission = replace(
+                    completed_submission, tt_out=host_output, read_events=read_events
+                )
+                req_ids = (
+                    [model_input.grammar_row_req_ids[row] for row in scheduled_rows]
+                    if scheduled_rows is not None
+                    else list(model_input.row_req_ids)
+                )
+
+                if any(req_id is None for req_id in req_ids):
+                    raise RuntimeError(
+                        f"deferred device sampling has missing request IDs: {req_ids}"
+                    )
+
+                step = AsyncTTModelRunnerOutput(
+                    controller=self,
+                    submission=completed_submission,
+                    model_input=model_input,
+                    completion_event=threading.Event(),
+                    context=self.capture_submitted_step_context(req_ids),
+                    scheduled_rows=scheduled_rows,
+                )
+
+                steady = self.can_use_steady_decode_fast_path(
+                    model_input, reload_plan=submission.reload_plan
+                )
+                self.register_pending_async_step(
+                    step,
+                    steady=steady,
+                    overlap_ok=steady and not submission.host_answered,
+                )
+                finalized = step
+
+            else:
+                finalized = self.finalize_decode(completed_submission)
+
             if finalized is None:
                 raise RuntimeError("deferred device sampling produced no output")
+
         except Exception:
-            fail_deferred()
+            self.fail_deferred_device_sampling()
             raise
+
         self.device_grammar_sample_count += 1
         logger.debug(
             "TT device grammar sampling active count=%d",
             self.device_grammar_sample_count,
         )
+
         return finalized
 
     def finalize_decode(
