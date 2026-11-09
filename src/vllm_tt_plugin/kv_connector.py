@@ -171,6 +171,9 @@ class LoadSpec:
     # generations of the pools the slots belong to (KVStoreClient checked them at acquire time)
     global_gen: str = ""
     swa_gen: str = ""
+    # scheduler-side time of the lookup that planned this load (keys, store calls), for the load's log line
+    lookup_ms: float = 0.0
+    keys_ms: float = 0.0
 
 
 @dataclass
@@ -283,11 +286,13 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     # ------------------------------------------------------------------ scheduler side
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int | None, bool]:
+        t_start = time.perf_counter()
         self._release_pending(request.request_id)
         tokens = request.prompt_token_ids or []
         if len(tokens) < self.min_tokens:
             return 0, False
         st = self._state(request)  # keys with the request's cache salt, for the saves too
+        t_keys = time.perf_counter()
         if not self.do_load or not _WORKER_READY.is_set() or not self._open_pools():
             return 0, False
         bt = self.layout.global_block_tokens
@@ -317,14 +322,16 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             self._release(lease_g)
             self._release(lease_s)
             return 0, False
-        self._pending[request.request_id] = (local, b, slots_g, slots_s[0], [lease_g, lease_s], gens)
+        t_end = time.perf_counter()
+        times = ((t_end - t_start) * 1e3, (t_keys - t_start) * 1e3)
+        self._pending[request.request_id] = (local, b, slots_g, slots_s[0], [lease_g, lease_s], gens, times)
         return b * bt - num_computed_tokens, False
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         pend = self._pending.pop(request.request_id, None)
         if pend is None:
             return
-        local, b, slots_g, slot_s, leases, gens = pend
+        local, b, slots_g, slot_s, leases, gens, times = pend
         if num_external_tokens == 0:
             for lease in leases:
                 self._release(lease)
@@ -342,6 +349,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 leases=leases,
                 global_gen=gens[0],
                 swa_gen=gens[1],
+                lookup_ms=times[0],
+                keys_ms=times[1],
             )
         )
         self._state(request).saved_blocks = b  # already in the store
@@ -538,17 +547,27 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             raise RuntimeError("TTKVStoreConnector: promised loads but the store's pools cannot be opened")
         for ld in meta.loads:
             t0 = time.perf_counter()
+            t1 = t2 = t0
+            nreg = 0
             try:
                 pg = self._mapping(self.pool_global, ld.global_gen)
                 ps = self._mapping(self.pool_swa, ld.swa_gen)
-                nb = self._copy(self._global_regions(pg, ld.global_slots, ld.global_blocks), to_device=True)
-                nb += self._copy(self._swa_regions(ps, ld.swa_slot, ld.swa_blocks), to_device=True)
+                rg = self._global_regions(pg, ld.global_slots, ld.global_blocks)
+                rs = self._swa_regions(ps, ld.swa_slot, ld.swa_blocks)
+                nreg = sum(len(r) for r in rg.values()) + sum(len(r) for r in rs.values())
+                t1 = time.perf_counter()
+                nb = self._copy(rg, to_device=True)
+                nb += self._copy(rs, to_device=True)
+                t2 = time.perf_counter()
             finally:
                 for lease in ld.leases:
                     self._release(lease)
+            t3 = time.perf_counter()
             logger.info(
-                "TTKVStoreConnector: loaded %d tokens of %s (%.1f MB) in %.1f ms",
-                ld.num_tokens, ld.req_id, nb / 1e6, (time.perf_counter() - t0) * 1e3,
+                "TTKVStoreConnector: loaded %d tokens of %s (%.1f MB, %d regions) in %.1f ms (regions %.1f, copy %.1f, "
+                "release %.1f; scheduler lookup %.1f, of which keys %.1f)",
+                ld.num_tokens, ld.req_id, nb / 1e6, nreg, (t3 - t0) * 1e3, (t1 - t0) * 1e3, (t2 - t1) * 1e3,
+                (t3 - t2) * 1e3, ld.lookup_ms, ld.keys_ms,
             )
 
     def _mapping(self, name: str, gen: str) -> Pool:
@@ -584,23 +603,42 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
         for sv in meta.saves:
             t0 = time.perf_counter()
             res_g = res_s = 0
-            nb = 0
+            nb = nreg = 0
+            t_store = t_regions = t_copy = 0.0
             try:
                 if sv.global_keys:
                     # reserve sends the mapping's generation and checks the answer's: the slots are in this mapping
+                    t = time.perf_counter()
                     res_g, slots = self.client.reserve(self.pool_global, sv.global_keys)
                     pool = self.client.pool(self.pool_global)
                     pick = [(s, b) for s, b in zip(slots, sv.global_blocks) if s is not None]
+                    t_store += time.perf_counter() - t
                     if pick:
-                        nb += self._copy(self._global_regions(pool, [s for s, _ in pick], [b for _, b in pick]), False)
+                        t = time.perf_counter()
+                        rg = self._global_regions(pool, [s for s, _ in pick], [b for _, b in pick])
+                        nreg += sum(len(r) for r in rg.values())
+                        t_regions += time.perf_counter() - t
+                        t = time.perf_counter()
+                        nb += self._copy(rg, False)
+                        t_copy += time.perf_counter() - t
                 if sv.snapshot_key is not None:
+                    t = time.perf_counter()
                     res_s, slots = self.client.reserve(self.pool_swa, [sv.snapshot_key])
                     pool = self.client.pool(self.pool_swa)
+                    t_store += time.perf_counter() - t
                     if slots and slots[0] is not None:
-                        nb += self._copy(self._swa_regions(pool, slots[0], sv.swa_blocks), False)
+                        t = time.perf_counter()
+                        rs = self._swa_regions(pool, slots[0], sv.swa_blocks)
+                        nreg += sum(len(r) for r in rs.values())
+                        t_regions += time.perf_counter() - t
+                        t = time.perf_counter()
+                        nb += self._copy(rs, False)
+                        t_copy += time.perf_counter() - t
                 # the copies above were blocking: the bytes are in place, publish
+                t = time.perf_counter()
                 self.client.commit(res_g)
                 self.client.commit(res_s)
+                t_store += time.perf_counter() - t
             except Exception as e:  # never fail the step for a cache
                 logger.warning("TTKVStoreConnector: save of %s failed: %s", sv.req_id, e)
                 for r in (res_g, res_s):
@@ -611,9 +649,10 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             if nb:
                 logger.info(
-                    "TTKVStoreConnector: saved %d blocks%s of %s (%.1f MB) in %.1f ms",
-                    len(sv.global_keys), " + SWA snapshot" if sv.snapshot_key else "", sv.req_id, nb / 1e6,
-                    (time.perf_counter() - t0) * 1e3,
+                    "TTKVStoreConnector: saved %d blocks%s of %s (%.1f MB, %d regions) in %.1f ms (store %.1f, "
+                    "regions %.1f, copy %.1f)",
+                    len(sv.global_keys), " + SWA snapshot" if sv.snapshot_key else "", sv.req_id, nb / 1e6, nreg,
+                    (time.perf_counter() - t0) * 1e3, t_store * 1e3, t_regions * 1e3, t_copy * 1e3,
                 )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
