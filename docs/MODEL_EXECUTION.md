@@ -21,9 +21,12 @@ The plugin rejects encoder-decoder models and `prompt_embeds` input.
 - `start_pos=-1` marks an inactive decode row. The model adapter must not
   interpret an inactive row as a live request or modify another request's state.
 - `page_table` is the first KV group's integer logical-to-physical block
-  table. If the resolved cache has multiple groups, the plugin also sends
-  `page_tables_per_layer`, ordered by attention-layer index. The model adapter
-  must use the page table for each layer. See [KV setup](MODEL_SETUP.md).
+  table. With `MambaSpec` groups it is the first attention group's table,
+  because group 0 can be a `MambaSpec` group. If the resolved cache has
+  multiple groups, the plugin also sends
+  `page_tables_per_layer`, ordered by attention-layer index, or by the index
+  of every layer when the cache has `MambaSpec` groups. The model adapter must
+  use the page table for each layer. See [KV setup](MODEL_SETUP.md).
 
 `TTModelInput` is an internal plugin payload. The model adapter receives the
 keyword arguments below, not a `TTModelInput` object. Source:
@@ -31,6 +34,63 @@ keyword arguments below, not a `TTModelInput` object. Source:
 `TTModelRunner._prepare_model_inputs` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py), and
 `TTLaneInputBatch` in [input_batch.py](../src/vllm_tt_plugin/input_batch.py).
+
+### Recurrent state blocks
+
+When the KV cache has `MambaSpec` groups (see
+[recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)), prefill and
+decode also receive `state_block_ids_per_layer`. It has one entry per layer,
+in `page_tables_per_layer` order. An attention layer's entry is `None`. A
+`MambaSpec` layer's entry is a CPU int32 tensor `[tt_max_batch_size, 1]`:
+row `i` is the block id that holds the recurrent state of submitted row `i`
+for that layer's group.
+
+1. `TTModelRunner` selects the block as upstream
+   `mamba_get_block_table_tensor` does: column 0 of the row of the layer's
+   group in mode `none`, and column `(seq_len - 1) // block_size` in mode
+   `align`. `seq_len` is the request's `num_computed_tokens` plus its
+   scheduled tokens.
+2. Before the forward, in mode `align`, `TTModelRunner` calls
+   `copy_kv_cache_blocks` to copy the state from the previous column's block
+   into the selected block when the request crosses into a new column. The
+   block of the previous column keeps the state at that block boundary for
+   prefix-cache hits.
+3. The model reads each row's start state from the selected block and writes
+   the row's end state to the same block.
+
+A block-output model (`output_tokens_per_step > 1`) can keep a running
+request's state in its own buffers between decode steps instead, because its
+decode steps never start from a block. It must still leave in column `p`'s
+block the state after exactly `(p + 1) * block_size` tokens before the step
+that commits past that boundary returns its output: the scheduler offers a
+block to the prefix cache once its last fed token commits, and a decode step
+can cross a boundary anywhere inside its output block. Column `p`'s block id is
+in the layer's row of `page_tables_per_layer`. Its prompt chunks still end on
+state block boundaries, as for a token model.
+
+A row whose `start_pos` is 0 has no earlier state. The model must start that
+row from zero state and must not read its block: vLLM 0.30.0 does not zero
+recurrent-state blocks, so the block can hold stale bytes.
+
+Padding rows have block 0, the null block. vLLM never allocates block 0 to a
+request, so the model can read or write block 0 without changing live state,
+and ignores the result. On the layer-slot overlay, padding rows write their
+state into block 0, so block 0 can hold any bytes, including fp32 state that
+reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+
+vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers
+(`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`).
+A block that held Mamba state can be reassigned to an attention group, and its
+stale bytes then read as NaN or Inf at positions attention does not write.
+vLLM lists only the blocks newly allocated to attention groups
+(`vllm/v1/core/single_type_kv_cache_manager.py:117-121`). This is why the
+adapter must implement `zero_kv_cache_blocks`; see
+[block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
+
+`TTModelRunner` derives `state_block_ids_per_layer` from the page tables, so it
+changes only on a step whose page tables or batch layout change. Under the
+[decode reload contract](DECODE_RELOAD_CONTRACT.md), reload it when the page
+tables are reloaded.
 
 ## Prefill
 
@@ -45,6 +105,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `enable_trace` | True when `tt.trace_mode="all"`. |
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
+| `state_block_ids_per_layer` | Supplied for `MambaSpec` groups. See [recurrent state blocks](#recurrent-state-blocks). |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
@@ -111,6 +172,7 @@ request-specific RoPE.
 | `enable_trace` | True for `tt.trace_mode="all"` or `"decode_only"`. |
 | `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling, selective readback, or a speculative verify, which is submitted as a front-packed verify is. The adapter must support the readback mode its execution path requests. |
 | `page_tables_per_layer` | Supplied for multiple KV groups. |
+| `state_block_ids_per_layer` | Supplied for `MambaSpec` groups. See [recurrent state blocks](#recurrent-state-blocks). |
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
 | `prompt_tokens`, `output_tokens` | Supplied together when device sampling needs token history for penalties. Histories use `-1` padding. |

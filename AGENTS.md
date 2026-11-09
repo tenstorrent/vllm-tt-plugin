@@ -286,8 +286,8 @@ runtime reads. Keep class and instance declarations consistent.
 Absent keys default via `.get`. That is the live contract. Do not add
 fail-on-missing for a new key unless the matching tt-metal generators will
 declare it in the same change. Raise when a *present* value contradicts
-another resolved property (block-output plus prefix caching; DiffusionGemma
-without `output_tokens_per_step > 1`) or when an operator request is
+another resolved property (DiffusionGemma without
+`output_tokens_per_step > 1`) or when an operator request is
 unsupported. Copy those existing `ValueError` messages.
 
 Leftover identity gates still exist. Do not copy them for new work, and do
@@ -298,10 +298,12 @@ not remove them in an unrelated pull request:
 - hybrid KV: `get_kv_cache_spec` on the model class, not `model_capabilities`
 
 Other contracts are methods, not dictionary keys: hybrid KV opt-in is
-`get_kv_cache_spec`; block-output lifecycle uses `release_request`,
-`release_persistent_capture`, and, for adaptive block output with multiple
-requests, `note_state_slots_moved`; speculative feasibility is `spec_plan`, a
-classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRACT.md).
+`get_kv_cache_spec`; recurrent state declared through `MambaSpec` uses
+`zero_kv_cache_blocks` and `copy_kv_cache_blocks`; block-output lifecycle uses
+`release_request`, `release_persistent_capture`, and, for adaptive block
+output with multiple requests, `note_state_slots_moved`; speculative
+feasibility is `spec_plan`, a classmethod specified in
+[docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRACT.md).
 `supports_narrow_decode` belongs to `SpecPlan`, not `model_capabilities`.
 `SpecPlan` resource declarations do not yet enforce row or byte budgets.
 

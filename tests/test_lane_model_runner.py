@@ -11,6 +11,7 @@ environment because importing the plugin modules pulls in ttnn.
 
 from types import MethodType, SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -364,6 +365,56 @@ def test_get_output_tokens_skips_all_intermediate_prefill_rows():
     assert logprobs == [None]
 
 
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_split_prompt_of_a_block_output_model(adaptive):
+    """A split prompt (Mamba cache mode align cuts it at block boundaries) runs
+    on an adaptive block-output model, whose prefill emits one anchor token:
+    the intermediate chunk emits nothing and the final chunk its anchor. A
+    model whose prefill emits a whole block still refuses."""
+    runner = SimpleNamespace(
+        host_sampler=lambda *args, **kwargs: pytest.fail("sampler must not run"),
+        _is_block_output_model=True,
+        _is_adaptive_block_output=adaptive,
+        _num_speculative_tokens=0,
+        _output_tokens_per_step=8,
+        _apply_sampled_tokens_to_state=lambda tokens, req_ids: None,
+    )
+    model_input = SimpleNamespace(
+        intermediate_prefill_mask=torch.tensor([True]), execution_lane="dflash"
+    )
+
+    def sample():
+        return TTModelRunner._get_output_tokens(
+            runner,
+            torch.zeros((1, 1)),
+            None,
+            SimpleNamespace(),
+            model_input,
+            [1],
+            True,  # sampled on device
+            False,  # prefill
+        )
+
+    def build():
+        return TTModelRunner._build_chunked_prefill_output(
+            runner,
+            req_ids=["mid", "last"],
+            sampled_token_ids=torch.tensor([[0], [42]], dtype=torch.int32),
+            logprobs=None,
+            intermediate_mask=np.array([True, False]),
+        )
+
+    if not adaptive:
+        with pytest.raises(ValueError, match="output_tokens_per_step=8"):
+            sample()
+        with pytest.raises(ValueError, match="output_tokens_per_step=8"):
+            build()
+        return
+    sampled, _ = sample()
+    assert sampled[0].tolist() == [[0]]
+    assert build().sampled_token_ids == [[], [42]]
+
+
 def test_finish_lane_sync_suppresses_intermediate_prefill_output():
     # The chunk ends at position 3 but the request has 8 tokens, so the step
     # contributes KV state only.
@@ -440,6 +491,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         prompt_lens=[1],
         input_positions=torch.zeros((1,), dtype=torch.int32),
         block_tables_per_layer=None,
+        state_block_ids_per_layer=None,
         stage_inputs=None,
         multi_modal_kwargs={},
         perform_device_sampling=False,
@@ -495,6 +547,7 @@ def test_submit_decode_forwards_slot_remap_to_model(perform_device_sampling):
         block_tables=torch.zeros((2, 1), dtype=torch.int32),
         input_positions=torch.zeros((2,), dtype=torch.int32),
         block_tables_per_layer=None,
+        state_block_ids_per_layer=None,
         unpadded_batch_size=2,
         tt_sampling_params=_sampling_params(),
         perform_device_sampling=perform_device_sampling,

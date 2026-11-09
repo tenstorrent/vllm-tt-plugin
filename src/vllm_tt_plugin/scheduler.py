@@ -480,11 +480,6 @@ class TTScheduler(AsyncScheduler):
                 "Block-output accounting requires upstream to reserve exactly "
                 "one sampled-token placeholder"
             )
-            assert not self.kv_cache_manager.enable_caching, (
-                "Block-output models bypass the kv_cache_manager.cache_blocks "
-                "call made by AsyncScheduler._update_request_with_output and "
-                "must disable prefix caching"
-            )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
@@ -802,18 +797,33 @@ class TTScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        if getattr(self, "_base_need_mamba_split", False):
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        # vLLM treats a step starting before ``num_tokens - 1`` as a resumed
+        # request replaying its output and cuts it at a state block boundary,
+        # so the final state of every chunk lands on a boundary. A block-output
+        # decode starts up to one output block below that mark: the block it
+        # feeds is the one the previous step committed. Cut that way, a decode
+        # crossing a boundary would become a prefill chunk that commits
+        # nothing. A decode needs no cut, because the model leaves the state
+        # at a boundary it crosses in that column's block itself (see
+        # docs/MODEL_EXECUTION.md). Prompt chunks and real replays, which
+        # start further back, are still cut.
+        if getattr(self, "_base_need_mamba_split", False) and not (
+            self._is_block_output_model
+            and start >= request.num_prompt_tokens
+            and start + self._output_tokens_per_step
+            >= request.num_tokens + request.num_output_placeholders
+        ):
             num_new_tokens = super()._mamba_block_aligned_split(
                 request,
                 num_new_tokens,
                 num_new_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        start = (
-            request.num_computed_tokens
-            + num_new_local_computed_tokens
-            + num_external_computed_tokens
-        )
         return self._align_prefill_chunk_end(request, start, num_new_tokens)
 
     def _align_prefill_chunk_end(
@@ -1361,9 +1371,10 @@ class TTScheduler(AsyncScheduler):
         # Scheduler appends token-by-token and trims at EOS, stop tokens,
         # max_tokens, or max_model_len. The reservation is physical, so consume
         # all K placeholders even when the client-visible block is trimmed.
-        # Calling Scheduler directly intentionally skips AsyncScheduler's
-        # cache_blocks hook. Platform validation disables prefix caching for
-        # block-output models, and __init__ asserts that invariant.
+        # Calling Scheduler directly skips AsyncScheduler's placeholder and
+        # cache_blocks updates, which assume one placeholder per committed
+        # token; both are done here for the whole reservation.
+        status_before_update = request.status
         new_token_ids, stopped = Scheduler._update_request_with_output(
             self, request, new_token_ids
         )
@@ -1371,5 +1382,22 @@ class TTScheduler(AsyncScheduler):
         if request.num_output_placeholders < 0:
             raise RuntimeError(
                 "Output placeholders underflowed after block-output reconciliation"
+            )
+        if (
+            self.kv_cache_manager.enable_caching
+            and status_before_update == RequestStatus.RUNNING
+        ):
+            # Platform validation keeps prefix caching on only for a model
+            # that declares supports_prefix_caching, which promises that the
+            # KV and recurrent state of every fed position match the committed
+            # tokens. A trimmed block (EOS, stop, max_tokens) commits fewer
+            # tokens than it reserved, and the last committed token is sampled,
+            # not fed, so cache at most up to it.
+            self.kv_cache_manager.cache_blocks(
+                request,
+                min(
+                    request.num_computed_tokens - request.num_output_placeholders,
+                    request.num_tokens - 1,
+                ),
             )
         return new_token_ids, stopped

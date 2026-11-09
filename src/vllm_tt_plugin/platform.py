@@ -2194,13 +2194,6 @@ class TTPlatform(Platform):
                 "speculation honours. The model capability cannot be changed "
                 "from the command line, so drop the speculative flags"
             )
-        if is_block_output_model and supports_prefix_caching:
-            raise ValueError(
-                f"Model {model_class.__module__}.{model_class.__name__} "
-                "declares model_capabilities['supports_prefix_caching']=True, "
-                "but block-output models (output_tokens_per_step > 1) bypass "
-                "the vLLM prefix cache; fix the model's capability declaration"
-            )
         if (
             vllm_config.cache_config.enable_prefix_caching
             and not supports_prefix_caching
