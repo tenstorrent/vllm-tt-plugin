@@ -503,6 +503,40 @@ def _no_items_allowed(modality: str):
     return options_cls(count=0)
 
 
+TT_KV_STORE_CONNECTOR = "TTKVStoreConnector"
+
+
+def disable_kv_store_mm_embeds(vllm_config: "VllmConfig") -> bool:
+    """Turn off the multimodal embedding inputs vLLM derives for a KV consumer, when that consumer is
+    TTKVStoreConnector. Returns whether it changed the config.
+
+    vLLM turns pre-computed embedding inputs (``enable_mm_embeds``, ``allow_missing_mm_embeddings``) on for every
+    KV consumer, since a disaggregated decode engine is sent embeddings instead of media
+    (``VllmConfig._resolve_mm_embedding_inputs``). TTKVStoreConnector moves prefix KV only: every engine receives the
+    request's media and encodes them itself, and a model declaring ``mm_modalities`` cannot take embeddings. vLLM
+    derives the flags after the platform's config check, so this runs in the worker's own check
+    (``resolve_tt_mm_modalities``) and when the front end builds its InputProcessor, before any request is parsed.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    mm_config = getattr(model_config, "multimodal_config", None)
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    ec_config = getattr(vllm_config, "ec_transfer_config", None)
+    if mm_config is None or kv_config is None or kv_config.kv_connector != TT_KV_STORE_CONNECTOR:
+        return False
+    if ec_config is not None and getattr(ec_config, "is_ec_consumer", False):
+        return False  # an encoder-cache consumer is sent embeddings: keep them
+    if not (mm_config.enable_mm_embeds or getattr(mm_config, "allow_missing_mm_embeddings", False)):
+        return False
+    mm_config.enable_mm_embeds = False
+    mm_config.allow_missing_mm_embeddings = False
+    logger.info(
+        "%s moves prefix KV only (every engine encodes its requests' media): multimodal embedding inputs, which "
+        "vLLM turns on for a KV consumer, are off",
+        TT_KV_STORE_CONNECTOR,
+    )
+    return True
+
+
 def resolve_tt_mm_modalities(
     vllm_config: "VllmConfig",
     model_capabilities: dict | None,
@@ -555,6 +589,7 @@ def resolve_tt_mm_modalities(
             )
     else:
         mm_config = model_config.multimodal_config
+        disable_kv_store_mm_embeds(vllm_config)
         if declared is not None and mm_config.enable_mm_embeds:
             raise ValueError(
                 f"Model {name} encodes its own multimodal items "

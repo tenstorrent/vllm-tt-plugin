@@ -613,6 +613,23 @@ def test_mm_embeds_are_refused_for_a_declaring_model(processor_modalities):
         )
 
 
+def test_kv_store_connector_turns_off_the_embedding_inputs_vllm_derives_for_a_kv_consumer(processor_modalities):
+    """vLLM turns embedding inputs on for any KV consumer; TTKVStoreConnector engines get media, not embeddings."""
+    mm_config = MultiModalConfig(enable_mm_embeds=True)
+    mm_config.allow_missing_mm_embeddings = True  # as VllmConfig._resolve_mm_embedding_inputs sets it
+    vllm_config = _vllm_config(mm_config)
+    vllm_config.kv_transfer_config = SimpleNamespace(kv_connector="TTKVStoreConnector")
+    vllm_config.ec_transfer_config = None
+    resolve_tt_mm_modalities(vllm_config, {"mm_modalities": {"image"}}, _model_class())
+    assert not mm_config.enable_mm_embeds and not mm_config.allow_missing_mm_embeddings
+    # another connector keeps them, and a declaring model then refuses to start
+    other = MultiModalConfig(enable_mm_embeds=True)
+    other_config = _vllm_config(other)
+    other_config.kv_transfer_config = SimpleNamespace(kv_connector="NixlConnector")
+    with pytest.raises(ValueError, match="--enable-mm-embeds"):
+        resolve_tt_mm_modalities(other_config, {"mm_modalities": {"image"}}, _model_class())
+
+
 def test_a_declaration_vllm_serves_text_only_is_refused():
     """No registered processor: vLLM runs the model text-only."""
     with pytest.raises(ValueError, match="serves it text-only"):

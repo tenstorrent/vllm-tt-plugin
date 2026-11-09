@@ -1083,6 +1083,18 @@ def _install_tt_input_processor_patch() -> None:
     original = input_processor.InputProcessor.process_inputs
     input_processor._tt_original_process_inputs = original
 
+    # The front end's chat parsing reads enable_mm_embeds from this config: turn off the embedding inputs vLLM
+    # derives for a TTKVStoreConnector consumer before the server takes any request (disable_kv_store_mm_embeds).
+    original_init = input_processor.InputProcessor.__init__
+
+    def init_tt(self, vllm_config, *args, **kwargs):
+        from vllm_tt_plugin.config import disable_kv_store_mm_embeds
+
+        disable_kv_store_mm_embeds(vllm_config)
+        original_init(self, vllm_config, *args, **kwargs)
+
+    input_processor.InputProcessor.__init__ = init_tt
+
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
         is_block_output_model = is_tt_block_output_model(self.vllm_config)
