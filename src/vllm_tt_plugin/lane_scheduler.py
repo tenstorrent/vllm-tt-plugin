@@ -41,7 +41,7 @@ from vllm.v1.core.sched.output import (
     GrammarOutput,
     SchedulerOutput,
 )
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -614,6 +614,29 @@ class TTLaneCoordinator(SchedulerInterface):
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        scheduled_ts = time.monotonic()
+        merged = self._schedule_lanes(throttle_prefills)
+        if self.log_stats:
+            self._record_scheduled_events(merged, scheduled_ts)
+        return merged
+
+    def _record_scheduled_events(self, merged: SchedulerOutput, scheduled_ts: float) -> None:
+        """Record SCHEDULED on the requests this step takes from waiting (new or resumed after a preemption).
+
+        vLLM's request-timing metrics (vllm:request_queue_time_seconds, request_prefill_time_seconds,
+        request_inference_time_seconds) come from a request's QUEUED and SCHEDULED events, which the base scheduler
+        records only with log_stats on. The lanes run with log_stats off (the coordinator owns the stats), so the
+        coordinator records both events itself: QUEUED in add_request, SCHEDULED here, with the step's start time
+        as the base scheduler uses."""
+        req_ids = [r.req_id for r in merged.scheduled_new_reqs]
+        req_ids += list(merged.scheduled_cached_reqs.resumed_req_ids)
+        for req_id in req_ids:
+            lane = self._req_to_lane.get(req_id)
+            request = self.lanes[lane].requests.get(req_id) if lane is not None else None
+            if request is not None:
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_ts)
+
+    def _schedule_lanes(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if self._hold_for_prefill_gather():
             # A decode-only pass hides the waiting queues, and nothing runs, so
             # this step schedules nothing; the engine loop takes in new
@@ -803,6 +826,9 @@ class TTLaneCoordinator(SchedulerInterface):
             lane = self._pick_lane()
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
+        if self.log_stats:
+            # The lanes run with log_stats off: QUEUED (with SCHEDULED in schedule) feeds vLLM's queue time metric.
+            request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
         self,

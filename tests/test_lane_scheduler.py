@@ -931,3 +931,43 @@ def test_merge_carries_every_lanes_finishing_requests():
     merged = merge_lane_scheduler_outputs(outs)
     assert get_tt_finishing_req_ids(merged) == ("a", "c", "d")
     assert get_tt_finishing_req_ids(merge_lane_scheduler_outputs(outs[1:2])) == ()
+
+
+class _EventRequest(SimpleNamespace):
+    """A request that keeps the events recorded on it (vLLM's Request.record_event)."""
+
+    def record_event(self, event_type, timestamp=None):
+        self.__dict__.setdefault("events", []).append((event_type, timestamp))
+
+
+class _AddingLane(FakeLane):
+    def add_request(self, request):
+        self.requests[request.request_id] = request
+
+
+@pytest.mark.parametrize("log_stats", [True, False])
+def test_coordinator_records_queued_and_scheduled_events_for_request_timing_metrics(monkeypatch, log_stats):
+    # vLLM's vllm:request_queue_time_seconds is SCHEDULED - QUEUED. The lanes run with log_stats off, so the
+    # coordinator records both events when it logs stats, and nothing otherwise.
+    from vllm.v1.engine import EngineCoreEventType
+
+    lanes = [_AddingLane(), _AddingLane()]
+    coordinator = _make_coordinator(lanes, log_stats=log_stats)
+    new, resumed, other = (_EventRequest(request_id=r) for r in ("new", "resumed", "other"))
+    for request in (new, resumed, other):
+        coordinator.add_request(request)
+
+    out = SchedulerOutput.make_empty()
+    out.scheduled_new_reqs = [SimpleNamespace(req_id="new")]
+    out.scheduled_cached_reqs.resumed_req_ids = {"resumed"}
+    monkeypatch.setattr(coordinator, "_schedule_lanes", lambda throttle_prefills=False: out)
+    monkeypatch.setattr("vllm_tt_plugin.lane_scheduler.time.monotonic", lambda: 123.0)
+    assert coordinator.schedule() is out
+
+    queued = (EngineCoreEventType.QUEUED, None)
+    scheduled = (EngineCoreEventType.SCHEDULED, 123.0)
+    if log_stats:
+        assert new.events == [queued, scheduled] and resumed.events == [queued, scheduled]
+        assert other.events == [queued]  # still waiting: no SCHEDULED yet
+    else:
+        assert not any(hasattr(r, "events") for r in (new, resumed, other))
