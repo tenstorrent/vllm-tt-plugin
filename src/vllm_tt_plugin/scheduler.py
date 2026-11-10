@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import os
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -968,6 +969,14 @@ class TTScheduler(AsyncScheduler):
         Rounded hits keep the piece the scheduler hands out bounded by the budget. Also covers same-step phantom hits (vLLM registers blocks at schedule time).
         """
         blocks, num_local, boundary, diverged = super()._get_local_prefix_cache_hit(request)
+        if os.environ.get("VLLM_TT_PREFIX_DEBUG", "0") == "1":
+            # Debug (default off): vLLM's raw local hit before the model hook. The model hook runs only ``if num_local`` (a cold prompt never asks the model for a lookup).
+            logger.info(
+                "TT prefix debug: req=%s num_tokens=%d num_local=%d",
+                request.request_id,
+                request.num_tokens,
+                num_local,
+            )
         policy = getattr(self, "_prefix_hit_policy", "")
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if policy == "model" and align:
