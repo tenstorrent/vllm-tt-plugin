@@ -94,3 +94,20 @@ def test_policy_model_is_accepted_and_garbage_is_not():
     assert get_tt_prefix_hit_policy(cfg) == "model"
     with pytest.raises(ValueError):  # allow-pytest.raises: stdlib-only module test
         store_tt_prefix_hit_policy(cfg, "models")
+
+
+def test_peek_model_home_is_none_without_hook_or_peek_and_survives_a_failing_hook():
+    assert ph.peek_model_home("r", [1, 2], 2) is None
+    ph.set_prefix_hook(Hook())  # a hook without peek_home
+    assert ph.peek_model_home("r", [1, 2], 2) is None
+
+    class Peeking(Hook):
+        def peek_home(self, request_id, tokens, num_tokens, finished_ids=(), touch=False):
+            if self.fail:
+                raise RuntimeError("boom")
+            return 4096, 2, [1, 0, 0, 2]
+
+    ph.set_prefix_hook(Peeking())
+    assert ph.peek_model_home("r", [1, 2], 2) == (4096, 2, [1, 0, 0, 2])
+    ph.set_prefix_hook(Peeking(fail=True))
+    assert ph.peek_model_home("r", [1, 2], 2) is None

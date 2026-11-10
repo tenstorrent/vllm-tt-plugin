@@ -3,6 +3,7 @@
 
 import os
 import sys
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -33,7 +34,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.prefill_rows import prefill_row_capacity
-from vllm_tt_plugin.prefix_hooks import cancel_model_hit, plan_model_hit
+from vllm_tt_plugin.prefix_hooks import cancel_model_hit, peek_model_home, plan_model_hit
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 
 if TYPE_CHECKING:
@@ -947,10 +948,14 @@ class TTScheduler(AsyncScheduler):
         if saved_active is not None:
             self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
         held_back: list = []
+        held_home: list = []
         try:
             held_back = self._hold_back_partial_prefills(partial_prefills)
+            held_home = self._hold_for_home_row()
             result = super().schedule()
         finally:
+            if held_home:  # (back in front of what is left of the queue, in their FIFO order)
+                self.waiting.prepend_requests(reversed(held_home))  # (extendleft reverses)
             if saved_budget is not None:
                 self.max_num_scheduled_tokens = saved_budget
             for request in held_back:
@@ -960,6 +965,104 @@ class TTScheduler(AsyncScheduler):
             if saved_active is not None:
                 self.max_num_active_reqs = saved_active
         return result
+
+    def _home_row_hold_params(self):
+        """-> (T seconds max hold, H_min tokens, cost factor, cold prefill tokens/s) or None when the hold is off. Env ``DSV41_HOME_ROW_HOLD_S`` (0 / unset = off); the live switch file
+        ``DSV41_HOME_ROW_HOLD_FILE`` (content "0" = off, "1" = on, anything else / missing = the env decides) lets one boot A/B it."""
+        t = float(os.environ.get("DSV41_HOME_ROW_HOLD_S", "0") or 0)
+        f = os.environ.get("DSV41_HOME_ROW_HOLD_FILE")
+        if f:
+            try:
+                with open(f) as fh:
+                    v = fh.read().strip()
+                if v == "0":
+                    return None
+            except OSError:
+                pass
+        if t <= 0:
+            return None
+        return (
+            t,
+            int(os.environ.get("DSV41_HOME_ROW_HOLD_MIN", "32768")),
+            float(os.environ.get("DSV41_HOME_ROW_HOLD_FACTOR", "0.4")),
+            max(float(os.environ.get("DSV41_HOME_ROW_HOLD_RATE", "2000")), 1.0),
+        )
+
+    def _hold_for_home_row(self, now: float | None = None) -> list[Request]:
+        """Bounded hold of a request whose resident prefix sits on a mesh row with no free user (busy-row loss, DSV41 paged APC).
+
+        Without it the model plans such a request cold on a row that has a free user and recomputes the whole prefix (a 300k-700k conversation turn: minutes of prefill instead of seconds).
+        A waiting request that has not started (``num_computed_tokens == 0``) is taken out of the queue for this step while the model says (``peek_model_home``, read-only) that it holds
+        ``>= H_min`` tokens of the prompt on a row with no free user. The hold is bounded by ``min(T, factor * hit / rate)`` seconds from the first time the request was seen (the cold prefill the
+        hit saves, at ``rate`` tokens/s, discounted by ``factor``), after which it is admitted cold as today and never held again (no starvation); it ends early when the home row has a free user
+        (the request is then planned on it) or the prefix is gone. Other requests are not delayed by it. -> the held requests in FIFO order (the caller puts them back in front of the queue).
+        Off (default): nothing is read, nothing changes."""
+        params = self._home_row_hold_params()
+        if params is None or not self.waiting:
+            return []
+        t_max, h_min, factor, rate = params
+        now = time.monotonic() if now is None else now
+        state = getattr(self, "_home_hold", None)
+        if state is None:
+            state = self._home_hold = {}  # request id -> [first seen, "done" once the bound is over, held at least once, time of the last peek, its answer]
+        waiting = []
+        while self.waiting:
+            waiting.append(self.waiting.pop_request())
+        held: list[Request] = []
+        taken: dict[int, int] = {}  # home row -> free users that earlier requests of this step will reserve
+        keep = create_request_queue(self.policy)
+        live = {r.request_id for r in waiting}
+        for rid in [k for k in state if k not in live]:
+            del state[rid]
+        for request in waiting:
+            hold = False
+            if request.num_computed_tokens == 0:
+                st = state.setdefault(request.request_id, [now, None, False, None, None])
+                if st[1] != "done":
+                    if st[3] is not None and now - st[3] < 0.25 and not getattr(self, "finished_req_ids", None):
+                        info = st[4]  # (the peek hashes the whole prompt: not on every spin of an otherwise idle loop)
+                    else:
+                        token_ids = getattr(request, "all_token_ids", None)
+                        info = peek_model_home(
+                            request.request_id,
+                            token_ids if token_ids is not None else request.prompt_token_ids,
+                            request.num_tokens,
+                            finished_ids=getattr(self, "finished_req_ids", None),
+                            touch=True,
+                        )
+                        st[3], st[4] = now, info
+                    if info is not None:
+                        hit, home, free = int(info[0]), int(info[1]), list(info[2])
+                        # a free user of the home row that a request ahead in the queue is about to reserve (it hits there too) is not free for this one: planning goes in queue order within the step
+                        avail = free[home] - taken.get(home, 0) if 0 <= home < len(free) else 0
+                        if hit >= h_min and 0 <= home < len(free) and avail <= 0:
+                            limit = min(t_max, factor * hit / rate)
+                            if now - st[0] < limit:
+                                hold = True
+                                if not st[2]:
+                                    st[2] = True
+                                    logger.info(
+                                        "TT scheduler: hold %s for its home row %d (resident hit %d of %d tokens, free users per row %s, up to %.1f s)",
+                                        request.request_id, home, hit, request.num_tokens, free, limit,
+                                    )
+                            else:
+                                st[1] = "done"  # the bound is over: cold from now on
+                                logger.info(
+                                    "TT scheduler: hold of %s over after %.1f s (home row %d, hit %d): admitted cold",
+                                    request.request_id, now - st[0], home, hit,
+                                )
+                        else:
+                            if hit > 0 and avail > 0:
+                                taken[home] = taken.get(home, 0) + 1
+                        if st[2] and not hold and st[1] != "done":
+                            st[1] = "done"
+                            logger.info("TT scheduler: hold of %s ends after %.1f s (home row has a free user or the prefix is gone)", request.request_id, now - st[0])
+            if hold:
+                held.append(request)
+            else:
+                keep.add_request(request)
+        self.waiting = keep
+        return held
 
     def _get_local_prefix_cache_hit(self, request: Request):
         """vLLM's prefix-cache hit, rounded down to what the model can resume from (``prefix_cache_hit_policy``).
