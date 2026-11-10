@@ -33,7 +33,7 @@ def _sched(waiting):
 def _peeker(monkeypatch, answers):
     calls = []
 
-    def peek(rid, tokens, n, finished_ids=None):
+    def peek(rid, tokens, n, finished_ids=None, touch=False):
         calls.append(rid)
         return answers.get(rid)
 

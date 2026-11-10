@@ -72,16 +72,18 @@ def cancel_model_hit(request_ids) -> None:
             logger.exception("model prefix hook cancel failed for %s", rid)
 
 
-def peek_model_home(request_id, prompt_token_ids, num_tokens: int, finished_ids=None):
+def peek_model_home(request_id, prompt_token_ids, num_tokens: int, finished_ids=None, touch: bool = False):
     """Read-only look at where the model holds this request's prefix: ``(resident_hit_tokens, home_row, free_users_per_row)`` or None (no hook, a hook without ``peek_home``, a failure).
 
-    Nothing is pinned, reserved or counted (``plan_hit`` does that). Used by the bounded home-row hold of the scheduler (``DSV41_HOME_ROW_HOLD_S``)."""
+    Nothing is pinned, reserved or counted (``plan_hit`` does that); ``touch`` refreshes the LRU position of the resume point so a held request does not lose it to eviction. Used by the bounded home-row hold of the scheduler (``DSV41_HOME_ROW_HOLD_S``)."""
     hook = get_prefix_hook()
     peek = getattr(hook, "peek_home", None)
     if peek is None or num_tokens <= 0:
         return None
     try:
         extra = {"finished_ids": list(finished_ids)} if finished_ids else {}
+        if touch:
+            extra["touch"] = True
         return peek(request_id, prompt_token_ids, int(num_tokens), **extra)
     except Exception:  # noqa: BLE001
         logger.exception("model prefix hook peek_home failed for %s", request_id)

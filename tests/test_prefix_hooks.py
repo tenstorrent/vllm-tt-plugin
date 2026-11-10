@@ -102,7 +102,7 @@ def test_peek_model_home_is_none_without_hook_or_peek_and_survives_a_failing_hoo
     assert ph.peek_model_home("r", [1, 2], 2) is None
 
     class Peeking(Hook):
-        def peek_home(self, request_id, tokens, num_tokens, finished_ids=()):
+        def peek_home(self, request_id, tokens, num_tokens, finished_ids=(), touch=False):
             if self.fail:
                 raise RuntimeError("boom")
             return 4096, 2, [1, 0, 0, 2]

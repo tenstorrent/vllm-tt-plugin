@@ -1027,6 +1027,7 @@ class TTScheduler(AsyncScheduler):
                             token_ids if token_ids is not None else request.prompt_token_ids,
                             request.num_tokens,
                             finished_ids=getattr(self, "finished_req_ids", None),
+                            touch=True,
                         )
                         st[3], st[4] = now, info
                     if info is not None:
