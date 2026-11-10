@@ -152,3 +152,16 @@ def test_switch_file_turns_it_off_live(monkeypatch, tmp_path):
     assert _step(_sched([_req("a")]), 0.0)[0] == ["a"]
     f.unlink()  # missing file: the env decides
     assert _step(_sched([_req("a")]), 0.0)[0] == ["a"]
+
+
+def test_a_free_user_an_earlier_request_will_reserve_is_not_free_for_the_next(monkeypatch):
+    monkeypatch.setenv("DSV41_HOME_ROW_HOLD_S", "100")
+    one_free = [0, 0, 1, 0]
+    _peeker(monkeypatch, {"small": (8192, 2, one_free), "giant": (300000, 2, one_free)})
+    # queue order: the small one reserves the only free user of row 2 first -> the giant is held
+    assert _step(_sched([_req("small", 9000), _req("giant")]), 0.0) == (["giant"], ["small"])
+    # alone, the giant finds the user free and is planned on its home row
+    assert _step(_sched([_req("giant")]), 0.0) == ([], ["giant"])
+    # a request ahead without any hit takes nothing
+    _peeker(monkeypatch, {"cold": (0, -1, one_free), "giant": (300000, 2, one_free)})
+    assert _step(_sched([_req("cold"), _req("giant")]), 0.0) == ([], ["cold", "giant"])

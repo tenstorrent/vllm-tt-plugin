@@ -1009,6 +1009,7 @@ class TTScheduler(AsyncScheduler):
         while self.waiting:
             waiting.append(self.waiting.pop_request())
         held: list[Request] = []
+        taken: dict[int, int] = {}  # home row -> free users that earlier requests of this step will reserve
         keep = create_request_queue(self.policy)
         live = {r.request_id for r in waiting}
         for rid in [k for k in state if k not in live]:
@@ -1032,7 +1033,9 @@ class TTScheduler(AsyncScheduler):
                         st[3], st[4] = now, info
                     if info is not None:
                         hit, home, free = int(info[0]), int(info[1]), list(info[2])
-                        if hit >= h_min and 0 <= home < len(free) and free[home] == 0:
+                        # a free user of the home row that a request ahead in the queue is about to reserve (it hits there too) is not free for this one: planning goes in queue order within the step
+                        avail = free[home] - taken.get(home, 0) if 0 <= home < len(free) else 0
+                        if hit >= h_min and 0 <= home < len(free) and avail <= 0:
                             limit = min(t_max, factor * hit / rate)
                             if now - st[0] < limit:
                                 hold = True
@@ -1048,7 +1051,10 @@ class TTScheduler(AsyncScheduler):
                                     "TT scheduler: hold of %s over after %.1f s (home row %d, hit %d): admitted cold",
                                     request.request_id, now - st[0], home, hit,
                                 )
-                        elif st[2]:
+                        else:
+                            if hit > 0 and avail > 0:
+                                taken[home] = taken.get(home, 0) + 1
+                        if st[2] and not hold and st[1] != "done":
                             st[1] = "done"
                             logger.info("TT scheduler: hold of %s ends after %.1f s (home row has a free user or the prefix is gone)", request.request_id, now - st[0])
             if hold:
