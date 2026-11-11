@@ -36,7 +36,6 @@ def test_compact_bad_words_preserves_retained_output_history(resumed, output_mod
         max_num_batched_tokens=MAX_MODEL_LEN * 8,
         vocab_size=vocab,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(8, with_custom=False),
     )
     target = _make_req("target", [1, 2], [7], {"temperature": 1.0}, seed=42)

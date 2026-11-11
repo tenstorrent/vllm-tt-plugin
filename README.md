@@ -28,7 +28,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.31.0)
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.32.0)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
@@ -48,10 +48,11 @@ If testing a specific model, check the
 [TT-Metal LLMs table](https://github.com/tenstorrent/tt-metal?tab=readme-ov-file#llms)
 for the appropriate tt-metal and vLLM commits.
 
-vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
-Ubuntu 22.04.
+The plugin requires Python `>=3.11,<3.14`; vLLM 0.32.0 requires 3.11 or newer.
+tt-metal's Ubuntu 24.04 environment (Python 3.12) qualifies. The Ubuntu 22.04
+default `python3` (3.10) does not.
 
-The installation script builds vLLM `0.31.0` from source with
+The installation script builds vLLM `0.32.0` from source with
 `VLLM_TARGET_DEVICE=empty`.
 
 To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),

@@ -121,7 +121,6 @@ def _lane_batch(per_lane: int = SLOT_ROWS) -> TTLaneInputBatch:
         max_num_batched_tokens=MAX_MODEL_LEN * per_lane,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
     )
 
 

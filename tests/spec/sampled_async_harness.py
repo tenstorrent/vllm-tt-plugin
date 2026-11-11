@@ -77,7 +77,6 @@ def _rebuild_batch(runner) -> None:
         max_num_batched_tokens=async_harness.MAX_MODEL_LEN,
         vocab_size=SAMPLED_VOCAB_SIZE,
         block_sizes=[async_harness.BLOCK_SIZE],
-        kernel_block_sizes=[async_harness.BLOCK_SIZE],
     )
 
 
