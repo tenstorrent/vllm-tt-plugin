@@ -160,12 +160,12 @@ def _submit(controller, *, spec_mode=None, layout_changed=False):
     )
 
 
-def _cached_reqs(req_ids, *, context_phase=(), resumed=()):
+def _cached_reqs(req_ids, *, context_phase=()):
     req_ids = list(req_ids)
     context_phase = set(context_phase)
     return CachedRequestData(
         req_ids=req_ids,
-        resumed_req_ids=set(resumed),
+        resumed_req_ids=set(),
         new_token_ids=[[] for _ in req_ids],
         all_token_ids={},
         new_block_ids=[None for _ in req_ids],
@@ -882,12 +882,14 @@ def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
     controller._previous_device_sampling = True
 
     def output(ids, *, context=(), resumed=(), scheduled_counts=None):
+        # The V2 scheduler output delivers a resume as a new request.
         ids = list(ids)
         return SimpleNamespace(
             num_scheduled_tokens=scheduled_counts or {req_id: 1 for req_id in ids},
-            scheduled_new_reqs=[],
+            scheduled_new_reqs=[SimpleNamespace(req_id=req_id) for req_id in resumed],
             scheduled_cached_reqs=_cached_reqs(
-                ids, context_phase=context, resumed=resumed
+                [req_id for req_id in ids if req_id not in resumed],
+                context_phase=context,
             ),
             pending_structured_output_tokens=False,
         )
@@ -1131,8 +1133,12 @@ def test_ordinary_preemption_or_resume_keeps_inflight_token(lifecycle):
     scheduler_output = SimpleNamespace(
         finished_req_ids=set(),
         preempted_req_ids={"request"} if lifecycle == "preempted" else set(),
+        # The V2 scheduler output delivers a resume as a new request.
+        scheduled_new_reqs=(
+            [SimpleNamespace(req_id="request")] if lifecycle == "resumed" else []
+        ),
         scheduled_cached_reqs=_cached_reqs(
-            ["request"], resumed=["request"] if lifecycle == "resumed" else []
+            [] if lifecycle == "resumed" else ["request"]
         ),
     )
 
@@ -1149,7 +1155,8 @@ def test_only_finished_result_ids_are_suppressed_from_scheduler_output():
     scheduler_output = SimpleNamespace(
         finished_req_ids={"finished"},
         preempted_req_ids={"preempted"},
-        scheduled_cached_reqs=_cached_reqs(["resumed"], resumed=["resumed"]),
+        scheduled_new_reqs=[SimpleNamespace(req_id="resumed")],
+        scheduled_cached_reqs=_cached_reqs([]),
     )
 
     assert TTAsyncDecodeController.suppressed_output_req_ids(scheduler_output) == {

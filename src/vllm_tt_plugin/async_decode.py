@@ -547,7 +547,7 @@ class TTAsyncDecodeController:
         are ambiguous for a one-token final chunk and speculative decode.
         """
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
+        if scheduler_output.scheduled_new_reqs:
             return True
         return any(
             cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids
@@ -605,10 +605,7 @@ class TTAsyncDecodeController:
     ) -> bool:
         runner = self.runner
         input_batch = runner.input_batch
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        legacy_prompt = bool(
-            scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids
-        )
+        legacy_prompt = bool(scheduler_output.scheduled_new_reqs)
         if legacy_prompt or runner._decode_layout_changed_since_last_decode:
             return False
         if self.decode_input_update_contract_version() >= 1:

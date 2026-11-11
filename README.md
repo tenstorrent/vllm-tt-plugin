@@ -844,8 +844,8 @@ clear error before anything reaches the device:
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.
 - Multi-host MPI data parallelism is not supported.
-- vLLM's V2 model runner. The plugin implements only the V1 model-runner
-  contract and pins `VLLM_USE_V2_MODEL_RUNNER=0`; setting it to `1` is refused.
+- vLLM's V1 model runner. The plugin implements only the V2 model-runner
+  contract and pins `VLLM_USE_V2_MODEL_RUNNER=1`; any other value is refused.
 
 These are TT runtime characteristics, not vLLM plugin API limitations.
 

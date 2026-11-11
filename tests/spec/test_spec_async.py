@@ -455,15 +455,17 @@ def _runner(model: DeferredVerifyTarget) -> SimpleNamespace:
 def _new_request(
     req_id: str, first_token: int, temperature: float = 0.0
 ) -> NewRequestData:
+    prompt = list(range(first_token, first_token + PROMPT_LEN))
     return NewRequestData(
         req_id=req_id,
-        prompt_token_ids=list(range(first_token, first_token + PROMPT_LEN)),
+        prompt_token_ids=prompt,
         mm_features=[],
         sampling_params=SamplingParams(temperature=temperature),
         pooling_params=None,
         block_ids=([0],),
         num_computed_tokens=PROMPT_LEN,
         lora_request=None,
+        prefill_token_ids=list(prompt),
     )
 
 
@@ -491,19 +493,16 @@ def _scheduler_output(
     drafts=None,
 ) -> SchedulerOutput:
     output = SchedulerOutput.make_empty()
-    output.scheduled_new_reqs = [_new_request(*spec) for spec in new]
-    scheduled = [spec[0] for spec in new] + list(decoding)
+    output.scheduled_new_reqs = [_new_request(*spec) for spec in new] + [
+        _resume_record(runner, req_id) for req_id in resumed
+    ]
+    scheduled = [spec[0] for spec in new] + list(resumed) + list(decoding)
     output.scheduled_cached_reqs = CachedRequestData(
         req_ids=list(decoding),
-        resumed_req_ids=set(resumed),
+        resumed_req_ids=set(),
         new_token_ids=[[] for _ in decoding],
         all_token_ids={},
-        # A resumed request carries fresh blocks, which
-        # ``apply_cached_req_state_update`` requires of a resume: the scheduler
-        # freed the request's blocks when it preempted it.
-        new_block_ids=[
-            ([1],) if req_id in set(resumed) else None for req_id in decoding
-        ],
+        new_block_ids=[None for _ in decoding],
         num_computed_tokens=[_computed_tokens(runner, req_id) for req_id in decoding],
         num_output_tokens=[
             len(runner.requests[req_id].output_token_ids) for req_id in decoding
@@ -515,6 +514,24 @@ def _scheduler_output(
     output.preempted_req_ids = set(preempted)
     output.scheduled_spec_decode_tokens = dict(drafts or {})
     return output
+
+
+def _resume_record(runner, req_id: str) -> NewRequestData:
+    """A resume as vLLM's V2 scheduler output delivers it: a new request with
+    fresh blocks, whose ``prefill_token_ids`` holds the prompt and every token
+    the request generated before the preemption."""
+    state = runner.requests[req_id]
+    return NewRequestData(
+        req_id=req_id,
+        prompt_token_ids=list(state.prompt_token_ids),
+        mm_features=[],
+        sampling_params=state.sampling_params,
+        pooling_params=None,
+        block_ids=([1],),
+        num_computed_tokens=_computed_tokens(runner, req_id),
+        lora_request=None,
+        prefill_token_ids=[*state.prompt_token_ids, *state.output_token_ids],
+    )
 
 
 def _admit(runner, *specs) -> None:
@@ -1115,7 +1132,7 @@ def test_a_late_result_does_not_revive_a_preempted_candidate_state():
 
     # The resume: fresh blocks, and the row comes back. It speculates again,
     # from the history the preemption kept.
-    runner._update_states(_scheduler_output(runner, decoding=["a"], resumed=["a"]))
+    runner._update_states(_scheduler_output(runner, resumed=["a"]))
     assert "a" in runner.input_batch.req_id_to_index
 
     next_expected = continuation(*_tail(runner, "a"), DRAFT_LEN + 1)

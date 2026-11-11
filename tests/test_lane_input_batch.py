@@ -207,19 +207,17 @@ def _new_req(req_id, prompt):
         block_ids=([0],),
         lora_request=None,
         prompt_embeds=None,
-        prefill_token_ids=None,
+        prefill_token_ids=list(prompt),
     )
 
 
-def _step_output(new_reqs=(), finished=(), plan_rows=None, preempted=None, cached=None):
+def _step_output(new_reqs=(), finished=(), plan_rows=None, preempted=None):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     out = SchedulerOutput.make_empty()
     out.scheduled_new_reqs = list(new_reqs)
     out.finished_req_ids = set(finished)
     out.preempted_req_ids = None if preempted is None else set(preempted)
-    if cached is not None:
-        out.scheduled_cached_reqs = cached
     return out
 
 
@@ -510,8 +508,6 @@ def test_sparse_two_lane_grammar_uses_submitted_row_snapshot():
 
 
 def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
-    from vllm.v1.core.sched.output import CachedRequestData
-
     b = _lane_batch(num_lanes=1, per_lane=2)
     requests: dict = {}
     b.apply_step_plan(
@@ -546,19 +542,14 @@ def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
     )
     assert b.req_id_to_index == {"c": 0, "b": 1}
 
-    # "c" finishes, and "a" resumes into the row it left: the resume re-prefills
-    # from the state kept above, so it never has to look the request up again.
-    resumed = CachedRequestData(
-        req_ids=["a"],
-        resumed_req_ids={"a"},
-        new_token_ids=[[]],
-        all_token_ids={"a": [1]},
-        new_block_ids=[([7],)],
-        num_computed_tokens=[0],
-        num_output_tokens=[0],
-    )
+    # "c" finishes, and "a" resumes into the row it left. The V2 scheduler output
+    # delivers the resume as a new request with fresh blocks; the state kept
+    # above is what ``build_cached_request_state`` reads as the held state.
+    resumed = _new_req("a", [1])
+    resumed.block_ids = ([7],)
+    resumed.num_computed_tokens = 0
     b.apply_step_plan(
-        _step_output(finished=["c"], cached=resumed),
+        _step_output(finished=["c"], new_reqs=[resumed]),
         _plan({"a": 0}, capacity=2),
         requests,
         {},

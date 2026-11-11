@@ -122,6 +122,7 @@ def _new_request(req_id: str, stage_inputs=None) -> NewRequestData:
         block_ids=([0],),
         num_computed_tokens=0,
         lora_request=None,
+        prefill_token_ids=[1] * PROMPT_LEN,
     )
     if stage_inputs is not None:
         data.additional_information = stage_inputs
@@ -140,23 +141,10 @@ def _empty_cached() -> CachedRequestData:
     )
 
 
-def _resumed(req_id: str) -> CachedRequestData:
-    """A preempted request coming back: fresh blocks, KV to rebuild from 0."""
-    return CachedRequestData(
-        req_ids=[req_id],
-        resumed_req_ids={req_id},
-        new_token_ids=[[]],
-        all_token_ids={},
-        new_block_ids=[([1],)],
-        num_computed_tokens=[0],
-        num_output_tokens=[0],
-    )
-
-
-def _step(*, new=(), cached=None, scheduled=None, finished=(), preempted=()):
+def _step(*, new=(), scheduled=None, finished=(), preempted=()):
     output = SchedulerOutput.make_empty()
     output.scheduled_new_reqs = list(new)
-    output.scheduled_cached_reqs = cached if cached is not None else _empty_cached()
+    output.scheduled_cached_reqs = _empty_cached()
     output.num_scheduled_tokens = dict(scheduled or {})
     output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
     output.finished_req_ids = set(finished)
@@ -195,8 +183,9 @@ def test_stage_inputs_follow_the_request_until_it_finishes():
     assert runner.model.released == [slot], "the model released the request's state"
     assert runner.requests["a"].stage_inputs is payload
 
+    # vLLM's V2 scheduler output delivers the resume as a new request.
     kwargs = _run_prefill(
-        runner, _step(cached=_resumed("a"), scheduled={"a": PROMPT_LEN})
+        runner, _step(new=[_new_request("a")], scheduled={"a": PROMPT_LEN})
     )
     assert kwargs["stage_inputs"] == [payload], "the resumed prefill gets it again"
     assert kwargs["stage_inputs"][0] is payload

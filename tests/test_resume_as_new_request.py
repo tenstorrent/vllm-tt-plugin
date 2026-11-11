@@ -2,27 +2,26 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """A request delivered in ``scheduled_new_reqs`` replaces what the runner holds.
 
-vLLM's V1 scheduler output reports a request resumed after preemption in
-``scheduled_cached_reqs`` with ``resumed_req_ids``, and the runner keeps the
-request's ``CachedRequestState``, generated tokens included. The V2 scheduler
-output delivers the same resume in ``scheduled_new_reqs``, and the generated
-tokens appear only in ``NewRequestData.prefill_token_ids``. A request can also
-come back as new while it still holds a persistent-batch row: a resumable
-streaming-input request with its next input chunk, or a V2 resume in the step
-that reports its preemption.
+vLLM's V2 scheduler output delivers a request resumed after preemption in
+``scheduled_new_reqs``, and its generated tokens appear only in
+``NewRequestData.prefill_token_ids``. The runner rebuilds the request's state
+from that record, keeping from the held state only what the record cannot carry.
+A request can also come back as new while it still holds a persistent-batch row:
+a resumable streaming-input request with its next input chunk, or a resume in
+the step that reports its preemption.
 
 These tests drive the front-packed ``TTModelRunner._update_states`` and the
-lane-DP ``TTLaneInputBatch.apply_step_plan`` through both output shapes.
+lane-DP ``TTLaneInputBatch.apply_step_plan``.
 """
 
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
+from vllm.v1.core.sched.output import NewRequestData
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from tests.test_lane_input_batch import _lane_batch, _plan, _step_output
-from tests.test_stage_inputs import _resumed, _run_prefill, _runner, _step
+from tests.test_stage_inputs import _run_prefill, _runner, _step
 from vllm_tt_plugin.input_batch import build_cached_request_state
 
 PROMPT = [11, 12, 13, 14]
@@ -35,13 +34,12 @@ def _record(
     req_id,
     prompt,
     *,
-    generated=None,
+    generated=(),
     num_computed_tokens=0,
     block_ids=([0],),
     seed=None,
 ) -> NewRequestData:
-    """A ``scheduled_new_reqs`` entry. ``generated=None`` is the V1 shape, which
-    leaves ``prefill_token_ids`` unset; a list is the V2 shape."""
+    """A ``scheduled_new_reqs`` entry; ``generated`` is a resume's history."""
     sampling_params = (
         SamplingParams(temperature=0.0)
         if seed is None
@@ -56,7 +54,7 @@ def _record(
         block_ids=block_ids,
         num_computed_tokens=num_computed_tokens,
         lora_request=None,
-        prefill_token_ids=(None if generated is None else [*prompt, *generated]),
+        prefill_token_ids=[*prompt, *generated],
     )
 
 
@@ -69,7 +67,7 @@ def _rows_holding(batch, req_id) -> list[int]:
 # --------------------------------------------------------------------------
 
 
-def test_the_v1_shape_starts_with_no_generated_tokens():
+def test_a_new_request_starts_with_no_generated_tokens():
     state = build_cached_request_state(
         _record("a", PROMPT), supports_stage_inputs=False
     )
@@ -77,7 +75,7 @@ def test_the_v1_shape_starts_with_no_generated_tokens():
     assert state.num_tokens == len(PROMPT)
 
 
-def test_the_v2_shape_seeds_the_generated_tokens_from_prefill_token_ids():
+def test_a_resume_seeds_the_generated_tokens_from_prefill_token_ids():
     state = build_cached_request_state(
         _record("a", PROMPT, generated=GENERATED), supports_stage_inputs=False
     )
@@ -96,11 +94,15 @@ def test_the_generated_tokens_are_copied_out_of_the_schedulers_list():
     assert state.output_token_ids == GENERATED
 
 
-def test_prefill_token_ids_shorter_than_the_prompt_is_refused():
-    record = _record("a", PROMPT, generated=[])
-    record.prefill_token_ids = PROMPT[:2]
+@pytest.mark.parametrize("prefill_token_ids", [None, PROMPT[:2]])
+def test_a_record_without_its_prompt_in_prefill_token_ids_is_refused(
+    prefill_token_ids,
+):
+    """``None`` is what the V1 scheduler output sends."""
+    record = _record("a", PROMPT)
+    record.prefill_token_ids = prefill_token_ids
 
-    with pytest.raises(ValueError, match="holds 2 tokens, fewer than its 4 prompt"):
+    with pytest.raises(ValueError, match="expected at least its 4 prompt tokens"):
         build_cached_request_state(record, supports_stage_inputs=False)
 
 
@@ -176,19 +178,16 @@ def _preempted_runner():
     return runner, advanced
 
 
-def _resume_step(shape, num_scheduled):
-    if shape == "v1":
-        return _step(cached=_resumed("a"), scheduled={"a": num_scheduled})
+def _resume_step(num_scheduled):
     return _step(
         new=[_record("a", PROMPT, generated=GENERATED, block_ids=([1],), seed=SEED)],
         scheduled={"a": num_scheduled},
     )
 
 
-@pytest.mark.parametrize("shape", ["v1", "v2"])
-def test_a_resume_replays_the_prompt_and_the_generated_tokens(shape):
+def test_a_resume_replays_the_prompt_and_the_generated_tokens():
     runner, _ = _preempted_runner()
-    step = _resume_step(shape, len(HISTORY))
+    step = _resume_step(len(HISTORY))
 
     runner._update_states(step)
     model_input = runner._prepare_model_inputs(step, None)
@@ -203,13 +202,12 @@ def test_a_resume_replays_the_prompt_and_the_generated_tokens(shape):
     assert model_input.intermediate_prefill_mask.tolist() == [False]
 
 
-@pytest.mark.parametrize("shape", ["v1", "v2"])
-def test_a_resume_replayed_in_chunks_samples_only_after_the_last(shape):
+def test_a_resume_replayed_in_chunks_samples_only_after_the_last():
     """Every chunk but the last stops short of ``num_tokens``, so it samples
     nothing. With the generated tokens missing, the first chunk would already
     reach ``num_tokens`` and sample against a partial replay."""
     runner, _ = _preempted_runner()
-    first = _resume_step(shape, 5)
+    first = _resume_step(5)
 
     runner._update_states(first)
     model_input = runner._prepare_model_inputs(first, None)
@@ -218,13 +216,12 @@ def test_a_resume_replayed_in_chunks_samples_only_after_the_last(shape):
     assert model_input.intermediate_prefill_mask.tolist() == [True]
 
 
-@pytest.mark.parametrize("shape", ["v1", "v2"])
-def test_a_seeded_resume_samples_on_from_its_advanced_generator(shape):
+def test_a_seeded_resume_samples_on_from_its_advanced_generator():
     """Host sampling draws from the row's generator. A resume that restarted it
     from the seed would repeat the draws of the tokens already generated."""
     runner, advanced = _preempted_runner()
 
-    runner._update_states(_resume_step(shape, len(HISTORY)))
+    runner._update_states(_resume_step(len(HISTORY)))
 
     batch = runner.input_batch
     generator = batch.sampling.generators[batch.req_id_to_index["a"]]
@@ -255,7 +252,7 @@ def test_a_request_scheduled_as_new_while_holding_a_row_is_rebuilt_in_that_row()
 
 
 def test_a_resume_in_the_step_that_reports_the_preemption_holds_one_row():
-    """V2 shape: "a" is in ``preempted_req_ids`` and in ``scheduled_new_reqs`` of
+    """Request "a" is in ``preempted_req_ids`` and in ``scheduled_new_reqs`` of
     one step, as after ``reset_prefix_cache(reset_running_requests=True)``. The
     model hears of the preemption once, and "a" ends on one row with its full
     history."""
@@ -285,51 +282,12 @@ def test_a_resume_in_the_step_that_reports_the_preemption_holds_one_row():
     assert batch.token_ids_cpu[row, : len(HISTORY)].tolist() == HISTORY
 
 
-def test_a_v1_resume_in_the_step_that_reports_the_preemption_uses_its_new_blocks():
-    """The V1 shape of the same event: "a" is in ``preempted_req_ids`` and in
-    ``resumed_req_ids``, with all-new blocks, while it still holds its row. The
-    row's block table must list only the new blocks; the preemption freed the
-    old ones."""
-    runner = _runner(supports_stage_inputs=False)
-    _run_prefill(
-        runner,
-        _step(
-            new=[_record("a", PROMPT, block_ids=([3],)), _record("b", [5, 6])],
-            scheduled={"a": len(PROMPT), "b": 2},
-        ),
-    )
-    runner.requests["a"].output_token_ids.extend(GENERATED)
-    resume = _step(
-        cached=CachedRequestData(
-            req_ids=["a"],
-            resumed_req_ids={"a"},
-            new_token_ids=[[]],
-            all_token_ids={},
-            new_block_ids=[([5],)],
-            num_computed_tokens=[0],
-            num_output_tokens=[0],
-        ),
-        scheduled={"a": len(HISTORY), "b": 1},
-        preempted={"a"},
-    )
-
-    runner._update_states(resume)
-
-    batch = runner.input_batch
-    row = batch.req_id_to_index["a"]
-    assert _rows_holding(batch, "a") == [row]
-    assert runner.requests["a"].block_ids == ([5],)
-    (table,) = batch.block_tables_for_rows([row], 2)
-    assert table.tolist() == [[5, 0]], "the row lists the freed block 3"
-
-
 # --------------------------------------------------------------------------
 # Lane-DP: TTLaneInputBatch.apply_step_plan
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("shape", ["v1", "v2"])
-def test_lane_resume_rebuilds_the_same_row_in_either_output_shape(shape):
+def test_lane_resume_rebuilds_the_row_from_its_record_and_held_state():
     b = _lane_batch(num_lanes=1, per_lane=2)
     requests: dict = {}
     b.apply_step_plan(
@@ -347,24 +305,11 @@ def test_lane_resume_rebuilds_the_same_row_in_either_output_shape(shape):
         {},
     )
 
-    if shape == "v1":
-        resume = _step_output(
-            cached=CachedRequestData(
-                req_ids=["a"],
-                resumed_req_ids={"a"},
-                new_token_ids=[[]],
-                all_token_ids={},
-                new_block_ids=[([7],)],
-                num_computed_tokens=[0],
-                num_output_tokens=[0],
-            )
-        )
-    else:
-        resume = _step_output(
-            new_reqs=[
-                _record("a", PROMPT, generated=GENERATED, block_ids=([7],), seed=SEED)
-            ]
-        )
+    resume = _step_output(
+        new_reqs=[
+            _record("a", PROMPT, generated=GENERATED, block_ids=([7],), seed=SEED)
+        ]
+    )
     b.apply_step_plan(resume, _plan({"a": 0}, capacity=2), requests, {})
 
     assert b.req_id_to_index == {"a": 0, "b": 1}

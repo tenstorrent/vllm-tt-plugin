@@ -108,6 +108,10 @@ def _admit(runner, *specs: tuple[str, int, SamplingParams]) -> None:
             block_ids=([0],),
             num_computed_tokens=PROMPT_LEN,
             lora_request=None,
+            prefill_token_ids=[
+                (first_token + index) % SAMPLED_VOCAB_SIZE
+                for index in range(PROMPT_LEN)
+            ],
         )
         for req_id, first_token, params in specs
     ]

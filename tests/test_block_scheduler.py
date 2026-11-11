@@ -1120,7 +1120,14 @@ def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
     assert request.num_output_placeholders == 0
 
     resumed = scheduler.schedule()
-    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
+    assert _resumed_history(resumed, request) == [*request.prompt_token_ids, 7]
+
+
+def _resumed_history(output, request):
+    """The V2 scheduler output delivers a resume as a new request whose
+    ``prefill_token_ids`` holds the prompt and every delivered token."""
+    (record,) = [r for r in output.scheduled_new_reqs if r.req_id == request.request_id]
+    return list(record.prefill_token_ids)
 
 
 def test_preempted_request_waits_for_inflight_output_before_resume():
@@ -1139,7 +1146,7 @@ def test_preempted_request_waits_for_inflight_output_before_resume():
     assert request.num_output_placeholders == 0
 
     resumed = scheduler.schedule()
-    assert request.request_id in resumed.scheduled_cached_reqs.resumed_req_ids
+    assert _resumed_history(resumed, request) == [*request.prompt_token_ids, 7]
     assert request.num_output_placeholders == 1
 
     following = scheduler.update_from_output(resumed, _runner_output(resumed, [8]))
