@@ -4,10 +4,10 @@
 
 import pytest
 import torch
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.sample.topk_topp_sampler import random_sample
 
 
 @pytest.mark.parametrize("seed", [0, 1, 42, 2**60 + 7])
@@ -20,7 +20,6 @@ def test_host_sampling_matches_direct_request_generator(seed, row):
     batch = InputBatch(
         max_num_reqs=8,
         max_model_len=16,
-        max_num_batched_tokens=16,
         vocab_size=128,
         block_sizes=[16],
         kernel_block_sizes=[16],

@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from threading import Lock
 
 import torch
-from vllm.v1.sample.ops.topk_topp_sampler import (
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+from vllm_tt_plugin.sample.sampler import Sampler
+from vllm_tt_plugin.sample.topk_topp_sampler import (
     TopKTopPSampler,
-    apply_top_k_top_p,
     sample_with_exponential_noise,
 )
-from vllm.v1.sample.sampler import Sampler
 
 
 @dataclass
@@ -29,7 +30,6 @@ class _PrefetchedNoise:
 class TTTopKTopPSampler(TopKTopPSampler):
     def __init__(self, logprobs_mode="raw_logprobs", use_fp64_gumbel=False):
         super().__init__(logprobs_mode, use_fp64_gumbel)
-        self.forward = self.forward_native
         self._sampling_pool = None
         self._noise_cache = OrderedDict()
         self._cached_bytes = 0

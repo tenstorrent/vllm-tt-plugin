@@ -31,9 +31,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_tt_plugin.config import (
     resolve_tt_supports_stage_outputs,
@@ -43,6 +41,8 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.logits_processor import build_logitsprocs
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
     _require_kv_for_every_sequence,
@@ -252,7 +252,6 @@ def test_prefill_fallback_releases_finished_runner_state(async_scheduling):
     runner.input_batch = InputBatch(
         max_num_reqs=2,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=64,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],
@@ -453,7 +452,6 @@ def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired)
     batch = InputBatch(
         max_num_reqs=1,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=64,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],
@@ -462,9 +460,6 @@ def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired)
                 speculative_config=None,
                 scheduler_config=SimpleNamespace(max_num_seqs=1),
             ),
-            torch.device("cpu"),
-            is_pin_memory=False,
-            is_pooling_model=False,
         ),
         disable_logprobs=True,
         output_tokens_per_step=CANVAS,

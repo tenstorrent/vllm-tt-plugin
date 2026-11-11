@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.sample.sampler import Sampler
 
 from tests.test_lane_input_batch import (
     BLOCK,
@@ -17,12 +16,10 @@ from tests.test_lane_input_batch import (
     _plan,
     _step_output,
 )
-from tests.test_lane_input_batch import (
-    _disable_pinned_memory as _disable_pinned_memory,
-)
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
+from vllm_tt_plugin.sample.sampler import Sampler
 
 
 @pytest.mark.parametrize("resumed", [False, True])
@@ -33,7 +30,6 @@ def test_compact_bad_words_preserves_retained_output_history(resumed, output_mod
         num_lanes=2,
         per_lane=4,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN * 8,
         vocab_size=vocab,
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],

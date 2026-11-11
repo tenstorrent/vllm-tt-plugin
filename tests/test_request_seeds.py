@@ -5,9 +5,9 @@
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_tt_plugin.input_batch import InputBatch
+from vllm_tt_plugin.request_state import CachedRequestState
 
 
 @pytest.mark.parametrize(
@@ -18,7 +18,6 @@ def test_large_signed_seeds_survive_request_compaction(large_seeds):
     batch = InputBatch(
         max_num_reqs=4,
         max_model_len=16,
-        max_num_batched_tokens=16,
         vocab_size=128,
         block_sizes=[16],
         kernel_block_sizes=[16],

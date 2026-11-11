@@ -25,8 +25,6 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.async_decode import (
@@ -36,6 +34,8 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.input_batch import TTLaneInputBatch
 from vllm_tt_plugin.lane_scheduler import TTStepPlan
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.sampler import Sampler
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -78,7 +78,6 @@ def _lane_runner(
         num_lanes=NUM_LANES,
         per_lane=PER_LANE,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=vocab_size,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],

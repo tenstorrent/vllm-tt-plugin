@@ -16,13 +16,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
-from vllm.v1.sample.ops.bad_words import apply_bad_words
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.bad_words import apply_bad_words
 from vllm_tt_plugin.worker import TTWorker
 
 # region Constants
@@ -47,7 +47,6 @@ def _batch_with_one_request(
     batch = InputBatch(
         max_num_reqs=MAX_NUM_REQS,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],
@@ -510,7 +509,7 @@ def test_block_resume_replay_past_one_canvas_remains_prefill():
 
 
 def test_decode_with_bad_words_carries_the_output_history_without_penalties():
-    """vLLM's bad-words op bans a word's last token only after the rest of it.
+    """The bad-words op bans a word's last token only after the rest of it.
 
     It reads the rest of the word from the output history the host sampler is
     handed, so a decode with bad words carries that history even when no row

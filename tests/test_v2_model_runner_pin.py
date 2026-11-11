@@ -175,7 +175,6 @@ def test_every_other_v2_refusal_still_raises():
 @pytest.mark.parametrize(
     ("path", "value", "option"),
     [
-        ("model_config.logits_processors", ["pkg:P"], "--logits-processors"),
         ("model_config.enable_trace_replay", True, "--enable-trace-replay"),
         ("model_config.return_sampling_mask", True, "--return-sampling-mask"),
         ("watermark_config", object(), "--watermark-config"),
@@ -187,15 +186,13 @@ def test_every_other_v2_refusal_still_raises():
     ],
 )
 def test_options_tt_does_not_implement_under_v2_are_refused(path, value, option):
-    """vLLM refuses trace replay and the sampling mask under V1 only, selects V2
-    for watermarking and HiSparse whatever the pin says, and under V2 loads
-    custom logits processors with an interface TTModelRunner does not build.
+    """vLLM refuses trace replay and the sampling mask under V1 only, and
+    selects V2 for watermarking and HiSparse whatever the pin says.
     TTModelRunner implements none of these, so none may pass."""
     from vllm_tt_plugin.platform import _refuse_unimplemented_v2_features
 
     config = SimpleNamespace(
         model_config=SimpleNamespace(
-            logits_processors=None,
             enable_trace_replay=False,
             return_sampling_mask=False,
         ),
@@ -211,28 +208,6 @@ def test_options_tt_does_not_implement_under_v2_are_refused(path, value, option)
     setattr(target, name, value)
     with pytest.raises(ValueError, match=f"^{option} not supported on TT"):
         _refuse_unimplemented_v2_features(config)
-
-
-def test_a_tt_engine_config_refuses_custom_logits_processors():
-    """The refusal runs in ``TTPlatform.check_and_update_config``, inside
-    ``VllmConfig.__post_init__``."""
-    from vllm.config import ModelConfig, VllmConfig
-
-    from tests.test_block_scheduler import LOCAL_MODEL_CONFIG, _stub_model_resolution
-    from tests.test_lane_input_batch import FirstPromptTokenBoost
-
-    model_config = ModelConfig(
-        model=str(LOCAL_MODEL_CONFIG),
-        dtype="float16",
-        seed=42,
-        skip_tokenizer_init=True,
-        logits_processors=[FirstPromptTokenBoost],
-    )
-    with (
-        _stub_model_resolution(),
-        pytest.raises(ValueError, match="--logits-processors not supported on TT"),
-    ):
-        VllmConfig(model_config=model_config)
 
 
 @pytest.mark.parametrize(

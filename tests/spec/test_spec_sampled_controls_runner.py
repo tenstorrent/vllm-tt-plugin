@@ -31,13 +31,15 @@ import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.outputs import LogprobsTensors
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
+from vllm_tt_plugin.sample.logits_processor import (
+    LogitsProcessors,
+    MinTokensLogitsProcessor,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -136,13 +138,10 @@ def _with_min_tokens(runner) -> None:
     runner.input_batch = InputBatch(
         max_num_reqs=sync_harness.MAX_NUM_REQS,
         max_model_len=sync_harness.MAX_MODEL_LEN,
-        max_num_batched_tokens=sync_harness.MAX_MODEL_LEN,
         vocab_size=SAMPLED_VOCAB_SIZE,
         block_sizes=[sync_harness.BLOCK_SIZE],
         kernel_block_sizes=[sync_harness.BLOCK_SIZE],
-        logitsprocs=LogitsProcessors(
-            [MinTokensLogitsProcessor(None, torch.device("cpu"), False)]
-        ),
+        logitsprocs=LogitsProcessors([MinTokensLogitsProcessor()]),
     )
 
 
@@ -464,7 +463,7 @@ def test_drafted_commits_report_the_target_s_own_logprobs():
 def test_a_multi_token_bad_word_is_applied_on_an_ordinary_decode():
     """The ordinary host sampler needs the output history to match a word.
 
-    vLLM's bad-words op bans a word's last token only after the rest of it,
+    The bad-words op bans a word's last token only after the rest of it,
     and reads that from the output history it is handed. A decode that hands
     it none bans one-token words only, so a greedy request whose chain holds
     the word ``[a, b]`` would emit it.

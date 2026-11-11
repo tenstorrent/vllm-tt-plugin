@@ -55,7 +55,7 @@ serve speculative decoding within the following execution limits:
   per request: the greedy walk cannot apply those, so a verify would answer the
   request without them. In both modes `logit_bias` is refused. vLLM's own
   request validation refuses `logit_bias`, and a `min_p` above 1e-5, whenever
-  speculation is configured, before the plugin sees the request. vLLM's
+  speculation is configured, before the plugin sees the request. The plugin's
   `build_logitsprocs` builds no min_p processor for a speculating launch, so a
   smaller `min_p` has no effect, and it refuses custom logits processors
   (`--logits-processors`) when `TTModelRunner` is constructed.
@@ -979,8 +979,8 @@ host tensors from `read_decode_output` for a verify. The readback is
 temporaries.
 
 **What the host computes.** `vllm_tt_plugin.spec_accept.accept_sampled_drafts`
-builds the distribution vLLM's ordinary sampler would use, in its order: the
-grammar bitmask, which the runner applies to the logits before vLLM's sampler
+builds the distribution the ordinary host sampler would use, in its order: the
+grammar bitmask, which the runner applies to the logits before that sampler
 on an ordinary step; then `allowed_token_ids`, `bad_words` and `min_tokens`;
 then presence, frequency and repetition penalties; then temperature, then
 top-k and top-p. Each control reads column `j`'s own state, which is the row's

@@ -179,7 +179,7 @@ def fixed_target_distribution(
     repetition_penalty: float = 1.0,
     excluded: Iterable[int] = (),
 ) -> dict[int, float]:
-    """What vLLM's ordinary sampler draws from after ``token`` at ``position``.
+    """What the ordinary host sampler draws from after ``token`` at ``position``.
 
     Computed here, in plain Python, rather than through the plugin or vLLM, so
     a test compares the server against an independent statement of the

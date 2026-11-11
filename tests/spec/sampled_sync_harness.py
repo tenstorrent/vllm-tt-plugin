@@ -15,13 +15,13 @@ from types import SimpleNamespace
 import torch
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.sampler import Sampler
 from vllm_tt_plugin.spec_decode import VerifyOutput
 
 from .sampled_target import (
@@ -43,7 +43,6 @@ def _runner(model: SampledTarget, num_speculative_tokens: int = DRAFT_LEN):
     batch = InputBatch(
         max_num_reqs=MAX_NUM_REQS,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=SAMPLED_VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],

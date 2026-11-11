@@ -14,10 +14,10 @@ import threading
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.sample.sampler import Sampler
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.sample.sampler import Sampler
 
 from . import test_spec_async as async_harness
 from .sampled_target import SAMPLED_VOCAB_SIZE, SampledTarget, base_token
@@ -74,7 +74,6 @@ def _rebuild_batch(runner) -> None:
     runner.input_batch = InputBatch(
         max_num_reqs=async_harness.MAX_NUM_REQS,
         max_model_len=async_harness.MAX_MODEL_LEN,
-        max_num_batched_tokens=async_harness.MAX_MODEL_LEN,
         vocab_size=SAMPLED_VOCAB_SIZE,
         block_sizes=[async_harness.BLOCK_SIZE],
         kernel_block_sizes=[async_harness.BLOCK_SIZE],
