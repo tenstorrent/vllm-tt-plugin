@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.sample.sampler import Sampler
 
 from tests.test_lane_input_batch import (
@@ -14,6 +13,7 @@ from tests.test_lane_input_batch import (
     _host_runner,
     _make_logitsprocs,
     _make_req,
+    _new_req,
     _plan,
     _step_output,
 )
@@ -39,7 +39,7 @@ def test_compact_bad_words_preserves_retained_output_history(resumed, output_mod
         kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(8, with_custom=False),
     )
-    target = _make_req("target", [1, 2], [7], {"temperature": 1.0}, seed=42)
+    target = _make_req("target", [1, 2], [7], {"temperature": 1.0, "seed": 42}, seed=42)
     target.sampling_params._bad_words_token_ids = [[7, 8]]
     idle = _make_req(
         "idle", [3], [7], {"temperature": 1.0, "presence_penalty": 0.5}, seed=99
@@ -59,22 +59,23 @@ def test_compact_bad_words_preserves_retained_output_history(resumed, output_mod
         assert requests["target"] is target
         assert target.output_token_ids == [7]
         assert "target" not in batch.req_id_to_index
-        cached = CachedRequestData(
-            req_ids=["target"],
-            resumed_req_ids={"target"},
-            new_token_ids=[[]],
-            all_token_ids={"target": [1, 2, 7]},
-            new_block_ids=[([7],)],
-            num_computed_tokens=[0],
-            num_output_tokens=[1],
-        )
+        # vLLM's V2 scheduler output resumes it as a new request, with fresh
+        # blocks and its generated token in prefill_token_ids. The rebuilt state
+        # keeps the held generator.
+        resume = _new_req("target", [1, 2])
+        resume.sampling_params = target.sampling_params
+        resume.block_ids = ([7],)
+        resume.num_computed_tokens = 0
+        resume.prefill_token_ids = [1, 2, 7]
         batch.apply_step_plan(
-            _step_output(cached=cached),
+            _step_output(new_reqs=[resume]),
             _plan({"target": 6}, capacity=8, num_lanes=2),
             requests,
             {},
         )
-        assert requests["target"] is target
+        assert requests["target"].generator is target.generator
+        target = requests["target"]
+        assert target.output_token_ids == [7]
         assert batch.req_id_to_index == {"idle": 1, "target": 6}
 
     batch.refresh_logitsprocs()

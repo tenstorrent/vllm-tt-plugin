@@ -27,6 +27,7 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.core_client as core_client
     import vllm.v1.engine.input_processor as input_processor
+    from vllm.config import vllm as vllm_config_module
     from vllm.entrypoints.launchers.utils import server_utils
 
     from vllm_tt_plugin.platform import TTPlatform
@@ -43,6 +44,10 @@ def reset_tt_platform_class_state():
     saved = {
         name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
     }
+    saved_validate_v2 = vllm_config_module.VllmConfig._validate_v2_model_runner
+    saved_original_validate_v2 = vllm_config_module.__dict__.get(
+        "_tt_original_validate_v2_model_runner", unset
+    )
     saved_process_inputs = input_processor.InputProcessor.process_inputs
     saved_original_process_inputs = input_processor.__dict__.get(
         "_tt_original_process_inputs", unset
@@ -119,6 +124,14 @@ def reset_tt_platform_class_state():
     else:
         async_llm._tt_original_add_streaming_input_request = (
             saved_original_add_streaming_input_request
+        )
+
+    vllm_config_module.VllmConfig._validate_v2_model_runner = saved_validate_v2
+    if saved_original_validate_v2 is unset:
+        vllm_config_module.__dict__.pop("_tt_original_validate_v2_model_runner", None)
+    else:
+        vllm_config_module._tt_original_validate_v2_model_runner = (
+            saved_original_validate_v2
         )
 
     input_processor.InputProcessor.process_inputs = saved_process_inputs

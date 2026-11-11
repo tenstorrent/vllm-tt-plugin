@@ -130,15 +130,17 @@ def _new_request(req_id: str, first_token: int) -> NewRequestData:
     ran, so the next step for this request is a decode. That keeps these tests
     on the lifecycle rather than on prefill.
     """
+    prompt = list(range(first_token, first_token + PROMPT_LEN))
     return NewRequestData(
         req_id=req_id,
-        prompt_token_ids=list(range(first_token, first_token + PROMPT_LEN)),
+        prompt_token_ids=prompt,
         mm_features=[],
         sampling_params=SamplingParams(temperature=0.0),
         pooling_params=None,
         block_ids=([0],),
         num_computed_tokens=PROMPT_LEN,
         lora_request=None,
+        prefill_token_ids=list(prompt),
     )
 
 
@@ -154,21 +156,14 @@ def _empty_cached() -> CachedRequestData:
     )
 
 
-def _cached_for(runner, req_ids, resumed=()) -> CachedRequestData:
-    """A resumed request carries fresh blocks; a running one carries none.
-
-    ``apply_cached_req_state_update`` requires that of a resume, because the
-    scheduler freed the request's blocks when it preempted the request and
-    allocates new ones to restart it.
-    """
+def _cached_for(runner, req_ids) -> CachedRequestData:
+    """Running requests; a running request carries no new blocks here."""
     return CachedRequestData(
         req_ids=list(req_ids),
-        resumed_req_ids=set(resumed),
+        resumed_req_ids=set(),
         new_token_ids=[[] for _ in req_ids],
         all_token_ids={},
-        new_block_ids=[
-            ([1],) if req_id in set(resumed) else None for req_id in req_ids
-        ],
+        new_block_ids=[None for _ in req_ids],
         num_computed_tokens=[
             int(runner.requests[req_id].num_computed_tokens) for req_id in req_ids
         ],
@@ -367,12 +362,14 @@ def test_a_resumed_request_speculates_from_a_reset_count():
     assert runner._req_accepted_counts["a"] == DRAFT_LEN + 1
 
     runner._update_states(_scheduler_output(preempted=["a"]))
-    # The scheduler resumes it as a cached request with its prompt to recompute.
-    runner.requests["a"].num_computed_tokens = 0
-    resumed = _scheduler_output(
-        cached=_cached_for(runner, ["a"], resumed=["a"]),
-        scheduled=["a"],
-    )
+    # vLLM's V2 scheduler output resumes it as a new request, with fresh blocks
+    # and its prompt and generated tokens to recompute.
+    state = runner.requests["a"]
+    record = _new_request("a", state.prompt_token_ids[0])
+    record.block_ids = ([1],)
+    record.num_computed_tokens = 0
+    record.prefill_token_ids = [*state.prompt_token_ids, *state.output_token_ids]
+    resumed = _scheduler_output(new=[record], scheduled=["a"])
     runner._update_states(resumed)
     # A prefill step: what the scheduler schedules for a resumed request.
     TTModelRunner._prepare_model_inputs(runner, resumed, None)

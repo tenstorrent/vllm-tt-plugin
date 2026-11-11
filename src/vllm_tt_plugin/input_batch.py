@@ -82,7 +82,7 @@ def log_prefill_chunks(
     new request starts mid-prompt too, but is not a continuation and is not
     logged.
     """
-    continuing = set(cached_reqs.req_ids) - set(cached_reqs.resumed_req_ids)
+    continuing = set(cached_reqs.req_ids)
     for i, row in enumerate(req_indices):
         req_id = input_batch.req_ids[row]
         start = int(input_positions[i])
@@ -151,9 +151,9 @@ def build_cached_request_state(
 
     ``NewRequestData.prefill_token_ids`` seeds ``output_token_ids``. vLLM's V2
     scheduler output delivers a request resumed after preemption as a new
-    request, and that field is the only place its generated tokens appear. The
-    V1 scheduler output leaves the field ``None`` and reports a resume through
-    ``scheduled_cached_reqs`` instead.
+    request, and that field is the only place its generated tokens appear. Only
+    the V1 scheduler output leaves the field ``None``, so ``None`` is refused:
+    ``_pin_v2_model_runner`` should have made it impossible.
 
     ``held`` is the state the caller still holds for this request id, or
     ``None``: a request resumed after preemption, or a resumable streaming-input
@@ -170,18 +170,17 @@ def build_cached_request_state(
         raise NotImplementedError("TT backend does not support prompt_embeds yet")
     num_prompt_tokens = len(new_req_data.prompt_token_ids)
     prefill_token_ids = new_req_data.prefill_token_ids
-    output_token_ids: list[int] = []
-    if prefill_token_ids is not None:
-        if len(prefill_token_ids) < num_prompt_tokens:
-            raise ValueError(
-                f"Request {new_req_data.req_id}: prefill_token_ids holds "
-                f"{len(prefill_token_ids)} tokens, fewer than its "
-                f"{num_prompt_tokens} prompt tokens"
-            )
-        # Copied, never kept by reference: in a single-process engine
-        # prefill_token_ids can be the scheduler's own Request._all_token_ids,
-        # which keeps growing.
-        output_token_ids = list(prefill_token_ids[num_prompt_tokens:])
+    if prefill_token_ids is None or len(prefill_token_ids) < num_prompt_tokens:
+        raise ValueError(
+            f"Request {new_req_data.req_id}: prefill_token_ids is "
+            f"{'None' if prefill_token_ids is None else len(prefill_token_ids)}, "
+            f"expected at least its {num_prompt_tokens} prompt tokens. The TT "
+            "runner reads only vLLM's V2 scheduler output."
+        )
+    # Copied, never kept by reference: in a single-process engine
+    # prefill_token_ids can be the scheduler's own Request._all_token_ids,
+    # which keeps growing.
+    output_token_ids = list(prefill_token_ids[num_prompt_tokens:])
     sampling_params = new_req_data.sampling_params
     if sampling_params.sampling_type != SamplingType.RANDOM_SEED:
         generator = None
@@ -217,20 +216,16 @@ def apply_cached_req_state_update(
     req_state: CachedRequestState,
     num_computed_tokens: int,
     new_block_ids,
-    resumed_from_preemption: bool,
 ) -> None:
     """Apply a ``scheduled_cached_reqs`` update to a request's cached state.
 
-    Identical for front-packed and lane-DP: a request resumed from preemption
-    had its KV freed and rebuilt (replace block IDs), otherwise the newly
-    allocated blocks are appended. Persistent-batch row bookkeeping is left to
-    the caller.
+    Identical for front-packed and lane-DP: the newly allocated blocks are
+    appended. A request resumed after preemption is not a cached request in the
+    V2 scheduler output; it arrives in ``scheduled_new_reqs`` with its new block
+    ids. Persistent-batch row bookkeeping is left to the caller.
     """
     req_state.num_computed_tokens = num_computed_tokens
-    if resumed_from_preemption:
-        assert new_block_ids is not None
-        req_state.block_ids = new_block_ids
-    elif new_block_ids is not None:
+    if new_block_ids is not None:
         for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
             block_ids.extend(new_ids)
 
@@ -1074,25 +1069,13 @@ class TTLaneInputBatch(InputBatch):
             )
             req_ids_to_add.append(req_id)
 
-        # Running / resumed requests.
+        # Running requests.
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
             req_state = requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_id in req_data.resumed_req_ids
-            apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
-            )
-            if resumed_from_preemption:
-                # A resume re-places the request wherever the coordinator's free
-                # list sent it, which is rarely the row it left. That row went
-                # back when the preemption was reported, so this removal only
-                # covers a resume whose preemption never was, keeping the
-                # request off two rows at once.
-                layout_changed |= self._free_row(req_id, release_request)
-                req_ids_to_add.append(req_id)
-                continue
+            apply_cached_req_state_update(req_state, num_computed_tokens, new_block_ids)
             req_index = self.req_id_to_index.get(req_id)
             if req_index is None:
                 req_ids_to_add.append(req_id)

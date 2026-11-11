@@ -43,7 +43,7 @@ the behaviour, runtime-monkeypatch vLLM from this repo next to the existing
 bug may still be fixed in vLLM core (see the TODO on
 `_install_tt_harmony_truncation_patch`). Neighbors for a new patch:
 `_install_diffusion_gemma_architecture_patch`,
-`_install_tt_harmony_truncation_patch`, `_pin_v1_model_runner`, and the
+`_install_tt_harmony_truncation_patch`, `_pin_v2_model_runner`, and the
 `_install_block_output_*` functions.
 
 ### Repository boundaries, and what changed recently
@@ -440,7 +440,7 @@ If you add a new class-level attribute to `TTPlatform`, add its name to
 
 The same autouse fixture, `reset_tt_platform_class_state` in
 `tests/conftest.py`, also saves and restores the patches `platform.py`
-installs: `InputProcessor.process_inputs`,
+installs: `VllmConfig._validate_v2_model_runner`, `InputProcessor.process_inputs`,
 `AsyncLLM._add_streaming_input_request`, `EngineCore.reset_prefix_cache`,
 `EngineCore.pause_scheduler`, `EngineCoreProc.pause_scheduler`, and the
 `_tt_original_*` markers. A new `_install_*_patch` must extend that restore

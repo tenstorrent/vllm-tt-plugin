@@ -978,43 +978,77 @@ def _uninstall_tt_async_spec_method_patch() -> None:
     del vllm_config_module._tt_original_eagle_model_types
 
 
-def _pin_v1_model_runner() -> None:
-    """Keep the engine on vLLM's V1 model runner.
+def _pin_v2_model_runner() -> None:
+    """Keep the engine on vLLM's V2 model-runner contract.
 
-    ``VllmConfig.use_v2_model_runner`` defaults on for every architecture when
-    Triton is present and no requested feature is refused under V2.
-    The TT runner reads the V2 scheduler output, where a request resumed after
+    ``VllmConfig.use_v2_model_runner`` selects the shape of the scheduler
+    output, and the TT runner reads only the V2 shape: a request resumed after
     preemption arrives in ``scheduled_new_reqs`` with its history in
-    ``NewRequestData.prefill_token_ids``. Known V2 differences the TT backend
-    does not handle yet:
+    ``NewRequestData.prefill_token_ids``. The V1 shape reports the same resume
+    in ``scheduled_cached_reqs`` with ``resumed_req_ids``, which the TT runner
+    does not read, so ``apply_cached_req_state_update`` would append the new
+    block ids to the blocks the preemption freed.
 
-    - ``InputProcessor`` loads custom logits processors with the V2 loader
-      (``vllm.v1.worker.gpu.sample.logits_processor``), which rejects a class
-      without the V2 interface, while ``TTModelRunner`` builds its processors
-      with the V1 ``build_logitsprocs``.
-    - ``VllmConfig`` refuses the ``ngram`` speculative method under V2, and TT
-      n-gram drafting uses the V1 ``NgramProposer``.
+    Left unset, the variable gives V1 on a host without Triton, which a TT host
+    normally is. Pin it rather than rely on the default.
 
-    Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
-    which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
-    set to the empty string. Pin the variable rather than rely on that. Two
-    options select V2 whatever the variable says: ``--watermark-config``, and
-    ``attention_config.hisparse_config``, which raises when the variable is 0.
-
-    Refuse an explicit opt-in instead of honoring it: the TT backend has not
-    been validated on the V2 path, so a clear failure is more useful than an
-    unvalidated run.
+    Refuse an explicit V1 request instead of honoring it: the wrong output is
+    silent, so a clear failure is more useful.
     """
     requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
-    if requested is not None and requested != "0":
+    if requested is not None and requested != "1":
         raise ValueError(
-            f"{_V2_MODEL_RUNNER_ENV}={requested!r} selects vLLM's V2 model "
-            "runner. The TT backend does not implement all of the V2 "
-            "model-runner contract yet: custom logits processors are loaded "
-            "for V2 but run as V1, and n-gram drafting needs V1. Unset "
-            f"{_V2_MODEL_RUNNER_ENV} or set it to 0."
+            f"{_V2_MODEL_RUNNER_ENV}={requested!r} does not select vLLM's V2 "
+            "model runner. The TT backend reads only the V2 scheduler output: "
+            "under V1 a request resumed after preemption would write its KV "
+            f"into freed blocks. Unset {_V2_MODEL_RUNNER_ENV} or set it to 1."
         )
-    os.environ[_V2_MODEL_RUNNER_ENV] = "0"
+    os.environ[_V2_MODEL_RUNNER_ENV] = "1"
+
+
+# How vLLM 0.31's ``VllmConfig._get_v2_model_runner_unsupported_features`` names
+# the speculative methods TT drafts inside ``TTModelRunner``: the n-gram drafter,
+# and ``MODEL_OWNED_DRAFT_METHOD``.
+_UPSTREAM_V2_SPEC_METHOD_REFUSALS = frozenset(
+    {"speculative method 'ngram'", f"speculative method '{MODEL_OWNED_DRAFT_METHOD}'"}
+)
+
+
+def _install_tt_v2_model_runner_validation_patch() -> None:
+    """Validate a V2 config against what the TT runner needs, not vLLM's GPU runner.
+
+    vLLM 0.31's ``VllmConfig._validate_v2_model_runner`` refuses V2 without
+    Triton, and refuses the ``ngram`` and ``custom_class`` speculative methods.
+    These checks describe vLLM's GPU V2 model runner, which a TT engine does not
+    run: ``TTWorker`` runs ``TTModelRunner`` instead, which drafts n-gram tokens
+    with ``NgramProposer`` and takes model-owned drafts from the TT model. Every
+    other refusal is kept.
+
+    TODO: remove at the next vLLM bump. vLLM 0.32 accepts ``ngram`` under V2 and
+    vLLM 0.33 no longer requires Triton; ``custom_class`` stays refused until
+    vLLM's custom speculator registration replaces it.
+    """
+    from vllm.config import vllm as vllm_config_module
+
+    if hasattr(vllm_config_module, "_tt_original_validate_v2_model_runner"):
+        return
+    config_cls = vllm_config_module.VllmConfig
+    vllm_config_module._tt_original_validate_v2_model_runner = (
+        config_cls._validate_v2_model_runner
+    )
+
+    def validate_v2_model_runner_tt(self) -> None:
+        unsupported = [
+            feature
+            for feature in self._get_v2_model_runner_unsupported_features()
+            if feature not in _UPSTREAM_V2_SPEC_METHOD_REFUSALS
+        ]
+        if unsupported:
+            raise ValueError(
+                f"Model Runner V2 does not yet support: {', '.join(unsupported)}"
+            )
+
+    config_cls._validate_v2_model_runner = validate_v2_model_runner_tt
 
 
 def _neutralize_model_owned_sampling(params) -> list[str]:
@@ -1714,7 +1748,8 @@ class TTPlatform(Platform):
         # this process, so TT models must be registered before that (including
         # test models when the CLI override requests them).
         super().pre_register_and_update(parser)
-        _pin_v1_model_runner()
+        _pin_v2_model_runner()
+        _install_tt_v2_model_runner_validation_patch()
         _install_api_lifespan_gc_patch()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
@@ -1796,7 +1831,8 @@ class TTPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         # Before any read of ``vllm_config.use_v2_model_runner``, which
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
-        _pin_v1_model_runner()
+        _pin_v2_model_runner()
+        _install_tt_v2_model_runner_validation_patch()
         _install_api_lifespan_gc_patch()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
