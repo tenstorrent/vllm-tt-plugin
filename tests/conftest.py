@@ -198,4 +198,6 @@ def vllm_config() -> SimpleNamespace:
         lora_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
+        watermark_config=None,
+        attention_config=SimpleNamespace(hisparse_config=None),
     )

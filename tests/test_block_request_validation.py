@@ -255,6 +255,8 @@ def _config(
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
+        watermark_config=None,
+        attention_config=SimpleNamespace(hisparse_config=None),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
             pipeline_parallel_size=1,

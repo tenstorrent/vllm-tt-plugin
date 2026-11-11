@@ -173,27 +173,44 @@ def test_every_other_v2_refusal_still_raises():
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "option"),
+    ("path", "value", "option"),
     [
-        ("logits_processors", ["pkg:Processor"], "--logits-processors"),
-        ("enable_trace_replay", True, "--enable-trace-replay"),
-        ("return_sampling_mask", True, "--return-sampling-mask"),
+        ("model_config.logits_processors", ["pkg:P"], "--logits-processors"),
+        ("model_config.enable_trace_replay", True, "--enable-trace-replay"),
+        ("model_config.return_sampling_mask", True, "--return-sampling-mask"),
+        ("watermark_config", object(), "--watermark-config"),
+        (
+            "attention_config.hisparse_config",
+            object(),
+            "attention_config.hisparse_config",
+        ),
     ],
 )
-def test_options_vllm_accepts_only_under_v2_are_refused(field, value, option):
-    """vLLM refuses trace replay and the sampling mask under V1 only, and under
-    V2 loads custom logits processors with an interface TTModelRunner does not
-    build, so the pin must not let any of them through."""
+def test_options_tt_does_not_implement_under_v2_are_refused(path, value, option):
+    """vLLM refuses trace replay and the sampling mask under V1 only, selects V2
+    for watermarking and HiSparse whatever the pin says, and under V2 loads
+    custom logits processors with an interface TTModelRunner does not build.
+    TTModelRunner implements none of these, so none may pass."""
     from vllm_tt_plugin.platform import _refuse_unimplemented_v2_features
 
-    model_config = SimpleNamespace(
-        logits_processors=None, enable_trace_replay=False, return_sampling_mask=False
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            logits_processors=None,
+            enable_trace_replay=False,
+            return_sampling_mask=False,
+        ),
+        watermark_config=None,
+        attention_config=SimpleNamespace(hisparse_config=None),
     )
-    _refuse_unimplemented_v2_features(SimpleNamespace(model_config=model_config))
+    _refuse_unimplemented_v2_features(config)
 
-    setattr(model_config, field, value)
+    *parents, name = path.split(".")
+    target = config
+    for parent in parents:
+        target = getattr(target, parent)
+    setattr(target, name, value)
     with pytest.raises(ValueError, match=f"^{option} not supported on TT"):
-        _refuse_unimplemented_v2_features(SimpleNamespace(model_config=model_config))
+        _refuse_unimplemented_v2_features(config)
 
 
 def test_a_tt_engine_config_refuses_custom_logits_processors():

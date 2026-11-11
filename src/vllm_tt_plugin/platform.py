@@ -1065,23 +1065,29 @@ def _refuse_unimplemented_v2_features(vllm_config: "VllmConfig") -> None:
 
     vLLM refuses ``--enable-trace-replay`` and ``--return-sampling-mask`` under
     V1 and accepts them under V2; ``TTModelRunner`` implements neither, so
-    ``_pin_v2_model_runner`` would let them through silently. Custom logits
+    ``_pin_v2_model_runner`` would let them through silently. Watermarking
+    (``--watermark-config``) and HiSparse attention
+    (``attention_config.hisparse_config``) select V2 whatever the pin says, and
+    ``TTModelRunner`` implements neither. Custom logits
     processors are refused because vLLM's ``InputProcessor`` loads them with the
     V2 interface under V2, while ``TTModelRunner`` builds them with the V1
     ``build_logitsprocs``: neither interface would load in both places.
     """
     model_config = vllm_config.model_config
-    if model_config is None:
-        return
-    refused = [
-        option
-        for option, enabled in (
+    options = [
+        ("--watermark-config", vllm_config.watermark_config is not None),
+        (
+            "attention_config.hisparse_config",
+            vllm_config.attention_config.hisparse_config is not None,
+        ),
+    ]
+    if model_config is not None:
+        options += [
             ("--logits-processors", bool(model_config.logits_processors)),
             ("--enable-trace-replay", model_config.enable_trace_replay),
             ("--return-sampling-mask", model_config.return_sampling_mask),
-        )
-        if enabled
-    ]
+        ]
+    refused = [option for option, enabled in options if enabled]
     if refused:
         raise ValueError(
             f"{', '.join(refused)} not supported on TT: TTModelRunner does not "

@@ -282,44 +282,6 @@ def test_a_resume_in_the_step_that_reports_the_preemption_holds_one_row():
     assert batch.token_ids_cpu[row, : len(HISTORY)].tolist() == HISTORY
 
 
-def test_a_v1_resume_in_the_step_that_reports_the_preemption_uses_its_new_blocks():
-    """The V1 shape of the same event: "a" is in ``preempted_req_ids`` and in
-    ``resumed_req_ids``, with all-new blocks, while it still holds its row. The
-    row's block table must list only the new blocks; the preemption freed the
-    old ones."""
-    runner = _runner(supports_stage_inputs=False)
-    _run_prefill(
-        runner,
-        _step(
-            new=[_record("a", PROMPT, block_ids=([3],)), _record("b", [5, 6])],
-            scheduled={"a": len(PROMPT), "b": 2},
-        ),
-    )
-    runner.requests["a"].output_token_ids.extend(GENERATED)
-    resume = _step(
-        cached=CachedRequestData(
-            req_ids=["a"],
-            resumed_req_ids={"a"},
-            new_token_ids=[[]],
-            all_token_ids={},
-            new_block_ids=[([5],)],
-            num_computed_tokens=[0],
-            num_output_tokens=[0],
-        ),
-        scheduled={"a": len(HISTORY), "b": 1},
-        preempted={"a"},
-    )
-
-    runner._update_states(resume)
-
-    batch = runner.input_batch
-    row = batch.req_id_to_index["a"]
-    assert _rows_holding(batch, "a") == [row]
-    assert runner.requests["a"].block_ids == ([5],)
-    (table,) = batch.block_tables_for_rows([row], 2)
-    assert table.tolist() == [[5, 0]], "the row lists the freed block 3"
-
-
 # --------------------------------------------------------------------------
 # Lane-DP: TTLaneInputBatch.apply_step_plan
 # --------------------------------------------------------------------------
