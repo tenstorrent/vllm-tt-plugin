@@ -181,6 +181,9 @@ def vllm_config() -> SimpleNamespace:
             original_max_model_len=None,
             is_moe=False,
             multimodal_config=None,
+            logits_processors=None,
+            enable_trace_replay=False,
+            return_sampling_mask=False,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(

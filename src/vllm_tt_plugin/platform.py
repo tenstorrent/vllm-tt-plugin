@@ -993,10 +993,17 @@ def _pin_v2_model_runner() -> None:
     normally is. Pin it rather than rely on the default.
 
     Refuse an explicit V1 request instead of honoring it: the wrong output is
-    silent, so a clear failure is more useful.
+    silent, so a clear failure is more useful. A value counts as V2 when vLLM
+    reads it as true, which ``vllm.envs`` does with ``bool(int(value))``.
     """
+    from vllm.envs import maybe_convert_bool
+
     requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
-    if requested is not None and requested != "1":
+    try:
+        selects_v2 = requested is None or maybe_convert_bool(requested)
+    except ValueError:
+        selects_v2 = False
+    if not selects_v2:
         raise ValueError(
             f"{_V2_MODEL_RUNNER_ENV}={requested!r} does not select vLLM's V2 "
             "model runner. The TT backend reads only the V2 scheduler output: "
@@ -1024,9 +1031,11 @@ def _install_tt_v2_model_runner_validation_patch() -> None:
     with ``NgramProposer`` and takes model-owned drafts from the TT model. Every
     other refusal is kept.
 
-    TODO: remove at the next vLLM bump. vLLM 0.32 accepts ``ngram`` under V2 and
-    vLLM 0.33 no longer requires Triton; ``custom_class`` stays refused until
-    vLLM's custom speculator registration replaces it.
+    TODO: narrow at each vLLM bump. vLLM 0.32 accepts ``ngram`` under V2 but still
+    requires Triton; vLLM 0.33 drops the Triton requirement; 0.32 and 0.33 still
+    refuse ``custom_class``. Upstream main removes ``custom_class`` and the V1
+    runner, and TT must then register its drafter as a custom speculator
+    (vllm-project/vllm#63205).
     """
     from vllm.config import vllm as vllm_config_module
 
@@ -1049,6 +1058,35 @@ def _install_tt_v2_model_runner_validation_patch() -> None:
             )
 
     config_cls._validate_v2_model_runner = validate_v2_model_runner_tt
+
+
+def _refuse_unimplemented_v2_features(vllm_config: "VllmConfig") -> None:
+    """Refuse the engine options vLLM accepts only under V2, which TT lacks.
+
+    vLLM refuses ``--enable-trace-replay`` and ``--return-sampling-mask`` under
+    V1 and accepts them under V2; ``TTModelRunner`` implements neither, so
+    ``_pin_v2_model_runner`` would let them through silently. Custom logits
+    processors are refused because vLLM's ``InputProcessor`` loads them with the
+    V2 interface under V2, while ``TTModelRunner`` builds them with the V1
+    ``build_logitsprocs``: neither interface would load in both places.
+    """
+    model_config = vllm_config.model_config
+    if model_config is None:
+        return
+    refused = [
+        option
+        for option, enabled in (
+            ("--logits-processors", bool(model_config.logits_processors)),
+            ("--enable-trace-replay", model_config.enable_trace_replay),
+            ("--return-sampling-mask", model_config.return_sampling_mask),
+        )
+        if enabled
+    ]
+    if refused:
+        raise ValueError(
+            f"{', '.join(refused)} not supported on TT: TTModelRunner does not "
+            "implement it under vLLM's V2 model runner"
+        )
 
 
 def _neutralize_model_owned_sampling(params) -> list[str]:
@@ -1833,6 +1871,7 @@ class TTPlatform(Platform):
         # ``VllmConfig.__post_init__`` performs immediately after this hook.
         _pin_v2_model_runner()
         _install_tt_v2_model_runner_validation_patch()
+        _refuse_unimplemented_v2_features(vllm_config)
         _install_api_lifespan_gc_patch()
         _install_torch_accelerator_cleanup_patch()
         _install_tt_harmony_truncation_patch()
@@ -2851,8 +2890,17 @@ class TTPlatform(Platform):
         if processed_inputs.get("prompt_embeds") is not None:
             raise VLLMValidationError(f"prompt_embeds are not supported on {dev}")
 
-        if isinstance(params, SamplingParams) and params.prompt_logprobs is not None:
-            raise VLLMValidationError(f"Not yet supporting prompt_logprobs on {dev}")
+        if isinstance(params, SamplingParams):
+            # TTModelRunner implements none of these. vLLM refuses
+            # prompt_logprob_token_ids only under V1, and accepts
+            # trace_decode_token_ids under either runner.
+            for name in (
+                "prompt_logprobs",
+                "prompt_logprob_token_ids",
+                "trace_decode_token_ids",
+            ):
+                if getattr(params, name) is not None:
+                    raise VLLMValidationError(f"Not yet supporting {name} on {dev}")
 
         if isinstance(params, SamplingParams):
             cls._reject_unsupported_speculative_request(params)

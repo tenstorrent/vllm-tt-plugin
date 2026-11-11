@@ -239,6 +239,8 @@ def _config(
             multimodal_config=None,
             generation_config="auto",
             logits_processors=None,
+            enable_trace_replay=False,
+            return_sampling_mask=False,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(

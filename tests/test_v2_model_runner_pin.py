@@ -44,12 +44,24 @@ def test_pin_is_idempotent():
     assert os.environ[_V2_MODEL_RUNNER_ENV] == "1"
 
 
-@pytest.mark.parametrize("requested", ["0", "false", "01"])
-def test_pin_refuses_any_other_explicit_value(requested):
+@pytest.mark.parametrize("requested", ["0", "00", "false"])
+def test_pin_refuses_a_value_vllm_does_not_read_as_v2(requested):
     os.environ[_V2_MODEL_RUNNER_ENV] = requested
 
     with pytest.raises(ValueError, match="does not select vLLM's V2 model runner"):
         _pin_v2_model_runner()
+
+
+@pytest.mark.parametrize("requested", ["1", "01", "2"])
+def test_pin_accepts_every_value_vllm_reads_as_v2(requested):
+    import vllm.envs as envs
+
+    os.environ[_V2_MODEL_RUNNER_ENV] = requested
+    assert envs.VLLM_USE_V2_MODEL_RUNNER is True
+
+    _pin_v2_model_runner()
+
+    assert os.environ[_V2_MODEL_RUNNER_ENV] == "1"
 
 
 def test_upstream_still_honors_the_v2_env_knob():
@@ -157,4 +169,75 @@ def test_every_other_v2_refusal_still_raises():
     ):
         VllmConfig._validate_v2_model_runner(
             _config(method="ngram", mamba_cache_mode="all")
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "option"),
+    [
+        ("logits_processors", ["pkg:Processor"], "--logits-processors"),
+        ("enable_trace_replay", True, "--enable-trace-replay"),
+        ("return_sampling_mask", True, "--return-sampling-mask"),
+    ],
+)
+def test_options_vllm_accepts_only_under_v2_are_refused(field, value, option):
+    """vLLM refuses trace replay and the sampling mask under V1 only, and under
+    V2 loads custom logits processors with an interface TTModelRunner does not
+    build, so the pin must not let any of them through."""
+    from vllm_tt_plugin.platform import _refuse_unimplemented_v2_features
+
+    model_config = SimpleNamespace(
+        logits_processors=None, enable_trace_replay=False, return_sampling_mask=False
+    )
+    _refuse_unimplemented_v2_features(SimpleNamespace(model_config=model_config))
+
+    setattr(model_config, field, value)
+    with pytest.raises(ValueError, match=f"^{option} not supported on TT"):
+        _refuse_unimplemented_v2_features(SimpleNamespace(model_config=model_config))
+
+
+def test_a_tt_engine_config_refuses_custom_logits_processors():
+    """The refusal runs in ``TTPlatform.check_and_update_config``, inside
+    ``VllmConfig.__post_init__``."""
+    from vllm.config import ModelConfig, VllmConfig
+
+    from tests.test_block_scheduler import LOCAL_MODEL_CONFIG, _stub_model_resolution
+    from tests.test_lane_input_batch import FirstPromptTokenBoost
+
+    model_config = ModelConfig(
+        model=str(LOCAL_MODEL_CONFIG),
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+        logits_processors=[FirstPromptTokenBoost],
+    )
+    with (
+        _stub_model_resolution(),
+        pytest.raises(ValueError, match="--logits-processors not supported on TT"),
+    ):
+        VllmConfig(model_config=model_config)
+
+
+@pytest.mark.parametrize(
+    "request_field",
+    [
+        {"prompt_logprobs": 1},
+        {"prompt_logprob_token_ids": [5, 6]},
+        {"trace_decode_token_ids": [5]},
+    ],
+)
+def test_a_request_for_a_scoring_or_replay_feature_is_refused(request_field):
+    """vLLM accepts ``prompt_logprob_token_ids`` under V2, and
+    ``trace_decode_token_ids`` under either runner; TTModelRunner returns
+    neither, so the request is refused instead of answered without them."""
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_tt_plugin.platform import TTPlatform
+
+    (name,) = request_field
+    with pytest.raises(VLLMValidationError, match=f"Not yet supporting {name}"):
+        TTPlatform.validate_request(
+            {"prompt_token_ids": [1, 2, 3]},
+            SamplingParams(max_tokens=1, **request_field),
         )
