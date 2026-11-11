@@ -207,6 +207,7 @@ def _new_req(req_id, prompt):
         block_ids=([0],),
         lora_request=None,
         prompt_embeds=None,
+        prefill_token_ids=None,
     )
 
 

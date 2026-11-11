@@ -1028,9 +1028,14 @@ class TTModelRunner:
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
+        # A request resumed in the step that reports its preemption (after
+        # ``reset_prefix_cache(reset_running_requests=True)``) is scheduled but
+        # its row lists the freed blocks, so it is removed here and re-added
+        # with the new ones, as upstream's V1 runner does.
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1045,8 +1050,23 @@ class TTModelRunner:
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            # A scheduled_new_reqs entry rebuilds the request from its record;
+            # ``build_cached_request_state`` keeps from the held state only what
+            # the record cannot carry. The id still holds a row when the request
+            # was in the previous step and comes back as new in this one: a
+            # resumable streaming-input request with its next input chunk, or,
+            # in vLLM's V2 scheduler output, a request that resumes in the same
+            # step that reports its preemption. Model-owned state is not
+            # released here: only the finish and preemption handling above
+            # releases it, so a streaming-input continuation keeps it.
+            req_index = self.input_batch.remove_request(req_id)
+            if req_index is not None:
+                removed_req_indices.append(req_index)
+                persistent_batch_layout_changed = True
             self.requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=self.supports_stage_inputs
+                new_req_data,
+                supports_stage_inputs=self.supports_stage_inputs,
+                held=self.requests.get(req_id),
             )
             req_ids_to_add.append(req_id)
 
@@ -4802,6 +4822,7 @@ class TTModelRunner:
                     req_ids=list(req_ids),
                     req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
                     submit_time_ns=now,
+                    request_states=tuple(self.requests.get(rid) for rid in req_ids),
                 ),
                 completion_time_ns=now,
                 runner_output=runner_output,

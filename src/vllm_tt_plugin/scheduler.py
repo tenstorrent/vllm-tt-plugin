@@ -360,10 +360,11 @@ class TTScheduler(AsyncScheduler):
       The base class marks them stale, appends them on arrival without
       touching the placeholder count, and keeps the request waiting until
       they drain, so the resumed prefill replays them instead of sampling
-      against the old token history. Only the wholesale
-      ``reset_prefix_cache`` teardown drops stale output
-      (``Request.drop_stale_output``); wiring ordinary preemption into it
-      drops valid tokens and silently truncates the response.
+      against the old token history. Stale output is dropped
+      (``Request.drop_stale_output``) only by the wholesale
+      ``reset_prefix_cache`` teardown and when a resumable streaming-input
+      request stops; wiring ordinary preemption into it drops valid tokens and
+      silently truncates the response.
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting

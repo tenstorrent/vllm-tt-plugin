@@ -206,6 +206,25 @@ def test_stage_inputs_follow_the_request_until_it_finishes():
     assert "a" not in runner.requests
 
 
+def test_a_resume_delivered_as_new_keeps_the_payload_it_arrived_with():
+    """vLLM's V2 scheduler output delivers the resume as a new request, and the
+    runner rebuilds its cached state from that record. The payload is the one the
+    request arrived with, whatever the resume record carries."""
+    payload = {"voice": "clone", "ref_code": [[1, 2, 3]]}
+    runner = _runner(supports_stage_inputs=True)
+    _run_prefill(
+        runner, _step(new=[_new_request("a", payload)], scheduled={"a": PROMPT_LEN})
+    )
+    runner._update_states(_step(preempted={"a"}))
+
+    resume = _new_request("a", {"voice": "updated"})
+    resume.prefill_token_ids = list(resume.prompt_token_ids)
+    kwargs = _run_prefill(runner, _step(new=[resume], scheduled={"a": PROMPT_LEN}))
+
+    assert kwargs["stage_inputs"] == [payload]
+    assert kwargs["stage_inputs"][0] is payload
+
+
 def test_a_model_without_the_capability_gets_no_stage_inputs_keyword():
     runner = _runner(supports_stage_inputs=False)
 

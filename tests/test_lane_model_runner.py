@@ -550,6 +550,7 @@ def test_async_lane_decode_uses_batch_extraction():
         req_ids=["req-4"],
         req_id_to_index={"req-4": 0},
         submit_time_ns=123,
+        request_states=(None,),
     )
     model_input = object()
 

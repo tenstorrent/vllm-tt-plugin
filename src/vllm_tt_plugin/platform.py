@@ -981,31 +981,38 @@ def _uninstall_tt_async_spec_method_patch() -> None:
 def _pin_v1_model_runner() -> None:
     """Keep the engine on vLLM's V1 model runner.
 
-    ``VllmConfig.use_v2_model_runner`` defaults on for every dense architecture,
-    and the V2 scheduler drops two things the TT runner reads: it folds
-    preemption-resumed requests into ``scheduled_new_reqs`` (so
-    ``CachedRequestData.resumed_req_ids`` is always empty) and stops populating
-    ``all_token_ids``, moving the history to
-    ``NewRequestData.prefill_token_ids``. ``build_cached_request_state`` reads
-    neither, so a resume after preemption would rebuild the request with an empty
-    ``output_token_ids`` while ``num_computed_tokens`` still counts the generated
-    tokens: silent output corruption.
+    ``VllmConfig.use_v2_model_runner`` defaults on for every architecture when
+    Triton is present and no requested feature is refused under V2.
+    The TT runner reads the V2 scheduler output, where a request resumed after
+    preemption arrives in ``scheduled_new_reqs`` with its history in
+    ``NewRequestData.prefill_token_ids``. Known V2 differences the TT backend
+    does not handle yet:
+
+    - ``InputProcessor`` loads custom logits processors with the V2 loader
+      (``vllm.v1.worker.gpu.sample.logits_processor``), which rejects a class
+      without the V2 interface, while ``TTModelRunner`` builds its processors
+      with the V1 ``build_logitsprocs``.
+    - ``VllmConfig`` refuses the ``ngram`` speculative method under V2, and TT
+      n-gram drafting uses the V1 ``NgramProposer``.
 
     Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
     which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
-    set to the empty string. Pin the variable rather than rely on that.
+    set to the empty string. Pin the variable rather than rely on that. Two
+    options select V2 whatever the variable says: ``--watermark-config``, and
+    ``attention_config.hisparse_config``, which raises when the variable is 0.
 
-    Refuse an explicit opt-in instead of honoring it: the corruption is silent,
-    so a clear failure is strictly more useful than a wrong answer.
+    Refuse an explicit opt-in instead of honoring it: the TT backend has not
+    been validated on the V2 path, so a clear failure is more useful than an
+    unvalidated run.
     """
     requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
     if requested is not None and requested != "0":
         raise ValueError(
             f"{_V2_MODEL_RUNNER_ENV}={requested!r} selects vLLM's V2 model "
-            "runner. The TT backend implements only the V1 model-runner "
-            "contract: under V2 a request resumed after preemption silently "
-            f"loses every generated token. Unset {_V2_MODEL_RUNNER_ENV} or set "
-            "it to 0."
+            "runner. The TT backend does not implement all of the V2 "
+            "model-runner contract yet: custom logits processors are loaded "
+            "for V2 but run as V1, and n-gram drafting needs V1. Unset "
+            f"{_V2_MODEL_RUNNER_ENV} or set it to 0."
         )
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
