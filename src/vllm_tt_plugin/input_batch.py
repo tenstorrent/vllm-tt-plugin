@@ -109,9 +109,10 @@ def log_prefill_chunks(
 @dataclass
 class TTCachedRequestState(CachedRequestState):
     # A pipeline stage's per-request input: vLLM-Omni's ``additional_information``
-    # as it stood when the request arrived, decoded to a plain dict. It lives
-    # exactly as long as the cached state: kept across preemption, so a resumed
-    # prefill sees it again, and dropped on finish or abort.
+    # as it stood when the request arrived, decoded to a plain dict. It lives as
+    # long as the request: kept across preemption, also when the resume rebuilds
+    # the cached state (``build_cached_request_state`` takes it from the held
+    # state), so a resumed prefill sees it again, and dropped on finish or abort.
     stage_inputs: Any = None
 
 
@@ -143,7 +144,10 @@ def build_cached_request_state(
 
     ``supports_stage_inputs`` is the model's declaration. Without it the request's
     ``additional_information`` is not kept: vLLM-Omni puts engine bookkeeping on
-    every request, so its presence does not mean the model needs it.
+    every request, so its presence does not mean the model needs it. With it,
+    ``stage_inputs`` is the payload the request arrived with, so a request the
+    caller still holds keeps ``held.stage_inputs`` and its record's payload is
+    not read.
 
     ``NewRequestData.prefill_token_ids`` seeds ``output_token_ids``. vLLM's V2
     scheduler output delivers a request resumed after preemption as a new
@@ -188,7 +192,9 @@ def build_cached_request_state(
         generator = torch.Generator(device="cpu")
         generator.manual_seed(sampling_params.seed)
     stage_inputs = None
-    if supports_stage_inputs:
+    if supports_stage_inputs and held is not None:
+        stage_inputs = held.stage_inputs
+    elif supports_stage_inputs:
         stage_inputs = _decode_stage_inputs(
             getattr(new_req_data, "additional_information", None)
         )
@@ -1049,15 +1055,16 @@ class TTLaneInputBatch(InputBatch):
         req_ids_to_add: list[str] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            # A scheduled_new_reqs entry rebuilds the request from its record
-            # (``build_cached_request_state`` keeps only a resumed request's
-            # generator). A resumable streaming-input request comes back as new with
-            # its next input chunk while it still holds its row, and the
-            # coordinator places it on that same row. ``add_request`` writes a
-            # row's generator, bad words and allowlist membership only when the
-            # new sampling params set them, so the row is cleared first or the
-            # previous record's entries survive. Model-owned state is not
-            # released here: finish and preemption own that.
+            # A scheduled_new_reqs entry rebuilds the request from its record;
+            # ``build_cached_request_state`` keeps from the held state only what
+            # the record cannot carry. A resumable streaming-input request comes
+            # back as new with its next input chunk while it still holds its
+            # row, and the coordinator places it on that same row.
+            # ``add_request`` writes a row's generator, bad words and allowlist
+            # membership only when the new sampling params set them, so the row
+            # is cleared first or the previous record's entries survive.
+            # Model-owned state is not released here: finish and preemption own
+            # that.
             self.remove_request(req_id)
             # Lane mode refuses supports_stage_inputs at config time: its prefill
             # inputs carry no per-row stage inputs.
