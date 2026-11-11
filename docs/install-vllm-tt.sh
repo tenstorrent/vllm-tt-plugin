@@ -40,4 +40,9 @@ uv pip install numba==0.61.2   # matches vLLM's own requirements/cuda.txt pin
 # vLLM has to come from source. vLLM ends up declaring no torch dependency, which
 # is intended; torch belongs to the tt-metal env this plugin runs inside.
 VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.30.0
+# Patch the installed vLLM with the backports in patches/vllm-<version>/ (MiMo
+# tool calling; see patches/vllm-0.30.0/README.md). Skips a patch that is
+# already applied and a vLLM version with no patch directory; fails on a conflict.
+bash patches/apply-vllm-patches.sh ||
+    { echo "install-vllm-tt: patching vLLM failed"; return 1; }
 uv pip install -e .

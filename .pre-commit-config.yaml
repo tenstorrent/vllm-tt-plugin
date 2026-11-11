@@ -6,8 +6,11 @@ repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v6.0.0
   hooks:
+  # Patch context lines end in whitespace; "fixing" them corrupts the patch.
   - id: trailing-whitespace
+    exclude: ^patches/.*\.patch$
   - id: end-of-file-fixer
+    exclude: ^patches/.*\.patch$
   - id: check-yaml
   - id: check-toml
   - id: check-merge-conflict
