@@ -1045,6 +1045,17 @@ class TTModelRunner:
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            # A scheduled_new_reqs entry replaces everything the runner holds
+            # for its id. The id still holds a row when the request was in the
+            # previous step and comes back as new in this one: a resumable
+            # streaming-input request with its next input chunk, or, in vLLM's
+            # V2 scheduler output, a request that resumes in the same step that
+            # reports its preemption. Model-owned state is not released here:
+            # the finish and preemption handling above owns that.
+            req_index = self.input_batch.remove_request(req_id)
+            if req_index is not None:
+                removed_req_indices.append(req_index)
+                persistent_batch_layout_changed = True
             self.requests[req_id] = build_cached_request_state(
                 new_req_data, supports_stage_inputs=self.supports_stage_inputs
             )

@@ -141,12 +141,32 @@ def build_cached_request_state(
     ``supports_stage_inputs`` is the model's declaration. Without it the request's
     ``additional_information`` is not kept: vLLM-Omni puts engine bookkeeping on
     every request, so its presence does not mean the model needs it.
+
+    ``NewRequestData.prefill_token_ids`` seeds ``output_token_ids``. vLLM's V2
+    scheduler output delivers a request resumed after preemption as a new
+    request, and that field is the only place its generated tokens appear. The
+    V1 scheduler output leaves the field ``None`` and reports a resume through
+    ``scheduled_cached_reqs`` instead.
     """
     assert new_req_data.sampling_params is not None, (
         "Pooling is not supported for TT yet"
     )
     if new_req_data.prompt_token_ids is None:
         raise NotImplementedError("TT backend does not support prompt_embeds yet")
+    num_prompt_tokens = len(new_req_data.prompt_token_ids)
+    prefill_token_ids = new_req_data.prefill_token_ids
+    output_token_ids: list[int] = []
+    if prefill_token_ids is not None:
+        if len(prefill_token_ids) < num_prompt_tokens:
+            raise ValueError(
+                f"Request {new_req_data.req_id}: prefill_token_ids holds "
+                f"{len(prefill_token_ids)} tokens, fewer than its "
+                f"{num_prompt_tokens} prompt tokens"
+            )
+        # Copied, never kept by reference: in a single-process engine
+        # prefill_token_ids can be the scheduler's own Request._all_token_ids,
+        # which keeps growing.
+        output_token_ids = list(prefill_token_ids[num_prompt_tokens:])
     sampling_params = new_req_data.sampling_params
     if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
         generator = torch.Generator(device="cpu")
@@ -167,7 +187,7 @@ def build_cached_request_state(
         generator=generator,
         block_ids=new_req_data.block_ids,
         num_computed_tokens=new_req_data.num_computed_tokens,
-        output_token_ids=[],
+        output_token_ids=output_token_ids,
         lora_request=new_req_data.lora_request,
         prompt_embeds=new_req_data.prompt_embeds,
         stage_inputs=stage_inputs,
@@ -1015,6 +1035,15 @@ class TTLaneInputBatch(InputBatch):
         req_ids_to_add: list[str] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            # A scheduled_new_reqs entry replaces everything this batch holds for
+            # its id. A resumable streaming-input request comes back as new with
+            # its next input chunk while it still holds its row, and the
+            # coordinator places it on that same row. ``add_request`` writes a
+            # row's generator, bad words and allowlist membership only when the
+            # new sampling params set them, so the row is cleared first or the
+            # previous record's entries survive. Model-owned state is not
+            # released here: finish and preemption own that.
+            self.remove_request(req_id)
             # Lane mode refuses supports_stage_inputs at config time: its prefill
             # inputs carry no per-row stage inputs.
             requests[req_id] = build_cached_request_state(
