@@ -50,7 +50,8 @@ for the appropriate tt-metal and vLLM commits.
 
 The plugin requires Python `>=3.11,<3.14`; vLLM 0.32.0 requires 3.11 or newer.
 tt-metal's Ubuntu 24.04 environment (Python 3.12) qualifies. The Ubuntu 22.04
-default `python3` (3.10) does not.
+default `python3` (3.10) does not: on Python 3.10, use the `compat/vllm-0.31.0`
+tag (vLLM 0.31.0) as described below.
 
 The installation script builds vLLM `0.32.0` from source with
 `VLLM_TARGET_DEVICE=empty`.

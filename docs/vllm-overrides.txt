@@ -24,5 +24,9 @@ numpy>=1.24.4,<2
 # transformers 5.12.1 (tt_metal/python_env/requirements-dev.txt), but common.txt
 # requires tokenizers>=0.23.2 and every transformers release below 5.16.0 caps
 # tokenizers at 0.23.0, so the install upgrades transformers in the tt-metal env to
-# a release tt-metal does not validate.
+# a release tt-metal does not validate. transformers 5.15.0 and later raise
+# AmbiguousGlobalPerLayerAttributeError when code reads head_dim or
+# num_key_value_heads off a Gemma 4 or DiffusionGemma text config instead of
+# text_config.per_layer_config[i]; tt-metal's Gemma 4 and DiffusionGemma model code
+# must read them per layer before those models can run on this install.
 transformers>=5.16.1,<5.20.0
