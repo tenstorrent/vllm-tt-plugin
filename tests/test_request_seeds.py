@@ -21,7 +21,6 @@ def test_large_signed_seeds_survive_request_compaction(large_seeds):
         max_num_batched_tokens=16,
         vocab_size=128,
         block_sizes=[16],
-        kernel_block_sizes=[16],
     )
     seeds = [17, *large_seeds]
     for index, seed in enumerate(seeds):

@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -255,7 +255,7 @@ class RunManifest:
         self.records.append(
             {
                 "test": name,
-                "at": datetime.now(timezone.utc).isoformat(),
+                "at": datetime.now(UTC).isoformat(),
                 **payload,
             }
         )
@@ -265,7 +265,7 @@ class RunManifest:
         if metrics is not None:
             (self.directory / "metrics-final.txt").write_text(metrics.raw)
         manifest = {
-            "written_at": datetime.now(timezone.utc).isoformat(),
+            "written_at": datetime.now(UTC).isoformat(),
             "declared_config": self.config,
             "launch_args": self.launch_args,
             "environment": self.environment,

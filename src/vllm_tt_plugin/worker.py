@@ -722,7 +722,7 @@ def _upstream_admission_blocks(
     )
     if not groups:
         return 0
-    bytes_per_block = _pool_bytes_per_block(groups)
+    bytes_per_block = _pool_bytes_per_block(sizing_config, groups)
     one_request_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
     null_block = 1
     return -(-one_request_bytes // bytes_per_block) + null_block
@@ -896,7 +896,7 @@ def _fit_block_output_max_model_len(
     """Fit ``--max-model-len -1`` to the block-output KV pool.
 
     Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
-    (vllm/v1/core/kv_cache_utils.py:2092): the TT pool is a fixed budget
+    (vllm/v1/core/kv_cache_utils.py): the TT pool is a fixed budget
     rather than profiled memory, and the upstream fit would hand the whole
     pool to ``max_model_len``, while a block-output request also needs one
     full output canvas of headroom. The engine snapshots ``max_model_len``

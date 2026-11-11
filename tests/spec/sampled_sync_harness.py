@@ -46,7 +46,6 @@ def _runner(model: SampledTarget, num_speculative_tokens: int = DRAFT_LEN):
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=SAMPLED_VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     plan = type(model).spec_plan(None, MAX_NUM_REQS, max(num_speculative_tokens, 1))
     runner = SimpleNamespace(

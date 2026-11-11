@@ -98,7 +98,7 @@ The whole unit suite runs on any machine. `tests/host-stubs/ttnn/` supplies an
 import-only `ttnn` stand-in whose every device-reaching entry point raises. A
 test that starts depending on real hardware fails loudly there rather than
 passing against a fake device. Work from the repository root. `uv` must
-already be installed. CI also runs this recipe on Python 3.10.
+already be installed. vLLM requires Python 3.11 or newer.
 
 ```bash
 export VIRTUAL_ENV="$PWD/.venv"
@@ -218,13 +218,13 @@ marked ready for review. Draft pull requests run nothing, and converting a
 pull request to draft cancels its run in progress. Its jobs:
 
 - `pre-commit` on `ubuntu-latest`
-- `host-tests-stubbed` on Python 3.10 and 3.12 with `tests/host-stubs`, which
+- `host-tests-stubbed` on Python 3.12 with `tests/host-stubs`, which
   installs through `docs/install-vllm-tt.sh`. That job therefore also fails
   when the documented install path rots, which is intentional. It calls the
   reusable `.github/workflows/host-tests-stubbed.yaml`, which
   `vllm-release-watch.yml` also runs against the pinned and the latest vLLM.
-- `host-tests-ttnn` with real `ttnn`, inside tt-metal's Ubuntu 22.04 and 24.04
-  release images for the latest stable tag and the latest release tag (dev or
+- `host-tests-ttnn` with real `ttnn`, inside tt-metal's Ubuntu 24.04
+  release image for the latest stable tag and the latest release tag (dev or
   rc). Its failures show on the pull request but do not block merging, and
   `required-checks` does not wait for it. A `workflow_dispatch` run
   can name one tt-metal tag instead.

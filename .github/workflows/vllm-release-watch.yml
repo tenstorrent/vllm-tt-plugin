@@ -124,7 +124,7 @@ jobs:
     uses: ./.github/workflows/host-tests-stubbed.yaml
     with:
       vllm-version: ${{ matrix.vllm }}
-      python-versions: '["3.10"]'
+      python-versions: '["3.12"]'
       report: true
 
   upstream-diffs:
