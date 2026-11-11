@@ -129,7 +129,10 @@ def _decode_stage_inputs(payload: Any) -> dict | None:
 
 
 def build_cached_request_state(
-    new_req_data, *, supports_stage_inputs: bool
+    new_req_data,
+    *,
+    supports_stage_inputs: bool,
+    held: TTCachedRequestState | None = None,
 ) -> TTCachedRequestState:
     """Build the cached state for one newly-scheduled request.
 
@@ -147,6 +150,15 @@ def build_cached_request_state(
     request, and that field is the only place its generated tokens appear. The
     V1 scheduler output leaves the field ``None`` and reports a resume through
     ``scheduled_cached_reqs`` instead.
+
+    ``held`` is the state the caller still holds for this request id, or
+    ``None``. The record cannot carry a seeded request's host ``torch.Generator``,
+    which has advanced once per sampled token, so a record with generated tokens
+    takes ``held.generator`` instead of a fresh one. Such a record is a resume
+    after preemption, and the caller keeps a preempted request's state. A record
+    with no generated tokens gets a fresh generator: nothing has been sampled
+    from ``held.generator`` yet, because intermediate prefill chunks sample from
+    a clone.
     """
     assert new_req_data.sampling_params is not None, (
         "Pooling is not supported for TT yet"
@@ -168,11 +180,13 @@ def build_cached_request_state(
         # which keeps growing.
         output_token_ids = list(prefill_token_ids[num_prompt_tokens:])
     sampling_params = new_req_data.sampling_params
-    if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+    if sampling_params.sampling_type != SamplingType.RANDOM_SEED:
+        generator = None
+    elif output_token_ids and held is not None and held.generator is not None:
+        generator = held.generator
+    else:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(sampling_params.seed)
-    else:
-        generator = None
     stage_inputs = None
     if supports_stage_inputs:
         stage_inputs = _decode_stage_inputs(
@@ -1035,8 +1049,9 @@ class TTLaneInputBatch(InputBatch):
         req_ids_to_add: list[str] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            # A scheduled_new_reqs entry replaces everything this batch holds for
-            # its id. A resumable streaming-input request comes back as new with
+            # A scheduled_new_reqs entry rebuilds the request from its record
+            # (``build_cached_request_state`` keeps only a resumed request's
+            # generator). A resumable streaming-input request comes back as new with
             # its next input chunk while it still holds its row, and the
             # coordinator places it on that same row. ``add_request`` writes a
             # row's generator, bad words and allowlist membership only when the
@@ -1047,7 +1062,7 @@ class TTLaneInputBatch(InputBatch):
             # Lane mode refuses supports_stage_inputs at config time: its prefill
             # inputs carry no per-row stage inputs.
             requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=False
+                new_req_data, supports_stage_inputs=False, held=requests.get(req_id)
             )
             req_ids_to_add.append(req_id)
 

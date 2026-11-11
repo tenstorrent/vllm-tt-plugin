@@ -16,6 +16,7 @@ lane-DP ``TTLaneInputBatch.apply_step_plan`` through both output shapes.
 """
 
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 
@@ -27,6 +28,7 @@ from vllm_tt_plugin.input_batch import build_cached_request_state
 PROMPT = [11, 12, 13, 14]
 GENERATED = [21, 22, 23]
 HISTORY = PROMPT + GENERATED
+SEED = 7
 
 
 def _record(
@@ -102,36 +104,81 @@ def test_prefill_token_ids_shorter_than_the_prompt_is_refused():
         build_cached_request_state(record, supports_stage_inputs=False)
 
 
+def _sampled_from(state):
+    """Advance a seeded state's generator once per ``GENERATED`` token, as host
+    sampling would; return the generator state after those draws."""
+    for _ in GENERATED:
+        torch.rand(4, generator=state.generator)
+    return state.generator.get_state().clone()
+
+
+def test_a_resume_with_generated_tokens_keeps_the_held_generator():
+    held = build_cached_request_state(
+        _record("a", PROMPT, seed=SEED), supports_stage_inputs=False
+    )
+    advanced = _sampled_from(held)
+
+    state = build_cached_request_state(
+        _record("a", PROMPT, generated=GENERATED, seed=SEED),
+        supports_stage_inputs=False,
+        held=held,
+    )
+
+    assert state.generator is held.generator
+    assert torch.equal(state.generator.get_state(), advanced)
+
+
+def test_a_record_without_generated_tokens_gets_a_fresh_generator():
+    """A streaming-input continuation, or a resume preempted before its first
+    sample: its record holds no generated tokens."""
+    held = build_cached_request_state(
+        _record("a", PROMPT, seed=SEED), supports_stage_inputs=False
+    )
+    _sampled_from(held)
+
+    state = build_cached_request_state(
+        _record("a", PROMPT, generated=[], seed=SEED),
+        supports_stage_inputs=False,
+        held=held,
+    )
+
+    assert state.generator is not held.generator
+    fresh = torch.Generator().manual_seed(SEED).get_state()
+    assert torch.equal(state.generator.get_state(), fresh)
+
+
 # --------------------------------------------------------------------------
 # Front-packed: TTModelRunner._update_states
 # --------------------------------------------------------------------------
 
 
 def _preempted_runner():
-    """A runner whose request "a" generated ``GENERATED`` and was then preempted."""
+    """A runner whose seeded request "a" sampled ``GENERATED`` and was then
+    preempted. Returns the runner and the generator state after those samples."""
     runner = _runner(supports_stage_inputs=False)
     runner._update_states(
-        _step(new=[_record("a", PROMPT)], scheduled={"a": len(PROMPT)})
+        _step(new=[_record("a", PROMPT, seed=SEED)], scheduled={"a": len(PROMPT)})
     )
     # The runner appends every sampled token to the cached state.
     runner.requests["a"].output_token_ids.extend(GENERATED)
+    advanced = _sampled_from(runner.requests["a"])
     runner._update_states(_step(preempted={"a"}))
     assert "a" not in runner.input_batch.req_id_to_index
-    return runner
+    return runner, advanced
 
 
 def _resume_step(shape, num_scheduled):
     if shape == "v1":
         return _step(cached=_resumed("a"), scheduled={"a": num_scheduled})
     return _step(
-        new=[_record("a", PROMPT, generated=GENERATED, block_ids=([1],))],
+        new=[_record("a", PROMPT, generated=GENERATED, block_ids=([1],), seed=SEED)],
         scheduled={"a": num_scheduled},
     )
 
 
 @pytest.mark.parametrize("shape", ["v1", "v2"])
 def test_a_resume_replays_the_prompt_and_the_generated_tokens(shape):
-    runner = _preempted_runner()
+    runner, _ = _preempted_runner()
     step = _resume_step(shape, len(HISTORY))
 
     runner._update_states(step)
@@ -152,7 +199,7 @@ def test_a_resume_replayed_in_chunks_samples_only_after_the_last(shape):
     """Every chunk but the last stops short of ``num_tokens``, so it samples
     nothing. With the generated tokens missing, the first chunk would already
     reach ``num_tokens`` and sample against a partial replay."""
-    runner = _preempted_runner()
+    runner, _ = _preempted_runner()
     first = _resume_step(shape, 5)
 
     runner._update_states(first)
@@ -162,13 +209,26 @@ def test_a_resume_replayed_in_chunks_samples_only_after_the_last(shape):
     assert model_input.intermediate_prefill_mask.tolist() == [True]
 
 
+@pytest.mark.parametrize("shape", ["v1", "v2"])
+def test_a_seeded_resume_samples_on_from_its_advanced_generator(shape):
+    """Host sampling draws from the row's generator. A resume that restarted it
+    from the seed would repeat the draws of the tokens already generated."""
+    runner, advanced = _preempted_runner()
+
+    runner._update_states(_resume_step(shape, len(HISTORY)))
+
+    batch = runner.input_batch
+    generator = batch.sampling.generators[batch.req_id_to_index["a"]]
+    assert torch.equal(generator.get_state(), advanced)
+
+
 def test_a_request_scheduled_as_new_while_holding_a_row_is_rebuilt_in_that_row():
     """A streaming-input continuation: "a" ran in the previous step and comes
     back as new with its next input chunk, now unseeded."""
     runner = _runner(supports_stage_inputs=False)
     runner._update_states(
         _step(
-            new=[_record("a", PROMPT, seed=7), _record("b", [5, 6])],
+            new=[_record("a", PROMPT, seed=SEED), _record("b", [5, 6])],
             scheduled={"a": len(PROMPT), "b": 2},
         )
     )
@@ -226,12 +286,13 @@ def test_lane_resume_rebuilds_the_same_row_in_either_output_shape(shape):
     b = _lane_batch(num_lanes=1, per_lane=2)
     requests: dict = {}
     b.apply_step_plan(
-        _step_output(new_reqs=[_record("a", PROMPT), _record("b", [5, 6])]),
+        _step_output(new_reqs=[_record("a", PROMPT, seed=SEED), _record("b", [5, 6])]),
         _plan({"a": 0, "b": 1}, capacity=2),
         requests,
         {},
     )
     requests["a"].output_token_ids.extend(GENERATED)
+    advanced = _sampled_from(requests["a"])
     b.apply_step_plan(
         _step_output(preempted=["a"]),
         _plan({"b": 1}, is_decode=True, capacity=2),
@@ -253,7 +314,9 @@ def test_lane_resume_rebuilds_the_same_row_in_either_output_shape(shape):
         )
     else:
         resume = _step_output(
-            new_reqs=[_record("a", PROMPT, generated=GENERATED, block_ids=([7],))]
+            new_reqs=[
+                _record("a", PROMPT, generated=GENERATED, block_ids=([7],), seed=SEED)
+            ]
         )
     b.apply_step_plan(resume, _plan({"a": 0}, capacity=2), requests, {})
 
@@ -262,6 +325,7 @@ def test_lane_resume_rebuilds_the_same_row_in_either_output_shape(shape):
     assert requests["a"].output_token_ids == GENERATED
     assert b.num_tokens[0] == len(HISTORY)
     assert b.token_ids_cpu[0, : len(HISTORY)].tolist() == HISTORY
+    assert torch.equal(b.sampling.generators[0].get_state(), advanced)
 
 
 def test_lane_request_scheduled_as_new_on_its_own_row_drops_its_old_row_state():
@@ -270,7 +334,7 @@ def test_lane_request_scheduled_as_new_on_its_own_row_drops_its_old_row_state():
     b = _lane_batch(num_lanes=1, per_lane=2)
     requests: dict = {}
     b.apply_step_plan(
-        _step_output(new_reqs=[_record("a", PROMPT, seed=7)]),
+        _step_output(new_reqs=[_record("a", PROMPT, seed=SEED)]),
         _plan({"a": 0}, capacity=2),
         requests,
         {},

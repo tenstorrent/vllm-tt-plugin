@@ -1045,8 +1045,9 @@ class TTModelRunner:
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
-            # A scheduled_new_reqs entry replaces everything the runner holds
-            # for its id. The id still holds a row when the request was in the
+            # A scheduled_new_reqs entry rebuilds the request from its record
+            # (``build_cached_request_state`` keeps only a resumed request's
+            # generator). The id still holds a row when the request was in the
             # previous step and comes back as new in this one: a resumable
             # streaming-input request with its next input chunk, or, in vLLM's
             # V2 scheduler output, a request that resumes in the same step that
@@ -1057,7 +1058,9 @@ class TTModelRunner:
                 removed_req_indices.append(req_index)
                 persistent_batch_layout_changed = True
             self.requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=self.supports_stage_inputs
+                new_req_data,
+                supports_stage_inputs=self.supports_stage_inputs,
+                held=self.requests.get(req_id),
             )
             req_ids_to_add.append(req_id)
 

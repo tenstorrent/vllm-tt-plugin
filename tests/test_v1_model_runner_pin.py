@@ -4,7 +4,7 @@
 """The TT backend runs only vLLM's V1 model runner.
 
 ``_pin_v1_model_runner`` lists the V2 differences the TT backend does not
-handle yet; one of them changes seeded output silently. Upstream defaults V2 on
+handle yet. Upstream defaults V2 on
 for dense architectures, so these tests guard both halves of the pin: that the
 plugin writes it, and that upstream still honors the knob the plugin writes.
 """

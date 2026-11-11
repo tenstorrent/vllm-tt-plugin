@@ -987,30 +987,28 @@ def _pin_v1_model_runner() -> None:
     ``NewRequestData.prefill_token_ids``. Known V2 differences the TT backend
     does not handle yet:
 
-    - A seeded request resumed under V2 gets a new ``TTCachedRequestState``,
-      whose ``torch.Generator`` restarts from the seed. Under V1 the request
-      keeps its cached state, and host sampling continues from the advanced
-      generator. The V2 output is different and nothing reports it.
     - ``InputProcessor`` loads custom logits processors with the V2 loader
       (``vllm.v1.worker.gpu.sample.logits_processor``), which rejects a class
       without the V2 interface, while ``TTModelRunner`` builds its processors
       with the V1 ``build_logitsprocs``.
+    - ``VllmConfig`` refuses the ``ngram`` speculative method under V2, and TT
+      n-gram drafting uses the V1 ``NgramProposer``.
 
     Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
     which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
     set to the empty string. Pin the variable rather than rely on that.
 
-    Refuse an explicit opt-in instead of honoring it: the generator restart is
-    silent, so a clear failure is strictly more useful.
+    Refuse an explicit opt-in instead of honoring it: the TT backend has not
+    been validated on the V2 path, so a clear failure is more useful than an
+    unvalidated run.
     """
     requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
     if requested is not None and requested != "0":
         raise ValueError(
             f"{_V2_MODEL_RUNNER_ENV}={requested!r} selects vLLM's V2 model "
             "runner. The TT backend does not implement all of the V2 "
-            "model-runner contract yet: a seeded request resumed after "
-            "preemption restarts its random generator, and custom logits "
-            "processors are loaded for V2 but run as V1. Unset "
+            "model-runner contract yet: custom logits processors are loaded "
+            "for V2 but run as V1, and n-gram drafting needs V1. Unset "
             f"{_V2_MODEL_RUNNER_ENV} or set it to 0."
         )
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
