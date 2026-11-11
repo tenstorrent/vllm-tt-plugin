@@ -36,6 +36,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- spec_admission.py    # Speculative configuration and model-plan validation
 |   +-- spec_decode.py       # Candidate/verification types and greedy acceptance
 |   +-- spec_accept.py       # Host sampled acceptance for the logits accept mode
+|   +-- sample/              # Host sampler, its ops, and host logits processors
 |   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
@@ -333,7 +334,7 @@ Common options:
 | `fabric_config` | Fabric config such as `DISABLED`, `FABRIC_1D`, `FABRIC_2D`, `FABRIC_1D_RING`, `FABRIC_2D_TORUS_XY`, or `CUSTOM`. Any `ttnn.FabricConfig` name is accepted. Overrides model defaults; otherwise defaults to Wormhole Galaxy `FABRIC_1D_RING`, Blackhole Galaxy `FABRIC_2D_TORUS_XY`, other multi-device `FABRIC_1D`. |
 | `fabric_reliability_mode` | Fabric reliability mode, such as `STRICT_INIT` or `RELAXED_INIT`. |
 | `dispatch_core_axis` | Dispatch core axis, `row` or `col`. |
-| `always_compat_sampling` | Use vLLM's LogitProcessor and sampler path even when not required by the batch. Default: `false`. |
+| `always_compat_sampling` | Use the host logits processor and sampler path even when not required by the batch. Default: `false`. |
 | `decode_interleave_enabled` | Insert decode-only steps into a run of consecutive prefill steps, so a running request's inter-token latency does not scale with another request's prompt length. Default: `true`. |
 | `decode_interleave_prefill_steps` | Consecutive prefill steps allowed before one insertion. Raise it to favor time to first token, lower it to favor inter-token latency. Default: `2`. |
 | `decode_interleave_decode_steps` | How many decode-only steps one insertion runs. Reaching this count stops the policy choosing decode; it never forces a prefill step. Does not loosen the latency bound; buys more decode progress per insertion, and more cheaply than a shorter prefill run does. Default: `1`. |
@@ -660,7 +661,7 @@ Two drafting methods execute today:
 
 | `speculative_config.method` | Proposal source | Required model implementation |
 | --- | --- | --- |
-| `ngram` | vLLM's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
+| `ngram` | The plugin's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
 | `custom_class` | The selected adapter's `propose_draft_tokens` | `spec_plan`, multi-position verification and `device_propose` in `spec_requirements` |
 
 Two accept modes execute, chosen per step from the adapter's `SpecPlan`. With
@@ -1011,6 +1012,19 @@ Block-output models (`output_tokens_per_step > 1`) cannot declare this capabilit
 ## Request seeds
 
 Sampling batches preserve signed 64-bit request seeds, including through slot compaction. Host generators retain the original seed. A model whose device sampler requires a narrower seed remains responsible for conversion at its device boundary. Host and device samplers need not generate identical random streams.
+
+## Custom logits processors
+
+Classes named by `--logits-processors`, and processors installed under the
+`vllm.logits_processors` entry-point group, must implement vLLM's V2 interface,
+`vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor`.
+`TTModelRunner` refuses any other class when it starts. While custom
+processors are loaded, every step samples on the host. The host sampler applies
+them after the penalties and before temperature, `min_p`, top-k and top-p. The
+`req_states` buffers are host tensors: `.gpu`, `.cpu` and `.np` name the same
+storage. A row whose token is discarded, such as an intermediate prefill
+chunk, is presented at the request's last committed position. Custom
+processors are refused with speculative decoding and with block-output models.
 
 ## Host sampling readback
 

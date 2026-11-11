@@ -4,7 +4,7 @@
 
 ``TTModelRunner._update_states`` removes finished requests from the
 front-packed ``InputBatch`` and places new ones into the freed rows in the same
-step, before ``refresh_logitsprocs``. vLLM's builtin processors apply a batch
+step, before ``refresh_logitsprocs``. The builtin processors apply a batch
 update's ``added`` entries before its ``removed`` ones, so a reused row that is
 also still listed as removed has the new request's state set and then cleared.
 min_tokens, logit_bias and min_p then go unapplied for the life of that
@@ -17,21 +17,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.utils import torch_utils
-from vllm.v1.sample.logits_processor import build_logitsprocs
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin.input_batch import InputBatch
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.logits_processor import build_logitsprocs
 
 VOCAB = 16
 BLOCK = 16
 MAX_MODEL_LEN = 128
-
-
-@pytest.fixture(autouse=True)
-def _disable_pinned_memory(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
 
 
 def _batch() -> InputBatch:
@@ -42,13 +36,10 @@ def _batch() -> InputBatch:
     return InputBatch(
         max_num_reqs=4,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],
-        logitsprocs=build_logitsprocs(
-            config, torch.device("cpu"), is_pin_memory=False, is_pooling_model=False
-        ),
+        logitsprocs=build_logitsprocs(config),
     )
 
 

@@ -22,59 +22,48 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
-from vllm.utils import torch_utils
 from vllm.v1.core.sched.output import GrammarOutput
-from vllm.v1.sample import sampler as sampler_module
-from vllm.v1.sample.logits_processor import AdapterLogitsProcessor, build_logitsprocs
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops import penalties as penalties_module
-from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
+from vllm.v1.worker.gpu.sample.logits_processor import LogitsProcessor
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
 from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.logits_processor import build_logitsprocs
+from vllm_tt_plugin.sample.metadata import SamplingMetadata
+from vllm_tt_plugin.sample.sampler import Sampler
 
 VOCAB = 64
 BLOCK = 16
 MAX_MODEL_LEN = 256
 
 
-@pytest.fixture(autouse=True)
-def _disable_pinned_memory(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
-    monkeypatch.setattr(sampler_module, "PIN_MEMORY", False)
-    monkeypatch.setattr(penalties_module, "PIN_MEMORY", False)
-
-
-class FirstPromptTokenBoost(AdapterLogitsProcessor):
+class FirstPromptTokenBoost(LogitsProcessor):
     """Custom logits processor: boost the token equal to the request's first
     prompt token. Intrinsic to the request, so it is batching-invariant."""
 
-    def is_argmax_invariant(self) -> bool:
-        return False
+    def __init__(self, vllm_config, req_states):
+        self.req_states = req_states
 
-    def new_req_logits_processor(self, params):
-        def boost(prompt_ids, output_ids, logits):
-            if prompt_ids:
-                logits[prompt_ids[0]] = logits[prompt_ids[0]] + 50.0
-            return logits
-
-        return boost
+    def apply(self, logits, ctx):
+        slots = ctx.expanded_idx_mapping.long()
+        rows = torch.arange(logits.shape[0])[self.req_states.prompt_len.gpu[slots] > 0]
+        first = self.req_states.all_token_ids.gpu[slots[rows], 0].long()
+        logits[rows, first] += 50.0
+        return logits
 
 
 def _make_logitsprocs(max_num_reqs, with_custom=True):
     cfg = SimpleNamespace(
         speculative_config=None,
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_reqs),
+        model_config=SimpleNamespace(
+            max_model_len=MAX_MODEL_LEN, get_vocab_size=lambda: VOCAB
+        ),
     )
     return build_logitsprocs(
-        cfg,
-        torch.device("cpu"),
-        is_pin_memory=False,
-        is_pooling_model=False,
-        custom_logitsprocs=[FirstPromptTokenBoost] if with_custom else [],
+        cfg, custom_logitsprocs=[FirstPromptTokenBoost] if with_custom else []
     )
 
 
@@ -100,7 +89,6 @@ def _lane_batch(num_lanes, per_lane, with_custom=True, disable_logprobs=False):
         num_lanes=num_lanes,
         per_lane=per_lane,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN * num_lanes * per_lane,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],
@@ -713,7 +701,6 @@ def _plain_batch_of_one(
     b = InputBatch(
         max_num_reqs=1,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
         kernel_block_sizes=[BLOCK],

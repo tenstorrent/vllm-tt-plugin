@@ -3,10 +3,10 @@
 
 import pytest
 import torch
-from vllm.v1.sample.sampler import Sampler
 
 from tests.test_lane_input_batch import _lane_batch, _make_req
 from vllm_tt_plugin.host_sampler import TTHostSampler
+from vllm_tt_plugin.sample.sampler import Sampler
 
 
 @pytest.mark.parametrize("temperatures", [[1.0, 1.0], [0.0, 1.0], [0.7, 1.0]])

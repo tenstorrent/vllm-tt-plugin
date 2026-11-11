@@ -643,8 +643,6 @@ class TTAsyncDecodeController:
             return False
         if input_batch.sampling.has_active_logitsprocs():
             return False
-        if runner.model_config.logits_processors:
-            return False
         return runner.check_perform_device_sampling(
             is_decode=True,
             has_structured_outputs=False,

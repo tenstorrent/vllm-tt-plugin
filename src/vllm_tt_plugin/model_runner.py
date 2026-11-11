@@ -30,8 +30,6 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -79,6 +77,8 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm_tt_plugin.sample.metadata import SamplingMetadata
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -492,9 +492,6 @@ class TTModelRunner:
         # sampling isn't supported for a given batch.
         self._host_logitsprocs: LogitsProcessors = build_logitsprocs(
             vllm_config=vllm_config,
-            device=torch.device("cpu"),
-            is_pin_memory=False,
-            is_pooling_model=False,
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
 
@@ -674,7 +671,6 @@ class TTModelRunner:
 
         max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
-        max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         if self._is_lane_mode:
             # Lane-chunked persistent batch: rows are partitioned into
             # ``tt_data_parallel_size`` lanes of ``tt_per_lane_max_num_seqs``
@@ -686,7 +682,6 @@ class TTModelRunner:
                 num_lanes=self.tt_data_parallel_size,
                 per_lane=self.tt_per_lane_max_num_seqs,
                 max_model_len=max_model_len,
-                max_num_batched_tokens=max_num_batched_tokens,
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
@@ -698,7 +693,6 @@ class TTModelRunner:
             self.input_batch = InputBatch(
                 max_num_reqs=max_num_reqs,
                 max_model_len=max_model_len,
-                max_num_batched_tokens=max_num_batched_tokens,
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
@@ -1768,7 +1762,7 @@ class TTModelRunner:
         if self._spec_method != "ngram" or not committed:
             return
         if self._ngram_proposer is None:
-            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+            from vllm_tt_plugin.ngram_proposer import NgramProposer
 
             self._ngram_proposer = NgramProposer(self.vllm_config)
 
@@ -2682,7 +2676,7 @@ class TTModelRunner:
         )
 
         # Populate prompt_tokens and output_tokens if penalties are needed
-        # (decode only). Bad words need output_tokens too: vLLM's bad-words op
+        # (decode only). Bad words need output_tokens too: the bad-words op
         # bans a word's last token only when this history ends with the rest of
         # the word.
         prompt_tokens = None
@@ -2846,7 +2840,7 @@ class TTModelRunner:
     ) -> dict[int, tuple[int, tuple[int, ...]]]:
         """Per row, how many more tokens must pass before a stop token may.
 
-        What vLLM's ``MinTokensLogitsProcessor`` reads, from the same fields:
+        What ``MinTokensLogitsProcessor`` reads, from the same fields:
         ``min_tokens``, the request's own output list, and
         ``all_stop_token_ids``, which holds the end-of-sequence id even under
         ``ignore_eos``. Captured at build time, when every earlier step has
@@ -4050,9 +4044,8 @@ class TTModelRunner:
         has_always_host_only_sampling_params = (
             not input_batch.no_allowed_token_ids  # allowed_token_ids set
             or input_batch.sampling.bad_words_token_ids  # bad_words set
-            or input_batch.sampling.has_active_logitsprocs()  # min_p, logit_bias,
-            # min_tokens
-            or bool(self.model_config.logits_processors)  # custom logitsprocs
+            # min_p, logit_bias, min_tokens, custom logits processors
+            or input_batch.sampling.has_active_logitsprocs()
         )
         if has_always_host_only_sampling_params:
             return False

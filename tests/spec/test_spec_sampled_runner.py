@@ -13,7 +13,7 @@ Every step goes through ``_prepare_model_inputs``, ``submit_decode`` and
 ``_finish_front_packed_sync``, the synchronous path a server takes, against
 ``SampledTarget``, whose distribution does not depend on what was drafted.
 The reference arm for a sampled request is a runner that does not speculate at
-all, so its tokens come from vLLM's ordinary host sampler.
+all, so its tokens come from the ordinary host sampler.
 """
 
 from __future__ import annotations
@@ -24,9 +24,12 @@ import pytest
 import torch
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import MinPLogitsProcessor, build_logitsprocs
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin.sample.logits_processor import (
+    MinPLogitsProcessor,
+    build_logitsprocs,
+)
 from vllm_tt_plugin.spec_accept import spec_sampling_inputs
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -504,9 +507,6 @@ def test_a_speculating_launch_admits_a_small_min_p_and_applies_it_nowhere():
 
     processors = build_logitsprocs(
         vllm_config=SimpleNamespace(speculative_config=speculative),
-        device=torch.device("cpu"),
-        is_pin_memory=False,
-        is_pooling_model=False,
     )
     assert not any(isinstance(p, MinPLogitsProcessor) for p in processors.all)
 

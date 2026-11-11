@@ -10,7 +10,7 @@ out, and logprobs, which report on what was committed.
 
 The references are the same two kinds.
 
-vLLM's own ``Sampler``, for a row that carries no drafts, fed what the plugin's
+The host ``Sampler``, for a row that carries no drafts, fed what the plugin's
 ordinary host path feeds it: logits the grammar bitmask has already masked,
 and the token filters in its ``SamplingMetadata``. The row must commit the same
 token, leave its generator in the same state, and report the same logprobs.
@@ -34,12 +34,15 @@ from itertools import product
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 import vllm_tt_plugin.spec_accept as spec_accept
+from vllm_tt_plugin.sample.logits_processor import (
+    BatchUpdateBuilder,
+    LogitsProcessors,
+    MinTokensLogitsProcessor,
+)
+from vllm_tt_plugin.sample.metadata import SamplingMetadata
+from vllm_tt_plugin.sample.sampler import Sampler
 from vllm_tt_plugin.spec_accept import (
     SpecPenalties,
     SpecSamplingInputs,
@@ -71,7 +74,7 @@ def _min_tokens_processor(
     params: list[SamplingParams | None], outputs: list[list[int]]
 ) -> MinTokensLogitsProcessor:
     """vLLM's min_tokens processor, fed the batch through its own update path."""
-    processor = MinTokensLogitsProcessor(None, torch.device("cpu"), False)
+    processor = MinTokensLogitsProcessor()
     builder = BatchUpdateBuilder()
     for row, (param, output) in enumerate(zip(params, outputs)):
         if param is not None:
@@ -94,7 +97,8 @@ def _ordinary(
     top_k: torch.Tensor | None = None,
     penalties: dict | None = None,
 ):
-    """One ordinary step through vLLM's ``Sampler``, as the plugin's host path runs it.
+    """One ordinary step through the host ``Sampler``, as the runner's host
+    path runs it.
 
     The grammar is applied to the logits first, by masking, which is what
     ``TTModelRunner.apply_grammar_bitmask`` does before it calls the sampler.

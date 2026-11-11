@@ -11,7 +11,8 @@ import torch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.worker.gpu_input_batch import CachedRequestState
+
+    from vllm_tt_plugin.request_state import CachedRequestState
 
 
 def scheduled_structured_output_request_ids(

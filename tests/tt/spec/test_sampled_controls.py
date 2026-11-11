@@ -5,7 +5,7 @@
 A launch whose model declares the ``logits`` accept mode applies structured
 output, ``allowed_token_ids``, ``bad_words`` and ``min_tokens`` at every
 candidate column of a verify, and returns logprobs for every committed token.
-The host suite holds the walk to vLLM's own sampler and to an independent
+The host suite holds the walk to the ordinary host sampler and to an independent
 reference. This file asks the same of the server, where the scheduler's grammar
 validation and bitmask layout, the engine's deferred sampling for structured
 requests, the request's stop handling and the OpenAI logprobs encoding are all
@@ -87,7 +87,7 @@ class _Excluded:
     """What one request's token filters rule out at each output position.
 
     Called with the output so far. The history a bad word is matched against is
-    the output only, which is what vLLM's sampler hands its bad-words op.
+    the output only, which is what the host sampler hands its bad-words op.
     """
 
     def __init__(self, prompt, *, allowed=None, bad_words=(), min_tokens=None):

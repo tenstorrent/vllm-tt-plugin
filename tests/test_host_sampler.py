@@ -3,9 +3,9 @@
 
 import pytest
 import torch
-from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 from vllm_tt_plugin.host_sampler import TTTopKTopPSampler
+from vllm_tt_plugin.sample.topk_topp_sampler import TopKTopPSampler
 
 
 @pytest.mark.parametrize("batch", [1, 4, 7, 32])

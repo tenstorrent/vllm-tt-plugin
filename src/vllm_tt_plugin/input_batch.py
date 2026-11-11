@@ -10,20 +10,8 @@ import torch
 from vllm.sampling_params import SamplingType
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
-from vllm.v1.sample.logits_processor import (
-    BatchUpdateBuilder,
-    LogitsProcessors,
-    MoveDirectionality,
-)
-from vllm.v1.sample.logits_processor.builtin import (
-    LogitBiasLogitsProcessor,
-    MinPLogitsProcessor,
-    MinTokensLogitsProcessor,
-)
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.worker.block_table import MultiGroupBlockTable
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+from vllm_tt_plugin.block_table import MultiGroupBlockTable
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
@@ -32,6 +20,16 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin.request_state import CachedRequestState
+from vllm_tt_plugin.sample.logits_processor import (
+    BatchUpdateBuilder,
+    LogitBiasLogitsProcessor,
+    LogitsProcessors,
+    MinPLogitsProcessor,
+    MinTokensLogitsProcessor,
+    MoveDirectionality,
+)
+from vllm_tt_plugin.sample.metadata import SamplingMetadata
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.structured_output import (
     capture_structured_decode_request_ids,
@@ -293,7 +291,10 @@ class SamplingInputBatch:
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
     def has_active_logitsprocs(self) -> bool:
-        """True if any logits processors have active per-request state."""
+        """True if custom logits processors are loaded, or a built-in one has
+        per-request state."""
+        if self.logitsprocs.custom is not None:
+            return True
         for proc in self.logitsprocs.all:
             if isinstance(proc, MinPLogitsProcessor) and proc.min_p_count:
                 return True
@@ -330,7 +331,6 @@ class InputBatch:
         self,
         max_num_reqs: int,
         max_model_len: int,
-        max_num_batched_tokens: int,
         vocab_size: int,
         block_sizes: list[int],  # The block_size of each kv cache group
         kernel_block_sizes: list[int],
@@ -368,9 +368,6 @@ class InputBatch:
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            pin_memory=False,
-            device="cpu",
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             # Per-group max blocks per request; TT runs without context
@@ -884,7 +881,6 @@ class TTLaneInputBatch(InputBatch):
         num_lanes: int,
         per_lane: int,
         max_model_len: int,
-        max_num_batched_tokens: int,
         vocab_size: int,
         block_sizes: list[int],
         kernel_block_sizes: list[int],
@@ -902,7 +898,6 @@ class TTLaneInputBatch(InputBatch):
         super().__init__(
             max_num_reqs=num_lanes * per_lane,
             max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
             vocab_size=vocab_size,
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
@@ -1178,11 +1173,7 @@ class TTLaneInputBatch(InputBatch):
 
     def can_compact_host_sampling(self) -> bool:
         """Whether sampling can operate independently of persistent slot rows."""
-        return not self.sampling.has_active_logitsprocs() and all(
-            type(proc)
-            in (MinPLogitsProcessor, LogitBiasLogitsProcessor, MinTokensLogitsProcessor)
-            for proc in self.sampling.logitsprocs.all
-        )
+        return not self.sampling.has_active_logitsprocs()
 
     def build_merged_sampling_metadata(
         self,
@@ -1196,7 +1187,7 @@ class TTLaneInputBatch(InputBatch):
         work. It reindexes all per-request data, while keeping seeded generators
         attached to their requests and cloning intermediate-prefill generators.
 
-        Mirrors a normal single-engine vLLM ``SamplingMetadata`` build, but over
+        Mirrors a normal single-engine ``SamplingMetadata`` build, but over
         the full ``max_num_reqs`` slot batch (live rows interleaved with neutral
         gap rows) so it lines up row-for-row with the full slot logits the
         runner hands the host sampler and with the per-row logits-processor
@@ -1284,7 +1275,7 @@ class TTLaneInputBatch(InputBatch):
         top_k = sampling.top_k[rows]
         if compact:
             # A supplied all-ones top_p still sorts the entire vocabulary in
-            # vLLM's native sampler. None expresses that there is no filter.
+            # vLLM's top-k/top-p op. None expresses that there is no filter.
             if bool((top_p == 1.0).all()):
                 top_p = None
             if bool((top_k == self.vocab_size).all()):

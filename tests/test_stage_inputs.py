@@ -50,7 +50,6 @@ def _runner(*, supports_stage_inputs: bool) -> SimpleNamespace:
     batch = InputBatch(
         max_num_reqs=MAX_NUM_REQS,
         max_model_len=MAX_MODEL_LEN,
-        max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
         kernel_block_sizes=[BLOCK_SIZE],

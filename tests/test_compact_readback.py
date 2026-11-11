@@ -6,12 +6,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.v1.sample.sampler import Sampler
 
 from tests.test_decode_reload_contract import _accepted_decode_hooks, _submission_input
 from tests.test_lane_input_batch import VOCAB, _host_runner, _lane_batch, _make_req
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController, TTDecodeSubmission
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
+from vllm_tt_plugin.sample.sampler import Sampler
 
 
 @pytest.mark.parametrize("capability", [False, True])
