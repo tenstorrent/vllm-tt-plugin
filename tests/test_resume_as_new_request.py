@@ -128,21 +128,30 @@ def test_a_resume_with_generated_tokens_keeps_the_held_generator():
     assert torch.equal(state.generator.get_state(), advanced)
 
 
-def test_a_record_without_generated_tokens_gets_a_fresh_generator():
-    """A streaming-input continuation, or a resume preempted before its first
-    sample: its record holds no generated tokens."""
+def test_a_streaming_continuation_keeps_its_advanced_generator():
+    """A streaming-input continuation's record holds no generated tokens: the
+    previous turn's output is part of its prompt now. Its generator has still
+    advanced, and a fresh one would repeat the previous turn's draws."""
     held = build_cached_request_state(
         _record("a", PROMPT, seed=SEED), supports_stage_inputs=False
     )
-    _sampled_from(held)
+    advanced = _sampled_from(held)
 
     state = build_cached_request_state(
-        _record("a", PROMPT, generated=[], seed=SEED),
+        _record("a", PROMPT + GENERATED + [31], generated=[], seed=SEED),
         supports_stage_inputs=False,
         held=held,
     )
 
-    assert state.generator is not held.generator
+    assert state.generator is held.generator
+    assert torch.equal(state.generator.get_state(), advanced)
+
+
+def test_a_new_request_gets_a_generator_seeded_from_its_params():
+    state = build_cached_request_state(
+        _record("a", PROMPT, seed=SEED), supports_stage_inputs=False
+    )
+
     fresh = torch.Generator().manual_seed(SEED).get_state()
     assert torch.equal(state.generator.get_state(), fresh)
 
@@ -274,6 +283,44 @@ def test_a_resume_in_the_step_that_reports_the_preemption_holds_one_row():
     assert _rows_holding(batch, "a") == [batch.req_id_to_index["a"]]
     row = batch.req_id_to_index["a"]
     assert batch.token_ids_cpu[row, : len(HISTORY)].tolist() == HISTORY
+
+
+def test_a_v1_resume_in_the_step_that_reports_the_preemption_uses_its_new_blocks():
+    """The V1 shape of the same event: "a" is in ``preempted_req_ids`` and in
+    ``resumed_req_ids``, with all-new blocks, while it still holds its row. The
+    row's block table must list only the new blocks; the preemption freed the
+    old ones."""
+    runner = _runner(supports_stage_inputs=False)
+    _run_prefill(
+        runner,
+        _step(
+            new=[_record("a", PROMPT, block_ids=([3],)), _record("b", [5, 6])],
+            scheduled={"a": len(PROMPT), "b": 2},
+        ),
+    )
+    runner.requests["a"].output_token_ids.extend(GENERATED)
+    resume = _step(
+        cached=CachedRequestData(
+            req_ids=["a"],
+            resumed_req_ids={"a"},
+            new_token_ids=[[]],
+            all_token_ids={},
+            new_block_ids=[([5],)],
+            num_computed_tokens=[0],
+            num_output_tokens=[0],
+        ),
+        scheduled={"a": len(HISTORY), "b": 1},
+        preempted={"a"},
+    )
+
+    runner._update_states(resume)
+
+    batch = runner.input_batch
+    row = batch.req_id_to_index["a"]
+    assert _rows_holding(batch, "a") == [row]
+    assert runner.requests["a"].block_ids == ([5],)
+    (table,) = batch.block_tables_for_rows([row], 2)
+    assert table.tolist() == [[5, 0]], "the row lists the freed block 3"
 
 
 # --------------------------------------------------------------------------

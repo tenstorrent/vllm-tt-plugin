@@ -1028,9 +1028,14 @@ class TTModelRunner:
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
+        # A request resumed in the step that reports its preemption (after
+        # ``reset_prefix_cache(reset_running_requests=True)``) is scheduled but
+        # its row lists the freed blocks, so it is removed here and re-added
+        # with the new ones, as upstream's V1 runner does.
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1052,7 +1057,8 @@ class TTModelRunner:
             # resumable streaming-input request with its next input chunk, or,
             # in vLLM's V2 scheduler output, a request that resumes in the same
             # step that reports its preemption. Model-owned state is not
-            # released here: the finish and preemption handling above owns that.
+            # released here: only the finish and preemption handling above
+            # releases it, so a streaming-input continuation keeps it.
             req_index = self.input_batch.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -4816,6 +4822,7 @@ class TTModelRunner:
                     req_ids=list(req_ids),
                     req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
                     submit_time_ns=now,
+                    request_states=tuple(self.requests.get(rid) for rid in req_ids),
                 ),
                 completion_time_ns=now,
                 runner_output=runner_output,

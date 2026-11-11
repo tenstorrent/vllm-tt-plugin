@@ -799,6 +799,7 @@ def test_transition_applies_drained_token_before_host_authoritative_reload():
             req_ids=["request"],
             req_id_to_index={"request": 0},
             submit_time_ns=1,
+            request_states=(request_state,),
         ),
         completion_time_ns=2,
     )
@@ -1056,7 +1057,11 @@ def test_contract_v0_sync_mode_is_informational_once(monkeypatch):
     assert "synchronous scheduling" in infos[0][0]
 
 
-def _completed_step(token: int, runner_output=None) -> CompletedDecodeStep:
+def _completed_step(
+    token: int, runner_output=None, request_state=None
+) -> CompletedDecodeStep:
+    """A completed step submitted for ``request_state``, the runner's state of
+    request "request" at submission."""
     return CompletedDecodeStep(
         sampled_token_ids=torch.tensor([[token]], dtype=torch.int32),
         logprobs=None,
@@ -1064,6 +1069,7 @@ def _completed_step(token: int, runner_output=None) -> CompletedDecodeStep:
             req_ids=["request"],
             req_id_to_index={"request": 0},
             submit_time_ns=1,
+            request_states=(request_state,),
         ),
         completion_time_ns=2,
         runner_output=runner_output,
@@ -1102,7 +1108,7 @@ def test_finished_async_result_updates_neither_runner_nor_published_output():
     )
     runner = _async_apply_runner(request_state)
     controller = TTAsyncDecodeController(runner)
-    completed = _completed_step(7, runner_output)
+    completed = _completed_step(7, runner_output, request_state)
 
     controller.apply_completed_decode_step(
         completed,
@@ -1131,7 +1137,7 @@ def test_ordinary_preemption_or_resume_keeps_inflight_token(lifecycle):
     )
 
     controller.apply_completed_decode_step(
-        _completed_step(7, runner_output),
+        _completed_step(7, runner_output, request_state),
         suppress_output_req_ids=controller.suppressed_output_req_ids(scheduler_output),
     )
 
@@ -1151,6 +1157,31 @@ def test_only_finished_result_ids_are_suppressed_from_scheduler_output():
     }
 
 
+def test_a_result_submitted_before_a_rebuild_is_published_but_not_applied():
+    """A request listed in ``scheduled_new_reqs`` while a decode for it is still
+    in flight gets a new cached state: a resumable streaming-input request with
+    its next chunk (vLLM drops the in-flight token, ``drop_stale_output``), or a
+    resume (vLLM already put the token in ``prefill_token_ids``). Applying the
+    late token to the new state would add a token vLLM does not have."""
+    submitted_for = SimpleNamespace(output_token_ids=[])
+    runner = _async_apply_runner(submitted_for)
+    controller = TTAsyncDecodeController(runner)
+    runner_output = SimpleNamespace(
+        req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
+    )
+    runner._completed_decode_steps.append(
+        _completed_step(7, runner_output, submitted_for)
+    )
+    rebuilt = SimpleNamespace(output_token_ids=[])
+    runner.requests["request"] = rebuilt
+
+    controller.apply_ready_completed_decode_steps()
+
+    assert rebuilt.output_token_ids == []
+    assert submitted_for.output_token_ids == []
+    assert runner_output.sampled_token_ids == [[7]], "vLLM still sees the output"
+
+
 def test_forced_reset_skips_only_newest_counted_runner_state_frames():
     request_state = SimpleNamespace(output_token_ids=[])
     runner = _async_apply_runner(request_state)
@@ -1160,7 +1191,8 @@ def test_forced_reset_skips_only_newest_counted_runner_state_frames():
         for token in (5, 6, 7)
     ]
     runner._completed_decode_steps.extend(
-        _completed_step(token, output) for token, output in zip((5, 6, 7), outputs)
+        _completed_step(token, output, request_state)
+        for token, output in zip((5, 6, 7), outputs)
     )
 
     controller.apply_ready_completed_decode_steps(
@@ -1234,7 +1266,7 @@ def test_step_resolved_during_apply_stays_pending_until_drained():
     runner_output = SimpleNamespace(
         req_id_to_index={"request": 0}, sampled_token_ids=[[7]]
     )
-    completed = _completed_step(7, runner_output)
+    completed = _completed_step(7, runner_output, request_state)
     # The step's completion goes through the real output path: ensure_finalized
     # runs _get_output_impl, whose enqueue_completed_decode_step is followed by
     # the event set.
@@ -1280,6 +1312,7 @@ def test_forced_reset_discard_count_requires_all_stale_frames():
         _completed_step(
             7,
             SimpleNamespace(req_id_to_index={"request": 0}, sampled_token_ids=[[7]]),
+            request_state,
         )
     )
 

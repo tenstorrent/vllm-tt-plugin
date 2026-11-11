@@ -981,7 +981,8 @@ def _uninstall_tt_async_spec_method_patch() -> None:
 def _pin_v1_model_runner() -> None:
     """Keep the engine on vLLM's V1 model runner.
 
-    ``VllmConfig.use_v2_model_runner`` defaults on for every dense architecture.
+    ``VllmConfig.use_v2_model_runner`` defaults on for every architecture when
+    Triton is present and no requested feature is refused under V2.
     The TT runner reads the V2 scheduler output, where a request resumed after
     preemption arrives in ``scheduled_new_reqs`` with its history in
     ``NewRequestData.prefill_token_ids``. Known V2 differences the TT backend
@@ -996,7 +997,9 @@ def _pin_v1_model_runner() -> None:
 
     Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
     which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
-    set to the empty string. Pin the variable rather than rely on that.
+    set to the empty string. Pin the variable rather than rely on that. Two
+    options select V2 whatever the variable says: ``--watermark-config``, and
+    ``attention_config.hisparse_config``, which raises when the variable is 0.
 
     Refuse an explicit opt-in instead of honoring it: the TT backend has not
     been validated on the V2 path, so a clear failure is more useful than an

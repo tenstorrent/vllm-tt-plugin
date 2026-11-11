@@ -638,6 +638,13 @@ class TTLaneCoordinator(SchedulerInterface):
             decode_layout_changed |= req_id in self._req_to_row
             self._release_slot(req_id)
 
+        # A request listed as new while it still holds its row is placed on that
+        # row again with a rebuilt state (``TTLaneInputBatch.apply_step_plan``):
+        # a resumable streaming-input request with its next input chunk. The
+        # row's contents change although the row does not move.
+        for new_req_data in merged.scheduled_new_reqs:
+            decode_layout_changed |= new_req_data.req_id in self._req_to_row
+
         for req_id in merged.num_scheduled_tokens:
             lane = lane_of_req.get(req_id, self._req_to_lane.get(req_id))
             if lane is None:

@@ -291,6 +291,25 @@ def test_step_plan_reports_exact_lane_layout_changes():
     assert not prefill_plan.decode_layout_changed
 
 
+def test_a_request_listed_as_new_on_the_row_it_holds_changes_the_layout():
+    """A resumable streaming-input request comes back in ``scheduled_new_reqs``
+    with its next chunk while it still holds its row. ``apply_step_plan``
+    rebuilds that row, and the runner asserts that the plan agrees."""
+    lane = FakeLane(running=1)
+    coordinator = _make_coordinator([lane], per_lane_max=2)
+    first = coordinator.schedule()
+    (req_id,) = first.num_scheduled_tokens
+    row = coordinator._req_to_row[req_id]
+
+    continuation = SchedulerOutput.make_empty()
+    continuation.scheduled_new_reqs = [SimpleNamespace(req_id=req_id)]
+    continuation.num_scheduled_tokens = {req_id: 2}
+    plan = coordinator._build_step_plan([continuation], continuation, is_decode=False)
+
+    assert plan.decode_layout_changed
+    assert coordinator._req_to_row[req_id] == row
+
+
 def test_decode_fallback_when_forced_prefill_schedules_nothing():
     # Lane 0 has running decodes (and a finished req to report); lane 1 has a
     # queued request that forces prefill. Prefill schedules nothing, so the

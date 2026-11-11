@@ -156,13 +156,12 @@ def build_cached_request_state(
     ``scheduled_cached_reqs`` instead.
 
     ``held`` is the state the caller still holds for this request id, or
-    ``None``. The record cannot carry a seeded request's host ``torch.Generator``,
-    which has advanced once per sampled token, so a record with generated tokens
-    takes ``held.generator`` instead of a fresh one. Such a record is a resume
-    after preemption, and the caller keeps a preempted request's state. A record
-    with no generated tokens gets a fresh generator: nothing has been sampled
-    from ``held.generator`` yet, because intermediate prefill chunks sample from
-    a clone.
+    ``None``: a request resumed after preemption, or a resumable streaming-input
+    request back with its next input chunk. The record cannot carry a seeded
+    request's host ``torch.Generator``, which has advanced once per draw, so a
+    held request keeps ``held.generator``; a fresh one would repeat the draws
+    already made. Upstream's V1 runner keeps it the same way: it updates a
+    streaming request's ``CachedRequestState`` in place.
     """
     assert new_req_data.sampling_params is not None, (
         "Pooling is not supported for TT yet"
@@ -186,7 +185,7 @@ def build_cached_request_state(
     sampling_params = new_req_data.sampling_params
     if sampling_params.sampling_type != SamplingType.RANDOM_SEED:
         generator = None
-    elif output_token_ids and held is not None and held.generator is not None:
+    elif held is not None and held.generator is not None:
         generator = held.generator
     else:
         generator = torch.Generator(device="cpu")
@@ -1012,7 +1011,9 @@ class TTLaneInputBatch(InputBatch):
         and on preemption, which freed the KV and reset ``num_computed_tokens``
         so the resume re-prefills from zero into whatever row it is given then.
         A preempted request's ``CachedRequestState`` stays in ``requests`` for
-        that resume.
+        that resume. A request listed in ``scheduled_new_reqs`` while it still
+        holds its row (a resumable streaming-input request with its next input
+        chunk) is rebuilt on that row without a release.
 
         ``release_request`` is the model's hook of that name, or ``None`` when
         the model defines none. It is called with the row of every request
@@ -1063,8 +1064,8 @@ class TTLaneInputBatch(InputBatch):
             # ``add_request`` writes a row's generator, bad words and allowlist
             # membership only when the new sampling params set them, so the row
             # is cleared first or the previous record's entries survive.
-            # Model-owned state is not released here: finish and preemption own
-            # that.
+            # Model-owned state is not released here: only finish and
+            # preemption release it, so a streaming-input continuation keeps it.
             self.remove_request(req_id)
             # Lane mode refuses supports_stage_inputs at config time: its prefill
             # inputs carry no per-row stage inputs.

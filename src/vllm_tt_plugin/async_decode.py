@@ -143,6 +143,25 @@ class SubmittedStepContext:
     req_ids: list[str]
     req_id_to_index: dict[str, int]
     submit_time_ns: int
+    # The runner's ``CachedRequestState`` of each request in ``req_ids`` at
+    # submission, in the same order.
+    request_states: tuple[Any, ...]
+
+    def rebuilt_req_ids(self, requests: dict[str, Any]) -> set[str]:
+        """Live requests whose cached state was rebuilt since this submission.
+
+        A request listed in ``scheduled_new_reqs`` while it is still live gets a
+        new state object: a resume after preemption, or a resumable
+        streaming-input request with its next input chunk. vLLM has already
+        folded every token of this step it delivered into that record's
+        ``prefill_token_ids``, and drops the rest (``drop_stale_output``), so
+        this step's tokens must not reach the new state.
+        """
+        return {
+            req_id
+            for req_id, state in zip(self.req_ids, self.request_states, strict=True)
+            if req_id in requests and requests[req_id] is not state
+        }
 
 
 @dataclass
@@ -567,6 +586,7 @@ class TTAsyncDecodeController:
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             submit_time_ns=time.perf_counter_ns(),
+            request_states=tuple(runner.requests.get(rid) for rid in req_ids),
         )
 
     def steady_decode_base_enabled(self) -> bool:
@@ -840,6 +860,9 @@ class TTAsyncDecodeController:
         * Normal output for a live request: publish and apply.
         * Ordinary preemption or resume: publish and apply.
         * Forced-reset output: publish, but do not apply. vLLM discards it.
+        * Output for a request whose cached state was rebuilt since the step was
+          submitted (``SubmittedStepContext.rebuilt_req_ids``): publish, but do
+          not apply.
         * Request already finished or aborted: remove any late output and do
           not apply it.
 
@@ -906,7 +929,11 @@ class TTAsyncDecodeController:
             self.apply_completed_decode_step(
                 completed,
                 suppress_output_req_ids=suppressed,
-                skip_state_req_ids=suppressed | forced_reset_req_ids,
+                skip_state_req_ids=(
+                    suppressed
+                    | forced_reset_req_ids
+                    | completed.context.rebuilt_req_ids(self.runner.requests)
+                ),
             )
             remaining_results.subtract(published_req_ids)
 
