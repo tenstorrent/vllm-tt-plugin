@@ -29,6 +29,7 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.input_processor as input_processor
     from vllm.entrypoints.launchers.utils import server_utils
 
+    import vllm_tt_plugin.scheduler as tt_scheduler
     from vllm_tt_plugin.platform import TTPlatform
 
     saved_lifespan = server_utils.lifespan
@@ -76,6 +77,9 @@ def reset_tt_platform_class_state():
             "_tt_original_dp_reset_prefix_cache_async",
         )
     }
+    # The worker publishes the loaded model's prefix-hit confirmer as a module
+    # global that every scheduler constructed afterwards takes.
+    saved_published_confirmer = tt_scheduler._published_confirmer
 
     yield
 
@@ -112,6 +116,7 @@ def reset_tt_platform_class_state():
         engine_core.__dict__.pop("_tt_original_pause_scheduler", None)
     else:
         engine_core._tt_original_pause_scheduler = saved_original_pause_scheduler
+    tt_scheduler._published_confirmer = saved_published_confirmer
 
     async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
     if saved_original_add_streaming_input_request is unset:

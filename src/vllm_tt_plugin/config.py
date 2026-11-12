@@ -419,6 +419,83 @@ def resolve_tt_supports_stage_outputs(
     additional[_SUPPORTS_STAGE_OUTPUTS_KEY] = supported
 
 
+def validate_tt_device_top_k_unbounded_as(
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``device_top_k_unbounded_as``.
+
+    The value is the top-k bound the model substitutes for a sampled row whose
+    ``top_k`` is unset or above ``max_device_top_k``; ``TTModelRunner`` keeps
+    such rows on the device when it is declared.
+
+    Raises:
+        ValueError: declared without ``max_device_top_k``, or not an integer in
+            ``1..max_device_top_k``.
+    """
+    capabilities = model_capabilities or {}
+    value = capabilities.get("device_top_k_unbounded_as")
+    if value is None:
+        return
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    max_top_k = capabilities.get("max_device_top_k")
+    if max_top_k is None:
+        raise ValueError(
+            f"Model {name} declares model_capabilities['device_top_k_unbounded_as']"
+            f"={value!r} without max_device_top_k"
+        )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= max_top_k
+    ):
+        raise ValueError(
+            f"Model {name} must declare model_capabilities['device_top_k_unbounded_as']"
+            f" as an integer in 1..{max_top_k} (its max_device_top_k), got {value!r}"
+        )
+
+
+def validate_tt_prefix_hit_confirmation(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``confirms_prefix_cache_hits``.
+
+    ``TTWorker.load_model`` publishes the loaded model's
+    ``confirm_prefix_cache_hit`` for the scheduler of its process, which trims
+    vLLM's prefix-cache hit to the answer.
+
+    Raises:
+        ValueError: the declaration comes without ``supports_prefix_caching``
+            or without the method, or the executor runs the worker outside the
+            scheduler's process (anything but the uniproc executor), where the
+            published method would never reach the scheduler.
+    """
+    capabilities = model_capabilities or {}
+    if not capabilities.get("confirms_prefix_cache_hits", False):
+        return
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    if not capabilities.get("supports_prefix_caching", False):
+        raise ValueError(
+            f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
+            "=True without supports_prefix_caching=True"
+        )
+    if not callable(getattr(model_class, "confirm_prefix_cache_hit", None)):
+        raise ValueError(
+            f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
+            "=True without a confirm_prefix_cache_hit(prompt_token_ids, mm_items, "
+            "num_computed_tokens) method"
+        )
+    backend = vllm_config.parallel_config.distributed_executor_backend
+    if backend not in (None, "uni"):
+        raise ValueError(
+            f"Model {name} confirms prefix-cache hits from the worker that loaded "
+            "it, which must share the scheduler's process (the uniproc executor); "
+            f"got distributed_executor_backend={backend!r}"
+        )
+
+
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
     """Return the admitted speculative plan, or ``None``.
 
