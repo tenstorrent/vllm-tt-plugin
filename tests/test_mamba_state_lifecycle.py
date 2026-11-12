@@ -83,6 +83,7 @@ from vllm_tt_plugin.spec_admission import (
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_INTERNAL,
     DraftOutput,
     SpecPlan,
@@ -496,6 +497,11 @@ class _Harness:
         self.accept_cycle: dict[int, int] = {}
         self.accepted: dict[tuple[int, int], int] = {}
         self.step_kinds: dict[str, int] = {}
+        # (step kind, spec_mode, perform_device_sampling) of every step, and
+        # per verify (spec_mode, perform_device_sampling, request id -> valid
+        # drafts).
+        self.step_modes: set[tuple] = set()
+        self.verify_steps: list[tuple[str, bool, dict[str, int]]] = []
         # Verify rows whose tokens span two block-table columns, and steps
         # whose window began in a lower column than the request's previous
         # one.
@@ -516,11 +522,15 @@ class _Harness:
         max_tokens: int = 8,
         prompt: list[int] | None = None,
         ignore_eos: bool = True,
+        sampling: dict | None = None,
     ) -> None:
         init_none_hash(sha256)
-        # Greedy, so the argmax_ids walk can certify a speculating request.
+        # Greedy unless ``sampling`` says otherwise, so the argmax_ids walk can
+        # certify a speculating request.
         params = SamplingParams(
-            max_tokens=max_tokens, ignore_eos=ignore_eos, temperature=0.0
+            max_tokens=max_tokens,
+            ignore_eos=ignore_eos,
+            **{"temperature": 0.0, **(sampling or {})},
         )
         params.update_from_generation_config({}, eos_token_id=EOS)
         # Distinct prompts, so a row that reads another request's block
@@ -655,6 +665,13 @@ class _Harness:
         verify = model_input.spec_mode is not None
         kind = "prefill" if is_prefill else "verify" if verify else "decode"
         self.step_kinds[kind] = self.step_kinds.get(kind, 0) + 1
+        device_sampled = bool(model_input.perform_device_sampling)
+        self.step_modes.add((kind, model_input.spec_mode, device_sampled))
+        if verify:
+            valid = model_input.num_valid_drafts[: len(row_req_ids)].tolist()
+            self.verify_steps.append(
+                (model_input.spec_mode, device_sampled, dict(zip(row_req_ids, valid)))
+            )
         positions = torch.as_tensor(model_input.input_positions)
         if positions.dim() == 2:
             positions = positions[:, 0]
@@ -823,9 +840,14 @@ class _Harness:
         row_req_ids = model_input.row_req_ids
         self.proposing_req_ids = list(row_req_ids)
         if verify:
-            walk = self.runner.walk_spec_acceptance(
-                model_input, self.verify_ids(model_input)
-            )
+            answer = self.verify_ids(model_input)
+            if model_input.spec_mode == ACCEPT_MODE_LOGITS:
+                # The target puts all its mass on the scripted ids, so the
+                # host rejection sampling commits the scripted counts.
+                vocab = int(self.runner.vocab_size)
+                answer = torch.nn.functional.one_hot(answer.to(torch.int64), vocab)
+                answer = torch.log(answer.to(torch.float32))
+            walk = self.runner.walk_spec_acceptance(model_input, answer)
             prefixes = self.runner.spec_committed_prefixes(
                 model_input, walk.committed, walk.counts
             )
