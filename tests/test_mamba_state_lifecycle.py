@@ -373,12 +373,19 @@ class _Harness:
         self.zeroed: list[int] = []
         self.copies: list[tuple[int, int]] = []
         # Request id -> start position of each step that began from a block
-        # vLLM kept for the prefix cache (new and resumed requests).
+        # vLLM kept for the prefix cache (new and resumed requests), and the
+        # first GDN group's block it read.
         self.hits: dict[str, list[int]] = {}
-        # (request id, position) of every prefill checkpoint written.
+        self.hit_blocks: dict[str, list[int]] = {}
+        # (request id, position) of every prefill checkpoint written, and the
+        # first GDN group's block it went to.
         self.checkpoints: list[tuple[str, int]] = []
+        self.checkpoint_blocks: list[int] = []
         # Steps whose rows read one block and wrote another.
         self.crossings = 0
+        # Request id -> its tokens in each prefill step, and its first step.
+        self.prefill_chunks: dict[str, list[int]] = {}
+        self.first_step: dict[str, int] = {}
         self.cached_states_checked = 0
         self.output_base = 50_000
         self.num_steps = 0
@@ -431,6 +438,15 @@ class _Harness:
                 self.hash_tokens.setdefault(
                     block_hash, tuple(tokens[: (j + 1) * self.hash_block_size])
                 )
+
+    def kept_gdn_blocks(self) -> set[int]:
+        """The GDN blocks vLLM keeps under a prefix hash."""
+        return {
+            block.block_id
+            for block in self.scheduler.kv_cache_manager.block_pool.blocks
+            if block.block_hash is not None
+            and get_group_id(block.block_hash) in self.groups
+        }
 
     def check_cached_states(self) -> None:
         """Every GDN block vLLM keeps under a prefix hash holds the state of
@@ -491,6 +507,9 @@ class _Harness:
             start = int(positions[row])
             end = start + out.num_scheduled_tokens[req_id]
             assert start == computed[req_id]
+            self.first_step.setdefault(req_id, self.num_steps)
+            if model_input.prompt_lens is not None:
+                self.prefill_chunks.setdefault(req_id, []).append(end - start)
             # The attention page table is the scheduler's attention blocks.
             held = self.scheduler_blocks(req_id, attention)
             page_table = model_input.block_tables_per_group[attention][row]
@@ -500,6 +519,9 @@ class _Harness:
                 self.resumed_from_zero.add(req_id)
             if req_id in fresh and start > 0:
                 self.hits.setdefault(req_id, []).append(start)
+                self.hit_blocks.setdefault(req_id, []).append(
+                    int(state.groups[0].start_blocks[row])
+                )
             position = (
                 0
                 if state.checkpoint_positions is None
@@ -507,6 +529,9 @@ class _Harness:
             )
             if position:
                 self.checkpoints.append((req_id, position))
+                self.checkpoint_blocks.append(
+                    int(state.groups[0].checkpoint_blocks[row, 0])
+                )
             blocks = []
             for i, g in enumerate(self.groups):
                 group = state.groups[i]
@@ -637,7 +662,8 @@ def test_qwen38_layers_form_four_groups_of_16_with_one_page():
     assert h.runner._mamba_groups.attention_group_index == 3
 
 
-def test_requests_finish_and_their_blocks_serve_later_requests():
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_requests_finish_and_their_blocks_serve_later_requests(mode):
     """Completion: freed GDN blocks come back to new requests.
 
     Two waves of requests share a pool that holds one wave. A block that held
@@ -645,7 +671,7 @@ def test_requests_finish_and_their_blocks_serve_later_requests():
     which starts from zero state, or to an attention group, which vLLM lists
     for zeroing. Chunked prefill splits the 3000-token prompt.
     """
-    h = _Harness(num_blocks=24)
+    h = _Harness(num_blocks=24, mode=mode)
     for i, prompt_len in enumerate((3000, 700, 1500, 300)):
         h.add(f"first-{i}", prompt_len, max_tokens=8)
     h.run()
@@ -660,18 +686,20 @@ def test_requests_finish_and_their_blocks_serve_later_requests():
     )
 
 
-def test_abort_preemption_and_row_movement_keep_each_state_with_its_request():
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_abort_preemption_and_row_movement_keep_each_state_with_its_request(mode):
     """Abort, preemption and row movement in one run.
 
     The pool holds 14 blocks: three 1000-token requests with one attention
     block and three GDN blocks each, so the fourth waits until request r2 is
     aborted mid-decode. Decoding past the 1024-token boundary needs a second
-    attention block per request, and the pool cannot give every request one:
-    the scheduler preempts. A preempted request loses its blocks and resumes as
-    a prefill from position 0. The abort, the preemption and finishing
-    requests move the remaining rows.
+    attention block per request, and in mode align new GDN blocks too, and the
+    pool cannot give every request one: the scheduler preempts. A preempted
+    request loses its blocks and resumes as a prefill from position 0: a
+    1000-token prompt reaches no block boundary whose state vLLM could keep.
+    The abort, the preemption and finishing requests move the remaining rows.
     """
-    h = _Harness(num_blocks=15)
+    h = _Harness(num_blocks=15, mode=mode)
     for i in range(MAX_NUM_SEQS):
         h.add(f"r{i}", 1000, max_tokens=60 + 10 * i)
 
@@ -765,3 +793,181 @@ def test_forced_prefix_cache_reset_resumes_running_requests_on_new_blocks(mode):
 
     assert not h.scheduler.requests
     assert h.resumed_from_zero == {"a", "b"}
+
+
+# region Prefix reuse in cache mode align
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_alignment", "max_num_batched_tokens", "prefill_chunks"),
+    [
+        # One prefill of 2500 tokens writes the state after 2048 tokens into
+        # the block vLLM reserved for it.
+        (64, 4096, [2500]),
+        # Without checkpoint blocks vLLM ends a chunk at 2048 instead.
+        (None, 4096, [2048, 452]),
+        # 1024-token steps: no chunk holds a checkpoint.
+        (64, 1024, [1024, 1024, 452]),
+        (None, 1024, [1024, 1024, 452]),
+    ],
+)
+def test_prompt_boundary_state_is_the_same_unchunked_and_chunked(
+    checkpoint_alignment, max_num_batched_tokens, prefill_chunks
+):
+    """Request a prefills a 2500-token prompt, then request b sends the same
+    prompt: an exact hit on the state after 2048 tokens, the prompt's last
+    block boundary, from which b prefills the remaining 452 tokens. Whether a
+    wrote that state as a prefill checkpoint or as the end of a chunk, b reads
+    the state of exactly its first 2048 tokens, as a cold prefill computes it.
+    """
+    h = _Harness(
+        num_blocks=32,
+        max_num_batched_tokens=max_num_batched_tokens,
+        mode="align",
+        checkpoint_alignment=checkpoint_alignment,
+    )
+    prompt = _prompt(1, 2500)
+    h.add("a", prompt=prompt, max_tokens=8)
+    h.run()
+    h.add("b", prompt=prompt, max_tokens=8)
+    h.run()
+
+    assert h.prefill_chunks["a"] == prefill_chunks
+    assert h.prefill_chunks["b"] == [452]
+    assert h.hits == {"b": [2048]}
+    if prefill_chunks == [2500]:
+        assert h.checkpoints == [("a", 2048)]
+        assert h.hit_blocks["b"] == h.checkpoint_blocks
+    else:
+        assert h.checkpoints == []
+
+
+def test_partial_hits_restore_the_longest_kept_state_and_write_new_checkpoints():
+    """A partial hit covers less than the prompt, and a prefill that continues
+    from it can write a checkpoint of its own.
+
+    Request a's 2500 tokens leave the state after 2048 tokens. Request b sends
+    3600 tokens with the same first 2500: it hits 2048, reads column 1's block,
+    writes the state after 3072 tokens into the column 2 block vLLM reserves,
+    and its end state into column 3. Request c shares 3500 tokens with b and
+    hits b's checkpoint.
+    """
+    h = _Harness(
+        num_blocks=40,
+        max_num_batched_tokens=4096,
+        mode="align",
+        checkpoint_alignment=64,
+    )
+    shared = _prompt(1, 4000)
+    h.add("a", prompt=shared[:2500], max_tokens=4)
+    h.run()
+    h.add("b", prompt=shared[:3600], max_tokens=4)
+    h.run()
+    h.add("c", prompt=shared[:3500] + _prompt(2, 300), max_tokens=4)
+    h.run()
+
+    assert h.hits == {"b": [2048], "c": [3072]}
+    assert h.checkpoints == [("a", 2048), ("b", 3072)]
+    assert h.hit_blocks == {
+        "b": [h.checkpoint_blocks[0]],
+        "c": [h.checkpoint_blocks[1]],
+    }
+
+
+def test_diverging_continuations_read_one_kept_prefix_and_leave_it_intact():
+    """Requests b, c and d share request a's first 2048 tokens and then
+    diverge. All three hit the same kept block in one step, each writes its
+    own blocks, and they decode across the 3072-token boundary. The kept block
+    keeps the state of the shared 2048 tokens throughout:
+    ``_Harness.check_cached_states`` compares it after every step, and no
+    block a row reads as its start state is written in the same step."""
+    h = _Harness(num_blocks=48, max_num_batched_tokens=4096, mode="align")
+    prefix = _prompt(1, 2048)
+    h.add("a", prompt=prefix + _prompt(2, 452), max_tokens=4)
+    h.run()
+    for i, name in enumerate("bcd"):
+        h.add(name, prompt=prefix + _prompt(10 + i, 700 + 100 * i), max_tokens=400)
+    h.run(max_steps=800)
+
+    assert h.hits == {"b": [2048], "c": [2048], "d": [2048]}
+    assert len({block for blocks in h.hit_blocks.values() for block in blocks}) == 1
+    assert len({h.first_step[r] for r in "bcd"}) == 1, "the hits ran in two steps"
+    assert h.crossings >= 4, "not every request crossed into a new column"
+
+
+def test_evicted_prefix_states_are_recomputed_and_their_blocks_reused():
+    """A small pool: three 3000-token requests after request a evict a's kept
+    state, its blocks go to other requests' attention and GDN groups, and
+    request b with a's prompt prefills from position 0."""
+    h = _Harness(num_blocks=16, max_num_batched_tokens=4096, mode="align")
+    prompt = _prompt(1, 2500)
+    h.add("a", prompt=prompt, max_tokens=8)
+    h.run()
+    kept = h.kept_gdn_blocks()
+    assert kept, "request a left no kept GDN state"
+    for i in range(3):
+        h.add(f"filler-{i}", 3000, max_tokens=8)
+    h.run()
+    h.add("b", prompt=prompt, max_tokens=8)
+    h.run()
+
+    assert "b" not in h.hits
+    assert kept & set(h.zeroed), "no kept GDN block went back to attention"
+
+
+def test_preempted_requests_resume_from_zero_or_from_a_kept_prefix():
+    """Four requests decode past block boundaries in a 16-block pool. vLLM
+    preempts some; a resumed request replays its tokens from position 0, or
+    from the state at a block boundary of its own prompt that vLLM kept."""
+    h = _Harness(num_blocks=16, max_num_batched_tokens=4096, mode="align")
+    for i in range(MAX_NUM_SEQS):
+        h.add(f"r{i}", 1000 + 300 * i, max_tokens=200)
+    h.run(max_steps=2000)
+
+    assert not h.scheduler.requests
+    assert h.resumed_from_zero, "no preempted request resumed from position 0"
+    assert h.preempted & set(h.hits), "no preempted request resumed from its prefix"
+
+
+@pytest.mark.parametrize("checkpoint_alignment", [None, 64])
+def test_hits_inside_a_block_copy_the_shared_blocks_before_the_forward(
+    checkpoint_alignment,
+):
+    """With a 128-token ``prefix_match_unit`` vLLM keeps the state of a
+    prompt's last multiple of 128 tokens, inside a block. Request b's hit on
+    a's 2432 tokens continues in the same column, so vLLM queues
+    copy-on-write copies of the shared attention and GDN blocks; the runner
+    hands them to ``copy_kv_cache_blocks`` before the forward, and b then
+    updates its own copy in place."""
+    h = _Harness(
+        num_blocks=40,
+        max_num_batched_tokens=4096,
+        mode="align",
+        checkpoint_alignment=checkpoint_alignment,
+        prefix_match_unit=128,
+    )
+    prompt = _prompt(1, 2500)
+    h.add("a", prompt=prompt, max_tokens=4)
+    h.run()
+    copies_before_b = len(h.copies)
+    h.add("b", prompt=prompt, max_tokens=4)
+    h.run()
+
+    assert h.hits == {"b": [2432]}
+    assert len(h.copies) > copies_before_b
+
+
+@pytest.mark.parametrize("prompt_len", [1000, 1023, 1024, 1025])
+def test_align_running_state_moves_into_each_new_column_once(prompt_len):
+    """In mode align the request's state moves to a new block when its tokens
+    cross 1024: in the prefill chunk or the decode that crosses, the row reads
+    column 0's block and writes column 1's, and from then on it updates
+    column 1's block in place."""
+    h = _Harness(num_blocks=16, mode="align")
+    h.add("a", prompt_len, max_tokens=60)
+    h.run()
+
+    assert h.crossings == 1
+
+
+# endregion
