@@ -314,35 +314,26 @@ class MambaCacheGroups:
                     f"{table[row].tolist()}"
                 )
 
-    def block_copies(
-        self, copies: Sequence[KVCacheBlockCopy] | None
-    ) -> list[tuple[int, int]]:
-        """``SchedulerOutput.kv_cache_block_copies`` as ``(src, dst)`` pairs.
+    def refuse_block_copies(self, copies: Sequence[KVCacheBlockCopy] | None) -> None:
+        """Raise if vLLM queued ``SchedulerOutput.kv_cache_block_copies``.
 
-        vLLM queues copies for prefix-cache hits that end inside a block
-        (copy-on-write of the shared block), which mode ``none`` never has.
-        No block may be the destination of two copies or both a source and a
-        destination, so applying the copies in list order and applying them
-        all at once give the same result.
+        vLLM 0.31 queues copy-on-write copies only for a prefix-cache hit that
+        ends inside a block. Mode ``none`` has no prefix caching. In mode
+        ``align`` such a hit needs a ``prefix_match_unit`` below the block
+        size, which ``TTScheduler`` rejects for a model with MambaSpec groups:
+        its prefill chunk alignment is the KV block size
+        (``get_tt_prefill_chunk_alignment``), and ``prefix_match_unit`` must
+        be a multiple of the alignment. The TT model has no copy hook.
         """
-        if not copies:
-            return []
-        pairs = [(int(c.src_block_id), int(c.dst_block_id)) for c in copies]
-        if self.mamba_cache_mode == "none":
+        if copies:
             raise RuntimeError(
-                f"vLLM requested KV cache block copies (src, dst) {pairs} for a "
-                "model with MambaSpec groups in mamba_cache_mode 'none', which "
-                "runs without prefix caching"
+                "vLLM requested KV cache block copies (src, dst) "
+                f"{[(int(c.src_block_id), int(c.dst_block_id)) for c in copies]} "
+                "for a model with MambaSpec groups in mamba_cache_mode "
+                f"{self.mamba_cache_mode!r}; TT copies no KV cache blocks, and "
+                "vLLM queues them only for prefix-cache hits that end inside a "
+                "block"
             )
-        destinations = [dst for _, dst in pairs]
-        overlap = {src for src, _ in pairs} & set(destinations)
-        if overlap or len(set(destinations)) != len(destinations):
-            raise RuntimeError(
-                f"KV cache block copies (src, dst) {pairs} write a block twice "
-                f"or read a block another copy writes ({sorted(overlap)}); "
-                "the copies would depend on the order the model applies them in"
-            )
-        return pairs
 
 
 def check_mamba_launch(

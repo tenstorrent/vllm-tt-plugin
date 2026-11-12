@@ -26,7 +26,7 @@ the runner's ``mamba_state`` three ways:
   ``mamba_get_block_table_tensor`` selects, in mode ``align`` the source and
   destination of the copy ``preprocess_mamba`` makes before the forward;
 - against the state the blocks hold: ``StateLedger`` replays what the model
-  contract asks of the recurrent kernels (block operations first, then read the
+  contract asks of the recurrent kernels (zeroing first, then read the
   start state from the start block unless the row has none, write a prefill
   checkpoint and the end state, padding rows write anything into block 0), so
   a row must find the state of exactly the tokens it has computed, whoever
@@ -249,12 +249,6 @@ class StateLedger:
             for block in block_ids:
                 self.states[(g, block)] = ZEROED
 
-    def copy(self, groups: list[int], copies: list[tuple[int, int]]):
-        """``copy_kv_cache_blocks``: the page of each block in every layer slot."""
-        for g in groups:
-            for src, dst in copies:
-                self.states[(g, dst)] = self.states.get((g, src))
-
 
 class UpstreamAlignRunner:
     """The Mamba bookkeeping of upstream's GPU model runner in mode ``align``.
@@ -371,7 +365,6 @@ class _Harness:
         self.resumed_from_zero: set[str] = set()
         self.rows_seen: dict[str, set[int]] = {}
         self.zeroed: list[int] = []
-        self.copies: list[tuple[int, int]] = []
         # Request id -> start position of each step that began from a block
         # vLLM kept for the prefix cache (new and resumed requests), and the
         # first GDN group's block it read.
@@ -475,14 +468,10 @@ class _Harness:
             return bool(self.scheduler.requests)
         self.model.calls.clear()
         model_input = self.runner.build_model_input(out, None)
-        # Block operations in the order the runner hands them to the model.
         for name, kwargs in self.model.calls:
             if name == "zero_kv_cache_blocks":
                 self.ledger.zero(self.groups, kwargs["block_ids"])
                 self.zeroed += kwargs["block_ids"]
-            elif name == "copy_kv_cache_blocks":
-                self.ledger.copy(self.groups, kwargs["copies"])
-                self.copies += kwargs["copies"]
         row_req_ids = model_input.row_req_ids
         positions = torch.as_tensor(model_input.input_positions).reshape(-1)
         state = model_input.mamba_state

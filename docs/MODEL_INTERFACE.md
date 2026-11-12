@@ -53,7 +53,7 @@ An ordinary text adapter needs `initialize_vllm_model`, `prefill_forward`,
 on the class and instance, even when the dictionary is empty: platform
 admission tolerates absence, but runtime sampling reads the dictionary directly.
 
-An adapter that declares recurrent state through `MambaSpec` also needs `allocate_kv_cache_per_layer` and `zero_kv_cache_blocks`, and `copy_kv_cache_blocks` to serve with prefix caching (`mamba_cache_mode` `align`). Its prefill and decode receive `mamba_state`, one `MambaGroupState` per `MambaSpec` group (see [state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)).
+An adapter that declares recurrent state through `MambaSpec` also needs `allocate_kv_cache_per_layer` and `zero_kv_cache_blocks`. Its prefill and decode receive `mamba_state`, one `MambaGroupState` per `MambaSpec` group (see [state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)).
 
 The execution page specifies when `read_decode_output` and
 `process_decode_output_host` are needed. Add extension hooks only with the

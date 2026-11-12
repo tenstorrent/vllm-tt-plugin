@@ -657,22 +657,16 @@ class TTModelRunner:
         kv_cache_groups = kv_cache_config.kv_cache_groups
         self._validate_kv_cache_groups(kv_cache_groups)
         self._mamba_groups = mamba_cache_groups(kv_cache_groups, self.vllm_config)
-        if self._mamba_groups is not None:
+        if self._mamba_groups is not None and not callable(
+            getattr(self.model, "zero_kv_cache_blocks", None)
+        ):
             # vLLM sends ``new_block_ids_to_zero`` for every config with Mamba
-            # layers (``KVCacheConfig.needs_kv_cache_zeroing``), and block
-            # copies with prefix caching; see
-            # ``_apply_kv_cache_block_operations``.
-            hooks = ["zero_kv_cache_blocks"]
-            if self._mamba_groups.mamba_cache_mode == "align":
-                hooks.append("copy_kv_cache_blocks")
-            missing = [h for h in hooks if not callable(getattr(self.model, h, None))]
-            if missing:
-                raise ValueError(
-                    f"{type(self.model).__name__} declares MambaSpec KV cache "
-                    "groups in mamba_cache_mode="
-                    f"{self._mamba_groups.mamba_cache_mode!r} but does not "
-                    f"implement {', '.join(missing)}"
-                )
+            # layers (``KVCacheConfig.needs_kv_cache_zeroing``); see
+            # ``_zero_new_kv_cache_blocks``.
+            raise ValueError(
+                f"{type(self.model).__name__} declares MambaSpec KV cache groups "
+                "but does not implement zero_kv_cache_blocks"
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -2964,7 +2958,7 @@ class TTModelRunner:
         # preemption or resume keeps a completed token valid for replay. Only a
         # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
-        self._apply_kv_cache_block_operations(scheduler_output)
+        self._zero_new_kv_cache_blocks(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
             and self._decode_layout_changed_since_last_decode
@@ -3001,33 +2995,26 @@ class TTModelRunner:
             )
         return model_input
 
-    def _apply_kv_cache_block_operations(
-        self, scheduler_output: SchedulerOutput
-    ) -> None:
-        """Hand the model the block zeroing and copies vLLM asks for.
+    def _zero_new_kv_cache_blocks(self, scheduler_output: SchedulerOutput) -> None:
+        """Hand the model the blocks vLLM asks to zero before this step.
 
         With Mamba layers vLLM lists every block it newly allocated to an
         attention group in ``new_block_ids_to_zero``: the block can still hold
         recurrent-state bytes that read as NaN or Inf at positions attention
-        has not written yet and masks. With prefix caching it also lists
-        copy-on-write copies of shared blocks in ``kv_cache_block_copies``.
-        The upstream GPU runner zeroes, then copies, before the forward, so a
-        copy destination that is also listed for zeroing ends up with the
-        copied content. The TT model owns the device buffers, so the runner
-        passes the whole lists to ``zero_kv_cache_blocks`` and
-        ``copy_kv_cache_blocks`` in that order. Without MambaSpec groups
-        nothing changes.
+        has not written yet and masks. The upstream GPU runner zeroes them
+        before the forward; the TT model owns the device buffers, so the runner
+        passes the whole list to ``zero_kv_cache_blocks``, which
+        ``initialize_kv_cache`` requires of a model with MambaSpec groups.
+        Without MambaSpec groups nothing changes.
         """
         if self._mamba_groups is None:
             return
-        copies = self._mamba_groups.block_copies(scheduler_output.kv_cache_block_copies)
+        self._mamba_groups.refuse_block_copies(scheduler_output.kv_cache_block_copies)
         block_ids = scheduler_output.new_block_ids_to_zero
         if block_ids:
             self.model.zero_kv_cache_blocks(
                 kv_cache=self.kv_caches, block_ids=list(block_ids)
             )
-        if copies:
-            self.model.copy_kv_cache_blocks(kv_cache=self.kv_caches, copies=copies)
 
     # All lane-specific input/output shaping lives in ``TTLaneInputBatch``
     # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the

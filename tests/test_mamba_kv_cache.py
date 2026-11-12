@@ -180,18 +180,11 @@ class _AllocatingModel:
         self.calls.append(("decode_forward", kwargs))
 
 
-class _ZeroingModel(_AllocatingModel):
-    """A model with the hooks a MambaSpec model needs in mode none."""
+class _RecordingModel(_AllocatingModel):
+    """A model with every hook a MambaSpec model needs, recording each call."""
 
     def zero_kv_cache_blocks(self, **kwargs):
         self.calls.append(("zero_kv_cache_blocks", kwargs))
-
-
-class _RecordingModel(_ZeroingModel):
-    """A model with every hook a MambaSpec model needs, recording each call."""
-
-    def copy_kv_cache_blocks(self, **kwargs):
-        self.calls.append(("copy_kv_cache_blocks", kwargs))
 
 
 def _runner(cfg, model=None) -> TTModelRunner:
@@ -864,67 +857,57 @@ def test_page_table_is_the_attention_groups_table():
         assert page_table[1, :1].tolist() == [40]
 
 
-def test_mamba_model_refuses_block_copies():
-    """vLLM queues block copies only for prefix-cache hits, which mode none
-    never has; a copy that arrives anyway fails instead of being dropped."""
-    cfg = _vllm_config()
-    runner = _live_runner(cfg, _layer_specs(), _RecordingModel())
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_mamba_model_refuses_block_copies(mode):
+    """vLLM queues block copies only for prefix-cache hits that end inside a
+    block: mode none has no prefix caching, and in mode align TT rejects the
+    ``prefix_match_unit`` such a hit needs. A copy that arrives anyway fails,
+    printing the copies, before any block operation, instead of being
+    dropped."""
+    cfg = _vllm_config(mode)
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(mamba_cache_mode=mode), model)
 
-    with pytest.raises(RuntimeError, match=r"block copies \(src, dst\)"):
+    with pytest.raises(RuntimeError, match=r"block copies \(src, dst\) \[\(5, 6\)\]"):
         runner.build_model_input(
             _step(
                 {"a": 100},
                 new=[_new_request("a", 100, ([10], [11], [12], [20]))],
+                zero=[20],
                 copies=[KVCacheBlockCopy(src_block_id=5, dst_block_id=6)],
             ),
             None,
         )
+    assert model.calls == []
 
 
-def test_align_models_must_implement_copy_kv_cache_blocks():
-    """vLLM queues copy-on-write block copies for prefix-cache hits."""
-    cfg = _vllm_config("align")
-    kv_cache_config = _kv_cache_config(cfg, _layer_specs(mamba_cache_mode="align"), 256)
-
-    with pytest.raises(ValueError, match="does not implement copy_kv_cache_blocks"):
-        TTModelRunner.initialize_kv_cache(
-            _runner(cfg, _ZeroingModel()), kv_cache_config
-        )
-
-
-def test_align_prefix_hit_reads_the_cached_block_and_copies_follow_zeroing():
+def test_align_prefix_hit_reads_the_cached_block_and_writes_the_next_column():
     """A prefix hit on the state after 2048 tokens, then decode across 3072.
 
     Request A hits the cached state block of column 1 in each GDN group and
     prefills tokens 2048 to 2500: it reads column 1's block and writes column
-    2's. The runner zeroes the listed blocks, then applies vLLM's copies in
-    their order, before it builds the step. Decoding on, the row reads and
-    writes column 2's block until the decode at position 3072, which reads
-    column 2's block and writes column 3's.
+    2's, with no copy. The runner zeroes the listed blocks before it builds
+    the step. Decoding on, the row reads and writes column 2's block until the
+    decode at position 3072, which reads column 2's block and writes column
+    3's.
     """
     cfg = _vllm_config("align")
     model = _RecordingModel()
     runner = _live_runner(cfg, _layer_specs(mamba_cache_mode="align"), model)
     # Group order: GDN groups 0, 1, 2, then attention group 3.
     blocks_a = ([0, 10, 11], [0, 20, 21], [0, 30, 31], [40, 41, 42])
-    copies = [
-        KVCacheBlockCopy(src_block_id=7, dst_block_id=8),
-        KVCacheBlockCopy(src_block_id=7, dst_block_id=9),
-    ]
 
     prefill = runner.build_model_input(
         _step(
             {"a": 452},
             new=[_new_request("a", 2500, blocks_a, num_computed_tokens=2048)],
-            zero=[42, 8],
-            copies=copies,
+            zero=[42],
         ),
         None,
     )
 
     assert model.calls == [
-        ("zero_kv_cache_blocks", {"kv_cache": ["kv"], "block_ids": [42, 8]}),
-        ("copy_kv_cache_blocks", {"kv_cache": ["kv"], "copies": [(7, 8), (7, 9)]}),
+        ("zero_kv_cache_blocks", {"kv_cache": ["kv"], "block_ids": [42]}),
     ]
     assert [g.start_blocks[0].item() for g in prefill.mamba_state.groups] == [
         10,
@@ -954,32 +937,6 @@ def test_align_prefix_hit_reads_the_cached_block_and_copies_follow_zeroing():
     ]
     after = decode(3073)
     assert [g.start_blocks[0].item() for g in after.mamba_state.groups] == [12, 22, 32]
-
-
-def test_overlapping_block_copies_fail_before_any_block_operation():
-    """A block written twice, or read by one copy and written by another,
-    would make the result depend on the order the model applies copies in."""
-    cfg = _vllm_config("align")
-    model = _RecordingModel()
-    runner = _live_runner(cfg, _layer_specs(mamba_cache_mode="align"), model)
-    chained = [
-        KVCacheBlockCopy(src_block_id=5, dst_block_id=6),
-        KVCacheBlockCopy(src_block_id=6, dst_block_id=7),
-    ]
-
-    with pytest.raises(
-        RuntimeError, match=r"read a block another copy writes \(\[6\]\)"
-    ):
-        runner.build_model_input(
-            _step(
-                {"a": 100},
-                new=[_new_request("a", 100, ([10], [11], [12], [20]))],
-                zero=[20],
-                copies=chained,
-            ),
-            None,
-        )
-    assert model.calls == []
 
 
 def test_attention_only_model_without_hooks_is_unchanged():

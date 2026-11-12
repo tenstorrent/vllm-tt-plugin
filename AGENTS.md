@@ -299,8 +299,7 @@ not remove them in an unrelated pull request:
 
 Other contracts are methods, not dictionary keys: hybrid KV opt-in is
 `get_kv_cache_spec`; recurrent state declared through `MambaSpec` uses
-`zero_kv_cache_blocks` and, with prefix caching, `copy_kv_cache_blocks`;
-block-output lifecycle uses `release_request`,
+`zero_kv_cache_blocks`; block-output lifecycle uses `release_request`,
 `release_persistent_capture`, and, for adaptive block output with multiple
 requests, `note_state_slots_moved`; speculative feasibility is `spec_plan`, a
 classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRACT.md).
