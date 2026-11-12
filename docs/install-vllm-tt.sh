@@ -13,7 +13,7 @@
 # not stay behind in the image layer.
 VLLM_COMMON_REQUIREMENTS=$(mktemp)
 curl -fsSL \
-    https://raw.githubusercontent.com/vllm-project/vllm/v0.30.0/requirements/common.txt \
+    https://raw.githubusercontent.com/vllm-project/vllm/v0.31.0/requirements/common.txt \
     -o "$VLLM_COMMON_REQUIREMENTS" ||
     # `return`, not `exit`: this script is sourced into the caller's shell.
     { echo "install-vllm-tt: cannot fetch vLLM common.txt"; return 1; }
@@ -39,7 +39,7 @@ uv pip install numba==0.61.2   # matches vLLM's own requirements/cuda.txt pin
 # --no-binary vllm: the published wheel is the CUDA build, kernels included, so
 # vLLM has to come from source. vLLM ends up declaring no torch dependency, which
 # is intended; torch belongs to the tt-metal env this plugin runs inside.
-VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.30.0
+VLLM_TARGET_DEVICE=empty uv pip install --no-deps --no-binary vllm vllm==0.31.0
 # Patch the installed vLLM with the backports in patches/vllm-<version>/ (MiMo
 # tool calling; see patches/vllm-0.30.0/README.md). Skips a patch that is
 # already applied and a vLLM version with no patch directory; fails on a conflict.

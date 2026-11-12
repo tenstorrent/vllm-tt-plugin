@@ -48,12 +48,15 @@ Upstream vLLM is more general:
 There are three important scheduler-side collections:
 
 - `waiting`: requests not yet admitted into active execution
-- `skipped_waiting`: pending prefill requests temporarily blocked, for example
-  while their structured-output grammar is compiled
+- `kv_holding_waiting`: requests not yet admitted that already hold KV blocks,
+  for example a streaming-input session waiting for its next chunk. vLLM admits
+  from this queue before `waiting`.
 - `running`: requests already admitted and holding active scheduler state
 
-TT treats `waiting` and `skipped_waiting` together when checking for pending
-prefill work. A partly prefilled request sits in `running` with
+A request that is temporarily blocked, for example while its structured-output
+grammar is compiled, stays in its waiting queue, and vLLM's prefill pass skips
+it until it is ready. TT treats `waiting` and `kv_holding_waiting` together when
+checking for pending prefill work. A partly prefilled request sits in `running` with
 `is_prefill_chunk` set; TT counts it as pending prefill work too, because only
 a prefill step can advance it. What TT changes is not the existence of these
 collections, but the rules for choosing what kind of work a step may contain
@@ -69,7 +72,7 @@ For TT, it is useful to think in terms of two batch types:
 That is a simplification compared with upstream vLLM, but it matches how the TT path is intentionally organized today.
 
 TT still performs continuous batching in the broad sense: requests arrive in
-`waiting`, may be held in `skipped_waiting`, are admitted while other requests
+`waiting`, may wait there while blocked, are admitted while other requests
 remain active, can be preempted back to `waiting`, and leave independently as
 they finish. The restriction is within each device step: TT does not mix
 prefill and decode work in the same batch.
@@ -163,10 +166,9 @@ That lag is intentional and is what creates host/device overlap.
 
 The TT scheduler behaves like this:
 
-- if `waiting` or `skipped_waiting` contains pending prefill work, or any
+- if `waiting` or `kv_holding_waiting` contains pending prefill work, or any
   running request is a partial-prefill continuation, run the prefill scheduling
-  pass so newly ready requests can be promoted and admitted and continuations
-  can advance.
+  pass so newly ready requests can be admitted and continuations can advance.
 - otherwise, advance decode work
 - if pending prefill work cannot be admitted, fall back to decode to free
   capacity. Partial prefills do not make this fallback viable: a decode step
