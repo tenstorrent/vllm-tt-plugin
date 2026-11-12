@@ -27,3 +27,12 @@ numpy>=1.24.4,<2
 # release is validated. The floor restates vLLM's own: --override replaces a
 # requirement instead of intersecting it.
 transformers>=5.10.4,<5.15.0
+
+# vLLM 0.31.0 pins xgrammar 0.2.7. The MiMo tool parser backported in
+# patches/vllm-0.31.0/until-0.32/ uses xgrammar's builtin `mimo` structural tag,
+# which first shipped in 0.2.8 (mlc-ai/xgrammar#916); vLLM 0.32.0 pins 0.2.8 for
+# the same reason. 0.2.9 is what the MiMo endpoint was measured on. vLLM 0.31.0's
+# structured-output code is unchanged by the bump (tests/vllm_patches covers its
+# xgrammar backend). Revisit when the pinned vLLM moves: drop this line once
+# vLLM's own pin is at least 0.2.8.
+xgrammar==0.2.9

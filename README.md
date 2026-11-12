@@ -53,6 +53,9 @@ Ubuntu 22.04.
 
 The installation script builds vLLM `0.31.0` from source with
 `VLLM_TARGET_DEVICE=empty`.
+It then applies the tool-calling patch stack in
+`patches/vllm-0.31.0/series` to the installed vLLM; see
+`patches/vllm-0.31.0/README.md`.
 
 To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),
 check out the `compat/vllm-X.Y.Z` tag (e.g., `compat/vllm-0.25.1`), the last plugin state
