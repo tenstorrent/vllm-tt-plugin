@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
@@ -952,6 +952,7 @@ class TTScheduler(AsyncScheduler):
         try:
             held_back = self._hold_back_partial_prefills(partial_prefills)
             held_home = self._hold_for_home_row()
+            self._match_waiting_to_free_rows()
             result = super().schedule()
         finally:
             if held_home:  # (back in front of what is left of the queue, in their FIFO order)
@@ -1063,6 +1064,129 @@ class TTScheduler(AsyncScheduler):
                 keep.add_request(request)
         self.waiting = keep
         return held
+
+    def _row_match_params(self):
+        """-> (K window, W seconds a head may be passed over, delta seconds a candidate must save over the head) or None when the row-matching admission is off. Env ``DSV41_ROW_MATCH_K`` (0 / unset = off), ``DSV41_ROW_MATCH_WAIT_S`` (60),
+        ``DSV41_ROW_MATCH_DELTA_S`` (0.3); the live switch file ``DSV41_ROW_MATCH_FILE`` (content "0" = off, "1" = on, anything else / missing = the env decides)."""
+        k = int(os.environ.get("DSV41_ROW_MATCH_K", "0") or 0)
+        f = os.environ.get("DSV41_ROW_MATCH_FILE")
+        if f:
+            try:
+                with open(f) as fh:
+                    v = fh.read().strip()
+                if v == "0":
+                    return None
+                if v == "1" and k <= 1:
+                    k = 8
+            except OSError:
+                pass
+        if k <= 1:
+            return None
+        return k, float(os.environ.get("DSV41_ROW_MATCH_WAIT_S", "60")), float(os.environ.get("DSV41_ROW_MATCH_DELTA_S", "0.3"))
+
+    def _match_waiting_to_free_rows(self, now: float | None = None) -> None:
+        """Row-matching admission (default off, ``DSV41_ROW_MATCH_K``): which waiting request gets the free users of this step.
+
+        Measured on the AgentX hour (program/rowaffine): 94 % of the cross-row copies happen when the batch is nearly full and the queue is not empty: the request at the head takes the single user that just freed, on
+        whatever row, and its prefix lives elsewhere (a copy blocks the whole engine thread: 16 % of the hour at B=16). Here the first K waiting requests are looked at (``peek_model_home``, read-only): a request
+        whose resident prefix sits on a row that has a free user costs nothing, one whose prefix sits on a row with no free user costs the copy (about 0.25 s + 23.5 ms per 1000 tokens). The free users of this step
+        (the capacity left by the running requests) go greedily to the requests with the cheapest placement, a request other than the head only when it saves more than ``delta`` seconds; a head that has been waiting for
+        ``W`` seconds is never passed over (no starvation) and nothing is ever delayed when no user is free for it anyway (the queue order only decides who gets the users that are free NOW). The picked requests are
+        moved to the front of the queue in pick order; the base scheduler then admits in queue order. Everything else keeps its FIFO order."""
+        params = self._row_match_params()
+        if params is None or not self.waiting or getattr(self, "policy", SchedulingPolicy.FCFS) != SchedulingPolicy.FCFS:
+            return
+        k_win, w_max, delta = params
+        cap = int(self.max_num_running_reqs) - len(self.running)
+        if cap <= 0 or len(self.waiting) < 2:
+            return
+        now = time.monotonic() if now is None else now
+        state = getattr(self, "_row_match_state", None)
+        if state is None:
+            state = self._row_match_state = {}  # request id -> [first seen, time of the last peek, its answer]
+        waiting = []
+        while self.waiting:
+            waiting.append(self.waiting.pop_request())
+        live = {r.request_id for r in waiting}
+        for rid in [x for x in state if x not in live]:
+            del state[rid]
+        try:
+            window = waiting[:k_win]
+            infos = {}
+            for r in window:
+                st = state.setdefault(r.request_id, [now, None, None])
+                if r.num_computed_tokens != 0:
+                    infos[r.request_id] = None
+                    continue
+                if st[1] is not None and now - st[1] < 0.25 and not getattr(self, "finished_req_ids", None):
+                    infos[r.request_id] = st[2]
+                    continue
+                token_ids = getattr(r, "all_token_ids", None)
+                info = peek_model_home(
+                    r.request_id,
+                    token_ids if token_ids is not None else r.prompt_token_ids,
+                    r.num_tokens,
+                    finished_ids=getattr(self, "finished_req_ids", None),
+                    touch=True,
+                )
+                st[1], st[2] = now, info
+                infos[r.request_id] = info
+            free = None
+            for r in window:
+                i = infos.get(r.request_id)
+                if i is not None:
+                    free = list(i[2])
+                    break
+            if free is None:
+                return
+            taken = [0] * len(free)
+
+            def cost(r):
+                i = infos.get(r.request_id)
+                if i is None or r.num_computed_tokens != 0:
+                    return 0.0, -1
+                hit, home = int(i[0]), int(i[1])
+                if hit < 2048 or home < 0 or home >= len(free) or free[home] - taken[home] > 0:
+                    return 0.0, home
+                return 0.25 + 0.0235 * hit / 1000.0, home
+
+            def book(r, home, c):
+                nonlocal taken
+                if c == 0.0 and home >= 0 and free[home] - taken[home] > 0 and infos.get(r.request_id) is not None and int(infos[r.request_id][0]) >= 2048:
+                    taken[home] += 1
+                    return
+                rem = [free[x] - taken[x] - (1 if (c > 0 and x == home) else 0) for x in range(len(free))]
+                if c > 0 and 0 <= home < len(rem):
+                    rem[home] = -1  # a copy goes to another row
+                j = max(range(len(rem)), key=lambda x: rem[x])
+                taken[j] += 1
+
+            pool = list(window)
+            picks = []
+            for _ in range(min(cap, len(pool))):
+                head = pool[0]
+                hc, hh = cost(head)
+                pick, pc, ph = head, hc, hh
+                if now - state[head.request_id][0] < w_max and hc > delta:
+                    for r in pool[1:]:
+                        c, h = cost(r)
+                        if c < pc - delta:
+                            pick, pc, ph = r, c, h
+                book(pick, ph, pc)
+                picks.append(pick)
+                pool.remove(pick)
+            if picks != waiting[: len(picks)]:
+                moved = [r.request_id for r in picks if r is not waiting[picks.index(r)]]
+                rest = [r for r in waiting if r not in picks]
+                waiting = picks + rest
+                if moved:
+                    logger.info(
+                        "TT scheduler: row-matching admission moved %d of the first %d waiting request(s) ahead (free users per row %s): %s",
+                        len(moved), len(window), free, moved,
+                    )
+        finally:
+            for r in waiting:
+                self.waiting.add_request(r)
 
     def _get_local_prefix_cache_hit(self, request: Request):
         """vLLM's prefix-cache hit, rounded down to what the model can resume from (``prefix_cache_hit_policy``).
