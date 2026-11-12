@@ -718,7 +718,10 @@ runner never sends those drafts again, and the next `propose_draft_tokens` call
 continues from the token the ordinary decode committed. A model whose ordinary
 decode cannot read the state a verify leaves behind, for example recurrent
 state that only the verify path updates, must not declare
-`supports_narrow_decode`.
+`supports_narrow_decode`. A model that keeps recurrent state in `MambaSpec`
+blocks reads it from `mamba_state.start_blocks` on both calls, and the runner
+points `start_blocks` at the block the verify left for the committed count
+(see [speculative verification](MODEL_EXECUTION.md#speculative-verification)).
 
 **An ordinary decode may return host token ids.** On a launch that samples on
 device, a model may answer an ordinary decode step for some or all rows from
@@ -1188,7 +1191,10 @@ step names who acts.
    `supports_narrow_decode` would receive the `[B, 1+K]` verify here instead,
    with `num_valid_drafts` 0 on every row.
 3. Bootstrap. **The adapter** must initialize whatever drafter state it needs
-   from whichever of those two calls it received. An adapter that initializes
+   from whichever of those two calls it received, or from A's last prefill
+   chunk. **`TTModelRunner`** tells a model with `MambaSpec` groups which
+   prefill rows end their prefill through
+   `mamba_state.intermediate_prefill_mask`. An adapter that initializes
    its drafter only inside the verify call never drafts on a launch whose first
    decode step is the ordinary one, and the plugin reports nothing, because
    declining to draft is a legal answer.

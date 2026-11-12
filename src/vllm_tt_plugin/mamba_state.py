@@ -13,23 +13,30 @@ model keeps that overlay. It allocates one buffer per layer slot (the
 layer's state inside the buffer of its slot, at the block ids that layer's
 group owns.
 
-The TT runner implements ``mamba_cache_mode`` ``none`` and ``align`` without
-speculative decoding. The upstream GPU model runner, not the scheduler, picks
-the state blocks of each request from the group's block-table row
-(``mamba_get_block_table_tensor``, and in mode ``align`` ``preprocess_mamba``);
-this module does the same and hands the blocks to the model as
-``mamba_state``.
+The TT runner implements ``mamba_cache_mode`` ``none`` and ``align``, with
+synchronous speculative decoding or without it. The upstream GPU model runner,
+not the scheduler, picks the state blocks of each request from the group's
+block-table row (``mamba_get_block_table_tensor``, and in mode ``align``
+``preprocess_mamba``); this module does the same and hands the blocks to the
+model as ``mamba_state``.
 
-In mode ``none`` a request holds one state block per Mamba group for its whole
-life, in block-table column 0. In mode ``align`` the running state after ``n``
-tokens is in column ``(n - 1) // block_size``. When a step's tokens cross into
-a new column, upstream ``preprocess_mamba`` copies the running state into the
-block of the new column and the kernels update that block in place, so the
-block of the earlier column keeps the state of its boundary for the prefix
-cache. The TT runner does not copy: it names the block that holds the start
-state (``MambaGroupState.start_blocks``) and the block that takes the end state
+Each step writes into a **window** of ``1 + K`` consecutive block-table
+columns, K being ``MambaSpec.num_speculative_blocks`` (0 without speculative
+decoding): window column ``t`` takes the state after the step's query token
+``t``, and a prefill or an ordinary decode puts its end state into window
+column 0. The window begins at column 0 in mode ``none`` and, in mode
+``align``, at the column of the state after all the step's tokens
+(``window_start_column``). A step that committed ``a`` tokens leaves the
+request's state in window column ``a - 1`` (``accepted_state_column``), where
+the request's next step reads it. Upstream ``preprocess_mamba`` copies that
+state into the next window's column 0 when the window moves, and so keeps the
+state of a block boundary in the block of its own column for the prefix cache.
+The TT runner does not copy: it names the block that holds the start state
+(``MambaGroupState.start_blocks``) and the blocks that take the new states
 (``MambaGroupState.windows``), and the model reads the one and writes the
-other.
+others. Without speculative decoding the window is the running column, and
+the state after ``n`` tokens is in column ``(n - 1) // block_size`` in mode
+``align``.
 
 With ``MambaSpec.num_prefill_checkpoint_blocks`` 1, a prefill chunk can also
 pass the prompt's last cacheable position; the model then writes the state at
@@ -41,8 +48,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -54,9 +61,84 @@ from vllm_tt_plugin.mamba_checkpoints import prefill_checkpoints
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 # ``CacheConfig.mamba_cache_mode`` values the TT runner implements.
 SUPPORTED_MAMBA_CACHE_MODES = ("none", "align")
+
+
+def window_start_column(
+    mamba_cache_mode: str, block_size: int, num_computed: int, num_scheduled: int
+) -> int:
+    """The block-table column of a step's window column 0.
+
+    The column upstream ``mamba_get_block_table_tensor`` starts the window at
+    and ``preprocess_mamba`` records as the running column: column 0 in mode
+    ``none``; in mode ``align`` the column that holds, by position, the state
+    after all ``num_scheduled`` tokens of the step, drafts included.
+    """
+    if mamba_cache_mode == "none":
+        return 0
+    return (num_computed + num_scheduled - 1) // block_size
+
+
+def accepted_state_column(window_column: int, accepted_count: int) -> int:
+    """The block-table column of a request's state after a step whose window
+    began at ``window_column`` and that committed ``accepted_count`` tokens.
+
+    The step's committed tokens are its first ``accepted_count`` query tokens,
+    and the step wrote the state after query token ``t`` into window column
+    ``t``. A prefill and an ordinary decode commit a count of 1, their end
+    state; a verify commits its column-0 token plus the drafts it accepted.
+    """
+    return window_column + accepted_count - 1
+
+
+def restored_state_column(
+    mamba_cache_mode: str, block_size: int, num_computed: int
+) -> int:
+    """The block-table column in which vLLM placed a request's state after
+    ``num_computed`` tokens, or -1 when it placed none.
+
+    That is where a new or resumed request's first step finds its start state:
+    none at position 0, else the block of a prefix-cache hit, which in mode
+    ``align`` vLLM puts into the hit's column. Without speculative decoding
+    every later step finds its start state there too, because a step's window
+    is then its running column.
+    """
+    if num_computed == 0:
+        return -1
+    if mamba_cache_mode == "none":
+        return 0
+    return (num_computed - 1) // block_size
+
+
+def _holds_current_block(row: np.ndarray, column: int) -> bool:
+    """Whether column ``column`` of a runner block-table row holds a block
+    the request still holds there.
+
+    The runner's row only grows: when ``MambaManager`` moves a speculative
+    block to the end of the request's row, or frees a block and later gives it
+    to the request again, the runner's row lists the block at its old column
+    too. So a block that the row lists again in a later column is no longer
+    the request's block at ``column``.
+    """
+    block = row[column]
+    return bool(block) and not bool((row[column + 1 :] == block).any())
+
+
+class MambaWindow(NamedTuple):
+    """The window of a request's last step, recorded with speculative
+    decoding for the request's next step."""
+
+    # Block-table column of the step's window column 0.
+    column: int
+    # The last block-table column of any window the request has had. vLLM
+    # can leave blocks of earlier windows in columns up to it that a later
+    # step passes: ``MambaManager`` keeps unused speculative blocks in place
+    # or moves them to the end of the row, and the runner's row still lists a
+    # moved block at its old column too.
+    end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +151,15 @@ class MambaGroupState:
 
     # The group's layers, ``KVCacheGroupSpec.layer_names``.
     layer_names: tuple[str, ...]
-    # ``[rows, 1]``: the block that takes row ``i``'s end state in this group.
+    # ``[rows, 1 + K]``, K the group's ``MambaSpec.num_speculative_blocks``:
+    # column ``t`` is the block that takes row ``i``'s state after its query
+    # token ``t`` in this group. A prefill or an ordinary decode writes its
+    # end state into column 0 only.
     windows: torch.Tensor
     # ``[rows]``: the block that holds row ``i``'s start state in this group,
-    # 0 when the row starts at position 0 and has no earlier state. It is
-    # ``windows[i, 0]`` unless the row's tokens cross into a new block-table
-    # column in mode ``align``.
+    # 0 when the row starts at position 0 and has no earlier state. When it
+    # is not one of the row's own ``windows`` blocks the model leaves it
+    # unchanged: it can be a block vLLM keeps in the prefix cache.
     start_blocks: torch.Tensor
     # ``[rows, 1]`` when a row of this prefill writes a checkpoint, else
     # ``None``: the block that takes row ``i``'s state after
@@ -94,11 +179,17 @@ class MambaStepState:
     # group's ``checkpoint_blocks[i, 0]``, strictly between the row's start
     # and end position; 0 for no checkpoint.
     checkpoint_positions: torch.Tensor | None = None
+    # Prefill only, else ``None``: CPU bool ``[rows]``, the step's
+    # ``TTModelInput.intermediate_prefill_mask``. True for a row whose chunk
+    # ends before the request's last token, so the step samples no token for
+    # it, and for padding rows; False for a row that ends its prefill.
+    intermediate_prefill_mask: torch.Tensor | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class MambaCacheGroups:
-    """The ``MambaSpec`` groups of one ``KVCacheConfig``."""
+    """The ``MambaSpec`` groups of one ``KVCacheConfig``, and the window of
+    each request's last step."""
 
     # Indices into ``KVCacheConfig.kv_cache_groups``, in group order.
     group_indices: tuple[int, ...]
@@ -121,6 +212,26 @@ class MambaCacheGroups:
     # hits and of vLLM's prefill checkpoint positions; ``block_size`` when
     # ``None``.
     prefix_match_unit: int | None = None
+    # ``MambaSpec.num_speculative_blocks`` K, the same in every Mamba group
+    # and equal to the launch's speculative tokens: a window has ``1 + K``
+    # columns.
+    num_speculative_blocks: int = 0
+    # K > 0 only: request id -> the window of its last step, which upstream
+    # keeps as ``mamba_state_idx``. ``step_state`` records it; ``forget``
+    # drops the requests whose next step starts from vLLM's placement.
+    windows: dict[str, MambaWindow] = field(default_factory=dict)
+
+    def forget(self, scheduler_output: SchedulerOutput) -> None:
+        """Drop the windows of finished, preempted and resumed requests, as
+        upstream ``cleanup_mamba_state_idx`` does. A resumed request starts
+        from position 0 or from a prefix-cache hit, on blocks vLLM gave it
+        anew (``restored_state_column``)."""
+        for req_id in (
+            *scheduler_output.finished_req_ids,
+            *(scheduler_output.preempted_req_ids or ()),
+            *scheduler_output.scheduled_cached_reqs.resumed_req_ids,
+        ):
+            self.windows.pop(req_id, None)
 
     def step_state(
         self,
@@ -129,15 +240,25 @@ class MambaCacheGroups:
         num_computed_tokens: Sequence[int],
         num_scheduled_tokens: Sequence[int],
         num_rows: int,
+        *,
+        accepted_counts: Sequence[int] | None = None,
+        intermediate_prefill_mask: Sequence[bool] | None = None,
     ) -> MambaStepState:
-        """The model's ``mamba_state`` for one forward.
+        """The model's ``mamba_state`` for one forward. Call it once per step.
 
         Row ``i`` of every block table belongs to ``row_req_ids[i]``, which
         has computed ``num_computed_tokens[i]`` tokens before this step and
-        computes ``num_scheduled_tokens[i]`` in it: the counts upstream
-        ``preprocess_mamba`` and ``mamba_get_block_table_tensor`` select the
-        blocks from. The result has ``num_rows`` rows, the row count of
+        computes ``num_scheduled_tokens[i]`` in it, drafts included: the counts
+        upstream ``preprocess_mamba`` and ``mamba_get_block_table_tensor``
+        select the blocks from. ``accepted_counts[i]`` is the number of tokens
+        the request's previous step committed (``TTModelInput.accepted_counts``),
+        ``None`` meaning 1 for every row. ``intermediate_prefill_mask`` is the
+        prefill's ``TTModelInput.intermediate_prefill_mask``, ``None`` in
+        decode. The result has ``num_rows`` rows, the row count of
         ``page_tables_per_layer``; rows past ``row_req_ids`` hold block 0.
+
+        With speculative decoding this records each row's window
+        (``windows``) for the request's next step.
         """
         live = len(row_req_ids)
         if live > num_rows:
@@ -145,41 +266,63 @@ class MambaCacheGroups:
                 f"{live} scheduled rows {list(row_req_ids)} exceed the "
                 f"{num_rows} rows of the Mamba state inputs"
             )
-        if not live == len(num_computed_tokens) == len(num_scheduled_tokens):
+        counts = [1] * live if accepted_counts is None else list(accepted_counts)
+        if (
+            not live
+            == len(num_computed_tokens)
+            == len(num_scheduled_tokens)
+            == len(counts)
+        ):
             raise RuntimeError(
                 f"{live} scheduled rows {list(row_req_ids)} got "
-                f"{len(num_computed_tokens)} computed-token counts and "
-                f"{len(num_scheduled_tokens)} scheduled-token counts"
+                f"{len(num_computed_tokens)} computed-token counts, "
+                f"{len(num_scheduled_tokens)} scheduled-token counts and "
+                f"{len(counts)} accepted counts"
             )
-        starts = np.asarray(num_computed_tokens, dtype=np.int64).reshape(live)
-        ends = starts + np.asarray(num_scheduled_tokens, dtype=np.int64).reshape(live)
-        if self.mamba_cache_mode == "none":
-            # The request's one state block.
-            start_columns = dest_columns = np.zeros(live, dtype=np.int64)
-        else:
-            # The running state after n tokens is in column (n - 1) //
-            # block_size; a row at position 0 has none (column -1).
-            start_columns = (starts - 1) // self.block_size
-            dest_columns = (ends - 1) // self.block_size
+        starts = [int(c) for c in num_computed_tokens]
+        scheduled = [int(s) for s in num_scheduled_tokens]
+        num_spec = self.num_speculative_blocks
+        width = 1 + num_spec
+        window_columns = np.array(
+            [
+                window_start_column(self.mamba_cache_mode, self.block_size, c, s)
+                for c, s in zip(starts, scheduled)
+            ],
+            dtype=np.int64,
+        ).reshape(live)
+        previous = [self.windows.get(r) if num_spec else None for r in row_req_ids]
+        start_columns = np.array(
+            [
+                self._start_column(req_id, start, int(count), window)
+                for req_id, start, count, window in zip(
+                    row_req_ids, starts, counts, previous
+                )
+            ],
+            dtype=np.int64,
+        ).reshape(live)
+        held_ends = np.array(
+            [-1 if w is None else w.end for w in previous], dtype=np.int64
+        ).reshape(live)
         for g in self.group_indices:
-            width = block_tables_per_group[g].shape[1]
-            if live and int(dest_columns.max()) >= width:
+            table_width = block_tables_per_group[g].shape[1]
+            if live and int(window_columns.max()) + num_spec >= table_width:
                 raise RuntimeError(
                     f"requests {list(row_req_ids)} need state block-table "
-                    f"columns {dest_columns.tolist()} in KV cache group {g}, "
-                    f"but the table has {width} columns"
+                    f"columns {window_columns.tolist()} to "
+                    f"{(window_columns + num_spec).tolist()} in KV cache group "
+                    f"{g}, but the table has {table_width} columns"
                 )
         rows = np.arange(live)
+        window_index = window_columns[:, None] + np.arange(width)
         # A row writes the checkpoint vLLM's rule names where vLLM reserved
         # its block. Every Mamba group reserves alike, so the first group's
         # row decides, and ``_check_rows`` raises where another group's
-        # differs.
-        checkpoints = self._checkpoint_columns(
-            num_computed_tokens, num_scheduled_tokens
-        )
+        # differs. A block the runner's row lists again in a later column is
+        # a speculative block vLLM moved away, not a reservation.
+        checkpoints = self._checkpoint_columns(starts, scheduled)
         first_table = block_tables_per_group[self.group_indices[0]][:live].numpy()
         reserved = [
-            c is not None and bool(first_table[row, c[1]])
+            c is not None and _holds_current_block(first_table[row], c[1])
             for row, c in enumerate(checkpoints)
         ]
         positions = np.array(
@@ -191,24 +334,27 @@ class MambaCacheGroups:
         groups = []
         for g, names in zip(self.group_indices, self.layer_names):
             table = block_tables_per_group[g][:live].numpy()
-            dest = table[rows, dest_columns]
-            start = np.where(starts > 0, table[rows, np.maximum(start_columns, 0)], 0)
-            checkpoint = np.where(
-                checkpoint_columns >= 0,
-                table[rows, np.maximum(checkpoint_columns, 0)],
-                0,
-            )
             self._check_rows(
                 g,
                 row_req_ids,
                 table,
                 starts,
                 start_columns,
-                dest_columns,
+                window_columns,
                 checkpoint_columns,
+                held_ends,
             )
-            windows = torch.zeros((num_rows, 1), dtype=torch.int32)
-            windows[:live, 0] = torch.from_numpy(dest.astype(np.int32))
+            dest = table[rows[:, None], window_index]
+            start = np.where(
+                start_columns >= 0, table[rows, np.maximum(start_columns, 0)], 0
+            )
+            checkpoint = np.where(
+                checkpoint_columns >= 0,
+                table[rows, np.maximum(checkpoint_columns, 0)],
+                0,
+            )
+            windows = torch.zeros((num_rows, width), dtype=torch.int32)
+            windows[:live] = torch.from_numpy(dest.astype(np.int32))
             start_blocks = torch.zeros(num_rows, dtype=torch.int32)
             start_blocks[:live] = torch.from_numpy(start.astype(np.int32))
             checkpoint_blocks = None
@@ -231,9 +377,58 @@ class MambaCacheGroups:
             checkpoint_positions[:live, 0] = torch.from_numpy(
                 positions.astype(np.int32)
             )
+        mask = None
+        if intermediate_prefill_mask is not None:
+            values = [bool(m) for m in intermediate_prefill_mask]
+            if len(values) != live:
+                raise RuntimeError(
+                    f"{live} scheduled rows {list(row_req_ids)} got an "
+                    f"intermediate_prefill_mask of {len(values)} rows"
+                )
+            mask = torch.ones(num_rows, dtype=torch.bool)
+            mask[:live] = torch.tensor(values, dtype=torch.bool)
+        if num_spec:
+            for req_id, column, window in zip(
+                row_req_ids, window_columns.tolist(), previous
+            ):
+                end = column + num_spec
+                self.windows[req_id] = MambaWindow(
+                    column, end if window is None else max(window.end, end)
+                )
         return MambaStepState(
-            groups=tuple(groups), checkpoint_positions=checkpoint_positions
+            groups=tuple(groups),
+            checkpoint_positions=checkpoint_positions,
+            intermediate_prefill_mask=mask,
         )
+
+    def _start_column(
+        self, req_id: str, start: int, count: int, window: MambaWindow | None
+    ) -> int:
+        """The block-table column of a row's start state, -1 for none.
+
+        ``window`` is the request's last recorded window, ``None`` for a
+        request whose first step this is (and always without speculative
+        decoding); ``count`` is the tokens that step committed.
+        """
+        if window is None:
+            if count != 1:
+                raise RuntimeError(
+                    f"request {req_id} has no earlier window, but its previous "
+                    f"step committed {count} tokens"
+                )
+            return restored_state_column(self.mamba_cache_mode, self.block_size, start)
+        if start == 0:
+            raise RuntimeError(
+                f"request {req_id} starts at position 0, but its previous step's "
+                f"window at block-table column {window.column} is recorded; "
+                "vLLM resumes a request only through resumed_req_ids"
+            )
+        if not 1 <= count <= 1 + self.num_speculative_blocks:
+            raise RuntimeError(
+                f"request {req_id}'s previous step committed {count} tokens, "
+                f"outside [1, {1 + self.num_speculative_blocks}]"
+            )
+        return accepted_state_column(window.column, count)
 
     def _checkpoint_columns(
         self,
@@ -257,36 +452,49 @@ class MambaCacheGroups:
         group: int,
         row_req_ids: Sequence[str],
         table: np.ndarray,
-        starts: np.ndarray,
+        starts: Sequence[int],
         start_columns: np.ndarray,
-        dest_columns: np.ndarray,
+        window_columns: np.ndarray,
         checkpoint_columns: np.ndarray,
+        held_ends: np.ndarray,
     ) -> None:
         """Raise for a row whose blocks vLLM did not allocate as expected.
 
-        vLLM gives every scheduled request its state block before the step,
-        and block 0 is the null block that padding rows share. The block of
-        the start state is the running block of the request's previous step,
-        which vLLM frees only after this step. In mode ``align`` vLLM leaves
-        block 0 in every column a step's tokens pass without ending there,
-        except the column of a prefill checkpoint (``checkpoint_columns``, -1
-        for none), which every Mamba group reserves alike. A block in another
+        vLLM gives every scheduled request the blocks of its window before the
+        step, and block 0 is the null block that padding rows share. The block
+        of the start state is a block of the request's previous window or of
+        a prefix-cache hit, which vLLM frees only after this step. In mode
+        ``align`` vLLM leaves block 0 in every column a step's tokens pass
+        before its window, except the column of a prefill checkpoint
+        (``checkpoint_columns``, -1 for none), which every Mamba group
+        reserves alike, and the columns of the request's earlier windows, up
+        to ``held_ends`` (-1 for a request without one). A block in another
         passed column would be one the model never writes and vLLM could
         cache.
         """
+        width = 1 + self.num_speculative_blocks
         for row, req_id in enumerate(row_req_ids):
             start_column = int(start_columns[row])
-            dest_column = int(dest_columns[row])
+            window_column = int(window_columns[row])
             checkpoint_column = int(checkpoint_columns[row])
-            if not table[row, dest_column]:
+            for t in range(width):
+                column = window_column + t
+                if not table[row, column]:
+                    raise RuntimeError(
+                        f"request {req_id} has no state block in KV cache group "
+                        f"{group}; block-table column {column} (window column "
+                        f"{t}) holds the null block 0: {table[row].tolist()}"
+                    )
+                if not _holds_current_block(table[row], column):
+                    raise RuntimeError(
+                        f"request {req_id}'s window column {t} is block-table "
+                        f"column {column} of KV cache group {group}, whose block "
+                        f"{int(table[row, column])} vLLM moved to a later "
+                        f"column: {table[row].tolist()}"
+                    )
+            if start_column >= 0 and not table[row, start_column]:
                 raise RuntimeError(
-                    f"request {req_id} has no state block in KV cache group "
-                    f"{group}; block-table column {dest_column} holds the null "
-                    f"block 0: {table[row].tolist()}"
-                )
-            if starts[row] > 0 and not table[row, start_column]:
-                raise RuntimeError(
-                    f"request {req_id} starts at position {int(starts[row])}, "
+                    f"request {req_id} starts at position {starts[row]}, "
                     f"but block-table column {start_column} of KV cache group "
                     f"{group} holds the null block 0 instead of its start "
                     f"state: {table[row].tolist()}"
@@ -298,16 +506,16 @@ class MambaCacheGroups:
                     f"{self.group_indices[0]} but not of group {group}: "
                     f"{table[row].tolist()}"
                 )
-            first = max(start_column + 1, 0)
+            first = max(start_column, int(held_ends[row])) + 1
             passed = [
                 column
-                for column in range(first, dest_column)
+                for column in range(first, window_column)
                 if table[row, column] and column != checkpoint_column
             ]
             if passed:
                 raise RuntimeError(
                     f"request {req_id} passes block-table columns {first} to "
-                    f"{dest_column - 1} of KV cache group {group} in this step, "
+                    f"{window_column - 1} of KV cache group {group} in this step, "
                     f"but vLLM allocated blocks in columns {passed} that the "
                     "model does not write (vLLM's prefill checkpoint rule names "
                     f"column {checkpoint_column if checkpoint_column >= 0 else None}): "
@@ -358,11 +566,19 @@ def check_mamba_launch(
             "Block-output models (output_tokens_per_step > 1) do not support "
             "MambaSpec KV cache groups"
         )
-    if vllm_config.speculative_config is not None:
-        raise ValueError(
-            "Speculative decoding is not supported with MambaSpec KV cache "
-            "groups on TT yet; launch without --speculative-config"
-        )
+    speculative_config = vllm_config.speculative_config
+    num_speculative_tokens = 0
+    if speculative_config is not None:
+        num_speculative_tokens = speculative_config.num_speculative_tokens
+        if vllm_config.scheduler_config.async_scheduling:
+            # The scheduler's token counts of a request with a verify in flight
+            # count its drafts as accepted, so the state block the next step
+            # starts from is known only after the readback.
+            raise ValueError(
+                "Speculative decoding with MambaSpec KV cache groups runs only "
+                "with synchronous scheduling on TT; launch with "
+                "--no-async-scheduling"
+            )
     mode = vllm_config.cache_config.mamba_cache_mode
     model_config = vllm_config.model_config
     if (
@@ -397,11 +613,18 @@ def check_mamba_launch(
                 f"but cache_config.mamba_cache_mode={mode!r}; the model's "
                 "get_kv_cache_spec must use the resolved cache mode"
             )
-        if spec.num_speculative_blocks:
+        if spec.num_speculative_blocks != num_speculative_tokens:
+            # A verify writes the state after each of its 1 + K tokens into a
+            # block of its own, and MambaManager allocates K blocks beyond the
+            # running one.
             raise ValueError(
                 "MambaSpec has num_speculative_blocks="
-                f"{spec.num_speculative_blocks}; TT supports no speculative "
-                "state blocks yet, so it must be 0"
+                f"{spec.num_speculative_blocks}, but the launch verifies "
+                f"{num_speculative_tokens} speculative tokens per step; the "
+                "model's get_kv_cache_spec must declare num_speculative_blocks "
+                "equal to speculative_config.num_speculative_tokens (0 without "
+                "--speculative-config), as upstream MambaBase.get_kv_cache_spec "
+                "does"
             )
         if spec.num_prefill_checkpoint_blocks and (
             mode != "align"
@@ -567,6 +790,8 @@ def mamba_cache_groups(
             checkpoint_alignment if num_checkpoint_blocks else None
         ),
         prefix_match_unit=getattr(vllm_config.cache_config, "prefix_match_unit", None),
+        # check_mamba_launch made it the launch's draft length in every group.
+        num_speculative_blocks=specs[0].num_speculative_blocks,
     )
 
 
@@ -575,8 +800,12 @@ __all__ = [
     "MambaCacheGroups",
     "MambaGroupState",
     "MambaStepState",
+    "MambaWindow",
+    "accepted_state_column",
     "check_mamba_launch",
     "declares_mamba_spec",
     "mamba_attention_block_size",
     "mamba_cache_groups",
+    "restored_state_column",
+    "window_start_column",
 ]
