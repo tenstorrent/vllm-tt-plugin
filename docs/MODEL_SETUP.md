@@ -142,7 +142,8 @@ a buffer. A single-group cache gives every attention layer a separate
 
 When vLLM creates multiple KV groups, `TTModelRunner` expands group page tables
 into `page_tables_per_layer`, ordered by attention-layer index. Prefill and
-decode receive `page_tables_per_layer` in addition to group 0's `page_table`.
+decode receive `page_tables_per_layer` in addition to group 0's `page_table`
+(the first attention group's with `MambaSpec` groups).
 Each per-layer tensor has shape
 `[tt_max_batch_size, max_num_blocks_per_req]`, with unused rows and columns
 zero-padded. The per-layer row capacity can exceed `tokens.shape[0]` during
@@ -189,10 +190,10 @@ Allocation:
 - `per_layer_specs` has one entry per layer that the groups name, in decoder-layer index order, so the list covers the recurrent layers between the attention layers. Layer names must contain `layers.<index>` with indices `0` to `len(per_layer_specs) - 1`.
 - An attention entry is `(shape, dtype, tensor_idx)`, as above. A `MambaSpec` entry is `(MambaSpec.shapes, MambaSpec.dtypes, tensor_idx)`.
 - The layer at position `j` of each group gets `tensor_idx` `j`. The adapter allocates the buffers of each `tensor_idx` from its attention entries and stores the state of each recurrent layer with that `tensor_idx` inside them, at the block ids the layer's group owns. `TTModelRunner` raises if a recurrent layer's `tensor_idx` has no attention layer.
-- The adapter must implement `allocate_kv_cache_per_layer`.
+- The adapter must implement `allocate_kv_cache_per_layer` and `zero_kv_cache_blocks` (see [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations)); `TTModelRunner.initialize_kv_cache` raises without `zero_kv_cache_blocks`. Prefill and decode receive `mamba_state`; see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks).
 
 Block count: `get_num_available_blocks_tt` converts `max_tokens_all_users` to bytes per layer slot with the attention layers' bytes per token, then divides by the unified page size. A token count divided by `block_size` would ignore page padding. It then adds one block per running request in each attention group, for output, and one state block per running request in each `MambaSpec` group, as `MambaSpec.max_memory_usage_bytes` counts it in mode `none`. Each block is counted once, because all groups share it. Unlike the sliding-window path, the plugin does not grow this pool to upstream's admission floor: if the pool cannot admit one request at `max_model_len`, `get_num_available_blocks_tt` raises and names the two block counts. Lower `--max-model-len`, launch with `--max-model-len -1` to fit the length to the pool, or raise the model's `get_max_tokens_all_users` budget.
 
-Page tables: `page_tables_per_layer` has one entry per layer, and the entry of a recurrent layer is its group's table. The table width `max_num_blocks_per_req` is the largest block-table row width over the groups, at most `num_blocks`, rounded up to a multiple of 8. TT chunked SDPA requires a page-table row of a multiple of 32 bytes. `cache_config.block_size` does not set this width.
+Page tables: `page_tables_per_layer` has one entry per layer, and the entry of a recurrent layer is its group's table. vLLM orders the groups by specification, so group 0 can be a `MambaSpec` group; with `MambaSpec` groups, `page_table` is therefore the table of the first attention group, not of group 0. The table width `max_num_blocks_per_req` is the largest block-table row width over the groups, at most `num_blocks`, rounded up to a multiple of 8. TT chunked SDPA requires a page-table row of a multiple of 32 bytes. `cache_config.block_size` does not set this width.
 
 Sources: `check_mamba_launch`, `mamba_cache_groups` and `MambaCacheGroups` in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py); `TTModelRunner.initialize_kv_cache` and `_build_per_layer_specs` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py); `_mamba_hybrid_num_blocks` in [worker.py](../src/vllm_tt_plugin/worker.py).

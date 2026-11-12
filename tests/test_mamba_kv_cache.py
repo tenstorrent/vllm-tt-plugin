@@ -19,7 +19,13 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, get_kv_cache_configs
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     MambaSpec,
@@ -160,10 +166,24 @@ class _AllocatingModel:
 
     def __init__(self):
         self.per_layer_specs = None
+        self.calls: list[tuple[str, dict]] = []
 
     def allocate_kv_cache_per_layer(self, per_layer_specs):
         self.per_layer_specs = per_layer_specs
         return ["kv"]
+
+    def prefill_forward(self, **kwargs):
+        self.calls.append(("prefill_forward", kwargs))
+
+    def decode_forward(self, **kwargs):
+        self.calls.append(("decode_forward", kwargs))
+
+
+class _RecordingModel(_AllocatingModel):
+    """A model with every hook a MambaSpec model needs, recording each call."""
+
+    def zero_kv_cache_blocks(self, **kwargs):
+        self.calls.append(("zero_kv_cache_blocks", kwargs))
 
 
 def _runner(cfg, model=None) -> TTModelRunner:
@@ -183,7 +203,7 @@ def _runner(cfg, model=None) -> TTModelRunner:
     runner._is_block_output_model = False
     runner._output_tokens_per_step = 1
     runner._mamba_groups = None
-    runner.model = model if model is not None else _AllocatingModel()
+    runner.model = model if model is not None else _RecordingModel()
     return runner
 
 
@@ -293,7 +313,7 @@ def test_gdn_layers_share_the_layer_slot_of_their_group_position():
     """Layer ``4j + k`` of every group lands in layer slot ``j``."""
     cfg = _vllm_config()
     kv_cache_config = _kv_cache_config(cfg, _layer_specs(), 256)
-    model = _AllocatingModel()
+    model = _RecordingModel()
     runner = _runner(cfg, model)
 
     TTModelRunner.initialize_kv_cache(runner, kv_cache_config)
@@ -409,6 +429,268 @@ def test_gdn_layer_without_an_attention_layer_in_its_slot_is_rejected():
 
     with pytest.raises(ValueError, match="share no buffer with an attention layer"):
         TTModelRunner.initialize_kv_cache(_runner(cfg), kv_cache_config)
+
+
+# endregion
+
+
+def test_mamba_models_must_implement_zero_kv_cache_blocks():
+    """vLLM asks to zero new attention blocks whenever Mamba layers exist."""
+    cfg = _vllm_config()
+    kv_cache_config = _kv_cache_config(cfg, _layer_specs(), 256)
+
+    with pytest.raises(ValueError, match="zero_kv_cache_blocks"):
+        TTModelRunner.initialize_kv_cache(
+            _runner(cfg, _AllocatingModel()), kv_cache_config
+        )
+
+
+# region State blocks, page table and zeroing
+
+
+def test_state_blocks_match_upstream_selection():
+    """``step_state`` picks the block upstream ``mamba_get_block_table_tensor``
+    hands the GDN kernel in mode none, and block 0 for padding rows."""
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    from vllm_tt_plugin.mamba_state import MambaCacheGroups
+
+    spec = _layer_specs()["model.layers.0.linear_attn"]
+    tables = [
+        torch.arange(1, 4 * 24 + 1, dtype=torch.int32).reshape(4, 24) + 100 * g
+        for g in range(2)
+    ]
+    groups = MambaCacheGroups(
+        group_indices=(0, 1),
+        layer_names=(("model.layers.0.linear_attn",), ("model.layers.1.linear_attn",)),
+        attention_group_index=2,
+    )
+
+    state = groups.step_state(tables, ["a", "b", "c"], num_rows=6)
+
+    seq_lens = torch.tensor([1, 1024, 20_000, 0])
+    for g, group in enumerate(state.groups):
+        upstream = mamba_get_block_table_tensor(tables[g], seq_lens, spec, "none")
+        assert group.windows.dtype == torch.int32
+        assert group.windows.shape == (6, 1)
+        assert group.windows[:3, 0].tolist() == upstream[:3, 0].tolist()
+        assert group.windows[3:, 0].tolist() == [0, 0, 0]
+    # A scheduled row without a state block is a bookkeeping fault.
+    tables[1][2, 0] = 0
+    with pytest.raises(RuntimeError, match=r"requests \['c'\] have no state block"):
+        groups.step_state(tables, ["a", "b", "c"], num_rows=6)
+
+
+def _live_runner(cfg, specs, model) -> TTModelRunner:
+    """A runner built by ``TTModelRunner.__init__``, KV cache initialized."""
+    runner = TTModelRunner(
+        vllm_config=cfg,
+        mesh_device=None,
+        trace_mode="none",
+        enable_model_warmup=False,
+        num_devices=1,
+    )
+    runner.model = model
+    runner.initialize_kv_cache(_kv_cache_config(cfg, specs, 256))
+    return runner
+
+
+def _new_request(req_id: str, prompt_len: int, block_ids) -> NewRequestData:
+    return NewRequestData(
+        req_id=req_id,
+        prompt_token_ids=list(range(1, prompt_len + 1)),
+        mm_features=[],
+        sampling_params=SamplingParams(temperature=0.0),
+        pooling_params=None,
+        block_ids=block_ids,
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+
+
+def _step(
+    num_scheduled: dict[str, int],
+    new=(),
+    cached=(),
+    zero=None,
+    copies=None,
+) -> SchedulerOutput:
+    """``cached`` holds ``(req_id, num_computed_tokens, new_block_ids)``."""
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = list(new)
+    output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=[req_id for req_id, _, _ in cached],
+        resumed_req_ids=set(),
+        new_token_ids=[[] for _ in cached],
+        all_token_ids={},
+        new_block_ids=[block_ids for _, _, block_ids in cached],
+        num_computed_tokens=[computed for _, computed, _ in cached],
+        num_output_tokens=[0 for _ in cached],
+    )
+    output.num_scheduled_tokens = dict(num_scheduled)
+    output.total_num_scheduled_tokens = sum(num_scheduled.values())
+    output.new_block_ids_to_zero = zero
+    output.kv_cache_block_copies = copies
+    return output
+
+
+def _group_state(model_input, layer: int):
+    """The ``MambaGroupState`` whose layers include GDN layer ``layer``."""
+    name = f"model.layers.{layer}.linear_attn"
+    [group] = [g for g in model_input.mamba_state.groups if name in g.layer_names]
+    return group
+
+
+def _state_ids(model_input, layer: int) -> list[int]:
+    return _group_state(model_input, layer).windows[:, 0].tolist()
+
+
+def _zeroed(model) -> list[list[int]]:
+    return [
+        kwargs["block_ids"]
+        for name, kwargs in model.calls
+        if name == "zero_kv_cache_blocks"
+    ]
+
+
+def test_prefill_and_decode_get_each_rows_state_block_per_group():
+    """Requests A and B prefill, then decode.
+
+    Every GDN layer's group gets the block of that group for each row, and the
+    padding rows get the null block 0. vLLM lists the new attention blocks in
+    ``new_block_ids_to_zero``, and the runner hands the model the whole list
+    before the step.
+    """
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    # Group order: GDN groups 0, 1, 2, then attention group 3.
+    blocks_a = ([10], [11], [12], [20, 21])
+    blocks_b = ([30], [31], [32], [40])
+
+    prefill = runner.build_model_input(
+        _step(
+            {"a": 1500, "b": 700},
+            new=[_new_request("a", 1500, blocks_a), _new_request("b", 700, blocks_b)],
+            zero=[20, 21, 40],
+        ),
+        None,
+    )
+
+    assert model.calls == [
+        ("zero_kv_cache_blocks", {"kv_cache": ["kv"], "block_ids": [20, 21, 40]})
+    ]
+    groups = runner.kv_cache_config.kv_cache_groups
+    assert [g.layer_names for g in prefill.mamba_state.groups] == [
+        tuple(groups[i].layer_names) for i in (0, 1, 2)
+    ]
+    for layer in range(NUM_LAYERS):
+        if _is_attention(layer):
+            continue
+        group = layer % 4
+        assert _group_state(prefill, layer).windows.shape == (MAX_BATCH, 1)
+        ids = _state_ids(prefill, layer)
+        assert ids[:2] == [blocks_a[group][0], blocks_b[group][0]]
+        assert set(ids[2:]) == {0}
+
+    runner.submit_prefill(prefill, [2])
+    name, kwargs = model.calls[-1]
+    assert name == "prefill_forward"
+    assert kwargs["mamba_state"] is prefill.mamba_state
+
+    decode = runner.build_model_input(
+        _step({"a": 1, "b": 1}, cached=[("a", 1500, None), ("b", 700, None)]),
+        None,
+    )
+    assert decode.prompt_lens is None
+    assert _state_ids(decode, 0)[:2] == [10, 30]
+    assert _state_ids(decode, 6)[:2] == [12, 32]
+    runner.async_decode.submit_decode(decode, read_from_device=True)
+    name, kwargs = model.calls[-1]
+    assert name == "decode_forward"
+    assert kwargs["mamba_state"] is decode.mamba_state
+    assert _zeroed(model) == [[20, 21, 40]]
+
+
+def test_page_table_is_the_attention_groups_table():
+    """``page_table`` is an attention table although group 0 is a GDN group.
+
+    vLLM orders the groups by spec, so the GDN groups come first here. A model
+    that reads ``page_table`` for attention must get the attention group's
+    rows in prefill and in decode.
+    """
+    cfg = _vllm_config()
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(), model)
+    assert isinstance(
+        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec, MambaSpec
+    )
+    attention_group = 3
+    blocks_a = ([10], [11], [12], [20, 21])
+    blocks_b = ([30], [31], [32], [40])
+
+    prefill = runner.build_model_input(
+        _step(
+            {"a": 1500, "b": 700},
+            new=[_new_request("a", 1500, blocks_a), _new_request("b", 700, blocks_b)],
+        ),
+        None,
+    )
+    runner.submit_prefill(prefill, [2])
+    decode = runner.build_model_input(
+        _step({"a": 1, "b": 1}, cached=[("a", 1500, None), ("b", 700, None)]),
+        None,
+    )
+    runner.async_decode.submit_decode(decode, read_from_device=True)
+
+    forwards = [kwargs for name, kwargs in model.calls if name.endswith("_forward")]
+    assert len(forwards) == 2
+    for model_input, kwargs in zip((prefill, decode), forwards):
+        page_table = kwargs["page_table"]
+        assert torch.equal(
+            page_table, model_input.block_tables_per_group[attention_group]
+        )
+        assert page_table[0, :2].tolist() == [20, 21]
+        assert page_table[1, :1].tolist() == [40]
+
+
+def test_mamba_model_refuses_block_copies():
+    """vLLM queues block copies only for prefix-cache hits, which mode none
+    never has; a copy that arrives anyway fails instead of being dropped."""
+    cfg = _vllm_config()
+    runner = _live_runner(cfg, _layer_specs(), _RecordingModel())
+
+    with pytest.raises(RuntimeError, match=r"block copies \(src, dst\)"):
+        runner.build_model_input(
+            _step(
+                {"a": 100},
+                new=[_new_request("a", 100, ([10], [11], [12], [20]))],
+                copies=[KVCacheBlockCopy(src_block_id=5, dst_block_id=6)],
+            ),
+            None,
+        )
+
+
+def test_attention_only_model_without_hooks_is_unchanged():
+    """A model with no MambaSpec groups gets no zeroing and no ``mamba_state``."""
+    cfg = _vllm_config()
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+    )
+    specs = {f"model.layers.{i}.self_attn": spec for i in range(4)}
+    cfg.model_config.get_num_layers_by_block_type = lambda *_: 4
+    model = _AllocatingModel()
+    runner = _live_runner(cfg, specs, model)
+
+    model_input = runner.build_model_input(
+        _step({"a": 100}, new=[_new_request("a", 100, ([5],))], zero=[5]), None
+    )
+    runner.submit_prefill(model_input, [1])
+
+    assert model_input.mamba_state is None
+    [(name, kwargs)] = model.calls
+    assert name == "prefill_forward"
+    assert "mamba_state" not in kwargs
 
 
 # endregion

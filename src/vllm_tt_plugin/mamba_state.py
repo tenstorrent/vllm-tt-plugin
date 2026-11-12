@@ -15,6 +15,9 @@ group owns.
 
 The TT runner implements ``mamba_cache_mode`` ``none`` without speculative
 decoding: a request holds one state block per Mamba group for its whole life.
+The upstream GPU model runner, not the scheduler, picks that block from the
+group's block-table row (``mamba_get_block_table_tensor``); this module does
+the same and hands the blocks to the model as ``mamba_state``.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroupSpec, MambaSpec
 
 from vllm_tt_plugin.config import is_tt_block_output_model, uses_tt_lane_coordinator
@@ -34,6 +38,27 @@ if TYPE_CHECKING:
 SUPPORTED_MAMBA_CACHE_MODES = ("none",)
 
 
+@dataclass(frozen=True, slots=True)
+class MambaGroupState:
+    """The recurrent-state inputs of one forward for one ``MambaSpec`` group."""
+
+    # The group's layers, ``KVCacheGroupSpec.layer_names``.
+    layer_names: tuple[str, ...]
+    # CPU int32 ``[rows, 1]``: the block that holds row ``i``'s state in this
+    # group. The step reads row ``i``'s start state from it, unless the row
+    # starts at position 0, and writes the row's end state into it. Padding
+    # rows hold block 0, the null block vLLM never allocates.
+    windows: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class MambaStepState:
+    """The recurrent-state inputs of one forward, the model's ``mamba_state``."""
+
+    # One per ``MambaSpec`` KV cache group, in KV cache group order.
+    groups: tuple[MambaGroupState, ...]
+
+
 @dataclass(frozen=True)
 class MambaCacheGroups:
     """The ``MambaSpec`` groups of one ``KVCacheConfig``."""
@@ -43,6 +68,49 @@ class MambaCacheGroups:
     # Each Mamba group's ``KVCacheGroupSpec.layer_names``, in the order of
     # ``group_indices``.
     layer_names: tuple[tuple[str, ...], ...]
+    # The first attention group; its block table is the ``page_table`` the
+    # model receives. vLLM orders groups by spec, so group 0 can be a Mamba
+    # group.
+    attention_group_index: int
+
+    def step_state(
+        self,
+        block_tables_per_group: Sequence[torch.Tensor],
+        row_req_ids: Sequence[str],
+        num_rows: int,
+    ) -> MambaStepState:
+        """The model's ``mamba_state`` for one forward.
+
+        Row ``i`` of every block table belongs to ``row_req_ids[i]``. In mode
+        ``none`` upstream ``mamba_get_block_table_tensor`` passes a Mamba
+        group's row through, and the request's one state block is in column 0.
+        The result has ``num_rows`` rows, the row count of
+        ``page_tables_per_layer``; rows past ``row_req_ids`` hold block 0.
+        """
+        live = len(row_req_ids)
+        if live > num_rows:
+            raise RuntimeError(
+                f"{live} scheduled rows {list(row_req_ids)} exceed the "
+                f"{num_rows} rows of the Mamba state inputs"
+            )
+        groups = []
+        for g, names in zip(self.group_indices, self.layer_names):
+            windows = torch.zeros((num_rows, 1), dtype=torch.int32)
+            windows[:live, 0] = block_tables_per_group[g][:live, 0]
+            # vLLM gives every scheduled request its state block before the
+            # step, and block 0 is the null block that padding rows share.
+            missing = [
+                req_id
+                for req_id, block in zip(row_req_ids, windows[:live, 0].tolist())
+                if block == 0
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"requests {missing} have no state block in KV cache group "
+                    f"{g}; block-table column 0 holds the null block 0"
+                )
+            groups.append(MambaGroupState(layer_names=names, windows=windows))
+        return MambaStepState(groups=tuple(groups))
 
 
 def check_mamba_launch(vllm_config: VllmConfig, specs: Iterable[MambaSpec]) -> None:
@@ -119,7 +187,15 @@ def mamba_cache_groups(
     )
     if not group_indices:
         return None
-    if not any(isinstance(g.kv_cache_spec, AttentionSpec) for g in kv_cache_groups):
+    attention_group_index = next(
+        (
+            i
+            for i, group in enumerate(kv_cache_groups)
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+        ),
+        None,
+    )
+    if attention_group_index is None:
         raise ValueError(
             "The KV cache config has MambaSpec groups but no attention group. "
             "A TT model keeps Mamba state in the attention layer-slot buffers, "
@@ -132,12 +208,15 @@ def mamba_cache_groups(
     return MambaCacheGroups(
         group_indices=group_indices,
         layer_names=tuple(tuple(kv_cache_groups[i].layer_names) for i in group_indices),
+        attention_group_index=attention_group_index,
     )
 
 
 __all__ = [
     "SUPPORTED_MAMBA_CACHE_MODES",
     "MambaCacheGroups",
+    "MambaGroupState",
+    "MambaStepState",
     "check_mamba_launch",
     "mamba_cache_groups",
 ]

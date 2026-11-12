@@ -657,6 +657,16 @@ class TTModelRunner:
         kv_cache_groups = kv_cache_config.kv_cache_groups
         self._validate_kv_cache_groups(kv_cache_groups)
         self._mamba_groups = mamba_cache_groups(kv_cache_groups, self.vllm_config)
+        if self._mamba_groups is not None and not callable(
+            getattr(self.model, "zero_kv_cache_blocks", None)
+        ):
+            # vLLM sends ``new_block_ids_to_zero`` for every config with Mamba
+            # layers (``KVCacheConfig.needs_kv_cache_zeroing``); see
+            # ``_zero_new_kv_cache_blocks``.
+            raise ValueError(
+                f"{type(self.model).__name__} declares MambaSpec KV cache groups "
+                "but does not implement zero_kv_cache_blocks"
+            )
 
         # Stash on the runner for downstream phases that need to walk the
         # group structure during input prep / forward.
@@ -2447,7 +2457,8 @@ class TTModelRunner:
         # models additionally consume ``block_tables_per_group`` via the
         # ``page_tables_per_group`` kwarg in submit_prefill / submit_decode; the
         # legacy generator_vllm wrappers strip it on the way through and raise
-        # loudly if the list has more than one entry.
+        # loudly if the list has more than one entry. With MambaSpec groups,
+        # ``build_model_input`` replaces it with the first attention group's.
         block_tables = block_tables_per_group[0]
 
         # NOTE: We assume that all sequences in the group are all prompts or
@@ -2941,6 +2952,7 @@ class TTModelRunner:
         # preemption or resume keeps a completed token valid for replay. Only a
         # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
+        self._zero_new_kv_cache_blocks(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
             and self._decode_layout_changed_since_last_decode
@@ -2954,7 +2966,50 @@ class TTModelRunner:
 
         # Prepare model inputs only
         model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
+        if self._mamba_groups is not None:
+            # Group 0 can be a MambaSpec group, so ``page_table`` is the first
+            # attention group's table instead.
+            model_input = replace(
+                model_input,
+                block_tables=model_input.block_tables_per_group[
+                    self._mamba_groups.attention_group_index
+                ],
+                mamba_state=self._mamba_groups.step_state(
+                    model_input.block_tables_per_group,
+                    model_input.row_req_ids or [],
+                    self.tt_max_batch_size,
+                ),
+            )
         return model_input
+
+    def _zero_new_kv_cache_blocks(self, scheduler_output: SchedulerOutput) -> None:
+        """Hand the model the blocks vLLM asks to zero before this step.
+
+        With Mamba layers vLLM lists every block it newly allocated to an
+        attention group in ``new_block_ids_to_zero``: the block can still hold
+        recurrent-state bytes that read as NaN or Inf at positions attention
+        has not written yet and masks. The upstream GPU runner zeroes them
+        before the forward; the TT model owns the device buffers, so the runner
+        passes the whole list to ``zero_kv_cache_blocks``, which
+        ``initialize_kv_cache`` requires of a model with MambaSpec groups.
+        Without MambaSpec groups nothing changes.
+        """
+        if self._mamba_groups is None:
+            return
+        if scheduler_output.kv_cache_block_copies:
+            # vLLM queues block copies only for prefix-cache hits, and mode
+            # none runs without prefix caching.
+            raise RuntimeError(
+                "vLLM requested KV cache block copies (src, dst) "
+                f"{list(scheduler_output.kv_cache_block_copies)} for a model with "
+                "MambaSpec groups; TT does not copy KV cache blocks without "
+                "prefix caching support"
+            )
+        block_ids = scheduler_output.new_block_ids_to_zero
+        if block_ids:
+            self.model.zero_kv_cache_blocks(
+                kv_cache=self.kv_caches, block_ids=list(block_ids)
+            )
 
     # All lane-specific input/output shaping lives in ``TTLaneInputBatch``
     # (``apply_step_plan`` / ``build_model_input`` / ``extract_output``) and the
@@ -4168,6 +4223,8 @@ class TTModelRunner:
         # and never see the kwarg.
         if model_input.block_tables_per_layer is not None:
             kwargs["page_tables_per_layer"] = model_input.block_tables_per_layer
+        if model_input.mamba_state is not None:
+            kwargs["mamba_state"] = model_input.mamba_state
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs

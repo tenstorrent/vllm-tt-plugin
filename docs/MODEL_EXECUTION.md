@@ -21,9 +21,12 @@ The plugin rejects encoder-decoder models and `prompt_embeds` input.
 - `start_pos=-1` marks an inactive decode row. The model adapter must not
   interpret an inactive row as a live request or modify another request's state.
 - `page_table` is the first KV group's integer logical-to-physical block
-  table. If the resolved cache has multiple groups, the plugin also sends
-  `page_tables_per_layer`, ordered by attention-layer index. The model adapter
-  must use the page table for each layer. See [KV setup](MODEL_SETUP.md).
+  table. With `MambaSpec` groups it is the first attention group's table,
+  because group 0 can be a `MambaSpec` group. If the resolved cache has
+  multiple groups, the plugin also sends `page_tables_per_layer`, ordered by
+  attention-layer index, or by the index of every layer when the cache has
+  `MambaSpec` groups. The model adapter must use the page table for each
+  layer. See [KV setup](MODEL_SETUP.md).
 
 `TTModelInput` is an internal plugin payload. The model adapter receives the
 keyword arguments below, not a `TTModelInput` object. Source:
@@ -31,6 +34,31 @@ keyword arguments below, not a `TTModelInput` object. Source:
 `TTModelRunner._prepare_model_inputs` in
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py), and
 `TTLaneInputBatch` in [input_batch.py](../src/vllm_tt_plugin/input_batch.py).
+
+### Recurrent state blocks
+
+When the KV cache has `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)), prefill and decode also receive `mamba_state`, a `MambaStepState`. It holds one `MambaGroupState` per `MambaSpec` group, as upstream vLLM builds one attention metadata object per KV cache group (for GDN layers, `GDNAttentionMetadata` in `vllm/v1/attention/backends/gdn_attn.py`). Both classes are frozen dataclasses in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
+
+| Field | Content |
+|---|---|
+| `MambaStepState.groups` | One `MambaGroupState` per `MambaSpec` KV cache group, in KV cache group order. |
+| `MambaGroupState.layer_names` | The group's layers, `KVCacheGroupSpec.layer_names`. The group's tensors apply to each of these layers. |
+| `MambaGroupState.windows` | CPU int32 tensor `[tt_max_batch_size, 1]`. Row `i` is the block that holds the recurrent state of submitted row `i` in this group. |
+
+`TTModelRunner` selects the block as upstream `mamba_get_block_table_tensor` does in mode `none`: column 0 of the group's block-table row. A request keeps that block from its first step until vLLM frees it, so the block of a request does not change while the request runs. `TTModelRunner` raises if a scheduled row has the null block 0 there.
+
+For submitted row `i` with first position `start_pos[i]` and `n` scheduled tokens, the model must, in every layer of the group's `MambaGroupState.layer_names`:
+
+1. Take the start state, the full state after `start_pos[i]` tokens (conv history and recurrent state), from block `windows[i, 0]`. A row whose `start_pos` is 0 has no earlier state: the model starts it from zero state and must not read its block, because vLLM does not zero recurrent-state blocks and the block can hold stale bytes of an earlier owner.
+2. Write the end state, the full state after `start_pos[i] + n` tokens, into the same block `windows[i, 0]`.
+
+After the step, the block alone must hold the complete state, because the request's next step can run in another row and vLLM can free the block when the request ends. The model can keep temporary workspace during a step, but no request state that outlives the step outside the block.
+
+Padding rows have block 0, the null block. vLLM never allocates block 0 to a request, so the model can read or write block 0 without changing live state, and ignores the result. On the layer-slot overlay, padding rows can write their state into block 0, so block 0 can hold any bytes, including fp32 state that reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+
+vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers (`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`). A block that held recurrent state can be reassigned to an attention group, and its stale bytes then read as NaN or Inf at positions attention does not write and masks. vLLM lists every block newly allocated to an attention group. `TTModelRunner` passes the whole list to the adapter's `zero_kv_cache_blocks` before the step; see [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
+
+`TTModelRunner` derives `MambaGroupState.windows` from the page tables, so the windows change only on a step whose page tables or batch layout change. Under the [decode reload contract](DECODE_RELOAD_CONTRACT.md), treat `mamba_state` as a page-table input: reload it whenever the page tables are reloaded.
 
 ## Prefill
 
@@ -45,6 +73,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `enable_trace` | True when `tt.trace_mode="all"`. |
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
+| `mamba_state` | Supplied for `MambaSpec` groups: a `MambaStepState`, one `MambaGroupState` per group. See [recurrent state blocks](#recurrent-state-blocks). |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
@@ -111,6 +140,7 @@ request-specific RoPE.
 | `enable_trace` | True for `tt.trace_mode="all"` or `"decode_only"`. |
 | `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling, selective readback, or a speculative verify, which is submitted as a front-packed verify is. The adapter must support the readback mode its execution path requests. |
 | `page_tables_per_layer` | Supplied for multiple KV groups. |
+| `mamba_state` | Supplied for `MambaSpec` groups: a `MambaStepState`, one `MambaGroupState` per group. See [recurrent state blocks](#recurrent-state-blocks). |
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
 | `prompt_tokens`, `output_tokens` | Supplied together when device sampling needs token history for penalties. Histories use `-1` padding. |
