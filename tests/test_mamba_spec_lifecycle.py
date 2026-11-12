@@ -41,6 +41,7 @@ from tests.test_mamba_state_lifecycle import (
     _Harness,
     _prompt,
 )
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS
 
 
 def _all_counts(num_speculative_tokens: int) -> set[tuple[int, int]]:
@@ -282,3 +283,73 @@ def test_ngram_drafts_resume_from_their_window_column():
     assert not h.scheduler.requests
     assert {(3, 1), (3, 2), (3, 3), (3, 4)} <= set(h.accepted)
     assert h.cached_states_checked
+
+
+# The declarations of Qwen3.8's MTP class: device sampling through the verify's draws.
+DEVICE_SAMPLED_MODEL = {
+    "supports_sample_on_device": True,
+    "spec_ids_are_sampled": True,
+    "max_device_top_k": 32,
+    "supports_device_penalties": False,
+}
+
+
+@pytest.mark.parametrize("policy", ["auto", "host"])
+def test_a_device_sampling_launch_verifies_sampled_rows_on_the_device(policy):
+    """A model declaring ``supports_sample_on_device``, ``spec_ids_are_sampled``
+    and ``max_device_top_k``, offering ``argmax_ids`` and ``logits``, on a
+    ``decode_only`` device-sampling launch with synchronous scheduling and
+    MambaSpec state.
+
+    A step carrying a sampled request (temperature with top-k 20 or 10) is an
+    ``argmax_ids`` verify that samples on the device, so the model answers it
+    with draws; so is a step of greedy requests only; a draftless step is an
+    ordinary decode sampled on the device. A seeded request follows
+    ``seeded_sampling_policy``: under ``host`` every step it is part of
+    samples on the host, so its verifies are ``logits``. The state checks of
+    the harness hold on every step.
+    """
+    h = _Harness(
+        num_blocks=40,
+        max_num_batched_tokens=4096,
+        mode="align",
+        num_speculative_tokens=3,
+        offers=(3, 3, 0),
+    )
+    h.runner._spec_accept_modes = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
+    h.runner.sample_on_device_mode = "decode_only"
+    h.runner.seeded_sampling_policy = policy
+    h.model.model_capabilities = DEVICE_SAMPLED_MODEL
+    h.add("greedy", 1500, max_tokens=60)
+    h.add("sampled", 900, max_tokens=30, sampling={"temperature": 1.0, "top_k": 20})
+    h.add(
+        "seeded",
+        700,
+        max_tokens=20,
+        sampling={"temperature": 0.8, "top_k": 10, "seed": 7},
+    )
+
+    h.run(max_steps=400)
+
+    assert not h.scheduler.requests
+    device_verifies = [
+        drafts
+        for mode, device, drafts in h.verify_steps
+        if device and mode == ACCEPT_MODE_ARGMAX_IDS
+    ]
+    assert any(drafts.get("sampled", 0) for drafts in device_verifies), (
+        "the sampled request never verified drafts on the device"
+    )
+    assert any(set(drafts) == {"greedy"} for drafts in device_verifies)
+    assert ("decode", None, True) in h.step_modes
+    host_sampled = {m for m in h.step_modes if m[0] != "prefill" and not m[2]}
+    if policy == "auto":
+        assert not host_sampled
+        assert any(drafts.get("seeded", 0) for drafts in device_verifies)
+    else:
+        assert ("verify", ACCEPT_MODE_LOGITS, False) in host_sampled
+        assert host_sampled <= {
+            ("verify", ACCEPT_MODE_LOGITS, False),
+            ("decode", None, False),
+        }
+        assert not any("seeded" in drafts for drafts in device_verifies)
