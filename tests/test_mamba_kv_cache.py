@@ -281,7 +281,8 @@ def test_mamba_pool_below_one_full_length_request_fails_at_startup():
 @pytest.mark.parametrize(
     ("unsupported", "match"),
     [
-        ("speculative", "launch without --speculative-config"),
+        ("speculative_async", "launch with --no-async-scheduling"),
+        ("speculative_blocks", "num_speculative_blocks=0, but the launch verifies 3"),
         ("lane_dp", "lane-DP"),
         ("block_output", "Block-output models"),
         ("cache_mode_all", r"mamba_cache_mode='all' is not supported"),
@@ -298,9 +299,10 @@ def test_mamba_pool_below_one_full_length_request_fails_at_startup():
 def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, match):
     """The worker sizes the pool before it loads the model and rejects there.
 
-    Speculative decoding needs speculative state blocks, lane-DP and
-    block-output execution have no MambaSpec path, and mode ``all`` keeps a
-    state block per block of tokens. In mode ``align``: a nonzero retention
+    Speculative decoding runs synchronously only, and a verify needs one state
+    block per draft (``num_speculative_blocks``); lane-DP and block-output
+    execution have no MambaSpec path, and mode ``all`` keeps a state block per
+    block of tokens. In mode ``align``: a nonzero retention
     interval keeps decode-reached block boundaries, which TT has not
     validated; vLLM ends prefill chunks on block boundaries, which a model
     without chunked prefill cannot take; and a Mamba block-table column must
@@ -309,8 +311,11 @@ def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, mat
     mode = "none"
     specs = _layer_specs()
     cfg = _vllm_config(mode)
-    if unsupported == "speculative":
+    if unsupported.startswith("speculative"):
         cfg.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+        if unsupported == "speculative_async":
+            specs = _layer_specs(num_speculative_blocks=3)
+            cfg.scheduler_config.async_scheduling = True
     elif unsupported == "lane_dp":
         store_tt_lane_count(cfg, 2)
     elif unsupported == "block_output":
@@ -435,7 +440,10 @@ def test_attention_only_page_table_width_is_unchanged():
 @pytest.mark.parametrize(
     ("mamba_kwargs", "match"),
     [
-        (dict(num_speculative_blocks=1), "no speculative state blocks"),
+        (
+            dict(num_speculative_blocks=1),
+            "num_speculative_blocks=1, but the launch verifies 0 speculative",
+        ),
         (
             dict(num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=64),
             "prefill checkpoints need mode 'align'",
@@ -965,6 +973,225 @@ def test_attention_only_model_without_hooks_is_unchanged():
     [(name, kwargs)] = model.calls
     assert name == "prefill_forward"
     assert "mamba_state" not in kwargs
+
+
+# endregion
+
+# region Speculative windows
+
+
+def _spec_groups(mode: str, num_spec: int, alignment=None, num_groups=1):
+    from vllm_tt_plugin.mamba_state import MambaCacheGroups
+
+    return MambaCacheGroups(
+        group_indices=tuple(range(num_groups)),
+        layer_names=tuple(
+            (f"model.layers.{g}.linear_attn",) for g in range(num_groups)
+        ),
+        attention_group_index=num_groups,
+        mamba_cache_mode=mode,
+        block_size=MAX_MODEL_LEN if mode == "none" else BLOCK_SIZE,
+        prefill_checkpoint_alignment=alignment,
+        num_speculative_blocks=num_spec,
+    )
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+@pytest.mark.parametrize("num_spec", [1, 3])
+def test_speculative_windows_hold_one_block_per_query_token(mode, num_spec):
+    """``windows`` has ``1 + K`` columns, the blocks upstream
+    ``mamba_get_block_table_tensor`` hands the GDN kernel: window column
+    ``t`` takes the state after query token ``t``. A prefill, a verify inside
+    a column and a verify that crosses into the next column; padding rows
+    hold block 0."""
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    spec = _layer_specs(mamba_cache_mode=mode, num_speculative_blocks=num_spec)[
+        "model.layers.0.linear_attn"
+    ]
+    table = torch.arange(1, 3 * 24 + 1, dtype=torch.int32).reshape(3, 24)
+    if mode == "align":
+        # vLLM leaves the column a prefill from position 0 passes empty.
+        table[0, 0] = 0
+    computed, scheduled = [0, 1500, 1022], [1500, 1 + num_spec, 1 + num_spec]
+
+    state = _spec_groups(mode, num_spec).step_state(
+        [table], ["a", "b", "c"], computed, scheduled, num_rows=5
+    )
+
+    [group] = state.groups
+    upstream = mamba_get_block_table_tensor(
+        table,
+        torch.tensor([c + s for c, s in zip(computed, scheduled)]),
+        spec,
+        mode,
+    )[:, : 1 + num_spec]
+    assert group.windows.dtype == torch.int32
+    assert group.windows.shape == (5, 1 + num_spec)
+    assert group.windows[:3].tolist() == upstream.tolist()
+    assert group.windows[3:].tolist() == [[0] * (1 + num_spec)] * 2
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+@pytest.mark.parametrize(
+    ("num_spec", "count", "next_scheduled"),
+    [(1, a, s) for a in (1, 2) for s in (1, 2)]
+    + [(3, a, s) for a in (1, 2, 3, 4) for s in (1, 4)],
+)
+def test_each_accepted_count_reads_its_window_column(
+    mode, num_spec, count, next_scheduled
+):
+    """After a verify that committed ``count`` tokens the request's state is
+    in that verify's window column ``count - 1``, and the next step reads it
+    there, whatever that step computes.
+
+    The verify computes positions 1022 to ``1022 + K`` with 1024-token blocks,
+    so in mode ``align`` its window begins in column 1 when K = 3, past the
+    boundary its tokens cross, and in column 0 when K = 1. The next step is
+    an ordinary decode or another verify. Its window begins in column 0 again
+    when it computes no position past 1023, and its start block can be one of
+    its own window blocks. The start block
+    is the one upstream ``preprocess_mamba`` reads: the source of its copy, or
+    window column ``count - 1`` without a copy.
+    """
+    from tests.test_mamba_state_lifecycle import UpstreamAlignRunner
+
+    row = [10, 11, 12, 13, 14, 15][: 1 + num_spec + (mode == "align")]
+    table = _table(row)
+    groups = _spec_groups(mode, num_spec)
+    spec = _layer_specs(mamba_cache_mode=mode, num_speculative_blocks=num_spec)[
+        "model.layers.0.linear_attn"
+    ]
+    upstream = UpstreamAlignRunner(
+        SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]), [0]
+    )
+
+    def step(computed, scheduled, counts):
+        state = groups.step_state(
+            [table], ["a"], [computed], [scheduled], num_rows=2, accepted_counts=counts
+        )
+        columns = None
+        if mode == "align":
+            columns = upstream.columns(
+                _step({"a": scheduled}, cached=[("a", computed, None)]),
+                ["a"],
+                {"a": SimpleNamespace(num_computed_tokens=computed, block_ids=[row])},
+                {"a": counts[0]},
+            )["a"]
+        return state.groups[0], columns
+
+    verify, _ = step(1022, 1 + num_spec, [1])
+    after, columns = step(1022 + count, next_scheduled, [count])
+
+    assert after.start_blocks.tolist() == [int(verify.windows[0, count - 1]), 0]
+    if mode == "none":
+        assert verify.windows[0].tolist() == after.windows[0].tolist() == row
+        return
+    source, window = columns
+    assert int(after.start_blocks[0]) == row[source]
+    assert int(after.windows[0, 0]) == row[window]
+    assert int(verify.windows[0, 0]) == row[(1022 + num_spec) // BLOCK_SIZE]
+
+
+def test_speculative_blocks_vllm_left_behind_are_not_written():
+    """Between prefill chunks ``MambaManager`` moves the speculative blocks a
+    chunk passes to the end of the request's row; the runner's row, which
+    only grows, still lists them at their old columns too. Such a block is
+    neither a prefill checkpoint nor a block the chunk passes unwritten. A
+    speculative block vLLM keeps in place as a checkpoint block is one.
+
+    K = 1, 1024-token blocks, prefill checkpoints every 64 tokens. The first
+    chunk, 0 to 2048, has window columns 1 and 2. A second chunk 2048 to
+    4096 that does not end the prompt: vLLM declines the checkpoint at 3072
+    in column 2 and moves column 2's block 22 to column 3. A second chunk
+    2048 to 3500 that ends the prompt: vLLM keeps block 22 in column 2 as the
+    checkpoint block for 3072.
+    """
+    first = [0, 21, 22]
+
+    def second_chunk(row, end):
+        groups = _spec_groups("align", 1, alignment=64)
+        groups.step_state([_table(first)], ["a"], [0], [2048], num_rows=1)
+        return groups.step_state([_table(row)], ["a"], [2048], [end - 2048], num_rows=1)
+
+    moved = second_chunk([0, 21, 22, 22, 24], 4096)
+    assert moved.checkpoint_positions is None
+    assert moved.groups[0].start_blocks.tolist() == [21]
+    assert moved.groups[0].windows.tolist() == [[22, 24]]
+
+    kept = second_chunk([0, 21, 22, 23, 24], 3500)
+    assert kept.checkpoint_positions.tolist() == [[3072]]
+    assert kept.groups[0].checkpoint_blocks.tolist() == [[22]]
+    assert kept.groups[0].windows.tolist() == [[23, 24]]
+
+    # A block past the first chunk's window in a column the chunk passes is
+    # still one vLLM would cache unwritten.
+    with pytest.raises(RuntimeError, match=r"allocated blocks in columns \[3\]"):
+        second_chunk([0, 21, 22, 30, 31, 32, 33], 6000)
+    # A window block that the row lists again later is one vLLM moved away.
+    with pytest.raises(RuntimeError, match="whose block 23 vLLM moved"):
+        second_chunk([0, 21, 22, 23, 24, 23], 3500)
+
+
+def test_speculative_windows_are_recorded_per_request_and_forgotten():
+    """The runner records each request's window and drops it for finished,
+    preempted and resumed requests, whose next step starts from vLLM's
+    placement. A count above 1 without a recorded window, a count outside
+    ``[1, 1 + K]``, and a recorded request at position 0 fail."""
+    groups = _spec_groups("align", 3)
+    table = _table([10, 11, 12, 13, 14])
+    groups.step_state([table], ["a"], [1022], [4], num_rows=1)
+    assert groups.windows["a"] == (1, 4)
+
+    output = _step({})
+    output.preempted_req_ids = {"a"}
+    groups.forget(output)
+    assert groups.windows == {}
+    with pytest.raises(RuntimeError, match="has no earlier window"):
+        groups.step_state([table], ["a"], [1024], [1], num_rows=1, accepted_counts=[2])
+
+    groups.step_state([table], ["a"], [1022], [4], num_rows=1)
+    with pytest.raises(RuntimeError, match=r"committed 5 tokens, outside \[1, 4\]"):
+        groups.step_state([table], ["a"], [1027], [1], num_rows=1, accepted_counts=[5])
+    with pytest.raises(RuntimeError, match="starts at position 0"):
+        groups.step_state([table], ["a"], [0], [100], num_rows=1)
+
+
+@pytest.mark.parametrize(
+    ("mode", "mamba_columns", "width"),
+    [
+        # One block per window column: 1 + 5 = 6. vLLM pads a row of
+        # 20000-token blocks to a multiple of 4 columns, so without the
+        # speculative blocks the row would hold 4.
+        ("none", 6, 24),
+        # Position-indexed columns plus K: ceil(20000 / 1024) + 5 = 25.
+        ("align", 25, 32),
+    ],
+)
+def test_speculative_block_table_rows_hold_the_window(mode, mamba_columns, width):
+    """A MambaSpec group's block-table row holds the K speculative blocks
+    vLLM allocates past the running one, as upstream
+    ``MambaSpec.max_num_blocks_per_req`` sizes it."""
+    from vllm.v1.worker.block_table import get_block_table_width
+
+    cfg = _vllm_config(mode)
+    cfg.speculative_config = SimpleNamespace(
+        num_speculative_tokens=5,
+        use_eagle=lambda: False,
+        use_eagle_block_drop=lambda: False,
+    )
+    specs = _layer_specs(mamba_cache_mode=mode, num_speculative_blocks=5)
+    runner = _runner(cfg)
+
+    TTModelRunner.initialize_kv_cache(runner, _kv_cache_config(cfg, specs, 256))
+
+    tables = runner.input_batch.block_table.block_tables
+    mamba_block_size = MAX_MODEL_LEN if mode == "none" else BLOCK_SIZE
+    assert [t.max_num_blocks_per_req for t in tables] == [
+        get_block_table_width(mamba_columns, mamba_block_size)
+    ] * 3 + [20]
+    assert runner._mamba_groups.num_speculative_blocks == 5
+    assert runner.max_num_blocks_per_req == width
 
 
 # endregion

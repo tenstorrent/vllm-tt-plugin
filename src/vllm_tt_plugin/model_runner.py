@@ -689,6 +689,18 @@ class TTModelRunner:
 
         max_num_reqs = self.tt_max_batch_size
         max_model_len = self.model_config.max_model_len
+        # Block-table row width per group, as upstream's
+        # ``MambaSpec.max_num_blocks_per_req``: a MambaSpec row also holds the
+        # K speculative blocks past the running one.
+        per_group_max_num_blocks = [
+            cdiv(max_model_len, g.kv_cache_spec.block_size)
+            + (
+                g.kv_cache_spec.num_speculative_blocks
+                if isinstance(g.kv_cache_spec, MambaSpec)
+                else 0
+            )
+            for g in kv_cache_groups
+        ]
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         if self._is_lane_mode:
             # Lane-chunked persistent batch: rows are partitioned into
@@ -717,6 +729,7 @@ class TTModelRunner:
                 vocab_size=self.vocab_size,
                 block_sizes=per_group_block_sizes,
                 kernel_block_sizes=per_group_block_sizes,
+                max_num_blocks=per_group_max_num_blocks,
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
@@ -739,10 +752,7 @@ class TTModelRunner:
             # size the table from the groups. TT chunked SDPA requires a
             # page-table row of a multiple of 32 bytes, so 8 int32 columns.
             self.max_num_blocks_per_req = round_up(
-                min(
-                    max(cdiv(max_model_len, bs) for bs in per_group_block_sizes),
-                    kv_cache_config.num_blocks,
-                ),
+                min(max(per_group_max_num_blocks), kv_cache_config.num_blocks),
                 8,
             )
 
@@ -2959,6 +2969,8 @@ class TTModelRunner:
         # forced prefix-cache reset marks an in-flight result for discard.
         self._update_states(scheduler_output)
         self._zero_new_kv_cache_blocks(scheduler_output)
+        if self._mamba_groups is not None:
+            self._mamba_groups.forget(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
             and self._decode_layout_changed_since_last_decode
@@ -2977,6 +2989,9 @@ class TTModelRunner:
             # attention group's table instead.
             row_req_ids = model_input.row_req_ids or []
             batch = self.input_batch
+            # A verify, and an ordinary decode after a multi-token commit,
+            # carry each row's previous count; every other step's is 1.
+            accepted_counts = model_input.accepted_counts
             model_input = replace(
                 model_input,
                 block_tables=model_input.block_tables_per_group[
@@ -2991,6 +3006,11 @@ class TTModelRunner:
                     ],
                     [scheduler_output.num_scheduled_tokens[r] for r in row_req_ids],
                     self.tt_max_batch_size,
+                    accepted_counts=(
+                        None
+                        if accepted_counts is None
+                        else accepted_counts[live_row_index(model_input)].tolist()
+                    ),
                 ),
             )
         return model_input

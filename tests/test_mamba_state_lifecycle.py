@@ -255,9 +255,16 @@ class UpstreamAlignRunner:
 
     Calls upstream ``preprocess_mamba`` and records, instead of copying, the
     block-table columns of each copy it makes before the forward: the column
-    of the request's state after its last step, and the column the step
-    updates in place. ``mamba_state_idx`` is the map upstream keeps across
-    steps.
+    of the request's state after its last step (the running column plus the
+    accepted-token bias), and the column of the step's window column 0.
+    ``mamba_state_idx`` is the map upstream keeps across steps.
+
+    Each step is handed the runner's accepted counts. Upstream's post-step
+    ``postprocess_mamba_align_gpu`` would also copy a reached block-boundary
+    state into the block of its own column and then reset the count to 1 when
+    that column is the running one; the TT runner reads the same state from
+    window column ``count - 1`` instead, and vLLM keeps no decode-reached
+    boundary at ``prefix_cache_retention_interval`` 0.
     """
 
     def __init__(self, kv_cache_config, group_indices) -> None:
@@ -269,16 +276,17 @@ class UpstreamAlignRunner:
             offset=0,
         )
 
-    def columns(self, scheduler_output, row_req_ids, requests):
-        """Request id -> (source column, destination column) of the step.
+    def columns(self, scheduler_output, row_req_ids, requests, counts):
+        """Request id -> (source column, window column 0) of the step.
 
-        Without a copy the step reads and writes its running column, and a
-        request at position 0 reads nothing (source -1).
+        ``counts`` maps each row's request to its previous step's committed
+        tokens. Without a copy the step reads window column ``count - 1``, and
+        a request at position 0 reads nothing (source -1).
         """
         copied: dict[str, tuple[int, int]] = {}
 
-        def record(_bufs, _config, _funcs, _groups, src, dst, _bias, req_state, _ctx):
-            copied[req_state.req_id] = (src, dst)
+        def record(_bufs, _config, _funcs, _groups, src, dst, bias, req_state, _ctx):
+            copied[req_state.req_id] = (src + bias, dst)
 
         with (
             patch.object(mamba_utils, "collect_mamba_copy_meta", record),
@@ -291,7 +299,9 @@ class UpstreamAlignRunner:
                 self.mamba_state_idx,
                 SimpleNamespace(
                     req_ids=list(row_req_ids),
-                    num_accepted_tokens_cpu=np.ones(len(row_req_ids), np.int32),
+                    num_accepted_tokens_cpu=np.array(
+                        [counts[r] for r in row_req_ids], np.int32
+                    ),
                 ),
                 {
                     r: SimpleNamespace(
@@ -312,7 +322,7 @@ class UpstreamAlignRunner:
                 result[r] = copied[r]
             else:
                 started = requests[r].num_computed_tokens > 0
-                result[r] = (running if started else -1, running)
+                result[r] = (running + counts[r] - 1 if started else -1, running)
         return result
 
 
@@ -480,7 +490,9 @@ class _Harness:
             for g in self.groups
         ]
         upstream = (
-            self.upstream.columns(out, row_req_ids, self.runner.requests)
+            self.upstream.columns(
+                out, row_req_ids, self.runner.requests, dict.fromkeys(row_req_ids, 1)
+            )
             if self.upstream is not None
             else None
         )

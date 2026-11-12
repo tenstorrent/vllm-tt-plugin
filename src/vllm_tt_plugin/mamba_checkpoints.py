@@ -18,8 +18,10 @@ runner does the same through ``prefill_checkpoints``, the one place it applies
 that rule, so it reads no private scheduler state. ``MambaManager`` declines
 some checkpoints the rule allows, for example in a chunk that does not reach
 the end of the prefill; the block-table column then holds the null block 0,
-and ``MambaCacheGroups.step_state`` drops the checkpoint. A reserved block in
-a column the rule does not name fails there instead of going unwritten.
+or with speculative decoding a speculative block vLLM moved to the end of the
+row, which the runner's row lists again there. ``MambaCacheGroups.step_state``
+drops the checkpoint in both cases. A reserved block in a column the rule
+does not name fails there instead of going unwritten.
 """
 
 from __future__ import annotations
@@ -45,8 +47,10 @@ def prefill_checkpoints(
     ``column`` the block-table column of the block vLLM reserves for it.
     ``prefix_match_unit`` is ``cache_config.prefix_match_unit``, or the Mamba
     block size when unset, as upstream's ``MambaPrefillCheckpointBuilder``
-    passes it. TT runs without speculative decoding, so vLLM drops no EAGLE
-    block.
+    passes it. TT serves no EAGLE-style speculative method (it admits
+    ``ngram`` and the model-owned drafter, ``custom_class``, for which
+    ``SpeculativeConfig.use_eagle_block_drop`` is false), so vLLM drops no
+    EAGLE block.
     """
     seq_lens = [c + s for c, s in zip(num_computed_tokens, num_scheduled_tokens)]
     offsets, columns = compute_mamba_prefill_checkpoints(

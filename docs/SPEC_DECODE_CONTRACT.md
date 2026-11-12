@@ -718,7 +718,10 @@ runner never sends those drafts again, and the next `propose_draft_tokens` call
 continues from the token the ordinary decode committed. A model whose ordinary
 decode cannot read the state a verify leaves behind, for example recurrent
 state that only the verify path updates, must not declare
-`supports_narrow_decode`.
+`supports_narrow_decode`. A model that keeps recurrent state in `MambaSpec`
+blocks reads it from `mamba_state.start_blocks` on both calls, and the runner
+points `start_blocks` at the block the verify left for the committed count
+(see [speculative verification](MODEL_EXECUTION.md#speculative-verification)).
 
 **An ordinary decode may return host token ids.** On a launch that samples on
 device, a model may answer an ordinary decode step for some or all rows from
