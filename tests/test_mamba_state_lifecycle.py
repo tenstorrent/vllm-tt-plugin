@@ -49,6 +49,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.sampling_params import SamplingParams
@@ -73,8 +74,19 @@ from tests.test_mamba_kv_cache import (
     _RecordingModel,
     _vllm_config,
 )
+from vllm_tt_plugin.config import store_tt_spec_plan
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.scheduler import TTScheduler
+from vllm_tt_plugin.spec_admission import (
+    MODEL_OWNED_DRAFT_METHOD,
+    MODEL_OWNED_DRAFT_SENTINEL,
+)
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    DRAFTER_STATE_INTERNAL,
+    DraftOutput,
+    SpecPlan,
+)
 
 NUM_LAYERS = 64
 BLOCK_SIZE = 1024
@@ -91,13 +103,19 @@ LOCAL_MODEL_CONFIG = Path(__file__).parent / "model_configs" / "qwen2"
 # model zeroed it.
 GARBAGE = ("garbage",)
 ZEROED = ("zeroed",)
+EOS = 2
+NGRAM_LOOKUP = {"prompt_lookup_min": 2, "prompt_lookup_max": 4}
 
 
 def _is_attention(layer: int) -> bool:
     return layer % 4 == 3
 
 
-def _qwen38_specs(mode: str = "none", checkpoint_alignment: int | None = None):
+def _qwen38_specs(
+    mode: str = "none",
+    checkpoint_alignment: int | None = None,
+    num_speculative_blocks: int = 0,
+):
     attention = FullAttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,
@@ -116,6 +134,7 @@ def _qwen38_specs(mode: str = "none", checkpoint_alignment: int | None = None):
         mamba_cache_mode=mode,
         num_prefill_checkpoint_blocks=int(checkpoint_alignment is not None),
         prefill_checkpoint_alignment=checkpoint_alignment,
+        num_speculative_blocks=num_speculative_blocks,
     )
     return {
         (
@@ -137,10 +156,13 @@ def _scheduler(
     mode: str = "none",
     prefix_match_unit: int | None = None,
     prefill_chunk_alignment: int | None = None,
+    spec_plan: SpecPlan | None = None,
+    spec_method: str = MODEL_OWNED_DRAFT_METHOD,
 ) -> TTScheduler:
     """A real ``TTScheduler`` over a real ``KVCacheManager``.
 
-    Prefix caching is on exactly in mode ``align``.
+    Prefix caching is on exactly in mode ``align``. With ``spec_plan`` the
+    scheduler schedules the drafts of the model-owned drafter.
     """
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -195,6 +217,21 @@ def _scheduler(
     # chunked prefill off; these tests split long prompts into chunks.
     config.scheduler_config.enable_chunked_prefill = True
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    if spec_plan is not None:
+        # Attached after construction, as the platform would resolve a plan
+        # from the stub model class, which declares none.
+        config.speculative_config = SpeculativeConfig(
+            method=spec_method,
+            num_speculative_tokens=spec_plan.effective_k,
+            target_model_config=config.model_config,
+            target_parallel_config=config.parallel_config,
+            **(
+                {"model": MODEL_OWNED_DRAFT_SENTINEL}
+                if spec_method == MODEL_OWNED_DRAFT_METHOD
+                else NGRAM_LOOKUP
+            ),
+        )
+        store_tt_spec_plan(config, spec_plan)
     # As ``EngineCore`` resolves them from the groups.
     block_size, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, config)
     cache_config.block_size = min(
@@ -326,8 +363,29 @@ class UpstreamAlignRunner:
         return result
 
 
+class _DraftingModel(_RecordingModel):
+    """A ``_RecordingModel`` whose drafter offers what ``_Harness`` scripts."""
+
+    def __init__(self, harness: _Harness):
+        super().__init__()
+        self.harness = harness
+
+    def propose_draft_tokens(
+        self, num_drafts, committed, positions, counts, hidden=None
+    ) -> DraftOutput:
+        return self.harness.propose(num_drafts, positions)
+
+
 class _Harness:
-    """Drives ``TTScheduler`` and ``TTModelRunner`` through whole steps."""
+    """Drives ``TTScheduler`` and ``TTModelRunner`` through whole steps.
+
+    With ``num_speculative_tokens`` K > 0 the launch speculates with the
+    model-owned drafter, for which ``propose`` stands in, or with the
+    runner's n-gram proposer (``spec_method`` ``ngram``). Each verify accepts
+    a scripted prefix of the drafts through the runner's own accept walk and
+    commit, so the scheduler and the runner see the counts a real verify
+    produces.
+    """
 
     def __init__(
         self,
@@ -337,6 +395,10 @@ class _Harness:
         mode: str = "none",
         checkpoint_alignment: int | None = None,
         prefix_match_unit: int | None = None,
+        num_speculative_tokens: int = 0,
+        narrow_decode: bool = True,
+        offers: tuple[int, ...] | None = None,
+        spec_method: str = MODEL_OWNED_DRAFT_METHOD,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -344,14 +406,45 @@ class _Harness:
         cfg.scheduler_config.max_num_seqs = MAX_NUM_SEQS
         cfg.cache_config.prefix_match_unit = prefix_match_unit
         self.mode = mode
+        self.num_spec = num_speculative_tokens
+        spec_plan = None
+        if num_speculative_tokens:
+            spec_plan = SpecPlan(
+                effective_k=num_speculative_tokens,
+                lanes_per_request=1,
+                extra_bytes_per_seq=0,
+                extra_bytes_per_token=0,
+                accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+                drafter_state=DRAFTER_STATE_INTERNAL,
+                supports_narrow_decode=narrow_decode,
+            )
+            cfg.speculative_config = SimpleNamespace(
+                method=spec_method,
+                num_speculative_tokens=num_speculative_tokens,
+                use_eagle=lambda: False,
+                use_eagle_block_drop=lambda: False,
+                **NGRAM_LOOKUP,
+            )
+            store_tt_spec_plan(cfg, spec_plan)
         self.kv_cache_config = _kv_cache_config(
-            cfg, _qwen38_specs(mode, checkpoint_alignment), num_blocks
+            cfg,
+            _qwen38_specs(mode, checkpoint_alignment, num_speculative_tokens),
+            num_blocks,
         )
         self.scheduler = _scheduler(
-            self.kv_cache_config, max_num_batched_tokens, mode, prefix_match_unit
+            self.kv_cache_config,
+            max_num_batched_tokens,
+            mode,
+            prefix_match_unit,
+            spec_plan=spec_plan,
+            spec_method=spec_method,
         )
         self.hash_block_size = self.scheduler.hash_block_size
-        self.model = _RecordingModel()
+        self.model = (
+            _DraftingModel(self)
+            if num_speculative_tokens and spec_method == MODEL_OWNED_DRAFT_METHOD
+            else _RecordingModel()
+        )
         self.runner = TTModelRunner(
             vllm_config=cfg,
             mesh_device=None,
@@ -384,7 +477,7 @@ class _Harness:
         # first GDN group's block it went to.
         self.checkpoints: list[tuple[str, int]] = []
         self.checkpoint_blocks: list[int] = []
-        # Steps whose rows read one block and wrote another.
+        # Steps in which a row read a block outside its own window.
         self.crossings = 0
         # Request id -> its tokens and its (start, end) positions in each
         # prefill step, and its first step.
@@ -395,6 +488,26 @@ class _Harness:
         self.output_base = 50_000
         self.num_steps = 0
         self.num_added = 0
+        # Speculative decoding. ``offers`` cycles the number of drafts the
+        # drafter offers a row; ``accepted[(v, a)]`` counts verify rows that
+        # carried ``v`` valid drafts and committed ``a`` tokens.
+        self.offers = offers or tuple(range(num_speculative_tokens, -1, -1))
+        self.num_offers = 0
+        self.accept_cycle: dict[int, int] = {}
+        self.accepted: dict[tuple[int, int], int] = {}
+        self.step_kinds: dict[str, int] = {}
+        # Verify rows whose tokens span two block-table columns, and steps
+        # whose window began in a lower column than the request's previous
+        # one.
+        self.verify_crossings = 0
+        self.windows_moved_back = 0
+        self.last_window: dict[str, int] = {}
+        # Request id -> its output length at which the drafter offers EOS as
+        # its second draft, which the verify then accepts with the drafts
+        # after it.
+        self.eos_after: dict[str, int] = {}
+        self.proposing_req_ids: list[str] = []
+        self.draft_rng = torch.Generator().manual_seed(7)
 
     def add(
         self,
@@ -402,10 +515,14 @@ class _Harness:
         prompt_len: int = 0,
         max_tokens: int = 8,
         prompt: list[int] | None = None,
+        ignore_eos: bool = True,
     ) -> None:
         init_none_hash(sha256)
-        params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
-        params.update_from_generation_config({}, eos_token_id=2)
+        # Greedy, so the argmax_ids walk can certify a speculating request.
+        params = SamplingParams(
+            max_tokens=max_tokens, ignore_eos=ignore_eos, temperature=0.0
+        )
+        params.update_from_generation_config({}, eos_token_id=EOS)
         # Distinct prompts, so a row that reads another request's block
         # cannot find the state it expects there.
         self.num_added += 1
@@ -470,6 +587,57 @@ class _Harness:
             )
             self.cached_states_checked += 1
 
+    def propose(self, num_drafts: int, positions: torch.Tensor) -> DraftOutput:
+        """The drafter: each live row offers the next count of ``offers``."""
+        rows = int(positions.shape[0])
+        drafts = torch.randint(
+            3, 32, (rows, num_drafts), generator=self.draft_rng, dtype=torch.int32
+        )
+        num_valid = torch.zeros(rows, dtype=torch.int32)
+        for row, req_id in enumerate(self.proposing_req_ids):
+            if int(positions[row, 0]) < 0:
+                continue
+            offered = self.offers[self.num_offers % len(self.offers)]
+            self.num_offers += 1
+            request = self.requests[req_id]
+            if (
+                req_id in self.eos_after
+                and request.num_output_tokens >= self.eos_after[req_id]
+            ):
+                offered = num_drafts
+                drafts[row, 1] = EOS
+            num_valid[row] = offered
+        return DraftOutput(draft_token_ids=drafts, num_valid=num_valid)
+
+    def verify_ids(self, model_input) -> torch.Tensor:
+        """``argmax_ids`` that accept a scripted prefix of each row's drafts.
+
+        A row with ``v`` valid drafts commits ``a`` tokens, ``a`` cycling
+        through ``1..v+1`` per ``v``: the first ``a - 1`` drafts match, and
+        draft ``a - 1`` is rejected unless ``a`` is ``v + 1`` (all drafts and
+        the bonus). A row whose drafts carry EOS accepts all of them.
+        """
+        tokens = model_input.input_tokens
+        rows, width = (int(n) for n in tokens.shape)
+        drafts = model_input.draft_token_ids
+        ids = torch.full((rows, width), 5, dtype=torch.int32)
+        for row, req_id in enumerate(model_input.row_req_ids):
+            v = int(model_input.num_valid_drafts[row])
+            if v and bool((drafts[row, :v] == EOS).any()):
+                a = v + 1
+            else:
+                cycle = self.accept_cycle.get(v, 0)
+                self.accept_cycle[v] = cycle + 1
+                a = 1 + cycle % (v + 1)
+            self.accepted[(v, a)] = self.accepted.get((v, a), 0) + 1
+            ids[row, : a - 1] = drafts[row, : a - 1]
+            if a - 1 < v:
+                # Any other token rejects draft a - 1.
+                ids[row, a - 1] = 3 + (int(drafts[row, a - 1]) - 2) % 29
+            else:
+                ids[row, a - 1] = 3 + (self.num_steps + row) % 29
+        return ids
+
     def step(self) -> bool:
         out = self.scheduler.schedule()
         self.preempted.update(out.preempted_req_ids or ())
@@ -483,16 +651,37 @@ class _Harness:
                 self.ledger.zero(self.groups, kwargs["block_ids"])
                 self.zeroed += kwargs["block_ids"]
         row_req_ids = model_input.row_req_ids
-        positions = torch.as_tensor(model_input.input_positions).reshape(-1)
+        is_prefill = model_input.prompt_lens is not None
+        verify = model_input.spec_mode is not None
+        kind = "prefill" if is_prefill else "verify" if verify else "decode"
+        self.step_kinds[kind] = self.step_kinds.get(kind, 0) + 1
+        positions = torch.as_tensor(model_input.input_positions)
+        if positions.dim() == 2:
+            positions = positions[:, 0]
+        live = len(row_req_ids)
+        counts = (
+            [1] * live
+            if model_input.accepted_counts is None
+            else model_input.accepted_counts[:live].tolist()
+        )
+        counts_by_req = dict(zip(row_req_ids, counts))
         state = model_input.mamba_state
         assert [g.layer_names for g in state.groups] == [
             tuple(self.kv_cache_config.kv_cache_groups[g].layer_names)
             for g in self.groups
         ]
+        width = 1 + self.num_spec
+        assert {tuple(g.windows.shape) for g in state.groups} == {
+            (self.runner.tt_max_batch_size, width)
+        }
+        if is_prefill:
+            mask = state.intermediate_prefill_mask
+            assert mask.dtype == torch.bool
+            assert mask[live:].all()
+        else:
+            assert state.intermediate_prefill_mask is None
         upstream = (
-            self.upstream.columns(
-                out, row_req_ids, self.runner.requests, dict.fromkeys(row_req_ids, 1)
-            )
+            self.upstream.columns(out, row_req_ids, self.runner.requests, counts_by_req)
             if self.upstream is not None
             else None
         )
@@ -511,9 +700,15 @@ class _Harness:
             end = start + out.num_scheduled_tokens[req_id]
             assert start == computed[req_id]
             self.first_step.setdefault(req_id, self.num_steps)
-            if model_input.prompt_lens is not None:
+            if is_prefill:
                 self.prefill_chunks.setdefault(req_id, []).append(end - start)
                 self.prefill_spans.setdefault(req_id, []).append((start, end))
+                # The drafter starts a request only after its last chunk.
+                assert bool(state.intermediate_prefill_mask[row]) == (
+                    end < request.num_tokens
+                )
+            if verify and (start // BLOCK_SIZE) != ((end - 1) // BLOCK_SIZE):
+                self.verify_crossings += 1
             # The attention page table is the scheduler's attention blocks.
             held = self.scheduler_blocks(req_id, attention)
             page_table = model_input.block_tables_per_group[attention][row]
@@ -540,52 +735,113 @@ class _Harness:
             for i, g in enumerate(self.groups):
                 group = state.groups[i]
                 src = int(group.start_blocks[row])
-                dst = int(group.windows[row, 0])
+                window = group.windows[row].tolist()
                 checkpoint = (
                     (position, int(group.checkpoint_blocks[row, 0]))
                     if position
                     else None
                 )
-                self.check_blocks(req_id, g, start, end, src, dst, checkpoint)
+                self.check_blocks(
+                    req_id, g, start, end, src, window, checkpoint, counts[row]
+                )
                 if upstream is not None:
                     row_ids = self.runner.requests[req_id].block_ids[g]
-                    src_column, dst_column = upstream[req_id]
+                    src_column, window_column = upstream[req_id]
                     assert src == (row_ids[src_column] if src_column >= 0 else 0)
-                    assert dst == row_ids[dst_column]
-                blocks.append((g, src, dst, checkpoint))
+                    assert window[0] == row_ids[window_column]
+                    if i == 0:
+                        last = self.last_window.get(req_id)
+                        if req_id not in fresh and last is not None:
+                            self.windows_moved_back += window_column < last
+                        self.last_window[req_id] = window_column
+                blocks.append((g, src, window, checkpoint))
             rows.append((request, start, end, blocks))
-        # The kernels read every start state before any row writes.
-        read_only = set()
-        written = set()
-        for request, start, _end, blocks in rows:
-            for g, src, dst, checkpoint in blocks:
+        # The kernels read every start state before any row writes. No two
+        # rows write one block, and a start block outside the row's own window
+        # is written by no row: it can be a block vLLM keeps for the prefix
+        # cache.
+        written: dict[tuple[int, int], int] = {}
+        for row, (request, start, _end, blocks) in enumerate(rows):
+            for g, src, window, checkpoint in blocks:
                 self.ledger.read(g, src, list(request.all_token_ids), start)
-                if src and src != dst:
-                    read_only.add(src)
-                written.add(dst)
-                if checkpoint:
-                    written.add(checkpoint[1])
-        assert not read_only & written, (
-            f"blocks {sorted(read_only & written)} are a start state and written"
-        )
-        self.crossings += bool(read_only)
-        sampled: list[list[int]] = []
-        for request, start, end, blocks in rows:
+                own = [*window, *([checkpoint[1]] if checkpoint else [])]
+                assert len(set(own)) == len(own), (request.request_id, own)
+                for block in own:
+                    assert written.setdefault((g, block), row) == row, (
+                        f"rows {written[(g, block)]} and {row} write block {block}"
+                    )
+        crossed = False
+        for row, (_request, _start, _end, blocks) in enumerate(rows):
+            for g, src, window, _checkpoint in blocks:
+                if src and src not in window:
+                    crossed = True
+                    assert (g, src) not in written, (
+                        f"block {src} is row {row}'s start state and row "
+                        f"{written[(g, src)]} writes it"
+                    )
+        self.crossings += crossed
+        for row, (request, start, end, blocks) in enumerate(rows):
             tokens = list(request.all_token_ids)
-            for g, _src, dst, checkpoint in blocks:
+            for g, _src, window, checkpoint in blocks:
                 if checkpoint:
                     self.ledger.write(g, checkpoint[1], tokens, checkpoint[0])
-                self.ledger.write(g, dst, tokens, end)
-            emits = end >= request.num_tokens
-            sampled.append([self.output_base + self.num_steps] if emits else [])
+                if verify:
+                    # Window column t takes the state after query token t;
+                    # the columns past the row's valid drafts take anything.
+                    block = model_input.input_tokens[row].tolist()
+                    assert block[0] == tokens[start]
+                    valid = int(model_input.num_valid_drafts[row])
+                    for t, dst in enumerate(window):
+                        if t <= valid:
+                            self.ledger.states[(g, dst)] = tuple(
+                                tokens[:start] + block[: t + 1]
+                            )
+                            self.ledger.gdn_blocks.add(dst)
+                        else:
+                            self.ledger.states[(g, dst)] = GARBAGE
+                    continue
+                self.ledger.write(g, window[0], tokens, end)
+                for dst in window[1:]:
+                    self.ledger.states[(g, dst)] = GARBAGE
         for i, g in enumerate(self.groups):
             group = state.groups[i]
-            padding = len(row_req_ids)
-            assert set(group.windows[padding:, 0].tolist()) <= {0}
-            assert set(group.start_blocks[padding:].tolist()) <= {0}
+            assert set(group.windows[live:].reshape(-1).tolist()) <= {0}
+            assert set(group.start_blocks[live:].tolist()) <= {0}
             self.ledger.run_padding_row(g)
         if self.mode == "align":
             self.check_cached_states()
+        output = self.finish_step(model_input, rows, is_prefill, verify)
+        self.scheduler.update_from_output(out, output)
+        drafts = self.runner.take_draft_token_ids()
+        if drafts is not None:
+            self.scheduler.update_draft_token_ids(drafts)
+        self.num_steps += 1
+        return True
+
+    def finish_step(self, model_input, rows, is_prefill, verify) -> ModelRunnerOutput:
+        """Commit the step's tokens through the runner and build its output."""
+        row_req_ids = model_input.row_req_ids
+        self.proposing_req_ids = list(row_req_ids)
+        if verify:
+            walk = self.runner.walk_spec_acceptance(
+                model_input, self.verify_ids(model_input)
+            )
+            prefixes = self.runner.spec_committed_prefixes(
+                model_input, walk.committed, walk.counts
+            )
+            self.runner.commit_spec_acceptance(
+                model_input, walk.committed, walk.counts, None
+            )
+            return self.runner.build_spec_runner_output(row_req_ids, prefixes)
+        sampled: list[list[int]] = []
+        for row, (request, _start, end, _blocks) in enumerate(rows):
+            emits = end >= request.num_tokens
+            token = (
+                3 + (self.num_steps + row) % 29
+                if self.num_spec
+                else self.output_base + self.num_steps
+            )
+            sampled.append([token] if emits else [])
         # The runner keeps its own copy of each request's tokens, as its
         # sampling path does after a forward.
         emitted = [(r, t) for r, t in zip(row_req_ids, sampled) if t]
@@ -594,40 +850,53 @@ class _Harness:
                 torch.tensor([t for _, t in emitted], dtype=torch.int32),
                 req_ids=[r for r, _ in emitted],
             )
-        self.scheduler.update_from_output(
-            out,
-            ModelRunnerOutput(
-                req_ids=list(row_req_ids),
-                req_id_to_index={r: i for i, r in enumerate(row_req_ids)},
-                sampled_token_ids=sampled,
-                logprobs=None,
-                prompt_logprobs_dict={},
-                pooler_output=[],
-            ),
+        if self.num_spec and not is_prefill:
+            # As the runner's ordinary-decode tail does: the drafter is asked
+            # after every decode step.
+            self.runner.propose_after_plain_step(
+                model_input,
+                torch.tensor([t for _, t in emitted], dtype=torch.int32),
+                list(row_req_ids),
+            )
+        return ModelRunnerOutput(
+            req_ids=list(row_req_ids),
+            req_id_to_index={r: i for i, r in enumerate(row_req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
         )
-        self.num_steps += 1
-        return True
 
-    def check_blocks(self, req_id, group, start, end, src, dst, checkpoint) -> None:
-        """A row's blocks are the ones vLLM allocated and, in mode none,
-        upstream ``mamba_get_block_table_tensor`` selects."""
+    def check_blocks(
+        self, req_id, group, start, end, src, window, checkpoint, count
+    ) -> None:
+        """A row's blocks are blocks vLLM holds for the request, at the
+        columns upstream ``mamba_get_block_table_tensor`` selects."""
         held = self.scheduler_blocks(req_id, group)
+        width = 1 + self.num_spec
+        table = torch.zeros((1, max(len(held), width)), dtype=torch.int32)
+        table[0, : len(held)] = torch.tensor(held, dtype=torch.int32)
+        upstream = mamba_get_block_table_tensor(
+            table,
+            torch.tensor([end]),
+            self.kv_cache_config.kv_cache_groups[group].kv_cache_spec,
+            self.mode,
+        )
+        assert window == upstream[0, :width].tolist(), (req_id, group, held)
         if self.mode == "none":
-            upstream = mamba_get_block_table_tensor(
-                torch.tensor([held], dtype=torch.int32),
-                torch.tensor([end]),
-                self.kv_cache_config.kv_cache_groups[group].kv_cache_spec,
-                "none",
-            )
-            assert held == [dst] == upstream[0].tolist(), (req_id, group, held)
-            assert src == (dst if start else 0)
+            assert held == window, (req_id, group, held)
+            assert src == (held[count - 1] if start else 0), (req_id, held, count)
         else:
-            assert dst == held[(end - 1) // BLOCK_SIZE], (req_id, group, held)
-            assert src == (held[(start - 1) // BLOCK_SIZE] if start else 0), (
-                req_id,
-                group,
-                held,
-            )
+            column = (end - 1) // BLOCK_SIZE
+            assert window == held[column : column + width], (req_id, group, held)
+            if not start:
+                assert src == 0
+            elif self.num_spec:
+                # vLLM still holds the start block for the request, wherever
+                # it now sits in the row.
+                assert src in held, (req_id, group, src, held)
+            else:
+                assert src == held[(start - 1) // BLOCK_SIZE], (req_id, group, held)
         assert checkpoint == self.vllm_checkpoint(req_id, group, start, end), (
             req_id,
             group,
