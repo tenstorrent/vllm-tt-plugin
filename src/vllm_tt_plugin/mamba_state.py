@@ -30,6 +30,11 @@ cache. The TT runner does not copy: it names the block that holds the start
 state (``MambaGroupState.start_blocks``) and the block that takes the end state
 (``MambaGroupState.windows``), and the model reads the one and writes the
 other.
+
+With ``MambaSpec.num_prefill_checkpoint_blocks`` 1, a prefill chunk can also
+pass the prompt's last cacheable position; the model then writes the state at
+that position into a block vLLM reserved (``MambaGroupState.checkpoint_blocks``,
+``MambaStepState.checkpoint_positions``) while it continues the prompt.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ import torch
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroupSpec, MambaSpec
 
 from vllm_tt_plugin.config import is_tt_block_output_model, uses_tt_lane_coordinator
+from vllm_tt_plugin.mamba_checkpoints import prefill_checkpoints
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -69,6 +75,11 @@ class MambaGroupState:
     # ``windows[i, 0]`` unless the row's tokens cross into a new block-table
     # column in mode ``align``.
     start_blocks: torch.Tensor
+    # ``[rows, 1]`` when a row of this prefill writes a checkpoint, else
+    # ``None``: the block that takes row ``i``'s state after
+    # ``MambaStepState.checkpoint_positions[i, 0]`` tokens, 0 for no
+    # checkpoint.
+    checkpoint_blocks: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +88,11 @@ class MambaStepState:
 
     # One per ``MambaSpec`` KV cache group, in KV cache group order.
     groups: tuple[MambaGroupState, ...]
+    # CPU int32 ``[rows, 1]`` when a row of this prefill writes a checkpoint,
+    # else ``None``: the token count whose state row ``i`` writes into each
+    # group's ``checkpoint_blocks[i, 0]``, strictly between the row's start
+    # and end position; 0 for no checkpoint.
+    checkpoint_positions: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +112,14 @@ class MambaCacheGroups:
     mamba_cache_mode: str
     # ``MambaSpec.block_size``, the same in every Mamba group.
     block_size: int
+    # ``MambaSpec.prefill_checkpoint_alignment`` with
+    # ``num_prefill_checkpoint_blocks`` 1, the same in every Mamba group;
+    # ``None`` without prefill checkpoint blocks.
+    prefill_checkpoint_alignment: int | None = None
+    # ``cache_config.prefix_match_unit``, the token granularity of prefix
+    # hits and of vLLM's prefill checkpoint positions; ``block_size`` when
+    # ``None``.
+    prefix_match_unit: int | None = None
 
     def step_state(
         self,
@@ -136,52 +160,123 @@ class MambaCacheGroups:
             # block_size; a row at position 0 has none (column -1).
             start_columns = (starts - 1) // self.block_size
             dest_columns = (ends - 1) // self.block_size
-        rows = np.arange(live)
-        groups = []
-        for g, names in zip(self.group_indices, self.layer_names):
-            table = block_tables_per_group[g][:live].numpy()
-            if live and int(dest_columns.max()) >= table.shape[1]:
+        for g in self.group_indices:
+            width = block_tables_per_group[g].shape[1]
+            if live and int(dest_columns.max()) >= width:
                 raise RuntimeError(
                     f"requests {list(row_req_ids)} need state block-table "
                     f"columns {dest_columns.tolist()} in KV cache group {g}, "
-                    f"but the table has {table.shape[1]} columns"
+                    f"but the table has {width} columns"
                 )
+        rows = np.arange(live)
+        # A row writes the checkpoint vLLM's rule names where vLLM reserved
+        # its block. Every Mamba group reserves alike, so the first group's
+        # row decides, and ``_check_rows`` raises where another group's
+        # differs.
+        checkpoints = self._checkpoint_columns(
+            num_computed_tokens, num_scheduled_tokens
+        )
+        first_table = block_tables_per_group[self.group_indices[0]][:live].numpy()
+        reserved = [
+            c is not None and bool(first_table[row, c[1]])
+            for row, c in enumerate(checkpoints)
+        ]
+        positions = np.array(
+            [c[0] if r else 0 for c, r in zip(checkpoints, reserved)], dtype=np.int64
+        ).reshape(live)
+        checkpoint_columns = np.array(
+            [c[1] if r else -1 for c, r in zip(checkpoints, reserved)], dtype=np.int64
+        ).reshape(live)
+        groups = []
+        for g, names in zip(self.group_indices, self.layer_names):
+            table = block_tables_per_group[g][:live].numpy()
             dest = table[rows, dest_columns]
             start = np.where(starts > 0, table[rows, np.maximum(start_columns, 0)], 0)
-            self._check_rows(g, row_req_ids, table, starts, start_columns, dest_columns)
+            checkpoint = np.where(
+                checkpoint_columns >= 0,
+                table[rows, np.maximum(checkpoint_columns, 0)],
+                0,
+            )
+            self._check_rows(
+                g,
+                row_req_ids,
+                table,
+                starts,
+                start_columns,
+                dest_columns,
+                checkpoint_columns,
+            )
             windows = torch.zeros((num_rows, 1), dtype=torch.int32)
             windows[:live, 0] = torch.from_numpy(dest.astype(np.int32))
             start_blocks = torch.zeros(num_rows, dtype=torch.int32)
             start_blocks[:live] = torch.from_numpy(start.astype(np.int32))
+            checkpoint_blocks = None
+            if positions.any():
+                checkpoint_blocks = torch.zeros((num_rows, 1), dtype=torch.int32)
+                checkpoint_blocks[:live, 0] = torch.from_numpy(
+                    checkpoint.astype(np.int32)
+                )
             groups.append(
                 MambaGroupState(
-                    layer_names=names, windows=windows, start_blocks=start_blocks
+                    layer_names=names,
+                    windows=windows,
+                    start_blocks=start_blocks,
+                    checkpoint_blocks=checkpoint_blocks,
                 )
             )
-        return MambaStepState(groups=tuple(groups))
+        checkpoint_positions = None
+        if positions.any():
+            checkpoint_positions = torch.zeros((num_rows, 1), dtype=torch.int32)
+            checkpoint_positions[:live, 0] = torch.from_numpy(
+                positions.astype(np.int32)
+            )
+        return MambaStepState(
+            groups=tuple(groups), checkpoint_positions=checkpoint_positions
+        )
 
-    @staticmethod
+    def _checkpoint_columns(
+        self,
+        num_computed_tokens: Sequence[int],
+        num_scheduled_tokens: Sequence[int],
+    ) -> list[tuple[int, int] | None]:
+        """Each row's ``(position, column)`` prefill checkpoint by vLLM's rule,
+        or ``None``; all ``None`` without prefill checkpoint blocks."""
+        if self.prefill_checkpoint_alignment is None:
+            return [None] * len(num_computed_tokens)
+        return prefill_checkpoints(
+            [int(c) for c in num_computed_tokens],
+            [int(s) for s in num_scheduled_tokens],
+            mamba_block_size=self.block_size,
+            prefix_match_unit=self.prefix_match_unit or self.block_size,
+            checkpoint_alignment=self.prefill_checkpoint_alignment,
+        )
+
     def _check_rows(
+        self,
         group: int,
         row_req_ids: Sequence[str],
         table: np.ndarray,
         starts: np.ndarray,
         start_columns: np.ndarray,
         dest_columns: np.ndarray,
+        checkpoint_columns: np.ndarray,
     ) -> None:
         """Raise for a row whose blocks vLLM did not allocate as expected.
 
         vLLM gives every scheduled request its state block before the step,
         and block 0 is the null block that padding rows share. The block of
         the start state is the running block of the request's previous step,
-        which vLLM frees only after this step. Mode ``align`` without prefill
-        checkpoint blocks leaves block 0 in every column a step's tokens pass
-        without ending there, so a block there would be one the model never
-        writes and vLLM could cache.
+        which vLLM frees only after this step. In mode ``align`` vLLM leaves
+        block 0 in every column a step's tokens pass without ending there,
+        except the column of a prefill checkpoint (``checkpoint_columns``, -1
+        for none), which every Mamba group reserves alike. A block in another
+        passed column would be one the model never writes and vLLM could
+        cache.
         """
         for row, req_id in enumerate(row_req_ids):
             start_column = int(start_columns[row])
             dest_column = int(dest_columns[row])
+            checkpoint_column = int(checkpoint_columns[row])
             if not table[row, dest_column]:
                 raise RuntimeError(
                     f"request {req_id} has no state block in KV cache group "
@@ -195,13 +290,26 @@ class MambaCacheGroups:
                     f"{group} holds the null block 0 instead of its start "
                     f"state: {table[row].tolist()}"
                 )
-            passed = table[row, max(start_column + 1, 0) : dest_column]
-            if passed.any():
+            if checkpoint_column >= 0 and not table[row, checkpoint_column]:
                 raise RuntimeError(
-                    f"request {req_id} passes block-table columns "
-                    f"{max(start_column + 1, 0)} to {dest_column - 1} of KV "
-                    f"cache group {group} in this step, but vLLM allocated "
-                    f"blocks there that the model does not write: "
+                    f"request {req_id} has a prefill checkpoint block in "
+                    f"block-table column {checkpoint_column} of KV cache group "
+                    f"{self.group_indices[0]} but not of group {group}: "
+                    f"{table[row].tolist()}"
+                )
+            first = max(start_column + 1, 0)
+            passed = [
+                column
+                for column in range(first, dest_column)
+                if table[row, column] and column != checkpoint_column
+            ]
+            if passed:
+                raise RuntimeError(
+                    f"request {req_id} passes block-table columns {first} to "
+                    f"{dest_column - 1} of KV cache group {group} in this step, "
+                    f"but vLLM allocated blocks in columns {passed} that the "
+                    "model does not write (vLLM's prefill checkpoint rule names "
+                    f"column {checkpoint_column if checkpoint_column >= 0 else None}): "
                     f"{table[row].tolist()}"
                 )
 
@@ -280,13 +388,25 @@ def check_mamba_launch(
                 f"but cache_config.mamba_cache_mode={mode!r}; the model's "
                 "get_kv_cache_spec must use the resolved cache mode"
             )
-        if spec.num_speculative_blocks or spec.num_prefill_checkpoint_blocks:
+        if spec.num_speculative_blocks:
             raise ValueError(
                 "MambaSpec has num_speculative_blocks="
-                f"{spec.num_speculative_blocks} and num_prefill_checkpoint_blocks="
-                f"{spec.num_prefill_checkpoint_blocks}; TT supports neither "
-                "speculative nor prefill-checkpoint state blocks yet, so both "
-                "must be 0"
+                f"{spec.num_speculative_blocks}; TT supports no speculative "
+                "state blocks yet, so it must be 0"
+            )
+        if spec.num_prefill_checkpoint_blocks and (
+            mode != "align"
+            or spec.num_prefill_checkpoint_blocks != 1
+            or not spec.prefill_checkpoint_alignment
+        ):
+            # MambaManager reserves at most one checkpoint block per request,
+            # only in mode align, and never without an alignment.
+            raise ValueError(
+                "MambaSpec has num_prefill_checkpoint_blocks="
+                f"{spec.num_prefill_checkpoint_blocks} with "
+                f"prefill_checkpoint_alignment={spec.prefill_checkpoint_alignment} "
+                f"in mamba_cache_mode={mode!r}; prefill checkpoints need mode "
+                "'align', exactly 1 block and a positive alignment"
             )
         if mode == "none" and spec.block_size < max_model_len:
             # MambaManager allocates one block per block_size tokens in mode
@@ -384,12 +504,30 @@ def mamba_cache_groups(
             f"MambaSpec groups {list(group_indices)} have different block sizes "
             f"{sorted(block_sizes)}; upstream state selection assumes one"
         )
+    block_size = block_sizes.pop()
+    checkpoints = {
+        (spec.num_prefill_checkpoint_blocks, spec.prefill_checkpoint_alignment)
+        for spec in specs
+    }
+    if len(checkpoints) != 1:
+        # vLLM's scheduler splits prefill with the first Mamba group's
+        # alignment, and each group reserves its own checkpoint block.
+        raise ValueError(
+            f"MambaSpec groups {list(group_indices)} have different "
+            "(num_prefill_checkpoint_blocks, prefill_checkpoint_alignment) "
+            f"{sorted(checkpoints, key=str)}; declare one for every group"
+        )
+    num_checkpoint_blocks, checkpoint_alignment = checkpoints.pop()
     return MambaCacheGroups(
         group_indices=group_indices,
         layer_names=tuple(tuple(kv_cache_groups[i].layer_names) for i in group_indices),
         attention_group_index=attention_group_index,
         mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-        block_size=block_sizes.pop(),
+        block_size=block_size,
+        prefill_checkpoint_alignment=(
+            checkpoint_alignment if num_checkpoint_blocks else None
+        ),
+        prefix_match_unit=getattr(vllm_config.cache_config, "prefix_match_unit", None),
     )
 
 

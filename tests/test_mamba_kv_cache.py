@@ -436,8 +436,11 @@ def test_attention_only_page_table_width_is_unchanged():
 @pytest.mark.parametrize(
     ("mamba_kwargs", "match"),
     [
-        (dict(num_speculative_blocks=1), "neither speculative nor prefill"),
-        (dict(num_prefill_checkpoint_blocks=1), "neither speculative nor prefill"),
+        (dict(num_speculative_blocks=1), "no speculative state blocks"),
+        (
+            dict(num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=64),
+            "prefill checkpoints need mode 'align'",
+        ),
         # MambaManager would hold one state block per 1024 tokens.
         (dict(block_size=BLOCK_SIZE), "below max_model_len"),
         (dict(mamba_cache_mode="align"), "must use the resolved cache mode"),
@@ -540,15 +543,19 @@ def test_state_blocks_match_upstream_selection():
         groups.step_state(tables, ["a", "b", "c"], computed, scheduled, num_rows=6)
 
 
-def _align_groups():
+def _align_groups(num_groups=1, alignment=None, prefix_match_unit=BLOCK_SIZE):
     from vllm_tt_plugin.mamba_state import MambaCacheGroups
 
     return MambaCacheGroups(
-        group_indices=(0,),
-        layer_names=(("model.layers.0.linear_attn",),),
-        attention_group_index=1,
+        group_indices=tuple(range(num_groups)),
+        layer_names=tuple(
+            (f"model.layers.{g}.linear_attn",) for g in range(num_groups)
+        ),
+        attention_group_index=num_groups,
         mamba_cache_mode="align",
         block_size=BLOCK_SIZE,
+        prefill_checkpoint_alignment=alignment,
+        prefix_match_unit=prefix_match_unit,
     )
 
 
@@ -604,7 +611,7 @@ def test_align_mode_reads_the_previous_column_and_writes_the_running_one(
     ("computed", "scheduled", "row", "match"),
     [
         (2048, 452, [0, 0, 30], "holds the null block 0 instead of its start"),
-        (0, 2500, [0, 21, 30], "allocated blocks there that the model does"),
+        (0, 2500, [0, 21, 30], "that the model does not write"),
         (2048, 2048, [0, 21, 0, 0], "request a has no state block"),
         (0, 30_000, [5], "need state block-table columns"),
     ],
@@ -621,6 +628,68 @@ def test_align_mode_rejects_rows_vllm_did_not_allocate_as_expected(
     with pytest.raises(RuntimeError, match=match):
         _align_groups().step_state(
             [table, table], ["a"], [computed], [scheduled], num_rows=1
+        )
+
+
+def _table(row) -> torch.Tensor:
+    table = torch.zeros((1, 24), dtype=torch.int32)
+    table[0, : len(row)] = torch.tensor(row, dtype=torch.int32)
+    return table
+
+
+@pytest.mark.parametrize(
+    ("computed", "scheduled", "row", "prefix_match_unit", "checkpoint"),
+    [
+        # One unchunked prefill of 2500 tokens: vLLM reserves column 1 for the
+        # state after 2048 tokens, the prompt's last block boundary.
+        (0, 2500, [0, 21, 30], BLOCK_SIZE, (2048, 21)),
+        # With a 128-token prefix_match_unit the position is the prompt's last
+        # multiple of 128, still in column 1.
+        (0, 2500, [0, 21, 30], 128, (2432, 21)),
+        # After a prefix hit on 2048 tokens, a prompt of 4000: the state after
+        # 3072 tokens in column 2.
+        (2048, 1952, [0, 11, 21, 30], BLOCK_SIZE, (3072, 21)),
+        # vLLM declined the checkpoint (a chunk that does not reach the end of
+        # the prefill): the column holds the null block, and the row writes
+        # none.
+        (0, 2500, [0, 0, 30], BLOCK_SIZE, None),
+        # The rule allows none: the chunk starts one block below its end.
+        (2048, 452, [0, 11, 30], BLOCK_SIZE, None),
+    ],
+)
+def test_prefill_checkpoints_follow_vllms_rule_and_its_reservation(
+    computed, scheduled, row, prefix_match_unit, checkpoint
+):
+    """A row writes a checkpoint where vLLM's rule
+    (``compute_mamba_prefill_checkpoints``) places one and vLLM reserved its
+    block; the state inputs carry no checkpoint fields otherwise."""
+    groups = _align_groups(2, alignment=64, prefix_match_unit=prefix_match_unit)
+    tables = [_table(row), _table([b + 100 if b else 0 for b in row])]
+
+    state = groups.step_state(tables, ["a"], [computed], [scheduled], num_rows=2)
+
+    if checkpoint is None:
+        assert state.checkpoint_positions is None
+        assert [g.checkpoint_blocks for g in state.groups] == [None, None]
+        return
+    position, block = checkpoint
+    assert state.checkpoint_positions.tolist() == [[position], [0]]
+    assert [g.checkpoint_blocks.tolist() for g in state.groups] == [
+        [[block], [0]],
+        [[block + 100], [0]],
+    ]
+
+
+def test_prefill_checkpoint_blocks_vllm_reserved_unlike_the_rule_fail():
+    """A reserved block the rule does not name would stay unwritten while
+    vLLM caches it; groups that disagree cannot share one position."""
+    with pytest.raises(RuntimeError, match=r"allocated blocks in columns \[1\]"):
+        _align_groups(alignment=None).step_state(
+            [_table([0, 21, 30])], ["a"], [0], [2500], num_rows=1
+        )
+    with pytest.raises(RuntimeError, match="checkpoint block in block-table column 1"):
+        _align_groups(2, alignment=64).step_state(
+            [_table([0, 21, 30]), _table([0, 0, 130])], ["a"], [0], [2500], num_rows=1
         )
 
 

@@ -45,6 +45,8 @@ When the KV cache has `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#r
 | `MambaGroupState.layer_names` | The group's layers, `KVCacheGroupSpec.layer_names`. The group's tensors apply to each of these layers. |
 | `MambaGroupState.start_blocks` | CPU int32 tensor `[tt_max_batch_size]`. Row `i` is the block that holds the start state of submitted row `i` in this group, or 0 when the row has no earlier state. |
 | `MambaGroupState.windows` | CPU int32 tensor `[tt_max_batch_size, 1]`. Row `i` is the block that takes the end state of submitted row `i` in this group. |
+| `MambaGroupState.checkpoint_blocks` | `None`, or for a prefill in which a row writes a [prefill checkpoint](#prefill-checkpoints), a CPU int32 tensor `[tt_max_batch_size, 1]`. Row `i` is the block that takes the checkpoint state of submitted row `i` in this group, or 0 when the row writes none. |
+| `MambaStepState.checkpoint_positions` | `None`, or with `checkpoint_blocks`, a CPU int32 tensor `[tt_max_batch_size, 1]`. Row `i` is the token count whose state submitted row `i` writes into `checkpoint_blocks[i, 0]` of every group, or 0 when the row writes none. |
 
 In this section, the **full state** of a request after `n` tokens means everything the request's next step needs in that layer: the recurrent state and the convolution history after its first `n` tokens.
 
@@ -55,17 +57,32 @@ In this section, the **full state** of a request after `n` tokens means everythi
 | `none` | column 0, or 0 when `start_pos[i]` is 0 | column 0 |
 | `align` | column `(start_pos[i] - 1) // MambaSpec.block_size`, or 0 when `start_pos[i]` is 0 | column `(start_pos[i] + n - 1) // MambaSpec.block_size` |
 
-In mode `none` a request keeps one block from its first step until vLLM frees it, so both fields name that block. In mode `align` the running state after `m` tokens is in column `(m - 1) // MambaSpec.block_size`, and the two fields name different blocks when the step's tokens cross into a new column: a prefill that continues from a [prefix-cache hit](MODEL_LIFECYCLE.md#request-state), a prefill chunk or a decode that passes a block boundary. Upstream `preprocess_mamba` copies the start state into the new column's block and updates that block in place; `TTModelRunner` names both blocks instead and requests no copy. `TTModelRunner` raises if a scheduled row has the null block 0 in its start or destination column, or a block in a column the step passes without ending there.
+In mode `none` a request keeps one block from its first step until vLLM frees it, so both fields name that block. In mode `align` the running state after `m` tokens is in column `(m - 1) // MambaSpec.block_size`, and the two fields name different blocks when the step's tokens cross into a new column: a prefill that continues from a [prefix-cache hit](MODEL_LIFECYCLE.md#request-state), a prefill chunk or a decode that passes a block boundary. Upstream `preprocess_mamba` copies the start state into the new column's block and updates that block in place; `TTModelRunner` names both blocks instead and requests no copy. `TTModelRunner` raises if a scheduled row has the null block 0 in its start or destination column, or a block in a column the step passes without ending there, other than the column of a [prefill checkpoint](#prefill-checkpoints).
 
 For submitted row `i` with `n` scheduled tokens, the model must, in every layer of the group's `MambaGroupState.layer_names`:
 
 1. Take the start state, the full state after `start_pos[i]` tokens, from block `start_blocks[i]`. When `start_blocks[i]` is 0 the row has no earlier state: the model starts it from zero state and does not read a block, because vLLM does not zero recurrent-state blocks and the row's blocks can hold stale bytes of an earlier owner. `start_blocks[i]` is 0 exactly when `start_pos[i]` is 0.
-2. Write the end state, the full state after `start_pos[i] + n` tokens, into block `windows[i, 0]`.
-3. When `start_blocks[i]` differs from `windows[i, 0]`, leave block `start_blocks[i]` unchanged. vLLM can keep it in the prefix cache, and other rows of the same step can read it as their start state. The model can read the start block and write the destination block directly, or copy the start state into the destination block and update that block in place.
+2. When `checkpoint_positions[i, 0]` is a token count `p` above 0, write the full state after `p` tokens into block `checkpoint_blocks[i, 0]`, and continue the row's computation from there.
+3. Write the end state, the full state after `start_pos[i] + n` tokens, into block `windows[i, 0]`.
+4. When `start_blocks[i]` differs from `windows[i, 0]`, leave block `start_blocks[i]` unchanged. vLLM can keep it in the prefix cache, and other rows of the same step can read it as their start state. The model can read the start block and write the destination block directly, or copy the start state into the destination block and update that block in place.
 
 After the step, the destination block alone must hold the complete state, because the request's next step can run in another row and vLLM can free or share the block. The model can keep temporary workspace during a step, but no request state that outlives the step outside the block.
 
-Padding rows have block 0, the null block, in both fields. vLLM never allocates block 0 to a request, so the model can read or write block 0 without changing live state, and ignores the result. On the layer-slot overlay, padding rows can write their state into block 0, so block 0 can hold any bytes, including fp32 state that reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+#### Prefill checkpoints
+
+A model whose `MambaSpec` declares `num_prefill_checkpoint_blocks` 1 (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)) can receive prefill checkpoints in mode `align`. Without them, vLLM's scheduler ends a prefill chunk at the prompt's last cacheable position, so that the chunk's end state is the state vLLM keeps for the prefix cache: a 2500-token prompt with 1024-token blocks runs as a chunk of 2048 tokens and a chunk of 452. With them, the scheduler need not end a chunk there and can run a prompt that fits the step as one chunk, and `MambaManager` reserves a block for the state at that position in the block-table column before the destination column. The model writes that state into the reserved block while it continues the prompt: for the 2500-token prompt, the state after 2048 tokens into column 1's block and the state after 2500 tokens into column 2's.
+
+`TTModelRunner` finds each row's checkpoint with vLLM's rule, `compute_mamba_prefill_checkpoints` in `vllm/model_executor/layers/mamba/checkpoint.py`, as the upstream GPU runner does, and takes the block from the row's block-table column (`prefill_checkpoints` in [mamba_checkpoints.py](../src/vllm_tt_plugin/mamba_checkpoints.py)). When `MambaManager` declined the checkpoint, for example in a chunk that does not reach the end of the prefill, the column holds block 0 and the row writes none. For a row with a checkpoint at token count `p`:
+
+- `start_pos[i] < p < start_pos[i] + n`, and `p - start_pos[i]` is a multiple of `MambaSpec.prefill_checkpoint_alignment`, so the model can choose an alignment that its prefill computation stops at.
+- `p` is a multiple of `cache_config.prefix_match_unit`, or of the block size when that is unset.
+- `checkpoint_blocks[i, 0]` is a block vLLM reserved for this step. It differs from `start_blocks[i]` and `windows[i, 0]`. vLLM registers it in the prefix cache as the state after `p` tokens when it schedules the step, and lets only later steps hit it, so the model must write it in this step.
+
+`checkpoint_positions` and `checkpoint_blocks` are `None` in decode and in a prefill in which no row writes a checkpoint.
+
+#### Padding, zeroing and decode reload
+
+Padding rows have block 0, the null block, in every field. vLLM never allocates block 0 to a request, so the model can read or write block 0 without changing live state, and ignores the result. On the layer-slot overlay, padding rows can write their state into block 0, so block 0 can hold any bytes, including fp32 state that reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
 
 vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers (`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`). A block that held recurrent state can be reassigned to an attention group, and its stale bytes then read as NaN or Inf at positions attention does not write and masks. vLLM lists every block newly allocated to an attention group. `TTModelRunner` passes the whole list to the adapter's `zero_kv_cache_blocks` before the step, then vLLM's prefix-cache block copies to `copy_kv_cache_blocks`; see [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
 
