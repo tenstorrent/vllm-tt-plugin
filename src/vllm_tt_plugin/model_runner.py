@@ -3011,6 +3011,11 @@ class TTModelRunner:
                         if accepted_counts is None
                         else accepted_counts[live_row_index(model_input)].tolist()
                     ),
+                    intermediate_prefill_mask=(
+                        None
+                        if model_input.intermediate_prefill_mask is None
+                        else model_input.intermediate_prefill_mask.tolist()
+                    ),
                 ),
             )
         return model_input

@@ -179,6 +179,11 @@ class MambaStepState:
     # group's ``checkpoint_blocks[i, 0]``, strictly between the row's start
     # and end position; 0 for no checkpoint.
     checkpoint_positions: torch.Tensor | None = None
+    # Prefill only, else ``None``: CPU bool ``[rows]``, the step's
+    # ``TTModelInput.intermediate_prefill_mask``. True for a row whose chunk
+    # ends before the request's last token, so the step samples no token for
+    # it, and for padding rows; False for a row that ends its prefill.
+    intermediate_prefill_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -237,6 +242,7 @@ class MambaCacheGroups:
         num_rows: int,
         *,
         accepted_counts: Sequence[int] | None = None,
+        intermediate_prefill_mask: Sequence[bool] | None = None,
     ) -> MambaStepState:
         """The model's ``mamba_state`` for one forward. Call it once per step.
 
@@ -246,9 +252,10 @@ class MambaCacheGroups:
         upstream ``preprocess_mamba`` and ``mamba_get_block_table_tensor``
         select the blocks from. ``accepted_counts[i]`` is the number of tokens
         the request's previous step committed (``TTModelInput.accepted_counts``),
-        ``None`` meaning 1 for every row. The result has ``num_rows`` rows, the
-        row count of ``page_tables_per_layer``; rows past ``row_req_ids`` hold
-        block 0.
+        ``None`` meaning 1 for every row. ``intermediate_prefill_mask`` is the
+        prefill's ``TTModelInput.intermediate_prefill_mask``, ``None`` in
+        decode. The result has ``num_rows`` rows, the row count of
+        ``page_tables_per_layer``; rows past ``row_req_ids`` hold block 0.
 
         With speculative decoding this records each row's window
         (``windows``) for the request's next step.
@@ -370,6 +377,16 @@ class MambaCacheGroups:
             checkpoint_positions[:live, 0] = torch.from_numpy(
                 positions.astype(np.int32)
             )
+        mask = None
+        if intermediate_prefill_mask is not None:
+            values = [bool(m) for m in intermediate_prefill_mask]
+            if len(values) != live:
+                raise RuntimeError(
+                    f"{live} scheduled rows {list(row_req_ids)} got an "
+                    f"intermediate_prefill_mask of {len(values)} rows"
+                )
+            mask = torch.ones(num_rows, dtype=torch.bool)
+            mask[:live] = torch.tensor(values, dtype=torch.bool)
         if num_spec:
             for req_id, column, window in zip(
                 row_req_ids, window_columns.tolist(), previous
@@ -379,7 +396,9 @@ class MambaCacheGroups:
                     column, end if window is None else max(window.end, end)
                 )
         return MambaStepState(
-            groups=tuple(groups), checkpoint_positions=checkpoint_positions
+            groups=tuple(groups),
+            checkpoint_positions=checkpoint_positions,
+            intermediate_prefill_mask=mask,
         )
 
     def _start_column(

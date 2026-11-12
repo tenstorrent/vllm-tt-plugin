@@ -810,6 +810,11 @@ def test_prefill_and_decode_get_each_rows_state_block_per_group():
         assert ids[:2] == [blocks_a[group][0], blocks_b[group][0]]
         assert set(ids[2:]) == {0}
 
+    # Both prompts end in this step.
+    assert prefill.mamba_state.intermediate_prefill_mask.tolist() == [
+        False,
+        False,
+    ] + [True] * (MAX_BATCH - 2)
     runner.submit_prefill(prefill, [2])
     name, kwargs = model.calls[-1]
     assert name == "prefill_forward"
@@ -820,6 +825,7 @@ def test_prefill_and_decode_get_each_rows_state_block_per_group():
         None,
     )
     assert decode.prompt_lens is None
+    assert decode.mamba_state.intermediate_prefill_mask is None
     assert _state_ids(decode, 0)[:2] == [10, 30]
     assert _state_ids(decode, 6)[:2] == [12, 32]
     runner.async_decode.submit_decode(decode, read_from_device=True)
@@ -1155,6 +1161,27 @@ def test_speculative_windows_are_recorded_per_request_and_forgotten():
         groups.step_state([table], ["a"], [1027], [1], num_rows=1, accepted_counts=[5])
     with pytest.raises(RuntimeError, match="starts at position 0"):
         groups.step_state([table], ["a"], [0], [100], num_rows=1)
+
+
+def test_prefill_rows_say_whether_they_end_the_prefill():
+    """``intermediate_prefill_mask`` reaches the model in ``mamba_state`` on
+    a prefill, with padding rows True: a model initializes its drafter only
+    for a row whose chunk ends the request's prefill. Decode carries none."""
+    groups = _spec_groups("none", 1)
+    table = torch.arange(1, 2 * 4 + 1, dtype=torch.int32).reshape(2, 4)
+
+    prefill = groups.step_state(
+        [table],
+        ["a", "b"],
+        [0, 0],
+        [500, 900],
+        num_rows=4,
+        intermediate_prefill_mask=[True, False],
+    )
+    decode = groups.step_state([table], ["a"], [500], [1], num_rows=4)
+
+    assert prefill.intermediate_prefill_mask.tolist() == [True, False, True, True]
+    assert decode.intermediate_prefill_mask is None
 
 
 @pytest.mark.parametrize(

@@ -47,6 +47,7 @@ When the KV cache has `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#r
 | `MambaGroupState.windows` | CPU int32 tensor `[tt_max_batch_size, 1 + K]`. Row `i`, column `t` is the block that takes the state of submitted row `i` after its query token `t` in this group. A prefill and an ordinary decode write their end state into column 0 only; a [speculative verification](#speculative-verification) writes one column per verified token. |
 | `MambaGroupState.checkpoint_blocks` | `None`, or for a prefill in which a row writes a [prefill checkpoint](#prefill-checkpoints), a CPU int32 tensor `[tt_max_batch_size, 1]`. Row `i` is the block that takes the checkpoint state of submitted row `i` in this group, or 0 when the row writes none. |
 | `MambaStepState.checkpoint_positions` | `None`, or with `checkpoint_blocks`, a CPU int32 tensor `[tt_max_batch_size, 1]`. Row `i` is the token count whose state submitted row `i` writes into `checkpoint_blocks[i, 0]` of every group, or 0 when the row writes none. |
+| `MambaStepState.intermediate_prefill_mask` | `None` in decode. In prefill, a CPU bool tensor `[tt_max_batch_size]`, the step's `TTModelInput.intermediate_prefill_mask`: row `i` is True when its chunk ends before the request's last token, so the step samples no token for that row, and False when the chunk ends the request's prefill. Padding rows are True. |
 
 In this section, the **full state** of a request after `n` tokens means everything the request's next step needs in that layer: the recurrent state and the convolution history after its first `n` tokens. The `1 + K` blocks of `windows[i]` are the row's **window**.
 
@@ -118,9 +119,11 @@ These rules apply to every row of the step:
 - When a step's window moves past the request's earlier speculative blocks, `MambaManager` moves them to the end of the request's row, or keeps one in place as the block of a [prefill checkpoint](#prefill-checkpoints). `TTModelRunner`'s block-table row only grows, so it then lists a moved block at its old column too. `TTModelRunner` does not name a block at such an old column, so the model never sees it: a moved block is neither a checkpoint block nor a block the step passes unwritten. A window block that the row lists again at a later column is a bookkeeping fault, and `TTModelRunner` raises.
 - A padding row holds block 0 in every column of `windows` and in `start_blocks`.
 
+A model whose drafter starts from a prompt's last prefill chunk, for example a multi-token prediction head that needs the hidden state of the prompt's last token, starts it for the rows whose `intermediate_prefill_mask` entry is False. The prefill of a request resumed after preemption replays its generated tokens too, so its last chunk ends after them.
+
 #### Padding, zeroing and decode reload
 
-Padding rows have block 0, the null block, in every field. vLLM never allocates block 0 to a request, so the model can read or write block 0 without changing live state, and ignores the result. On the layer-slot overlay, padding rows can write their state into block 0, so block 0 can hold any bytes, including fp32 state that reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
+Padding rows have block 0, the null block, in every block field. vLLM never allocates block 0 to a request, so the model can read or write block 0 without changing live state, and ignores the result. On the layer-slot overlay, padding rows can write their state into block 0, so block 0 can hold any bytes, including fp32 state that reads as NaN or Inf in bf16. Attention must never read block 0 as live data.
 
 vLLM sends `new_block_ids_to_zero` whenever the cache has Mamba layers (`KVCacheConfig.needs_kv_cache_zeroing` in `vllm/v1/kv_cache_interface.py`). A block that held recurrent state can be reassigned to an attention group, and its stale bytes then read as NaN or Inf at positions attention does not write and masks. vLLM lists every block newly allocated to an attention group. `TTModelRunner` passes the whole list to the adapter's `zero_kv_cache_blocks` before the step; see [block operations](MODEL_LIFECYCLE.md#kv-cache-block-operations).
 
