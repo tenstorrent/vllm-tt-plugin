@@ -361,10 +361,18 @@ def _unresolved_layout_cache_config(block_size: int):
 
 
 @pytest.mark.parametrize(
-    ("batch", "in_flight", "expected"),
-    [(1, 1024, 32966), (32, 1024, 36904), (1, 512, 32902), (1, 4096, 33350)],
+    ("batch", "in_flight", "lookahead", "expected"),
+    [
+        (1, 1024, 0, 32966),
+        (32, 1024, 0, 36904),
+        (1, 512, 0, 32902),
+        (1, 4096, 0, 33350),
+        # Multi-module MTP lookahead: upstream keeps 3 extra tokens in each
+        # sliding window, one more block per sliding-window group.
+        (1, 1024, 4, 32970),
+    ],
 )
-def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
+def test_hybrid_pool_covers_upstream_admission(batch, in_flight, lookahead, expected):
     """Real upstream grouping/planning must admit the unchanged full context."""
     from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
     from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
@@ -386,7 +394,9 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
             max_num_seqs=batch, disable_hybrid_kv_cache_manager=False
         ),
         parallel_config=SimpleNamespace(
-            data_parallel_size=1, decode_context_parallel_size=1
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
         ),
         # As at init_device on vLLM 0.29+: the engine core resolves the KV
         # cache layout only afterwards, so the real config still raises here.
@@ -394,6 +404,7 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, expected):
         attention_config=SimpleNamespace(hisparse_config=None),
         additional_config={},
         speculative_config=None,
+        num_prefill_lookahead_tokens=lookahead,
         kv_transfer_config=None,
         max_in_flight_tokens=in_flight,
     )

@@ -357,9 +357,15 @@ class TTLaneCoordinator(SchedulerInterface):
         Shallow-copies ``vllm_config`` and its ``scheduler_config`` so the
         per-lane ``max_num_seqs`` override does not leak back onto the shared
         config the coordinator and model runner read for global sizing. All
-        lanes share this one view; the base scheduler only reads
-        ``max_num_seqs`` from it (to set ``max_num_running_reqs``), never
+        lanes share this one view; the base scheduler reads it and never
         mutates it.
+
+        ``max_num_active_seqs`` passes through unchanged because it is already
+        per-lane: only ``_convert_dp_to_lanes`` enters lane mode, so the user's
+        ``--max-num-seqs`` and ``--max-num-active-seqs`` are per-rank values,
+        and vLLM checks ``max_num_active_seqs <= max_num_seqs`` when it builds
+        ``SchedulerConfig``, before that conversion multiplies ``max_num_seqs``
+        by the lane count.
         """
         per_lane_vllm_config = copy.copy(vllm_config)
         per_lane_scheduler_config = copy.copy(vllm_config.scheduler_config)
@@ -374,7 +380,8 @@ class TTLaneCoordinator(SchedulerInterface):
     def _pick_lane(self) -> int:
         """Choose the least-loaded lane for a newly arriving request.
 
-        Scores each lane ``waiting * 4 + running`` and picks the lowest
+        Scores each lane ``waiting * 4 + running`` (both from vLLM's
+        ``Scheduler.get_request_counts``) and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
         load score vLLM uses to route requests across DP engines
         (``DPLBAsyncMPClient.get_core_engine_for_request`` in
@@ -393,7 +400,8 @@ class TTLaneCoordinator(SchedulerInterface):
         best_lane = 0
         best_score: int | None = None
         for lane, sched in enumerate(self.lanes):
-            score = len(sched.waiting) * 4 + len(sched.running)
+            num_running, num_waiting = sched.get_request_counts()
+            score = num_waiting * 4 + num_running
             if best_score is None or score < best_score:
                 best_score = score
                 best_lane = lane
@@ -410,12 +418,12 @@ class TTLaneCoordinator(SchedulerInterface):
         lane at capacity: it already holds one of those slots and only a
         prefill step can advance it.
 
-        ``skipped_waiting`` holds prefill requests blocked on grammar
-        compilation. We want to try to schedule them, because otherwise the
-        base scheduler won't revisit and promote them - decode intent hides
-        that queue.
+        A request blocked on grammar compilation still counts as waiting. We
+        want to try to schedule it, because only the base scheduler's prefill
+        loop checks whether the grammar is ready, and decode intent hides the
+        waiting queues from that loop.
         """
-        has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
+        has_waiting = sched.get_request_counts()[1] > 0
         has_running = bool(sched.running)
         has_partial_prefill = any(r.is_prefill_chunk for r in sched.running)
         has_capacity = len(sched.running) < self._per_lane_max

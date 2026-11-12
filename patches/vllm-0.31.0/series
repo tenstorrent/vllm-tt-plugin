@@ -1,0 +1,10 @@
+# The vLLM 0.31.0 patch stack, applied in this order by
+# patches/apply-vllm-patches.sh. See README.md.
+
+# Until vLLM 0.32: delete this line and until-0.32/ when the pin moves to 0.32.
+until-0.32/0001-mimo-parser-and-grammar.patch
+
+# Kept after 0.32 (rebase onto the new version).
+common/0001-schema-coercion.patch
+common/0002-truncated-tool-arguments.patch
+common/0003-xgrammar-pattern-search.patch

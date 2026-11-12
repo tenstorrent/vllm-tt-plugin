@@ -1,0 +1,392 @@
+JSON Schema pattern search semantics under xgrammar (mlc-ai/xgrammar#838).
+See README.md.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 64b5ca2..eedf195 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -243,6 +243,7 @@ if TYPE_CHECKING:
+     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
+     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
+     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
++    VLLM_XGRAMMAR_PATTERN_SEARCH: bool = True
+     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
+     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
+     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
+@@ -1806,6 +1807,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
+         os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
+     ),
++    # Rewrite JSON Schema `pattern` / `patternProperties` regexes before they
++    # reach xgrammar so they keep JSON Schema search semantics ("^x_" matches
++    # "x_signups"); xgrammar <= 0.2.9 compiles them as whole-string matches
++    # (mlc-ai/xgrammar#838). Applies to tool schemas in structural tags and to
++    # JSON-schema structured outputs on the xgrammar backend. Set to 0 to
++    # restore xgrammar's raw (anchored) behaviour.
++    "VLLM_XGRAMMAR_PATTERN_SEARCH": lambda: bool(
++        int(os.getenv("VLLM_XGRAMMAR_PATTERN_SEARCH", "1"))
++    ),
+     # Control the max chunk bytes (in MB) for the rpc message queue.
+     # Object larger than this threshold will be broadcast to worker
+     # processes via zmq.
+diff --git a/vllm/tool_parsers/structural_tag_registry.py b/vllm/tool_parsers/structural_tag_registry.py
+index 358d1f5..05c0f1e 100644
+--- a/vllm/tool_parsers/structural_tag_registry.py
++++ b/vllm/tool_parsers/structural_tag_registry.py
+@@ -30,10 +30,12 @@ from xgrammar.structural_tag import (
+     TriggeredTagsFormat,
+ )
+ 
++import vllm.envs as envs
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionNamedToolChoiceParam,
+     ChatCompletionToolsParam,
+ )
++from vllm.utils.json_schema_pattern import schema_with_search_patterns
+ from vllm.tool_parsers.tool_strict_level import ToolStrictLevel
+ 
+ ToolChoice: TypeAlias = (
+@@ -164,6 +166,8 @@ def get_model_structural_tag(
+         return None
+ 
+     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
++    if envs.VLLM_XGRAMMAR_PATTERN_SEARCH:
++        dumped_tools = _with_search_patterns(dumped_tools)
+     dumped_tool_choice = _dump_tool_choice_for_xgrammar(tool_choice)
+ 
+     if model in _VLLM_STRUCTURAL_TAG_REGISTRY:
+@@ -197,6 +201,25 @@ def get_model_structural_tag(
+     )
+ 
+ 
++def _with_search_patterns(dumped_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Give tool argument schemas JSON Schema ``pattern`` search semantics.
++
++    xgrammar compiles ``pattern`` / ``patternProperties`` as whole-string
++    matches (mlc-ai/xgrammar#838), so ``"^x_"`` would admit only the key
++    ``"x_"``. See :mod:`vllm.utils.json_schema_pattern`. Copies; never mutates
++    the request's tool schemas.
++    """
++    resolved = []
++    for tool in dumped_tools:
++        function = tool.get("function")
++        if isinstance(function, dict) and isinstance(function.get("parameters"), dict):
++            parameters = schema_with_search_patterns(function["parameters"])
++            if parameters is not function["parameters"]:
++                tool = {**tool, "function": {**function, "parameters": parameters}}
++        resolved.append(tool)
++    return resolved
++
++
+ def _dump_tool_for_xgrammar(
+     tool: ChatCompletionToolsParam | ResponsesTool,
+ ) -> dict[str, Any]:
+diff --git a/vllm/utils/json_schema_pattern.py b/vllm/utils/json_schema_pattern.py
+new file mode 100644
+index 0000000..0f91361
+--- /dev/null
++++ b/vllm/utils/json_schema_pattern.py
+@@ -0,0 +1,251 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Give JSON Schema ``pattern`` / ``patternProperties`` search semantics under
++xgrammar.
++
++JSON Schema (Draft 2020-12 sec. 6.3.3, ECMA-262 ``RegExp.test``) says a
++``pattern`` matches if the regex is found *anywhere* in the string, unless the
++pattern anchors itself. xgrammar (<= 0.2.9, mlc-ai/xgrammar#838, unmerged fix
++mlc-ai/xgrammar#925) compiles every ``pattern``, ``patternProperties`` key and
++``propertyNames.pattern`` as a whole-string match and silently drops ``^``/``$``.
++So ``"pattern": "^ab"`` rejects ``"abc"`` and ``patternProperties: {"^x_": ...}``
++admits only the literal key ``"x_"``; under constrained decoding the model is
++forced to truncate keys/values.
++
++:func:`search_regex_for_xgrammar` rewrites a regex ``p`` into a whole-string
++regex that accepts exactly the strings in which ``p`` is found (per top-level
++alternative: ``.*`` before unless the branch starts with ``^``, ``.*`` after
++unless it ends with an unescaped ``$``, the core kept in a non-capturing group,
++the result wrapped in a single ``^...$`` so that it is a fixed point). :func:`schema_with_search_patterns` applies it to every
++schema position of a JSON schema and returns a copy.
++
++The rewrite only ever widens the accepted set towards the JSON Schema
++semantics: whole-string matching of ``p`` is a subset of searching for ``p``.
++When the regex has anchors this module cannot place (inside groups, or not at a
++branch boundary) or does not parse, the pattern is returned unchanged, i.e. it
++keeps xgrammar's stricter full-match behaviour.
++
++Limitation (xgrammar): ``.`` in a JSON-string regex matches any character
++except ``"``, ``\\`` and control characters, and xgrammar 0.2.9 cannot express
++JSON escapes inside repeated groups, so the free text around the match cannot
++contain JSON escape sequences. In ``qwen_xml`` raw string parameters ``.``
++matches anything.
++"""
++
++import copy
++from typing import Any
++
++# Keywords whose value is a single subschema.
++_SCHEMA_KEYWORDS = (
++    "additionalItems",
++    "additionalProperties",
++    "contains",
++    "else",
++    "if",
++    "items",
++    "not",
++    "propertyNames",
++    "then",
++    "unevaluatedItems",
++    "unevaluatedProperties",
++)
++# Keywords whose value is a list of subschemas.
++_SCHEMA_LIST_KEYWORDS = ("allOf", "anyOf", "oneOf", "prefixItems", "items")
++# Keywords whose value maps names to subschemas.
++_SCHEMA_MAP_KEYWORDS = (
++    "$defs",
++    "definitions",
++    "dependentSchemas",
++    "properties",
++    "dependencies",
++)
++
++_WILDCARD = ".*"
++# xgrammar accepts an inline flag group only at the very start of the regex.
++_LEADING_FLAGS = ("(?i)",)
++
++
++class _Unsupported(Exception):
++    pass
++
++
++def _split_top_level(body: str) -> list[str]:
++    """Split ``body`` on top-level ``|``; validate anchors and nesting.
++
++    Raises :class:`_Unsupported` for unbalanced groups/classes, a trailing
++    backslash, or an anchor that is not at a top-level branch boundary.
++    """
++    branches: list[str] = []
++    depth = 0
++    in_class = False
++    start = 0
++    i = 0
++    n = len(body)
++    while i < n:
++        c = body[i]
++        if c == "\\":
++            if i + 1 >= n:
++                raise _Unsupported("trailing backslash")
++            i += 2
++            continue
++        if in_class:
++            if c == "]":
++                in_class = False
++        elif c == "[":
++            in_class = True
++            # ``[^`` negates; it is not an anchor.
++            if i + 1 < n and body[i + 1] == "^":
++                i += 1
++        elif c == "(":
++            depth += 1
++        elif c == ")":
++            depth -= 1
++            if depth < 0:
++                raise _Unsupported("unbalanced ')'")
++        elif c == "|" and depth == 0:
++            branches.append(body[start:i])
++            start = i + 1
++        elif c == "^":
++            if depth != 0 or i != start:
++                raise _Unsupported("'^' not at the start of a top-level branch")
++        elif c == "$":
++            at_branch_end = i + 1 == n or (depth == 0 and body[i + 1] == "|")
++            if depth != 0 or not at_branch_end:
++                raise _Unsupported("'$' not at the end of a top-level branch")
++        i += 1
++    if depth != 0 or in_class:
++        raise _Unsupported("unbalanced group or character class")
++    branches.append(body[start:])
++    return branches
++
++
++def _ends_with_unescaped(s: str, suffix: str) -> bool:
++    """Whether ``s`` ends with ``suffix`` whose first char is not escaped."""
++    if not s.endswith(suffix):
++        return False
++    backslashes = 0
++    j = len(s) - len(suffix) - 1
++    while j >= 0 and s[j] == "\\":
++        backslashes += 1
++        j -= 1
++    return backslashes % 2 == 0
++
++
++def _search_branch(branch: str) -> tuple[str, bool]:
++    """Rewrite one top-level branch; return (regex, was_fully_anchored)."""
++    anchored_start = branch.startswith("^")
++    core = branch[1:] if anchored_start else branch
++    # The splitter guarantees a ``$`` here is an unescaped anchor unless it is
++    # preceded by an odd number of backslashes.
++    anchored_end = _ends_with_unescaped(core, "$")
++    if anchored_end:
++        core = core[:-1]
++    if anchored_start and anchored_end:
++        return f"(?:{core})", True
++
++    prefix = "" if anchored_start else _WILDCARD
++    suffix = "" if anchored_end else _WILDCARD
++    # Avoid stacking ``.*`` on a core that already starts/ends with an
++    # unescaped ``.*`` (and is not lazy/possessive there).
++    if prefix and core.startswith(_WILDCARD) and not core.startswith(".*?"):
++        prefix = ""
++    if suffix and _ends_with_unescaped(core, _WILDCARD):
++        suffix = ""
++    if not core:
++        return _WILDCARD if (prefix or suffix) else "", False
++    return f"{prefix}(?:{core}){suffix}", False
++
++
++def search_regex_for_xgrammar(pattern: str) -> str:
++    """Rewrite a JSON Schema regex (search semantics) for xgrammar (full match).
++
++    Returns ``pattern`` unchanged when it is already whole-string (every
++    top-level branch is ``^...$``) or when it cannot be rewritten safely.
++    """
++    if not isinstance(pattern, str):
++        return pattern
++    flags = ""
++    body = pattern
++    for flag in _LEADING_FLAGS:
++        if body.startswith(flag):
++            flags, body = flag, body[len(flag) :]
++            break
++    try:
++        branches = _split_top_level(body)
++    except _Unsupported:
++        return pattern
++    rewritten = [_search_branch(b) for b in branches]
++    if all(full for _, full in rewritten):
++        return pattern
++    regexes = [r for r, _ in rewritten]
++    if _WILDCARD in regexes:
++        # A branch that matches everything makes the whole pattern do so.
++        body = _WILDCARD
++    elif len(regexes) == 1:
++        body = regexes[0]
++    else:
++        body = "(?:" + "|".join(regexes) + ")"
++    # One explicit ^...$ pair around the whole regex: xgrammar matches whole
++    # strings anyway (and warns about per-branch anchors), and a fully anchored
++    # result is a fixed point, so rewriting twice can never widen it.
++    return f"{flags}^{body}$"
++
++
++def _rewrite_schema_in_place(schema: Any) -> None:
++    if not isinstance(schema, dict):
++        return
++    pattern = schema.get("pattern")
++    if isinstance(pattern, str):
++        schema["pattern"] = search_regex_for_xgrammar(pattern)
++
++    pattern_props = schema.get("patternProperties")
++    if isinstance(pattern_props, dict):
++        new_props: dict[str, Any] = {}
++        for key, sub in pattern_props.items():
++            _rewrite_schema_in_place(sub)
++            new_key = search_regex_for_xgrammar(key)
++            if new_key in new_props:
++                # Two keys that are equivalent under search semantics: a
++                # matching name must satisfy both value schemas.
++                new_props[new_key] = {"allOf": [new_props[new_key], sub]}
++            else:
++                new_props[new_key] = sub
++        schema["patternProperties"] = new_props
++
++    for kw in _SCHEMA_KEYWORDS:
++        if isinstance(schema.get(kw), dict):
++            _rewrite_schema_in_place(schema[kw])
++    for kw in _SCHEMA_LIST_KEYWORDS:
++        if isinstance(schema.get(kw), list):
++            for sub in schema[kw]:
++                _rewrite_schema_in_place(sub)
++    for kw in _SCHEMA_MAP_KEYWORDS:
++        if isinstance(schema.get(kw), dict):
++            for sub in schema[kw].values():
++                # ``dependencies`` values may be lists of names; skipped.
++                _rewrite_schema_in_place(sub)
++
++
++def _has_pattern_keyword(obj: Any) -> bool:
++    """Cheap pre-check so schemas without patterns are returned as-is."""
++    if isinstance(obj, dict):
++        if "pattern" in obj or "patternProperties" in obj:
++            return True
++        return any(_has_pattern_keyword(v) for v in obj.values())
++    if isinstance(obj, list):
++        return any(_has_pattern_keyword(v) for v in obj)
++    return False
++
++
++def schema_with_search_patterns(schema: Any) -> Any:
++    """Return ``schema`` with every regex rewritten for xgrammar.
++
++    The input is never mutated. Schemas without ``pattern`` /
++    ``patternProperties`` (and non-dict schemas such as ``True``) are returned
++    as the same object.
++    """
++    if not isinstance(schema, dict) or not _has_pattern_keyword(schema):
++        return schema
++    copied = copy.deepcopy(schema)
++    _rewrite_schema_in_place(copied)
++    return copied
+diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
+index 5d2c2a4..0f47c49 100644
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -12,6 +12,7 @@ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.sampling_params import SamplingParams
+ from vllm.utils.import_utils import LazyLoader
++from vllm.utils.json_schema_pattern import schema_with_search_patterns
+ from vllm.utils.mistral import is_mistral_tokenizer
+ from vllm.v1.structured_output.backend_types import (
+     StructuredOutputBackend,
+@@ -83,7 +84,8 @@ class XgrammarBackend(StructuredOutputBackend):
+     ) -> StructuredOutputGrammar:
+         if request_type == StructuredOutputOptions.JSON:
+             ctx = self.compiler.compile_json_schema(
+-                grammar_spec, any_whitespace=not self.disable_any_whitespace
++                _with_search_patterns(grammar_spec),
++                any_whitespace=not self.disable_any_whitespace,
+             )
+         elif request_type == StructuredOutputOptions.JSON_OBJECT:
+             ctx = self.compiler.compile_json_schema(
+@@ -238,6 +240,20 @@ STRING_SUPPORTED_FORMATS = {
+ }
+ 
+ 
++def _with_search_patterns(json_schema: str) -> str:
++    """Rewrite ``pattern`` / ``patternProperties`` for JSON Schema search
++    semantics; xgrammar compiles them as whole-string matches
++    (mlc-ai/xgrammar#838). See :mod:`vllm.utils.json_schema_pattern`."""
++    if not vllm.envs.VLLM_XGRAMMAR_PATTERN_SEARCH or "pattern" not in json_schema:
++        return json_schema
++    try:
++        schema = json.loads(json_schema)
++    except (TypeError, ValueError):
++        return json_schema
++    rewritten = schema_with_search_patterns(schema)
++    return json_schema if rewritten is schema else json.dumps(rewritten)
++
++
+ def _has_pattern_and_length_bounds(schema: dict[str, Any]) -> bool:
+     return ("pattern" in schema or "format" in schema) and (
+         "minLength" in schema or "maxLength" in schema
+@@ -398,6 +414,8 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
+             )
+ 
+         try:
++            if vllm.envs.VLLM_XGRAMMAR_PATTERN_SEARCH:
++                schema = schema_with_search_patterns(schema)
+             xgr.Grammar.from_json_schema(schema)
+         except Exception as err:
+             raise VLLMValidationError(
