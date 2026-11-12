@@ -748,8 +748,9 @@ def _mamba_hybrid_num_blocks(
     would ignore that padding.
 
     On top of that come one block per running request in every attention
-    group, for the output reservation, and the blocks every running request
-    holds in each Mamba group, which the token budget does not count.
+    group, for the output reservation, the blocks every running request
+    holds in each Mamba group, which the token budget does not count, and
+    vLLM's null block 0, which BlockPool keeps out of every request.
 
     The pool stays within that budget. When it cannot admit one request at
     ``max_model_len``, this raises; the sliding-window path instead grows its
@@ -782,7 +783,10 @@ def _mamba_hybrid_num_blocks(
         for g in groups
         if isinstance(g.kv_cache_spec, MambaSpec)
     )
-    num_tt_blocks = attention_blocks + output_reservation_blocks + mamba_blocks
+    null_block = 1
+    num_tt_blocks = (
+        attention_blocks + output_reservation_blocks + mamba_blocks + null_block
+    )
     if getattr(model_config, "original_max_model_len", None) == -1:
         return num_tt_blocks
     admission_floor = (

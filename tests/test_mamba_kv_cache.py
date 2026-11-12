@@ -215,13 +215,13 @@ def _runner(cfg, model=None) -> TTModelRunner:
     [
         # Unified page = the 1 MiB attention page; the GDN page is padded to
         # it. 131072 tokens * 1024 B / 1 MiB = 128 blocks, plus one output
-        # block per request (32) and one state block per request in each of
-        # the three GDN groups (96).
-        (1024, 128 + 32 + 96),
+        # block per request (32), one state block per request in each of
+        # the three GDN groups (96) and the null block.
+        (1024, 128 + 32 + 96 + 1),
         # A 64-token attention page (64 KiB) does not divide the 801,792 B GDN
         # page, so vLLM pads the attention page to it: each block costs
         # 801,792 B per layer slot. ceil(131072 * 1024 / 801792) = 168.
-        (64, 168 + 32 + 96),
+        (64, 168 + 32 + 96 + 1),
     ],
 )
 def test_mamba_pool_is_sized_from_bytes_per_layer_slot(
@@ -256,23 +256,25 @@ def test_mamba_pool_is_sized_from_bytes_per_layer_slot(
 def test_mamba_pool_below_one_full_length_request_fails_at_startup():
     """A model budget that cannot admit one max_model_len request is rejected.
 
-    The budget gives 1 attention block, 1 output block and 3 state blocks. One
-    request needs ceil(20000 / 1024) = 20 attention blocks, one state block in
-    each GDN group and the null block, plus the output block: 25. The pool is
-    not grown past the budget, as it is for sliding-window models.
+    The budget gives 1 attention block, 1 output block, 3 state blocks and the
+    null block. One request needs ceil(20000 / 1024) = 20 attention blocks,
+    one state block in each GDN group and the null block, plus the output
+    block: 25. The pool is not grown past the budget, as it is for
+    sliding-window models.
     """
     cfg = _vllm_config()
     cfg.scheduler_config.max_num_seqs = 1
     specs = _layer_specs()
 
-    with pytest.raises(ValueError, match="holds 5 blocks.*needs 25 blocks"):
+    with pytest.raises(ValueError, match="holds 6 blocks.*needs 25 blocks"):
         _num_blocks(cfg, specs, 1024)
 
-    # A budget of 21 blocks plus the output and state blocks admits it.
-    assert _num_blocks(cfg, specs, 21 * BLOCK_SIZE) == 21 + 1 + 3
+    # A budget of exactly one request at max_model_len (20 blocks) admits it:
+    # the pool adds the output, state and null blocks.
+    assert _num_blocks(cfg, specs, 20 * BLOCK_SIZE) == 20 + 1 + 3 + 1
     # --max-model-len -1 keeps the budget; vLLM fits the length to the pool.
     cfg.model_config.original_max_model_len = -1
-    assert _num_blocks(cfg, specs, 1024) == 5
+    assert _num_blocks(cfg, specs, 1024) == 6
 
 
 @pytest.mark.parametrize(
