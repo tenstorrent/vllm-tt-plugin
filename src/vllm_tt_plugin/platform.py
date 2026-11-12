@@ -309,6 +309,75 @@ def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
     )
 
 
+def _resolve_mamba_multimodal_launch(
+    vllm_config: "VllmConfig", model_class: type
+) -> bool:
+    """Serve multimodal input to a ``MambaSpec`` model without prefix caching
+    or chunked prefill. Returns whether the model declares ``MambaSpec`` layers.
+
+    A model that keeps recurrent state in ``MambaSpec`` blocks cannot continue
+    a multimodal prompt yet, and a prefix-cache hit or a prefill chunk starts
+    a prompt's computation in its middle. For a launch that accepts multimodal
+    input, this turns both features off, as the platform does for a model that
+    declares neither ``supports_prefix_caching`` nor
+    ``supports_chunked_prefill``; a text-only launch keeps them. Runs before
+    ``_apply_chunked_prefill_policy``.
+
+    The model class's ``get_kv_cache_spec`` runs only for an architecture for
+    which vLLM resolved a Mamba cache config (``cache_config.mamba_block_size``),
+    so other models keep their behavior; ``check_mamba_launch`` rejects a
+    multimodal launch of any other ``MambaSpec`` model that still has either
+    feature on.
+    """
+    from vllm_tt_plugin.mamba_state import declares_mamba_spec
+
+    cache_config = vllm_config.cache_config
+    if getattr(cache_config, "mamba_block_size", None) is None:
+        return False
+    if not declares_mamba_spec(model_class, vllm_config):
+        return False
+    model_config = vllm_config.model_config
+    if not (
+        model_config.is_multimodal_model and model_config.supports_multimodal_inputs
+    ):
+        return True
+    scheduler_config = vllm_config.scheduler_config
+    if cache_config.enable_prefix_caching or scheduler_config.enable_chunked_prefill:
+        logger.warning(
+            "%s keeps recurrent state in MambaSpec blocks, and continuing a "
+            "multimodal prompt of a recurrent-state model is not supported yet. "
+            "This launch accepts multimodal input, so prefix caching and "
+            "chunked prefill are disabled; launch with --language-model-only to "
+            "keep them for text-only serving.",
+            model_class.__name__,
+        )
+    if cache_config.enable_prefix_caching:
+        cache_config.enable_prefix_caching = False
+        _renormalize_mamba_cache_config(vllm_config)
+    _disable_chunked_prefill(
+        vllm_config, f"{model_class.__name__} with multimodal input"
+    )
+    return True
+
+
+def _allow_chunked_mm_input_in_mamba_align(vllm_config: "VllmConfig") -> None:
+    """Clear ``disable_chunked_mm_input`` for a ``MambaSpec`` model in mode align.
+
+    ``VllmConfig.validate_block_size`` rejects ``disable_chunked_mm_input`` in
+    ``mamba_cache_mode`` "align", because vLLM's roll-back to the start of a
+    multimodal item would undo its block-aligned split.
+    ``_apply_chunked_prefill_policy`` sets the flag for every model with
+    chunked prefill, where it acts only on multimodal items.
+    ``_resolve_mamba_multimodal_launch`` turned prefix caching off for every
+    multimodal launch of a ``MambaSpec`` model, so a launch still in mode
+    "align" here is text-only and the flag has nothing to act on. Must run
+    after prefix caching is resolved: turning prefix caching off resets the
+    mode to "none".
+    """
+    if getattr(vllm_config.cache_config, "mamba_cache_mode", None) == "align":
+        vllm_config.scheduler_config.disable_chunked_mm_input = False
+
+
 def _galaxy_generator_version() -> str | None:
     """Return the active Galaxy-generator model version, or None.
 
@@ -2042,6 +2111,7 @@ class TTPlatform(Platform):
             model_class, "model_capabilities", None
         )
 
+        declares_mamba_spec = _resolve_mamba_multimodal_launch(vllm_config, model_class)
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
@@ -2215,6 +2285,8 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+        if declares_mamba_spec:
+            _allow_chunked_mm_input_in_mamba_align(vllm_config)
 
         if is_block_output_model:
             required_lifecycle_hooks = (

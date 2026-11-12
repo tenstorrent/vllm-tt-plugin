@@ -68,8 +68,10 @@ that request's state.
 An adapter with `MambaSpec` groups keeps each request's recurrent state in vLLM blocks, not in device-state slots, and `TTModelRunner` addresses those blocks per row in every step through `mamba_state` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). So:
 
 - Row movement needs no state gather: a moved row's `mamba_state` names the same blocks as before. `slot_remap` and `note_state_slots_moved` still apply to any slot-owned state the adapter keeps.
-- Completion and cancellation need no release: vLLM frees the request's blocks, and the next owner of a block starts from zero state or from state it writes itself.
-- A preempted request loses its blocks. vLLM schedules its resume as a prefill from `start_pos` 0 over its prompt and generated tokens, so the adapter rebuilds the state from zero state, not from a block.
+- Completion and cancellation need no release: vLLM frees the request's blocks, and the next owner of a block starts from zero state, from state it writes itself, or, in `mamba_cache_mode` `align`, from a block vLLM kept in the prefix cache.
+- A preempted request loses its blocks. vLLM schedules its resume as a prefill over its prompt and generated tokens: from `start_pos` 0 without a prefix-cache hit, so the adapter rebuilds the state from zero state, or from the state of a prefix-cache hit.
+
+In `mamba_cache_mode` `align` (prefix caching on), vLLM's prefix cache also covers recurrent state. When a request's computation reaches a position whose state vLLM keeps, vLLM registers the block that holds the state after exactly that many tokens. With `prefix_cache_retention_interval` 0, the only value TT supports, vLLM keeps what its `CacheConfig` documentation calls semantic checkpoints, including the replay boundary of a prompt (its last cacheable position) and shared-prefix junctions. A later request whose tokens start with the same tokens gets a **prefix-cache hit**: vLLM schedules it from `start_pos` equal to the hit length and puts the kept block into the request's block-table column for that length, so `mamba_state.start_blocks` names it. The kept block can be the start block of several requests at once and must stay unchanged; vLLM reuses it only after no request holds it and it is evicted from the prefix cache. A hit is shorter than the request's tokens and ends at a block boundary: vLLM ends hits on multiples of `prefix_match_unit`, which TT requires to be the block size for a model with `MambaSpec` groups, because such a model resumes a prefill only at the start of a KV block.
 
 Lane-DP uses scheduler-owned stable slots, and a request's row is its slot
 for its whole life. `TTLaneInputBatch.apply_step_plan` calls `release_request`
@@ -117,9 +119,9 @@ vLLM can ask the worker to change KV cache blocks before a step's forward. The a
 
 `kv_cache` is the object the adapter's KV allocator returned. Enqueue the zeroing on the device before the step's forward, so the forward reads zeroes. `TTModelRunner` does not wait for the operation to complete: the hook can return after it enqueues the work, and the adapter must order it before every later device read or write of the same blocks, including the step's forward. An adapter with `MambaSpec` groups must implement `zero_kv_cache_blocks`; `TTModelRunner.initialize_kv_cache` raises otherwise. For an adapter without `MambaSpec` groups, `TTModelRunner` does not call the hook.
 
-vLLM also sends `SchedulerOutput.kv_cache_block_copies`, but queues copies only for prefix-cache hits. Prefix caching stays off with `MambaSpec` groups, so `TTModelRunner` raises if a copy reaches an adapter with `MambaSpec` groups.
+vLLM also sends `SchedulerOutput.kv_cache_block_copies`, but queues copy-on-write copies only for a prefix-cache hit that ends inside a block. Mode `none` has no prefix caching. In mode `align` such a hit needs a `prefix_match_unit` below the block size, which `TTScheduler` rejects for a model with `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)). So the adapter has no copy hook, and `TTModelRunner` raises, printing the copies, if a copy reaches an adapter with `MambaSpec` groups. A step whose tokens cross into a new block-table column needs no copy either: the adapter reads `start_blocks` and writes `windows` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)).
 
-Sources: `_zero_new_kv_cache_blocks` and `initialize_kv_cache` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
+Sources: `_zero_new_kv_cache_blocks` and `initialize_kv_cache` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py); `MambaCacheGroups.refuse_block_copies` in [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
 
 ## Shutdown
 

@@ -52,6 +52,7 @@ def _decode_input(
         perform_device_sampling=device_sampling,
         decode_layout_changed=layout_changed,
         block_tables_per_group=[torch.tensor([[page, 0]], dtype=torch.int32)],
+        mamba_state=None,
         # A verify can never use resident inputs: its candidate block is
         # assembled from this step's drafts. Default None, so every test here
         # is about the plain decode unless it says otherwise.
@@ -219,6 +220,41 @@ def test_page_table_only_refresh_is_overlap_safe():
     assert not plan.reload_inputs
     assert plan.reload_page_table
     assert plan.overlap_safe
+
+
+def test_a_mamba_state_change_alone_reloads_the_page_tables():
+    """``mamba_state`` is a page-table input.
+
+    In mamba_cache_mode ``align`` a decode that crosses into a new block-table
+    column reads its start state from the old column's block and writes the
+    new one. On the next decode the start block is the new one, while the
+    block tables are the same as before: the model must still reload.
+    """
+    from vllm_tt_plugin.mamba_state import MambaGroupState, MambaStepState
+
+    def with_state(start: int):
+        model_input = _decode_input(page=7)
+        model_input.mamba_state = MambaStepState(
+            groups=(
+                MambaGroupState(
+                    layer_names=("model.layers.0.linear_attn",),
+                    windows=torch.tensor([[12]], dtype=torch.int32),
+                    start_blocks=torch.tensor([start], dtype=torch.int32),
+                ),
+            )
+        )
+        return model_input
+
+    controller = _controller()
+    _commit(controller, with_state(start=11))
+
+    plan = _commit(controller, with_state(start=12))
+    assert not plan.reload_inputs
+    assert plan.reload_page_table
+
+    steady = _commit(controller, with_state(start=12))
+    assert not steady.reload_inputs
+    assert not steady.reload_page_table
 
 
 def test_a_verify_always_reloads_its_inputs():
@@ -637,6 +673,7 @@ def test_v0_preserves_host_to_device_overlap_predicate():
         bad_words_token_ids_list=[{}],
         max_num_logprobs=[None],
         block_tables_per_group=[torch.zeros((1, 1), dtype=torch.int32)],
+        mamba_state=None,
     )
 
     v0 = TTAsyncDecodeController(

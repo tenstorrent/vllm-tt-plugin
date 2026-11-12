@@ -401,10 +401,23 @@ class TTAsyncDecodeController:
         self._verify_submissions = 0
 
     @staticmethod
-    def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
-        return tuple(
-            table.detach().clone() for table in model_input.block_tables_per_group
-        )
+    def _page_table_inputs(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
+        """The page-table inputs of a decode, compared across decodes.
+
+        ``mamba_state`` counts as a page-table input: in mamba_cache_mode
+        ``align`` a row's start block moves to its new block-table column on
+        the step after the one that crossed into it, while the block tables
+        stay the same.
+        """
+        tables = list(model_input.block_tables_per_group)
+        if model_input.mamba_state is not None:
+            for group in model_input.mamba_state.groups:
+                tables += [group.windows, group.start_blocks]
+        return tuple(tables)
+
+    @classmethod
+    def _clone_page_tables(cls, model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
+        return tuple(t.detach().clone() for t in cls._page_table_inputs(model_input))
 
     def note_prefill_submitted(self) -> None:
         """Invalidate decode-resident token/position state after prefill."""
@@ -415,7 +428,7 @@ class TTAsyncDecodeController:
         return int(getattr(self.runner.model, "decode_input_update_contract", 0))
 
     def _page_tables_changed(self, model_input: TTModelInput) -> bool:
-        current = model_input.block_tables_per_group
+        current = self._page_table_inputs(model_input)
         previous = self._submitted_page_tables
         return (
             previous is None

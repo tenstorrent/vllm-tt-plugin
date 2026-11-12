@@ -103,6 +103,7 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
             max_num_batched_tokens=MAX_MODEL_LEN,
             disable_hybrid_kv_cache_manager=False,
             async_scheduling=False,
+            enable_chunked_prefill=True,
         ),
         lora_config=None,
         load_config=None,
@@ -118,7 +119,7 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
             block_size=64,
             num_gpu_blocks_override=None,
             kv_cache_layout=KVCacheLayout.LBNHC.name,
-            prefix_cache_retention_interval=None,
+            prefix_cache_retention_interval=0,
             mamba_cache_mode=mamba_cache_mode,
             enable_prefix_caching=mamba_cache_mode != "none",
         ),
@@ -280,20 +281,33 @@ def test_mamba_pool_below_one_full_length_request_fails_at_startup():
 @pytest.mark.parametrize(
     ("unsupported", "match"),
     [
-        ("prefix_caching", "launch with --no-enable-prefix-caching"),
         ("speculative", "launch without --speculative-config"),
         ("lane_dp", "lane-DP"),
         ("block_output", "Block-output models"),
+        ("cache_mode_all", r"mamba_cache_mode='all' is not supported"),
+        (
+            "retention_interval",
+            "prefix_cache_retention_interval=4096 is not supported",
+        ),
+        ("dense_retention", "prefix_cache_retention_interval=None is not supported"),
+        ("no_chunked_prefill", "needs chunked prefill"),
+        ("align_block_size", r"differs from the attention block sizes \[64\]"),
+        ("multimodal", "cannot continue a multimodal prompt yet"),
     ],
 )
 def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, match):
     """The worker sizes the pool before it loads the model and rejects there.
 
-    Prefix caching resolves ``mamba_cache_mode`` to ``align``, speculative
-    decoding needs speculative state blocks, and lane-DP and block-output
-    execution have no MambaSpec path.
+    Speculative decoding needs speculative state blocks, lane-DP and
+    block-output execution have no MambaSpec path, and mode ``all`` keeps a
+    state block per block of tokens. In mode ``align``: a nonzero retention
+    interval keeps decode-reached block boundaries, which TT has not
+    validated; vLLM ends prefill chunks on block boundaries, which a model
+    without chunked prefill cannot take; and a Mamba block-table column must
+    cover the tokens of an attention one.
     """
-    mode = "align" if unsupported == "prefix_caching" else "none"
+    mode = "none"
+    specs = _layer_specs()
     cfg = _vllm_config(mode)
     if unsupported == "speculative":
         cfg.speculative_config = SimpleNamespace(num_speculative_tokens=3)
@@ -301,9 +315,44 @@ def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, mat
         store_tt_lane_count(cfg, 2)
     elif unsupported == "block_output":
         store_tt_output_tokens_per_step(cfg, 4)
+    elif unsupported == "multimodal":
+        # Chunked prefill on with multimodal input, which the platform turns
+        # off only when vLLM resolved a Mamba cache config.
+        cfg.model_config.is_multimodal_model = True
+        cfg.model_config.supports_multimodal_inputs = True
+    elif unsupported == "cache_mode_all":
+        cfg = _vllm_config("all")
+        specs = _layer_specs(mamba_cache_mode="all", block_size=BLOCK_SIZE)
+    else:
+        cfg = _vllm_config("align")
+        specs = _layer_specs(mamba_cache_mode="align")
+        if unsupported == "retention_interval":
+            cfg.cache_config.prefix_cache_retention_interval = 4096
+        elif unsupported == "dense_retention":
+            cfg.cache_config.prefix_cache_retention_interval = None
+        elif unsupported == "no_chunked_prefill":
+            cfg.scheduler_config.enable_chunked_prefill = False
+        elif unsupported == "align_block_size":
+            specs = _layer_specs(64, mamba_cache_mode="align")
 
     with pytest.raises(ValueError, match=match):
-        _num_blocks(cfg, _layer_specs(mamba_cache_mode=mode), 131_072)
+        _num_blocks(cfg, specs, 131_072)
+
+
+def test_align_pool_counts_two_state_blocks_per_request_and_group():
+    """In mode ``align`` a request holds its running state block and, until
+    vLLM retires it, the block of its previous column in every GDN group
+    (``MambaSpec.max_memory_usage_bytes``). Both groups use 1024-token blocks.
+    """
+    cfg = _vllm_config("align")
+    cfg.model_config.max_model_len = 8192
+
+    blocks = _num_blocks(cfg, _layer_specs(mamba_cache_mode="align"), 131_072)
+
+    # 128 attention blocks, one output block per request (32), two state
+    # blocks per request in each of the three GDN groups (192) and the null
+    # block.
+    assert blocks == 128 + 32 + 192 + 1
 
 
 # endregion
@@ -386,8 +435,11 @@ def test_attention_only_page_table_width_is_unchanged():
 @pytest.mark.parametrize(
     ("mamba_kwargs", "match"),
     [
-        (dict(num_speculative_blocks=1), "neither speculative nor prefill"),
-        (dict(num_prefill_checkpoint_blocks=1), "neither speculative nor prefill"),
+        (dict(num_speculative_blocks=1), "no speculative state blocks"),
+        (
+            dict(num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=64),
+            "prefill checkpoints need mode 'align'",
+        ),
         # MambaManager would hold one state block per 1024 tokens.
         (dict(block_size=BLOCK_SIZE), "below max_model_len"),
         (dict(mamba_cache_mode="align"), "must use the resolved cache mode"),
@@ -466,9 +518,12 @@ def test_state_blocks_match_upstream_selection():
         group_indices=(0, 1),
         layer_names=(("model.layers.0.linear_attn",), ("model.layers.1.linear_attn",)),
         attention_group_index=2,
+        mamba_cache_mode="none",
+        block_size=MAX_MODEL_LEN,
     )
+    computed, scheduled = [0, 1000, 19_999], [1, 24, 1]
 
-    state = groups.step_state(tables, ["a", "b", "c"], num_rows=6)
+    state = groups.step_state(tables, ["a", "b", "c"], computed, scheduled, num_rows=6)
 
     seq_lens = torch.tensor([1, 1024, 20_000, 0])
     for g, group in enumerate(state.groups):
@@ -477,10 +532,160 @@ def test_state_blocks_match_upstream_selection():
         assert group.windows.shape == (6, 1)
         assert group.windows[:3, 0].tolist() == upstream[:3, 0].tolist()
         assert group.windows[3:, 0].tolist() == [0, 0, 0]
+        # The request's one block holds its start state too; a row at
+        # position 0 has none.
+        assert group.start_blocks.shape == (6,)
+        assert group.start_blocks.tolist() == [0, *upstream[1:3, 0].tolist(), 0, 0, 0]
     # A scheduled row without a state block is a bookkeeping fault.
     tables[1][2, 0] = 0
-    with pytest.raises(RuntimeError, match=r"requests \['c'\] have no state block"):
-        groups.step_state(tables, ["a", "b", "c"], num_rows=6)
+    with pytest.raises(RuntimeError, match="request c has no state block"):
+        groups.step_state(tables, ["a", "b", "c"], computed, scheduled, num_rows=6)
+
+
+def _align_groups(num_groups=1, alignment=None):
+    from vllm_tt_plugin.mamba_state import MambaCacheGroups
+
+    return MambaCacheGroups(
+        group_indices=tuple(range(num_groups)),
+        layer_names=tuple(
+            (f"model.layers.{g}.linear_attn",) for g in range(num_groups)
+        ),
+        attention_group_index=num_groups,
+        mamba_cache_mode="align",
+        block_size=BLOCK_SIZE,
+        prefill_checkpoint_alignment=alignment,
+    )
+
+
+@pytest.mark.parametrize(
+    ("computed", "scheduled", "row", "start", "dest"),
+    [
+        # A new request: no start state, the running state of 2500 tokens in
+        # column 2. vLLM leaves block 0 in the columns the step passes.
+        (0, 2500, [0, 0, 30], 0, 30),
+        # A prefix hit on the state after 2048 tokens in column 1: read it,
+        # write the state after 2500 tokens into column 2.
+        (2048, 452, [0, 21, 30], 21, 30),
+        # A hit on the state after 2048 tokens, with a chunk that passes the
+        # 3072 boundary: column 2 stays the null block.
+        (2048, 2048, [0, 21, 0, 40], 21, 40),
+        # Decode inside column 2: the running block updated in place.
+        (2600, 1, [0, 21, 30], 30, 30),
+        # The decode that crosses into column 3 reads column 2's block.
+        (3072, 1, [0, 0, 30, 40], 30, 40),
+        # And the one after it reads the block it wrote.
+        (3073, 1, [0, 0, 30, 40], 40, 40),
+    ],
+)
+def test_align_mode_reads_the_previous_column_and_writes_the_running_one(
+    computed, scheduled, row, start, dest
+):
+    """In mode ``align`` the start state is the running state of the
+    request's previous step, in column ``(computed - 1) // block_size``, and
+    the end state goes to column ``(computed + scheduled - 1) // block_size``.
+    Upstream ``mamba_get_block_table_tensor`` selects the same destination;
+    upstream ``preprocess_mamba`` copies the start state there first, the TT
+    runner names both blocks instead."""
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    table = torch.zeros((1, 24), dtype=torch.int32)
+    table[0, : len(row)] = torch.tensor(row, dtype=torch.int32)
+
+    state = _align_groups().step_state(
+        [table, table], ["a"], [computed], [scheduled], num_rows=2
+    )
+
+    [group] = state.groups
+    assert group.windows[:, 0].tolist() == [dest, 0]
+    assert group.start_blocks.tolist() == [start, 0]
+    spec = _layer_specs(mamba_cache_mode="align")["model.layers.0.linear_attn"]
+    upstream = mamba_get_block_table_tensor(
+        table, torch.tensor([computed + scheduled]), spec, "align"
+    )
+    assert upstream[0, 0] == dest
+
+
+@pytest.mark.parametrize(
+    ("computed", "scheduled", "row", "match"),
+    [
+        (2048, 452, [0, 0, 30], "holds the null block 0 instead of its start"),
+        (0, 2500, [0, 21, 30], "that the model does not write"),
+        (2048, 2048, [0, 21, 0, 0], "request a has no state block"),
+        (0, 30_000, [5], "need state block-table columns"),
+    ],
+)
+def test_align_mode_rejects_rows_vllm_did_not_allocate_as_expected(
+    computed, scheduled, row, match
+):
+    """A missing start block, a block in a column the step passes without
+    writing it, a missing destination block and a column past the table all
+    fail before the forward."""
+    table = torch.zeros((1, 24), dtype=torch.int32)
+    table[0, : len(row)] = torch.tensor(row, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match=match):
+        _align_groups().step_state(
+            [table, table], ["a"], [computed], [scheduled], num_rows=1
+        )
+
+
+def _table(row) -> torch.Tensor:
+    table = torch.zeros((1, 24), dtype=torch.int32)
+    table[0, : len(row)] = torch.tensor(row, dtype=torch.int32)
+    return table
+
+
+@pytest.mark.parametrize(
+    ("computed", "scheduled", "row", "checkpoint"),
+    [
+        # One unchunked prefill of 2500 tokens: vLLM reserves column 1 for the
+        # state after 2048 tokens, the prompt's last block boundary.
+        (0, 2500, [0, 21, 30], (2048, 21)),
+        # After a prefix hit on 2048 tokens, a prompt of 4000: the state after
+        # 3072 tokens in column 2.
+        (2048, 1952, [0, 11, 21, 30], (3072, 21)),
+        # vLLM declined the checkpoint (a chunk that does not reach the end of
+        # the prefill): the column holds the null block, and the row writes
+        # none.
+        (0, 2500, [0, 0, 30], None),
+        # The rule allows none: the chunk starts one block below its end.
+        (2048, 452, [0, 11, 30], None),
+    ],
+)
+def test_prefill_checkpoints_follow_vllms_rule_and_its_reservation(
+    computed, scheduled, row, checkpoint
+):
+    """A row writes a checkpoint where vLLM's rule
+    (``compute_mamba_prefill_checkpoints``) places one and vLLM reserved its
+    block; the state inputs carry no checkpoint fields otherwise."""
+    groups = _align_groups(2, alignment=64)
+    tables = [_table(row), _table([b + 100 if b else 0 for b in row])]
+
+    state = groups.step_state(tables, ["a"], [computed], [scheduled], num_rows=2)
+
+    if checkpoint is None:
+        assert state.checkpoint_positions is None
+        assert [g.checkpoint_blocks for g in state.groups] == [None, None]
+        return
+    position, block = checkpoint
+    assert state.checkpoint_positions.tolist() == [[position], [0]]
+    assert [g.checkpoint_blocks.tolist() for g in state.groups] == [
+        [[block], [0]],
+        [[block + 100], [0]],
+    ]
+
+
+def test_prefill_checkpoint_blocks_vllm_reserved_unlike_the_rule_fail():
+    """A reserved block the rule does not name would stay unwritten while
+    vLLM caches it; groups that disagree cannot share one position."""
+    with pytest.raises(RuntimeError, match=r"allocated blocks in columns \[1\]"):
+        _align_groups(alignment=None).step_state(
+            [_table([0, 21, 30])], ["a"], [0], [2500], num_rows=1
+        )
+    with pytest.raises(RuntimeError, match="checkpoint block in block-table column 1"):
+        _align_groups(2, alignment=64).step_state(
+            [_table([0, 21, 30]), _table([0, 0, 130])], ["a"], [0], [2500], num_rows=1
+        )
 
 
 def _live_runner(cfg, specs, model) -> TTModelRunner:
@@ -497,7 +702,9 @@ def _live_runner(cfg, specs, model) -> TTModelRunner:
     return runner
 
 
-def _new_request(req_id: str, prompt_len: int, block_ids) -> NewRequestData:
+def _new_request(
+    req_id: str, prompt_len: int, block_ids, num_computed_tokens: int = 0
+) -> NewRequestData:
     return NewRequestData(
         req_id=req_id,
         prompt_token_ids=list(range(1, prompt_len + 1)),
@@ -505,7 +712,7 @@ def _new_request(req_id: str, prompt_len: int, block_ids) -> NewRequestData:
         sampling_params=SamplingParams(temperature=0.0),
         pooling_params=None,
         block_ids=block_ids,
-        num_computed_tokens=0,
+        num_computed_tokens=num_computed_tokens,
         lora_request=None,
     )
 
@@ -656,21 +863,86 @@ def test_page_table_is_the_attention_groups_table():
         assert page_table[1, :1].tolist() == [40]
 
 
-def test_mamba_model_refuses_block_copies():
-    """vLLM queues block copies only for prefix-cache hits, which mode none
-    never has; a copy that arrives anyway fails instead of being dropped."""
-    cfg = _vllm_config()
-    runner = _live_runner(cfg, _layer_specs(), _RecordingModel())
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_mamba_model_refuses_block_copies(mode):
+    """vLLM queues block copies only for prefix-cache hits that end inside a
+    block: mode none has no prefix caching, and in mode align TT rejects the
+    ``prefix_match_unit`` such a hit needs. A copy that arrives anyway fails,
+    printing the copies, before any block operation, instead of being
+    dropped."""
+    cfg = _vllm_config(mode)
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(mamba_cache_mode=mode), model)
 
-    with pytest.raises(RuntimeError, match=r"block copies \(src, dst\)"):
+    with pytest.raises(RuntimeError, match=r"block copies \(src, dst\) \[\(5, 6\)\]"):
         runner.build_model_input(
             _step(
                 {"a": 100},
                 new=[_new_request("a", 100, ([10], [11], [12], [20]))],
+                zero=[20],
                 copies=[KVCacheBlockCopy(src_block_id=5, dst_block_id=6)],
             ),
             None,
         )
+    assert model.calls == []
+
+
+def test_align_prefix_hit_reads_the_cached_block_and_writes_the_next_column():
+    """A prefix hit on the state after 2048 tokens, then decode across 3072.
+
+    Request A hits the cached state block of column 1 in each GDN group and
+    prefills tokens 2048 to 2500: it reads column 1's block and writes column
+    2's, with no copy. The runner zeroes the listed blocks before it builds
+    the step. Decoding on, the row reads and writes column 2's block until the
+    decode at position 3072, which reads column 2's block and writes column
+    3's.
+    """
+    cfg = _vllm_config("align")
+    model = _RecordingModel()
+    runner = _live_runner(cfg, _layer_specs(mamba_cache_mode="align"), model)
+    # Group order: GDN groups 0, 1, 2, then attention group 3.
+    blocks_a = ([0, 10, 11], [0, 20, 21], [0, 30, 31], [40, 41, 42])
+
+    prefill = runner.build_model_input(
+        _step(
+            {"a": 452},
+            new=[_new_request("a", 2500, blocks_a, num_computed_tokens=2048)],
+            zero=[42],
+        ),
+        None,
+    )
+
+    assert model.calls == [
+        ("zero_kv_cache_blocks", {"kv_cache": ["kv"], "block_ids": [42]}),
+    ]
+    assert [g.start_blocks[0].item() for g in prefill.mamba_state.groups] == [
+        10,
+        20,
+        30,
+    ]
+    assert [g.windows[0, 0].item() for g in prefill.mamba_state.groups] == [11, 21, 31]
+
+    def decode(computed, new_block_ids=None):
+        return runner.build_model_input(
+            _step({"a": 1}, cached=[("a", computed, new_block_ids)]), None
+        )
+
+    steady = decode(2500)
+    assert [g.start_blocks[0].item() for g in steady.mamba_state.groups] == [11, 21, 31]
+    assert [g.windows[0, 0].item() for g in steady.mamba_state.groups] == [11, 21, 31]
+    crossing = decode(3072, ([12], [22], [32], [43]))
+    assert [g.start_blocks[0].item() for g in crossing.mamba_state.groups] == [
+        11,
+        21,
+        31,
+    ]
+    assert [g.windows[0, 0].item() for g in crossing.mamba_state.groups] == [
+        12,
+        22,
+        32,
+    ]
+    after = decode(3073)
+    assert [g.start_blocks[0].item() for g in after.mamba_state.groups] == [12, 22, 32]
 
 
 def test_attention_only_model_without_hooks_is_unchanged():
