@@ -699,21 +699,37 @@ _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 _PREFILL_CHUNK_ALIGNMENT_DEFAULT = 128
 
 
-def get_tt_prefill_chunk_alignment(vllm_config: "VllmConfig") -> int:
+def get_tt_prefill_chunk_alignment(
+    vllm_config: "VllmConfig", kv_block_size: int | None = None
+) -> int:
     """Token alignment every partial prefill chunk must end on (0 disables).
 
     A request admitted on leftover budget would otherwise start every later
     chunk on an odd offset; aligning chunk ends keeps the model's chunk walk on
     its native grid for every model served through this plugin.
+
+    ``kv_block_size`` is the attention block size of a model with
+    ``MambaSpec`` KV cache groups, ``None`` otherwise. Such a model resumes a
+    prefill only at the start of a KV block, which can be larger than the
+    default grid (Qwen3.8 uses 512 or 1024 tokens), so the alignment defaults
+    to the block size and an operator value must be a positive multiple of it.
     """
     tt_config = get_tt_config(vllm_config)
     value = tt_config.get(
-        _PREFILL_CHUNK_ALIGNMENT_KEY, _PREFILL_CHUNK_ALIGNMENT_DEFAULT
+        _PREFILL_CHUNK_ALIGNMENT_KEY, kv_block_size or _PREFILL_CHUNK_ALIGNMENT_DEFAULT
     )
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(
             f"additional_config['tt']['{_PREFILL_CHUNK_ALIGNMENT_KEY}'] must be an "
             f"integer >= 0 (0 disables), got {value!r}"
+        )
+    if kv_block_size is not None and (value == 0 or value % kv_block_size):
+        raise ValueError(
+            f"additional_config['tt']['{_PREFILL_CHUNK_ALIGNMENT_KEY}']={value} is "
+            f"not a positive multiple of the KV block size {kv_block_size}. A model "
+            "with MambaSpec KV cache groups resumes a chunked prefill only at the "
+            f"start of a KV block; set a multiple of {kv_block_size} or leave the "
+            f"key unset ({kv_block_size})."
         )
     return value
 

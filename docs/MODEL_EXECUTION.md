@@ -75,7 +75,7 @@ A model whose `MambaSpec` declares `num_prefill_checkpoint_blocks` 1 (see [recur
 `TTModelRunner` finds each row's checkpoint with vLLM's rule, `compute_mamba_prefill_checkpoints` in `vllm/model_executor/layers/mamba/checkpoint.py`, as the upstream GPU runner does, and takes the block from the row's block-table column (`prefill_checkpoints` in [mamba_checkpoints.py](../src/vllm_tt_plugin/mamba_checkpoints.py)). When `MambaManager` declined the checkpoint, for example in a chunk that does not reach the end of the prefill, the column holds block 0 and the row writes none. For a row with a checkpoint at token count `p`:
 
 - `start_pos[i] < p < start_pos[i] + n`, and `p - start_pos[i]` is a multiple of `MambaSpec.prefill_checkpoint_alignment`, so the model can choose an alignment that its prefill computation stops at.
-- `p` is a multiple of `cache_config.prefix_match_unit`, or of the block size when that is unset.
+- `p` is a multiple of the block size: vLLM places it on a multiple of `cache_config.prefix_match_unit`, which TT requires to be the block size for a model with `MambaSpec` groups (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)).
 - `checkpoint_blocks[i, 0]` is a block vLLM reserved for this step. It differs from `start_blocks[i]` and `windows[i, 0]`. vLLM registers it in the prefix cache as the state after `p` tokens when it schedules the step, and lets only later steps hit it, so the model must write it in this step.
 
 `checkpoint_positions` and `checkpoint_blocks` are `None` in decode and in a prefill in which no row writes a checkpoint.

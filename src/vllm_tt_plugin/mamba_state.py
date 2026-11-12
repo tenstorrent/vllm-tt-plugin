@@ -39,6 +39,7 @@ that position into a block vLLM reserved (``MambaGroupState.checkpoint_blocks``,
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -459,6 +460,27 @@ def _check_align_launch(vllm_config: VllmConfig) -> None:
         )
 
 
+def mamba_attention_block_size(
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+) -> int | None:
+    """The KV block size a prefill chunk of a model with ``MambaSpec`` groups
+    must start on, or ``None`` without ``MambaSpec`` groups.
+
+    That is the attention block size: the TT model writes a chunk's attention
+    keys and values only from the start of a block. Several attention groups
+    give the least common multiple of their block sizes.
+    """
+    if not any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups):
+        return None
+    return math.lcm(
+        *(
+            g.kv_cache_spec.block_size
+            for g in kv_cache_groups
+            if not isinstance(g.kv_cache_spec, MambaSpec)
+        )
+    )
+
+
 def mamba_cache_groups(
     kv_cache_groups: Sequence[KVCacheGroupSpec], vllm_config: VllmConfig
 ) -> MambaCacheGroups | None:
@@ -537,5 +559,6 @@ __all__ = [
     "MambaGroupState",
     "MambaStepState",
     "check_mamba_launch",
+    "mamba_attention_block_size",
     "mamba_cache_groups",
 ]

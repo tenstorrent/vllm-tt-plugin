@@ -28,6 +28,7 @@ from vllm_tt_plugin.config import (
     tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.mamba_state import mamba_attention_block_size
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 
 if TYPE_CHECKING:
@@ -407,7 +408,10 @@ class TTScheduler(AsyncScheduler):
         self._pending_async_output_frames: dict[str, int] = {}
         self._widest_decode_batch_size = 0
         self._prefill_chunk_alignment = (
-            get_tt_prefill_chunk_alignment(self.vllm_config)
+            get_tt_prefill_chunk_alignment(
+                self.vllm_config,
+                mamba_attention_block_size(self.kv_cache_config.kv_cache_groups),
+            )
             if self.scheduler_config.enable_chunked_prefill
             else 0
         )

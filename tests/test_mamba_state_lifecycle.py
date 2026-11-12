@@ -383,8 +383,10 @@ class _Harness:
         self.checkpoint_blocks: list[int] = []
         # Steps whose rows read one block and wrote another.
         self.crossings = 0
-        # Request id -> its tokens in each prefill step, and its first step.
+        # Request id -> its tokens and its (start, end) positions in each
+        # prefill step, and its first step.
         self.prefill_chunks: dict[str, list[int]] = {}
+        self.prefill_spans: dict[str, list[tuple[int, int]]] = {}
         self.first_step: dict[str, int] = {}
         self.cached_states_checked = 0
         self.output_base = 50_000
@@ -510,6 +512,7 @@ class _Harness:
             self.first_step.setdefault(req_id, self.num_steps)
             if model_input.prompt_lens is not None:
                 self.prefill_chunks.setdefault(req_id, []).append(end - start)
+                self.prefill_spans.setdefault(req_id, []).append((start, end))
             # The attention page table is the scheduler's attention blocks.
             held = self.scheduler_blocks(req_id, attention)
             page_table = model_input.block_tables_per_group[attention][row]
@@ -727,10 +730,9 @@ def test_state_block_is_fixed_across_block_boundaries(prompt_len):
     assert len(blocks) == 1
 
 
-@pytest.mark.parametrize("prefix_match_unit", [None, 128])
 @pytest.mark.parametrize("max_num_batched_tokens", [1024, 2048, 4096])
 def test_prefill_checkpoints_match_the_blocks_mambamanager_reserves(
-    prefix_match_unit, max_num_batched_tokens
+    max_num_batched_tokens,
 ):
     """The runner finds every prefill checkpoint vLLM reserves, and no other.
 
@@ -746,7 +748,6 @@ def test_prefill_checkpoints_match_the_blocks_mambamanager_reserves(
         max_num_batched_tokens=max_num_batched_tokens,
         mode="align",
         checkpoint_alignment=64,
-        prefix_match_unit=prefix_match_unit,
     )
     shared = _prompt(100, 3000)
     for i, prompt_len in enumerate((1, 1023, 1024, 1025, 2048, 2500, 3000)):
@@ -762,15 +763,58 @@ def test_prefill_checkpoints_match_the_blocks_mambamanager_reserves(
     assert bool(h.checkpoints) == (max_num_batched_tokens > BLOCK_SIZE)
 
 
-def test_prefix_match_unit_off_the_prefill_chunk_grid_fails_at_startup():
-    """With a 64-token ``prefix_match_unit`` vLLM ends prefill chunks on
-    multiples of 64, which the default 128-token chunk grid floors back to
-    the chunk start; the scheduler refuses to start rather than stall."""
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_prefill_chunks_resume_at_kv_block_boundaries(mode):
+    """The TT model writes a prefill chunk's attention keys and values only
+    from the start of a KV block, so with MambaSpec groups every chunk that
+    does not finish its prompt ends on a multiple of the 1024-token block, not
+    on the default 128-token grid.
+
+    Request a's 1300-token prompt leaves 748 tokens of the 2048-token step for
+    request b. On the 128-token grid b would prefill 640 tokens and its next
+    chunk would start inside block 0; on the block grid b waits for the next
+    step. In mode align vLLM's own split also ends chunks on block boundaries.
+    """
+    h = _Harness(num_blocks=40, max_num_batched_tokens=2048, mode=mode)
+    assert h.scheduler._prefill_chunk_alignment == BLOCK_SIZE
+    for req_id, prompt_len in (("a", 1300), ("b", 3000), ("c", 2600), ("d", 900)):
+        h.add(req_id, prompt_len, max_tokens=4)
+    h.run()
+
+    chunked = {r: spans for r, spans in h.prefill_spans.items() if len(spans) > 1}
+    assert chunked, "no prompt was chunked"
+    for req_id, spans in h.prefill_spans.items():
+        for start, end in spans[:-1]:
+            assert start % BLOCK_SIZE == end % BLOCK_SIZE == 0, (req_id, spans)
+
+
+def test_an_operator_chunk_alignment_must_be_a_multiple_of_the_kv_block():
+    """``additional_config['tt']['prefill_chunk_alignment']`` defaults to the
+    KV block size for a model with MambaSpec groups and must be a positive
+    multiple of it; a model without them keeps the 128-token default."""
+    kv_cache_config = _Harness(num_blocks=32).kv_cache_config
+
+    for alignment in (640, 0):
+        with pytest.raises(
+            ValueError,
+            match=rf"prefill_chunk_alignment'\]={alignment} is not a positive "
+            "multiple of the KV block size 1024",
+        ):
+            _scheduler(kv_cache_config, 2048, prefill_chunk_alignment=alignment)
+    scheduler = _scheduler(kv_cache_config, 4096, prefill_chunk_alignment=2048)
+    assert scheduler._prefill_chunk_alignment == 2048
+
+
+def test_prefix_match_unit_below_the_kv_block_fails_at_startup():
+    """A ``prefix_match_unit`` below the block size makes vLLM end prefill
+    chunks, and resume prefix hits, inside a block, off the KV block grid
+    that prefill chunks of a MambaSpec model must start on; the scheduler
+    refuses to start rather than stall."""
     kv_cache_config = _Harness(num_blocks=32, mode="align").kv_cache_config
 
-    with pytest.raises(ValueError, match="prefix_match_unit=64"):
-        _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=64)
-    _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=128)
+    with pytest.raises(ValueError, match="prefix_match_unit=128"):
+        _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=128)
+    _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=BLOCK_SIZE)
 
 
 @pytest.mark.parametrize("mode", ["none", "align"])
@@ -927,34 +971,6 @@ def test_preempted_requests_resume_from_zero_or_from_a_kept_prefix():
     assert not h.scheduler.requests
     assert h.resumed_from_zero, "no preempted request resumed from position 0"
     assert h.preempted & set(h.hits), "no preempted request resumed from its prefix"
-
-
-@pytest.mark.parametrize("checkpoint_alignment", [None, 64])
-def test_hits_inside_a_block_copy_the_shared_blocks_before_the_forward(
-    checkpoint_alignment,
-):
-    """With a 128-token ``prefix_match_unit`` vLLM keeps the state of a
-    prompt's last multiple of 128 tokens, inside a block. Request b's hit on
-    a's 2432 tokens continues in the same column, so vLLM queues
-    copy-on-write copies of the shared attention and GDN blocks; the runner
-    hands them to ``copy_kv_cache_blocks`` before the forward, and b then
-    updates its own copy in place."""
-    h = _Harness(
-        num_blocks=40,
-        max_num_batched_tokens=4096,
-        mode="align",
-        checkpoint_alignment=checkpoint_alignment,
-        prefix_match_unit=128,
-    )
-    prompt = _prompt(1, 2500)
-    h.add("a", prompt=prompt, max_tokens=4)
-    h.run()
-    copies_before_b = len(h.copies)
-    h.add("b", prompt=prompt, max_tokens=4)
-    h.run()
-
-    assert h.hits == {"b": [2432]}
-    assert len(h.copies) > copies_before_b
 
 
 @pytest.mark.parametrize("prompt_len", [1000, 1023, 1024, 1025])

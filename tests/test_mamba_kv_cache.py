@@ -543,7 +543,7 @@ def test_state_blocks_match_upstream_selection():
         groups.step_state(tables, ["a", "b", "c"], computed, scheduled, num_rows=6)
 
 
-def _align_groups(num_groups=1, alignment=None, prefix_match_unit=BLOCK_SIZE):
+def _align_groups(num_groups=1, alignment=None):
     from vllm_tt_plugin.mamba_state import MambaCacheGroups
 
     return MambaCacheGroups(
@@ -555,7 +555,6 @@ def _align_groups(num_groups=1, alignment=None, prefix_match_unit=BLOCK_SIZE):
         mamba_cache_mode="align",
         block_size=BLOCK_SIZE,
         prefill_checkpoint_alignment=alignment,
-        prefix_match_unit=prefix_match_unit,
     )
 
 
@@ -638,32 +637,29 @@ def _table(row) -> torch.Tensor:
 
 
 @pytest.mark.parametrize(
-    ("computed", "scheduled", "row", "prefix_match_unit", "checkpoint"),
+    ("computed", "scheduled", "row", "checkpoint"),
     [
         # One unchunked prefill of 2500 tokens: vLLM reserves column 1 for the
         # state after 2048 tokens, the prompt's last block boundary.
-        (0, 2500, [0, 21, 30], BLOCK_SIZE, (2048, 21)),
-        # With a 128-token prefix_match_unit the position is the prompt's last
-        # multiple of 128, still in column 1.
-        (0, 2500, [0, 21, 30], 128, (2432, 21)),
+        (0, 2500, [0, 21, 30], (2048, 21)),
         # After a prefix hit on 2048 tokens, a prompt of 4000: the state after
         # 3072 tokens in column 2.
-        (2048, 1952, [0, 11, 21, 30], BLOCK_SIZE, (3072, 21)),
+        (2048, 1952, [0, 11, 21, 30], (3072, 21)),
         # vLLM declined the checkpoint (a chunk that does not reach the end of
         # the prefill): the column holds the null block, and the row writes
         # none.
-        (0, 2500, [0, 0, 30], BLOCK_SIZE, None),
+        (0, 2500, [0, 0, 30], None),
         # The rule allows none: the chunk starts one block below its end.
-        (2048, 452, [0, 11, 30], BLOCK_SIZE, None),
+        (2048, 452, [0, 11, 30], None),
     ],
 )
 def test_prefill_checkpoints_follow_vllms_rule_and_its_reservation(
-    computed, scheduled, row, prefix_match_unit, checkpoint
+    computed, scheduled, row, checkpoint
 ):
     """A row writes a checkpoint where vLLM's rule
     (``compute_mamba_prefill_checkpoints``) places one and vLLM reserved its
     block; the state inputs carry no checkpoint fields otherwise."""
-    groups = _align_groups(2, alignment=64, prefix_match_unit=prefix_match_unit)
+    groups = _align_groups(2, alignment=64)
     tables = [_table(row), _table([b + 100 if b else 0 for b in row])]
 
     state = groups.step_state(tables, ["a"], [computed], [scheduled], num_rows=2)
