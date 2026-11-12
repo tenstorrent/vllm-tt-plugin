@@ -1108,7 +1108,13 @@ class TTModelRunner:
         # they will be scheduled again sometime in the future.
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        # A forced prefix-cache reset (``reset_prefix_cache`` with
+        # ``reset_running_requests``) preempts running requests and resumes
+        # them in the same step, on new blocks. Their rows still hold the freed
+        # blocks, so they leave the persistent batch here and come back through
+        # the resumed-request path below, as in upstream's GPU runner.
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct

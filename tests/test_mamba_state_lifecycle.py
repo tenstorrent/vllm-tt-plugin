@@ -484,12 +484,17 @@ class _Harness:
         cached = out.scheduled_cached_reqs
         computed.update(zip(cached.req_ids, cached.num_computed_tokens))
         fresh = {new.req_id for new in out.scheduled_new_reqs} | cached.resumed_req_ids
+        attention = self.runner._mamba_groups.attention_group_index
         rows = []
         for row, req_id in enumerate(row_req_ids):
             request = self.scheduler.requests[req_id]
             start = int(positions[row])
             end = start + out.num_scheduled_tokens[req_id]
             assert start == computed[req_id]
+            # The attention page table is the scheduler's attention blocks.
+            held = self.scheduler_blocks(req_id, attention)
+            page_table = model_input.block_tables_per_group[attention][row]
+            assert page_table[: len(held)].tolist() == held, (req_id, held)
             self.rows_seen.setdefault(req_id, set()).add(row)
             if req_id in self.preempted and start == 0:
                 self.resumed_from_zero.add(req_id)
@@ -738,3 +743,25 @@ def test_prefix_match_unit_off_the_prefill_chunk_grid_fails_at_startup():
     with pytest.raises(ValueError, match="prefix_match_unit=64"):
         _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=64)
     _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=128)
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_forced_prefix_cache_reset_resumes_running_requests_on_new_blocks(mode):
+    """``reset_prefix_cache(reset_running_requests=True)`` preempts the running
+    requests and resumes them in the same step, on new blocks. The runner drops
+    their persistent-batch rows, which hold the freed blocks, and adds them
+    back as resumed requests: a row that kept its old row would append the new
+    attention blocks to the freed ones and read its GDN state from a freed
+    block."""
+    h = _Harness(num_blocks=32, max_num_batched_tokens=4096, mode=mode)
+    h.add("a", 2500, max_tokens=40)
+    h.add("b", 1500, max_tokens=40)
+    for _ in range(5):
+        h.step()
+    assert {"a", "b"} <= set(h.runner.input_batch.req_id_to_index)
+
+    assert h.scheduler.reset_prefix_cache(reset_running_requests=True)
+    h.run()
+
+    assert not h.scheduler.requests
+    assert h.resumed_from_zero == {"a", "b"}
