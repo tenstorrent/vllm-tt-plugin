@@ -580,23 +580,6 @@ def check_mamba_launch(
                 "--no-async-scheduling"
             )
     mode = vllm_config.cache_config.mamba_cache_mode
-    model_config = vllm_config.model_config
-    if (
-        getattr(model_config, "is_multimodal_model", False)
-        and model_config.supports_multimodal_inputs
-        and (mode != "none" or vllm_config.scheduler_config.enable_chunked_prefill)
-    ):
-        # The platform turns both off for such a launch
-        # (_resolve_mamba_multimodal_launch) when vLLM resolved a Mamba cache
-        # config for the architecture; this catches a launch it could not see.
-        raise ValueError(
-            "A model with MambaSpec KV cache groups cannot continue a multimodal "
-            f"prompt yet, but this launch accepts multimodal input with "
-            f"mamba_cache_mode={mode!r} and enable_chunked_prefill="
-            f"{vllm_config.scheduler_config.enable_chunked_prefill}. Launch with "
-            "--no-enable-prefix-caching --no-enable-chunked-prefill, or with "
-            "--language-model-only"
-        )
     if mode not in SUPPORTED_MAMBA_CACHE_MODES:
         raise ValueError(
             f"mamba_cache_mode={mode!r} is not supported with MambaSpec KV "

@@ -293,7 +293,6 @@ def test_mamba_pool_below_one_full_length_request_fails_at_startup():
         ("dense_retention", "prefix_cache_retention_interval=None is not supported"),
         ("no_chunked_prefill", "needs chunked prefill"),
         ("align_block_size", r"differs from the attention block sizes \[64\]"),
-        ("multimodal", "cannot continue a multimodal prompt yet"),
     ],
 )
 def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, match):
@@ -320,11 +319,6 @@ def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, mat
         store_tt_lane_count(cfg, 2)
     elif unsupported == "block_output":
         store_tt_output_tokens_per_step(cfg, 4)
-    elif unsupported == "multimodal":
-        # Chunked prefill on with multimodal input, which the platform turns
-        # off only when vLLM resolved a Mamba cache config.
-        cfg.model_config.is_multimodal_model = True
-        cfg.model_config.supports_multimodal_inputs = True
     elif unsupported == "cache_mode_all":
         cfg = _vllm_config("all")
         specs = _layer_specs(mamba_cache_mode="all", block_size=BLOCK_SIZE)
