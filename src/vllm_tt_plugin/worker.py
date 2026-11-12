@@ -761,6 +761,11 @@ def _mamba_hybrid_num_blocks(
     check_mamba_launch(
         vllm_config,
         [spec for spec in kv_cache_specs.values() if isinstance(spec, MambaSpec)],
+        [
+            spec.block_size
+            for spec in kv_cache_specs.values()
+            if not isinstance(spec, MambaSpec)
+        ],
     )
     _, groups = _kv_cache_groups_for_sizing(vllm_config, dict(kv_cache_specs))
     page_size = get_uniform_page_size(group.kv_cache_spec for group in groups)

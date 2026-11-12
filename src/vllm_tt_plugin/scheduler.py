@@ -415,6 +415,24 @@ class TTScheduler(AsyncScheduler):
             _validate_prefill_chunk_alignment(
                 self._prefill_chunk_alignment, self.scheduler_config
             )
+            # With fine-grained Mamba prefix hits vLLM's block-aligned split
+            # also ends a prefill chunk at the prompt's last multiple of
+            # hash_block_size. _align_prefill_chunk_end floors a chunk end off
+            # the alignment grid down to the grid, so a chunk that starts on
+            # the last grid point below such a stop gets no tokens and the
+            # request never finishes its prefill.
+            if (
+                getattr(self, "mamba_partial_cache_hit", False)
+                and self.hash_block_size % self._prefill_chunk_alignment
+            ):
+                raise ValueError(
+                    f"cache_config.prefix_match_unit={self.hash_block_size} "
+                    "with mamba_cache_mode 'align' makes vLLM end prefill "
+                    "chunks on multiples of it, off the grid of "
+                    "additional_config['tt']['prefill_chunk_alignment']="
+                    f"{self._prefill_chunk_alignment}. Set prefix_match_unit "
+                    "to a multiple of the alignment."
+                )
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,

@@ -170,3 +170,42 @@ def test_block_output_model_loses_chunked_prefill_even_when_declared():
     assert config.scheduler_config.max_num_batched_tokens == 16384
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.scheduler_config.disable_chunked_mm_input is False
+
+
+def _align_config(*, multimodal: bool, mm_inputs: bool):
+    config = _vllm_config()
+    config.cache_config = SimpleNamespace(mamba_cache_mode="align")
+    config.model_config.is_multimodal_model = multimodal
+    config.model_config.supports_multimodal_inputs = mm_inputs
+    return config
+
+
+def test_text_only_align_launch_clears_the_chunked_mm_input_flag():
+    """``VllmConfig.validate_block_size`` rejects ``disable_chunked_mm_input``
+    in mamba_cache_mode ``align``; without multimodal inputs the flag has
+    nothing to act on."""
+    from vllm_tt_plugin.platform import _allow_chunked_mm_input_in_mamba_align
+
+    for multimodal in (False, True):
+        config = _align_config(multimodal=multimodal, mm_inputs=False)
+        _apply(config, {"supports_chunked_prefill": True})
+        assert config.scheduler_config.disable_chunked_mm_input is True
+
+        _allow_chunked_mm_input_in_mamba_align(config)
+
+        assert config.scheduler_config.disable_chunked_mm_input is False
+
+
+def test_multimodal_align_launch_is_rejected_and_mode_none_keeps_the_flag():
+    """No TT scheduler path keeps a multimodal item in one prefill chunk in
+    mode ``align``. In mode ``none`` the flag is vLLM's rule and stays."""
+    from vllm_tt_plugin.platform import _allow_chunked_mm_input_in_mamba_align
+
+    config = _align_config(multimodal=True, mm_inputs=True)
+    _apply(config, {"supports_chunked_prefill": True})
+    with pytest.raises(ValueError, match="--language-model-only"):
+        _allow_chunked_mm_input_in_mamba_align(config)
+
+    config.cache_config.mamba_cache_mode = "none"
+    _allow_chunked_mm_input_in_mamba_align(config)
+    assert config.scheduler_config.disable_chunked_mm_input is True

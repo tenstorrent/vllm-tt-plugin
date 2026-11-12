@@ -309,6 +309,38 @@ def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
     )
 
 
+def _allow_chunked_mm_input_in_mamba_align(vllm_config: "VllmConfig") -> None:
+    """Clear ``disable_chunked_mm_input`` for a text-only ``align`` launch.
+
+    ``VllmConfig.validate_block_size`` rejects ``disable_chunked_mm_input`` in
+    ``mamba_cache_mode`` "align", because vLLM's roll-back to the start of a
+    multimodal item would undo its block-aligned split.
+    ``_apply_chunked_prefill_policy`` sets the flag for every model with
+    chunked prefill, where it acts only on multimodal items. With multimodal
+    inputs disabled the flag has nothing to act on and is cleared; with them
+    enabled the launch is rejected, because no TT scheduler path keeps a
+    multimodal item in one prefill chunk in mode "align". Must run after
+    prefix caching is resolved: turning prefix caching off resets the mode to
+    "none", where the flag still applies.
+    """
+    scheduler_config = vllm_config.scheduler_config
+    if (
+        getattr(vllm_config.cache_config, "mamba_cache_mode", None) != "align"
+        or not scheduler_config.disable_chunked_mm_input
+    ):
+        return
+    model_config = vllm_config.model_config
+    if model_config.is_multimodal_model and model_config.supports_multimodal_inputs:
+        raise ValueError(
+            "Prefix caching of recurrent state (mamba_cache_mode='align') "
+            "supports text-only requests on TT. Launch with "
+            "--language-model-only (or --limit-mm-per-prompt with 0 for every "
+            "modality) to serve text, or with --no-enable-prefix-caching to "
+            "serve multimodal requests"
+        )
+    scheduler_config.disable_chunked_mm_input = False
+
+
 def _galaxy_generator_version() -> str | None:
     """Return the active Galaxy-generator model version, or None.
 
@@ -2215,6 +2247,7 @@ class TTPlatform(Platform):
             "Automatic prefix caching is %s",
             "enabled" if vllm_config.cache_config.enable_prefix_caching else "disabled",
         )
+        _allow_chunked_mm_input_in_mamba_align(vllm_config)
 
         if is_block_output_model:
             required_lifecycle_hooks = (

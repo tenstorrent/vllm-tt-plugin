@@ -19,7 +19,10 @@ ownership, see the [model-plugin interface](MODEL_INTERFACE.md).
 | `reset_sampling_state` | Rebuild mutable penalty and RNG state for the current request layout. |
 
 `reload_inputs` already includes page tables, so the legal forward-input modes
-are "everything", "page tables only", and "nothing". The plugin asserts that
+are "everything", "page tables only", and "nothing". With `MambaSpec` groups,
+`mamba_state` is a page-table input, and the plugin sets `reload_page_table`
+when `mamba_state` changes while the page tables stay the same; see
+[recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks). The plugin asserts that
 `reload_inputs` and `reload_page_table` are never both true. It also asserts
 that `reset_sampling_state` implies `reload_inputs`, because a sampler may align
 seed counters from host positions only on a step that makes those positions

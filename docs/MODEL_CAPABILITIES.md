@@ -245,7 +245,8 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 ## Hooks that are not capability keys
 
 `get_kv_cache_spec` opts a model into hybrid KV-cache layouts, and a
-`MambaSpec` in its result also requires `zero_kv_cache_blocks`.
+`MambaSpec` in its result also requires `zero_kv_cache_blocks`, and
+`copy_kv_cache_blocks` with prefix caching.
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
