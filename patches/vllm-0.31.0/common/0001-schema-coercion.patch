@@ -1,0 +1,1075 @@
+Tool-argument schema coercion: untyped schemas ($ref/$defs, not, if/then/else,
+const, {}) and root-level combinators, validated with jsonschema. See README.md.
+
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 527c310..65b3383 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -28,10 +28,15 @@ from vllm.parser.engine.events import EventType, SemanticEvent
+ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
+ from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+ from vllm.tool_parsers.utils import (
+-    coerce_to_schema_type,
++    SchemaChecker,
+     extract_types_from_schema,
+     find_tool_name,
+-    find_tool_properties,
++    find_tool_parameters,
++    infer_schema_types,
++    resolve_schema_ref,
++    root_schema_conflict_keys,
++    root_schema_properties,
++    schema_coercion_candidates,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -45,6 +50,14 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _schema_has_ref(schema: object) -> bool:
++    if isinstance(schema, dict):
++        return "$ref" in schema or any(_schema_has_ref(v) for v in schema.values())
++    if isinstance(schema, list):
++        return any(_schema_has_ref(v) for v in schema)
++    return False
++
++
+ class ToolCallSlot:
+     __slots__ = (
+         "id",
+@@ -53,6 +66,7 @@ class ToolCallSlot:
+         "_args_joined",
+         "name_sent",
+         "string_keys",
++        "conflict_keys",
+         "streamed_json",
+     )
+ 
+@@ -63,6 +77,8 @@ class ToolCallSlot:
+         self._args_joined: str | None = ""
+         self.name_sent: bool = False
+         self.string_keys: set[str] | None = None
++        # Keys whose type depends on which root anyOf/oneOf branch applies.
++        self.conflict_keys: frozenset[str] = frozenset()
+         self.streamed_json: str = ""
+ 
+     @property
+@@ -125,6 +141,7 @@ class ParserEngine(Parser):
+         self._suppress_tool_calls: bool = False
+ 
+         self._arg_converter = parser_engine_config.arg_converter
++        self._schema_checkers: dict[int, tuple[dict, SchemaChecker]] = {}
+         self._arg_structural_chars = parser_engine_config.arg_structural_chars
+         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
+         self._strip_trailing_reasoning_ws = (
+@@ -241,55 +258,97 @@ class ParserEngine(Parser):
+     # ── Schema-aware type correction ─────────────────────────────────
+ 
+     @staticmethod
+-    def _coerce_value(value: object, schema: dict) -> tuple[object, bool]:
++    def _coerce_value(
++        value: object,
++        schema: dict,
++        root: dict | None = None,
++        raw_text: bool = False,
++        checker: SchemaChecker | None = None,
++    ) -> tuple[object, bool]:
+         """Coerce a single value according to its schema.
+ 
++        *root* is the tool's parameters schema; `$ref` pointers in *schema*
++        resolve against it.  *raw_text* says string values are raw text
++        from a format without type information (Qwen3/MiMo XML), rather
++        than strings the model encoded as strings.  The candidate readings
++        come from :func:`schema_coercion_candidates`; with a *checker*, the
++        first one that validates against *schema* wins.
++
+         Returns ``(coerced_value, changed)``.
+         """
+-        if isinstance(value, str):
+-            types = extract_types_from_schema(schema)
+-            coerced = coerce_to_schema_type(value, types)
+-            if coerced is not value:
+-                return coerced, True
++        if isinstance(value, (dict, list)):
++            return ParserEngine._coerce_container(value, schema, root, checker)
++
++        options = schema_coercion_candidates(value, schema, root, raw_text)
++        values = options.values
++        for candidate in values:
++            if isinstance(candidate, (dict, list)):
++                # Decoded from raw text: type its nested values before
++                # validating.  They were JSON-encoded, so not raw text.
++                ParserEngine._coerce_container(candidate, schema, root, checker)
++        chosen = values[options.fallback]
++        if len(values) > 1:
++            for candidate in values:
++                verdict = checker.is_valid(candidate, schema) if checker else None
++                if verdict is None:
++                    chosen = values[options.unverified]
++                    break
++                if verdict:
++                    chosen = candidate
++                    break
++        if type(chosen) is type(value) and chosen == value:
+             return value, False
++        return chosen, True
++
++    @staticmethod
++    def _coerce_container(
++        value: dict | list,
++        schema: dict,
++        root: dict | None,
++        checker: SchemaChecker | None,
++    ) -> tuple[object, bool]:
++        """Coerce the members of an already-decoded object or array."""
++        resolved = resolve_schema_ref(schema, root)
+ 
+         if isinstance(value, dict):
+-            nested_props = schema.get("properties")
++            nested_props = resolved.get("properties")
+             if isinstance(nested_props, dict):
+-                _, changed = ParserEngine._coerce_dict(value, nested_props)
+-                return value, changed
+-            return value, False
+-
+-        if isinstance(value, list):
+-            items_schema = schema.get("items")
+-            if isinstance(items_schema, dict):
+-                changed = False
+-                for i, item in enumerate(value):
+-                    coerced, item_changed = ParserEngine._coerce_value(
+-                        item, items_schema
+-                    )
+-                    if item_changed:
+-                        value[i] = coerced
+-                        changed = True
++                _, changed = ParserEngine._coerce_dict(
++                    value, nested_props, root, False, checker
++                )
+                 return value, changed
+             return value, False
+ 
+-        types = extract_types_from_schema(schema)
+-        as_str = json.dumps(value, ensure_ascii=False)
+-        coerced = coerce_to_schema_type(as_str, types)
+-        if type(coerced) is not type(value) or coerced != value:
+-            return coerced, True
++        items_schema = resolved.get("items")
++        if isinstance(items_schema, dict):
++            changed = False
++            for i, item in enumerate(value):
++                coerced, item_changed = ParserEngine._coerce_value(
++                    item, items_schema, root, False, checker
++                )
++                if item_changed:
++                    value[i] = coerced
++                    changed = True
++            return value, changed
+         return value, False
+ 
+     @staticmethod
+-    def _coerce_dict(args: dict, properties: dict) -> tuple[dict, bool]:
++    def _coerce_dict(
++        args: dict,
++        properties: dict,
++        root: dict | None = None,
++        raw_text: bool = False,
++        checker: SchemaChecker | None = None,
++    ) -> tuple[dict, bool]:
+         """Coerce all values in *args* using *properties* schemas."""
+         changed = False
+         for key, value in args.items():
+             prop = properties.get(key)
+             if not isinstance(prop, dict):
+                 continue
+-            coerced, val_changed = ParserEngine._coerce_value(value, prop)
++            coerced, val_changed = ParserEngine._coerce_value(
++                value, prop, root, raw_text, checker
++            )
+             if val_changed:
+                 args[key] = coerced
+                 changed = True
+@@ -361,30 +420,75 @@ class ParserEngine(Parser):
+         return json_str
+ 
+     @staticmethod
+-    def _streamable_string_keys(properties: dict) -> set[str] | None:
++    def _streamable_string_keys(
++        properties: dict, root: dict | None = None, raw_text: bool = False
++    ) -> set[str] | None:
+         """Return keys whose trailing string values can safely stream.
+ 
+         ``None`` means there is no schema, so all string values keep their
+-        JSON representation as strings.  With a schema, only fields that can
+-        remain strings are safe to emit before the value is closed; fields
+-        coerced to bool/number/null/object/array may serialize differently.
++        JSON representation as strings.  With a schema, only fields whose
++        string value is never coerced are safe to emit before the value is
++        closed: fields that can only be strings, and, unless *raw_text*,
++        fields without type information (explicitly encoded values are kept
++        as they are there).  Other fields may serialize differently once
++        coerced to bool/number/null/object/array.
+         """
+         if not properties:
+             return None
+ 
+         streamable: set[str] = set()
+         for key, schema in properties.items():
+-            if set(extract_types_from_schema(schema)) == {"string"}:
++            if set(extract_types_from_schema(schema)) != {"string"}:
++                continue
++            types = infer_schema_types(schema, root)
++            if types == {"string"} or (types is None and not raw_text):
+                 streamable.add(key)
+         return streamable
+ 
++    @property
++    def _raw_text_args(self) -> bool:
++        return self.parser_engine_config.raw_text_arg_values
++
++    def _tool_string_keys(self, name: str) -> set[str] | None:
++        params = find_tool_parameters(self._tools, name)
++        # Without the emitted keys, a key typed differently by different root
++        # anyOf/oneOf branches is unconstrained here, so it never streams.
++        properties = root_schema_properties(params)
++        if self._raw_text_args or _schema_has_ref(params):
++            return self._streamable_string_keys(
++                properties, params, self._raw_text_args
++            )
++        # Plain schema: the defaults are equivalent.
++        return self._streamable_string_keys(properties)
++
++    def _set_slot_schema_keys(self, slot: ToolCallSlot, name: str) -> None:
++        slot.string_keys = self._tool_string_keys(name)
++        slot.conflict_keys = root_schema_conflict_keys(
++            find_tool_parameters(self._tools, name)
++        )
++
++    def _schema_checker(self, params: dict) -> SchemaChecker:
++        """A validator for *params* (cached for the life of the request)."""
++        cached = self._schema_checkers.get(id(params))
++        if cached is None or cached[0] is not params:
++            cached = (params, SchemaChecker(params))
++            self._schema_checkers[id(params)] = cached
++        return cached[1]
++
+     def _fix_arg_types(self, args_json: str, func_name: str) -> str:
+         """Correct parameter types using the tool schema.
+ 
+-        String values are coerced via :func:`coerce_to_schema_type`.
+-        Nested objects and arrays are recursed into when the schema
+-        defines ``properties`` or ``items``.  Without a schema, values
+-        stay as strings.
++        Each value is read the way the schema says (see
++        :meth:`_coerce_value`); a value is only changed into a reading that
++        validates against its property schema, when one exists.  Nested
++        objects and arrays are recursed into when the schema defines
++        ``properties`` or ``items``.  Without a schema, values are kept.
++        Under a property schema without type information, raw text from a
++        format without types (`raw_text_arg_values`) is decoded as JSON,
++        and an explicitly encoded value is kept.  A root
++        ``$ref``/``allOf``/``anyOf``/``oneOf`` is normalized by
++        :func:`root_schema_properties`, with the emitted keys choosing the
++        ``anyOf``/``oneOf`` branch.
+         """
+         if not self._tools or not func_name:
+             return args_json
+@@ -395,11 +499,20 @@ class ParserEngine(Parser):
+         if not isinstance(args, dict):
+             return args_json
+ 
+-        properties = find_tool_properties(self._tools, func_name)
++        params = find_tool_parameters(self._tools, func_name)
++        # Normalize a root $ref/allOf/anyOf/oneOf; the emitted keys pick the
++        # anyOf/oneOf branch.
++        properties = root_schema_properties(params, args.keys())
+         if not properties:
+             return args_json
+ 
+-        _, changed = self._coerce_dict(args, properties)
++        _, changed = self._coerce_dict(
++            args,
++            properties,
++            params,
++            self._raw_text_args,
++            self._schema_checker(params),
++        )
+ 
+         if changed:
+             return json.dumps(args, ensure_ascii=False)
+@@ -889,9 +1002,7 @@ class ParserEngine(Parser):
+         slot = self._tool_slots[idx]
+         slot.name = name
+         slot.name_sent = True
+-        slot.string_keys = self._streamable_string_keys(
+-            find_tool_properties(self._tools, name)
+-        )
++        self._set_slot_schema_keys(slot, name)
+         self._ensure_tool_id(slot, name)
+         deltas.append(
+             DeltaToolCall(
+@@ -947,9 +1058,7 @@ class ParserEngine(Parser):
+             if self._accept_tool_name(name):
+                 slot.name = name
+                 slot.name_sent = True
+-                slot.string_keys = self._streamable_string_keys(
+-                    find_tool_properties(self._tools, name)
+-                )
++                self._set_slot_schema_keys(slot, name)
+                 self._ensure_tool_id(slot, name)
+                 deltas.append(
+                     DeltaToolCall(
+@@ -1031,6 +1140,11 @@ class ParserEngine(Parser):
+         if slot.name:
+             current_json = self._fix_arg_types(current_json, slot.name)
+ 
++        if slot.conflict_keys and self._has_conflict_key(current_json, slot):
++            # The branch, and so this key's type, may still change with later
++            # keys: hold everything from here until the final flush.
++            return None
++
+         prev = slot.streamed_json
+         safe_json = self._safe_arg_prefix(current_json, slot.string_keys)
+ 
+@@ -1049,6 +1163,14 @@ class ParserEngine(Parser):
+             return diff
+         return None
+ 
++    @staticmethod
++    def _has_conflict_key(args_json: str, slot: ToolCallSlot) -> bool:
++        try:
++            args = json.loads(args_json)
++        except (json.JSONDecodeError, ValueError):
++            return True
++        return not isinstance(args, dict) or not slot.conflict_keys.isdisjoint(args)
++
+     def _flush_arg_converter(self, idx: int) -> str | None:
+         converter = self._arg_converter
+         if converter is None:
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index 215fa0d..711cb92 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -82,6 +82,16 @@ class ParserEngineConfig:
+ 
+     tool_args_json: bool = True
+ 
++    # Argument values are raw text with no type encoding (Qwen3/MiMo
++    # ``<parameter=x>5</parameter>``): the converter emits every value as a
++    # JSON string and only the tool schema says what it is.  Under a property
++    # schema without type information (``{}``, a dangling ``$ref``, ...),
++    # such a value is decoded as JSON when it is a JSON object, array,
++    # number, boolean or null.  Leave False for formats that encode types
++    # (JSON arguments, Gemma4 ``<|"|>``, DeepSeek ``string="true"``): there
++    # a string value is a string the model chose and is never reinterpreted.
++    raw_text_arg_values: bool = False
++
+     # The tool region body is a single JSON array of ``{"name", "arguments"}``
+     # objects (one marker → N calls, no closing terminal). The engine splits
+     # the array into one tool call per element; the array's ``]`` ends the
+diff --git a/vllm/parser/glm47_moe.py b/vllm/parser/glm47_moe.py
+index 00e517f..42e0d5c 100644
+--- a/vllm/parser/glm47_moe.py
++++ b/vllm/parser/glm47_moe.py
+@@ -176,6 +176,7 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
+         arg_converter=_glm47_arg_converter,
+         stream_arg_deltas=True,
+         tool_args_json=False,
++        raw_text_arg_values=True,
+         validate_tool_names=True,
+     )
+ 
+diff --git a/vllm/parser/minimax_m2.py b/vllm/parser/minimax_m2.py
+index c96f852..7ff47ec 100644
+--- a/vllm/parser/minimax_m2.py
++++ b/vllm/parser/minimax_m2.py
+@@ -193,6 +193,7 @@ def minimax_m2_config() -> ParserEngineConfig:
+         arg_converter=_minimax_m2_arg_converter,
+         stream_arg_deltas=True,
+         tool_args_json=False,
++        raw_text_arg_values=True,
+         validate_tool_names=True,
+     )
+ 
+diff --git a/vllm/parser/qwen3.py b/vllm/parser/qwen3.py
+index a11551a..aadfe64 100644
+--- a/vllm/parser/qwen3.py
++++ b/vllm/parser/qwen3.py
+@@ -199,6 +199,7 @@ def qwen3_config(
+         stream_arg_deltas=True,
+         strip_trailing_reasoning_whitespace=False,
+         tool_args_json=False,
++        raw_text_arg_values=True,
+     )
+ 
+ 
+diff --git a/vllm/tool_parsers/utils.py b/vllm/tool_parsers/utils.py
+index d2c8c6f..0a54d08 100644
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -6,9 +6,11 @@ import json
+ import keyword as _python_keyword
+ import math
+ import warnings
++from collections.abc import Iterable
+ from dataclasses import dataclass
+ from json import JSONDecodeError, JSONDecoder
+ from typing import Any, TypeAlias
++from urllib.parse import unquote
+ 
+ import partial_json_parser
+ from openai.types.responses import (
+@@ -266,27 +268,38 @@ def _extract_tool_info(
+         raise TypeError(f"Unsupported tool type: {type(tool)}")
+ 
+ 
+-def find_tool_properties(
++def find_tool_parameters(
+     tools: list[Tool] | None,
+     tool_name: str,
+ ) -> dict[str, Any]:
+-    """Find a tool by name and return its properties dict, or {}."""
++    """Find a tool by name and return its whole parameters schema, or {}.
++
++    This is the root that `$ref` pointers such as `#/$defs/X` resolve against.
++    """
+     if not tools:
+         return {}
+     for tool in tools:
+         if isinstance(tool, (FunctionTool, NamespaceTool)):
+             for name, params in iter_response_function_tool_info(tool):
+                 if name == tool_name:
+-                    return (params or {}).get("properties", {})
++                    return params if isinstance(params, dict) else {}
+             continue
+         if not _is_function_tool(tool):
+             continue
+         name, params = _extract_tool_info(tool)
+         if name == tool_name:
+-            return (params or {}).get("properties", {})
++            return params if isinstance(params, dict) else {}
+     return {}
+ 
+ 
++def find_tool_properties(
++    tools: list[Tool] | None,
++    tool_name: str,
++) -> dict[str, Any]:
++    """Find a tool by name and return its properties dict, or {}."""
++    return find_tool_parameters(tools, tool_name).get("properties", {})
++
++
+ def find_tool_name(
+     tools: list[Tool] | None,
+     tool_name: str,
+@@ -309,9 +322,12 @@ def find_tool_name(
+ 
+ 
+ def _get_tool_schema_from_name_and_params(
+-    name: str, params: dict[str, Any] | None
++    name: str, params: dict[str, Any] | None, hoisted_defs: bool = False
+ ) -> dict:
+     params = params if params else {"type": "object", "properties": {}}
++    if hoisted_defs and "$defs" in params:
++        # _get_tool_schema_defs moves these to the root of the combined schema.
++        params = {k: v for k, v in params.items() if k != "$defs"}
+     return {
+         "properties": {
+             "name": {"type": "string", "enum": [name]},
+@@ -323,7 +339,7 @@ def _get_tool_schema_from_name_and_params(
+ 
+ def _get_tool_schema_from_tool(tool: Tool) -> dict:
+     name, params = _extract_tool_info(tool)
+-    return _get_tool_schema_from_name_and_params(name, params)
++    return _get_tool_schema_from_name_and_params(name, params, hoisted_defs=True)
+ 
+ 
+ def _get_tool_schema_defs(
+@@ -334,7 +350,9 @@ def _get_tool_schema_defs(
+         _, params = _extract_tool_info(tool)
+         if params is None:
+             continue
+-        defs = params.pop("$defs", {})
++        # Read, don't pop: popping mutated request.tools, so the tool parser
++        # could no longer resolve `$ref` pointers into `$defs` afterwards.
++        defs = params.get("$defs") or {}
+         for def_name, def_schema in defs.items():
+             if def_name in all_defs and all_defs[def_name] != def_schema:
+                 raise ValueError(
+@@ -353,7 +371,9 @@ def _get_json_schema_from_tools(
+     for tool in tools:
+         if isinstance(tool, (FunctionTool, NamespaceTool)):
+             fn_tool_schemas.extend(
+-                _get_tool_schema_from_name_and_params(name, params)
++                _get_tool_schema_from_name_and_params(
++                    name, params, hoisted_defs=isinstance(tool, FunctionTool)
++                )
+                 for name, params in iter_response_function_tool_info(tool)
+             )
+             if isinstance(tool, FunctionTool):
+@@ -1051,6 +1071,564 @@ def extract_types_from_schema(schema: Any) -> list[str]:
+     return list(types) if types else ["string"]
+ 
+ 
++_JSON_TYPES: frozenset[str] = frozenset(
++    {"null", "boolean", "integer", "number", "string", "array", "object"}
++)
++# Keywords that only constrain the JSON type, so `not` of a schema made of
++# them can be inverted into a set of allowed types.
++_TYPE_ONLY_KEYWORDS = frozenset(
++    {"type", "description", "title", "$comment", "examples", "default"}
++)
++_MAX_SCHEMA_DEPTH = 64
++
++
++def json_type_of(value: Any) -> str:
++    """The JSON Schema type of a decoded JSON value.
++
++    As in JSON Schema, a number with a zero fractional part (`5`, `5.0`) is
++    an `integer`; only other numbers are reported as `number`.
++    """
++    if value is None:
++        return "null"
++    if isinstance(value, bool):
++        return "boolean"
++    if isinstance(value, int):
++        return "integer"
++    if isinstance(value, float):
++        return "integer" if value.is_integer() else "number"
++    if isinstance(value, str):
++        return "string"
++    if isinstance(value, list):
++        return "array"
++    if isinstance(value, dict):
++        return "object"
++    return "string"
++
++
++def _lookup_schema_ref(ref: str, root: Any) -> dict | None:
++    """Resolve a local JSON pointer (`#`, `#/$defs/X`, `#/definitions/X`)."""
++    if not isinstance(root, dict) or not ref.startswith("#"):
++        return None
++    pointer = ref[1:]
++    if pointer and not pointer.startswith("/"):
++        return None
++    node: Any = root
++    for part in pointer.split("/")[1:]:
++        part = unquote(part).replace("~1", "/").replace("~0", "~")
++        if isinstance(node, dict) and part in node:
++            node = node[part]
++        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
++            node = node[int(part)]
++        else:
++            return None
++    return node if isinstance(node, dict) else None
++
++
++def resolve_schema_ref(schema: Any, root: Any = None) -> Any:
++    """Follow `$ref` chains in *schema* against *root*.
++
++    Sibling keywords of the `$ref` are kept and override the target's.  A
++    cyclic or dangling ref stops resolution and drops the `$ref`.  Non-dict
++    inputs are returned unchanged.
++    """
++    if not isinstance(schema, dict):
++        return schema
++    seen: set[str] = set()
++    while isinstance(schema.get("$ref"), str):
++        ref = schema["$ref"]
++        siblings = {k: v for k, v in schema.items() if k != "$ref"}
++        target = None if ref in seen else _lookup_schema_ref(ref, root)
++        if target is None:
++            return siblings
++        seen.add(ref)
++        schema = {**target, **siblings}
++    return schema
++
++
++def _declared_types(type_value: Any) -> set[str]:
++    names = [type_value] if isinstance(type_value, str) else type_value
++    types: set[str] = set()
++    for name in names if isinstance(names, list) else ():
++        if isinstance(name, str):
++            name = name.strip().lower()
++            types.add(_TYPE_ALIASES.get(name, name))
++    if "number" in types:
++        # Every integer is a number; keeping both makes `number` minus
++        # `integer` (from `not`) mean "a number with a fractional part".
++        types.add("integer")
++    return types
++
++
++def infer_schema_types(
++    schema: Any,
++    root: Any = None,
++    _seen: frozenset[str] = frozenset(),
++    _depth: int = 0,
++) -> set[str] | None:
++    """Infer the JSON types a value matching *schema* may have.
++
++    Returns `None` when the schema does not constrain the type (`{}`, a
++    description only, a cyclic or dangling `$ref`, ...), meaning any type.
++
++    The result uses :func:`json_type_of` semantics: `integer` is any
++    integral number, and `number` alone means a number with a fractional
++    part, so `{"type": "number"}` yields `{"number", "integer"}` and
++    `{"not": {"type": "integer"}}` excludes `integer` but keeps `number`.
++
++    Handles `type`, `const`, `enum`, `$ref` (resolved against *root*'s
++    `$defs`/`definitions`, with a cycle guard), `allOf` (intersection),
++    `anyOf`/`oneOf` (union), `not` of a pure type constraint, and
++    `if`/`then`/`else`.  Keywords on the same schema are combined as an
++    intersection; if they contradict, their union is used instead.  This
++    is only a type-level approximation: callers validate the coerced value
++    against the full schema when that matters.
++    """
++    if not isinstance(schema, dict) or _depth > _MAX_SCHEMA_DEPTH:
++        return None
++    depth = _depth + 1
++    constraints: list[set[str]] = []
++
++    declared = _declared_types(schema.get("type"))
++    if declared:
++        constraints.append(declared)
++
++    if "const" in schema:
++        constraints.append({json_type_of(schema["const"])})
++
++    enum = schema.get("enum")
++    if isinstance(enum, list) and enum:
++        constraints.append({json_type_of(v) for v in enum})
++
++    ref = schema.get("$ref")
++    if isinstance(ref, str) and ref not in _seen:
++        target = _lookup_schema_ref(ref, root)
++        if target is not None:
++            types = infer_schema_types(target, root, _seen | {ref}, depth)
++            if types is not None:
++                constraints.append(types)
++
++    all_of = schema.get("allOf")
++    if isinstance(all_of, list):
++        for sub in all_of:
++            types = infer_schema_types(sub, root, _seen, depth)
++            if types is not None:
++                constraints.append(types)
++
++    for key in ("anyOf", "oneOf"):
++        choices = schema.get(key)
++        if not isinstance(choices, list) or not choices:
++            continue
++        union: set[str] | None = set()
++        for sub in choices:
++            types = infer_schema_types(sub, root, _seen, depth)
++            if types is None:
++                union = None
++                break
++            union |= types
++        if union is not None:
++            constraints.append(union)
++
++    negated = schema.get("not")
++    if isinstance(negated, dict) and set(negated) <= _TYPE_ONLY_KEYWORDS:
++        excluded = infer_schema_types(negated, root, _seen, depth)
++        if excluded:
++            # `not: {type: integer}` leaves `number` (fractional numbers
++            # only); `not: {type: number}` removes both.
++            allowed = set(_JSON_TYPES) - excluded
++            if allowed:
++                constraints.append(allowed)
++
++    if "if" in schema and ("then" in schema or "else" in schema):
++        if_types = infer_schema_types(schema["if"], root, _seen, depth)
++        then_types = infer_schema_types(schema.get("then"), root, _seen, depth)
++        if then_types is not None and if_types is not None:
++            then_types = (then_types & if_types) or then_types
++        elif then_types is None:
++            then_types = if_types
++        else_types = infer_schema_types(schema.get("else"), root, _seen, depth)
++        if then_types is not None and else_types is not None:
++            constraints.append(then_types | else_types)
++
++    if not constraints:
++        return None
++    result = set(constraints[0])
++    for types in constraints[1:]:
++        result &= types
++    if not result:
++        result = set().union(*constraints)
++    return result
++
++
++# -- Root-level combinators in a tool's parameters schema -------------------
++
++_ROOT_COMBINATOR_KEYWORDS = ("$ref", "allOf", "anyOf", "oneOf")
++_MAX_ROOT_VARIANTS = 64
++_SCALAR_TYPES = frozenset({"string", "integer", "number", "boolean", "null"})
++
++
++class _RootVariant:
++    """One way an object can satisfy a schema: property schemas + required."""
++
++    __slots__ = ("props", "required")
++
++    def __init__(self, props: dict[str, list[dict]], required: set[str]) -> None:
++        self.props = props
++        self.required = required
++
++    def merge(self, other: "_RootVariant") -> "_RootVariant":
++        props = {k: list(v) for k, v in self.props.items()}
++        for key, schemas in other.props.items():
++            bucket = props.setdefault(key, [])
++            bucket.extend(s for s in schemas if s not in bucket)
++        return _RootVariant(props, self.required | other.required)
++
++    def property_map(self) -> dict[str, dict]:
++        return {
++            key: schemas[0] if len(schemas) == 1 else {"allOf": schemas}
++            for key, schemas in self.props.items()
++        }
++
++
++def _cross_variants(
++    left: list[_RootVariant], right: list[_RootVariant]
++) -> list[_RootVariant]:
++    return [a.merge(b) for a in left for b in right][:_MAX_ROOT_VARIANTS]
++
++
++def _root_variants(
++    schema: Any, root: Any, seen: frozenset[str] = frozenset(), depth: int = 0
++) -> list[_RootVariant]:
++    """Expand an object schema into the property maps it allows.
++
++    `$ref` chains are resolved against *root* (a ref already being expanded
++    contributes nothing), `allOf` members are merged into every variant, and
++    each `anyOf`/`oneOf` branch becomes a variant of its own.
++    """
++    if not isinstance(schema, dict) or depth > _MAX_SCHEMA_DEPTH:
++        return [_RootVariant({}, set())]
++    ref = schema.get("$ref")
++    if isinstance(ref, str):
++        if ref in seen:
++            return [_RootVariant({}, set())]
++        seen = seen | {ref}
++        schema = resolve_schema_ref(schema, root)
++    props = schema.get("properties")
++    required = schema.get("required")
++    variants = [
++        _RootVariant(
++            {k: [v] for k, v in props.items() if isinstance(v, dict)}
++            if isinstance(props, dict)
++            else {},
++            {r for r in required if isinstance(r, str)}
++            if isinstance(required, list)
++            else set(),
++        )
++    ]
++    members = schema.get("allOf")
++    if isinstance(members, list):
++        for member in members:
++            variants = _cross_variants(
++                variants, _root_variants(member, root, seen, depth + 1)
++            )
++    for keyword in ("anyOf", "oneOf"):
++        branches = schema.get(keyword)
++        if isinstance(branches, list) and branches:
++            alternatives: list[_RootVariant] = []
++            for branch in branches:
++                alternatives.extend(_root_variants(branch, root, seen, depth + 1))
++            variants = _cross_variants(variants, alternatives)
++    return variants
++
++
++def _schemas_agree(schemas: list[dict], root: Any) -> bool:
++    """True if every schema coerces a value the same way.
++
++    Scalar-only schemas agree when their inferred types match.  Anything that
++    may be an object or array (or is unconstrained) must be identical, since
++    its nested `properties`/`items` drive coercion too.
++    """
++    first = schemas[0]
++    if all(s == first for s in schemas[1:]):
++        return True
++    types = [infer_schema_types(s, root) for s in schemas]
++    return (
++        types[0] is not None
++        and types[0] <= _SCALAR_TYPES
++        and all(t == types[0] for t in types[1:])
++    )
++
++
++def _expand_root(params: dict) -> list[_RootVariant] | None:
++    """Variants of a combinator root, or None for a plain `properties` root."""
++    if not any(k in params for k in _ROOT_COMBINATOR_KEYWORDS):
++        return None
++    return _root_variants(params, params)
++
++
++def root_schema_conflict_keys(params: Any) -> frozenset[str]:
++    """Keys declared differently by the branches of a root `anyOf`/`oneOf`.
++
++    How such a key is coerced depends on which branch the emitted keys
++    select, so its value is only final once every key is known.
++    """
++    if not isinstance(params, dict):
++        return frozenset()
++    variants = _expand_root(params)
++    if not variants or len(variants) < 2:
++        return frozenset()
++    maps = [v.property_map() for v in variants]
++    return frozenset(
++        key
++        for key in {k for m in maps for k in m}
++        if not _schemas_agree([m[key] for m in maps if key in m], params)
++    )
++
++
++def root_schema_properties(
++    params: Any, keys: Iterable[str] | None = None
++) -> dict[str, Any]:
++    """Return the property schemas of a tool's parameters schema *params*.
++
++    A plain root returns its `properties` unchanged.  A root that is, or
++    contains, `$ref`/`allOf`/`anyOf`/`oneOf` is normalized first: `$ref`
++    chains are resolved (with a cycle guard), `allOf` members are merged (a key
++    declared by several members gets an `allOf` of its schemas, i.e. the
++    intersection of their types), and `anyOf`/`oneOf` branches are expanded.
++    Property schemas keep their `$ref`s, which resolve against *params*.
++
++    With several branches, a key declared the same way wherever it appears
++    gets that schema whichever branch applies.  A key declared differently
++    (:func:`root_schema_conflict_keys`) takes the schema of the branch that
++    best covers *keys*, the parameter names the model emitted: the most
++    emitted keys declared, then every emitted key declared, then every
++    required key emitted.  On a tie (or with *keys* None) where the tied
++    branches still disagree, the key is unconstrained (`{}`): its value is
++    decoded when it is a non-string JSON value and kept as a string otherwise.
++    """
++    if not isinstance(params, dict):
++        return {}
++    variants = _expand_root(params)
++    if variants is None:
++        props = params.get("properties")
++        return props if isinstance(props, dict) else {}
++    maps = [v.property_map() for v in variants]
++    if len(maps) == 1:
++        return maps[0]
++
++    candidates = list(range(len(maps)))
++    if keys is not None:
++        emitted = set(keys)
++
++        def score(i: int) -> tuple[int, bool, bool]:
++            declared = emitted & maps[i].keys()
++            return (
++                len(declared),
++                len(declared) == len(emitted),
++                variants[i].required <= emitted,
++            )
++
++        best = max(score(i) for i in candidates)
++        candidates = [i for i in candidates if score(i) == best]
++
++    result: dict[str, Any] = {}
++    for m in maps:
++        for key in m:
++            if key in result:
++                continue
++            defs = [mm[key] for mm in maps if key in mm]
++            if _schemas_agree(defs, params):
++                result[key] = defs[0]
++                continue
++            chosen = [maps[i][key] for i in candidates if key in maps[i]]
++            if len(chosen) == len(candidates) and _schemas_agree(chosen, params):
++                result[key] = chosen[0]
++            else:
++                result[key] = {}
++    return result
++
++
++_NO_VALUE: Any = object()
++
++
++def _decode_json_value(value: str) -> Any:
++    """`json.loads(value)` if it is a finite non-string JSON value, else `_NO_VALUE`."""
++    try:
++        parsed = json.loads(value)
++    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
++        return _NO_VALUE
++    if isinstance(parsed, str) or not _is_json_finite(parsed):
++        return _NO_VALUE
++    return parsed
++
++
++def coerce_untyped_value(value: str) -> Any:
++    """Decode a raw value whose schema says nothing about its type.
++
++    Returns the `json.loads` result when *value* is a JSON object, array,
++    number, boolean or null; otherwise (plain text, a JSON string literal,
++    invalid or non-finite JSON) returns *value* unchanged.
++
++    Only meaningful for raw-text argument formats (see
++    `ParserEngineConfig.raw_text_arg_values`): a value the model encoded as
++    a string must never be reinterpreted this way.
++    """
++    parsed = _decode_json_value(value)
++    return value if parsed is _NO_VALUE else parsed
++
++
++
++@dataclass
++class CoercionCandidates:
++    """Interpretations of one argument value, most preferred first.
++
++    The caller keeps the first candidate that validates against the
++    property schema.  `fallback` is the index to use when none validates,
++    `unverified` the index to use when validation is impossible (no
++    `jsonschema`, an unknown `type` name, an unresolvable or cyclic `$ref`).
++    """
++
++    values: list[Any]
++    fallback: int = 0
++    unverified: int = 0
++
++
++def _value_key(value: Any) -> str:
++    # Type-exact identity: 1, 1.0, True and "1" are all different.
++    return f"{type(value).__name__}:{json.dumps(value, sort_keys=True)}"
++
++
++def _candidates(values: list[Any], fallback: Any, unverified: Any) -> CoercionCandidates:
++    unique: list[Any] = []
++    keys: list[str] = []
++    for v in values:
++        if v is _NO_VALUE:
++            continue
++        key = _value_key(v)
++        if key not in keys:
++            keys.append(key)
++            unique.append(v)
++    return CoercionCandidates(
++        unique, keys.index(_value_key(fallback)), keys.index(_value_key(unverified))
++    )
++
++
++def schema_coercion_candidates(
++    value: Any,
++    schema: Any,
++    root: Any = None,
++    raw_text: bool = False,
++) -> CoercionCandidates:
++    """List the ways a scalar argument *value* may be read under *schema*.
++
++    *value* is a decoded JSON scalar (str, int, float, bool or None) from
++    the parser's argument converter.  *raw_text* says the format carries no
++    type information (Qwen3/MiMo `<parameter=x>5</parameter>`), so a string
++    is raw text whose type only the schema can tell.  Otherwise a string
++    value was explicitly encoded as a string by the model (a JSON string
++    literal, Gemma4 `<|"|>5<|"|>`, DeepSeek `string="true"`, ...).
++
++    - The schema's types are known to the pre-existing heuristic
++      (:func:`extract_types_from_schema` gives more than `string`): that
++      heuristic's result comes first and is also the fallback, so a result
++      that validates is exactly what it was before.
++    - The schema gives no type information (`{}`, a description, a
++      dangling or cyclic `$ref`, `not` of a non-type schema, ...): raw text
++      may be any JSON value (decoded first, else kept as text); an
++      explicitly encoded value is never changed.
++    - Otherwise (types inferred through `$ref`, `not`, `const`,
++      `if/then/else`, ...): raw text tries the type-directed coercions
++      before the text itself; an explicitly encoded value is tried as is
++      first.  If nothing validates, the first candidate whose JSON type the
++      schema allows is used, else the value unchanged.
++    """
++    types = infer_schema_types(schema, root)
++    legacy = set(extract_types_from_schema(schema))
++    legacy_known = legacy != {"string"}
++
++    if isinstance(value, str):
++        text = value
++        decoded = _decode_json_value(text)
++        if not legacy_known and types is None:
++            if not raw_text:
++                return _candidates([value], value, value)
++            return _candidates([decoded, value], value, coerce_untyped_value(value))
++        allowed = types if types is not None else legacy
++        primary = coerce_to_schema_type(text, sorted(allowed))
++        # Under an unconstrained branch (`anyOf: [{}, {type: null}]`) raw
++        # text may be any JSON value.
++        any_type = types is None and raw_text
++        typed = (
++            decoded
++            if any_type or (decoded is not _NO_VALUE and json_type_of(decoded) in allowed)
++            else _NO_VALUE
++        )
++        if legacy_known:
++            first = coerce_to_schema_type(text, sorted(legacy))
++            values = [first, primary, typed, value]
++        else:
++            values = [primary, typed, value] if raw_text else [value, primary, typed]
++        if raw_text:
++            # Raw text is only kept as text when no typed reading fits.
++            values = [v for v in values if not isinstance(v, str) or v != value]
++            values.append(value)
++        if any_type:
++            allowed = _JSON_TYPES
++    else:
++        text = json.dumps(value, ensure_ascii=False)
++        if not legacy_known and types is None:
++            return _candidates([value], value, value)
++        allowed = types if types is not None else legacy
++        primary = coerce_to_schema_type(text, sorted(allowed))
++        as_text = text if "string" in allowed else _NO_VALUE
++        if legacy_known:
++            first = coerce_to_schema_type(text, sorted(legacy))
++            if type(first) is type(value) and first == value:
++                first = value
++            values = [first, value, primary, as_text]
++        else:
++            values = [value, primary, as_text]
++
++    # Nothing validates: keep the first reading whose JSON type the schema
++    # allows (for a declared type, the pre-existing coercion), else the value.
++    consistent = next(
++        (v for v in values if v is not _NO_VALUE and json_type_of(v) in allowed),
++        value,
++    )
++    return _candidates(values, consistent, consistent)
++
++
++class SchemaChecker:
++    """Validate values against subschemas of one tool's parameters schema.
++
++    `$ref`s in a subschema resolve against the whole parameters schema
++    (*root*), so `#/$defs/X`, `#/definitions/X` and `#` all work.
++    """
++
++    def __init__(self, root: Any) -> None:
++        self._root = root if isinstance(root, dict) else {}
++        self._validator: Any = None
++        self._unavailable = False
++
++    def is_valid(self, value: Any, schema: Any) -> bool | None:
++        """Whether *value* validates against *schema*; None if unknown."""
++        if self._unavailable or not isinstance(schema, dict):
++            return None
++        try:
++            if self._validator is None:
++                from jsonschema.validators import Draft202012Validator, validator_for
++
++                cls = validator_for(self._root, default=Draft202012Validator)
++                self._validator = cls(self._root)
++            return bool(self._validator.evolve(schema=schema).is_valid(value))
++        except ImportError:
++            self._unavailable = True
++            return None
++        except Exception:
++            # Unknown `type` names, unresolvable or cyclic `$ref`s, invalid
++            # schemas: no verdict.
++            return None
++
++
+ _TYPE_ALIASES: dict[str, str] = {
+     "str": "string",
+     "text": "string",

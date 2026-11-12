@@ -4,8 +4,9 @@
 
 The coordinator is exercised over lightweight fake lane schedulers: a real
 ``TTScheduler`` needs a device KV cache config, but the coordinator only relies
-on a small surface of each lane (``waiting`` / ``skipped_waiting`` / ``running``
-length, forced-mode scheduling, and ``update_from_output``).
+on a small surface of each lane (``waiting`` / ``kv_holding_waiting`` /
+``running``, ``get_request_counts``, forced-mode scheduling, and
+``update_from_output``).
 """
 
 import collections
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.request import RequestStatus
 
@@ -42,17 +44,20 @@ class FakeLane:
     fallback.
     """
 
+    # Upstream's own count, so the fake fails loudly if vLLM moves the queues.
+    get_request_counts = Scheduler.get_request_counts
+
     def __init__(
         self,
         waiting=0,
         running=0,
-        skipped_waiting=0,
+        kv_holding_waiting=0,
         partial_prefills=0,
         pending_finished=(),
         owns=(),
     ):
         self.waiting = [object()] * waiting
-        self.skipped_waiting = [object()] * skipped_waiting
+        self.kv_holding_waiting = [object()] * kv_holding_waiting
         self.running = [
             SimpleNamespace(is_prefill_chunk=False) for _ in range(running)
         ] + [SimpleNamespace(is_prefill_chunk=True) for _ in range(partial_prefills)]
@@ -148,11 +153,13 @@ def test_negotiate_decode_when_no_lane_wants_prefill():
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.DECODE_ONLY
 
 
-def test_negotiate_prefill_when_lane_has_only_grammar_blocked_request():
-    # Lane 1's only pending work is a grammar-blocked structured-output request
-    # held in skipped_waiting (waiting is empty). It must still force prefill so
-    # the base scheduler can revisit and promote it after the grammar is ready.
-    coordinator = _make_coordinator([FakeLane(running=2), FakeLane(skipped_waiting=1)])
+def test_negotiate_prefill_when_lane_has_only_kv_holding_request():
+    # Lane 1's only pending work holds KV blocks while it waits (for example a
+    # streaming-input session that received its next chunk), so it sits in
+    # kv_holding_waiting and waiting is empty. It must still force prefill.
+    coordinator = _make_coordinator(
+        [FakeLane(running=2), FakeLane(kv_holding_waiting=1)]
+    )
     assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY
 
 
@@ -931,3 +938,17 @@ def test_merge_carries_every_lanes_finishing_requests():
     merged = merge_lane_scheduler_outputs(outs)
     assert get_tt_finishing_req_ids(merged) == ("a", "c", "d")
     assert get_tt_finishing_req_ids(merge_lane_scheduler_outputs(outs[1:2])) == ()
+
+
+def test_coordinator_reads_the_queues_of_real_lane_schedulers():
+    # The fakes above mirror a lane's queues; this drives the same reads on real
+    # lane schedulers, so a change to vLLM's waiting-queue layout fails here.
+    from tests.test_block_scheduler import _request as _real_request
+    from tests.test_block_scheduler import _scheduler as _real_scheduler
+
+    lanes = [_real_scheduler(output_width=1, max_num_seqs=2) for _ in range(2)]
+    lanes[0].add_request(_real_request(4, request_id="A", prompt_length=32))
+    coordinator = _make_coordinator(lanes, per_lane_max=2)
+
+    assert coordinator._pick_lane() == 1
+    assert coordinator._negotiate_forced_mode() == TTSchedulingMode.PREFILL_ONLY

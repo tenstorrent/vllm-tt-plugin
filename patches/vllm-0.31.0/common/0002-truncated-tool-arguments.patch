@@ -1,0 +1,200 @@
+Truncated tool arguments: a tool call cut off by max_tokens streams valid JSON
+equal to the non-streamed arguments, a repeated parameter keeps its first value,
+and the non-streamed response keeps finish_reason="length". See README.md.
+
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index f22fed1..c8fb576 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -1093,11 +1093,13 @@ class OpenAIServingChat(GenerateBaseServing):
+ 
+             # In OpenAI's API, when a tool is called, the finish_reason is:
+             # "tool_calls" for "auto" or "required" tool calls,
+-            # and "stop" for named tool calls.
+-            is_finish_reason_tool_calls = auto_tools_called or (
+-                request.tool_choice
+-                and request.tool_choice == "required"
+-                and output.finish_reason == "stop"
++            # and "stop" for named tool calls. A call cut off by max_tokens
++            # keeps "length", as streaming already does (finish_reason part of
++            # vllm-project/vllm#59324).
++            engine_stopped = (output.finish_reason or "stop") == "stop"
++            is_finish_reason_tool_calls = engine_stopped and (
++                auto_tools_called
++                or (request.tool_choice and request.tool_choice == "required")
+             )
+ 
+             routed_experts_b64 = (
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 65b3383..e4673bd 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -1177,23 +1177,96 @@ class ParserEngine(Parser):
+             return None
+ 
+         slot = self._tool_slots[idx]
++        prev = slot.streamed_json
+         try:
+             final_json = converter(slot.args, False)
+         except (json.JSONDecodeError, ValueError, TypeError):
+             logger.debug("arg converter failed (flush): %s", slot.args[:80])
+-            return None
++            return self._close_streamed_json(slot, prev)
+ 
+         if final_json:
+             final_json = self._fix_arg_types(final_json, slot.name)
+ 
+-        prev = slot.streamed_json
+         if final_json and len(final_json) > len(prev):
+-            if prev and not final_json.startswith(prev):
+-                return None
+-            diff = final_json[len(prev) :]
+-            slot.streamed_json = final_json
+-            return diff
+-        return None
++            if not prev or final_json.startswith(prev):
++                diff = final_json[len(prev) :]
++                slot.streamed_json = final_json
++                return diff
++        elif final_json == prev:
++            return None
++        # The final arguments do not extend what was already streamed. Never
++        # leave the client with an unterminated prefix: close it instead.
++        return self._close_streamed_json(slot, prev)
++
++    def _close_streamed_json(self, slot: ToolCallSlot, prev: str) -> str | None:
++        """Close the streamed argument prefix *prev* into valid JSON.
++
++        Used when the flush result cannot extend *prev*. Returns the suffix to
++        stream, or ``None`` when *prev* is empty or has no completion.
++        (Ported from the open upstream PR vllm-project/vllm#53739.)
++        """
++        if not prev:
++            return None
++        suffix = self._json_prefix_terminator(prev)
++        logger.warning(
++            "Final tool-call arguments do not extend the streamed prefix; "
++            "closing the streamed JSON with %r (tool %r).",
++            suffix,
++            slot.name,
++        )
++        if not suffix:
++            return None
++        slot.streamed_json = prev + suffix
++        return suffix
++
++    @staticmethod
++    def _json_prefix_terminator(prefix: str) -> str:
++        """Return the shortest suffix that makes *prefix* parse, or ``""``.
++
++        Closes an open string, completes a dangling ``"key": `` with ``null``
++        and closes every open object/array. Returns ``""`` if *prefix* already
++        parses or cannot be completed without inventing content.
++        """
++        in_string = False
++        escape = False
++        stack: list[str] = []
++        for c in prefix:
++            if escape:
++                escape = False
++                continue
++            if in_string:
++                if c == "\\":
++                    escape = True
++                elif c == '"':
++                    in_string = False
++                continue
++            if c == '"':
++                in_string = True
++            elif c == "{":
++                stack.append("}")
++            elif c == "[":
++                stack.append("]")
++            elif c in "}]" and stack:
++                stack.pop()
++        if escape:
++            # A lone trailing backslash cannot be completed without inventing
++            # the character it escapes.
++            return ""
++        suffix = ""
++        if in_string:
++            suffix += '"'
++        else:
++            tail = prefix.rstrip()
++            if tail.endswith(":") or (tail.endswith(",") and stack and stack[-1] == "]"):
++                suffix += "null"
++        suffix += "".join(reversed(stack))
++        if not suffix:
++            return ""
++        try:
++            json.loads(prefix + suffix)
++        except (json.JSONDecodeError, ValueError):
++            return ""
++        return suffix
+ 
+     _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]*)"')
+ 
+diff --git a/vllm/parser/mimo.py b/vllm/parser/mimo.py
+index b1c37dd..492be38 100644
+--- a/vllm/parser/mimo.py
++++ b/vllm/parser/mimo.py
+@@ -15,11 +15,17 @@ from vllm.parser.qwen3 import (
+ 
+ 
+ def _mimo_arg_converter(raw_args: str, partial: bool) -> str:
+-    params = {m.group(1): m.group(2) for m in _PARAM_RE.finditer(raw_args)}
+-    if partial:
+-        match = _PARTIAL_PARAM_RE.search(_PARAM_RE.sub("", raw_args))
+-        if match and match.group(1):
+-            params[match.group(1)] = match.group(2)
++    # Same rules as ``_qwen3_arg_converter``, without the newline trim: a
++    # repeated key keeps its first value (vllm-project/vllm#65775), and the
++    # open trailing parameter of a call cut off by max_tokens is kept in both
++    # modes, so the final arguments extend what streaming already sent.
++    del partial
++    params: dict[str, str] = {}
++    for m in _PARAM_RE.finditer(raw_args):
++        params.setdefault(m.group(1), m.group(2))
++    match = _PARTIAL_PARAM_RE.search(_PARAM_RE.sub("", raw_args))
++    if match and match.group(1):
++        params.setdefault(match.group(1), match.group(2))
+     return json.dumps(params, ensure_ascii=False)
+ 
+ 
+diff --git a/vllm/parser/qwen3.py b/vllm/parser/qwen3.py
+index aadfe64..22e4797 100644
+--- a/vllm/parser/qwen3.py
++++ b/vllm/parser/qwen3.py
+@@ -72,16 +72,23 @@ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
+     for match in _PARAM_RE.finditer(raw_args):
+         name = match.group(1)
+         value = match.group(2)
+-        params[name] = _trim_wrapping_newlines(value)
++        # A repeated key keeps its first value: that is the value streaming
++        # has already sent, so streamed and non-streamed arguments agree and
++        # stay valid JSON (backport of vllm-project/vllm#65775).
++        params.setdefault(name, _trim_wrapping_newlines(value))
+ 
+-    if partial:
+-        remaining = _PARAM_RE.sub("", raw_args)
+-        m = _PARTIAL_PARAM_RE.search(remaining)
+-        if m:
+-            name = m.group(1)
+-            value = m.group(2)
+-            if name:
+-                params[name] = _trim_wrapping_newlines(value)
++    # The open trailing parameter (no closing tag) is kept in both modes. A
++    # finished call only has one when generation was cut off (max_tokens) or
++    # the model omitted ``</parameter>``. Keeping its partial value makes the
++    # final conversion extend what was already streamed, instead of dropping
++    # the parameter only in the final (non-streaming / flush) result.
++    remaining = _PARAM_RE.sub("", raw_args)
++    m = _PARTIAL_PARAM_RE.search(remaining)
++    if m:
++        name = m.group(1)
++        value = m.group(2)
++        if name:
++            params.setdefault(name, _trim_wrapping_newlines(value))
+ 
+     return json.dumps(params, ensure_ascii=False)
+ 
