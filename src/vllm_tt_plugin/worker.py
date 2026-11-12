@@ -26,9 +26,11 @@ from vllm.v1.core.kv_cache_utils import (
     get_uniform_page_size,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -46,6 +48,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.mamba_state import check_mamba_launch
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
@@ -728,6 +731,82 @@ def _upstream_admission_blocks(
     return -(-one_request_bytes // bytes_per_block) + null_block
 
 
+def _mamba_hybrid_num_blocks(
+    vllm_config: VllmConfig,
+    kv_cache_specs: dict[str, KVCacheSpec],
+    max_tokens_all_users: int,
+    max_batch: int,
+) -> int:
+    """Pool size, in blocks, for a model with ``MambaSpec`` layers.
+
+    vLLM overlays every KV cache group on the same memory, so one block costs
+    one page in every layer slot, whichever group owns it. The page is the
+    unified page size of all groups: vLLM pads the smaller pages, which can be
+    the attention page. ``max_tokens_all_users`` counts attention tokens, so
+    this converts it to bytes per layer slot with the attention layers' bytes
+    per token and divides by the page. A token count divided by the block size
+    would ignore that padding.
+
+    On top of that come one block per running request in every attention
+    group, for the output reservation, the blocks every running request
+    holds in each Mamba group, which the token budget does not count, and
+    vLLM's null block 0, which BlockPool keeps out of every request.
+
+    The pool stays within that budget. When it cannot admit one request at
+    ``max_model_len``, this raises; the sliding-window path instead grows its
+    pool to upstream's admission floor. ``--max-model-len -1`` keeps the
+    budget and lets vLLM fit the length to it.
+    """
+    model_config = vllm_config.model_config
+    check_mamba_launch(
+        vllm_config,
+        [spec for spec in kv_cache_specs.values() if isinstance(spec, MambaSpec)],
+    )
+    _, groups = _kv_cache_groups_for_sizing(vllm_config, dict(kv_cache_specs))
+    page_size = get_uniform_page_size(group.kv_cache_spec for group in groups)
+    attention_specs = [
+        g.kv_cache_spec for g in groups if isinstance(g.kv_cache_spec, AttentionSpec)
+    ]
+    bytes_per_token = {
+        spec.real_page_size_bytes // spec.block_size for spec in attention_specs
+    }
+    if len(bytes_per_token) != 1:
+        raise ValueError(
+            "Sizing the TT KV pool of a MambaSpec model needs one attention "
+            "byte count per token and layer, got "
+            f"{sorted(bytes_per_token)} from attention specs {attention_specs}"
+        )
+    attention_blocks = -(-max_tokens_all_users * bytes_per_token.pop() // page_size)
+    output_reservation_blocks = max_batch * len(attention_specs)
+    mamba_blocks = max_batch * sum(
+        -(-g.kv_cache_spec.max_memory_usage_bytes(vllm_config) // page_size)
+        for g in groups
+        if isinstance(g.kv_cache_spec, MambaSpec)
+    )
+    null_block = 1
+    num_tt_blocks = (
+        attention_blocks + output_reservation_blocks + mamba_blocks + null_block
+    )
+    if getattr(model_config, "original_max_model_len", None) == -1:
+        return num_tt_blocks
+    admission_floor = (
+        _upstream_admission_blocks(vllm_config, kv_cache_specs)
+        + output_reservation_blocks
+    )
+    if admission_floor > num_tt_blocks:
+        raise ValueError(
+            f"The TT KV pool of this MambaSpec model holds {num_tt_blocks} "
+            f"blocks (max_tokens_all_users={max_tokens_all_users}, "
+            f"max_num_seqs={max_batch}), but one request at max_model_len="
+            f"{model_config.max_model_len} needs {admission_floor} blocks "
+            f"(including the null block and {output_reservation_blocks} "
+            "output-reservation blocks). Lower --max-model-len, launch with "
+            "--max-model-len -1 to fit it to the pool, or raise the model's "
+            "get_max_tokens_all_users budget."
+        )
+    return num_tt_blocks
+
+
 def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -> int:
     """
     Used to set the number of available blocks for the TT KV cache as we
@@ -795,6 +874,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # regardless of how parallelism is expressed.
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+    auto_fit = getattr(model_config, "original_max_model_len", None) == -1
+    model_specs = kv_cache_spec_from_model_class(model_class, vllm_config)
+    # A model with MambaSpec layers is sized from bytes, not tokens.
+    if model_specs is not None and any(
+        isinstance(spec, MambaSpec) for spec in model_specs.values()
+    ):
+        return _mamba_hybrid_num_blocks(
+            vllm_config, model_specs, max_tokens_all_users, max_batch
+        )
     per_user_output_reservation = max(cache_config.block_size, output_tokens_per_step)
     max_tokens_all_users += per_user_output_reservation * max_batch
 
@@ -837,12 +925,7 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # Raise the pool to upstream's admission requirement plus the output
     # reservation. Auto-fit (-1) keeps the model budget: vLLM fits the length
     # to it instead.
-    specs = (
-        kv_cache_spec_from_model_class(model_class, vllm_config)
-        if hybrid_kv_cache_groups_enabled
-        and getattr(model_config, "original_max_model_len", None) != -1
-        else None
-    )
+    specs = model_specs if hybrid_kv_cache_groups_enabled and not auto_fit else None
     if specs:
         output_reservation_blocks = (
             math.ceil(per_user_output_reservation / cache_config.block_size) * max_batch

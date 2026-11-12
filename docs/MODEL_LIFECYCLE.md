@@ -65,6 +65,12 @@ A request omitted from a prefill-only step can still own live decode state;
 absence from one submitted batch does not authorize the adapter to release
 that request's state.
 
+An adapter with `MambaSpec` groups keeps each request's recurrent state in vLLM blocks, not in device-state slots, and `TTModelRunner` addresses those blocks per row in every step through `mamba_state` (see [recurrent state blocks](MODEL_EXECUTION.md#recurrent-state-blocks)). So:
+
+- Row movement needs no state gather: a moved row's `mamba_state` names the same blocks as before. `slot_remap` and `note_state_slots_moved` still apply to any slot-owned state the adapter keeps.
+- Completion and cancellation need no release: vLLM frees the request's blocks, and the next owner of a block starts from zero state or from state it writes itself.
+- A preempted request loses its blocks. vLLM schedules its resume as a prefill from `start_pos` 0 over its prompt and generated tokens, so the adapter rebuilds the state from zero state, not from a block.
+
 Lane-DP uses scheduler-owned stable slots, and a request's row is its slot
 for its whole life. `TTLaneInputBatch.apply_step_plan` calls `release_request`
 with that row for every request whose row the step frees -- a finished
@@ -100,6 +106,20 @@ Sources: `_alloc_prefill_state_slots`, `_decode_state_slot_remap`,
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
 `TTLaneInputBatch.apply_step_plan` in
 [input_batch.py](../src/vllm_tt_plugin/input_batch.py).
+
+## KV cache block operations
+
+vLLM can ask the worker to change KV cache blocks before a step's forward. The adapter owns the device buffers, so `TTModelRunner._zero_new_kv_cache_blocks` hands the operation to an adapter hook. It runs in `TTModelRunner.build_model_input`, after `_update_states` and before `TTModelRunner` builds the step's inputs. Block ids are vLLM block ids; with `MambaSpec` groups, one block id addresses one page in every layer slot (see [recurrent state](MODEL_SETUP.md#recurrent-state-mambaspec)).
+
+| Hook | Adapter responsibility |
+|---|---|
+| `zero_kv_cache_blocks(kv_cache=..., block_ids=[...])` | Zero each listed block in every KV buffer. vLLM lists the blocks it newly allocated to attention groups this step (`SchedulerOutput.new_block_ids_to_zero`). It sends them when `KVCacheConfig.needs_kv_cache_zeroing` is true, which holds with `MambaSpec` layers: a reused block can hold recurrent-state bytes that decode to NaN or Inf. `TTModelRunner` passes the whole list. |
+
+`kv_cache` is the object the adapter's KV allocator returned. Enqueue the zeroing on the device before the step's forward, so the forward reads zeroes. `TTModelRunner` does not wait for the operation to complete: the hook can return after it enqueues the work, and the adapter must order it before every later device read or write of the same blocks, including the step's forward. An adapter with `MambaSpec` groups must implement `zero_kv_cache_blocks`; `TTModelRunner.initialize_kv_cache` raises otherwise. For an adapter without `MambaSpec` groups, `TTModelRunner` does not call the hook.
+
+vLLM also sends `SchedulerOutput.kv_cache_block_copies`, but queues copies only for prefix-cache hits. Prefix caching stays off with `MambaSpec` groups, so `TTModelRunner` raises if a copy reaches an adapter with `MambaSpec` groups.
+
+Sources: `_zero_new_kv_cache_blocks` and `initialize_kv_cache` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Shutdown
 

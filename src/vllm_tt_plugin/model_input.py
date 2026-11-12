@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
+from vllm_tt_plugin.mamba_state import MambaStepState
+
 
 @dataclass(frozen=True)
 class TTCompactedHostLogits:
@@ -111,7 +113,8 @@ class TTModelInput:
     input_positions: torch.Tensor
     prompt_lens: list[int] | None
     # Group-0 block table, retained as a tensor for back-compat with the
-    # padding paths that read it as ``block_tables``.
+    # padding paths that read it as ``block_tables``. With MambaSpec groups it
+    # is the first attention group's table.
     # Hybrid models must additionally consult ``block_tables_per_group``
     # below; legacy single-group models can continue to use this field.
     block_tables: torch.Tensor
@@ -174,6 +177,10 @@ class TTModelInput:
     # Prefill-only: the device state slot each prefilling row writes to. Global for
     # single-process DP (supplied by the scheduler-owned step plan), local otherwise.
     prefill_empty_slots: list[int] | None = None
+
+    # MambaSpec groups only, else ``None``: the recurrent-state inputs, one
+    # ``MambaGroupState`` per group (``MambaCacheGroups.step_state``).
+    mamba_state: MambaStepState | None = None
 
     # Decode-only, speculation only. ``draft_token_ids`` is ``[B, K]``, the
     # drafts the block's columns 1..K carry, kept alongside the block because
