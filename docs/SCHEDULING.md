@@ -220,6 +220,42 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+#### Multimodal requests of a model with MambaSpec layers
+
+A model that keeps recurrent state in `MambaSpec` blocks (the Qwen3.8
+adapter) builds the M-RoPE positions and vision rows of a prefill step from
+that step's tokens, and starts a multimodal prompt at position 0. A chunk end
+inside a multimodal item would cut an item's positions, and a prefix-cache hit
+would start the prompt in its middle. So for such a model, and only for it:
+
+- `TTScheduler.add_request` sets `skip_reading_prefix_cache` on a request
+  with multimodal items, so it never reads the prefix cache. (vLLM's
+  `strip_covered_mm_data` would also drop the pixels of an item a hit
+  covers.) vLLM still caches its blocks. Their hashes carry the item
+  identifiers from the first item on, so only the text before the first item
+  can match another request, and the model writes that state like any other.
+- `TTScheduler._multimodal_prefill_grant` gives the first prefill chunk of
+  such a request every multimodal item: the whole prompt when it fits what is
+  left of the step, past `long_prefill_token_threshold`. When it fits an empty
+  step but not this one, the request waits for the next step. A request
+  replayed after preemption carries its output tokens and can outgrow one
+  step; its first chunk then ends on a KV block boundary at or after the end
+  of its last item, and the rest follows as text chunks. What is left of a
+  step is counted from the grants of the step, tokens against
+  `max_num_scheduled_tokens` and tokens plus draft slots against
+  `max_num_batched_tokens`.
+- `TTScheduler._try_schedule_encoder_inputs` makes vLLM's encoder scheduling
+  all or nothing: when the encoder cache or the step's encoder budget cannot
+  take an item of the chunk, vLLM would end the chunk before that item; the
+  request waits instead.
+- `TTPlatform.validate_request` rejects a multimodal prompt longer than one
+  step (`multimodal_prefill_limit`): at most `max_num_scheduled_tokens` (when
+  set) and `max_num_batched_tokens` less the draft slots, rounded down to a
+  multiple of the KV block size when chunked prefill is on. The check covers
+  the whole prompt, not only its items.
+
+Text requests of the same launch keep prefix caching and chunked prefill.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.

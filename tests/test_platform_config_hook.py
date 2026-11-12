@@ -16,6 +16,7 @@ from vllm.config import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from tests.test_block_scheduler import LOCAL_MODEL_CONFIG, _stub_model_resolution
+from vllm_tt_plugin.config import get_tt_mamba_spec_layers
 
 
 def test_the_tt_class_decides_multimodal_input_support(monkeypatch):
@@ -122,18 +123,17 @@ def _launch(monkeypatch, *, mamba: bool, multimodal: bool) -> VllmConfig:
         )
 
 
-def test_multimodal_launch_of_a_mamba_model_turns_prefix_caching_and_chunking_off(
-    monkeypatch,
-):
-    """A MambaSpec model cannot continue a multimodal prompt yet, so a launch
-    that accepts multimodal input runs in mamba_cache_mode none with whole
-    prompts, as for a model that declares neither feature."""
+def test_multimodal_launch_of_a_mamba_model_keeps_align_and_chunking(monkeypatch):
+    """TTScheduler keeps a multimodal prompt of a MambaSpec model whole and
+    off the prefix cache, so the launch keeps both features for text."""
     config = _launch(monkeypatch, mamba=True, multimodal=True)
 
-    assert config.cache_config.enable_prefix_caching is False
-    assert config.cache_config.mamba_cache_mode == "none"
-    assert config.scheduler_config.enable_chunked_prefill is False
-    assert config.scheduler_config.long_prefill_token_threshold == 0
+    assert config.cache_config.enable_prefix_caching is True
+    assert config.cache_config.mamba_cache_mode == "align"
+    assert config.scheduler_config.enable_chunked_prefill is True
+    # VllmConfig.validate_block_size rejects the flag in mode align.
+    assert config.scheduler_config.disable_chunked_mm_input is False
+    assert get_tt_mamba_spec_layers(config) is True
 
 
 def test_text_only_launch_of_a_mamba_model_keeps_align_and_chunking(monkeypatch):
@@ -155,3 +155,4 @@ def test_multimodal_launch_of_a_model_without_mamba_spec_is_unchanged(monkeypatc
     assert config.cache_config.mamba_cache_mode == "align"
     assert config.scheduler_config.enable_chunked_prefill is True
     assert config.scheduler_config.disable_chunked_mm_input is True
+    assert get_tt_mamba_spec_layers(config) is False
