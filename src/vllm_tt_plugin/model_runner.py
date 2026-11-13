@@ -988,6 +988,7 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._proposed_draft_token_ids.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -1018,6 +1019,9 @@ class TTModelRunner:
                     f"this step: {sorted(scheduler_output.preempted_req_ids)}"
                 )
             self._release_model_request(req_id)
+            # A resume re-prefills, and its first decode verifies nothing, as
+            # ``Scheduler._preempt_request`` clears ``spec_token_ids``.
+            self._proposed_draft_token_ids.pop(req_id, None)
 
         # Only after the model released by slot: the release calls above read
         # the request's slot from the ownership map before it is dropped.
