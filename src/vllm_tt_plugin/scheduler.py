@@ -29,6 +29,7 @@ from vllm_tt_plugin.config import (
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
+from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1078,6 +1079,7 @@ class TTScheduler(AsyncScheduler):
         on its own SchedulerOutput because update_from_output must reconcile a
         commit against the decision that produced it.
         """
+        self._drop_admission_spec_padding(scheduler_output)
         super()._update_after_schedule(scheduler_output)
         output_frame_req_ids = tuple(
             req_id
@@ -1175,6 +1177,57 @@ class TTScheduler(AsyncScheduler):
                 request.num_output_placeholders += extra_placeholders
             decisions[req_id] = block_step
         set_tt_block_step_decisions(scheduler_output, decisions)
+
+    def _drop_admission_spec_padding(self, scheduler_output: SchedulerOutput) -> None:
+        """Schedule a request admitted with one uncomputed token for that token.
+
+        With speculative decoding on, ``Scheduler.schedule`` pads a request it
+        admits from a waiting queue with exactly one uncomputed token, such as
+        a new request whose prefix-cache hit covers all but its last token or a
+        preempted request that resumes with such a hit, to
+        ``1 + num_spec_tokens`` scheduled tokens and lists
+        ``[-1] * num_spec_tokens`` for it in ``scheduled_spec_decode_tokens``,
+        unless a partial prefill was scheduled before it in the step. The
+        padding keeps upstream's GPU runner on a uniform decode shape for its
+        CUDA graph: that runner clamps the ``-1`` input ids to 0, its rejection
+        sampler rejects every ``-1`` draft, so the request's token comes from
+        its last real token, and ``update_from_output`` rolls
+        ``num_computed_tokens`` back by the rejected drafts.
+
+        ``TTModelRunner`` runs every new and resumed request as a prefill, and
+        a prefill verifies no drafts: it would prefill ``num_spec_tokens``
+        positions past the request's last token from stale token ids and sample
+        the next token after the last of them. So the padding is removed here,
+        before the base class adds the scheduled tokens to
+        ``num_computed_tokens`` and to the asynchronous output placeholders.
+        The KV blocks vLLM allocated for the padded positions stay with the
+        request; those positions follow its last token, and only its own later
+        steps write them.
+        """
+        drafts_by_req = scheduler_output.scheduled_spec_decode_tokens
+        if not drafts_by_req:
+            return
+        admitted = {new.req_id for new in scheduler_output.scheduled_new_reqs}
+        admitted |= scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        for req_id in sorted(admitted & drafts_by_req.keys()):
+            drafts = drafts_by_req[req_id]
+            request = self.requests[req_id]
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            if (
+                any(token != PLACEHOLDER_TOKEN_ID for token in drafts)
+                or scheduled != 1 + len(drafts)
+                or request.num_computed_tokens + 1 != request.num_tokens
+            ):
+                raise RuntimeError(
+                    f"request {req_id} was admitted with {scheduled} scheduled "
+                    f"tokens and drafts {drafts} at {request.num_computed_tokens} "
+                    f"of {request.num_tokens} computed tokens; vLLM gives an "
+                    "admitted request drafts only as the padding of its one "
+                    "uncomputed token, which is all TTScheduler can remove"
+                )
+            del drafts_by_req[req_id]
+            scheduler_output.num_scheduled_tokens[req_id] = 1
+            scheduler_output.total_num_scheduled_tokens -= len(drafts)
 
     def _spec_frontier_ok(self, measured_len: int) -> bool:
         """Whether the model arms a session for a prefill of ``measured_len``.
