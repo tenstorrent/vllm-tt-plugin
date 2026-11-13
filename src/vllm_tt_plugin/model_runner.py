@@ -2064,27 +2064,33 @@ class TTModelRunner:
             if counts_by_row[row] < 1 or req_id in chained:
                 continue
             if declined:
-                # Erase, as ``_publish_draft`` does for an empty offer, for a
-                # request that still holds a row (the published-for rows of the
-                # full loop below).
-                if req_id in self.input_batch.req_id_to_index:
-                    self._proposed_draft_token_ids.pop(req_id, None)
+                # Erase, as ``_publish_draft`` does for an empty offer.
+                self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
             # indexed by the step's rows, which is the order the model answered
             # in; the persistent batch is indexed by where the request sits
             # now, and a completion between this step's submission and its
-            # commit makes ``condense`` slide a request into another row. A
-            # request with no row has no current length for max-model-length
-            # trimming, so this step records its retained accepted count but
-            # does not publish a proposal.
+            # commit makes ``condense`` slide a request into another row.
             batch_row = self.input_batch.req_id_to_index.get(req_id)
-            if batch_row is None:
+            if batch_row is not None:
+                num_tokens = int(self.input_batch.num_tokens[batch_row])
+            elif req_id in self._req_state_slot:
+                # A running request the step being built left out. Under
+                # asynchronous scheduling this commit runs at that step's
+                # build, and a prefill step leaves out every decode row. The
+                # proposal waits for the step that schedules the request
+                # again, as a synchronous launch's drafts wait on
+                # ``request.spec_token_ids``; without it that step verifies
+                # nothing for the row.
+                num_tokens = self.requests[req_id].num_tokens
+            else:
+                # Finished or preempted: no step continues this commit.
                 continue
             # Trimmed to what the request can still hold, the way the host
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
-            room = max_model_len - int(self.input_batch.num_tokens[batch_row])
+            room = max_model_len - num_tokens
             row_offered = num_drafts if offered_by_row is None else offered_by_row[row]
             usable = max(0, min(row_offered, room))
             self._publish_draft(
