@@ -140,6 +140,10 @@ class _LedgerDevice:
         self.steps: deque[SimpleNamespace] = deque()
         self.verifies = 0
         self.chained = 0
+        self.ordinary_decodes = 0
+        # Ordinary decodes submitted right after another ordinary decode.
+        self.plain_after_plain = 0
+        self.last_kind = None
         # The verify row whose device count is made wrong, for the guard test.
         self.miscount_at = -1
         self.miscounted_successors = 0
@@ -190,6 +194,7 @@ class _LedgerDevice:
             self.h.ledger.run_padding_row(g)
 
     def prefill_forward(self, tokens, prompt_lens, start_pos, mamba_state, **kwargs):
+        self.last_kind = "prefill"
         live = self._live()
         logits = torch.zeros((len(live), 1, VOCAB))
         rows = []
@@ -210,7 +215,7 @@ class _LedgerDevice:
                     self.h.ledger.write(g, block, prefix, position)
             if not bool(mamba_state.intermediate_prefill_mask[row]):
                 self.truth[req_id] = [*prefix, _target(prefix)]
-                logits[row, 0, _target(prefix)] = 1.0
+                logits[row, 0, _target(prefix)] = 1e4
         self._run_rows(mamba_state, rows)
         return logits
 
@@ -221,8 +226,17 @@ class _LedgerDevice:
                 "of this model reloads, its ordinary decode being host-answered"
             )
         live = self._live()
+        if kwargs.get("spec_mode") is not None:
+            self.last_kind = "verify"
         if kwargs.get("spec_mode") is None:
-            return self._narrow(live, tokens, start_pos, mamba_state)
+            self.ordinary_decodes += 1
+            self.plain_after_plain += self.last_kind == "plain"
+            self.last_kind = "plain"
+            logits = self._narrow(live, tokens, start_pos, mamba_state)
+            if kwargs.get("sampling_params") is None:
+                return logits
+            # A device-sampled ordinary decode: host ids, read inside the call.
+            return logits[:, 0].argmax(dim=-1).to(torch.int32).reshape(-1, 1)
         return self._verify(live, tokens, start_pos, mamba_state, kwargs)
 
     def _narrow(self, live, tokens, start_pos, mamba_state):
@@ -239,7 +253,7 @@ class _LedgerDevice:
             starts = [int(g.start_blocks[row]) for g in mamba_state.groups]
             rows.append((row, truth[:position], starts, [(0, tuple(truth))]))
             truth.append(_target(truth))
-            logits[row, 0, truth[-1]] = 1.0
+            logits[row, 0, truth[-1]] = 1e4
             self.next_drafts[req_id] = _drafts(truth)
         self._run_rows(mamba_state, rows)
         self.steps.append(
@@ -379,6 +393,8 @@ class _AsyncHarness:
         asynchronous: bool = True,
         chained: bool = False,
         max_num_batched_tokens: int = 4096,
+        trace_mode: str = "none",
+        device_sampling: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -419,11 +435,14 @@ class _AsyncHarness:
         self.runner = TTModelRunner(
             vllm_config=cfg,
             mesh_device=None,
-            trace_mode="none",
+            trace_mode=trace_mode,
             enable_model_warmup=False,
             num_devices=1,
         )
         self.runner.model = self.device
+        if device_sampling:
+            self.device.model_capabilities["supports_sample_on_device"] = True
+            self.runner.sample_on_device_mode = "decode_only"
         self.runner.initialize_kv_cache(self.kv_cache_config)
         self.groups = list(self.runner._mamba_groups.group_indices)
         self.ledger = StateLedger()
@@ -436,9 +455,13 @@ class _AsyncHarness:
         self.scheduled_ahead = 0
         self.preempted: set[str] = set()
 
-    def add(self, req_id: str, prompt_len: int, max_tokens: int) -> None:
+    def add(
+        self, req_id: str, prompt_len: int, max_tokens: int, temperature: float = 0.0
+    ) -> None:
         init_none_hash(sha256)
-        params = SamplingParams(max_tokens=max_tokens, ignore_eos=True, temperature=0.0)
+        params = SamplingParams(
+            max_tokens=max_tokens, ignore_eos=True, temperature=temperature
+        )
         params.update_from_generation_config({}, eos_token_id=EOS)
         self.num_added += 1
         request = Request(
@@ -616,3 +639,61 @@ def test_a_device_count_unequal_to_the_walk_raises_before_its_step_is_served():
     for req_id, request in h.requests.items():
         tokens = list(request.output_token_ids)
         assert tokens == reference.outputs[req_id][: len(tokens)], req_id
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_a_host_answering_model_never_gets_resident_decode_inputs(chained):
+    """The Qwen3.8 adapter declares ``supports_async_decode`` while its
+    ordinary decode returns host ids read inside the call. With traced,
+    device-sampled decoding (the deployment's), ``submit_decode`` records
+    every such step as host-answered, so ``plan_decode_reload`` reloads the
+    next ordinary decode (``host_answered_to_plain``), as it does after a
+    verify (``verify_to_plain``) and a prefill (``note_prefill_submitted``):
+    no ordinary decode is ever planned with resident inputs or registered as
+    overlap-safe. The device model raises on ``reload_inputs=False``."""
+    reference = _AsyncHarness(
+        48, mode="align", asynchronous=False, trace_mode="all", device_sampling=True
+    )
+    h = _AsyncHarness(
+        48,
+        mode="align",
+        asynchronous=True,
+        chained=chained,
+        trace_mode="all",
+        device_sampling=True,
+    )
+    for harness in (reference, h):
+        _scenario(harness)
+        # A sampled request is not speculable here, so the steps it shares
+        # are ordinary decodes, one after another.
+        harness.add("sampled", 900, max_tokens=24, temperature=1.0)
+    reference.run()
+    controller = h.runner.async_decode
+    plans, registered = [], []
+    plan, register = (
+        controller.plan_decode_reload,
+        controller.register_pending_async_step,
+    )
+
+    def planned(model_input):
+        result = plan(model_input)
+        plans.append(
+            (model_input.spec_mode, model_input.perform_device_sampling, result)
+        )
+        return result
+
+    def registered_step(step, *, steady, overlap_ok):
+        registered.append((type(step).__name__, steady, overlap_ok))
+        return register(step, steady=steady, overlap_ok=overlap_ok)
+
+    controller.plan_decode_reload = planned
+    controller.register_pending_async_step = registered_step
+    h.run()
+
+    assert h.outputs == reference.outputs
+    ordinary = [p for mode, sampled, p in plans if mode is None]
+    assert h.device.plain_after_plain > 5
+    assert all(sampled for mode, sampled, _ in plans if mode is None)
+    assert ordinary and all(p.reload_inputs and not p.overlap_safe for p in ordinary)
+    assert not [r for r in registered if r[0] == "AsyncTTModelRunnerOutput" and r[2]]
+    assert (h.device.chained > 0) == chained
