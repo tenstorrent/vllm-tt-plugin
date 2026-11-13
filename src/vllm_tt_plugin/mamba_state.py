@@ -167,6 +167,12 @@ class MambaGroupState:
     # ``MambaStepState.checkpoint_positions[i, 0]`` tokens, 0 for no
     # checkpoint.
     checkpoint_blocks: torch.Tensor | None = None
+    # ``[rows, 1 + K]`` on a chained verify, else ``None``: column ``c - 1``
+    # is the block that holds row ``i``'s start state if the previous verify,
+    # still unread, committed ``c`` tokens for it. The model picks the column
+    # by its own count; ``start_blocks[i]`` then holds column K. Padding rows
+    # hold block 0.
+    start_blocks_by_count: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +250,7 @@ class MambaCacheGroups:
         *,
         accepted_counts: Sequence[int] | None = None,
         intermediate_prefill_mask: Sequence[bool] | None = None,
+        chained: Sequence[bool] | None = None,
     ) -> MambaStepState:
         """The model's ``mamba_state`` for one forward. Call it once per step.
 
@@ -267,6 +274,11 @@ class MambaCacheGroups:
 
         With speculative decoding this records each row's window
         (``windows``) for the request's next step.
+
+        ``chained[i]`` marks a row of a chained verify, whose previous verify
+        is unread: its ``accepted_counts`` entry is not used, and every group
+        names the start block of each count the previous verify can commit
+        (``MambaGroupState.start_blocks_by_count``).
         """
         live = len(row_req_ids)
         if live > num_rows:
@@ -291,6 +303,12 @@ class MambaCacheGroups:
         scheduled = [int(s) for s in num_scheduled_tokens]
         num_spec = self.num_speculative_blocks
         width = 1 + num_spec
+        chained_rows = [False] * live if chained is None else [bool(c) for c in chained]
+        if len(chained_rows) != live:
+            raise RuntimeError(
+                f"{live} scheduled rows {list(row_req_ids)} got {len(chained_rows)} "
+                "chained-row flags"
+            )
         window_columns = np.array(
             [
                 window_start_column(self.mamba_cache_mode, self.block_size, c, s)
@@ -299,11 +317,29 @@ class MambaCacheGroups:
             dtype=np.int64,
         ).reshape(live)
         previous = [self.windows.get(r) if num_spec else None for r in row_req_ids]
+        for req_id, window, is_chained in zip(row_req_ids, previous, chained_rows):
+            if is_chained and window is None:
+                raise RuntimeError(
+                    f"request {req_id} is a row of a chained verify, but no "
+                    "earlier window of it is recorded"
+                )
+        # A chained row's candidate start columns, one per count c = 1..1+K.
+        candidates = np.array(
+            [
+                [accepted_state_column(w.column, c) for c in range(1, width + 1)]
+                if is_chained
+                else [-1] * width
+                for w, is_chained in zip(previous, chained_rows)
+            ],
+            dtype=np.int64,
+        ).reshape(live, width)
         start_columns = np.array(
             [
-                self._start_column(req_id, start, int(count), window)
-                for req_id, start, count, window in zip(
-                    row_req_ids, starts, counts, previous
+                candidates[row, -1]
+                if is_chained
+                else self._start_column(req_id, start, int(count), window)
+                for row, (req_id, start, count, window, is_chained) in enumerate(
+                    zip(row_req_ids, starts, counts, previous, chained_rows)
                 )
             ],
             dtype=np.int64,
@@ -352,10 +388,24 @@ class MambaCacheGroups:
                 checkpoint_columns,
                 held_ends,
             )
+            for row, is_chained in enumerate(chained_rows):
+                if is_chained and not table[row, candidates[row]].all():
+                    raise RuntimeError(
+                        f"request {row_req_ids[row]} is a row of a chained verify, "
+                        f"but its candidate start columns {candidates[row].tolist()} "
+                        f"of KV cache group {g} hold the null block 0: "
+                        f"{table[row].tolist()}"
+                    )
             dest = table[rows[:, None], window_index]
             start = np.where(
                 start_columns >= 0, table[rows, np.maximum(start_columns, 0)], 0
             )
+            by_count = None
+            if any(chained_rows):
+                by_count = torch.zeros((num_rows, width), dtype=torch.int32)
+                picked = table[rows[:, None], np.maximum(candidates, 0)]
+                picked = np.where(candidates >= 0, picked, 0)
+                by_count[:live] = torch.from_numpy(picked.astype(np.int32))
             checkpoint = np.where(
                 checkpoint_columns >= 0,
                 table[rows, np.maximum(checkpoint_columns, 0)],
@@ -377,6 +427,7 @@ class MambaCacheGroups:
                     windows=windows,
                     start_blocks=start_blocks,
                     checkpoint_blocks=checkpoint_blocks,
+                    start_blocks_by_count=by_count,
                 )
             )
         checkpoint_positions = None
@@ -408,6 +459,27 @@ class MambaCacheGroups:
             checkpoint_positions=checkpoint_positions,
             intermediate_prefill_mask=mask,
         )
+
+    def chain_window_safe(self, num_computed: int, num_scheduled: int) -> bool:
+        """Whether a chained verify's window is the same block-table column
+        for every count its unread predecessor can commit.
+
+        vLLM scheduled the step (``num_computed``, ``num_scheduled``) counting
+        all the predecessor's drafts as accepted. Had the predecessor's count
+        been known, ``num_computed`` would be up to K lower. The runner chains
+        a row only where no count moves the window: always in mode ``none``,
+        and in mode ``align`` unless a block boundary is in reach.
+        """
+        columns = {
+            window_start_column(
+                self.mamba_cache_mode,
+                self.block_size,
+                num_computed - self.num_speculative_blocks + k,
+                num_scheduled,
+            )
+            for k in range(1 + self.num_speculative_blocks)
+        }
+        return len(columns) == 1
 
     def _start_column(
         self, req_id: str, start: int, count: int, window: MambaWindow | None

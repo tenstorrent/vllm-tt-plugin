@@ -131,6 +131,7 @@ class _LedgerDevice:
         self.model_capabilities = {
             "supports_async_decode": True,
             "supports_async_spec_decode": True,
+            "supports_chained_spec_verify": chained,
         }
         self.calls: list[tuple[str, dict]] = []
         self.truth: dict[str, list[int]] = {}
@@ -138,6 +139,10 @@ class _LedgerDevice:
         # Each submitted decode's row -> request map, popped by its propose.
         self.steps: deque[SimpleNamespace] = deque()
         self.verifies = 0
+        self.chained = 0
+        # The verify row whose device count is made wrong, for the guard test.
+        self.miscount_at = -1
+        self.miscounted_successors = 0
         self.accepted: dict[tuple[int, int], int] = {}
         self.boundary_counts: set[int] = set()
 
@@ -237,23 +242,60 @@ class _LedgerDevice:
             logits[row, 0, truth[-1]] = 1.0
             self.next_drafts[req_id] = _drafts(truth)
         self._run_rows(mamba_state, rows)
-        self.steps.append(SimpleNamespace(rows=list(live), counts=[1] * len(live)))
+        self.steps.append(
+            SimpleNamespace(
+                rows=list(live),
+                counts=[1] * len(live),
+                next_drafts=[self.next_drafts[r] for r in live],
+            )
+        )
         return logits
 
     def _verify(self, live, tokens, start_pos, mamba_state, kwargs):
         num_valid = kwargs["num_valid_drafts"]
         rows_out = int(tokens.shape[0])
         ids = torch.full((rows_out, T), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
-        record = SimpleNamespace(rows=list(live), counts=[], ids=ids, p0=[])
+        record = SimpleNamespace(
+            rows=list(live), counts=[], ids=ids, p0=[], next_drafts=[], miscounted=False
+        )
+        predecessor = kwargs.get("spec_predecessor")
+        if predecessor is not None:
+            self.chained += 1
+            predecessor = predecessor.argmax_ids.record
         rows = []
         for row, req_id in enumerate(live):
             truth = self.truth[req_id]
-            p0 = int(start_pos[row, 0])
-            nv = int(num_valid[row])
-            block = tokens[row, : nv + 1].tolist()
-            starts = [int(g.start_blocks[row]) for g in mamba_state.groups]
+            if predecessor is None:
+                p0 = int(start_pos[row, 0])
+                nv = int(num_valid[row])
+                block = tokens[row, : nv + 1].tolist()
+                starts = [int(g.start_blocks[row]) for g in mamba_state.groups]
+                drafts = self.next_drafts.get(req_id, [])
+                assert block[1:] == drafts[:nv], (req_id, block)
+            else:
+                # The row continues the unread predecessor from the count the
+                # device accepted; the runner sent placeholders.
+                assert predecessor.rows[row] == req_id, (predecessor.rows, live)
+                count = predecessor.counts[row]
+                previous = predecessor.p0[row]
+                assert tokens[row].tolist() == [PLACEHOLDER_TOKEN_ID] * T
+                assert start_pos[row].tolist() == [previous + T + j for j in range(T)]
+                assert int(kwargs["accepted_counts"][row]) == 1
+                p0 = previous + count
+                nv = min(int(num_valid[row]), K)
+                drafts = predecessor.next_drafts[row]
+                block = [int(predecessor.ids[row, count - 1]), *drafts[:nv]]
+                starts = [
+                    int(g.start_blocks_by_count[row, count - 1])
+                    for g in mamba_state.groups
+                ]
+                if predecessor.miscounted:
+                    # The device built the row from its wrong count; the
+                    # predecessor's propose is what reports it.
+                    record.miscounted = True
+                    self.miscounted_successors += 1
+                    continue
             assert p0 == len(truth) - 1 and block[0] == truth[-1], (req_id, p0)
-            assert block[1:] == self.next_drafts.get(req_id, [])[:nv], (req_id, block)
             self._verify_row(row, req_id, p0, block, starts, ids, record, rows)
         self._run_rows(mamba_state, rows)
         self.steps.append(record)
@@ -279,10 +321,16 @@ class _LedgerDevice:
         if min(p0 % BLOCK_SIZE, BLOCK_SIZE - p0 % BLOCK_SIZE) <= 2 * T:
             self.boundary_counts.add(count)
         committed = [int(t) for t in ids[row, :count]]
+        if 0 <= self.miscount_at <= self.verifies and count <= nv:
+            # A device acceptance one draft longer than the walk of its ids.
+            count += 1
+            self.miscount_at = -1
+            record.miscounted = True
         record.counts.append(count)
         record.p0.append(p0)
         truth[p0 + 1 :] = committed
         self.next_drafts[req_id] = _drafts(truth)
+        record.next_drafts.append(self.next_drafts[req_id])
 
     def read_decode_output(self, tt_out, async_read: bool = False, **kwargs):
         return (tt_out, []) if async_read else tt_out
@@ -303,13 +351,18 @@ class _LedgerDevice:
             if int(positions[row, 0]) < 0:
                 continue
             count = int(counts[row])
-            assert count == step.counts[row], (req_id, count, step.counts[row])
+            if count != step.counts[row]:
+                # The model's guard: a chained step continued the device's count.
+                raise ValueError(
+                    f"request {req_id}: the runner committed {count} tokens, "
+                    f"the device accepted {step.counts[row]}"
+                )
             truth = self.truth[req_id]
             first = int(positions[row, 0])
             assert committed[row, :count].tolist() == truth[first : first + count], (
                 req_id
             )
-            drafts[row] = torch.tensor(self.next_drafts[req_id], dtype=torch.int32)
+            drafts[row] = torch.tensor(step.next_drafts[row], dtype=torch.int32)
             num_valid[row] = num_drafts
         return DraftOutput(draft_token_ids=drafts, num_valid=num_valid)
 
@@ -490,3 +543,76 @@ def test_async_verifies_resume_from_the_state_of_their_committed_count(
         assert h.cached_states_checked
         if num_blocks == 28:
             assert h.preempted
+
+
+@pytest.mark.parametrize("num_blocks", [48, 28])
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
+    """With ``supports_chained_spec_verify`` most verifies are submitted over
+    the unread verify before them. The device builds each chained row from
+    the count it accepted, and reads the start block of that count
+    (``start_blocks_by_count``); the predecessor's commit fills the chained
+    step's rows, whose walk then commits what the device computed. Every
+    start state read is the request's own and the outputs equal a
+    synchronous run's. Joins, prefills, finished rows that are not the last,
+    preemptions and, in mode ``align``, a window within reach of a block
+    boundary drain instead."""
+    reference = _AsyncHarness(num_blocks, mode=mode, asynchronous=False)
+    _scenario(reference)
+    reference.run()
+
+    h = _AsyncHarness(num_blocks, mode=mode, asynchronous=True, chained=True)
+    _scenario(h)
+    h.run()
+
+    assert h.outputs == reference.outputs
+    assert set(range(1, T + 1)) <= h.device.boundary_counts
+    controller = h.runner.async_decode
+    assert h.device.chained == controller._chained_verify_submissions > 10
+    assert controller._overlapped_unsafe_submissions == 0
+    assert "lifecycle" in controller._chain_drains
+    if mode == "align":
+        assert controller._chain_drains["mamba_boundary"]
+        assert h.cached_states_checked
+
+
+def test_a_row_near_max_model_len_drains_its_verify():
+    """A row within two steps of ``max_model_len`` is not chained: the
+    predecessor's commit could be cut there. vLLM then schedules fewer than
+    ``1 + K`` tokens for it too."""
+    h = _AsyncHarness(48, mode="none", asynchronous=True, chained=True)
+    h.add("long", MAX_MODEL_LEN - 3 * T, max_tokens=2 * T)
+    h.run()
+    reference = _AsyncHarness(48, mode="none", asynchronous=False)
+    reference.add("long", MAX_MODEL_LEN - 3 * T, max_tokens=2 * T)
+    reference.run()
+    assert h.outputs == reference.outputs
+    drains = h.runner.async_decode._chain_drains
+    assert {"width", "max_model_len"} & {r for r, n in drains.items() if n}
+
+
+def test_a_device_count_unequal_to_the_walk_raises_before_its_step_is_served():
+    """A chained step continues the device's count. When that count differs
+    from the runner's walk of the same ids, the predecessor's propose raises
+    (as the model's does), during the chained submission, before the
+    scheduler is handed the chained step's tokens."""
+    h = _AsyncHarness(48, mode="align", asynchronous=True, chained=True)
+    _scenario(h)
+    h.device.miscount_at = 30
+    served = []
+    update = h.scheduler.update_from_output
+
+    def record(scheduler_output, output):
+        served.append(dict(zip(output.req_ids, output.sampled_token_ids)))
+        return update(scheduler_output, output)
+
+    h.scheduler.update_from_output = record
+    with pytest.raises(ValueError, match="the device accepted"):
+        h.run()
+    assert h.device.miscounted_successors, "a chained step ran on the wrong count"
+    reference = _AsyncHarness(48, mode="align", asynchronous=False)
+    _scenario(reference)
+    reference.run()
+    for req_id, request in h.requests.items():
+        tokens = list(request.output_token_ids)
+        assert tokens == reference.outputs[req_id][: len(tokens)], req_id

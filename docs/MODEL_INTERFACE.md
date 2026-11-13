@@ -64,3 +64,44 @@ Source entry points: [loader.py](../src/vllm_tt_plugin/loader.py),
 [worker.py](../src/vllm_tt_plugin/worker.py),
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py), and
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py).
+
+## Chained speculative verification
+
+A model that declares `supports_chained_spec_verify` (see
+[model capabilities](MODEL_CAPABILITIES.md)) lets `TTModelRunner` submit an
+`argmax_ids` verify over the verify before it, before the runner has read that
+one. The [speculative decode contract](SPEC_DECODE_CONTRACT.md) states the
+ordinary verify; a chained verify differs as follows.
+
+| Item | Chained verify |
+|---|---|
+| `spec_predecessor` | Keyword argument of `decode_forward`: the `VerifyOutput` the model returned for the verify submitted just before, still unread. Absent on every other call. |
+| Live rows | Every live row of the call is a live row of the predecessor at the same row index. A predecessor row whose request finished is a padding row of the call. |
+| `tokens`, `start_pos` | Placeholders on live rows: `PLACEHOLDER_TOKEN_ID` in every column, and the positions of a predecessor that accepted all its drafts (its column-0 position plus `1 + K + j` in column `j`). Padding rows as on any verify. |
+| `num_valid_drafts` | On live rows, the most drafts the row may verify (`SpecPlan.draft_cap` of the step's live rows). |
+| `accepted_counts` | 1 on every row. |
+| `mamba_state` | Each `MambaGroupState` also carries `start_blocks_by_count` `[rows, 1 + K]`: column `c - 1` is the block holding the row's start state if the predecessor committed `c` tokens for it. `start_blocks` holds column K. |
+
+The model builds each live row from the predecessor's device result. With `c`
+the number of tokens the predecessor committed for the row by the model's own
+acceptance of its `argmax_ids`, the row is the predecessor's committed token
+`c - 1` in column 0, then `n = min(num_valid_drafts, offered)` drafts that the
+model's drafter made from that commit (`offered` is 0 when the drafter
+declines the row and K otherwise), at the predecessor's column-0 position plus
+`c`, starting from `start_blocks_by_count[row, c - 1]`. The return is the
+`VerifyOutput` of that block, as on any verify.
+
+`TTModelRunner` then reads the predecessor, walks it, commits it and calls
+`propose_draft_tokens` for it. That call must return the drafts the chained
+verify ran (`draft_token_ids[row, :n]` with `num_valid` the drafter's offer),
+and must raise when the runner's commit differs from the model's own
+acceptance: the chained verify continued the model's count. The runner fills
+the chained verify's rows from that proposal and walks the chained verify's
+`argmax_ids` against them. It chains only greedy rows whose request takes the
+scheduler's full `1 + K` tokens, with room for two more steps below
+`max_model_len` and, in `mamba_cache_mode` `align`, the same window column for
+every count (`MambaCacheGroups.chain_window_safe`); a prefill, a new or resumed
+request, a preemption, a forced prefix-cache reset, structured output, a
+moved row or a second unread verify drains the predecessor first. Sources:
+[spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
+[mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).

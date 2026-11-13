@@ -257,6 +257,13 @@ class TTModelInput:
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
 
+    # Chained verify only (``supports_chained_spec_verify``), else ``None``:
+    # the unread ``VerifyOutput`` of the verify submitted just before, which
+    # ``submit_decode`` passes to the model as ``spec_predecessor``. The live
+    # rows' tokens, drafts, positions and counts are placeholders until the
+    # predecessor's commit fills them (``vllm_tt_plugin.spec_chain``).
+    spec_predecessor: Any | None = None
+
 
 def live_row_index(
     model_input: TTModelInput, row_req_ids: list[str] | None = None
