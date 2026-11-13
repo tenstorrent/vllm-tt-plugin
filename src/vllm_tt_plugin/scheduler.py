@@ -1378,18 +1378,19 @@ class TTScheduler(AsyncScheduler):
     def _drop_admission_spec_padding(self, scheduler_output: SchedulerOutput) -> None:
         """Schedule a request admitted with one uncomputed token for that token.
 
-        With speculative decoding on, ``Scheduler.schedule`` pads a request it
-        admits from a waiting queue with exactly one uncomputed token, such as
-        a new request whose prefix-cache hit covers all but its last token or a
-        preempted request that resumes with such a hit, to
-        ``1 + num_spec_tokens`` scheduled tokens and lists
-        ``[-1] * num_spec_tokens`` for it in ``scheduled_spec_decode_tokens``,
-        unless a partial prefill was scheduled before it in the step. The
-        padding keeps upstream's GPU runner on a uniform decode shape for its
-        CUDA graph: that runner clamps the ``-1`` input ids to 0, its rejection
-        sampler rejects every ``-1`` draft, so the request's token comes from
-        its last real token, and ``update_from_output`` rolls
-        ``num_computed_tokens`` back by the rejected drafts.
+        With speculative decoding on, ``Scheduler.schedule`` pads a request
+        that it admits from a waiting queue with exactly one uncomputed token,
+        such as a new request whose prefix-cache hit covers all but its last
+        token or a preempted request that resumes with such a hit: it schedules
+        ``1 + num_spec_tokens`` tokens and lists ``[-1] * num_spec_tokens`` for
+        the request in ``scheduled_spec_decode_tokens``. It skips the padding
+        in a few cases, among them a step that scheduled a partial prefill
+        before the request. The padding keeps upstream's GPU runner on a
+        uniform decode shape for its CUDA graph: that runner clamps the ``-1``
+        input ids to 0, its rejection sampler rejects every ``-1`` draft, so
+        the request's token comes from its last real token, and
+        ``update_from_output`` rolls ``num_computed_tokens`` back by the
+        rejected drafts.
 
         ``TTModelRunner`` runs every new and resumed request as a prefill, and
         a prefill verifies no drafts: it would prefill ``num_spec_tokens``
@@ -1417,10 +1418,11 @@ class TTScheduler(AsyncScheduler):
             ):
                 raise RuntimeError(
                     f"request {req_id} was admitted with {scheduled} scheduled "
-                    f"tokens and drafts {drafts} at {request.num_computed_tokens} "
-                    f"of {request.num_tokens} computed tokens; vLLM gives an "
-                    "admitted request drafts only as the padding of its one "
-                    "uncomputed token, which is all TTScheduler can remove"
+                    f"tokens and drafts {drafts}, with "
+                    f"{request.num_computed_tokens} of its {request.num_tokens} "
+                    "tokens computed; vLLM gives an admitted request drafts "
+                    "only as the padding of its one uncomputed token, which is "
+                    "all TTScheduler can remove"
                 )
             del drafts_by_req[req_id]
             scheduler_output.num_scheduled_tokens[req_id] = 1
