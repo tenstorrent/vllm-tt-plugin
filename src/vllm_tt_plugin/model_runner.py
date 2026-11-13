@@ -36,6 +36,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
+    AsyncTTSpecDecodeOutput,
     CompletedDecodeStep,
     DeferredDecodeOutput,
     SubmittedStepContext,
@@ -83,6 +84,12 @@ from vllm_tt_plugin.model_input import (
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
+from vllm_tt_plugin.spec_chain import (
+    ChainPlan,
+    chained_rows,
+    fill_chained_input,
+    plan_chain,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -1070,6 +1077,7 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._proposed_draft_token_ids.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -1100,6 +1108,9 @@ class TTModelRunner:
                     f"this step: {sorted(scheduler_output.preempted_req_ids)}"
                 )
             self._release_model_request(req_id)
+            # A resume re-prefills, and its first decode verifies nothing, as
+            # ``Scheduler._preempt_request`` clears ``spec_token_ids``.
+            self._proposed_draft_token_ids.pop(req_id, None)
 
         # Only after the model released by slot: the release calls above read
         # the request's slot from the ownership map before it is dropped.
@@ -1879,6 +1890,7 @@ class TTModelRunner:
         row_req_ids: list[str],
         *,
         skip_req_ids: set[str] | None = None,
+        chain_successor: AsyncTTSpecDecodeOutput | None = None,
     ) -> None:
         """Ask the model's own drafter for the next step's drafts.
 
@@ -2014,6 +2026,30 @@ class TTModelRunner:
         max_model_len = int(self.model_config.max_model_len)
         skipped = set(skip_req_ids or ())
         counts_by_row = counts.tolist()
+        chained: set[str] = set()
+        if chain_successor is not None:
+            # These drafts already ran as the chained verify's: they fill its
+            # rows and are not published for another step.
+            successor = chain_successor.model_input
+            chained = set(successor.row_req_ids or ())
+            if chained & skipped:
+                raise RuntimeError(
+                    f"chained verify rows {sorted(chained & skipped)} were "
+                    "skipped at their predecessor's commit"
+                )
+            chain_successor.fill_chained(
+                fill_chained_input(
+                    successor,
+                    model_input,
+                    committed,
+                    counts,
+                    draft_token_ids,
+                    offered_by_row,
+                    max_model_len,
+                )
+            )
+            for req_id in chained:
+                self._proposed_draft_token_ids.pop(req_id, None)
         # ``row`` is the request's row of the step's block, which a lane step
         # places at the request's slot rather than at its live position.
         for row, req_id in zip(live_rows, row_req_ids, strict=True):
@@ -2025,30 +2061,36 @@ class TTModelRunner:
                 continue
             # A row that committed nothing this step proposes nothing: there is
             # no continuation to draft from.
-            if counts_by_row[row] < 1:
+            if counts_by_row[row] < 1 or req_id in chained:
                 continue
             if declined:
-                # Erase, as ``_publish_draft`` does for an empty offer, for a
-                # request that still holds a row (the published-for rows of the
-                # full loop below).
-                if req_id in self.input_batch.req_id_to_index:
-                    self._proposed_draft_token_ids.pop(req_id, None)
+                # Erase, as ``_publish_draft`` does for an empty offer.
+                self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
             # indexed by the step's rows, which is the order the model answered
             # in; the persistent batch is indexed by where the request sits
             # now, and a completion between this step's submission and its
-            # commit makes ``condense`` slide a request into another row. A
-            # request with no row has no current length for max-model-length
-            # trimming, so this step records its retained accepted count but
-            # does not publish a proposal.
+            # commit makes ``condense`` slide a request into another row.
             batch_row = self.input_batch.req_id_to_index.get(req_id)
-            if batch_row is None:
+            if batch_row is not None:
+                num_tokens = int(self.input_batch.num_tokens[batch_row])
+            elif req_id in self._req_state_slot:
+                # A running request the step being built left out. Under
+                # asynchronous scheduling this commit runs at that step's
+                # build, and a prefill step leaves out every decode row. The
+                # proposal waits for the step that schedules the request
+                # again, as a synchronous launch's drafts wait on
+                # ``request.spec_token_ids``; without it that step verifies
+                # nothing for the row.
+                num_tokens = self.requests[req_id].num_tokens
+            else:
+                # Finished or preempted: no step continues this commit.
                 continue
             # Trimmed to what the request can still hold, the way the host
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
-            room = max_model_len - int(self.input_batch.num_tokens[batch_row])
+            room = max_model_len - num_tokens
             row_offered = num_drafts if offered_by_row is None else offered_by_row[row]
             usable = max(0, min(row_offered, room))
             self._publish_draft(
@@ -2241,6 +2283,7 @@ class TTModelRunner:
         input_positions: torch.Tensor,
         live_rows: Sequence[int] | None = None,
         device_sampled: bool = False,
+        chain: ChainPlan | None = None,
     ) -> SpecDecodeRows:
         """Turn a plain decode's rows into this step's speculative rows.
 
@@ -2297,6 +2340,27 @@ class TTModelRunner:
         scheduled_drafts = self._drafts_to_verify(scheduler_output, row_req_ids)
         self._grammar_draft_handoff = {}
         self._grammar_handed_over_req_ids = set()
+        if chain is not None:
+            # The predecessor has not proposed yet: a held proposal would be
+            # an older step's.
+            if any(scheduled_drafts.values()) or bool(padding.any()):
+                raise RuntimeError(
+                    "a chained verify carries host drafts "
+                    f"{ {r: d for r, d in scheduled_drafts.items() if d} } or "
+                    f"padding rows among {row_req_ids}"
+                )
+            spec_plan = getattr(self, "_spec_plan", None)
+            cap = (
+                spec_plan.draft_cap(num_live)
+                if spec_plan is not None
+                else self._num_speculative_tokens
+            )
+            tokens, positions, drafts, num_valid, counts = chained_rows(
+                input_positions, self._num_speculative_tokens, cap
+            )
+            return SpecDecodeRows(
+                tokens, positions, drafts, num_valid, counts, ACCEPT_MODE_ARGMAX_IDS
+            )
         if (
             self._spec_supports_narrow_decode
             and not any(scheduled_drafts.values())
@@ -2396,6 +2460,7 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
+        chain: ChainPlan | None = None,
     ) -> TTModelInput:
         """Build a ``TTModelInput`` for one prefill or decode step.
 
@@ -2589,6 +2654,7 @@ class TTModelRunner:
                 input_tokens,
                 input_positions,
                 device_sampled=device_sampled,
+                chain=chain,
             )
             input_tokens, input_positions = spec.input_tokens, spec.input_positions
             spec_drafts = spec.draft_token_ids
@@ -2953,6 +3019,7 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         grammar_output: GrammarOutput | None,
+        chain: ChainPlan | None = None,
     ) -> TTModelInput | None:
         """
         Update internal state with the scheduler output and build
@@ -2961,6 +3028,10 @@ class TTModelRunner:
 
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
+
+        ``chain`` builds a chained verify over the unread verify it names
+        (``spec_chain``), whose commit is applied after the submission instead
+        of before the build.
         """
         # Update scheduler-owned state before accepting any older async result.
         # Reject late results for request IDs already reported finished. The
@@ -2978,12 +3049,30 @@ class TTModelRunner:
             # Preserve the legacy path's drain point: version-0 adapters still
             # own reload policy and receive reset_batch after batch mutation.
             self.async_decode.wait_for_all_pending_async_steps()
-        self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
+        if chain is None:
+            self.async_decode.apply_completed_decode_steps_before_build(
+                scheduler_output
+            )
         if not scheduler_output.total_num_scheduled_tokens:
             return None
 
         # Prepare model inputs only
-        model_input = self._prepare_model_inputs(scheduler_output, grammar_output)
+        model_input = self._prepare_model_inputs(
+            scheduler_output, grammar_output, chain=chain
+        )
+        if chain is not None:
+            if model_input.spec_mode is None or (
+                model_input.slot_remap is not None
+                and model_input.slot_remap.tolist()
+                != list(range(int(model_input.slot_remap.numel())))
+            ):
+                raise RuntimeError(
+                    "a chained verify was built as another step: spec_mode "
+                    f"{model_input.spec_mode!r}, slot_remap {model_input.slot_remap}"
+                )
+            model_input = replace(
+                model_input, spec_predecessor=chain.predecessor.verify_output
+            )
         if self._mamba_groups is not None:
             # Group 0 can be a MambaSpec group, so ``page_table`` is the first
             # attention group's table instead.
@@ -3016,6 +3105,7 @@ class TTModelRunner:
                         if model_input.intermediate_prefill_mask is None
                         else model_input.intermediate_prefill_mask.tolist()
                     ),
+                    chained=None if chain is None else [True] * len(row_req_ids),
                 ),
             )
         return model_input
@@ -3359,13 +3449,22 @@ class TTModelRunner:
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
-        if self.async_decode.must_drain_pending_async_steps(
+        # A step that continues the one unread verify row for row is built
+        # over it rather than after it (``spec_chain``).
+        chain, reason = plan_chain(self, scheduler_output)
+        if chain is None and self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
+            if reason != "off":
+                self.async_decode._chain_drains[reason] += 1
             self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
-        model_input = self.build_model_input(scheduler_output, None)
+        model_input = (
+            self.build_model_input(scheduler_output, None)
+            if chain is None
+            else self.build_model_input(scheduler_output, None, chain=chain)
+        )
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -3384,6 +3483,8 @@ class TTModelRunner:
                 model_input,
                 steady_decode_fast_path=steady_decode_fast_path,
             )
+            if chain is not None:
+                self.async_decode.complete_chain(chain, wrapper, scheduler_output)
             self._pending_samples.append(
                 partial(
                     self._finish_async_decode,
@@ -3774,6 +3875,7 @@ class TTModelRunner:
         spec_hidden: Any,
         *,
         skip_req_ids: set[str] | None = None,
+        chain_successor: AsyncTTSpecDecodeOutput | None = None,
     ) -> dict[str, list[int]]:
         """Apply the accepted prefixes and publish the next proposal.
 
@@ -3781,6 +3883,8 @@ class TTModelRunner:
         synchronous path inside the sampling tail, and on the asynchronous path
         when the next step drains this one. ``skip_req_ids`` is how a forced
         prefix-cache reset drops a frame it has already accounted for.
+        ``chain_successor`` is the chained verify that already ran this
+        step's proposal (``spec_chain``): the proposal fills its rows.
         """
         row_req_ids = model_input.row_req_ids
         live = live_row_index(model_input)
@@ -3798,7 +3902,10 @@ class TTModelRunner:
                 spec_hidden,
                 row_req_ids,
                 skip_req_ids=skip_req_ids,
+                chain_successor=chain_successor,
             )
+        elif chain_successor is not None:
+            raise RuntimeError("a chained verify follows a host-drafted verify")
         else:
             self._propose_ngram_drafts(
                 committed_by_req, model_input.perform_device_sampling

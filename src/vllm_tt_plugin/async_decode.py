@@ -16,7 +16,10 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    scheduler_output_has_prefill_work,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -76,6 +79,7 @@ if TYPE_CHECKING:
 
     from vllm_tt_plugin.model_input import TTDecodeReloadPlan, TTModelInput
     from vllm_tt_plugin.model_runner import TTModelRunner
+    from vllm_tt_plugin.spec_chain import ChainPlan
 
 logger = init_tt_logger(__name__)
 
@@ -106,6 +110,9 @@ class TTDecodeSubmission:
     readback_rows: tuple[int, ...] | None = None
     # A stage model's stage frames from this forward, popped right after it.
     stage_outputs: dict[str, TTStageFrame] | None = None
+    # The verify's ``VerifyOutput`` as the model returned it, which a chained
+    # verify submitted over this one hands back as ``spec_predecessor``.
+    verify_output: VerifyOutput | None = None
     # Whether a speculating model answered this ordinary decode from the host
     # rather than from its decode trace (SPEC_DECODE_CONTRACT.md section 4d):
     # host ids with nothing to read. The trace fed none of the step's tokens
@@ -195,6 +202,9 @@ class CompletedSpecDecodeStep:
     runner_output: ModelRunnerOutput | None = None
     # The published prefixes' logprobs, when the step's rows asked for them.
     logprobs: LogprobsLists | None = None
+    # The ``AsyncTTSpecDecodeOutput`` this step resolved from, whose
+    # ``chain_successor`` is the chained verify submitted over it, if any.
+    source: Any | None = None
 
 
 class DeferredDecodeOutput(AsyncModelRunnerOutput):
@@ -333,7 +343,31 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         self._model_input = model_input
         self._completion_event = completion_event
         self._context = context
+        # The chained verify submitted over this one, whose rows this step's
+        # commit fills (``vllm_tt_plugin.spec_chain``).
+        self.chain_successor: AsyncTTSpecDecodeOutput | None = None
+        # A chained verify's rows are placeholders until its predecessor's
+        # commit fills them; its walk must not run before.
+        self.chain_filled = getattr(model_input, "spec_predecessor", None) is None
         self._init_deferred()
+
+    @property
+    def model_input(self) -> TTModelInput:
+        return self._model_input
+
+    @property
+    def verify_output(self) -> VerifyOutput | None:
+        return self._submission.verify_output
+
+    def fill_chained(self, model_input: TTModelInput) -> None:
+        """Take the rows the chained verify ran, once its predecessor committed.
+
+        The predecessor's ``VerifyOutput`` is dropped: nothing reads it after
+        the submission, and holding it would keep each read verify alive for
+        as long as the step after it.
+        """
+        self._model_input = replace(model_input, spec_predecessor=None)
+        self.chain_filled = True
 
     def set_grammar_bitmask(
         self, bitmask: torch.Tensor, *, num_valid_drafts: torch.Tensor
@@ -360,11 +394,18 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         )
 
     def _get_output_impl(self) -> ModelRunnerOutput:
+        if not self.chain_filled:
+            raise RuntimeError(
+                "a chained verify was read before its predecessor's commit "
+                "filled its rows; the runner commits the predecessor right "
+                "after it submits the chained verify"
+            )
         completed = self._controller.complete_spec_decode_step(
             submission=self._submission,
             model_input=self._model_input,
             context=self._context,
         )
+        completed.source = self
         runner_output = self._controller.runner.build_spec_runner_output(
             self._model_input.row_req_ids, completed.prefixes, completed.logprobs
         )
@@ -399,6 +440,10 @@ class TTAsyncDecodeController:
         # count the scheduler's lookahead reservation rather than a verify.
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
+        # Verifies submitted over an unread verify (``spec_chain``), and why
+        # each other build drained instead, by ``plan_chain`` reason.
+        self._chained_verify_submissions = 0
+        self._chain_drains: Counter[str] = Counter()
 
     @staticmethod
     def _page_table_inputs(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -530,24 +575,6 @@ class TTAsyncDecodeController:
         return current_req_ids == scheduled_req_ids
 
     @staticmethod
-    def scheduler_output_has_prefill_work(
-        scheduler_output: SchedulerOutput,
-    ) -> bool:
-        """Whether the scheduler output contains any context-phase work.
-
-        This decision is made before ``_update_states``, so the persistent
-        batch still describes the previous step. ``is_context_phase`` is the
-        exact signal for a cached chunked-prefill continuation; token counts
-        are ambiguous for a one-token final chunk and speculative decode.
-        """
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
-            return True
-        return any(
-            cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids
-        )
-
-    @staticmethod
     def suppressed_output_req_ids(scheduler_output: SchedulerOutput) -> set[str]:
         """Requests whose late output must not reach scheduler accounting.
 
@@ -605,7 +632,9 @@ class TTAsyncDecodeController:
         if legacy_prompt or runner._decode_layout_changed_since_last_decode:
             return False
         if self.decode_input_update_contract_version() >= 1:
-            if self.scheduler_output_has_prefill_work(scheduler_output):
+            # Read before ``_update_states``: the persistent batch still
+            # describes the previous step.
+            if scheduler_output_has_prefill_work(scheduler_output):
                 return False
             if (
                 not self._decode_chain_valid
@@ -782,6 +811,9 @@ class TTAsyncDecodeController:
             self._ordinary_decode_submissions += 1
         else:
             self._verify_submissions += 1
+            self._chained_verify_submissions += (
+                getattr(model_input, "spec_predecessor", None) is not None
+            )
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
             logger.info(
@@ -791,6 +823,14 @@ class TTAsyncDecodeController:
                 self._verify_submissions,
                 self._overlapped_submissions,
             )
+            if self._chained_verify_submissions or self._chain_drains:
+                logger.info(
+                    "TT chained verifies: %d of %d verifies; builds that "
+                    "drained instead, by reason: %s",
+                    self._chained_verify_submissions,
+                    self._verify_submissions,
+                    dict(sorted(self._chain_drains.items())),
+                )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
         """Report the overlap counters, rarely enough to be readable.
@@ -1171,6 +1211,7 @@ class TTAsyncDecodeController:
                 completed.counts,
                 completed.spec_hidden,
                 skip_req_ids=skipped_state,
+                chain_successor=getattr(completed.source, "chain_successor", None),
             )
             return
         self.runner._apply_sampled_tokens_to_state(
@@ -1199,7 +1240,11 @@ class TTAsyncDecodeController:
     ) -> DeferredDecodeOutput:
         context = self.capture_submitted_step_context()
         if model_input.spec_mode is not None:
-            return self._submit_async_spec_step(model_input, context)
+            return self._submit_async_spec_step(
+                model_input,
+                context,
+                chained=getattr(model_input, "spec_predecessor", None) is not None,
+            )
         event = threading.Event()
         submission = self.submit_decode(
             model_input,
@@ -1231,7 +1276,11 @@ class TTAsyncDecodeController:
         return step
 
     def _submit_async_spec_step(
-        self, model_input: TTModelInput, context: SubmittedStepContext
+        self,
+        model_input: TTModelInput,
+        context: SubmittedStepContext,
+        *,
+        chained: bool = False,
     ) -> AsyncTTSpecDecodeOutput:
         """Submit a verify whose readback and accept walk are deferred.
 
@@ -1245,6 +1294,9 @@ class TTAsyncDecodeController:
         on a launch that samples on device a verify reaches
         ``can_use_steady_decode_fast_path`` with every condition met and comes
         back eligible.
+
+        A ``chained`` verify (``spec_chain``) is the one built to be
+        submitted over an outstanding step: the unread verify it continues.
         """
         event = threading.Event()
         submission = self.submit_decode(
@@ -1261,8 +1313,35 @@ class TTAsyncDecodeController:
             completion_event=event,
             context=context,
         )
-        self.register_pending_async_step(step, steady=False, overlap_ok=False)
+        self.register_pending_async_step(step, steady=chained, overlap_ok=False)
         return step
+
+    def complete_chain(
+        self,
+        chain: ChainPlan,
+        successor: AsyncTTSpecDecodeOutput,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Read, walk and commit the verify a chained verify continues.
+
+        Runs right after the chained submission, on the engine thread, so the
+        device runs the chained verify while the host reads its predecessor.
+        The predecessor's commit proposes for it, and the drafts it returns
+        are the ones the chained verify ran: ``commit_spec_acceptance`` fills
+        them into the successor instead of publishing them. The lifecycle sets
+        are the ones the build would have applied the predecessor with.
+        """
+        predecessor = chain.predecessor
+        predecessor.chain_successor = successor
+        predecessor.ensure_finalized()
+        self.apply_ready_completed_decode_steps(
+            suppress_output_req_ids=self.suppressed_output_req_ids(scheduler_output)
+        )
+        if not successor.chain_filled:
+            raise RuntimeError(
+                "the predecessor of a chained verify was committed without "
+                "filling the chained verify's rows"
+            )
 
     def submit_async_lane_decode(
         self,
@@ -1385,6 +1464,9 @@ class TTAsyncDecodeController:
             kwargs["spec_mode"] = model_input.spec_mode
         if model_input.accepted_counts is not None:
             kwargs["accepted_counts"] = model_input.accepted_counts
+        spec_predecessor = getattr(model_input, "spec_predecessor", None)
+        if spec_predecessor is not None:
+            kwargs["spec_predecessor"] = spec_predecessor
         if perform_device_sampling:
             sampling_param_dict = {
                 field.name: (
@@ -1466,6 +1548,7 @@ class TTAsyncDecodeController:
             read_from_device=read_from_device,
         )
         spec_hidden = None
+        verify_output = None
         requested_spec_mode = kwargs.get("spec_mode")
         if requested_spec_mode is not None:
             # A verify returns its mode's tensor inside a VerifyOutput, which
@@ -1478,6 +1561,7 @@ class TTAsyncDecodeController:
             )
             # Safe after the unwrap, which refuses anything but a VerifyOutput.
             spec_hidden = verify.hidden
+            verify_output = verify
         elif isinstance(tt_out, VerifyOutput):
             raise TypeError(
                 f"TT model {type(runner.model).__name__} returned a "
@@ -1570,6 +1654,7 @@ class TTAsyncDecodeController:
             readback_rows=readback_rows,
             stage_outputs=stage_outputs,
             host_answered=host_answered,
+            verify_output=verify_output,
         )
 
     def complete_deferred_device_sampling(

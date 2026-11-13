@@ -281,7 +281,6 @@ def test_mamba_pool_below_one_full_length_request_fails_at_startup():
 @pytest.mark.parametrize(
     ("unsupported", "match"),
     [
-        ("speculative_async", "launch with --no-async-scheduling"),
         ("speculative_blocks", "num_speculative_blocks=0, but the launch verifies 3"),
         ("lane_dp", "lane-DP"),
         ("block_output", "Block-output models"),
@@ -298,8 +297,8 @@ def test_mamba_pool_below_one_full_length_request_fails_at_startup():
 def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, match):
     """The worker sizes the pool before it loads the model and rejects there.
 
-    Speculative decoding runs synchronously only, and a verify needs one state
-    block per draft (``num_speculative_blocks``); lane-DP and block-output
+    A verify needs one state block per draft (``num_speculative_blocks``);
+    lane-DP and block-output
     execution have no MambaSpec path, and mode ``all`` keeps a state block per
     block of tokens. In mode ``align``: a nonzero retention
     interval keeps decode-reached block boundaries, which TT has not
@@ -312,9 +311,6 @@ def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, mat
     cfg = _vllm_config(mode)
     if unsupported.startswith("speculative"):
         cfg.speculative_config = SimpleNamespace(num_speculative_tokens=3)
-        if unsupported == "speculative_async":
-            specs = _layer_specs(num_speculative_blocks=3)
-            cfg.scheduler_config.async_scheduling = True
     elif unsupported == "lane_dp":
         store_tt_lane_count(cfg, 2)
     elif unsupported == "block_output":
@@ -336,6 +332,25 @@ def test_unsupported_mamba_launches_fail_before_the_model_loads(unsupported, mat
 
     with pytest.raises(ValueError, match=match):
         _num_blocks(cfg, specs, 131_072)
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_asynchronous_speculation_over_mamba_spec_is_admitted(mode):
+    """The runner drains every verify and commits it before it builds the
+    request's next step, so the start block is known at the build under
+    asynchronous scheduling too (``test_mamba_spec_async.py`` drives it)."""
+    cfg = _vllm_config(mode)
+    cfg.speculative_config = SimpleNamespace(
+        num_speculative_tokens=3,
+        use_eagle=lambda: False,
+        use_eagle_block_drop=lambda: False,
+    )
+    cfg.scheduler_config.async_scheduling = True
+    specs = _layer_specs(
+        num_speculative_blocks=3,
+        **({"mamba_cache_mode": "align"} if mode == "align" else {}),
+    )
+    assert _num_blocks(cfg, specs, 131_072) > 0
 
 
 def test_align_pool_counts_two_state_blocks_per_request_and_group():

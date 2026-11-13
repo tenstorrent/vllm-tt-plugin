@@ -88,12 +88,17 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
 | `spec_ids_are_sampled` | `False` | Declares that an `argmax_ids` verify of a device-sampled step returns the device sampler's draws (one per candidate column for a drafted row, the plain decode's draw for an undrafted one), so `TTModelRunner._request_is_argmax_certifiable` certifies sampled requests on such steps and the proposer offers them drafts (a penalised request stays uncertifiable: the draws carry no penalty history). On a model that also serves `logits`, the device draws take precedence over the host `logits` walk on a device-sampled step. Validated at config time as a boolean; `True` requires `supports_sample_on_device`. See [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) sections 1 and 4d. |
 | `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
+| `supports_chained_spec_verify` | `False` | Declares that an `argmax_ids` verify accepts `spec_predecessor`, the unread `VerifyOutput` of the verify submitted just before, and builds each live row from that predecessor's device result: its committed token at the count the device accepted, the drafts its drafter made from that commit, the position after that commit, and the GDN start block `MambaGroupState.start_blocks_by_count[row, count - 1]`. `TTModelRunner` then submits such a verify over the unread one under asynchronous scheduling (`vllm_tt_plugin.spec_chain`), for greedy rows that continue the predecessor's rows at the same indices, and drains instead on any other step. The platform rejects a non-boolean value and `True` without `supports_async_spec_decode`. The call is specified in [chained verification](MODEL_INTERFACE.md#chained-speculative-verification). |
 | `supports_compact_host_logits` | `False` | Permits `process_decode_output_host(..., sample_rows=...)` to return only selected lane-DP host-sampling rows in the supplied order. Active or custom logits processors can require full-slot output instead. |
 | `supports_selective_host_readback` | `False` | Permits `read_decode_output(..., async_read=True, sample_rows=...)` to read only selected lane-DP host-sampling rows. The adapter must also declare `supports_compact_host_logits` and retain an output handle for host processing. |
 
 The [selective-read contract](DECODE_RELOAD_CONTRACT.md#host-sampling-output-and-selective-reads)
 defines buffer ownership, row ordering, and output shapes for both host-output
 capabilities. Neither host-output capability changes decode input reloads.
+
+`supports_chained_spec_verify` adds nothing to the async checks below: a
+launch with synchronous scheduling never chains, and `--no-async-scheduling`
+turns chaining off.
 
 The async capability combination has a specific order: the platform first
 disables async scheduling for a model without `supports_async_decode`; the

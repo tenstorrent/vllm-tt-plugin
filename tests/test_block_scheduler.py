@@ -242,6 +242,7 @@ def test_prefill_fallback_releases_finished_runner_state(async_scheduling):
     runner = TTModelRunner.__new__(TTModelRunner)
     runner.tt_per_lane_max_num_seqs = 2
     runner._req_state_slot = {}
+    runner._proposed_draft_token_ids = {}
     runner._pending_state_slot_settle = None
     runner.requests = {}
     runner.encoder_cache = {}
@@ -1152,9 +1153,13 @@ def test_forced_reset_discards_stale_frame_before_following_valid_frame():
     scheduler, request, submitted = _scheduled(output_width=1, async_scheduling=True)
 
     assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    # The empty step that goes ahead of the resumed prefill while ``submitted``
+    # is uncommitted (TTScheduler._schedule_release_step) carries the counts.
+    first = scheduler.schedule()
     resumed = scheduler.schedule()
 
-    assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
+    assert first.total_num_scheduled_tokens == 0
+    assert get_tt_forced_reset_discard_counts(first) == {request.request_id: 1}
     stale = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert stale[0].outputs == []
     assert request.num_stale_output_tokens == 0
@@ -1176,9 +1181,13 @@ def test_forced_reset_counts_one_speculative_forward_as_one_output_frame():
 
     assert request.num_output_placeholders == 4
     assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    # The empty step that goes ahead of the resumed prefill while ``submitted``
+    # is uncommitted (TTScheduler._schedule_release_step) carries the counts.
+    first = scheduler.schedule()
     resumed = scheduler.schedule()
 
-    assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
+    assert first.total_num_scheduled_tokens == 0
+    assert get_tt_forced_reset_discard_counts(first) == {request.request_id: 1}
     assert request.drop_stale_output is True
 
     stale = scheduler.update_from_output(
