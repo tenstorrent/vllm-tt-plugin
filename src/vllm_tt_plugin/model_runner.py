@@ -1534,8 +1534,8 @@ class TTModelRunner:
         """
         if draft_cap is None:
             draft_cap = num_drafts
-        if not 1 <= draft_cap <= num_drafts:
-            raise ValueError(f"draft_cap must be in [1, {num_drafts}], got {draft_cap}")
+        if not 0 <= draft_cap <= num_drafts:
+            raise ValueError(f"draft_cap must be in [0, {num_drafts}], got {draft_cap}")
         drafts = torch.full(
             (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
         )
@@ -1755,6 +1755,17 @@ class TTModelRunner:
         nothing.
         """
         if self._spec_method != "ngram" or not committed:
+            return
+        plan = getattr(self, "_spec_plan", None)
+        live = sum(req_id is not None for req_id in self.input_batch.req_ids)
+        if plan is not None and live and plan.draft_cap(live) == 0:
+            # More live requests than the plan lets draft (a draft cap of 0): propose nothing, so these steps stay
+            # ordinary decodes, which can overlap the next step. The cap is read from the live count at proposal
+            # time; the step that uses the drafts clamps them to the cap of its own live rows (draft_cap in the
+            # input build), so a count that rose in between only truncates. One that fell (5 live requests drop to 4)
+            # leaves the next step draftless, a single lost drafting step per transition.
+            for req_id in committed:
+                self._publish_draft(req_id, [], device_sampled)
             return
         if self._ngram_proposer is None:
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer

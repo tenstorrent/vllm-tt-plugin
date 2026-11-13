@@ -261,10 +261,10 @@ class SpecPlan:
                     "SpecPlan.k_by_rows max_rows must be positive integers in "
                     f"strictly ascending order, got {k_by_rows!r}"
                 )
-            if not _is_int(k) or not 1 <= k <= self.effective_k:
+            if not _is_int(k) or not 0 <= k <= self.effective_k:
                 raise ValueError(
                     "SpecPlan.k_by_rows draft caps must be integers in "
-                    f"[1, effective_k={self.effective_k}], got {entry!r}"
+                    f"[0, effective_k={self.effective_k}], got {entry!r}"
                 )
             previous_max_rows = max_rows
         # effective_k is what the platform publishes as num_speculative_tokens
@@ -305,7 +305,8 @@ class SpecPlan:
     def draft_cap(self, live_rows: int) -> int:
         """The most drafts one row may verify on a step with ``live_rows`` rows.
 
-        ``live_rows`` counts the step's requests, not its padding rows.
+        ``live_rows`` counts the step's requests, not its padding rows. A cap of
+        0 means a step with that many live rows carries no drafts.
         Admission refuses a ``k_by_rows`` that does not reach the launch's
         ``max_num_seqs``, so an admitted launch never asks for a row count the
         mapping lacks.

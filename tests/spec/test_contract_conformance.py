@@ -109,6 +109,13 @@ def test_draft_cap_refuses_a_row_count_that_is_not_a_positive_integer(live_rows)
         _plan().draft_cap(live_rows)
 
 
+def test_k_by_rows_may_cap_a_row_count_at_zero_drafts():
+    # A cap of 0 means a step with that many live rows carries no drafts (an ordinary decode).
+    plan = _plan(effective_k=5, k_by_rows=((1, 5), (4, 3), (32, 0)))
+    assert [plan.draft_cap(rows) for rows in (1, 2, 4, 5, 32)] == [5, 3, 3, 0, 0]
+    assert plan.block_width == 6
+
+
 def test_k_by_rows_normalizes_json_lists_to_tuples():
     # The plan is stored in additional_config as JSON-encodable data, and JSON
     # has lists and no tuples.
@@ -125,7 +132,7 @@ def test_k_by_rows_normalizes_json_lists_to_tuples():
         pytest.param(((0, 7),), id="zero-rows"),
         pytest.param(((4, 7), (4, 3)), id="rows-not-ascending"),
         pytest.param(((8, 3), (4, 7)), id="rows-descending"),
-        pytest.param(((4, 0),), id="zero-cap"),
+        pytest.param(((4, -1),), id="negative-cap"),
         pytest.param(((4, 7), (8, 8)), id="cap-above-effective-k"),
         pytest.param(((4, 3), (8, 2)), id="never-reaches-effective-k"),
         pytest.param(((True, 7),), id="bool-rows"),
