@@ -324,6 +324,25 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
         )
 
 
+def _carry_cleanup(earlier: SchedulerOutput, later: SchedulerOutput) -> None:
+    """Add to ``later`` the cleanup that ``earlier`` drained.
+
+    Every base ``schedule()`` pass drains ``finished_req_ids``, the freed
+    encoder cache entries, and the requests preempted since the previous pass,
+    even a pass that schedules nothing. When one ``TTScheduler.schedule()`` call
+    runs several passes and returns only ``later``, the runner must still
+    receive what ``earlier`` drained.
+    """
+    later.finished_req_ids |= earlier.finished_req_ids
+    later.free_encoder_mm_hashes = (
+        earlier.free_encoder_mm_hashes + later.free_encoder_mm_hashes
+    )
+    if earlier.preempted_req_ids:
+        later.preempted_req_ids = (
+            later.preempted_req_ids or set()
+        ) | earlier.preempted_req_ids
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -393,6 +412,11 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
+        # The step the default mode returned last, while it produces output
+        # tokens that update_from_output has not committed; and a prefill step
+        # kept for the next schedule() call. See _schedule_release_step.
+        self._unreleased_step: SchedulerOutput | None = None
+        self._deferred_prefill: SchedulerOutput | None = None
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -890,6 +914,22 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
             return self._finalize_scheduler_output(result, is_decode=True)
 
+        result = self._schedule_default_mode(has_pending_prefill, has_running_decode)
+        self._unreleased_step = (
+            result if getattr(result, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()) else None
+        )
+        return result
+
+    def _schedule_default_mode(
+        self, has_pending_prefill: bool, has_running_decode: bool
+    ) -> SchedulerOutput:
+        deferred = getattr(self, "_deferred_prefill", None)
+        if deferred is not None:
+            # The previous call returned an empty step in its place; see
+            # _schedule_release_step.
+            self._deferred_prefill = None
+            return self._finalize_scheduler_output(deferred, is_decode=False)
+
         # Default mode:
         # Prefer prefill whenever prefill work is pending, so new requests are
         # admitted and partial prefills advance.
@@ -906,7 +946,23 @@ class TTScheduler(AsyncScheduler):
                 )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result, is_decode=True)
+            release_step = (
+                self._schedule_release_step()
+                if getattr(self, "_unreleased_step", None) is not None
+                and self.scheduler_config.async_scheduling
+                else None
+            )
             prefill_result = self._schedule_prefill_only()
+            if release_step is not None:
+                if prefill_result.total_num_scheduled_tokens > 0:
+                    self._decode_interleave.record_step(
+                        is_decode=False, prefill_pending=True
+                    )
+                    self._deferred_prefill = prefill_result
+                    return self._finalize_scheduler_output(
+                        release_step, is_decode=False
+                    )
+                _carry_cleanup(release_step, prefill_result)
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
             # and free capacity for a later prefill admission.
@@ -915,17 +971,7 @@ class TTScheduler(AsyncScheduler):
                     is_decode=True, prefill_pending=True
                 )
                 result = self._schedule_decode_only()
-                # Even an empty prefill pass drains upstream cleanup events.
-                # The runner must receive them with the replacement decode.
-                result.finished_req_ids |= prefill_result.finished_req_ids
-                result.free_encoder_mm_hashes = (
-                    prefill_result.free_encoder_mm_hashes
-                    + result.free_encoder_mm_hashes
-                )
-                if prefill_result.preempted_req_ids:
-                    result.preempted_req_ids = (
-                        result.preempted_req_ids or set()
-                    ) | prefill_result.preempted_req_ids
+                _carry_cleanup(prefill_result, result)
                 return self._finalize_scheduler_output(result, is_decode=True)
             self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result, is_decode=False)
@@ -1010,6 +1056,43 @@ class TTScheduler(AsyncScheduler):
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
+
+    def _schedule_release_step(self) -> SchedulerOutput:
+        """Schedule an empty step for the engine to execute before a prefill.
+
+        Under async scheduling ``EngineCore.step_with_batch_queue`` commits a
+        step's output (``update_from_output``) only after it has scheduled and
+        executed the next step, and ``TTModelRunner`` runs a prefill to the end
+        inside ``execute_model``. A prefill scheduled right after a step that
+        produces output tokens would hold those tokens back from the client for
+        the whole prefill. The engine executes this empty step instead; its
+        two-entry batch queue is then full, so it commits the held step before
+        it returns.
+
+        Only the prefill pass can tell whether a prefill happens, so
+        ``_schedule_default_mode`` runs it right after this pass. When it
+        schedules tokens, the prefill is kept in ``_deferred_prefill`` and the
+        next ``schedule()`` call returns it. When it schedules nothing, there is
+        no prefill to go ahead of, so this step is not returned and
+        ``_carry_cleanup`` adds what it drained to the step returned instead.
+        Running this pass first keeps that cleanup ahead of the prefill, in the
+        order the runner receives the two steps.
+
+        Every queue is hidden, so the base scheduler schedules nothing and
+        preempts nothing, and the step carries only what the pass drains.
+        """
+        saved_waiting = self.waiting
+        saved_kv_holding = self.kv_holding_waiting
+        saved_running = self.running
+        self.waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy)
+        self.running = []
+        try:
+            return super().schedule()
+        finally:
+            self.waiting = saved_waiting
+            self.kv_holding_waiting = saved_kv_holding
+            self.running = saved_running
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
@@ -1269,7 +1352,9 @@ class TTScheduler(AsyncScheduler):
         """Bind this step's block-step decisions before the base loop commits
         its outputs, so ``_update_request_with_output`` reads the decision that
         produced THIS output rather than a later schedule's overwrite, and
-        consume only the output frames this scheduled step reserved."""
+        consume only the output frames this scheduled step reserved. A
+        committed step no longer holds output back from a prefill
+        (``_schedule_release_step``)."""
         if self._is_block_output_model:
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output
@@ -1279,6 +1364,8 @@ class TTScheduler(AsyncScheduler):
         finally:
             self._committing_block_step_decisions = {}
             self.tt_release_output_frames(scheduler_output)
+            if scheduler_output is getattr(self, "_unreleased_step", None):
+                self._unreleased_step = None
 
     def tt_release_output_frames(self, scheduler_output: SchedulerOutput) -> None:
         """Release the output frames ``scheduler_output`` reserved.
