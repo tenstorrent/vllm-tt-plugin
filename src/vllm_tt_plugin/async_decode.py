@@ -16,7 +16,10 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOu
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_input import TTCompactedHostLogits
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    scheduler_output_has_prefill_work,
+)
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
@@ -572,24 +575,6 @@ class TTAsyncDecodeController:
         return current_req_ids == scheduled_req_ids
 
     @staticmethod
-    def scheduler_output_has_prefill_work(
-        scheduler_output: SchedulerOutput,
-    ) -> bool:
-        """Whether the scheduler output contains any context-phase work.
-
-        This decision is made before ``_update_states``, so the persistent
-        batch still describes the previous step. ``is_context_phase`` is the
-        exact signal for a cached chunked-prefill continuation; token counts
-        are ambiguous for a one-token final chunk and speculative decode.
-        """
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
-            return True
-        return any(
-            cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids
-        )
-
-    @staticmethod
     def suppressed_output_req_ids(scheduler_output: SchedulerOutput) -> set[str]:
         """Requests whose late output must not reach scheduler accounting.
 
@@ -647,7 +632,9 @@ class TTAsyncDecodeController:
         if legacy_prompt or runner._decode_layout_changed_since_last_decode:
             return False
         if self.decode_input_update_contract_version() >= 1:
-            if self.scheduler_output_has_prefill_work(scheduler_output):
+            # Read before ``_update_states``: the persistent batch still
+            # describes the previous step.
+            if scheduler_output_has_prefill_work(scheduler_output):
                 return False
             if (
                 not self._decode_chain_valid
