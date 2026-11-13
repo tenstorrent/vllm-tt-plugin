@@ -599,6 +599,60 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
         assert h.cached_states_checked
 
 
+@pytest.mark.parametrize("chained", [False, True])
+def test_a_decode_row_keeps_its_proposal_across_a_prefill_step(chained):
+    """Under asynchronous scheduling a verify's commit, and the proposal it
+    publishes, run at the next step's build, after ``_update_states``. When a
+    request arrives, that step is its prefill, and a prefill step takes every
+    decode row out of the persistent batch. The decode rows' proposals still
+    reach their next verify, which checks all K drafts, as on a synchronous
+    launch; only the new request's first decode has none."""
+    decoding, arriving = [("a", 700, 40), ("b", 900, 40)], ("c", 700, 8)
+    h = _AsyncHarness(48, mode="align", asynchronous=True, chained=chained)
+    for request in decoding:
+        h.add(*request)
+    steps: list[tuple[str, dict[str, int]]] = []
+    device = h.device
+    prefill, verify, narrow = device.prefill_forward, device._verify, device._narrow
+
+    def record_prefill(tokens, prompt_lens, start_pos, mamba_state, **kwargs):
+        steps.append(("prefill", dict.fromkeys(device._live(), 0)))
+        return prefill(tokens, prompt_lens, start_pos, mamba_state, **kwargs)
+
+    def record_verify(live, tokens, start_pos, mamba_state, kwargs):
+        num_valid = kwargs["num_valid_drafts"].tolist()
+        steps.append(("verify", dict(zip(live, num_valid))))
+        return verify(live, tokens, start_pos, mamba_state, kwargs)
+
+    def record_narrow(live, tokens, start_pos, mamba_state):
+        steps.append(("ordinary", dict.fromkeys(live, 0)))
+        return narrow(live, tokens, start_pos, mamba_state)
+
+    device.prefill_forward = record_prefill
+    device._verify = record_verify
+    device._narrow = record_narrow
+    update, updates = h._update, []
+
+    def arrive_mid_decode(scheduler_output, output):
+        update(scheduler_output, output)
+        updates.append(scheduler_output)
+        if len(updates) == 6:
+            h.add(*arriving)
+
+    h._update = arrive_mid_decode
+    h.run()
+
+    joined = next(i for i, (_, rows) in enumerate(steps) if "c" in rows)
+    assert steps[joined] == ("prefill", {"c": 0})
+    assert steps[joined - 1][0] == "verify", "a and b were decoding when c arrived"
+    assert steps[joined + 1] == ("verify", {"a": K, "b": K, "c": 0})
+    reference = _AsyncHarness(48, mode="align", asynchronous=False)
+    for request in (*decoding, arriving):
+        reference.add(*request)
+    reference.run()
+    assert h.outputs == reference.outputs
+
+
 def test_a_row_near_max_model_len_drains_its_verify():
     """A row within two steps of ``max_model_len`` is not chained: the
     predecessor's commit could be cut there. vLLM then schedules fewer than
@@ -621,7 +675,12 @@ def test_a_device_count_unequal_to_the_walk_raises_before_its_step_is_served():
     scheduler is handed the chained step's tokens."""
     h = _AsyncHarness(48, mode="align", asynchronous=True, chained=True)
     _scenario(h)
-    h.device.miscount_at = 30
+    # Verify 29 is r4's row of a chained verify that another chained verify
+    # of the same rows follows, with no prefill or join between them, so the
+    # device builds that successor from the wrong count. A miscount on a
+    # verify that a prefill or join follows drains instead, and no chained
+    # step would run on it.
+    h.device.miscount_at = 29
     served = []
     update = h.scheduler.update_from_output
 
