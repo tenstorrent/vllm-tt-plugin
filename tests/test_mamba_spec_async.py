@@ -481,9 +481,22 @@ class _AsyncHarness:
                 self.hash_tokens.setdefault(
                     block_hash, tuple(tokens[: (j + 1) * self.hash_block_size])
                 )
-        for block in self.scheduler.kv_cache_manager.block_pool.blocks:
+        # vLLM caches a prefill's blocks when it schedules the prefill. A
+        # prefill TTScheduler keeps for its next schedule() call runs after
+        # this commit, and no step reads its blocks before it runs.
+        manager = self.scheduler.kv_cache_manager
+        deferred = self.scheduler._deferred_prefill
+        unwritten = {
+            block_id
+            for req_id in (deferred.num_scheduled_tokens if deferred else ())
+            for ids in manager.get_block_ids(req_id)
+            for block_id in ids
+        }
+        for block in manager.block_pool.blocks:
             key = block.block_hash
             if key is None or get_group_id(key) not in self.groups:
+                continue
+            if block.block_id in unwritten:
                 continue
             tokens = self.hash_tokens[get_block_hash(key)]
             held = self.ledger.states.get((get_group_id(key), block.block_id))
@@ -577,9 +590,10 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     (``start_blocks_by_count``); the predecessor's commit fills the chained
     step's rows, whose walk then commits what the device computed. Every
     start state read is the request's own and the outputs equal a
-    synchronous run's. Joins, prefills, finished rows that are not the last,
-    preemptions and, in mode ``align``, a window within reach of a block
-    boundary drain instead."""
+    synchronous run's. Joins and prefills (at the empty step the scheduler
+    returns ahead of them), finished rows that are not the last, preemptions
+    and, in mode ``align``, a window within reach of a block boundary drain
+    instead."""
     reference = _AsyncHarness(num_blocks, mode=mode, asynchronous=False)
     _scenario(reference)
     reference.run()
@@ -593,7 +607,9 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     controller = h.runner.async_decode
     assert h.device.chained == controller._chained_verify_submissions > 10
     assert controller._overlapped_unsafe_submissions == 0
-    assert "lifecycle" in controller._chain_drains
+    # TTScheduler returns an empty step ahead of each prefill while a verify
+    # is unread; that step schedules no rows, so it drains for "rows".
+    assert controller._chain_drains["rows"]
     if mode == "align":
         assert controller._chain_drains["mamba_boundary"]
         assert h.cached_states_checked
