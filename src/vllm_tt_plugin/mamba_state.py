@@ -14,7 +14,8 @@ layer's state inside the buffer of its slot, at the block ids that layer's
 group owns.
 
 The TT runner implements ``mamba_cache_mode`` ``none`` and ``align``, with
-synchronous speculative decoding or without it. The upstream GPU model runner,
+speculative decoding or without it, under synchronous or asynchronous
+scheduling. The upstream GPU model runner,
 not the scheduler, picks the state blocks of each request from the group's
 block-table row (``mamba_get_block_table_tensor``, and in mode ``align``
 ``preprocess_mamba``); this module does the same and hands the blocks to the
@@ -256,6 +257,13 @@ class MambaCacheGroups:
         prefill's ``TTModelInput.intermediate_prefill_mask``, ``None`` in
         decode. The result has ``num_rows`` rows, the row count of
         ``page_tables_per_layer``; rows past ``row_req_ids`` hold block 0.
+
+        Under asynchronous scheduling vLLM schedules a step while the
+        request's previous verify is still in flight and counts that
+        verify's drafts as accepted in ``num_computed_tokens``.
+        ``MambaManager`` allocates by that count, so the window follows it
+        too, and the start column follows the recorded window of the
+        previous step and its committed count, as without it.
 
         With speculative decoding this records each row's window
         (``windows``) for the request's next step.
@@ -570,15 +578,6 @@ def check_mamba_launch(
     num_speculative_tokens = 0
     if speculative_config is not None:
         num_speculative_tokens = speculative_config.num_speculative_tokens
-        if vllm_config.scheduler_config.async_scheduling:
-            # The scheduler's token counts of a request with a verify in flight
-            # count its drafts as accepted, so the state block the next step
-            # starts from is known only after the readback.
-            raise ValueError(
-                "Speculative decoding with MambaSpec KV cache groups runs only "
-                "with synchronous scheduling on TT; launch with "
-                "--no-async-scheduling"
-            )
     mode = vllm_config.cache_config.mamba_cache_mode
     if mode not in SUPPORTED_MAMBA_CACHE_MODES:
         raise ValueError(
