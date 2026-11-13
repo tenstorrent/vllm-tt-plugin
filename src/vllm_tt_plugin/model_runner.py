@@ -79,6 +79,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.repetition_guard import RepetitionGuard
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -104,6 +105,44 @@ if TYPE_CHECKING:
 import numpy as np
 
 logger = init_tt_logger(__name__)
+
+
+def _guard_repetition(
+    runner, req_ids: list[str | None], token_lists: list[list[int]]
+) -> list[list[int]]:
+    """Apply the repetition guard to one step's published token lists.
+
+    See ``repetition_guard``. The stop id is one of the request's own
+    ``all_stop_token_ids`` (the end-of-sequence id is among them), so the engine
+    ends the request exactly as it ends one that sampled it. A request with
+    ``ignore_eos`` is never touched. Runner-like test doubles without a guard
+    publish unchanged.
+    """
+    guard = getattr(runner, "_repetition_guard", None)
+    if guard is None:
+        return token_lists
+    guarded = None
+    for row, (req_id, tokens) in enumerate(zip(req_ids, token_lists)):
+        if req_id is None or not tokens:
+            continue
+        params = getattr(runner.requests.get(req_id), "sampling_params", None)
+        stop_ids = getattr(params, "all_stop_token_ids", None)
+        if params is None or params.ignore_eos or not stop_ids:
+            continue
+        out = guard.apply(req_id, tokens, min(stop_ids))
+        if out is not tokens:
+            logger.warning(
+                "Request %s stopped: more than %d identical tokens in a row "
+                "(token id %d)",
+                req_id,
+                guard.max_run,
+                tokens[len(out) - 1],
+            )
+            if guarded is None:
+                guarded = list(token_lists)
+            guarded[row] = out
+    return token_lists if guarded is None else guarded
+
 
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
@@ -314,6 +353,7 @@ class TTModelRunner:
         self._shutdown_complete = False
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
         self._device_grammar_poisoned = False
+        self._repetition_guard = RepetitionGuard()
 
         # Resolved and validated by the platform's config-time admission;
         # ``None`` means the launch asked for no speculation. The draft length
@@ -988,6 +1028,9 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            guard = getattr(self, "_repetition_guard", None)
+            if guard is not None:
+                guard.drop(req_id)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -3732,7 +3775,9 @@ class TTModelRunner:
         return ModelRunnerOutput(
             req_ids=list(row_req_ids),
             req_id_to_index={req: idx for idx, req in enumerate(row_req_ids)},
-            sampled_token_ids=[list(prefix) for prefix in prefixes],
+            sampled_token_ids=_guard_repetition(
+                self, row_req_ids, [list(prefix) for prefix in prefixes]
+            ),
             logprobs=logprobs,
             prompt_logprobs_dict=dict.fromkeys(row_req_ids, None),
             pooler_output=[],
@@ -3945,7 +3990,7 @@ class TTModelRunner:
                 if req_id_to_index is not None
                 else {req_id: idx for idx, req_id in enumerate(req_ids)}
             ),
-            sampled_token_ids=sampled_token_id_lists,
+            sampled_token_ids=_guard_repetition(self, req_ids, sampled_token_id_lists),
             logprobs=logprobs,
             prompt_logprobs_dict=dict.fromkeys(req_ids, None),
             pooler_output=[],
@@ -4606,7 +4651,9 @@ class TTModelRunner:
         output = ModelRunnerOutput(
             req_ids=output_req_ids,
             req_id_to_index=output_req_id_to_index,
-            sampled_token_ids=sampled_token_id_lists,
+            sampled_token_ids=_guard_repetition(
+                self, output_req_ids, sampled_token_id_lists
+            ),
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
