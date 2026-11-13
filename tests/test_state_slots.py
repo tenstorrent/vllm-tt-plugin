@@ -27,6 +27,7 @@ def _runner(slots=SLOTS):
     return SimpleNamespace(
         tt_per_lane_max_num_seqs=slots,
         _req_state_slot={},
+        _proposed_draft_token_ids={},
         _pending_state_slot_settle=None,
         _pending_state_slot_moves=None,
         requests={},

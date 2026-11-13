@@ -1409,6 +1409,68 @@ def test_a_condensed_row_is_drafted_against_its_own_remaining_context():
     assert len(runner._proposed_draft_token_ids["b"]) == DRAFT_LEN
 
 
+def test_a_decode_row_keeps_its_proposal_across_a_prefill_step():
+    """A prefill step does not cost the decode rows their next drafts.
+
+    The asynchronous commit, and the proposal it publishes, run at the next
+    step's build, after ``_update_states``. When a request arrives, that step
+    is its prefill, which schedules no decode row, so ``_update_states`` has
+    taken "a" and "b" out of the persistent batch before their verify commits.
+    Their proposals still reach the verify that schedules them again, as a
+    synchronous launch's drafts wait on ``request.spec_token_ids``, and that
+    verify checks all ``K`` drafts. Only "c", whose first decode follows its
+    prefill, has none.
+    """
+    model = DeferredVerifyTarget()
+    runner = _runner(model)
+    runner._spec_drafts_from_model = True
+    _admit(runner, ("a", 11), ("b", 41))
+    # The state slots the real runner claims at each request's prefill.
+    runner._req_state_slot.update({"a": 0, "b": 1})
+    wrapper = _submit_step(
+        runner,
+        "a",
+        "b",
+        drafts={req: _accept_everything(runner, req) for req in ("a", "b")},
+    )
+    model.release()
+    wrapper.get_output()
+
+    _drain(runner, new=[("c", 71)])
+
+    assert "a" not in runner.input_batch.req_id_to_index
+    proposed = runner._proposed_draft_token_ids
+    assert {req: len(proposed.get(req, ())) for req in "ab"} == {
+        "a": DRAFT_LEN,
+        "b": DRAFT_LEN,
+    }
+    for req in "ab":
+        # What a scheduler reports for a decoding request.
+        runner.requests[req].num_computed_tokens = runner.requests[req].num_tokens
+    placeholders = [PLACEHOLDER_TOKEN_ID] * DRAFT_LEN
+    scheduler_output = _scheduler_output(
+        runner, decoding=("a", "b", "c"), drafts=dict.fromkeys("abc", placeholders)
+    )
+    assert runner.execute_model(scheduler_output) is None
+    wrapper = runner.sample_tokens(None)
+    num_valid = model.verify_calls[-1]["num_valid_drafts"].tolist()
+    rows = runner.input_batch.req_id_to_index
+    assert {req: num_valid[rows[req]] for req in "abc"} == {
+        "a": DRAFT_LEN,
+        "b": DRAFT_LEN,
+        "c": 0,
+    }
+    model.release()
+    wrapper.get_output()
+    _drain(runner, "a", "b", "c")
+    # The drafts continue each row's own commit, so the verify accepts them.
+    assert {req: runner._req_accepted_counts[req] for req in "abc"} == {
+        "a": DRAFT_LEN + 1,
+        "b": DRAFT_LEN + 1,
+        "c": 1,
+    }
+
+
 # endregion Adverse ordering
 
 
