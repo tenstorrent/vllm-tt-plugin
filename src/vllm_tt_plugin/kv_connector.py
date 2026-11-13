@@ -83,6 +83,12 @@ _WORKER_READY = threading.Event()
 SWA_WINDOW_BLOCKS = 4  # 4 x 64 = 256 >= vLLM's window of 255 positions (128 + chunk alignment - 1)
 
 
+def _regions_take_host_buffer(ttnn) -> bool:
+    """Whether this ttnn build's ``copy_device_to_host_regions`` takes ``host_buffer`` (the object that owns the host
+    memory: bounds-checked, and kept alive for a non-blocking read). nanobind puts the signature in the docstring."""
+    return "host_buffer" in (getattr(ttnn.copy_device_to_host_regions, "__doc__", None) or "")
+
+
 def _git_head(path: str | None) -> str:
     """Commit of a checkout (read from .git, no subprocess); '' if unknown."""
     if not path:
@@ -548,19 +554,40 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 off += L.num_devices * SWA_WINDOW_BLOCKS * pb
         return out
 
-    def _copy(self, regions: dict[tuple[int, int], list], to_device: bool) -> int:
+    def _copy(self, pool: Pool, regions: dict[tuple[int, int], list], to_device: bool) -> int:
+        """Copy ``regions`` (addresses in ``pool``'s mapping) to / from the KV tensors: every tensor's regions in one
+        call, non-blocking except the last, so the device works through them back to back and the call returns when
+        all of them are done.
+
+        ``host_buffer=pool.mm`` (a ttnn build that takes it): ttnn checks that every region lies inside the mapping
+        and, for the non-blocking reads, keeps the mapping alive until their bytes have landed (they are copied in
+        later, on the command queue's reader thread). Such a build refuses a non-blocking read without it; without
+        a mapping object every call blocks. An older build takes the addresses as they are, as before."""
         import ttnn
 
         items = [(k, r) for k, r in regions.items() if r]
+        pinned = _regions_take_host_buffer(ttnn)
+        extra = {"host_buffer": pool.mm} if pinned and pool.mm is not None else {}
         nbytes = 0
-        for i, ((layer, kv), regs) in enumerate(items):
-            last = i == len(items) - 1
-            t = self._kv[layer][kv]
-            if to_device:
-                ttnn.copy_host_to_device_regions(t, regs, blocking=last)
-            else:
-                ttnn.copy_device_to_host_regions(t, regs, blocking=last)
-            nbytes += sum(r[2] for r in regs)
+        t = None
+        try:
+            for i, ((layer, kv), regs) in enumerate(items):
+                blocking = i == len(items) - 1 or (pinned and not extra)
+                t = self._kv[layer][kv]
+                if to_device:
+                    ttnn.copy_host_to_device_regions(t, regs, blocking=blocking, **extra)
+                else:
+                    ttnn.copy_device_to_host_regions(t, regs, blocking=blocking, **extra)
+                nbytes += sum(r[2] for r in regs)
+        except Exception:
+            # The reads issued before the failing call may still be in flight into the pool: let them land before the
+            # caller aborts the reservation and the store hands those slots to someone else.
+            if t is not None and not to_device:
+                try:
+                    ttnn.synchronize_device(t.device())
+                except Exception as e:  # noqa: BLE001 - the original error is the one to report
+                    logger.warning("TTKVStoreConnector: sync after a failed region copy failed: %s", e)
+            raise
         return nbytes
 
     def start_load_kv(self, forward_context: Any, **kwargs: Any) -> None:
@@ -576,8 +603,8 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
             try:
                 pg = self._mapping(self.pool_global, ld.global_gen)
                 ps = self._mapping(self.pool_swa, ld.swa_gen)
-                nb = self._copy(self._global_regions(pg, ld.global_slots, ld.global_blocks), to_device=True)
-                nb += self._copy(self._swa_regions(ps, ld.swa_slot, ld.swa_blocks), to_device=True)
+                nb = self._copy(pg, self._global_regions(pg, ld.global_slots, ld.global_blocks), to_device=True)
+                nb += self._copy(ps, self._swa_regions(ps, ld.swa_slot, ld.swa_blocks), to_device=True)
             finally:
                 for lease in ld.leases:
                     self._release(lease)
@@ -631,12 +658,13 @@ class TTKVStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     pool = self.client.pool(self.pool_global)
                     pick = [(s, b) for s, b in zip(slots, sv.global_blocks) if s is not None]
                     if pick:
-                        nb += self._copy(self._global_regions(pool, [s for s, _ in pick], [b for _, b in pick]), False)
+                        regions = self._global_regions(pool, [s for s, _ in pick], [b for _, b in pick])
+                        nb += self._copy(pool, regions, False)
                 if sv.snapshot_key is not None:
                     res_s, slots = self.client.reserve(self.pool_swa, [sv.snapshot_key])
                     pool = self.client.pool(self.pool_swa)
                     if slots and slots[0] is not None:
-                        nb += self._copy(self._swa_regions(pool, slots[0], sv.swa_blocks), False)
+                        nb += self._copy(pool, self._swa_regions(pool, slots[0], sv.swa_blocks), False)
                 # the copies above were blocking: the bytes are in place, publish
                 self.client.commit(res_g)
                 self.client.commit(res_s)

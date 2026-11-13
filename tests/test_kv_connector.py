@@ -433,3 +433,66 @@ def test_a_failed_prefill_row_is_not_saved(connector, caplog):
     c.wait_for_save()
     assert reserved == [[b"k2"]]  # only the good request reached the store
     assert c.skip_save_req_ids == set()  # consumed: the next step saves again
+
+
+def test_region_copies_pass_the_pool_mapping_when_ttnn_takes_it(monkeypatch):
+    """``_copy`` hands ttnn the pool's mapping as ``host_buffer`` (bounds check, and kept alive for the non-blocking
+    reads) on a build that takes it, blocks on every call when there is no mapping object, and calls an older build
+    as before; a failed read waits for the reads already issued before the error reaches the caller."""
+    import sys
+    import types
+
+    from vllm_tt_plugin import kv_connector as kc
+
+    calls = []
+
+    class Tensor:
+        def device(self):
+            return "mesh"
+
+    def make_ttnn(with_host_buffer, fail_at=None):
+        ttnn = types.ModuleType("ttnn")
+
+        def copy(name):
+            def fn(t, regs, blocking=True, **kwargs):
+                if fail_at is not None and len(calls) == fail_at:
+                    raise RuntimeError("bad region")
+                calls.append((name, blocking, kwargs))
+
+            fn.__doc__ = "copy(device_tensor, regions, blocking=True, cq_id=None" + (
+                ", host_buffer=None)" if with_host_buffer else ")"
+            )
+            return fn
+
+        ttnn.copy_device_to_host_regions = copy("read")
+        ttnn.copy_host_to_device_regions = copy("write")
+        ttnn.synchronize_device = lambda device: calls.append(("sync", device))
+        return ttnn
+
+    conn = object.__new__(kc.TTKVStoreConnector)
+    conn._kv = {layer: (Tensor(), Tensor()) for layer in range(2)}
+    regions = {(0, 0): [(0, 0, 64, 1000)], (0, 1): [], (1, 0): [(0, 0, 64, 2000)], (1, 1): [(0, 64, 64, 3000)]}
+    mapping = object()
+    pool = kc.Pool("p", "/x", "g", 4, 64, mapping, 1000)
+
+    monkeypatch.setitem(sys.modules, "ttnn", make_ttnn(True))
+    assert conn._copy(pool, regions, to_device=False) == 192
+    assert calls == [("read", False, {"host_buffer": mapping})] * 2 + [("read", True, {"host_buffer": mapping})]
+    calls.clear()
+    conn._copy(pool, regions, to_device=True)
+    assert [c[:2] for c in calls] == [("write", False), ("write", False), ("write", True)]
+    assert all(c[2] == {"host_buffer": mapping} for c in calls)
+    calls.clear()
+    conn._copy(kc.Pool("p", "/x", "g", 4, 64, None, 1000), regions, to_device=False)  # no mapping object: blocking
+    assert calls == [("read", True, {})] * 3
+    calls.clear()
+
+    monkeypatch.setitem(sys.modules, "ttnn", make_ttnn(False))  # a build from before host_buffer
+    conn._copy(pool, regions, to_device=False)
+    assert calls == [("read", False, {}), ("read", False, {}), ("read", True, {})]
+    calls.clear()
+
+    monkeypatch.setitem(sys.modules, "ttnn", make_ttnn(True, fail_at=1))
+    with pytest.raises(RuntimeError, match="bad region"):
+        conn._copy(pool, regions, to_device=False)
+    assert calls == [("read", False, {"host_buffer": mapping}), ("sync", "mesh")]
