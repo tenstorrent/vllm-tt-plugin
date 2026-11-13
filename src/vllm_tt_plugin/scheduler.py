@@ -1121,11 +1121,14 @@ class TTScheduler(AsyncScheduler):
         self, has_pending_prefill: bool, has_running_decode: bool
     ) -> SchedulerOutput:
         deferred = getattr(self, "_deferred_prefill", None)
-        if deferred is not None:
-            # The previous call returned an empty step in its place; see
-            # _schedule_release_step.
+        # Under a pause in mode "keep" (PAUSED_ALL) the base scheduler schedules
+        # nothing, but the engine still calls schedule() while finished
+        # requests wait to be reported; the kept prefill waits for the pause
+        # to end as well.
+        if deferred is not None and self.pause_state != PauseState.PAUSED_ALL:
+            # Finalized when it was kept; see _schedule_release_step.
             self._deferred_prefill = None
-            return self._finalize_scheduler_output(deferred, is_decode=False)
+            return deferred
 
         # Default mode:
         # Prefer prefill whenever prefill work is pending, so new requests are
@@ -1155,10 +1158,13 @@ class TTScheduler(AsyncScheduler):
                     self._decode_interleave.record_step(
                         is_decode=False, prefill_pending=True
                     )
-                    self._deferred_prefill = prefill_result
-                    return self._finalize_scheduler_output(
+                    release_step = self._finalize_scheduler_output(
                         release_step, is_decode=False
                     )
+                    self._deferred_prefill = self._finalize_scheduler_output(
+                        prefill_result, is_decode=False
+                    )
+                    return release_step
                 _carry_cleanup(release_step, prefill_result)
             # If prefill cannot make progress (e.g. KV pressure), do not stall
             # decode. Fall back to decode-only so running requests can advance
@@ -1192,7 +1198,11 @@ class TTScheduler(AsyncScheduler):
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
-        if pending_reset_discards:
+        # A reset while a prefill is kept counts the frames that prefill
+        # reserved. The runner can discard a frame only after the step that
+        # produces it has run, so the counts wait for a step handed out after
+        # the kept prefill.
+        if pending_reset_discards and getattr(self, "_deferred_prefill", None) is None:
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
         return scheduler_output
@@ -1274,6 +1284,16 @@ class TTScheduler(AsyncScheduler):
         ``_carry_cleanup`` adds what it drained to the step returned instead.
         Running this pass first keeps that cleanup ahead of the prefill, in the
         order the runner receives the two steps.
+
+        Between the two calls the engine commits the held step and handles
+        client calls: aborts, pauses and prefix-cache resets. The kept prefill
+        is finalized when it is kept and handed out unchanged, and while it is
+        kept ``_finalize_scheduler_output`` holds back forced-reset discard
+        counts: a reset in between counts the frames the prefill reserved, and
+        the runner can discard them only after the prefill has run. A request
+        aborted in between is still prefilled; the runner drops it with the
+        next step's ``finished_req_ids``. Under a pause in mode "keep" the
+        prefill is not handed out until the pause ends.
 
         Every queue is hidden, so the base scheduler schedules nothing and
         preempts nothing, and the step carries only what the pass drains.

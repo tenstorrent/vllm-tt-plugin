@@ -416,6 +416,23 @@ commits every step before it schedules the next one, and this never happens.
 Single-process lane-DP does not do it: `TTLaneCoordinator` runs its lanes in
 forced modes.
 
+Between the call that keeps the prefill and the call that returns it, the
+engine commits the held step and handles client calls. The kept prefill is
+finalized when it is kept and returned unchanged:
+
+- A forced prefix-cache reset (`reset_prefix_cache(reset_running_requests=True)`,
+  which `pause_scheduler(clear_cache=True)` and `release_kv_cache_memory` also
+  run) preempts the kept prefill's requests and counts the frames the prefill
+  reserved. The prefill
+  still runs, and `_finalize_scheduler_output` attaches the discard counts to
+  a later step, because the runner can discard a frame only after the step that
+  produces it has run.
+- A request aborted in between is still prefilled. The runner drops it, and
+  its output, with the next step's `finished_req_ids`.
+- During a pause in mode "keep" the prefill is not returned until the pause
+  ends, although the engine still calls `schedule()` while finished requests
+  wait to be reported.
+
 The empty step costs one engine iteration, in which `EngineCoreProc` sleeps 1 ms
 because nothing executed. The runner drains pending async decode for the empty
 step, which it does for the prefill anyway.
