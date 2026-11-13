@@ -473,6 +473,9 @@ class _Harness:
         # first GDN group's block it read.
         self.hits: dict[str, list[int]] = {}
         self.hit_blocks: dict[str, list[int]] = {}
+        # (request id, start position) of each such step that began one token
+        # before the request's last token.
+        self.last_token_hits: list[tuple[str, int]] = []
         # (request id, position) of every prefill checkpoint written, and the
         # first GDN group's block it went to.
         self.checkpoints: list[tuple[str, int]] = []
@@ -707,6 +710,10 @@ class _Harness:
                 assert bool(state.intermediate_prefill_mask[row]) == (
                     end < request.num_tokens
                 )
+                # A prefill computes the request's own tokens and no position
+                # past them.
+                assert int(model_input.prompt_lens[row]) == end, (req_id, end)
+                assert end <= request.num_tokens, (req_id, start, end)
             if verify and (start // BLOCK_SIZE) != ((end - 1) // BLOCK_SIZE):
                 self.verify_crossings += 1
             # The attention page table is the scheduler's attention blocks.
@@ -718,6 +725,8 @@ class _Harness:
                 self.resumed_from_zero.add(req_id)
             if req_id in fresh and start > 0:
                 self.hits.setdefault(req_id, []).append(start)
+                if start + 1 == request.num_tokens:
+                    self.last_token_hits.append((req_id, start))
                 self.hit_blocks.setdefault(req_id, []).append(
                     int(state.groups[0].start_blocks[row])
                 )
