@@ -39,6 +39,7 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | Keyword | Meaning |
 |---|---|
 | `tokens` | CPU integer tensor `[B, T]`, containing token history from position 0 through the largest scheduled chunk end. |
+| `original_prompt_lens` | Supplied only when `supports_original_prompt_lens=True`: a CPU list of original prompt token counts, one per submitted row. Captured when building the submission, in the same order as `tokens` and `empty_slots`; stable across chunks and resumed replay. This count may exceed the end of an intermediate chunk. |
 | `start_pos` | One absolute chunk start per row. Front-packed prefill supplies a NumPy array; lane-DP supplies a torch tensor. |
 | `prompt_lens` | One exclusive chunk end per row, supplied as a NumPy array. `prompt_lens[i]` is not the chunk length. |
 | `page_table`, `kv_cache` | Block addresses and the object returned by the adapter's KV allocator. |
@@ -53,6 +54,17 @@ For row `i`, `prefill_forward` computes
 `prompt_lens[i]=192` request 64 tokens while retaining absolute positions.
 Prefix-cache hits and resumed requests can also have nonzero `start_pos`.
 Resume prefill can replay generated tokens to rebuild KV state.
+
+An adapter declaring `supports_original_prompt_lens` receives the original
+prompt boundary even when replay includes generated output. At chunk end `end`,
+its prompt history is `tokens[i, :min(original_prompt_lens[i], end)]` and its
+output history is `tokens[i, original_prompt_lens[i]:end]` (empty when the
+boundary is beyond `end`). Presence/frequency penalties use output history;
+repetition penalties use both histories. Row padding and unscheduled future
+tokens are not history. The count is not a request identity or a chunk length.
+The plugin omits this keyword for adapters without the opt-in, preserving their
+existing call signatures. Warmup and decode callback signatures are unchanged.
+Host-prefill sampling uses the authoritative split regardless of model opt-in.
 
 The model adapter returns host logits `[B, 1, V]` for host sampling, or sampled
 token IDs for device sampling. The plugin has no separate prefill readback

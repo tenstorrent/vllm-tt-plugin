@@ -1612,6 +1612,7 @@ class TTLaneInputBatch(InputBatch):
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
+            original_prompt_lens=lane_batch.num_prompt_tokens[rows_np].tolist(),
             block_tables=block_tables_per_group[0],
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=runner._block_tables_per_layer(

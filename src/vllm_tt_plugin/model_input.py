@@ -223,6 +223,10 @@ class TTModelInput:
     # ``supports_stage_inputs``.
     stage_inputs: list[Any] | None = None
 
+    # Prefill-only, captured in submitted row order, including replayed outputs.
+    # The original prompt length can exceed an intermediate chunk's end.
+    original_prompt_lens: list[int] | None = None
+
     # Decode-only: retain device logits until sample_tokens supplies the grammar,
     # then invoke the model's device sampler. Structured prefills stay on host.
     defer_device_sampling: bool = False
@@ -293,3 +297,37 @@ def penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.Te
     """
     ids = prompt_tokens.to(torch.int64)
     return ids.masked_fill(ids == -1, vocab_size)
+
+
+def prefill_penalty_history(
+    tokens: torch.Tensor,
+    chunk_ends,
+    original_prompt_lens: list[int] | None,
+    vocab_size: int,
+) -> tuple[torch.Tensor, list[list[int]]]:
+    """Split captured replay tokens without counting padding or future tokens."""
+    rows, width = tokens.shape
+    if original_prompt_lens is None or len(original_prompt_lens) != rows:
+        raise ValueError(
+            f"Prefill needs one original prompt length per row ({rows}), "
+            f"got {original_prompt_lens!r}"
+        )
+    ends = torch.as_tensor(chunk_ends, dtype=torch.int64)
+    originals = torch.as_tensor(original_prompt_lens, dtype=torch.int64)
+    if (
+        ends.shape != (rows,)
+        or (ends < 0).any()
+        or (ends > width).any()
+        or (originals < 0).any()
+    ):
+        raise ValueError(
+            f"Invalid prefill history bounds: ends={ends.tolist()}, "
+            f"originals={originals.tolist()}, token shape={tuple(tokens.shape)}"
+        )
+    positions = torch.arange(width).unsqueeze(0)
+    prompt_end = torch.minimum(ends, originals).unsqueeze(1)
+    prompt = tokens.to(torch.int64).masked_fill(positions >= prompt_end, vocab_size)
+    output = tokens.masked_fill(
+        (positions < originals.unsqueeze(1)) | (positions >= ends.unsqueeze(1)), -1
+    )
+    return penalty_prompt_ids(prompt, vocab_size), penalty_history(output)

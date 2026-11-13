@@ -54,6 +54,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     is_tt_device_grammar_preload_eligible,
+    resolve_tt_supports_original_prompt_lens,
 )
 from vllm_tt_plugin.host_sampler import create_host_sampler
 from vllm_tt_plugin.input_batch import (
@@ -76,6 +77,7 @@ from vllm_tt_plugin.model_input import (
     live_row_index,
     penalty_history,
     penalty_prompt_ids,
+    prefill_penalty_history,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
@@ -2782,6 +2784,11 @@ class TTModelRunner:
             input_tokens=input_tokens,
             input_positions=input_positions,
             prompt_lens=prompt_lens,
+            original_prompt_lens=(
+                input_batch.num_prompt_tokens[req_indices].tolist()
+                if is_prompt
+                else None
+            ),
             block_tables=block_tables,
             block_tables_per_group=block_tables_per_group,
             block_tables_per_layer=self._block_tables_per_layer(block_tables_per_group),
@@ -4102,6 +4109,12 @@ class TTModelRunner:
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
+        if resolve_tt_supports_original_prompt_lens(
+            getattr(self.model, "model_capabilities", None)
+        ):
+            if model_input.original_prompt_lens is None:
+                raise ValueError("Prefill is missing captured original_prompt_lens")
+            kwargs["original_prompt_lens"] = list(model_input.original_prompt_lens)
         # Hybrid attention models route per-layer block tables; the
         # runner already expanded ``block_tables_per_group`` into a
         # per-layer list at submission time when the kv_cache_config has
@@ -4379,27 +4392,23 @@ class TTModelRunner:
                 # Prompt tokens for penalties: must be int64 and padded with a
                 # valid index (vocab_size), not TT's -1 sentinel.
                 prompt_token_ids: torch.Tensor | None = None
-                if not no_penalties:
-                    if is_decode and model_input.prompt_tokens is not None:
-                        prompt_token_ids = penalty_prompt_ids(
-                            _take(model_input.prompt_tokens), self.vocab_size
-                        )
-                    elif not is_decode:
-                        prompt_token_ids = model_input.input_tokens[
-                            start : start + sz
-                        ].to(torch.int64)
-                        assert model_input.prompt_lens is not None
-                        prompt_lens_t = torch.as_tensor(
-                            model_input.prompt_lens[start : start + sz],
-                            dtype=torch.int64,
-                        )
-                        positions = torch.arange(
-                            prompt_token_ids.shape[1],
-                        ).unsqueeze(0)
-                        pad_mask = positions >= prompt_lens_t.unsqueeze(1)
-                        prompt_token_ids = prompt_token_ids.masked_fill(
-                            pad_mask, self.vocab_size
-                        )
+                if not is_decode and (
+                    not no_penalties or model_input.bad_words_token_ids_list[dp_rank]
+                ):
+                    prompt_token_ids, output_token_ids = prefill_penalty_history(
+                        _take(model_input.input_tokens),
+                        model_input.prompt_lens[start : start + sz],
+                        model_input.original_prompt_lens[start : start + sz]
+                        if model_input.original_prompt_lens is not None
+                        else None,
+                        self.vocab_size,
+                    )
+                    if no_penalties:
+                        prompt_token_ids = None
+                elif not no_penalties and model_input.prompt_tokens is not None:
+                    prompt_token_ids = penalty_prompt_ids(
+                        _take(model_input.prompt_tokens), self.vocab_size
+                    )
 
                 # Get host-only sampling params from model_input
                 # (per-rank lists).

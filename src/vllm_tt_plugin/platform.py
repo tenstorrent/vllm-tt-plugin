@@ -29,6 +29,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
     resolve_tt_scheduler_cls,
+    resolve_tt_supports_original_prompt_lens,
     resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
@@ -2117,6 +2118,7 @@ class TTPlatform(Platform):
             )
         store_tt_block_kv_extent_tokens(vllm_config, block_kv_extent)
         is_block_output_model = is_tt_block_output_model(vllm_config)
+        resolve_tt_supports_original_prompt_lens(model_capabilities)
         supports_device_grammar = (
             model_capabilities.get("supports_device_grammar", False)
             if model_capabilities

@@ -38,6 +38,17 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config)
 
 
+def resolve_tt_supports_original_prompt_lens(model_capabilities: dict | None) -> bool:
+    """Validate the opt-in to authoritative original prompt lengths on prefill."""
+    supported = (model_capabilities or {}).get("supports_original_prompt_lens", False)
+    if not isinstance(supported, bool):
+        raise ValueError(
+            "model_capabilities['supports_original_prompt_lens'] must be a boolean, "
+            f"got {supported!r}"
+        )
+    return supported
+
+
 def get_tt_seeded_sampling_policy(
     vllm_config: "VllmConfig",
 ) -> Literal["auto", "host"]:
