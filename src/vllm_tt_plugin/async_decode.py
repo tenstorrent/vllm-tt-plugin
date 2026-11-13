@@ -357,8 +357,13 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         return self._submission.verify_output
 
     def fill_chained(self, model_input: TTModelInput) -> None:
-        """Take the rows the chained verify ran, once its predecessor committed."""
-        self._model_input = model_input
+        """Take the rows the chained verify ran, once its predecessor committed.
+
+        The predecessor's ``VerifyOutput`` is dropped: nothing reads it after
+        the submission, and holding it would keep each read verify alive for
+        as long as the step after it.
+        """
+        self._model_input = replace(model_input, spec_predecessor=None)
         self.chain_filled = True
 
     def set_grammar_bitmask(
