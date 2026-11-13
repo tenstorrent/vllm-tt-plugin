@@ -611,8 +611,11 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     # is unread; that step schedules no rows, so it drains for "rows".
     assert controller._chain_drains["rows"]
     if mode == "align":
-        assert controller._chain_drains["mamba_boundary"]
         assert h.cached_states_checked
+    if mode == "align" and num_blocks == 28:
+        # With 48 blocks no chain attempt of this scenario meets a block
+        # boundary: the empty step after each prefill changes which steps chain.
+        assert controller._chain_drains["mamba_boundary"]
 
 
 @pytest.mark.parametrize("chained", [False, True])

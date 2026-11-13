@@ -361,6 +361,20 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
         )
 
 
+def scheduler_output_has_prefill_work(scheduler_output: SchedulerOutput) -> bool:
+    """Whether the scheduler output contains any context-phase work.
+
+    That is a new or resumed request, or a cached request with no output token
+    yet. ``is_context_phase`` is the exact signal for a cached chunked-prefill
+    continuation; token counts are ambiguous for a one-token final chunk and
+    speculative decode. ``TTModelRunner`` runs such a step as a prefill.
+    """
+    cached_reqs = scheduler_output.scheduled_cached_reqs
+    if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
+        return True
+    return any(cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids)
+
+
 def _carry_cleanup(earlier: SchedulerOutput, later: SchedulerOutput) -> None:
     """Add to ``later`` the cleanup that ``earlier`` drained.
 
@@ -1129,6 +1143,17 @@ class TTScheduler(AsyncScheduler):
             # Finalized when it was kept; see _schedule_release_step.
             self._deferred_prefill = None
             return deferred
+        held = getattr(self, "_unreleased_step", None)
+        if (
+            held is not None
+            and self.scheduler_config.async_scheduling
+            and scheduler_output_has_prefill_work(held)
+        ):
+            # Whatever comes next would run before the engine commits the
+            # prefill; see _schedule_release_step.
+            return self._finalize_scheduler_output(
+                self._schedule_release_step(), is_decode=False
+            )
 
         # Default mode:
         # Prefer prefill whenever prefill work is pending, so new requests are
@@ -1146,10 +1171,10 @@ class TTScheduler(AsyncScheduler):
                 )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result, is_decode=True)
+            # A held step here is a decode or a verify.
             release_step = (
                 self._schedule_release_step()
-                if getattr(self, "_unreleased_step", None) is not None
-                and self.scheduler_config.async_scheduling
+                if held is not None and self.scheduler_config.async_scheduling
                 else None
             )
             prefill_result = self._schedule_prefill_only()
@@ -1265,25 +1290,33 @@ class TTScheduler(AsyncScheduler):
         return result
 
     def _schedule_release_step(self) -> SchedulerOutput:
-        """Schedule an empty step for the engine to execute before a prefill.
+        """Schedule an empty step that lets the engine commit the held step.
 
         Under async scheduling ``EngineCore.step_with_batch_queue`` commits a
         step's output (``update_from_output``) only after it has scheduled and
-        executed the next step, and ``TTModelRunner`` runs a prefill to the end
-        inside ``execute_model``. A prefill scheduled right after a step that
-        produces output tokens would hold those tokens back from the client for
-        the whole prefill. The engine executes this empty step instead; its
-        two-entry batch queue is then full, so it commits the held step before
-        it returns.
+        executed the next step. The engine executes this empty step instead;
+        its two-entry batch queue is then full, so it commits the held step
+        (``_unreleased_step``) before it returns. ``_schedule_default_mode``
+        returns it in two cases.
 
-        Only the prefill pass can tell whether a prefill happens, so
-        ``_schedule_default_mode`` runs it right after this pass. When it
-        schedules tokens, the prefill is kept in ``_deferred_prefill`` and the
-        next ``schedule()`` call returns it. When it schedules nothing, there is
-        no prefill to go ahead of, so this step is not returned and
-        ``_carry_cleanup`` adds what it drained to the step returned instead.
-        Running this pass first keeps that cleanup ahead of the prefill, in the
-        order the runner receives the two steps.
+        The held step is a prefill. ``TTModelRunner`` ran it to the end inside
+        ``execute_model``, so its tokens are ready, and any next step would
+        hold them back for its own ``execute_model``: a whole prefill, or the
+        build and submission of a decode or verify, which after a prefill
+        rebuilds its full inputs. A prefill chunk that does not complete its
+        prompt produces no output, is never held, and is not followed by this
+        step.
+
+        The held step is a decode or a verify and a prefill comes next. The
+        decode's tokens would wait for the whole prefill. Only the prefill
+        pass can tell whether a prefill happens, so ``_schedule_default_mode``
+        runs it right after this pass. When it schedules tokens, the prefill
+        is kept in ``_deferred_prefill`` and the next ``schedule()`` call
+        returns it. When it schedules nothing, there is no prefill to go ahead
+        of, so this step is not returned and ``_carry_cleanup`` adds what it
+        drained to the step returned instead; running decodes then keep their
+        overlap with the engine. Running this pass first keeps that cleanup
+        ahead of the prefill, in the order the runner receives the two steps.
 
         Between the two calls the engine commits the held step and handles
         client calls: aborts, pauses and prefix-cache resets. The kept prefill
@@ -1570,8 +1603,7 @@ class TTScheduler(AsyncScheduler):
         its outputs, so ``_update_request_with_output`` reads the decision that
         produced THIS output rather than a later schedule's overwrite, and
         consume only the output frames this scheduled step reserved. A
-        committed step no longer holds output back from a prefill
-        (``_schedule_release_step``)."""
+        committed step is no longer the held step (``_schedule_release_step``)."""
         if self._is_block_output_model:
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output

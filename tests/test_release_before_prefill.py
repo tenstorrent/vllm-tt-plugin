@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""A step's output tokens reach the client before a prefill runs.
+"""A prefill's tokens reach the client before the next step runs, and a
+decode's tokens before a prefill runs.
 
 Under async scheduling vLLM's ``EngineCore.step_with_batch_queue`` commits a
 step's output only after it has scheduled and executed the next step, and
@@ -17,6 +18,7 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.interface import PauseState
@@ -34,7 +36,10 @@ from tests.test_block_scheduler import _scheduler as _real_scheduler
 from vllm_tt_plugin.async_decode import TTAsyncDecodeController
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    scheduler_output_has_prefill_work,
+)
 
 TOKEN = 7
 
@@ -91,9 +96,9 @@ class _SynchronousExecutor:
 
     Logs ``("prefill" | "decode" | "empty", req_ids)`` for each step,
     ``("discard", (req_id,))`` for forced-reset discard counts a step brings,
-    and ``("resume", (req_id,))`` for a request a step resumes. Chunked prefill
-    is off in these tests, so a step with a new or resumed request is a whole
-    prefill. ``applied`` counts the tokens the runner adds to each request.
+    and ``("resume", (req_id,))`` for a request a step resumes. A step is a
+    prefill when ``TTModelRunner`` runs it as one. ``applied`` counts the
+    tokens the runner adds to each request.
     """
 
     def __init__(self, log: list, max_num_reqs: int) -> None:
@@ -101,6 +106,7 @@ class _SynchronousExecutor:
         self.runner = _runner(max_num_reqs)
         self.applied: Counter[str] = Counter()
         self._executed: tuple[str, ...] = ()
+        self._intermediate: np.ndarray | None = None
         apply = self.runner._apply_sampled_tokens_to_state
 
         def count_applied(sampled_token_ids, req_ids=None, skip_req_ids=None):
@@ -134,19 +140,40 @@ class _SynchronousExecutor:
         if not req_ids:
             self.log.append(("empty", ()))
             return _done(EMPTY_MODEL_RUNNER_OUTPUT)
-        is_prefill = scheduler_output.scheduled_new_reqs or cached.resumed_req_ids
+        is_prefill = scheduler_output_has_prefill_work(scheduler_output)
         self.log.append(("prefill" if is_prefill else "decode", req_ids))
         self._executed = req_ids
+        # As TTModelRunner marks a prefill row that ends before its last token.
+        self._intermediate = (
+            np.array(
+                [
+                    runner.requests[r].num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens[r]
+                    < runner.requests[r].num_tokens
+                    for r in req_ids
+                ]
+            )
+            if is_prefill
+            else None
+        )
         return _done(None)
 
     def sample_tokens(self, grammar_output, non_block=False):
         req_ids = list(self._executed)
         sampled = torch.full((len(req_ids), 1), TOKEN, dtype=torch.int32)
-        return _done(
-            self.runner.defer_state_apply_and_build_runner_output(
+        if self._intermediate is not None and self._intermediate.any():
+            output = self.runner._build_chunked_prefill_output(
+                req_ids=req_ids,
+                sampled_token_ids=sampled,
+                logprobs=None,
+                intermediate_mask=self._intermediate,
+                defer_state_apply=True,
+            )
+        else:
+            output = self.runner.defer_state_apply_and_build_runner_output(
                 sampled, req_ids=req_ids
             )
-        )
+        return _done(output)
 
 
 def _engine(scheduler, log: list) -> SimpleNamespace:
@@ -358,6 +385,53 @@ def test_cleanup_reaches_the_decode_when_no_prefill_is_admitted():
     assert step.finished_req_ids == {"C"}
 
 
+def _held_from_prefills(log: list) -> list[dict[str, int]]:
+    """For each prefill or decode step, the tokens that earlier prefill steps
+    computed and that are not released yet, by request."""
+    pending: Counter[str] = Counter()
+    held = []
+    for kind, req_ids in log:
+        if kind in ("prefill", "decode"):
+            held.append({r: n for r, n in pending.items() if n})
+        if kind == "prefill":
+            pending.update(req_ids)
+        elif kind == "release" and pending[req_ids[0]]:
+            pending[req_ids[0]] -= 1
+    return held
+
+
+def test_a_prefill_s_tokens_are_released_before_the_next_step_runs():
+    # A's prefill is followed by A's decodes; B's by a decode of both.
+    log = _serve(
+        _async_scheduler(),
+        {0: [_request(6, request_id="A")], 3: [_request(3, request_id="B")]},
+    ).log
+
+    assert log.index(("release", ("A",))) < log.index(("decode", ("A",)))
+    assert not any(_held_from_prefills(log))
+
+
+def test_no_empty_step_between_two_decodes():
+    log = _serve(_async_scheduler(), {0: [_request(6, request_id="A")]}).log
+
+    decodes = [i for i, (kind, _) in enumerate(log) if kind == "decode"]
+    assert len(decodes) == 5
+    assert ("empty", ()) not in log[decodes[0] : decodes[-1]]
+
+
+def test_only_the_last_chunk_of_a_prompt_is_followed_by_an_empty_step():
+    # A 200-token prompt at 64 tokens per step: three chunks that produce no
+    # token, then the last one, which does.
+    scheduler = _async_scheduler()
+    scheduler.scheduler_config.enable_chunked_prefill = True
+    scheduler.max_num_scheduled_tokens = 64
+    log = _serve(scheduler, {0: [_request(3, request_id="A", prompt_length=200)]}).log
+
+    executed = [kind for kind, _ in log if kind in ("prefill", "decode", "empty")]
+    assert executed[:6] == ["prefill"] * 4 + ["empty", "decode"]
+    assert log.index(("release", ("A",))) < log.index(("decode", ("A",)))
+
+
 # A prefill kept by one schedule() call reaches the runner on the next call.
 # Between the two, the engine commits the held step and handles client calls.
 
@@ -384,8 +458,9 @@ def _no_unreleased_token_applied(engine) -> None:
         )
 
 
-def _two_prefills():
-    return {0: [_request(3, request_id="A")], 1: [_request(3, request_id="B")]}
+def _prefill_after_a_decode():
+    """B arrives while A decodes, so B's prefill is kept behind A's decode."""
+    return {0: [_request(6, request_id="A")], 3: [_request(3, request_id="B")]}
 
 
 def test_a_reset_while_a_prefill_is_kept_discards_its_frame_after_it_runs():
@@ -395,19 +470,22 @@ def test_a_reset_while_a_prefill_is_kept_discards_its_frame_after_it_runs():
         assert engine.scheduler.reset_prefix_cache(reset_running_requests=True)
 
     between, ran = _when_a_prefill_is_kept(reset)
-    engine = _serve(_async_scheduler(), _two_prefills(), between)
+    engine = _serve(_async_scheduler(), _prefill_after_a_decode(), between)
     log = engine.log
 
     assert ran
     assert log.index(("prefill", ("B",))) < log.index(("discard", ("B",)))
     assert log.index(("discard", ("B",))) < log.index(("resume", ("B",)))
-    assert engine.released == {"A": 3, "B": 3}
+    assert engine.released == {"A": 6, "B": 3}
     _no_unreleased_token_applied(engine)
 
 
 @pytest.mark.parametrize("pause", [False, True], ids=["abort", "pause-abort"])
 def test_an_abort_while_a_prefill_is_kept(pause):
+    released_a: list[int] = []
+
     def abort(engine) -> None:
+        released_a.append(engine.released["A"])
         if pause:
             EngineCore.pause_scheduler(engine, mode="abort", clear_cache=False)
             EngineCore.resume_scheduler(engine)
@@ -415,11 +493,11 @@ def test_an_abort_while_a_prefill_is_kept(pause):
             engine.scheduler.finish_requests("B", RequestStatus.FINISHED_ABORTED)
 
     between, ran = _when_a_prefill_is_kept(abort)
-    engine = _serve(_async_scheduler(), _two_prefills(), between)
+    engine = _serve(_async_scheduler(), _prefill_after_a_decode(), between)
 
     assert ran
     assert engine.released["B"] == 0
-    assert engine.released["A"] == (1 if pause else 3)
+    assert engine.released["A"] == (released_a[0] if pause else 6)
     assert not engine.model_executor.runner.requests
     _no_unreleased_token_applied(engine)
 
@@ -429,7 +507,7 @@ def test_an_abort_while_a_prefill_is_kept(pause):
 def test_a_keep_pause_while_a_prefill_is_kept(clear_cache, abort_a):
     # Paused from the window for three engine iterations. An abort while
     # paused makes the engine step, and so call schedule(), during the pause.
-    paused = {"iterations": -1}
+    paused = {"iterations": -1, "released_a": 0}
 
     def between(engine) -> None:
         if paused["iterations"] < 0:
@@ -440,12 +518,13 @@ def test_a_keep_pause_while_a_prefill_is_kept(clear_cache, abort_a):
             return
         paused["iterations"] += 1
         if paused["iterations"] == 1 and abort_a:
+            paused["released_a"] = engine.released["A"]
             engine.scheduler.finish_requests("A", RequestStatus.FINISHED_ABORTED)
         if paused["iterations"] == 3:
             engine.log.append(("unpause", ()))
             EngineCore.resume_scheduler(engine)
 
-    engine = _serve(_async_scheduler(), _two_prefills(), between)
+    engine = _serve(_async_scheduler(), _prefill_after_a_decode(), between)
     log = engine.log
 
     pause, unpause = log.index(("pause", ())), log.index(("unpause", ()))
@@ -453,5 +532,5 @@ def test_a_keep_pause_while_a_prefill_is_kept(clear_cache, abort_a):
     assert log.index(("prefill", ("B",))) > unpause
     if clear_cache:
         assert log.index(("discard", ("B",))) < log.index(("resume", ("B",)))
-    assert engine.released == {"A": 1 if abort_a else 3, "B": 3}
+    assert engine.released == {"A": paused["released_a"] if abort_a else 6, "B": 3}
     _no_unreleased_token_applied(engine)

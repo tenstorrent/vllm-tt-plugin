@@ -34,7 +34,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
+from vllm_tt_plugin.scheduler import (
+    get_tt_forced_reset_discard_counts,
+    scheduler_output_has_prefill_work,
+)
 from vllm_tt_plugin.spec_admission import SUPPORTS_CHAINED_SPEC_VERIFY
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
 from vllm_tt_plugin.structured_output import has_structured_outputs
@@ -94,7 +97,7 @@ def plan_chain(
         or scheduler_output.scheduled_cached_reqs.resumed_req_ids
         or scheduler_output.preempted_req_ids
         or get_tt_forced_reset_discard_counts(scheduler_output)
-        or runner.async_decode.scheduler_output_has_prefill_work(scheduler_output)
+        or scheduler_output_has_prefill_work(scheduler_output)
     ):
         return None, "lifecycle"
     if scheduler_output.pending_structured_output_tokens or has_structured_outputs(

@@ -182,9 +182,10 @@ The TT scheduler behaves like this:
   running request's inter-token latency does not scale with another request's
   prompt length. Both counts default to 1 decode step after 2 prefill steps.
   See "Decode interleave" below.
-- under async scheduling, if the step before a prefill produces output tokens
-  that the engine has not committed yet, return an empty step first and the
-  prefill on the next call. See "Releasing output before a prefill" below.
+- under async scheduling, return an empty step right after a prefill that
+  produced tokens, and between a decode whose tokens the engine has not
+  committed yet and a prefill. See "Releasing output before the next step"
+  below.
 
 The reason for this policy is simple: TT wants a homogeneous batch type per
 step.
@@ -340,7 +341,7 @@ has been submitted, not when the step itself finishes. Within one insertion,
 every decode token but the last is published as the following decode step is
 submitted, which is immediate. The last one is followed by a prefill step,
 which on TT runs a whole chunk inside its submission, so the scheduler returns
-an empty step before it (see "Releasing output before a prefill" below) and
+an empty step before it (see "Releasing output before the next step" below) and
 that token is published before the chunk runs, like its siblings. The gap a
 decode request observes is therefore the whole run of prefill steps.
 
@@ -382,20 +383,33 @@ advance. Every lane executes the one negotiated mode, so a per-lane decision
 would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
 each rank runs the policy on its own scheduler state.
 
-### Releasing output before a prefill
+### Releasing output before the next step
 
 Under async scheduling, `EngineCore.step_with_batch_queue` keeps up to two
 steps in its queue. It commits step N's output (`update_from_output`, which
 publishes the step's tokens to the client) only after it has scheduled and
 submitted step N+1. `TTModelRunner` runs a prefill to the end inside its
-submission. A prefill scheduled right after a step that produces tokens would
-therefore hold those tokens for the whole prefill: the first token of a request
-prefilled alone would wait for the next request's prefill as well.
+submission. Without the measures below:
+
+- A prefill's tokens wait for the submission of the next step: a whole prefill
+  when another prompt follows (the first token of a request prefilled alone
+  would wait for the next request's prefill as well), or the build and
+  submission of the first decode or verify, which after a prefill rebuilds its
+  full inputs.
+- A decode's tokens wait for a whole prefill when a prefill follows.
 
 `TTScheduler` remembers the last step it returned that produces output tokens
 (a decode step, or a prefill step that completes a prompt) until
-`update_from_output` commits it. When that step is still uncommitted, prefill
-work is pending, and the decode interleave does not take the step for decode:
+`update_from_output` commits it. A prefill chunk that does not complete its
+prompt produces none, so the chunks of one prompt run back to back.
+
+When that step is a prefill, the next `schedule()` call returns an empty step,
+whatever would come next. The engine executes it; its queue then holds two
+steps, so it commits the prefill and publishes its tokens before it returns.
+The following call schedules as usual.
+
+When that step is a decode or a verify, prefill work is pending, and the decode
+interleave does not take the step for decode:
 
 1. `schedule()` runs a base scheduling pass with every queue hidden
    (`_schedule_release_step`). The pass schedules nothing and drains the
@@ -403,16 +417,14 @@ work is pending, and the decode interleave does not take the step for decode:
    requests).
 2. `schedule()` runs the prefill pass. If it schedules tokens, `schedule()`
    keeps it and returns the empty step from step 1.
-3. The engine executes the empty step. Its queue then holds two steps, so it
-   commits the held step and publishes its tokens before it returns.
+3. The engine executes the empty step and commits the held step.
 4. The next `schedule()` call returns the kept prefill.
 
 If the prefill pass schedules nothing (every slot taken, KV pressure, a request
 waiting for its grammar), `schedule()` returns the decode fallback with the
-cleanup from step 1, so running decodes keep their overlap. A step that
-produces no tokens, such as a partial prefill chunk, holds nothing back, so the
-chunks of one prompt run back to back. With `--no-async-scheduling` the engine
-commits every step before it schedules the next one, and this never happens.
+cleanup from step 1, so running decodes keep their overlap; no empty step
+comes between two decodes. With `--no-async-scheduling` the engine commits
+every step before it schedules the next one, and none of this happens.
 Single-process lane-DP does not do it: `TTLaneCoordinator` runs its lanes in
 forced modes.
 
@@ -433,9 +445,10 @@ finalized when it is kept and returned unchanged:
   ends, although the engine still calls `schedule()` while finished requests
   wait to be reported.
 
-The empty step costs one engine iteration, in which `EngineCoreProc` sleeps 1 ms
-because nothing executed. The runner drains pending async decode for the empty
-step, which it does for the prefill anyway.
+Each empty step costs one engine iteration, in which `EngineCoreProc` sleeps
+1 ms because nothing executed. The runner drains pending async decode for an
+empty step ahead of a prefill, which it does for the prefill anyway; after a
+prefill nothing is pending.
 
 ### Generic speculative decoding
 
