@@ -186,6 +186,54 @@ def test_prefix_hit_then_speculative_decode():
     assert h.cached_states_checked
 
 
+def test_a_prefix_hit_that_leaves_one_token_prefills_that_token_alone():
+    """Request b repeats request a's prompt of two blocks and one token and
+    hits the state after 2048 tokens, which leaves one uncomputed token. vLLM
+    pads such an admission to 1 + K scheduled tokens with K ``-1`` drafts;
+    ``TTScheduler`` drops the padding, so b's prefill computes position 2048
+    alone from the hit's block, and b's next step starts from that prefill's
+    end state."""
+    h = _Harness(
+        num_blocks=40,
+        max_num_batched_tokens=4096,
+        mode="align",
+        num_speculative_tokens=3,
+    )
+    prompt = _prompt(1, 2 * BLOCK_SIZE + 1)
+    h.add("a", prompt=prompt, max_tokens=8)
+    h.run()
+    h.add("b", prompt=prompt, max_tokens=40)
+    h.run()
+
+    assert h.last_token_hits == [("b", 2 * BLOCK_SIZE)]
+    assert h.prefill_spans["b"] == [(2 * BLOCK_SIZE, 2 * BLOCK_SIZE + 1)]
+    assert h.step_kinds["verify"]
+    assert h.cached_states_checked
+
+
+def test_a_resume_that_leaves_one_token_prefills_that_token_alone():
+    """In a pool of 28 blocks vLLM preempts request r1 at 1025 tokens. Its
+    replay prefills positions 0 to 1023 as one chunk, whose end state vLLM
+    keeps in the prefix cache, and r1 is preempted again before its next
+    chunk. Its next resume hits that state, which leaves one uncomputed token,
+    so that prefill computes position 1024 alone."""
+    h = _Harness(
+        num_blocks=28,
+        max_num_batched_tokens=4096,
+        mode="align",
+        num_speculative_tokens=3,
+    )
+    for i, prompt_len in enumerate((900, 1000, 1010, 1018)):
+        h.add(f"r{i}", prompt_len, max_tokens=40 + 10 * i)
+
+    h.run(max_steps=2000)
+
+    assert not h.scheduler.requests
+    assert h.preempted == {"r1"}
+    assert h.last_token_hits == [("r1", BLOCK_SIZE)]
+    assert (BLOCK_SIZE, BLOCK_SIZE + 1) in h.prefill_spans["r1"]
+
+
 @pytest.mark.parametrize("max_num_batched_tokens", [1024, 2048, 4096])
 def test_chunked_prefill_keeps_speculative_blocks_out_of_checkpoints(
     max_num_batched_tokens,
