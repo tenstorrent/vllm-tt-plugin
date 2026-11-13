@@ -556,7 +556,14 @@ Ordering first, because it bounds everything below. A speculative step is
 registered as not overlap-safe, so the runner drains it before it builds the
 next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
-unapplied, and verify, accept and propose stay serialized per request. What
+unapplied, and verify, accept and propose stay serialized per request. The one
+exception is a model declaring `supports_chained_spec_verify`: there the
+runner may submit a greedy verify that continues the unread one row for row,
+and the model builds its rows on the device from the unread result
+([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
+The runner then reads, commits and proposes for the unread verify before it
+builds anything else, so accept and propose still run once per verify, in
+step order. What
 this path defers is the readback and the commit, not the order of the steps. A
 lane verify takes this same deferred path
 (`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step
