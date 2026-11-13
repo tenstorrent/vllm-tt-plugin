@@ -342,7 +342,7 @@ def test_the_draft_cap_drops_only_the_suffix_of_a_proposal():
     assert counts.tolist() == [4, 1, 1]
 
 
-@pytest.mark.parametrize("draft_cap", [0, 4])
+@pytest.mark.parametrize("draft_cap", [-1, 4])
 def test_a_draft_cap_outside_the_block_width_is_refused(draft_cap):
     with pytest.raises(ValueError, match="draft_cap"):
         TTModelRunner._spec_row_state({}, {}, ["a"], 3, draft_cap)
