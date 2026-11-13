@@ -23,6 +23,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
@@ -30,6 +31,7 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_mm_modalities,
     resolve_tt_scheduler_cls,
     resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
@@ -266,11 +268,15 @@ def _apply_chunked_prefill_policy(
         _disable_chunked_prefill(vllm_config, reason)
         return
 
-    # A chunk boundary inside a multimodal item would split its embeddings from
-    # their positions. Only meaningful while prefill can be split, and vLLM
-    # rejects the flag outright when one item exceeds the token budget, so it
-    # stays off for every model that does not reach here.
-    scheduler_config.disable_chunked_mm_input = True
+    # The pixel_values lists carry no placeholder positions, so a chunk boundary
+    # inside an item would split its embeddings from their positions. A model
+    # taking mm_items gets every item's whole-prompt range with every chunk and
+    # embeds the rows a chunk covers itself, so its items may straddle chunks:
+    # vLLM's setting stands. Only meaningful while prefill can be split, and
+    # vLLM rejects the flag outright when one item exceeds the token budget, so
+    # it stays off for every model that does not reach here.
+    if get_tt_mm_modalities(vllm_config) is None:
+        scheduler_config.disable_chunked_mm_input = True
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
@@ -1076,6 +1082,18 @@ def _install_tt_input_processor_patch() -> None:
 
     original = input_processor.InputProcessor.process_inputs
     input_processor._tt_original_process_inputs = original
+
+    # The front end's chat parsing reads enable_mm_embeds from this config: turn off the embedding inputs vLLM
+    # derives for a TTKVStoreConnector consumer before the server takes any request (disable_kv_store_mm_embeds).
+    original_init = input_processor.InputProcessor.__init__
+
+    def init_tt(self, vllm_config, *args, **kwargs):
+        from vllm_tt_plugin.config import disable_kv_store_mm_embeds
+
+        disable_kv_store_mm_embeds(vllm_config)
+        original_init(self, vllm_config, *args, **kwargs)
+
+    input_processor.InputProcessor.__init__ = init_tt
 
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
@@ -2036,6 +2054,7 @@ class TTPlatform(Platform):
             model_class, "model_capabilities", None
         )
 
+        resolve_tt_mm_modalities(vllm_config, model_capabilities, model_class)
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
