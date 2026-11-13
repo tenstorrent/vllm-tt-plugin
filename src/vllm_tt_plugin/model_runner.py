@@ -1293,12 +1293,11 @@ class TTModelRunner:
             self._req_state_slot.pop(req_id, None)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
-        """Pick each prefilling request's state slot, skipping slots that live
-        off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        """Keep continuing prefills in their owned slots. New requests prefer
+        their decode row when free, without displacing any live owner.
 
-        Exhaustion is unreachable: holders and prefills are disjoint and both count
-        against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
+        Exhaustion is unreachable: holders and new requests both count against
+        ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
         stopped describing the device, and nothing on the host can recover it, so fail
         rather than guess and return plausible, wrong text.
         """
@@ -1308,15 +1307,19 @@ class TTModelRunner:
                 f"{len(row_req_ids)} prefill(s) exceed the {n_slots} device state "
                 "slots; admission is the scheduler's job, not this function's"
             )
-        prefilling = set(row_req_ids)
-        held = {
-            slot
+        owners = {
+            req_id: slot
             for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling and req_id in self.requests
+            if req_id in self.requests
         }
+        # Reserve continuations before assigning newcomers: row order need not
+        # match the slot order from the preceding chunk, and prefill has no gather.
+        held = set(owners.values())
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
-            if row not in held:
+            if req_id in owners:
+                slot = owners[req_id]
+            elif row not in held:
                 slot = row
             else:
                 free = [s for s in range(n_slots) if s not in held]

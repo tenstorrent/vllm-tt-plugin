@@ -165,6 +165,38 @@ def test_accepting_the_decode_remap_advances_the_ownership_map():
     assert r._req_state_slot["A"] == 0 and r._req_state_slot["B"] == 1
 
 
+@pytest.mark.parametrize("rows", [["C", "B"], ["B", "C"], ["B", "A"]])
+def test_prefill_continuation_keeps_state_when_rows_change(rows):
+    r = _runner(slots=3)
+    _prefill(r, ["A", "B"])
+    state = ["A", "B", None]
+    old_slots = dict(r._req_state_slot)
+
+    slots = _prefill(r, rows)
+    for req_id, slot in zip(rows, slots):
+        if req_id in old_slots:
+            assert slot == old_slots[req_id]
+            assert state[slot] == req_id
+        else:
+            assert state[slot] is None
+            state[slot] = req_id
+    _assert_state_found(r, state)
+
+
+def test_prefill_continuation_reserves_owner_after_peer_release():
+    r = _runner(slots=3)
+    _prefill(r, ["A", "B", "C"])
+    state = ["A", "B", "C"]
+    _release(r, preempted={"C"})
+    state[2] = None
+    slots = _prefill(r, ["D", "B"])
+    assert slots == [2, 1]
+    state[slots[0]] = "D"
+    # A preempted request remains in requests but owns no state until resumed.
+    r.requests.pop("C")
+    _assert_state_found(r, state)
+
+
 def test_release_keeps_a_merely_unscheduled_request():
     """Every prefill step leaves the whole decode batch unscheduled, and that state is
     still live. The release predicate must not read "unscheduled" as "dead"."""

@@ -45,6 +45,11 @@ Device-state slots identify adapter-owned request state. A prefill row is not
 necessarily the slot that owns that request. KV page addresses and state slots
 serve different purposes; the adapter must honor both.
 
+Continuing prefill chunks keep their current state slot even when their packed
+row changes. The plugin reserves all live owners before allocating slots for new
+requests; prefill does not move existing state. A decode gather can subsequently
+move that state through the explicit remap contract below.
+
 | Interface | Adapter responsibility |
 |---|---|
 | `prefill_forward(empty_slots=[...])` | Write each prefill row's state into the corresponding destination slot; preserve live state in other slots. Stateless adapters can ignore `empty_slots`. |
