@@ -22,6 +22,7 @@ from vllm_tt_plugin.scheduler import (
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
@@ -32,6 +33,41 @@ from vllm_tt_plugin.structured_output import (
     has_scheduled_structured_outputs,
     has_structured_outputs,
 )
+
+
+def fused_sample_counts(ids: torch.Tensor) -> torch.Tensor:
+    """Each row's committed count in a ``fused_sample`` block: the columns before
+    its first ``PLACEHOLDER_TOKEN_ID``, or the whole width. Never 0: column 0 is
+    always a committed token (a padding row commits its column 0, count 1)."""
+    pad = ids == PLACEHOLDER_TOKEN_ID
+    width = int(ids.shape[1])
+    first = torch.where(
+        pad.any(dim=1),
+        pad.to(torch.int64).argmax(dim=1),
+        torch.full((int(ids.shape[0]),), width, dtype=torch.int64),
+    )
+    return first.clamp(min=1)
+
+
+def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
+    """A ``fused_sample`` verify's ``[B, 1+K]`` committed ids, checked against
+    its counts."""
+    ids = torch.as_tensor(verify.accepted_token_ids).to(torch.int64)
+    counts = torch.as_tensor(verify.accepted_counts).reshape(-1).to(torch.int64)
+    if ids.dim() != 2 or int(counts.numel()) != int(ids.shape[0]):
+        raise ValueError(
+            "a fused_sample verify returns [B, 1+K] accepted_token_ids and [B] "
+            f"accepted_counts, got {tuple(ids.shape)} / {tuple(counts.shape)}"
+        )
+    derived = fused_sample_counts(ids)
+    if not torch.equal(derived, counts.clamp(min=1)):
+        raise ValueError(
+            "a fused_sample verify's accepted_counts disagree with its ids' "
+            f"committed prefixes: counts {counts.tolist()}, prefixes "
+            f"{derived.tolist()}; a row pads its tail with PLACEHOLDER_TOKEN_ID "
+            "right after its last committed token"
+        )
+    return ids
 
 
 def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
@@ -72,6 +108,12 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
         return tt_out.argmax_ids
     if spec_mode == ACCEPT_MODE_LOGITS:
         return tt_out.logits
+    if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+        # The ids carry the counts: a row's committed prefix ends at its first
+        # PLACEHOLDER_TOKEN_ID (or fills the block), which is the one tensor
+        # every consumer above reads. The model's own counts must say the
+        # same, checked here where both are still in hand.
+        return fused_sample_ids(tt_out)
     raise NotImplementedError(
         f"the runner drives no accept walk for spec_mode {spec_mode!r}"
     )
@@ -374,9 +416,10 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
         both off ``model_input``. Only an ``argmax_ids`` verify has no use for
         a grammar, and no structured row reaches one.
         """
-        if self._model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS:
+        if self._model_input.spec_mode != ACCEPT_MODE_LOGITS:
             raise RuntimeError(
-                "a grammar bitmask reached an argmax_ids verify, whose ids "
+                f"a grammar bitmask reached a {self._model_input.spec_mode} "
+                "verify, whose ids "
                 "cannot be masked; a structured-output row makes its verify "
                 "ask for logits"
             )
