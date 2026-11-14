@@ -14,6 +14,7 @@ def register() -> None:
     register_tt_models_from_plugin()
     _register_tt_reasoning_parsers()
     _register_tt_tool_parsers()
+    _register_tt_tokenizers()
     # TT_DETOK_PRIME_TOKENS: the streaming detokenizer primed with the prompt's
     # tail; installed here because the API server process, where the
     # detokenizer runs, loads general plugins and no platform code.
@@ -50,6 +51,21 @@ def _register_tt_tool_parsers() -> None:
         "vllm_tt_plugin.gemma4_tool_parser",
         "Gemma4ToolParser",
     )
+    ToolParserManager.register_lazy_module(
+        "deepseek_v41",
+        "vllm_tt_plugin.deepseek_v41_tool_parser",
+        "DeepSeekV41ToolParser",
+    )
+
+
+def _register_tt_tokenizers() -> None:
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers.registry import TokenizerRegistry
+
+    TokenizerRegistry.register(
+        "deepseek_v41", "vllm_tt_plugin.deepseek_v41_tokenizer", "DeepseekV41Tokenizer"
+    )
+    RENDERER_REGISTRY.register("deepseek_v41", "vllm.renderers.hf", "HfRenderer")
 
 
 def platform_plugin() -> str | None:
