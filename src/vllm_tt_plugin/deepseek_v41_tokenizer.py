@@ -10,6 +10,7 @@ import copy
 import hashlib
 import importlib.util
 from functools import lru_cache
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 CHECKPOINT = "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -23,7 +24,10 @@ def load_encoder(path):
     if hashlib.sha256(path.read_bytes()).hexdigest() != ENCODER_SHA256:
         raise ValueError(f"DeepSeek-V4.1 checkpoint encoder hash mismatch: {path}")
     spec = importlib.util.spec_from_file_location(
-        "deepseek_v41_checkpoint_encoder", path
+        "deepseek_v41_checkpoint_encoder",
+        path,
+        # HF snapshots resolve to extensionless content-addressed blobs.
+        loader=SourceFileLoader("deepseek_v41_checkpoint_encoder", str(path)),
     )
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load checkpoint encoder: {path}")

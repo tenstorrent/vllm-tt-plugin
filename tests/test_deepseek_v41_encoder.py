@@ -93,6 +93,23 @@ def test_encoder_hash_is_checked(tmp_path):
         load_encoder(str(path))
 
 
+@pytest.mark.parametrize("symlink", [False, True])
+def test_encoder_loads_extensionless_hf_cache_blob(encoder_path, tmp_path, symlink):
+    blob = tmp_path / "92a67eab2a67d924a6a8279bc0f90e3f504ac40e"
+    blob.write_bytes(Path(encoder_path).read_bytes())
+    path = blob
+    if symlink:
+        path = tmp_path / "encoding.py"
+        path.symlink_to(blob)
+    expected = load_encoder(encoder_path).encode_messages(
+        MESSAGES, thinking_mode="chat"
+    )
+    assert (
+        load_encoder(str(path)).encode_messages(MESSAGES, thinking_mode="chat")
+        == expected
+    )
+
+
 def test_tokenizer_retains_ids_and_uses_encoder(encoder_path):
     class Tokenizer:
         def encode(self, text, **kwargs):

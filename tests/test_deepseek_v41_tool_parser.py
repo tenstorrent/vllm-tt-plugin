@@ -82,6 +82,14 @@ def test_required_tool_choice_does_not_enable_unsupported_grammar():
     assert not instance.supports_required_and_named
 
 
+def test_plain_stream_delta_has_empty_tool_call_list():
+    delta = parser().extract_tool_calls_streaming(
+        "", "hello", "hello", [], [], [], SimpleNamespace()
+    )
+    assert delta.content == "hello"
+    assert delta.tool_calls == []
+
+
 def test_registered_tokenizer_and_hf_renderer_on_checkpoint():
     snapshot = os.getenv("V41_TEST_SNAPSHOT")
     if not snapshot:

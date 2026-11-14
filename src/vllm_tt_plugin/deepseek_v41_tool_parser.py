@@ -96,5 +96,5 @@ class DeepSeekV41ToolParser(ToolParser):
                 )
             self._calls_sent = True
         if content or deltas:
-            return DeltaMessage(content=content or None, tool_calls=deltas or None)
+            return DeltaMessage(content=content or None, tool_calls=deltas)
         return None
