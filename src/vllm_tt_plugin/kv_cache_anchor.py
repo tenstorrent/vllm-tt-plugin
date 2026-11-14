@@ -25,6 +25,25 @@ class AnchoredSlidingWindowManager(SlidingWindowManager):
         end = (num_prompt_tokens - 1) // alignment * alignment // self.block_size
         return max(0, end - cdiv(self.sliding_window - 1, self.block_size)), end
 
+    def _remove_blocks_in_range(self, request_id: str, first_block: int, last_block: int) -> None:
+        """As the stock manager, but the freed blocks go to the front of the eviction queue (reused first)."""
+        if request_id not in self.req_to_blocks or first_block >= last_block:
+            return
+        blocks = self.req_to_blocks[request_id]
+        last_block = min(last_block, len(blocks))
+        freed = []
+        for i in range(last_block - 1, first_block - 1, -1):
+            if blocks[i] == self._null_block:
+                break
+            freed.append(blocks[i])
+            blocks[i] = self._null_block
+        evictable = []
+        for block in reversed(freed):  # the oldest positions are reused first
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                evictable.append(block)
+        self.block_pool.free_block_queue.prepend_n(evictable)
+
     def remove_skipped_blocks(
         self, request_id: str, processed_computed_tokens: int, num_prompt_tokens: int | None = None
     ) -> None:
