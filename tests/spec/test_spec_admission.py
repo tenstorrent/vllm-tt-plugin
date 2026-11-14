@@ -335,18 +335,10 @@ def test_a_logits_only_plan_is_admitted():
     assert _admit(_config(), model_class=variant).accept_modes == ("logits",)
 
 
-def test_a_fused_sample_only_plan_is_refused():
-    """A mode the runner never asks for cannot be the only one offered.
-
-    No runner path consumes ``fused_sample``, so a plan offering only it would
-    pass admission and fail on its first decode.
-    """
+def test_a_fused_sample_only_plan_is_admitted():
+    """``fused_sample`` has a runner path: the walk takes the device's commit."""
     variant = make_fake_spec_model(accept_modes=("fused_sample",))
-    with pytest.raises(ValueError) as excinfo:
-        _admit(_config(), model_class=variant)
-    message = str(excinfo.value)
-    assert "fused_sample" in message
-    assert "argmax_ids" in message and "logits" in message
+    assert _admit(_config(), model_class=variant).accept_modes == ("fused_sample",)
 
 
 def test_a_plan_offering_more_than_the_runner_drives_is_still_admitted():
@@ -436,15 +428,6 @@ def test_offering_fused_sample_alongside_a_runnable_mode_is_still_admitted():
     )
     plan = _admit(_config(), model_class=variant)
     assert ACCEPT_MODE_FUSED_SAMPLE in plan.accept_modes
-
-
-def test_a_plan_offering_only_unrunnable_modes_is_refused():
-    variant = make_fake_spec_model(accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,))
-    with pytest.raises(ValueError) as excinfo:
-        _admit(_config(), model_class=variant)
-    message = str(excinfo.value)
-    assert ACCEPT_MODE_FUSED_SAMPLE in message
-    assert ACCEPT_MODE_ARGMAX_IDS in message
 
 
 def test_a_paged_drafter_cache_is_refused():

@@ -83,6 +83,7 @@ from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inpu
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
@@ -1637,15 +1638,28 @@ class TTModelRunner:
         it is not a ``logits`` verify (``_decode_device_sampled``).
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
+        # ``fused_sample`` certifies exactly the rows ``argmax_ids`` does (the
+        # device commits under the same greedy / spec_ids_are_sampled rules),
+        # so it stands in for ``argmax_ids`` wherever that would be chosen, and
+        # a model offering it has asked for it: the device's commit may span
+        # more tokens than the drafts the runner sent.
+        id_mode = (
+            ACCEPT_MODE_FUSED_SAMPLE
+            if ACCEPT_MODE_FUSED_SAMPLE in modes
+            else ACCEPT_MODE_ARGMAX_IDS
+        )
         if ACCEPT_MODE_LOGITS not in modes:
-            return ACCEPT_MODE_ARGMAX_IDS
-        if ACCEPT_MODE_ARGMAX_IDS not in modes:
+            return id_mode
+        if (
+            ACCEPT_MODE_ARGMAX_IDS not in modes
+            and ACCEPT_MODE_FUSED_SAMPLE not in modes
+        ):
             return ACCEPT_MODE_LOGITS
         if all(
             self._request_is_argmax_certifiable(req_id, device_sampled)
             for req_id in row_req_ids
         ):
-            return ACCEPT_MODE_ARGMAX_IDS
+            return id_mode
         return ACCEPT_MODE_LOGITS
 
     def _request_is_argmax_certifiable(
@@ -3485,6 +3499,39 @@ class TTModelRunner:
 
         if model_input.spec_mode == ACCEPT_MODE_LOGITS:
             return self._walk_sampled_acceptance(model_input, tt_out)
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            # The device accepted already: its committed ids are the walk's
+            # result, counted to the first placeholder (fused_sample_ids checked
+            # them against the model's counts at the unwrap). The commit may run
+            # past the drafts the runner sent -- a model running several
+            # device steps per call -- up to the block's 1+K columns, which
+            # the scheduler's lookahead reservation (effective_k + 1) covers.
+            from vllm_tt_plugin.async_decode import fused_sample_counts
+
+            ids = torch.as_tensor(tt_out).to(torch.int64)
+            if model_input.max_num_logprobs[0] is not None:
+                raise RuntimeError(
+                    "a fused_sample verify carries a row that asked for "
+                    "logprobs, which ids cannot answer; _spec_mode_for_step "
+                    "asks for logits for such a row"
+                )
+            width = int(model_input.input_tokens.shape[1])
+            if ids.dim() != 2 or int(ids.shape[1]) > width:
+                raise ValueError(
+                    "a fused_sample verify commits at most the block's "
+                    f"{width} columns per row, got {tuple(ids.shape)}"
+                )
+            counts = fused_sample_counts(ids)
+            # Laid out as the argmax walk lays it out: [B, 1+K] at the block's
+            # width, each row's committed prefix followed by placeholders.
+            committed = torch.full(
+                (int(ids.shape[0]), width), PLACEHOLDER_TOKEN_ID, dtype=torch.int64
+            )
+            cols = torch.arange(int(ids.shape[1])).unsqueeze(0)
+            committed[:, : int(ids.shape[1])] = torch.where(
+                cols < counts.unsqueeze(1), ids, committed[:, : int(ids.shape[1])]
+            )
+            return SpecWalk(committed.to(torch.int32), counts.to(torch.int32))
         if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
             raise NotImplementedError(
                 f"the runner drives no accept walk for spec_mode "

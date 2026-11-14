@@ -26,10 +26,15 @@ serve speculative decoding within the following execution limits:
   proposing on device through `propose_draft_tokens`. Every other method vLLM
   knows is refused at configuration time rather than admitted to draft
   nothing.
-- two accept modes, **`argmax_ids`** and **`logits`**, chosen per step from
-  what the model declares (section 4h). A plan must offer at least one of
-  them; `fused_sample` has no runner path. An ordinary narrow decode does not
-  send `spec_mode`.
+- three accept modes, **`argmax_ids`**, **`logits`** and **`fused_sample`**,
+  chosen per step from what the model declares (section 4h). A plan must
+  offer at least one of them. `fused_sample` stands in for `argmax_ids` on a
+  model that offers it: it certifies the same rows, and the runner takes the
+  device's committed ids as the walk's result, so a model may commit more
+  tokens per call than the drafts it was sent (several device steps per
+  call), up to the block's `1 + effective_k` columns that the lookahead
+  reservation of section 4f covers. An ordinary narrow decode does not send
+  `spec_mode`.
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
@@ -88,9 +93,8 @@ exception does not raise: on a model that does not serve `logits` but declares
 and keep every step they are part of an ordinary decode, which uses the
 selected model's normal sampling path (section 4d). Separately, `TTPlatform`
 can disable async scheduling when `supports_async_decode` is absent (section
-4c). `fused_sample`, use of `DraftOutput.draft_scores` and a scheduler-owned
-paged drafter cache each need their own execution path before the matching
-refusal can go.
+4c). Use of `DraftOutput.draft_scores` and a scheduler-owned paged drafter
+cache each need their own execution path before the matching refusal can go.
 
 The plugin's `logits` path is validated against tt-metal's
 `DummySpecDecodeModel` (host tests in `tests/spec/`, server tests in
@@ -228,9 +232,12 @@ when it cannot. It must not raise, and it must not return anything else.
 model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
-`accept_modes` must include `argmax_ids` or `logits`, the return formats the
-runner executes. A model may also declare `fused_sample`, but that declaration
-enables no execution path. Declaring `logits` enables sampled speculation for
+`accept_modes` must include `argmax_ids`, `logits` or `fused_sample`, the
+return formats the runner executes. A `fused_sample` verify returns
+`accepted_token_ids` `[B, 1+K]` (each row's committed prefix, its tail padded
+with `PLACEHOLDER_TOKEN_ID`) and `accepted_counts` `[B]`, which must agree;
+the runner commits the prefixes as they are, under the certification rules
+of `argmax_ids`. Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
