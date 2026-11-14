@@ -39,6 +39,7 @@ from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_INTERNAL,
     PLACEHOLDER_TOKEN_ID,
@@ -708,6 +709,57 @@ def test_a_verify_answering_in_another_mode_is_refused():
     assert (
         _verify_output_tensor(as_logits, "FakeSpecModel", ACCEPT_MODE_LOGITS) is logits
     )
+
+    # fused_sample: the device accepted already, the runner takes its commit. A model
+    # offering it is asked for it wherever argmax_ids would be. Its ids carry the
+    # counts (prefix up to the first placeholder) and must agree with
+    # accepted_counts. A row may commit more tokens than the drafts it was sent
+    # (several device steps per call), but never past the block.
+    chooser = SimpleNamespace(_spec_accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,))
+    assert TTModelRunner._spec_mode_for_step(chooser, ["r"]) == ACCEPT_MODE_FUSED_SAMPLE
+    chooser = SimpleNamespace(
+        _spec_accept_modes=(ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS),
+        _request_is_argmax_certifiable=lambda req_id, sampled: req_id == "g",
+    )
+    assert TTModelRunner._spec_mode_for_step(chooser, ["g"]) == ACCEPT_MODE_FUSED_SAMPLE
+    assert TTModelRunner._spec_mode_for_step(chooser, ["g", "s"]) == ACCEPT_MODE_LOGITS
+
+    pad = PLACEHOLDER_TOKEN_ID
+    ids = torch.tensor([[5, 6, 7, 8, 9, pad], [4, pad, pad, pad, pad, pad]])
+    fused = VerifyOutput(
+        spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+        accepted_token_ids=ids,
+        accepted_counts=torch.tensor([5, 1], dtype=torch.int32),
+    )
+    out = _verify_output_tensor(fused, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
+    assert out.tolist() == ids.tolist()
+    wrong = VerifyOutput(
+        spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+        accepted_token_ids=ids,
+        accepted_counts=torch.tensor([4, 1], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        _verify_output_tensor(wrong, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
+
+    # one draft sent for row 0, five tokens committed: the walk takes them all
+    step = SimpleNamespace(
+        spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+        row_req_ids=["r", None],
+        draft_token_ids=torch.tensor([[6] + [pad] * 6, [pad] * 7]),
+        num_valid_drafts=torch.tensor([1, 0]),
+        max_num_logprobs=[None],
+        input_tokens=torch.zeros(2, 8, dtype=torch.int32),
+    )
+    committed, counts = TTModelRunner.walk_spec_acceptance(
+        SimpleNamespace(), step, out
+    )[:2]
+    assert counts.tolist() == [5, 1]
+    assert committed.shape == (2, 8)
+    assert committed[0].tolist() == [5, 6, 7, 8, 9] + [pad] * 3
+    assert committed[1].tolist() == [4] + [pad] * 7
+    step.input_tokens = torch.zeros(2, 4, dtype=torch.int32)
+    with pytest.raises(ValueError, match="at most the block"):
+        TTModelRunner.walk_spec_acceptance(SimpleNamespace(), step, out)
 
 
 def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():
