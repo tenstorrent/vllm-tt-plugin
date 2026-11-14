@@ -81,7 +81,7 @@ class DeepSeekV41ToolParser(ToolParser):
         self._content_sent = len(prefix)
         deltas = []
         if not self._calls_sent and START in current_text and END in current_text:
-            _, calls = parse_calls(current_text)
+            _, calls = parse_calls(current_text, allow_partial_eos=True)
             for index, (name, arguments) in enumerate(calls):
                 deltas.append(
                     DeltaToolCall(

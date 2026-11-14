@@ -60,3 +60,15 @@ def test_plain_text_and_partial_tag_prefixes():
     for n in range(1, len(START)):
         assert safe_content_prefix("hello" + START[:n]) == "hello"
     assert safe_content_prefix("hello" + START + CALL) == "hello"
+
+
+def test_partial_eos_is_accepted_only_for_streaming():
+    complete = START + CALL + END
+    expected = parse_calls(complete)
+    for length in range(1, len(EOS)):
+        partial = complete + EOS[:length]
+        with pytest.raises(ValueError, match="Unexpected content"):
+            parse_calls(partial)
+        assert parse_calls(partial, allow_partial_eos=True) == expected
+    with pytest.raises(ValueError, match="Unexpected content"):
+        parse_calls(complete + "unexpected", allow_partial_eos=True)

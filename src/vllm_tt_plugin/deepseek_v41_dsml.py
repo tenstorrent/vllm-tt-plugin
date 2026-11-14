@@ -18,7 +18,7 @@ PARAM = re.compile(
 )
 
 
-def parse_calls(text):
+def parse_calls(text, *, allow_partial_eos=False):
     """Return content and full calls, preserving JSON types and string bytes.
 
     Incomplete or malformed markup raises ValueError rather than fabricating
@@ -51,7 +51,10 @@ def parse_calls(text):
         cursor = invocation.end()
     if body[cursor:].strip() or not calls:
         raise ValueError("Invalid or empty V4.1 calls block")
-    if text[end + len(END) :].removesuffix(EOS).strip():
+    suffix = text[end + len(END) :]
+    if suffix.removesuffix(EOS).strip() and not (
+        allow_partial_eos and EOS.startswith(suffix)
+    ):
         raise ValueError("Unexpected content after V4.1 calls")
     return text[:start] or None, calls
 
