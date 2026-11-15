@@ -22,9 +22,12 @@ can submit step n + 1 over an unread verify n:
    n + 1 verified: ``fill_chained_input`` writes the rows step n + 1 really
    ran into its ``TTModelInput``, from which its own accept walk then runs.
 
-The rows are greedy only (``argmax_ids``), so the runner's walk of step n's
-ids gives the count the device used; the model raises from that propose when
-the runner's commit differs from its own.
+A greedy row's ids are the target argmax. On a model that also declares
+``spec_ids_are_sampled``, a sampled row chains when step n and step n + 1
+both sample on the device; its ids are then the device sampler's draws, and
+the model counts acceptance over them as the runner's walk does. Either way
+the runner's walk of step n's ids gives the count the device used, and the
+model raises from that propose when the runner's commit differs from its own.
 """
 
 from __future__ import annotations
@@ -124,6 +127,7 @@ def plan_chain(
     )
     max_model_len = int(runner.model_config.max_model_len)
     mamba = runner._mamba_groups
+    device_sampled = None
     for req_id in rows:
         if scheduler_output.num_scheduled_tokens[req_id] != 1 + num_drafts:
             return None, "width"
@@ -133,7 +137,14 @@ def plan_chain(
         ):
             return None, "width"
         if not runner._request_is_argmax_certifiable(req_id, device_sampled=False):
-            return None, "sampling"
+            if device_sampled is None:
+                device_sampled = _samples_on_device(
+                    runner, scheduler_output, previous, rows
+                )
+            if not device_sampled or not runner._request_is_argmax_certifiable(
+                req_id, device_sampled=True
+            ):
+                return None, "sampling"
         length = int(batch.num_tokens[batch.req_id_to_index[req_id]])
         if length + 2 * (1 + num_drafts) > max_model_len:
             return None, "max_model_len"
@@ -145,6 +156,52 @@ def plan_chain(
         ):
             return None, "mamba_boundary"
     return ChainPlan(predecessor=predecessor), "chained"
+
+
+def _samples_on_device(
+    runner: Any,
+    scheduler_output: SchedulerOutput,
+    previous: TTModelInput,
+    rows: list[str],
+) -> bool:
+    """Whether the unread verify and the step about to be built both sample
+    on the device, so that a sampled row's ids are draws in both: the count
+    the model continues from is its acceptance over the predecessor's draws,
+    and the chained verify answers with draws the runner's walk certifies.
+
+    Read before ``_update_states``, over the chained rows of a persistent
+    batch that still holds the finished ones; the build decides again over
+    the rows alone and raises if its decision does not certify every chained
+    row (``TTModelRunner._spec_decode_rows``).
+    """
+    if not previous.perform_device_sampling:
+        return False
+    batch = runner.input_batch
+    return bool(
+        runner._decode_device_sampled(
+            scheduler_output, None, [batch.req_id_to_index[r] for r in rows]
+        )
+    )
+
+
+def check_chained_rows_certifiable(
+    runner: Any, row_req_ids: list[str], device_sampled: bool
+) -> None:
+    """Raise unless the id walk of the step being built certifies every
+    chained row under the step's own device-sampling decision
+    (``TTModelRunner._decode_device_sampled``), which the submission uses;
+    ``plan_chain`` decided over the persistent batch before
+    ``_update_states``."""
+    uncertified = [
+        r
+        for r in row_req_ids
+        if not runner._request_is_argmax_certifiable(r, device_sampled)
+    ]
+    if uncertified:
+        raise RuntimeError(
+            f"chained verify rows {uncertified} are not certifiable by the id "
+            f"walk of a step with device_sampled={device_sampled}"
+        )
 
 
 def chained_rows(
@@ -236,6 +293,7 @@ def fill_chained_input(
 __all__ = [
     "ChainPlan",
     "chained_rows",
+    "check_chained_rows_certifiable",
     "fill_chained_input",
     "plan_chain",
 ]

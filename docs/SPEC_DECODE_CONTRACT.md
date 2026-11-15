@@ -558,7 +558,9 @@ next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
 unapplied, and verify, accept and propose stay serialized per request. The one
 exception is a model declaring `supports_chained_spec_verify`: there the
-runner may submit a greedy verify that continues the unread one row for row,
+runner may submit a verify that continues the unread one row for row (greedy
+rows, and with `spec_ids_are_sampled` the sampled rows of a device-sampled
+step; section 4i),
 and the model builds its rows on the device from the unread result
 ([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
 The runner then reads, commits and proposes for the unread verify before it
@@ -1162,6 +1164,18 @@ device-sampled step verifies in `argmax_ids` where section 4h chose `logits`
 for a sampled row before; the host `logits` walk remains the mode for the
 controls the device draws do not carry (penalties, logprobs, grammars, token
 filters) and for host-sampled steps.
+
+**Chained verifies.** On a model that also declares
+`supports_chained_spec_verify`, a sampled row chains like a greedy row when
+the unread verify and the step being built both sample on the device
+(`spec_chain.plan_chain`; otherwise the sampled row drains with reason
+`sampling`).
+The model counts the predecessor's acceptance over its draws, draws the
+chained row's columns with the row's own sampling settings, and derives a
+seeded row's seeds from the positions it computes on the device, so the
+runner's walk of the chained verify certifies the same rejection sampling as
+an unchained one
+([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
 
 **Admission is unchanged.** On a launch whose plan keeps no
 `supports_narrow_decode` and serves no `logits`, every decode step is a verify
