@@ -97,11 +97,31 @@ verify ran (`draft_token_ids[row, :n]` with `num_valid` the drafter's offer),
 and must raise when the runner's commit differs from the model's own
 acceptance: the chained verify continued the model's count. The runner fills
 the chained verify's rows from that proposal and walks the chained verify's
-`argmax_ids` against them. It chains only greedy rows whose request takes the
-scheduler's full `1 + K` tokens, with room for two more steps below
+`argmax_ids` against them. It chains only rows the id walk certifies (greedy
+rows, and sampled rows as below) whose request takes the scheduler's full
+`1 + K` tokens, with room for two more steps below
 `max_model_len` and, in `mamba_cache_mode` `align`, the same window column for
 every count (`MambaCacheGroups.chain_window_safe`); a prefill, a new or resumed
 request, a preemption, a forced prefix-cache reset, structured output, a
-moved row or a second unread verify drains the predecessor first. Sources:
+moved row or a second unread verify drains the predecessor first.
+
+A model that also declares `spec_ids_are_sampled` (see
+[sampled ids](SPEC_DECODE_CONTRACT.md#4i-sampled-ids-spec_ids_are_sampled))
+also chains device-sampled rows. The runner chains a sampled row only when the
+predecessor sampled on the device (`TTModelInput.perform_device_sampling`) and
+the step being built samples on the device too; `plan_chain` reads that
+decision before `_update_states`, and the build raises when its own decision
+does not certify every chained row. The call then carries the step's
+`sampling_params`, as any device-sampled verify does, and the model must:
+
+| Duty | Chained verify of a sampled row |
+|---|---|
+| Count | `c` is the model's acceptance over the predecessor's draws, which is the walk the runner runs over the same `argmax_ids`. |
+| Draws | Each column of the row is a draw under the row's own temperature, top-k, top-p and seed, as on an unchained device-sampled verify. |
+| Seeds | A seeded row's seed for each column follows from the position the device computed (the predecessor's column-0 position plus `c`, plus the column), so the draw at a position equals the draw an unchained verify of the request makes at that position. An unseeded row takes fresh randomness on every step. |
+
+A host-sampled step, and a row the draws do not certify (a penalty, logprobs,
+structured output, a token filter, a pending `min_tokens`), drain the
+predecessor first. Sources:
 [spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).

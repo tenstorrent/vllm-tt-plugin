@@ -87,6 +87,7 @@ from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_chain import (
     ChainPlan,
     chained_rows,
+    check_chained_rows_certifiable,
     fill_chained_input,
     plan_chain,
 )
@@ -2349,6 +2350,7 @@ class TTModelRunner:
                     f"{ {r: d for r, d in scheduled_drafts.items() if d} } or "
                     f"padding rows among {row_req_ids}"
                 )
+            check_chained_rows_certifiable(self, row_req_ids, device_sampled)
             spec_plan = getattr(self, "_spec_plan", None)
             cap = (
                 spec_plan.draft_cap(num_live)

@@ -31,10 +31,18 @@ command queue runs them, and checks every step:
 
 The pool is small, so finished requests' blocks serve later requests, and
 greedy outputs must equal those of a synchronous run.
+
+With ``sampled_ids`` the device also declares ``spec_ids_are_sampled``: on a
+step the runner samples on the device, a sampled row's ids are draws
+(``_draw``), whose seed a seeded row derives from the request seed and the
+input position (``_position_seed``) and an unseeded row takes from fresh
+entropy, so a seeded request's token at a position does not depend on how
+steps group the positions.
 """
 
 from __future__ import annotations
 
+import random
 from collections import deque
 from types import SimpleNamespace
 
@@ -80,6 +88,10 @@ T = K + 1
 # _vllm_config's vocabulary.
 VOCAB = 32
 FIRST_ID = 3
+# The device sampler's top-k bound with ``sampled_ids``. Below the vocabulary,
+# as the Qwen3.8 class's 32 is below its 248320: the input batch stores a
+# top-k at or above the vocabulary as the vocabulary.
+MAX_DEVICE_TOP_K = 8
 
 
 def _target(prefix: list[int] | tuple[int, ...]) -> int:
@@ -105,6 +117,21 @@ def _drafts(prefix: list[int]) -> list[int]:
     return drafts
 
 
+def _position_seed(seed: int, position: int) -> int:
+    """The device seed of a seeded row's draw at input ``position``."""
+    return (seed * 1_000_003 + (position + 1) * 7919) % (1 << 20)
+
+
+def _draw(prefix: list[int], device_seed: int) -> int:
+    """The device sampler's draw after ``prefix``: the target's token for
+    three seeds in four, so drafts are often accepted and every count occurs,
+    another token otherwise."""
+    token = _target(prefix)
+    if device_seed % 4:
+        return token
+    return FIRST_ID + (token - FIRST_ID + 1 + device_seed % 7) % (VOCAB - FIRST_ID)
+
+
 class _Answer:
     """A verify's deferred ``argmax_ids``: the ids, and how often the host read them."""
 
@@ -121,7 +148,8 @@ class _LedgerDevice:
     Each verify walks its own ids the way the runner does and keeps the
     drafts of the commit for the propose that follows (the drafter runs with
     the verify, as on a one-enqueue step), and each propose checks that the
-    runner committed what the device accepted.
+    runner committed what the device accepted. A chained verify derives each
+    row's positions, and so a seeded row's seeds, from that count.
     """
 
     decode_input_update_contract = 1
@@ -144,9 +172,17 @@ class _LedgerDevice:
         # Ordinary decodes submitted right after another ordinary decode.
         self.plain_after_plain = 0
         self.last_kind = None
-        # The verify row whose device count is made wrong, for the guard test.
-        self.miscount_at = -1
+        # ``(verify rows so far, request, record) -> bool``: the first verify
+        # row it selects gets a device count one draft longer than the walk of
+        # its ids, for the guard tests.
+        self.miscount = None
         self.miscounted_successors = 0
+        # Every verify's record, and the fresh entropy of unseeded draws.
+        self.records: list[SimpleNamespace] = []
+        self.entropy = random.Random(0)
+        # ``(request, token history) -> bool``: the drafter declines the row
+        # (offers no drafts) after that history.
+        self.decline = None
         self.accepted: dict[tuple[int, int], int] = {}
         self.boundary_counts: set[int] = set()
 
@@ -232,14 +268,42 @@ class _LedgerDevice:
             self.ordinary_decodes += 1
             self.plain_after_plain += self.last_kind == "plain"
             self.last_kind = "plain"
-            logits = self._narrow(live, tokens, start_pos, mamba_state)
+            logits = self._narrow(
+                live, tokens, start_pos, mamba_state, kwargs.get("sampling_params")
+            )
             if kwargs.get("sampling_params") is None:
                 return logits
             # A device-sampled ordinary decode: host ids, read inside the call.
             return logits[:, 0].argmax(dim=-1).to(torch.int32).reshape(-1, 1)
         return self._verify(live, tokens, start_pos, mamba_state, kwargs)
 
-    def _narrow(self, live, tokens, start_pos, mamba_state):
+    def _draws(self, row: int, sampling) -> bool:
+        """Whether ``row``'s ids are draws: a sampled row of a device-sampled
+        step (``sampling``) on a device declaring ``spec_ids_are_sampled``."""
+        return (
+            sampling is not None
+            and bool(self.model_capabilities.get("spec_ids_are_sampled"))
+            and float(sampling.temperature[row]) > 0
+            and int(sampling.top_k[row]) != 1
+        )
+
+    def _token(self, prefix, row: int, position: int, sampling) -> int:
+        """The device's token after ``prefix`` at input ``position``: the
+        target's, or a drawing row's draw, seeded by the request seed and the
+        position or by fresh entropy."""
+        if not self._draws(row, sampling):
+            return _target(prefix)
+        seed = sampling.seed[row]
+        if seed is None:
+            return _draw(prefix, self.entropy.randrange(1 << 20))
+        return _draw(prefix, _position_seed(seed, position))
+
+    def _offer(self, req_id: str) -> int:
+        """The drafts the drafter offers after the request's history."""
+        declined = self.decline is not None and self.decline(req_id, self.truth[req_id])
+        return 0 if declined else K
+
+    def _narrow(self, live, tokens, start_pos, mamba_state, sampling=None):
         logits = torch.zeros((int(tokens.shape[0]), 1, VOCAB))
         rows = []
         for row, req_id in enumerate(live):
@@ -252,7 +316,7 @@ class _LedgerDevice:
             )
             starts = [int(g.start_blocks[row]) for g in mamba_state.groups]
             rows.append((row, truth[:position], starts, [(0, tuple(truth))]))
-            truth.append(_target(truth))
+            truth.append(self._token(truth, row, position, sampling))
             logits[row, 0, truth[-1]] = 1e4
             self.next_drafts[req_id] = _drafts(truth)
         self._run_rows(mamba_state, rows)
@@ -261,6 +325,7 @@ class _LedgerDevice:
                 rows=list(live),
                 counts=[1] * len(live),
                 next_drafts=[self.next_drafts[r] for r in live],
+                offered=[self._offer(r) for r in live],
             )
         )
         return logits
@@ -269,13 +334,31 @@ class _LedgerDevice:
         num_valid = kwargs["num_valid_drafts"]
         rows_out = int(tokens.shape[0])
         ids = torch.full((rows_out, T), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
-        record = SimpleNamespace(
-            rows=list(live), counts=[], ids=ids, p0=[], next_drafts=[], miscounted=False
-        )
+        sampling = kwargs.get("sampling_params")
         predecessor = kwargs.get("spec_predecessor")
+        record = SimpleNamespace(
+            rows=list(live),
+            counts=[],
+            ids=ids,
+            p0=[],
+            next_drafts=[],
+            offered=[],
+            miscounted=False,
+            sampled=[self._draws(row, sampling) for row in range(len(live))],
+            chained=predecessor is not None,
+            followed=False,
+        )
+        self.records.append(record)
+        for row, req_id in enumerate(live):
+            params = self.h.requests[req_id].sampling_params
+            if params.temperature > 0 and not record.sampled[row]:
+                raise AssertionError(
+                    f"{req_id} samples and its argmax_ids verify answers the argmax"
+                )
         if predecessor is not None:
             self.chained += 1
             predecessor = predecessor.argmax_ids.record
+            predecessor.followed = True
         rows = []
         for row, req_id in enumerate(live):
             truth = self.truth[req_id]
@@ -296,7 +379,7 @@ class _LedgerDevice:
                 assert start_pos[row].tolist() == [previous + T + j for j in range(T)]
                 assert int(kwargs["accepted_counts"][row]) == 1
                 p0 = previous + count
-                nv = min(int(num_valid[row]), K)
+                nv = min(int(num_valid[row]), predecessor.offered[row])
                 drafts = predecessor.next_drafts[row]
                 block = [int(predecessor.ids[row, count - 1]), *drafts[:nv]]
                 starts = [
@@ -310,20 +393,24 @@ class _LedgerDevice:
                     self.miscounted_successors += 1
                     continue
             assert p0 == len(truth) - 1 and block[0] == truth[-1], (req_id, p0)
-            self._verify_row(row, req_id, p0, block, starts, ids, record, rows)
+            self._verify_row(
+                row, req_id, p0, block, starts, ids, record, rows, sampling
+            )
         self._run_rows(mamba_state, rows)
         self.steps.append(record)
         return VerifyOutput(
             spec_mode=ACCEPT_MODE_ARGMAX_IDS, argmax_ids=_Answer(ids, record)
         )
 
-    def _verify_row(self, row, req_id, p0, block, starts, ids, record, rows):
+    def _verify_row(self, row, req_id, p0, block, starts, ids, record, rows, sampling):
         truth = self.truth[req_id]
         prefix = truth[:p0]
         nv = len(block) - 1
         for t in range(T):
             ids[row, t] = (
-                _target(prefix + block[: t + 1]) if t <= nv else PLACEHOLDER_TOKEN_ID
+                self._token(prefix + block[: t + 1], row, p0 + t, sampling)
+                if t <= nv
+                else PLACEHOLDER_TOKEN_ID
             )
         count = 1
         while count <= nv and block[count] == int(ids[row, count - 1]):
@@ -335,16 +422,21 @@ class _LedgerDevice:
         if min(p0 % BLOCK_SIZE, BLOCK_SIZE - p0 % BLOCK_SIZE) <= 2 * T:
             self.boundary_counts.add(count)
         committed = [int(t) for t in ids[row, :count]]
-        if 0 <= self.miscount_at <= self.verifies and count <= nv:
+        if (
+            self.miscount is not None
+            and count <= nv
+            and self.miscount(self.verifies, req_id, record)
+        ):
             # A device acceptance one draft longer than the walk of its ids.
             count += 1
-            self.miscount_at = -1
+            self.miscount = None
             record.miscounted = True
         record.counts.append(count)
         record.p0.append(p0)
         truth[p0 + 1 :] = committed
         self.next_drafts[req_id] = _drafts(truth)
         record.next_drafts.append(self.next_drafts[req_id])
+        record.offered.append(self._offer(req_id))
 
     def read_decode_output(self, tt_out, async_read: bool = False, **kwargs):
         return (tt_out, []) if async_read else tt_out
@@ -377,7 +469,7 @@ class _LedgerDevice:
                 req_id
             )
             drafts[row] = torch.tensor(step.next_drafts[row], dtype=torch.int32)
-            num_valid[row] = num_drafts
+            num_valid[row] = step.offered[row]
         return DraftOutput(draft_token_ids=drafts, num_valid=num_valid)
 
 
@@ -395,6 +487,7 @@ class _AsyncHarness:
         max_num_batched_tokens: int = 4096,
         trace_mode: str = "none",
         device_sampling: bool = False,
+        sampled_ids: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -440,9 +533,16 @@ class _AsyncHarness:
             num_devices=1,
         )
         self.runner.model = self.device
-        if device_sampling:
+        if device_sampling or sampled_ids:
             self.device.model_capabilities["supports_sample_on_device"] = True
             self.runner.sample_on_device_mode = "decode_only"
+        if sampled_ids:
+            # The Qwen3.8 MTP class's sampling declarations.
+            self.device.model_capabilities.update(
+                spec_ids_are_sampled=True,
+                max_device_top_k=MAX_DEVICE_TOP_K,
+                supports_device_penalties=False,
+            )
         self.runner.initialize_kv_cache(self.kv_cache_config)
         self.groups = list(self.runner._mamba_groups.group_indices)
         self.ledger = StateLedger()
@@ -456,11 +556,19 @@ class _AsyncHarness:
         self.preempted: set[str] = set()
 
     def add(
-        self, req_id: str, prompt_len: int, max_tokens: int, temperature: float = 0.0
+        self,
+        req_id: str,
+        prompt_len: int,
+        max_tokens: int,
+        temperature: float = 0.0,
+        **sampling,
     ) -> None:
         init_none_hash(sha256)
         params = SamplingParams(
-            max_tokens=max_tokens, ignore_eos=True, temperature=temperature
+            max_tokens=max_tokens,
+            ignore_eos=True,
+            temperature=temperature,
+            **sampling,
         )
         params.update_from_generation_config({}, eos_token_id=EOS)
         self.num_added += 1
@@ -643,9 +751,9 @@ def test_a_decode_row_keeps_its_proposal_across_a_prefill_step(chained):
         steps.append(("verify", dict(zip(live, num_valid))))
         return verify(live, tokens, start_pos, mamba_state, kwargs)
 
-    def record_narrow(live, tokens, start_pos, mamba_state):
+    def record_narrow(live, tokens, start_pos, mamba_state, sampling=None):
         steps.append(("ordinary", dict.fromkeys(live, 0)))
-        return narrow(live, tokens, start_pos, mamba_state)
+        return narrow(live, tokens, start_pos, mamba_state, sampling)
 
     device.prefill_forward = record_prefill
     device._verify = record_verify
@@ -699,7 +807,7 @@ def test_a_device_count_unequal_to_the_walk_raises_before_its_step_is_served():
     # device builds that successor from the wrong count. A miscount on a
     # verify that a prefill or join follows drains instead, and no chained
     # step would run on it.
-    h.device.miscount_at = 29
+    h.device.miscount = lambda verifies, req_id, record: verifies >= 29
     served = []
     update = h.scheduler.update_from_output
 
@@ -775,3 +883,201 @@ def test_a_host_answering_model_never_gets_resident_decode_inputs(chained):
     assert ordinary and all(p.reload_inputs and not p.overlap_safe for p in ordinary)
     assert not [r for r in registered if r[0] == "AsyncTTModelRunnerOutput" and r[2]]
     assert (h.device.chained > 0) == chained
+
+
+# Chained verification of device-sampled rows (``spec_ids_are_sampled`` with
+# ``supports_chained_spec_verify``).
+
+SEEDED = ("s0", "s1", "s2")
+# A pool in which ``_sampled_scenario`` preempts no request in either mode.
+SAMPLED_BLOCKS = 80
+
+
+def _sampled_scenario(h: _AsyncHarness, *, unseeded: bool = True) -> None:
+    """Greedy and seeded sampled requests (top-k within the device bound),
+    with ``unseeded`` one sampled request without a seed, more of them than
+    rows; the drafter declines a row after every seventh position, so some
+    chained rows verify no draft."""
+    for i, prompt_len in enumerate((1019, 2045, 700)):
+        h.add(f"g{i}", prompt_len, max_tokens=24)
+    for req_id, prompt_len, seed in zip(SEEDED, (1022, 3066, 900), (11, 12, 13)):
+        h.add(req_id, prompt_len, max_tokens=24, temperature=0.8, top_k=5, seed=seed)
+    if unseeded:
+        h.add("u0", 1500, max_tokens=24, temperature=1.0, top_k=MAX_DEVICE_TOP_K)
+    h.device.decline = lambda req_id, truth: len(truth) % 7 == 3
+
+
+def _sampled_rows(records, select) -> list[tuple[str, int]]:
+    """``(request, count)`` of the sampled rows of the verify records
+    ``select`` keeps."""
+    return [
+        (req_id, record.counts[row])
+        for record in records
+        if select(record)
+        for row, req_id in enumerate(record.rows)
+        if record.sampled[row] and row < len(record.counts)
+    ]
+
+
+@pytest.mark.parametrize("mode", ["none", "align"])
+def test_device_sampled_rows_chain_like_greedy_rows(mode):
+    """On a device-sampled step a sampled row's ids are draws, so it chains
+    like a greedy row: a chained verify continues the device's count over the
+    predecessor's draws, and its rows draw at the positions that count gives,
+    a seeded row with the seed of that position. No sampled row drains
+    (``sampling``); predecessors of chained steps commit every count, rows
+    the drafter declined included; seeded and greedy outputs equal a
+    synchronous run's."""
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode=mode, asynchronous=False, sampled_ids=True
+    )
+    _sampled_scenario(reference)
+    reference.run()
+
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS, mode=mode, asynchronous=True, chained=True, sampled_ids=True
+    )
+    _sampled_scenario(h)
+    h.run()
+
+    for req_id, output in reference.outputs.items():
+        if req_id != "u0":
+            assert h.outputs[req_id] == output, req_id
+    assert len(h.outputs["u0"]) == 24
+    controller = h.runner.async_decode
+    assert controller._chain_drains["sampling"] == 0
+    assert controller._overlapped_unsafe_submissions == 0
+    chained = _sampled_rows(h.device.records, lambda r: r.chained)
+    assert {req_id for req_id, _ in chained} == {*SEEDED, "u0"}
+    followed = _sampled_rows(h.device.records, lambda r: r.followed)
+    assert {count for _, count in followed} == set(range(1, T + 1))
+    assert any(
+        not record.offered[row]
+        for record in h.device.records
+        if record.followed
+        for row in range(len(record.offered))
+        if record.rows[row] in SEEDED
+    ), "a chained step continued a seeded row the drafter declined"
+
+
+@pytest.mark.parametrize(
+    "ineligible",
+    [
+        # More candidates than the device sampler keeps (max_device_top_k).
+        {"temperature": 1.0, "top_k": 20},
+        # Logprobs: host-sampled on this one-device launch
+        # (check_perform_device_sampling), and never certifiable by the walk.
+        {"temperature": 0.0, "logprobs": 1},
+    ],
+)
+def test_a_step_the_device_cannot_sample_drains_its_sampled_rows(ineligible):
+    """While a request the device cannot sample is in the batch, every step
+    samples on the host: a sampled row is then not certifiable by the id
+    walk, so its steps are ordinary decodes and no verify chains over them.
+    Before the request arrives and after it finishes, sampled rows chain."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="align", asynchronous=True, chained=True, sampled_ids=True
+    )
+    for req_id, prompt_len, seed in (("g0", 1019, None), ("s0", 1022, 5)):
+        sampling = {} if seed is None else {"temperature": 0.8, "top_k": 5}
+        h.add(req_id, prompt_len, max_tokens=60, seed=seed, **sampling)
+    kinds: list[tuple[str, bool, list[str]]] = []
+    device = h.device
+    verify, narrow = device._verify, device._narrow
+
+    def record_verify(live, tokens, start_pos, mamba_state, kwargs):
+        kinds.append(("verify", "spec_predecessor" in kwargs, list(live)))
+        return verify(live, tokens, start_pos, mamba_state, kwargs)
+
+    def record_narrow(live, tokens, start_pos, mamba_state, sampling=None):
+        kinds.append(("ordinary", sampling is not None, list(live)))
+        return narrow(live, tokens, start_pos, mamba_state, sampling)
+
+    device._verify, device._narrow = record_verify, record_narrow
+    update, updates = h._update, []
+
+    def arrive(scheduler_output, output):
+        update(scheduler_output, output)
+        updates.append(scheduler_output)
+        if len(updates) == 12:
+            h.add("x", 800, max_tokens=12, **ineligible)
+
+    h._update = arrive
+    h.run()
+
+    with_x = [i for i, (_, _, rows) in enumerate(kinds) if "x" in rows]
+    assert with_x
+    first, last = with_x[0], with_x[-1]
+    assert all(kinds[i][:2] == ("ordinary", False) for i in with_x), (
+        "every step x shares samples on the host"
+    )
+    chained_s0 = [
+        i
+        for i, (kind, chained, rows) in enumerate(kinds)
+        if kind == "verify" and chained and "s0" in rows
+    ]
+    assert any(i < first for i in chained_s0) and any(i > last for i in chained_s0)
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="align", asynchronous=False, sampled_ids=True
+    )
+    reference.add("g0", 1019, max_tokens=60)
+    reference.run()
+    assert h.outputs["g0"] == reference.outputs["g0"]
+    assert len(h.outputs["s0"]) == 60 and len(h.outputs["x"]) == 12
+
+
+def test_a_build_that_samples_on_the_host_refuses_a_chained_sampled_row():
+    """``plan_chain`` reads the device-sampling decision before
+    ``_update_states``; the build decides again, and a chained sampled row
+    its own decision does not certify raises instead of being verified
+    against the argmax. Here the build's decision turns to host sampling
+    once verifies chain, while ``plan_chain``'s does not."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="none", asynchronous=True, chained=True, sampled_ids=True
+    )
+    _sampled_scenario(h, unseeded=False)
+    runner = h.runner
+    decide, build = runner._decode_device_sampled, runner.build_model_input
+    building = []
+
+    def build_model_input(*args, **kwargs):
+        building.append(True)
+        try:
+            return build(*args, **kwargs)
+        finally:
+            building.pop()
+
+    def decide_in_build(*args, **kwargs):
+        if building and h.device.chained >= 5:
+            return False
+        return decide(*args, **kwargs)
+
+    runner.build_model_input = build_model_input
+    runner._decode_device_sampled = decide_in_build
+    with pytest.raises(RuntimeError, match="not certifiable by the id walk"):
+        h.run()
+
+
+def test_a_sampled_device_count_unequal_to_the_walk_raises_before_its_step_is_served():
+    """The guard covers sampled rows: a device count over the draws one draft
+    longer than the runner's walk of the same draws, on a sampled row of a
+    chained verify, raises at that verify's propose, before vLLM receives the
+    tokens of the chained step built on it."""
+    h = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="align", asynchronous=True, chained=True, sampled_ids=True
+    )
+    _sampled_scenario(h, unseeded=False)
+    h.device.miscount = lambda verifies, req_id, record: (
+        verifies > 20 and record.chained and req_id in SEEDED
+    )
+    with pytest.raises(ValueError, match="the device accepted"):
+        h.run()
+    assert h.device.miscounted_successors, "a chained step ran on the wrong count"
+    reference = _AsyncHarness(
+        SAMPLED_BLOCKS, mode="align", asynchronous=False, sampled_ids=True
+    )
+    _sampled_scenario(reference, unseeded=False)
+    reference.run()
+    for req_id, request in h.requests.items():
+        tokens = list(request.output_token_ids)
+        assert tokens == reference.outputs[req_id][: len(tokens)], req_id
