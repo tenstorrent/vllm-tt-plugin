@@ -32,8 +32,9 @@ serve speculative decoding within the following execution limits:
   model that offers it: it certifies the same rows, and the runner takes the
   device's committed ids as the walk's result, so a model may commit more
   tokens per call than the drafts it was sent (several device steps per
-  call), up to the block's `1 + effective_k` columns that the lookahead
-  reservation of section 4f covers. An ordinary narrow decode does not send
+  call), at most the block's `1 + effective_k` columns. Section 4f states
+  the KV the scheduler reserves for such a call, and what a commit past the
+  drafts does to vLLM's counters. An ordinary narrow decode does not send
   `spec_mode`.
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
@@ -237,7 +238,10 @@ return formats the runner executes. A `fused_sample` verify returns
 `accepted_token_ids` `[B, 1+K]` (each row's committed prefix, its tail padded
 with `PLACEHOLDER_TOKEN_ID`) and `accepted_counts` `[B]`, which must agree;
 the runner commits the prefixes as they are, under the certification rules
-of `argmax_ids`. Declaring `logits` enables sampled speculation for
+of `argmax_ids`. The runner reads both on the host as soon as `decode_forward`
+returns, before any `read_decode_output`, so they are host tensors even on a
+`read_from_device=False` call: the commit is complete when the verify
+returns. Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
@@ -913,6 +917,40 @@ write outside the reservation. The plugin offers no way to declare that: there
 is no capability key for a proposal write extent and `SpecPlan` has no field
 for one. An adapter in that position raises it with the plugin owner before it
 is admitted, because nothing detects the overrun at run time.
+
+**A `fused_sample` call that commits past its drafts.** On a `custom_class`
+launch the reservation is `effective_k + 1` positions past the step's own
+`1 + d` tokens, where `d` is the drafts the scheduler scheduled for the row
+(its `num_valid_drafts`). With column 0 at position `p`, the allocation ends at
+position `p + d + effective_k + 1`. A call that chains device steps writes K/V
+for every chained verify block and for the drafts its last step proposes, and
+every one of those writes must land at or below that position; nothing checks
+it at run time. Committing at most the block's `1 + effective_k` tokens and
+then proposing at most `d` drafts is enough. The GLM-5.3-Flash stack adapter
+with `GLM53_SPEC_STEPS_PER_CALL=M` fits that way: its drafter offers its `K`
+device drafts, so `d = K`, while its `effective_k` is `M (K + 1) - 1`, and its
+chain of at most `M` steps writes through `p + effective_k + K`, one position
+short of the end. It also shortens the chain where the row's page table stops.
+An `ngram` launch reserves nothing past the step's own `1 + d` tokens, so there
+a `fused_sample` verify may commit at most `1 + d` tokens.
+
+**What vLLM's counters show for such a commit.** At schedule time vLLM
+advances `num_computed_tokens`, and through `AsyncScheduler`
+`num_output_placeholders`, by the step's `1 + d` tokens. In
+`update_from_output` it subtracts `num_rejected = d - (c - 1)` from both for a
+row that committed `c` tokens. When `c > d + 1` that is negative, so both
+advance by the whole commit and `num_computed_tokens` ends at
+`num_tokens - 1`, as after any decode. vLLM does this only for a row it
+scheduled drafts for. A row with `d = 0` that commits `c > 1` gets the same
+adjustment from `TTScheduler._count_commit_past_scheduled_drafts`; without it
+the request would hold `c` new tokens against counts advanced by one, and the
+next step would schedule `c - 1` of them again as new input. vLLM's
+speculative-decoding metrics are not corrected: they record `c - 1` accepted
+tokens against `d` drafted ones, so the acceptance rate can read above 100 %
+and per-position acceptance counts land on positions that were never drafted.
+A row with `d = 0` records nothing. `c - 1` never exceeds `effective_k`, the
+bound vLLM asserts. Judge such a model by its committed tokens per step, not by
+vLLM's acceptance rate.
 
 ## 4g. Lifecycle hooks the runner calls on any model that defines them
 

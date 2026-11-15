@@ -1004,7 +1004,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## Sampling limits
 
-Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. A model that also declares `device_top_k_unbounded_as` keeps those requests on the device, sampled from its `max_device_top_k` most probable tokens. Models without the capability keep their existing routing. To keep requests that do not set `top_k` on the device, see [Default top-k for device sampling](#default-top-k-for-device-sampling).
+Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. A model that also declares `device_top_k_unbounded_as` keeps those requests on the device, where the model samples them from its `device_top_k_unbounded_as` most probable tokens (at most `max_device_top_k`) instead of the full distribution. Models without the capability keep their existing routing. To keep requests that do not set `top_k` on the device, see [Default top-k for device sampling](#default-top-k-for-device-sampling).
 
 Block-output models (`output_tokens_per_step > 1`) cannot declare this capability: their model-owned sampler produces a complete canvas, which the host sampler cannot replace. The combination is rejected at startup.
 

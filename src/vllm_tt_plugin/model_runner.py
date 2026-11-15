@@ -1315,11 +1315,12 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
-        # A request mid-prefill keeps the slot its earlier chunks wrote: a
-        # stateful model (recurrent carries, per-slot chunk cursors) continues
-        # from that slot's state, and no gather moves state between prefill
-        # steps. Reserve those first so a request joining the batch at a lower
-        # row cannot take a continuing request's slot.
+        # A request mid-prefill keeps the slot recorded for it: a stateful
+        # model (recurrent carries, per-slot chunk cursors) continues from the
+        # state its earlier chunks wrote, and the record follows that state
+        # through any decode gather in between (_decode_state_slot_remap moves
+        # every slot's owner). Reserve those first so a request joining the
+        # batch at a lower row cannot take a continuing request's slot.
         kept = {
             req_id: slot
             for req_id, slot in self._req_state_slot.items()
@@ -4107,11 +4108,11 @@ class TTModelRunner:
             needs_unbounded_or_larger_k = (temperature != 0) & (
                 (top_k < 1) | (top_k > max_top_k)
             )
-            # A model that declares ``device_top_k_unbounded_as`` (the bound
-            # it substitutes) serves rows without a top-k bound (vLLM's
-            # default) and rows above its bound from its top-``max_top_k``
-            # candidates on the device; without it such a batch samples on
-            # the host.
+            # A model that declares ``device_top_k_unbounded_as`` (the top-k
+            # it substitutes, at most ``max_top_k``) serves rows without a
+            # top-k bound (vLLM's default) and rows above its bound on the
+            # device, from its top-``device_top_k_unbounded_as`` candidates;
+            # without it such a batch samples on the host.
             unbounded_as = self.model.model_capabilities.get(
                 "device_top_k_unbounded_as"
             )

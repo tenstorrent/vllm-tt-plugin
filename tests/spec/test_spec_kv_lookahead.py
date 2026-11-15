@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import torch
 from vllm.config import (
     CacheConfig,
@@ -314,3 +315,52 @@ def test_without_an_admitted_plan_the_crossing_block_is_absent():
         computed + 1 + NUM_SPEC_TOKENS
     )
     assert _allocated_blocks(scheduler, request) == [1]
+
+
+# --- a fused_sample commit past the drafts the step scheduled ---------------
+
+
+@pytest.mark.parametrize("num_drafts", [1, 0])
+def test_a_commit_past_the_scheduled_drafts_keeps_the_counts_whole(num_drafts):
+    """A ``fused_sample`` verify may commit more than a row's ``1 + d`` tokens
+    (several device steps per call). Schedule time advanced
+    ``num_computed_tokens`` and the placeholders by ``1 + d``. vLLM corrects
+    both by ``num_rejected = d - (c - 1)``, negative here, for a row with
+    drafts; ``TTScheduler`` applies the same correction to a row without. Either
+    way the request ends one token short of computed, as after any decode, and
+    the next step schedules one token rather than the commit again."""
+    scheduler = _scheduler(admitted=True)
+    request = _prefilled(scheduler, 20)
+    request.spec_token_ids = DRAFT_IDS[:num_drafts]
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {request.request_id: 1 + num_drafts}
+    drafts = step.scheduled_spec_decode_tokens.get(request.request_id, [])
+    assert drafts == DRAFT_IDS[:num_drafts]
+
+    committed = [901, 902, 903, 904]  # c = 4, past 1 + d
+    outputs = scheduler.update_from_output(
+        step,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[list(committed)],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert list(request.output_token_ids) == [7, *committed]
+    assert request.num_computed_tokens == request.num_tokens - 1
+    assert request.num_output_placeholders == 0
+    # vLLM's speculative counters are left as vLLM computes them: 3 accepted
+    # against 1 drafted reads as 300 % acceptance (SPEC_DECODE_CONTRACT.md
+    # section 4f), and a draftless row records nothing.
+    stats = next(iter(outputs.values())).scheduler_stats.spec_decoding_stats
+    if num_drafts:
+        assert (stats.num_draft_tokens, stats.num_accepted_tokens) == (1, 3)
+    else:
+        assert stats is None
+
+    following = scheduler.schedule()
+    assert following.num_scheduled_tokens == {request.request_id: 1}
