@@ -434,7 +434,9 @@ def validate_tt_prefix_hit_confirmation(
         ValueError: the declaration comes without ``supports_prefix_caching``
             or without the method, or the executor runs the worker outside the
             scheduler's process (anything but the uniproc executor), where the
-            published method would never reach the scheduler.
+            published method would never reach the scheduler, or the launch
+            runs single-process lane-DP, whose lanes would share one
+            lane-blind confirmer.
     """
     capabilities = model_capabilities or {}
     if not capabilities.get("confirms_prefix_cache_hits", False):
@@ -457,6 +459,15 @@ def validate_tt_prefix_hit_confirmation(
             f"Model {name} confirms prefix-cache hits from the worker that loaded "
             "it, which must share the scheduler's process (the uniproc executor); "
             f"got distributed_executor_backend={backend!r}"
+        )
+    if uses_tt_lane_coordinator(vllm_config):
+        raise ValueError(
+            f"Model {name} confirms prefix-cache hits through one confirmer per "
+            "process, and single-process lane-DP runs "
+            f"{get_tt_data_parallel_size(vllm_config)} TT lanes, each a "
+            "scheduler over its own KV cache: every lane would ask the same "
+            "confirmer, which cannot tell one lane's requests from another's. "
+            "Serve this model without TT lanes (data_parallel_size=1)."
         )
 
 

@@ -1338,11 +1338,12 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
-        # A request mid-prefill keeps the slot its earlier chunks wrote: a
-        # stateful model (recurrent carries, per-slot chunk cursors) continues
-        # from that slot's state, and no gather moves state between prefill
-        # steps. Reserve those first so a request joining the batch at a lower
-        # row cannot take a continuing request's slot.
+        # A request mid-prefill keeps the slot recorded for it: a stateful
+        # model (recurrent carries, per-slot chunk cursors) continues from the
+        # state its earlier chunks wrote, and the record follows that state
+        # through any decode gather in between (_decode_state_slot_remap moves
+        # every slot's owner). Reserve those first so a request joining the
+        # batch at a lower row cannot take a continuing request's slot.
         kept = {
             req_id: slot
             for req_id, slot in self._req_state_slot.items()

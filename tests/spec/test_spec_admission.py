@@ -417,10 +417,10 @@ def test_an_absent_capability_dictionary_is_refused_not_crashed():
     assert "supports_spec_decode" in str(excinfo.value)
 
 
-# --- surfaces refused until something implements them ---------------------
+# --- every accept mode is admitted; a paged drafter cache is still refused --
 
 
-def test_offering_fused_sample_alongside_a_runnable_mode_is_still_admitted():
+def test_offering_fused_sample_alongside_argmax_ids_is_admitted():
     # Declaring a real capability must not make a model less admissible, or a
     # model author's only remedy is to hide what the device can do.
     variant = make_fake_spec_model(
