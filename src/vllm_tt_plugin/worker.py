@@ -604,6 +604,10 @@ class TTWorker(WorkerBase):
         best-effort backstop and deliberately does not call it; see the note
         there.
         """
+        # The published prefix-hit confirmer is a bound method of the model:
+        # left in place it would keep the model alive past the mesh close
+        # below. The scheduler holds it weakly.
+        publish_prefix_hit_confirmer(None)
         if getattr(self, "model_runner", None) is not None:
             try:
                 self.model_runner.shutdown()

@@ -114,22 +114,19 @@ def test_config_accessor_defaults_and_validates():
         get_tt_prefill_chunk_alignment(cfg)
 
 
-def test_a_permanent_cap_below_the_grid_still_makes_progress():
-    # long_prefill_token_threshold=64 caps every step at 64 tokens: deferring would
-    # never converge, so the new request keeps its 64-token chunk ...
+def test_a_full_step_that_misses_the_grid_is_refused():
+    # __init__ refuses a per-step cap below the alignment, so a full step always
+    # reaches the grid. Past that validation (this stub skips __init__), a full
+    # 64-token step under a 128 alignment cannot, and is refused rather than
+    # cut off the grid, for a new request and a running one alike ...
     s = _scheduler()
     s.scheduler_config = SimpleNamespace(
         max_num_batched_tokens=4096, long_prefill_token_threshold=64
     )
-    assert s._mamba_block_aligned_split(_request(1024), 64) == 64
-    # ... a running request ends its chunk on a KV block instead (the model
-    # takes a resume offset only on a block boundary): from 157 the 64-token
-    # offer ends on the 192 block, and an offer that reaches no block waits ...
-    assert s._mamba_block_aligned_split(_request(1024, computed=157), 64) == 35
-    s.scheduler_config = SimpleNamespace(
-        max_num_batched_tokens=4096, long_prefill_token_threshold=60
-    )
-    assert s._mamba_block_aligned_split(_request(1024, computed=130), 60) == 0
+    with pytest.raises(RuntimeError, match="misses the 128-token alignment grid"):
+        s._mamba_block_aligned_split(_request(1024), 64)
+    with pytest.raises(RuntimeError, match="from position 157"):
+        s._mamba_block_aligned_split(_request(1024, computed=157), 64)
     # ... while a chunk cut short by this step's leftover budget still waits.
     s.scheduler_config = SimpleNamespace(
         max_num_batched_tokens=4096, long_prefill_token_threshold=0
@@ -193,7 +190,8 @@ def test_init_rejects_a_scheduled_token_limit_below_the_alignment():
                 long_prefill_token_threshold=0,
             ),
         )
-    # and the scheduler's own cap agrees, so a 64-token proposal is a full step
+    # and the scheduler's own cap agrees, so a 64-token proposal is a full step,
+    # which it refuses rather than end off the grid
     s = _scheduler()
     s.scheduler_config = SimpleNamespace(
         max_num_batched_tokens=4096,
@@ -201,4 +199,5 @@ def test_init_rejects_a_scheduled_token_limit_below_the_alignment():
         long_prefill_token_threshold=0,
     )
     assert s._full_step_prefill_cap() == 64
-    assert s._mamba_block_aligned_split(_request(1024), 64) == 64
+    with pytest.raises(RuntimeError, match="per-step cap 64"):
+        s._mamba_block_aligned_split(_request(1024), 64)
