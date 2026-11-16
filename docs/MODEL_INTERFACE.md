@@ -107,8 +107,10 @@ the chained verify's rows from that proposal and walks the chained verify's
 rows, and sampled rows as below) whose request takes the scheduler's full
 `1 + K` tokens, with room for two more steps below
 `max_model_len`; a prefill, a new or resumed request, a preemption, a forced
-prefix-cache reset, structured output, a moved row or a second unread verify
-drains the predecessor first. In `mamba_cache_mode` `align` a chained row can
+prefix-cache reset, structured output, a request that is not a row of the
+predecessor or a second unread verify drains the predecessor first. A row
+that moved because a predecessor row left does not: `slot_remap` names its
+predecessor row. In `mamba_cache_mode` `align` a chained row can
 be next to a block boundary: its `windows` can then begin one column past the
 column that holds, by position, its last query token at a low count, and that
 count's start block is an earlier window column than `c - 1`, or the block
