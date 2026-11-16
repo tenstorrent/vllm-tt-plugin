@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """Host-only tests for the single-token repetition guard."""
 
-import random
 from types import SimpleNamespace
 
 from vllm_tt_plugin.model_runner import _guard_repetition
@@ -21,8 +20,8 @@ def _publish(guard, req_id, steps, stop=STOP):
 
 def test_output_below_the_limit_is_unchanged():
     guard = RepetitionGuard()
-    rng = random.Random(0)
-    tokens = [rng.randrange(1, 200) for _ in range(5000)]
+    # Deterministic token ids with no two equal neighbours (7919 is not a multiple of 199): a stand-in for ordinary output.
+    tokens = [(i * 7919) % 199 + 1 for i in range(5000)]
     assert _publish(guard, "r", [[t] for t in tokens]) == tokens
 
 
