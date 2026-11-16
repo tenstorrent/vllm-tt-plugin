@@ -76,7 +76,8 @@ ordinary verify; a chained verify differs as follows.
 | Item | Chained verify |
 |---|---|
 | `spec_predecessor` | Keyword argument of `decode_forward`: the `VerifyOutput` the model returned for the verify submitted just before, still unread. Absent on every other call. |
-| Live rows | Every live row of the call is a live row of the predecessor at the same row index. A predecessor row whose request finished is a padding row of the call. |
+| Live rows | Every live row `i` of the call is the live row `slot_remap[i]` of the predecessor (row `i` when `slot_remap` is absent). A predecessor row whose request finished, or that the step does not schedule, is not a live row of the call. |
+| `slot_remap` | As on every decode: the gather permutation of the step (row `i` reads state slot `slot_remap[i]`). After a decode `TTModelRunner` keeps each request's state slot at its row, so on a chained verify `slot_remap[i]` is also the predecessor row that row `i` continues. A row moves when a predecessor row leaves and `InputBatch.condense` moves the last row into its place. |
 | `tokens`, `start_pos` | Placeholders on live rows: `PLACEHOLDER_TOKEN_ID` in every column, and the positions of a predecessor that accepted all its drafts (its column-0 position plus `1 + K + j` in column `j`). Padding rows as on any verify. |
 | `num_valid_drafts` | On live rows, the most drafts the row may verify (`SpecPlan.draft_cap` of the step's live rows). |
 | `accepted_counts` | 1 on every row. |
@@ -88,8 +89,13 @@ acceptance of its `argmax_ids`, the row is the predecessor's committed token
 `c - 1` in column 0, then `n = min(num_valid_drafts, offered)` drafts that the
 model's drafter made from that commit (`offered` is 0 when the drafter
 declines the row and K otherwise), at the predecessor's column-0 position plus
-`c`, starting from `start_blocks_by_count[row, c - 1]`. The return is the
-`VerifyOutput` of that block, as on any verify.
+`c`, starting from `start_blocks_by_count[row, c - 1]`. Here `c`, the
+committed tokens, the drafts and the column-0 position are those of the
+predecessor row `slot_remap[row]`; `start_blocks_by_count`, `windows`,
+`num_valid_drafts` and the sampling parameters are the call's own row. The
+return is the `VerifyOutput` of that block, as on any verify. A model that
+does not support a moved row raises on a `slot_remap` that is not the
+identity.
 
 `TTModelRunner` then reads the predecessor, walks it, commits it and calls
 `propose_draft_tokens` for it. That call must return the drafts the chained

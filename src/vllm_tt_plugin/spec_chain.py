@@ -11,7 +11,10 @@ verify's rows on the device from its own unread result instead, so the runner
 can submit step n + 1 over an unread verify n:
 
 1. ``plan_chain`` decides, before the build, whether step n + 1 continues
-   verify n row for row (``ChainPlan``), or drains it as before.
+   verify n row for row (``ChainPlan``), or drains it as before. A row can
+   move: when a predecessor row leaves, ``InputBatch.condense`` moves the
+   last row into its place, and the build's ``slot_remap`` names, for each
+   row, the predecessor row it continues.
 2. The build sends each live row as placeholders (``chained_rows``): tokens
    ``PLACEHOLDER_TOKEN_ID``, positions of a predecessor that accepted all its
    drafts, ``num_valid_drafts`` the most drafts the row may verify, count 1,
@@ -69,7 +72,7 @@ def plan_chain(
     Read before ``_update_states``: the persistent batch still holds the
     predecessor's rows. Returns the plan, or ``None`` and the reason the step
     drains instead. A row chains only when every count the predecessor can
-    commit gives the same build: the same rows at the same indices, the
+    commit gives the same build: a request of the predecessor's rows, the
     scheduler's full ``1 + K`` tokens with ``K`` placeholders, and room for
     two more steps below ``max_model_len``.
     """
@@ -112,12 +115,15 @@ def plan_chain(
     batch = runner.input_batch
     if list(batch.req_ids[: batch.num_reqs]) != previous_rows:
         return None, "rows"
+    # A predecessor row whose request finished, or that the step does not
+    # schedule (vLLM leaves out a request whose in-flight step reaches
+    # max_tokens), leaves the batch, and ``InputBatch.condense`` moves the
+    # last row into its place: the chained call's ``slot_remap`` names each
+    # row's predecessor row. A request that is not a predecessor row drains.
     finished = set(scheduler_output.finished_req_ids)
-    rows = [r for r in previous_rows if r not in finished]
-    # Finished rows leave the batch; only a suffix leaves the others in place.
-    if not rows or previous_rows[: len(rows)] != rows:
-        return None, "rows"
-    if set(scheduler_output.num_scheduled_tokens) != set(rows):
+    scheduled = set(scheduler_output.num_scheduled_tokens)
+    rows = [r for r in previous_rows if r in scheduled and r not in finished]
+    if not rows or set(rows) != scheduled:
         return None, "rows"
     num_drafts = int(runner._num_speculative_tokens)
     computed = dict(

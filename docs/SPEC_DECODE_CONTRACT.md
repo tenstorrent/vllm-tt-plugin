@@ -558,7 +558,8 @@ next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
 unapplied, and verify, accept and propose stay serialized per request. The one
 exception is a model declaring `supports_chained_spec_verify`: there the
-runner may submit a verify that continues the unread one row for row (greedy
+runner may submit a verify that continues the unread one row for row, a moved
+row naming its predecessor row through `slot_remap` (greedy
 rows, and with `spec_ids_are_sampled` the sampled rows of a device-sampled
 step; section 4i),
 and the model builds its rows on the device from the unread result

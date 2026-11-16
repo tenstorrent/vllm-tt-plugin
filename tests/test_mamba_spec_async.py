@@ -57,7 +57,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from tests.test_mamba_kv_cache import _kv_cache_config, _vllm_config
 from tests.test_mamba_state_lifecycle import (
@@ -184,6 +184,9 @@ class _LedgerDevice:
         self.steps: deque[SimpleNamespace] = deque()
         self.verifies = 0
         self.chained = 0
+        # Chained verifies whose ``slot_remap`` moves a live row.
+        self.moved_rows = 0
+        self.prefills = 0
         self.ordinary_decodes = 0
         # Ordinary decodes submitted right after another ordinary decode.
         self.plain_after_plain = 0
@@ -260,6 +263,7 @@ class _LedgerDevice:
 
     def prefill_forward(self, tokens, prompt_lens, start_pos, mamba_state, **kwargs):
         self.last_kind = "prefill"
+        self.prefills += 1
         live = self._live()
         logits = torch.zeros((len(live), 1, VOCAB))
         rows = []
@@ -384,8 +388,11 @@ class _LedgerDevice:
                 raise AssertionError(
                     f"{req_id} samples and its argmax_ids verify answers the argmax"
                 )
+        remap = kwargs.get("slot_remap")
+        sources = list(range(len(live))) if remap is None else remap.tolist()
         if predecessor is not None:
             self.chained += 1
+            self.moved_rows += sources[: len(live)] != list(range(len(live)))
             predecessor = predecessor.argmax_ids.record
             predecessor.followed = True
         rows = []
@@ -399,18 +406,24 @@ class _LedgerDevice:
                 drafts = self.next_drafts.get(req_id, [])
                 assert block[1:] == drafts[:nv], (req_id, block)
             else:
-                # The row continues the unread predecessor from the count the
-                # device accepted; the runner sent placeholders.
-                assert predecessor.rows[row] == req_id, (predecessor.rows, live)
-                count = predecessor.counts[row]
-                previous = predecessor.p0[row]
+                # The row continues the unread predecessor's row ``source``
+                # (``slot_remap``) from the count the device accepted; the
+                # runner sent placeholders.
+                source = sources[row]
+                assert predecessor.rows[source] == req_id, (
+                    predecessor.rows,
+                    live,
+                    sources,
+                )
+                count = predecessor.counts[source]
+                previous = predecessor.p0[source]
                 assert tokens[row].tolist() == [PLACEHOLDER_TOKEN_ID] * T
                 assert start_pos[row].tolist() == [previous + T + j for j in range(T)]
                 assert int(kwargs["accepted_counts"][row]) == 1
                 p0 = previous + count
-                nv = min(int(num_valid[row]), predecessor.offered[row])
-                drafts = predecessor.next_drafts[row]
-                block = [int(predecessor.ids[row, count - 1]), *drafts[:nv]]
+                nv = min(int(num_valid[row]), predecessor.offered[source])
+                drafts = predecessor.next_drafts[source]
+                block = [int(predecessor.ids[source, count - 1]), *drafts[:nv]]
                 starts = [
                     int(g.start_blocks_by_count[row, count - 1])
                     for g in mamba_state.groups
@@ -728,8 +741,7 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     step's rows, whose walk then commits what the device computed. Every
     start state read is the request's own and the outputs equal a
     synchronous run's. Joins and prefills (at the empty step the scheduler
-    returns ahead of them), finished rows that are not the last and
-    preemptions drain instead."""
+    returns ahead of them) and preemptions drain instead."""
     reference = _AsyncHarness(num_blocks, mode=mode, asynchronous=False)
     _scenario(reference)
     reference.run()
@@ -808,6 +820,163 @@ def test_a_chained_verify_next_to_a_block_boundary_is_the_drained_verify(
     assert controller._overlapped_unsafe_submissions == 0
     assert set(controller._chain_drains) <= {"pending", "rows", "lifecycle"}
     if num_blocks == 28:
+        assert h.preempted
+
+
+LEAVING = (
+    ("r0", 1019, 28),
+    ("r1", 700, 16),
+    ("r2", 2045, 32),
+    ("r3", 900, 24),
+    ("r4", 1500, 40),
+    ("r5", 1022, 36),
+)
+# Requests stopped by a token of their own output, and the one aborted.
+LEAVING_STOPPED = ("r2", "r5")
+LEAVING_ABORTED = "r4"
+
+
+def _leaving_scenario(
+    h: _AsyncHarness, *, sampled: bool, stops: dict[str, int] | None = None
+) -> None:
+    """Two more requests than rows, of different lengths, so that once the
+    last one has joined requests finish in every row with nothing waiting:
+    by max_tokens, by a stop token (``stops``) and, on an asynchronous run,
+    one by an abort. With ``sampled`` every other request is a seeded sampled
+    one."""
+    for i, (req_id, prompt_len, max_tokens) in enumerate(LEAVING):
+        sampling: dict = {}
+        if sampled and i % 2:
+            sampling.update(temperature=0.8, top_k=5, seed=21 + i)
+        if stops and req_id in stops:
+            sampling.update(stop_token_ids=[stops[req_id]])
+        h.add(req_id, prompt_len, max_tokens=max_tokens, **sampling)
+    if not h.asynchronous:
+        return
+    update = h._update
+
+    def abort(scheduler_output, output):
+        update(scheduler_output, output)
+        request = h.scheduler.requests.get(LEAVING_ABORTED)
+        if request is not None and len(request.output_token_ids) >= 25:
+            h.scheduler.finish_requests(LEAVING_ABORTED, RequestStatus.FINISHED_ABORTED)
+
+    h._update = abort
+
+
+def _leaving_stops(num_blocks: int, sampled: bool) -> dict[str, int]:
+    """A stop token for each of ``LEAVING_STOPPED``: the first token of its
+    output that it had not produced before its eleventh."""
+    h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, asynchronous=False)
+    _leaving_scenario(h, sampled=sampled)
+    h.run()
+    stops = {}
+    for req_id in LEAVING_STOPPED:
+        out = h.outputs[req_id]
+        stops[req_id] = next(
+            t for i, t in enumerate(out) if i >= 10 and t not in out[:i]
+        )
+    return stops
+
+
+class _LeavingRows:
+    """Per ``execute_model`` call over an unread verify: the predecessor's
+    rows that leave (finished, or not scheduled), whether one of them was not
+    its last row, and whether the step chained."""
+
+    def __init__(self, h: _AsyncHarness):
+        self.steps: list[SimpleNamespace] = []
+        # Steps over an unread verify that schedule nothing.
+        self.empty_drains = 0
+        runner, execute = h.runner, h.runner.execute_model
+        controller = runner.async_decode
+
+        def record(scheduler_output):
+            with runner._steady_decode_lock:
+                pending = list(runner._pending_async_steps)
+            previous = (
+                list(pending[0].model_input.row_req_ids or ())
+                if len(pending) == 1 and hasattr(pending[0], "chain_successor")
+                else []
+            )
+            scheduled = set(scheduler_output.num_scheduled_tokens)
+            finished = set(scheduler_output.finished_req_ids)
+            before = controller._chained_verify_submissions
+            result = execute(scheduler_output)
+            leaving = [r for r in previous if r not in scheduled]
+            if previous and not scheduled:
+                self.empty_drains += 1
+            self.steps.append(
+                SimpleNamespace(
+                    finished=[r for r in leaving if r in finished],
+                    skipped=[r for r in leaving if r not in finished],
+                    moved=bool(leaving)
+                    and previous[: len(previous) - len(leaving)]
+                    != [r for r in previous if r in scheduled],
+                    prefill=bool(scheduler_output.scheduled_new_reqs),
+                    chained=controller._chained_verify_submissions > before,
+                )
+            )
+            return result
+
+        runner.execute_model = record
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "sampled"), [(48, False), (80, False), (80, True)]
+)
+def test_a_chained_verify_continues_rows_that_moved(num_blocks, sampled):
+    """A request that finishes (max_tokens, a stop token, an abort) or that
+    vLLM leaves out because its in-flight step reaches max_tokens leaves the
+    persistent batch, and ``InputBatch.condense`` moves the last row into its
+    place. The next verify still chains: ``slot_remap`` names each row's
+    predecessor row, and the device builds the row from that row's count. The
+    device gets the same start blocks and window blocks as a drained run, row
+    for row and step for step, and leaves the same GDN state in every block;
+    the outputs equal a synchronous run's. Only steps that schedule nothing
+    drain for "rows". With 48 blocks a request is also preempted and
+    resumes."""
+
+    stops = _leaving_stops(num_blocks, sampled)
+
+    def harness(**kwargs) -> _AsyncHarness:
+        h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, **kwargs)
+        _leaving_scenario(h, sampled=sampled, stops=stops)
+        return h
+
+    reference = harness(asynchronous=False)
+    reference.run()
+    drained = harness(asynchronous=True)
+    drained.run()
+    h = harness(asynchronous=True, chained=True)
+    leaving = _LeavingRows(h)
+    h.run()
+
+    aborted = h.outputs.pop(LEAVING_ABORTED)
+    assert aborted == drained.outputs.pop(LEAVING_ABORTED)
+    assert 25 <= len(aborted) < 40
+    assert aborted == reference.outputs.pop(LEAVING_ABORTED)[: len(aborted)]
+    assert h.outputs == reference.outputs == drained.outputs
+    assert h.requests[LEAVING_ABORTED].status == RequestStatus.FINISHED_ABORTED
+    assert {h.requests[r].status for r in LEAVING_STOPPED} == {
+        RequestStatus.FINISHED_STOPPED
+    }
+    assert h.device.inputs == drained.device.inputs
+    assert h.ledger.states == drained.ledger.states
+    assert h.cached_states_checked
+    controller = h.runner.async_decode
+    assert controller._overlapped_unsafe_submissions == 0
+    assert h.device.chained == controller._chained_verify_submissions
+    # A finished row that was not the last one, and a row vLLM left out, were
+    # chained over.
+    assert h.device.moved_rows
+    assert any(s.chained and s.moved and s.finished for s in leaving.steps)
+    assert any(s.chained and s.skipped for s in leaving.steps)
+    # Every step over an unread verify that still schedules a predecessor
+    # row chains: what drains for "rows" schedules nothing (the empty step
+    # ``TTScheduler`` returns ahead of a prefill, or every row left).
+    assert controller._chain_drains["rows"] == leaving.empty_drains
+    if num_blocks == 48:
         assert h.preempted
 
 

@@ -3063,14 +3063,11 @@ class TTModelRunner:
             scheduler_output, grammar_output, chain=chain
         )
         if chain is not None:
-            if model_input.spec_mode is None or (
-                model_input.slot_remap is not None
-                and model_input.slot_remap.tolist()
-                != list(range(int(model_input.slot_remap.numel())))
-            ):
+            # ``slot_remap`` stays: it names each row's predecessor row.
+            if model_input.spec_mode is None:
                 raise RuntimeError(
                     "a chained verify was built as another step: spec_mode "
-                    f"{model_input.spec_mode!r}, slot_remap {model_input.slot_remap}"
+                    f"{model_input.spec_mode!r}"
                 )
             model_input = replace(
                 model_input, spec_predecessor=chain.predecessor.verify_output
