@@ -484,7 +484,6 @@ def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired)
         tt_data_parallel_size=1,
         input_batch=batch,
         seeded_sampling_policy="auto",
-        model_config=SimpleNamespace(logits_processors=[]),
         supports_device_grammar=False,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         supports_topk_logprobs=False,

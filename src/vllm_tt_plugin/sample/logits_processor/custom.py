@@ -6,14 +6,23 @@
 ``--logits-processors`` classes and installed ``vllm.logits_processors`` entry
 points must implement ``vllm.v1.worker.gpu.sample.logits_processor``'s
 ``LogitsProcessor``. That interface keys a processor's per-request state by a
-request slot that stays fixed for the request's lifetime, and shares a
-slot-indexed token history, ``LogitsProcRequestState``. Persistent-batch rows
-are not fixed: condense and lane moves relocate requests. So
-``CustomLogitsProcessors`` gives every request a slot of its own, follows the
-request's row through each ``BatchUpdate``, and keeps the slot-indexed history.
+slot, and shares a slot-indexed token history, ``LogitsProcRequestState``. In
+vLLM's V2 runner a request takes a slot, and the processors see
+``add_request``, when a ``scheduled_new_reqs`` entry admits it; the request
+keeps the slot until it finishes, is preempted, or a later
+``scheduled_new_reqs`` entry rebuilds it. A step that does not schedule a
+running request leaves its slot alone.
+
+A persistent-batch row does not follow that lifetime. In front-packed mode,
+``TTModelRunner._update_states`` removes a running request from the batch on
+every step that does not schedule it (every prefill step, for a decoding
+request) and adds it back later, and ``InputBatch.condense`` moves requests
+between rows. So ``CustomLogitsProcessors`` keys slots by request id, binds
+each request's current row to its slot through each ``BatchUpdate``, and frees
+a slot only through ``release_requests``.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING
 
@@ -28,7 +37,6 @@ from vllm.v1.worker.gpu.sample.logits_processor.loader import LOGITSPROCS_GROUP
 
 from vllm_tt_plugin.sample.logits_processor.interface import (
     BatchUpdate,
-    LogitsProcessor,
     MoveDirectionality,
 )
 
@@ -65,7 +73,7 @@ class _HostRequestStates:
         self.total_len = _HostTensor(max_num_reqs, dtype=torch.int32)
 
 
-class CustomLogitsProcessors(LogitsProcessor):
+class CustomLogitsProcessors:
     """Runs V2-interface processors on logits whose row ``i`` is batch row ``i``.
 
     A row that holds no request (a lane slot gap) is not shown to the
@@ -84,53 +92,99 @@ class CustomLogitsProcessors(LogitsProcessor):
         max_num_reqs = req_states.max_num_reqs
         # pop() hands out the lowest free slot first.
         self._free_slots = list(range(max_num_reqs - 1, -1, -1))
+        self._req_slot: dict[str, int] = {}
         self._row_slot: dict[int, int] = {}
         # slot -> the request's live output list, and how much of it is
-        # already copied into all_token_ids.
+        # already copied into all_token_ids. The list is the one the request's
+        # CachedRequestState holds, so it also identifies the lifetime that
+        # took the slot.
         self._output_token_ids: dict[int, list[int]] = {}
         self._num_synced = np.zeros(max_num_reqs, dtype=np.int64)
         self._needs_processing = np.zeros(max_num_reqs, dtype=bool)
 
-    def is_argmax_invariant(self) -> bool:
-        return False
+    def release_requests(self, req_ids: Iterable[str]) -> None:
+        """Free the slots of requests whose lifetime ends: finished, preempted,
+        or rebuilt from a ``scheduled_new_reqs`` entry. The rebuilt request
+        takes a new slot, and the processors see ``add_request`` again, when
+        the batch adds it back."""
+        for req_id in req_ids:
+            slot = self._req_slot.pop(req_id, None)
+            if slot is None:
+                continue
+            for row in [row for row, held in self._row_slot.items() if held == slot]:
+                del self._row_slot[row]
+            del self._output_token_ids[slot]
+            self._needs_processing[slot] = False
+            self._free_slots.append(slot)
 
-    def update_state(self, batch_update: BatchUpdate | None) -> None:
+    def update_state(
+        self, batch_update: BatchUpdate | None, req_ids: Sequence[str | None]
+    ) -> None:
+        """Bind batch rows to slots after one step's batch changes.
+
+        ``req_ids`` is the batch's row-to-request list after those changes. A
+        removed row only loses its binding: the request keeps its slot, and the
+        processors their per-request state, until ``release_requests``.
+        """
         if batch_update is None:
             return
         for row in batch_update.removed:
-            self._release_row(row)
+            self._row_slot.pop(row, None)
+        added: dict[int, tuple[SamplingParams, list[int], list[int]]] = {}
         for row, params, prompt_token_ids, output_token_ids in batch_update.added:
-            # The persistent batch drops a row from ``removed`` when a new
-            # request reuses it in the same step, so the previous occupant's
-            # slot is released here.
-            self._release_row(row)
-            self._add(row, params, prompt_token_ids or [], output_token_ids)
+            # The persistent batch drops a row from ``removed`` when a request
+            # reuses it in the same step, so the previous occupant's binding
+            # is dropped here.
+            self._row_slot.pop(row, None)
+            added[row] = (params, prompt_token_ids or [], output_token_ids)
         for src, dst, direction in batch_update.moved:
-            src_slot = self._row_slot.pop(src, None)
-            if direction == MoveDirectionality.SWAP:
-                dst_slot = self._row_slot.pop(dst, None)
-                if dst_slot is not None:
-                    self._row_slot[src] = dst_slot
-            else:
-                self._release_row(dst)
-            if src_slot is not None:
-                self._row_slot[dst] = src_slot
-        if batch_update.added:
+            if direction != MoveDirectionality.UNIDIRECTIONAL:
+                raise RuntimeError(
+                    f"Custom logits processors follow one-way row moves only; "
+                    f"got {direction} for rows {src} -> {dst}"
+                )
+            slot = self._row_slot.pop(src, None)
+            self._row_slot.pop(dst, None)
+            if slot is not None:
+                self._row_slot[dst] = slot
+            if src in added:
+                added[dst] = added.pop(src)
+        admitted = False
+        for row, (params, prompt_token_ids, output_token_ids) in added.items():
+            req_id = req_ids[row] if row < len(req_ids) else None
+            if req_id is None:
+                raise RuntimeError(
+                    f"Batch row {row} was added this step but holds no request "
+                    f"after the step's moves; row requests: {list(req_ids)}"
+                )
+            slot = self._req_slot.get(req_id)
+            if slot is None:
+                slot = self._admit(req_id, params, prompt_token_ids, output_token_ids)
+                admitted = True
+            elif self._output_token_ids[slot] is not output_token_ids:
+                raise RuntimeError(
+                    f"Request {req_id} came back on batch row {row} with rebuilt "
+                    f"state while it still holds custom logits processor slot "
+                    f"{slot}; release_requests was not called for its previous "
+                    "lifetime"
+                )
+            self._row_slot[row] = slot
+        if admitted:
             for processor in self.processors:
                 processor.apply_staged_writes()
 
-    def _add(
+    def _admit(
         self,
-        row: int,
+        req_id: str,
         params: SamplingParams,
         prompt_token_ids: list[int],
         output_token_ids: list[int],
-    ) -> None:
+    ) -> int:
         if not self._free_slots:
             raise RuntimeError(
-                f"No free custom logits processor slot for batch row {row}: "
-                f"all {self.req_states.max_num_reqs} slots are held by rows "
-                f"{sorted(self._row_slot)}"
+                f"No free custom logits processor slot for request {req_id}: "
+                f"all {self.req_states.max_num_reqs} slots are held by requests "
+                f"{sorted(self._req_slot)}"
             )
         slot = self._free_slots.pop()
         num_prompt = len(prompt_token_ids)
@@ -141,6 +195,8 @@ class CustomLogitsProcessors(LogitsProcessor):
             output_token_ids
         )
         states.prompt_len.np[slot] = num_prompt
+        # Output tokens present at admission come from a resume after
+        # preemption, which V2 counts as prefill.
         states.prefill_len.np[slot] = num_prompt + num_output
         states.total_len.np[slot] = num_prompt + num_output
         self._output_token_ids[slot] = output_token_ids
@@ -149,15 +205,8 @@ class CustomLogitsProcessors(LogitsProcessor):
         for processor in self.processors:
             needs_processing |= bool(processor.add_request(slot, params))
         self._needs_processing[slot] = needs_processing
-        self._row_slot[row] = slot
-
-    def _release_row(self, row: int) -> None:
-        slot = self._row_slot.pop(row, None)
-        if slot is None:
-            return
-        del self._output_token_ids[slot]
-        self._needs_processing[slot] = False
-        self._free_slots.append(slot)
+        self._req_slot[req_id] = slot
+        return slot
 
     def _sync_history(self, slots: np.ndarray) -> None:
         """Copy output tokens committed since the last sync into all_token_ids."""
@@ -206,6 +255,20 @@ class CustomLogitsProcessors(LogitsProcessor):
         return logits
 
 
+def custom_logitsproc_names(custom_logitsprocs: Sequence[str | type]) -> list[str]:
+    """The custom processors vLLM's V2 loader loads: the ``--logits-processors``
+    entries and the installed ``vllm.logits_processors`` entry points. vLLM's
+    ``InputProcessor`` validates requests against both sources."""
+    names = [
+        entry if isinstance(entry, str) else entry.__qualname__
+        for entry in custom_logitsprocs
+    ]
+    names += [
+        entry_point.value for entry_point in entry_points(group=LOGITSPROCS_GROUP)
+    ]
+    return names
+
+
 def build_custom_logitsprocs(
     vllm_config: "VllmConfig", custom_logitsprocs: Sequence[str | type]
 ) -> CustomLogitsProcessors | None:
@@ -215,7 +278,7 @@ def build_custom_logitsprocs(
     ``vllm.logits_processors`` entry points, and raises for a class that does
     not implement the V2 interface.
     """
-    if not custom_logitsprocs and not entry_points(group=LOGITSPROCS_GROUP):
+    if not custom_logitsproc_names(custom_logitsprocs):
         return None
     model_config = vllm_config.model_config
     req_states = _HostRequestStates(

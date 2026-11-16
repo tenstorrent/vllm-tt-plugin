@@ -202,6 +202,9 @@ def test_update_states_releases_model_request_before_removing_row(
         def refresh_logitsprocs(self):
             pass
 
+        def release_custom_logitsproc_slots(self, scheduler_output):
+            pass
+
     input_batch = InputBatchSpy()
 
     def release_request(slot):
@@ -664,6 +667,9 @@ def test_finishing_one_request_releases_only_its_own_slot():
         def refresh_logitsprocs(self):
             pass
 
+        def release_custom_logitsproc_slots(self, scheduler_output):
+            pass
+
     runner = TTModelRunner.__new__(TTModelRunner)
     runner.requests = {"req-a": object(), "req-b": object()}
     runner.encoder_cache = {}
@@ -718,6 +724,9 @@ def test_release_names_the_slot_the_model_currently_holds():
             pass
 
         def refresh_logitsprocs(self):
+            pass
+
+        def release_custom_logitsproc_slots(self, scheduler_output):
             pass
 
     runner = TTModelRunner.__new__(TTModelRunner)

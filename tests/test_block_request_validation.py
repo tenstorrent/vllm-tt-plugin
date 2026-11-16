@@ -628,6 +628,22 @@ def test_startup_rejects_logits_processors_for_block_models(monkeypatch):
         TTPlatform.check_and_update_config(config)
 
 
+def test_startup_rejects_installed_entry_point_processors_for_block_models(
+    monkeypatch,
+):
+    """vLLM loads installed ``vllm.logits_processors`` entry points without
+    ``--logits-processors``, and the runner applies them on the host."""
+    from vllm_tt_plugin.sample.logits_processor import custom
+
+    entry_point = SimpleNamespace(name="installed", value="pkg.module:Proc")
+    monkeypatch.setattr(custom, "entry_points", lambda group: [entry_point])
+    config = _config()
+    _patch_model_resolution(monkeypatch)
+
+    with pytest.raises(ValueError, match="pkg.module:Proc"):
+        TTPlatform.check_and_update_config(config)
+
+
 @pytest.mark.parametrize(
     ("tt_overrides", "warns"),
     [

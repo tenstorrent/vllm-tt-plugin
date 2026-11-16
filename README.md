@@ -290,7 +290,7 @@ curl http://localhost:8000/v1/completions \
 
 Before a forward is submitted, TT selects one sampling path for the whole
 submitted batch. If any request or batch feature cannot use on-device
-sampling, the batch uses vLLM's host-side path. Structured outputs have
+sampling, the batch uses the host-side path. Structured outputs have
 additional rules; see [Structured Output Sampling](#structured-output-sampling).
 
 Single-token-output models can explicitly use
@@ -1015,16 +1015,11 @@ Sampling batches preserve signed 64-bit request seeds, including through slot co
 
 ## Custom logits processors
 
-Classes named by `--logits-processors`, and processors installed under the
-`vllm.logits_processors` entry-point group, must implement vLLM's V2 interface,
-`vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor`.
-`TTModelRunner` refuses any other class when it starts. While custom
-processors are loaded, every step samples on the host. The host sampler applies
-them after the penalties and before temperature, `min_p`, top-k and top-p. The
-`req_states` buffers are host tensors: `.gpu`, `.cpu` and `.np` name the same
-storage. A row whose token is discarded, such as an intermediate prefill
-chunk, is presented at the request's last committed position. Custom
-processors are refused with speculative decoding and with block-output models.
+Classes named by `--logits-processors`, and processors installed under the `vllm.logits_processors` entry-point group, must implement vLLM's V2 interface, `vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor`. `TTModelRunner` refuses any other class when it starts. While custom processors are loaded, every step samples on the host. The host sampler applies them after the penalties and before temperature, `min_p`, top-k and top-p.
+
+A request keeps its processor slot, and the processors' per-request state, from its admission until it finishes, is preempted, or comes back in a `scheduled_new_reqs` entry, as in vLLM's V2 runner. `add_request` runs once per such lifetime; a step that does not schedule the request does not call it again. The `req_states` buffers are host tensors: `.gpu`, `.cpu` and `.np` name the same storage. A row whose token is discarded, such as an intermediate prefill chunk, is presented at the request's last committed position.
+
+Custom processors from either source are refused with speculative decoding and with block-output models.
 
 ## Host sampling readback
 

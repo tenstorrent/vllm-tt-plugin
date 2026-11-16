@@ -24,7 +24,6 @@ def _runner(policy, *, cap=32):
         model=SimpleNamespace(
             model_capabilities={} if cap is None else {"max_device_top_k": cap}
         ),
-        model_config=SimpleNamespace(logits_processors=[]),
         input_batch=SimpleNamespace(
             sampling=sampling,
             req_id_to_index={"target": 0, "companion": 3},

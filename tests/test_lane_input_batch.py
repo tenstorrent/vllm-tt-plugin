@@ -1051,7 +1051,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         num_devices=4,
         tt_data_parallel_size=2,
         model=SimpleNamespace(model_capabilities={"max_device_top_k": 32}),
-        model_config=SimpleNamespace(is_multimodal_model=False, logits_processors=[]),
+        model_config=SimpleNamespace(is_multimodal_model=False),
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
         _decode_layout_changed_since_last_decode=False,
         _output_tokens_per_step=1,

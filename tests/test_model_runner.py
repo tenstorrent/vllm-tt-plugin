@@ -584,7 +584,6 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
         num_devices=4,
         tt_data_parallel_size=1,
         model=SimpleNamespace(model_capabilities=capabilities),
-        model_config=SimpleNamespace(logits_processors=[]),
         input_batch=SimpleNamespace(
             no_penalties=not has_penalties,
             no_allowed_token_ids=True,

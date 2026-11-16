@@ -2433,10 +2433,16 @@ class TTPlatform(Platform):
                     "Rust frontend bypasses the TT request validation; unset "
                     "VLLM_USE_RUST_FRONTEND"
                 )
-            if model_config.logits_processors:
+            from vllm_tt_plugin.sample.logits_processor.custom import (
+                custom_logitsproc_names,
+            )
+
+            if names := custom_logitsproc_names(model_config.logits_processors or ()):
                 raise ValueError(
-                    "Block-output models do not support --logits-processors "
-                    "because output is sampled inside the model"
+                    "Block-output models do not support custom logits "
+                    "processors because output is sampled inside the model; "
+                    "loaded from --logits-processors or installed "
+                    f"vllm.logits_processors entry points: {names}"
                 )
             if (
                 vllm_config.scheduler_config.async_scheduling

@@ -3,6 +3,7 @@
 
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
+from itertools import chain
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -22,6 +23,7 @@ from vllm_tt_plugin.model_input import (
 )
 from vllm_tt_plugin.request_state import CachedRequestState
 from vllm_tt_plugin.sample.logits_processor import (
+    BatchUpdate,
     BatchUpdateBuilder,
     LogitBiasLogitsProcessor,
     LogitsProcessors,
@@ -478,9 +480,11 @@ class InputBatch:
                 sampling_params.max_tokens = fitted
 
         # Register with batch update builder for logits processors. A row
-        # freed earlier in the same step is still in ``removed``, and vLLM's
-        # builtin processors apply ``added`` before ``removed``, so the row must
-        # leave ``removed`` or the new request's per-row state is cleared.
+        # freed earlier in the same step is still in ``removed``, and the
+        # builtin processors (``process_dict_updates``,
+        # ``MinPLogitsProcessor.update_state``) apply ``added`` before
+        # ``removed``, so the row must leave ``removed`` or the new request's
+        # per-row state is cleared.
         builder = self.sampling.batch_update_builder
         if req_index in builder._removed:
             builder._removed.remove(req_index)
@@ -734,8 +738,32 @@ class InputBatch:
         # reset batch update tracking.
         # Update sampling metadata if batch state is changed.
         batch_update = self.sampling.batch_update_builder.get_and_reset(self.num_reqs)
-        for logit_proc in self.sampling.logitsprocs.all:
+        self._update_logitsprocs(batch_update)
+
+    def _update_logitsprocs(self, batch_update: BatchUpdate | None) -> None:
+        logitsprocs = self.sampling.logitsprocs
+        for logit_proc in logitsprocs.all:
             logit_proc.update_state(batch_update)
+        if logitsprocs.custom is not None:
+            logitsprocs.custom.update_state(batch_update, self._req_ids)
+
+    def release_custom_logitsproc_slots(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Free the custom logits processor slots of the requests whose
+        lifetime ends this step, where vLLM's V2 runner frees them: finished,
+        preempted, or rebuilt from a ``scheduled_new_reqs`` entry. A running
+        request that the step does not schedule keeps its slot."""
+        custom = self.sampling.logitsprocs.custom
+        if custom is None:
+            return
+        custom.release_requests(
+            chain(
+                scheduler_output.finished_req_ids,
+                scheduler_output.preempted_req_ids or (),
+                (new_req.req_id for new_req in scheduler_output.scheduled_new_reqs),
+            )
+        )
 
     def make_prompt_token_ids_tensor(
         self, req_indices: list[int] | None = None
@@ -1022,6 +1050,7 @@ class TTLaneInputBatch(InputBatch):
         decode batch.
         """
         layout_changed = False
+        self.release_custom_logitsproc_slots(scheduler_output)
 
         # Finished requests release their slot. One that holds no row was never
         # placed (aborted while queued) or was preempted and aborted before its
@@ -1168,8 +1197,7 @@ class TTLaneInputBatch(InputBatch):
         batch_update = self.sampling.batch_update_builder.get_and_reset(
             self.max_num_reqs
         )
-        for logit_proc in self.sampling.logitsprocs.all:
-            logit_proc.update_state(batch_update)
+        self._update_logitsprocs(batch_update)
 
     def can_compact_host_sampling(self) -> bool:
         """Whether sampling can operate independently of persistent slot rows."""

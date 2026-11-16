@@ -85,6 +85,6 @@ class LogitsProcessors:
 
     @property
     def all(self) -> Iterator["LogitsProcessor"]:
-        """Iterator over all logits processors."""
-        custom = () if self.custom is None else (self.custom,)
-        return chain(self.argmax_invariant, self.non_argmax_invariant, custom)
+        """Iterator over the built-in logits processors. ``custom`` takes its
+        batch changes through its own ``update_state``."""
+        return chain(self.argmax_invariant, self.non_argmax_invariant)

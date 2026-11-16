@@ -29,7 +29,6 @@ def test_top_k_routes_only_active_sampling_rows(cap, top_k, temperature):
         model=SimpleNamespace(
             model_capabilities={} if cap is None else {"max_device_top_k": cap}
         ),
-        model_config=SimpleNamespace(logits_processors=[]),
         input_batch=SimpleNamespace(
             sampling=sampling,
             req_id_to_index={"first": 0, "last": 3},
@@ -52,7 +51,6 @@ def test_loaded_model_without_device_sampler_uses_host(supports_device_sampler):
         ),
         num_devices=2,
         tt_data_parallel_size=1,
-        model_config=SimpleNamespace(logits_processors=[]),
         input_batch=SimpleNamespace(
             sampling=SamplingInputBatch(1),
             req_id_to_index={"request": 0},

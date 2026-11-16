@@ -18,7 +18,10 @@ from vllm_tt_plugin.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
 )
-from vllm_tt_plugin.sample.logits_processor.custom import build_custom_logitsprocs
+from vllm_tt_plugin.sample.logits_processor.custom import (
+    build_custom_logitsprocs,
+    custom_logitsproc_names,
+)
 from vllm_tt_plugin.sample.logits_processor.interface import (
     BatchUpdate,
     LogitsProcessor,
@@ -44,8 +47,11 @@ def build_logitsprocs(
     custom_logitsprocs: Sequence[str | type] = (),
 ) -> LogitsProcessors:
     if vllm_config.speculative_config:
-        if custom_logitsprocs:
-            raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
+        if names := custom_logitsproc_names(custom_logitsprocs):
+            raise ValueError(
+                f"{STR_SPEC_DEC_REJECTS_LOGITSPROCS} Loaded from --logits-processors "
+                f"or installed vllm.logits_processors entry points: {names}"
+            )
         logger.warning(
             "min_p and logit_bias parameters won't work with speculative decoding."
         )

@@ -474,8 +474,9 @@ class TTModelRunner:
         # See _grammar_validated_drafts.
         self._grammar_draft_handoff: dict[str, list[int]] = {}
         self._grammar_handed_over_req_ids: set[str] = set()
-        # Built on first use rather than here, because constructing it compiles
-        # numba kernels and a launch that never speculates must not pay that.
+        # Built on first use rather than here: importing its module imports
+        # numba, which a launch that never speculates must not pay for. numba
+        # compiles the n-gram kernel at the first proposal.
         self._ngram_proposer: Any = None
         self._pending_state_slot_settle: dict[str, int] | None = None
         # Slot-level ``old -> new`` for the same pending gather, forwarded to the
@@ -978,6 +979,7 @@ class TTModelRunner:
         Based on _update_states for GPU/TPU backends.
         """
         persistent_batch_layout_changed = False
+        self.input_batch.release_custom_logitsproc_slots(scheduler_output)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -4068,7 +4070,7 @@ class TTModelRunner:
         max_lp = input_batch.max_num_logprobs
         if has_structured_outputs and max_lp is not None:
             # Grammar-aware device logprob parity is not part of the initial
-            # contract. Keep vLLM's host path rather than publish incomplete
+            # contract. Keep the host path rather than publish incomplete
             # or force-argmax placeholder metadata.
             return False
         if max_lp is not None:
