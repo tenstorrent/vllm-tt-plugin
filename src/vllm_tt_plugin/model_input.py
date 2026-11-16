@@ -201,6 +201,12 @@ class TTModelInput:
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
 
+    # Prefill only, for a model declaring
+    # ``model_capabilities["prefill_next_token_ids"]``: int64 ``[rows]``, row
+    # i's token at position ``prompt_lens[i]`` (its next chunk's first token)
+    # when the row is intermediate, -1 otherwise. ``None`` otherwise.
+    prefill_next_token_ids: torch.Tensor | None = None
+
     # Request id per live forward row. A prefill build can drop rows, so
     # forward row order is not recoverable from the persistent batch;
     # sample-time consumers must resolve rows through this. A lane decode

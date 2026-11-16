@@ -235,6 +235,41 @@ def test_cached_chunked_prefill_classification(
     assert model_input.intermediate_prefill_mask.tolist() == [intermediate_prefill_mask]
 
 
+@pytest.mark.parametrize(
+    "num_computed_tokens, next_token_id",
+    [(0, 2), (4, 6), (6, -1)],
+)
+@pytest.mark.parametrize("declared", [True, False])
+def test_prefill_next_token_ids_for_a_declaring_model(
+    num_computed_tokens: int, next_token_id: int, declared: bool
+):
+    """``prefill_next_token_ids``: an intermediate row carries its next prompt token.
+
+    The prompt's token at position p is p, so a chunk ending at e of an
+    8-token prompt hands the model e (the next chunk's first token); the chunk
+    that ends the prompt hands -1. ``tokens`` itself stops at the chunk's end.
+    Without the declaration nothing is built.
+    """
+    batch, request = _batch_with_one_request(
+        prompt_len=8,
+        output_len=0,
+        num_computed_tokens=num_computed_tokens,
+    )
+    runner = _fake_runner(batch, request)
+    if declared:
+        runner._prefill_next_token_ids = True
+
+    model_input = _prepare(runner, ("r", 2, num_computed_tokens, 0))
+
+    end = num_computed_tokens + 2
+    assert model_input.input_tokens.tolist() == [list(range(end))]
+    if declared:
+        assert model_input.prefill_next_token_ids.dtype == torch.int64
+        assert model_input.prefill_next_token_ids.tolist() == [next_token_id]
+    else:
+        assert model_input.prefill_next_token_ids is None
+
+
 def test_resumed_replay_past_prompt_length_remains_prefill():
     """Resumed replay past the prompt length remains prefill."""
     # 4-token prompt, 6 previously generated tokens (num_tokens=10). Resumed

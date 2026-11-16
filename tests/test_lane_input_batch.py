@@ -360,6 +360,12 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
     assert model_input.intermediate_prefill_mask.tolist() == [True]
     # An intermediate chunk must not advance device RNG state.
     assert model_input.perform_device_sampling is False
+    assert model_input.prefill_next_token_ids is None
+    # A model declaring prefill_next_token_ids also gets the next chunk's first
+    # prompt token, which ``input_tokens`` stops short of.
+    runner._prefill_next_token_ids = True
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+    assert model_input.prefill_next_token_ids.tolist() == [3]
 
 
 def test_lane_structured_decode_captures_expected_grammar_request_ids():

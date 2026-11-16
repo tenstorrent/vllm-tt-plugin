@@ -65,6 +65,7 @@ from vllm_tt_plugin.input_batch import (
     build_cached_request_state,
     clone_torch_generator,
     log_prefill_chunks,
+    prefill_next_token_ids,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
@@ -582,6 +583,13 @@ class TTModelRunner:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
+        )
+        # MODEL_CAPABILITIES.md: a prefill also hands the model each
+        # intermediate row's next prompt token.
+        self._prefill_next_token_ids = bool(
+            getattr(self.model, "model_capabilities", {}).get(
+                "prefill_next_token_ids", False
+            )
         )
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
@@ -2472,6 +2480,7 @@ class TTModelRunner:
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
+        next_token_ids: torch.Tensor | None = None
         num_valid_drafts: torch.Tensor | None = None
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
@@ -2511,6 +2520,13 @@ class TTModelRunner:
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, :max_prefill_tokens
             ]
+            if getattr(self, "_prefill_next_token_ids", False):
+                next_token_ids = prefill_next_token_ids(
+                    input_batch.token_ids_cpu_tensor,
+                    req_indices,
+                    prompt_lens,
+                    intermediate_prefill_mask,
+                )
             decode_layout_changed = False
             self._reset_spec_state_for_prefill(row_req_ids)
             device_sampled = None  # a prefill step decides at its submission
@@ -2843,6 +2859,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_next_token_ids=next_token_ids,
             defer_device_sampling=defer_device_sampling,
             structured_output_req_ids=structured_output_req_ids,
             grammar_row_req_ids=tuple(row_req_ids)
@@ -4217,6 +4234,9 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        next_token_ids = getattr(model_input, "prefill_next_token_ids", None)
+        if next_token_ids is not None:
+            kwargs["next_token_ids"] = next_token_ids
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)
