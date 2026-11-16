@@ -278,7 +278,13 @@ class MambaCacheGroups:
         ``chained[i]`` marks a row of a chained verify, whose previous verify
         is unread: its ``accepted_counts`` entry is not used, and every group
         names the start block of each count the previous verify can commit
-        (``MambaGroupState.start_blocks_by_count``).
+        (``MambaGroupState.start_blocks_by_count``). Its window is the one
+        vLLM allocated by the scheduled count, as on a drained step, so for
+        each count the row names the blocks a drained build of the step
+        names. Near a block boundary that window can begin one column past
+        the column that holds, by position, the row's last query token at a
+        low count; that count's start block is then an earlier window column
+        than ``c - 1``, or the block before the window.
         """
         live = len(row_req_ids)
         if live > num_rows:
@@ -459,27 +465,6 @@ class MambaCacheGroups:
             checkpoint_positions=checkpoint_positions,
             intermediate_prefill_mask=mask,
         )
-
-    def chain_window_safe(self, num_computed: int, num_scheduled: int) -> bool:
-        """Whether a chained verify's window is the same block-table column
-        for every count its unread predecessor can commit.
-
-        vLLM scheduled the step (``num_computed``, ``num_scheduled``) counting
-        all the predecessor's drafts as accepted. Had the predecessor's count
-        been known, ``num_computed`` would be up to K lower. The runner chains
-        a row only where no count moves the window: always in mode ``none``,
-        and in mode ``align`` unless a block boundary is in reach.
-        """
-        columns = {
-            window_start_column(
-                self.mamba_cache_mode,
-                self.block_size,
-                num_computed - self.num_speculative_blocks + k,
-                num_scheduled,
-            )
-            for k in range(1 + self.num_speculative_blocks)
-        }
-        return len(columns) == 1
 
     def _start_column(
         self, req_id: str, start: int, count: int, window: MambaWindow | None

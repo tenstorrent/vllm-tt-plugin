@@ -563,9 +563,11 @@ rows, and with `spec_ids_are_sampled` the sampled rows of a device-sampled
 step; section 4i),
 and the model builds its rows on the device from the unread result
 ([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
-The runner then reads, commits and proposes for the unread verify before it
-builds anything else, so accept and propose still run once per verify, in
-step order. What
+With `MambaSpec` groups such a verify names, for the count the model computes,
+the state blocks that a drained verify of the step names, also next to a block
+boundary. The runner then reads, commits and proposes for the unread verify
+before it builds anything else, so accept and propose still run once per
+verify, in step order. What
 this path defers is the readback and the commit, not the order of the steps. A
 lane verify takes this same deferred path
 (`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step

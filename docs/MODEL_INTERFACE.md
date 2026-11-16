@@ -80,7 +80,7 @@ ordinary verify; a chained verify differs as follows.
 | `tokens`, `start_pos` | Placeholders on live rows: `PLACEHOLDER_TOKEN_ID` in every column, and the positions of a predecessor that accepted all its drafts (its column-0 position plus `1 + K + j` in column `j`). Padding rows as on any verify. |
 | `num_valid_drafts` | On live rows, the most drafts the row may verify (`SpecPlan.draft_cap` of the step's live rows). |
 | `accepted_counts` | 1 on every row. |
-| `mamba_state` | Each `MambaGroupState` also carries `start_blocks_by_count` `[rows, 1 + K]`: column `c - 1` is the block holding the row's start state if the predecessor committed `c` tokens for it. `start_blocks` holds column K. |
+| `mamba_state` | Each `MambaGroupState` also carries `start_blocks_by_count` `[rows, 1 + K]`: column `c - 1` is the block holding the row's start state if the predecessor committed `c` tokens for it. `start_blocks` holds column K. `windows` is the window vLLM allocated by the scheduled count, one for every count, as on a drained verify of the step. |
 
 The model builds each live row from the predecessor's device result. With `c`
 the number of tokens the predecessor committed for the row by the model's own
@@ -100,10 +100,16 @@ the chained verify's rows from that proposal and walks the chained verify's
 `argmax_ids` against them. It chains only rows the id walk certifies (greedy
 rows, and sampled rows as below) whose request takes the scheduler's full
 `1 + K` tokens, with room for two more steps below
-`max_model_len` and, in `mamba_cache_mode` `align`, the same window column for
-every count (`MambaCacheGroups.chain_window_safe`); a prefill, a new or resumed
-request, a preemption, a forced prefix-cache reset, structured output, a
-moved row or a second unread verify drains the predecessor first.
+`max_model_len`; a prefill, a new or resumed request, a preemption, a forced
+prefix-cache reset, structured output, a moved row or a second unread verify
+drains the predecessor first. In `mamba_cache_mode` `align` a chained row can
+be next to a block boundary: its `windows` can then begin one column past the
+column that holds, by position, its last query token at a low count, and that
+count's start block is an earlier window column than `c - 1`, or the block
+before the window. The model reads and writes these blocks as on any verify
+(see [speculative verification](MODEL_EXECUTION.md#speculative-verification)),
+and the step names, for the count the model computes, the blocks that a
+drained verify of the same step names.
 
 A model that also declares `spec_ids_are_sampled` (see
 [sampled ids](SPEC_DECODE_CONTRACT.md#4i-sampled-ids-spec_ids_are_sampled))

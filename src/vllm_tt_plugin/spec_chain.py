@@ -16,7 +16,9 @@ can submit step n + 1 over an unread verify n:
    ``PLACEHOLDER_TOKEN_ID``, positions of a predecessor that accepted all its
    drafts, ``num_valid_drafts`` the most drafts the row may verify, count 1,
    and the predecessor's ``VerifyOutput`` as ``spec_predecessor``.
-   ``MambaCacheGroups.step_state`` names each count's start block.
+   ``MambaCacheGroups.step_state`` names each count's start block, and the
+   window vLLM allocated by the scheduled count, which a drained build of the
+   step names for every count too.
 3. After the submission the runner reads verify n, commits it and calls the
    model's ``propose_draft_tokens`` for it, whose drafts are the ones step
    n + 1 verified: ``fill_chained_input`` writes the rows step n + 1 really
@@ -68,9 +70,8 @@ def plan_chain(
     predecessor's rows. Returns the plan, or ``None`` and the reason the step
     drains instead. A row chains only when every count the predecessor can
     commit gives the same build: the same rows at the same indices, the
-    scheduler's full ``1 + K`` tokens with ``K`` placeholders, room for two
-    more steps below ``max_model_len``, and, in mode ``align``, the same
-    window column (``MambaCacheGroups.chain_window_safe``).
+    scheduler's full ``1 + K`` tokens with ``K`` placeholders, and room for
+    two more steps below ``max_model_len``.
     """
     from vllm_tt_plugin.async_decode import AsyncTTSpecDecodeOutput
 
@@ -126,7 +127,6 @@ def plan_chain(
         )
     )
     max_model_len = int(runner.model_config.max_model_len)
-    mamba = runner._mamba_groups
     device_sampled = None
     for req_id in rows:
         if scheduler_output.num_scheduled_tokens[req_id] != 1 + num_drafts:
@@ -151,10 +151,6 @@ def plan_chain(
         # vLLM counted the predecessor's drafts as accepted.
         if computed.get(req_id) != length + num_drafts:
             return None, "counts"
-        if mamba is not None and not mamba.chain_window_safe(
-            length + num_drafts, 1 + num_drafts
-        ):
-            return None, "mamba_boundary"
     return ChainPlan(predecessor=predecessor), "chained"
 
 

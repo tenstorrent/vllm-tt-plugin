@@ -102,10 +102,9 @@ def _target(prefix: list[int] | tuple[int, ...]) -> int:
     ) % (VOCAB - FIRST_ID)
 
 
-def _drafts(prefix: list[int]) -> list[int]:
-    """K drafts after ``prefix``: the first ``j`` are the target's own chain,
-    the rest differ from it; ``j`` cycles with the position."""
-    agree = len(prefix) % T
+def _agreeing_drafts(prefix: list[int], agree: int) -> list[int]:
+    """K drafts after ``prefix``: the first ``agree`` are the target's own
+    chain, the rest differ from it."""
     chain = list(prefix)
     drafts = []
     for k in range(K):
@@ -115,6 +114,23 @@ def _drafts(prefix: list[int]) -> list[int]:
         drafts.append(token)
         chain.append(token)
     return drafts
+
+
+def _drafts(prefix: list[int]) -> list[int]:
+    """K drafts after ``prefix`` whose agreeing prefix cycles with the
+    position."""
+    return _agreeing_drafts(prefix, len(prefix) % T)
+
+
+def _boundary_drafts(prefix: list[int]) -> list[int]:
+    """K drafts after ``prefix`` that all agree away from a block boundary, so
+    a greedy request moves K + 1 positions per verify, and within 9 positions
+    of one agree for 0 to K - 1 drafts, varying with the request and the
+    boundary, so a greedy verify there commits every count 1 to K."""
+    n = len(prefix)
+    if n % BLOCK_SIZE < BLOCK_SIZE - 9:
+        return _agreeing_drafts(prefix, K)
+    return _agreeing_drafts(prefix, (prefix[0] + n // BLOCK_SIZE + n) % K)
 
 
 def _position_seed(seed: int, position: int) -> int:
@@ -185,6 +201,11 @@ class _LedgerDevice:
         self.decline = None
         self.accepted: dict[tuple[int, int], int] = {}
         self.boundary_counts: set[int] = set()
+        # The drafter's rule: token history -> its K drafts.
+        self.drafts = _drafts
+        # Every row the device ran, in order: (row, start block per group,
+        # window blocks per group).
+        self.inputs: list[tuple] = []
 
     def allocate_kv_cache_per_layer(self, per_layer_specs):
         return ["kv"]
@@ -201,6 +222,14 @@ class _LedgerDevice:
         launch does: ``rows`` is ``[(row, prefix, start_blocks, writes)]``,
         ``writes`` ``[(window column, state)]``, per group."""
         written: dict[tuple[int, int], int] = {}
+        for row, _prefix, starts, _writes in rows:
+            self.inputs.append(
+                (
+                    row,
+                    tuple(starts),
+                    tuple(tuple(g.windows[row].tolist()) for g in mamba_state.groups),
+                )
+            )
         for row, prefix, starts, writes in rows:
             for i, g in enumerate(self.h.groups):
                 self.h.ledger.read(g, starts[i], prefix, len(prefix))
@@ -318,7 +347,7 @@ class _LedgerDevice:
             rows.append((row, truth[:position], starts, [(0, tuple(truth))]))
             truth.append(self._token(truth, row, position, sampling))
             logits[row, 0, truth[-1]] = 1e4
-            self.next_drafts[req_id] = _drafts(truth)
+            self.next_drafts[req_id] = self.drafts(truth)
         self._run_rows(mamba_state, rows)
         self.steps.append(
             SimpleNamespace(
@@ -434,7 +463,7 @@ class _LedgerDevice:
         record.counts.append(count)
         record.p0.append(p0)
         truth[p0 + 1 :] = committed
-        self.next_drafts[req_id] = _drafts(truth)
+        self.next_drafts[req_id] = self.drafts(truth)
         record.next_drafts.append(self.next_drafts[req_id])
         record.offered.append(self._offer(req_id))
 
@@ -699,9 +728,8 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     step's rows, whose walk then commits what the device computed. Every
     start state read is the request's own and the outputs equal a
     synchronous run's. Joins and prefills (at the empty step the scheduler
-    returns ahead of them), finished rows that are not the last, preemptions
-    and, in mode ``align``, a window within reach of a block boundary drain
-    instead."""
+    returns ahead of them), finished rows that are not the last and
+    preemptions drain instead."""
     reference = _AsyncHarness(num_blocks, mode=mode, asynchronous=False)
     _scenario(reference)
     reference.run()
@@ -720,10 +748,67 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     assert controller._chain_drains["rows"]
     if mode == "align":
         assert h.cached_states_checked
-    if mode == "align" and num_blocks == 28:
-        # With 48 blocks no chain attempt of this scenario meets a block
-        # boundary: the empty step after each prefill changes which steps chain.
-        assert controller._chain_drains["mamba_boundary"]
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "sampled"), [(24, False), (28, False), (80, False), (80, True)]
+)
+def test_a_chained_verify_next_to_a_block_boundary_is_the_drained_verify(
+    num_blocks, sampled
+):
+    """In mode ``align`` vLLM schedules a verify over the unread one counting
+    that one's drafts as accepted, and allocates the verify's window by that
+    count. Next to a block boundary the window then begins one column past
+    the column that holds, by position, the row's last query token at a low
+    count; a drained verify writes that window for every count, and reads
+    the start block of the count committed. A chained verify after every
+    such count (1 to K) hands the device the same start blocks and window
+    blocks as a drained run, row for row and step for step, and leaves the
+    same GDN state in every block; the outputs equal a synchronous run's.
+    With 28 blocks greedy requests are also preempted and resume."""
+    prompts = [BLOCK_SIZE * (1 + i % 3) - 8 - 4 * (i // 3) - i % 2 for i in range(16)]
+
+    def harness(**kwargs) -> _AsyncHarness:
+        h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, **kwargs)
+        h.device.drafts = _boundary_drafts
+        for i, prompt_len in enumerate(prompts):
+            sampling = dict(temperature=0.8, top_k=4, seed=7 + i) if sampled else {}
+            h.add(f"r{i}", prompt_len, max_tokens=40, **sampling)
+        return h
+
+    reference = harness(asynchronous=False)
+    reference.run()
+    drained = harness(asynchronous=True)
+    drained.run()
+    h = harness(asynchronous=True, chained=True)
+    # The predecessor's count of each chained verify whose window begins past
+    # the column of its last query token by position.
+    crossed: list[int] = []
+    previous: dict[str, int] = {}
+    verify_row = h.device._verify_row
+
+    def note_crossing(row, req_id, p0, block, starts, ids, record, rows, sampling):
+        window = h.runner._mamba_groups.windows[req_id].column
+        if record.chained and window != (p0 + K) // BLOCK_SIZE:
+            crossed.append(p0 - previous[req_id])
+        previous[req_id] = p0
+        verify_row(row, req_id, p0, block, starts, ids, record, rows, sampling)
+
+    h.device._verify_row = note_crossing
+    h.run()
+
+    assert h.outputs == reference.outputs == drained.outputs
+    assert all(len(o) == 40 for o in h.outputs.values())
+    assert set(crossed) == set(range(1, T))
+    assert h.device.inputs == drained.device.inputs
+    assert h.ledger.states == drained.ledger.states
+    assert h.cached_states_checked
+    controller = h.runner.async_decode
+    assert h.device.chained == controller._chained_verify_submissions > 30
+    assert controller._overlapped_unsafe_submissions == 0
+    assert set(controller._chain_drains) <= {"pending", "rows", "lifecycle"}
+    if num_blocks == 28:
+        assert h.preempted
 
 
 @pytest.mark.parametrize("chained", [False, True])
