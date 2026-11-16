@@ -64,6 +64,7 @@ _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
 _SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 _SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
+_SUPPORTS_PREFILL_NEXT_TOKEN_IDS_KEY = "_tt_supports_prefill_next_token_ids"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -347,6 +348,36 @@ def validate_and_store_tt_supports_stage_inputs(
         additional = {}
         vllm_config.additional_config = additional
     additional[_SUPPORTS_STAGE_INPUTS_KEY] = supported
+
+
+def get_tt_supports_prefill_next_token_ids(vllm_config: "VllmConfig") -> bool:
+    """Return whether prefill passes each row's next prompt token to the model."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_PREFILL_NEXT_TOKEN_IDS_KEY, False))
+
+
+def validate_and_store_tt_supports_prefill_next_token_ids(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``prefill_next_token_ids`` and store it on the vLLM config.
+
+    Raises:
+        ValueError: the declaration is not a boolean.
+    """
+    supported = (model_capabilities or {}).get("prefill_next_token_ids", False)
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {model_class.__module__}.{model_class.__name__} must declare "
+            "model_capabilities['prefill_next_token_ids'] as a boolean, got "
+            f"{supported!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_PREFILL_NEXT_TOKEN_IDS_KEY] = supported
 
 
 def get_tt_supports_stage_outputs(vllm_config: "VllmConfig") -> bool:

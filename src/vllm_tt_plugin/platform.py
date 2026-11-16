@@ -39,6 +39,7 @@ from vllm_tt_plugin.config import (
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_prefill_next_token_ids,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
     validate_tt_prefix_hit_confirmation,
@@ -2235,6 +2236,9 @@ class TTPlatform(Platform):
         store_tt_supports_device_grammar(
             vllm_config,
             supports_device_grammar,
+        )
+        validate_and_store_tt_supports_prefill_next_token_ids(
+            vllm_config, model_capabilities, model_class
         )
         if is_diffusion_gemma and not is_block_output_model:
             raise ValueError(
