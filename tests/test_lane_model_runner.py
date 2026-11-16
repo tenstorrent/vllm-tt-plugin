@@ -444,6 +444,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         multi_modal_kwargs={},
         perform_device_sampling=False,
         prefill_empty_slots=[4],
+        prefill_next_token_ids=None,
     )
 
     # Multi-lane batch (len > 1) so the empty-slots path is exercised; the
@@ -451,6 +452,43 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
     TTModelRunner.submit_prefill(runner, model_input, [2, 2])
 
     assert captured["empty_slots"] == [4]
+
+
+def test_submit_prefill_forwards_next_token_ids_only_when_built():
+    captured: list[dict] = []
+
+    class FakeModel:
+        def prefill_forward(self, **kwargs):
+            captured.append(kwargs)
+            return object()
+
+    runner = SimpleNamespace(
+        kv_caches=object(),
+        trace_mode="none",
+        request_specific_rope=False,
+        supports_stage_outputs=False,
+        model=FakeModel(),
+        async_decode=SimpleNamespace(note_prefill_submitted=lambda: None),
+    )
+    model_input = SimpleNamespace(
+        input_tokens=torch.zeros((1, 1), dtype=torch.int32),
+        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        prompt_lens=[1],
+        input_positions=torch.zeros((1,), dtype=torch.int32),
+        block_tables_per_layer=None,
+        stage_inputs=None,
+        multi_modal_kwargs={},
+        perform_device_sampling=False,
+        prefill_empty_slots=[0],
+        prefill_next_token_ids=None,
+    )
+
+    TTModelRunner.submit_prefill(runner, model_input, [1])
+    model_input.prefill_next_token_ids = torch.tensor([7], dtype=torch.int64)
+    TTModelRunner.submit_prefill(runner, model_input, [1])
+
+    assert "next_token_ids" not in captured[0]
+    assert captured[1]["next_token_ids"].tolist() == [7]
 
 
 def _sampling_params(rows=2):

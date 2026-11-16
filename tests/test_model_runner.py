@@ -82,6 +82,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         supports_stage_inputs=False,
+        supports_prefill_next_token_ids=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
@@ -233,6 +234,67 @@ def test_cached_chunked_prefill_classification(
         num_computed_tokens + num_scheduled_tokens
     ]
     assert model_input.intermediate_prefill_mask.tolist() == [intermediate_prefill_mask]
+
+
+@pytest.mark.parametrize(
+    "rows, next_token_ids",
+    [
+        ([(8, 0, 0, 2)], [2]),
+        ([(8, 0, 4, 2)], [6]),
+        ([(8, 0, 6, 2)], [-1]),
+        # Resumed replay of a 4-token prompt and 6 outputs: the chunk ending at
+        # 6 hands the output token there.
+        ([(4, 6, 4, 2)], [6]),
+        # An intermediate row next to a final one, front-packed in one step.
+        ([(8, 0, 4, 2), (3, 0, 0, 3)], [6, -1]),
+    ],
+)
+@pytest.mark.parametrize("declared", [True, False])
+def test_prefill_next_token_ids_for_a_declaring_model(
+    rows: list[tuple[int, int, int, int]], next_token_ids: list[int], declared: bool
+):
+    """``prefill_next_token_ids``: an intermediate row carries its next token.
+
+    Each row is ``(prompt_len, output_len, num_computed, num_scheduled)`` of
+    one request, whose token at position p is p, so a chunk ending at e short
+    of the request's length hands the model e (the next chunk's first token);
+    a chunk that ends the scheduled sequence hands -1. ``tokens`` stops at the
+    step's largest chunk end. Without the declaration nothing is built.
+    """
+    (prompt_len, output_len, num_computed, num_scheduled), *others = rows
+    batch, request = _batch_with_one_request(
+        prompt_len=prompt_len,
+        output_len=output_len,
+        num_computed_tokens=num_computed,
+    )
+    runner = _fake_runner(batch, request)
+    runner.supports_prefill_next_token_ids = declared
+    scheduled = [("r", num_scheduled, num_computed, output_len)]
+    for i, (prompt_len, output_len, num_computed, num_scheduled) in enumerate(
+        others, start=1
+    ):
+        _, other = _batch_with_one_request(
+            prompt_len=prompt_len,
+            output_len=output_len,
+            num_computed_tokens=num_computed,
+        )
+        other.req_id = f"r{i}"
+        batch.add_request(other)
+        runner.requests[other.req_id] = other
+        scheduled.append((other.req_id, num_scheduled, num_computed, output_len))
+
+    model_input = _prepare(runner, *scheduled)
+
+    ends = [
+        num_computed + num_scheduled for _, num_scheduled, num_computed, _ in scheduled
+    ]
+    assert model_input.prompt_lens.tolist() == ends
+    assert model_input.input_tokens[0].tolist() == list(range(max(ends)))
+    if declared:
+        assert model_input.prefill_next_token_ids.dtype == torch.int64
+        assert model_input.prefill_next_token_ids.tolist() == next_token_ids
+    else:
+        assert model_input.prefill_next_token_ids is None
 
 
 def test_resumed_replay_past_prompt_length_remains_prefill():
