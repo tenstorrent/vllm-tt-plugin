@@ -444,6 +444,9 @@ class TTAsyncDecodeController:
         # each other build drained instead, by ``plan_chain`` reason.
         self._chained_verify_submissions = 0
         self._chain_drains: Counter[str] = Counter()
+        # Prefills submitted behind an unread verify
+        # (``spec_chain.prefill_over_pending``).
+        self._prefills_over_pending = 0
 
     @staticmethod
     def _page_table_inputs(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -826,10 +829,12 @@ class TTAsyncDecodeController:
             if self._chained_verify_submissions or self._chain_drains:
                 logger.info(
                     "TT chained verifies: %d of %d verifies; builds that "
-                    "drained instead, by reason: %s",
+                    "drained instead, by reason: %s; prefills behind an "
+                    "unread verify: %d",
                     self._chained_verify_submissions,
                     self._verify_submissions,
                     dict(sorted(self._chain_drains.items())),
+                    self._prefills_over_pending,
                 )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:

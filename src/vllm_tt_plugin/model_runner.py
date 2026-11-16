@@ -90,6 +90,7 @@ from vllm_tt_plugin.spec_chain import (
     check_chained_rows_certifiable,
     fill_chained_input,
     plan_chain,
+    prefill_over_pending,
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -3063,14 +3064,11 @@ class TTModelRunner:
             scheduler_output, grammar_output, chain=chain
         )
         if chain is not None:
-            if model_input.spec_mode is None or (
-                model_input.slot_remap is not None
-                and model_input.slot_remap.tolist()
-                != list(range(int(model_input.slot_remap.numel())))
-            ):
+            # ``slot_remap`` stays: it names each row's predecessor row.
+            if model_input.spec_mode is None:
                 raise RuntimeError(
                     "a chained verify was built as another step: spec_mode "
-                    f"{model_input.spec_mode!r}, slot_remap {model_input.slot_remap}"
+                    f"{model_input.spec_mode!r}"
                 )
             model_input = replace(
                 model_input, spec_predecessor=chain.predecessor.verify_output
@@ -3457,9 +3455,12 @@ class TTModelRunner:
         if chain is None and self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
-            if reason != "off":
-                self.async_decode._chain_drains[reason] += 1
-            self.async_decode.wait_for_all_pending_async_steps()
+            if prefill_over_pending(self, scheduler_output):
+                self.async_decode._prefills_over_pending += 1
+            else:
+                if reason != "off":
+                    self.async_decode._chain_drains[reason] += 1
+                self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = (

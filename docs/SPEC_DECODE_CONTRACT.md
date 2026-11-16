@@ -558,14 +558,20 @@ next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
 unapplied, and verify, accept and propose stay serialized per request. The one
 exception is a model declaring `supports_chained_spec_verify`: there the
-runner may submit a verify that continues the unread one row for row (greedy
+runner may submit a verify that continues the unread one row for row, a moved
+row naming its predecessor row through `slot_remap` (greedy
 rows, and with `spec_ids_are_sampled` the sampled rows of a device-sampled
 step; section 4i),
 and the model builds its rows on the device from the unread result
 ([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
-The runner then reads, commits and proposes for the unread verify before it
-builds anything else, so accept and propose still run once per verify, in
-step order. What
+With `MambaSpec` groups such a verify names, for the count the model computes,
+the state blocks that a drained verify of the step names, also next to a block
+boundary. The runner then reads, commits and proposes for the unread verify
+before it builds anything else, so accept and propose still run once per
+verify, in step order. A model declaring `supports_prefill_over_pending_spec`
+also takes a join's prefill behind the unread verify: the runner submits the
+prefill first, and reads, commits and proposes for the verify after it
+([prefill behind an unread verify](MODEL_INTERFACE.md#prefill-behind-an-unread-verify)). What
 this path defers is the readback and the commit, not the order of the steps. A
 lane verify takes this same deferred path
 (`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step

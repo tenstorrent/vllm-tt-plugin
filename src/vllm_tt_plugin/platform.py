@@ -37,6 +37,7 @@ from vllm_tt_plugin.config import (
     store_tt_lane_count,
     store_tt_mamba_spec_layers,
     store_tt_output_tokens_per_step,
+    store_tt_prefill_over_pending_spec,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
@@ -50,6 +51,7 @@ from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
     validate_chained_spec_verify,
+    validate_prefill_over_pending_spec,
 )
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
@@ -2484,6 +2486,12 @@ class TTPlatform(Platform):
             vllm_config.scheduler_config.async_scheduling = False
 
         validate_chained_spec_verify(model_capabilities, model_class.__name__)
+        store_tt_prefill_over_pending_spec(
+            vllm_config,
+            validate_prefill_over_pending_spec(
+                model_capabilities, model_class.__name__
+            ),
+        )
 
         # Single-execute models (Galaxy generators, GPT-OSS under user-row
         # sharding) run one shared device execute on the full mesh, so

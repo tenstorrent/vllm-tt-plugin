@@ -57,7 +57,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from tests.test_mamba_kv_cache import _kv_cache_config, _vllm_config
 from tests.test_mamba_state_lifecycle import (
@@ -102,10 +102,9 @@ def _target(prefix: list[int] | tuple[int, ...]) -> int:
     ) % (VOCAB - FIRST_ID)
 
 
-def _drafts(prefix: list[int]) -> list[int]:
-    """K drafts after ``prefix``: the first ``j`` are the target's own chain,
-    the rest differ from it; ``j`` cycles with the position."""
-    agree = len(prefix) % T
+def _agreeing_drafts(prefix: list[int], agree: int) -> list[int]:
+    """K drafts after ``prefix``: the first ``agree`` are the target's own
+    chain, the rest differ from it."""
     chain = list(prefix)
     drafts = []
     for k in range(K):
@@ -115,6 +114,23 @@ def _drafts(prefix: list[int]) -> list[int]:
         drafts.append(token)
         chain.append(token)
     return drafts
+
+
+def _drafts(prefix: list[int]) -> list[int]:
+    """K drafts after ``prefix`` whose agreeing prefix cycles with the
+    position."""
+    return _agreeing_drafts(prefix, len(prefix) % T)
+
+
+def _boundary_drafts(prefix: list[int]) -> list[int]:
+    """K drafts after ``prefix`` that all agree away from a block boundary, so
+    a greedy request moves K + 1 positions per verify, and within 9 positions
+    of one agree for 0 to K - 1 drafts, varying with the request and the
+    boundary, so a greedy verify there commits every count 1 to K."""
+    n = len(prefix)
+    if n % BLOCK_SIZE < BLOCK_SIZE - 9:
+        return _agreeing_drafts(prefix, K)
+    return _agreeing_drafts(prefix, (prefix[0] + n // BLOCK_SIZE + n) % K)
 
 
 def _position_seed(seed: int, position: int) -> int:
@@ -168,6 +184,13 @@ class _LedgerDevice:
         self.steps: deque[SimpleNamespace] = deque()
         self.verifies = 0
         self.chained = 0
+        # Chained verifies whose ``slot_remap`` moves a live row.
+        self.moved_rows = 0
+        self.prefills = 0
+        # Prefills submitted while a verify was unread, and the requests of
+        # that verify whose rows' state slots they took.
+        self.prefills_behind = 0
+        self.slots_reused_behind: list[str] = []
         self.ordinary_decodes = 0
         # Ordinary decodes submitted right after another ordinary decode.
         self.plain_after_plain = 0
@@ -185,6 +208,11 @@ class _LedgerDevice:
         self.decline = None
         self.accepted: dict[tuple[int, int], int] = {}
         self.boundary_counts: set[int] = set()
+        # The drafter's rule: token history -> its K drafts.
+        self.drafts = _drafts
+        # Every row the device ran, in order: (row, start block per group,
+        # window blocks per group).
+        self.inputs: list[tuple] = []
 
     def allocate_kv_cache_per_layer(self, per_layer_specs):
         return ["kv"]
@@ -201,6 +229,14 @@ class _LedgerDevice:
         launch does: ``rows`` is ``[(row, prefix, start_blocks, writes)]``,
         ``writes`` ``[(window column, state)]``, per group."""
         written: dict[tuple[int, int], int] = {}
+        for row, _prefix, starts, _writes in rows:
+            self.inputs.append(
+                (
+                    row,
+                    tuple(starts),
+                    tuple(tuple(g.windows[row].tolist()) for g in mamba_state.groups),
+                )
+            )
         for row, prefix, starts, writes in rows:
             for i, g in enumerate(self.h.groups):
                 self.h.ledger.read(g, starts[i], prefix, len(prefix))
@@ -231,6 +267,24 @@ class _LedgerDevice:
 
     def prefill_forward(self, tokens, prompt_lens, start_pos, mamba_state, **kwargs):
         self.last_kind = "prefill"
+        self.prefills += 1
+        runner = self.h.runner
+        unread = [
+            step
+            for step in runner._pending_async_steps
+            if isinstance(getattr(step, "verify_output", None), VerifyOutput)
+            and not step.is_resolved()
+        ]
+        if unread:
+            # The model's side of supports_prefill_over_pending_spec: one
+            # unread verify, whose propose comes after this prefill.
+            assert len(unread) == 1, unread
+            assert self.model_capabilities.get("supports_prefill_over_pending_spec")
+            self.prefills_behind += 1
+            verify_rows = unread[0].model_input.row_req_ids
+            for slot in kwargs.get("empty_slots") or ():
+                if slot < len(verify_rows):
+                    self.slots_reused_behind.append(verify_rows[slot])
         live = self._live()
         logits = torch.zeros((len(live), 1, VOCAB))
         rows = []
@@ -318,7 +372,7 @@ class _LedgerDevice:
             rows.append((row, truth[:position], starts, [(0, tuple(truth))]))
             truth.append(self._token(truth, row, position, sampling))
             logits[row, 0, truth[-1]] = 1e4
-            self.next_drafts[req_id] = _drafts(truth)
+            self.next_drafts[req_id] = self.drafts(truth)
         self._run_rows(mamba_state, rows)
         self.steps.append(
             SimpleNamespace(
@@ -355,8 +409,11 @@ class _LedgerDevice:
                 raise AssertionError(
                     f"{req_id} samples and its argmax_ids verify answers the argmax"
                 )
+        remap = kwargs.get("slot_remap")
+        sources = list(range(len(live))) if remap is None else remap.tolist()
         if predecessor is not None:
             self.chained += 1
+            self.moved_rows += sources[: len(live)] != list(range(len(live)))
             predecessor = predecessor.argmax_ids.record
             predecessor.followed = True
         rows = []
@@ -370,18 +427,24 @@ class _LedgerDevice:
                 drafts = self.next_drafts.get(req_id, [])
                 assert block[1:] == drafts[:nv], (req_id, block)
             else:
-                # The row continues the unread predecessor from the count the
-                # device accepted; the runner sent placeholders.
-                assert predecessor.rows[row] == req_id, (predecessor.rows, live)
-                count = predecessor.counts[row]
-                previous = predecessor.p0[row]
+                # The row continues the unread predecessor's row ``source``
+                # (``slot_remap``) from the count the device accepted; the
+                # runner sent placeholders.
+                source = sources[row]
+                assert predecessor.rows[source] == req_id, (
+                    predecessor.rows,
+                    live,
+                    sources,
+                )
+                count = predecessor.counts[source]
+                previous = predecessor.p0[source]
                 assert tokens[row].tolist() == [PLACEHOLDER_TOKEN_ID] * T
                 assert start_pos[row].tolist() == [previous + T + j for j in range(T)]
                 assert int(kwargs["accepted_counts"][row]) == 1
                 p0 = previous + count
-                nv = min(int(num_valid[row]), predecessor.offered[row])
-                drafts = predecessor.next_drafts[row]
-                block = [int(predecessor.ids[row, count - 1]), *drafts[:nv]]
+                nv = min(int(num_valid[row]), predecessor.offered[source])
+                drafts = predecessor.next_drafts[source]
+                block = [int(predecessor.ids[source, count - 1]), *drafts[:nv]]
                 starts = [
                     int(g.start_blocks_by_count[row, count - 1])
                     for g in mamba_state.groups
@@ -434,7 +497,7 @@ class _LedgerDevice:
         record.counts.append(count)
         record.p0.append(p0)
         truth[p0 + 1 :] = committed
-        self.next_drafts[req_id] = _drafts(truth)
+        self.next_drafts[req_id] = self.drafts(truth)
         record.next_drafts.append(self.next_drafts[req_id])
         record.offered.append(self._offer(req_id))
 
@@ -488,6 +551,7 @@ class _AsyncHarness:
         trace_mode: str = "none",
         device_sampling: bool = False,
         sampled_ids: bool = False,
+        prefill_over_pending: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -543,6 +607,10 @@ class _AsyncHarness:
                 max_device_top_k=MAX_DEVICE_TOP_K,
                 supports_device_penalties=False,
             )
+        if prefill_over_pending:
+            # As TTPlatform stores the validated declaration for the scheduler.
+            self.device.model_capabilities["supports_prefill_over_pending_spec"] = True
+            self.scheduler._prefill_over_pending_spec = True
         self.runner.initialize_kv_cache(self.kv_cache_config)
         self.groups = list(self.runner._mamba_groups.group_indices)
         self.ledger = StateLedger()
@@ -699,9 +767,7 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     step's rows, whose walk then commits what the device computed. Every
     start state read is the request's own and the outputs equal a
     synchronous run's. Joins and prefills (at the empty step the scheduler
-    returns ahead of them), finished rows that are not the last, preemptions
-    and, in mode ``align``, a window within reach of a block boundary drain
-    instead."""
+    returns ahead of them) and preemptions drain instead."""
     reference = _AsyncHarness(num_blocks, mode=mode, asynchronous=False)
     _scenario(reference)
     reference.run()
@@ -720,10 +786,294 @@ def test_chained_verifies_continue_the_unread_verify(mode, num_blocks):
     assert controller._chain_drains["rows"]
     if mode == "align":
         assert h.cached_states_checked
-    if mode == "align" and num_blocks == 28:
-        # With 48 blocks no chain attempt of this scenario meets a block
-        # boundary: the empty step after each prefill changes which steps chain.
-        assert controller._chain_drains["mamba_boundary"]
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "sampled"), [(24, False), (28, False), (80, False), (80, True)]
+)
+def test_a_chained_verify_next_to_a_block_boundary_is_the_drained_verify(
+    num_blocks, sampled
+):
+    """In mode ``align`` vLLM schedules a verify over the unread one counting
+    that one's drafts as accepted, and allocates the verify's window by that
+    count. Next to a block boundary the window then begins one column past
+    the column that holds, by position, the row's last query token at a low
+    count; a drained verify writes that window for every count, and reads
+    the start block of the count committed. A chained verify after every
+    such count (1 to K) hands the device the same start blocks and window
+    blocks as a drained run, row for row and step for step, and leaves the
+    same GDN state in every block; the outputs equal a synchronous run's.
+    With 28 blocks greedy requests are also preempted and resume."""
+    prompts = [BLOCK_SIZE * (1 + i % 3) - 8 - 4 * (i // 3) - i % 2 for i in range(16)]
+
+    def harness(**kwargs) -> _AsyncHarness:
+        h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, **kwargs)
+        h.device.drafts = _boundary_drafts
+        for i, prompt_len in enumerate(prompts):
+            sampling = dict(temperature=0.8, top_k=4, seed=7 + i) if sampled else {}
+            h.add(f"r{i}", prompt_len, max_tokens=40, **sampling)
+        return h
+
+    reference = harness(asynchronous=False)
+    reference.run()
+    drained = harness(asynchronous=True)
+    drained.run()
+    h = harness(asynchronous=True, chained=True)
+    # The predecessor's count of each chained verify whose window begins past
+    # the column of its last query token by position.
+    crossed: list[int] = []
+    previous: dict[str, int] = {}
+    verify_row = h.device._verify_row
+
+    def note_crossing(row, req_id, p0, block, starts, ids, record, rows, sampling):
+        window = h.runner._mamba_groups.windows[req_id].column
+        if record.chained and window != (p0 + K) // BLOCK_SIZE:
+            crossed.append(p0 - previous[req_id])
+        previous[req_id] = p0
+        verify_row(row, req_id, p0, block, starts, ids, record, rows, sampling)
+
+    h.device._verify_row = note_crossing
+    h.run()
+
+    assert h.outputs == reference.outputs == drained.outputs
+    assert all(len(o) == 40 for o in h.outputs.values())
+    assert set(crossed) == set(range(1, T))
+    assert h.device.inputs == drained.device.inputs
+    assert h.ledger.states == drained.ledger.states
+    assert h.cached_states_checked
+    controller = h.runner.async_decode
+    assert h.device.chained == controller._chained_verify_submissions > 30
+    assert controller._overlapped_unsafe_submissions == 0
+    assert set(controller._chain_drains) <= {"pending", "rows", "lifecycle"}
+    if num_blocks == 28:
+        assert h.preempted
+
+
+LEAVING = (
+    ("r0", 1019, 28),
+    ("r1", 700, 16),
+    ("r2", 2045, 32),
+    ("r3", 900, 24),
+    ("r4", 1500, 40),
+    ("r5", 1022, 36),
+)
+# Requests stopped by a token of their own output, and the one aborted.
+LEAVING_STOPPED = ("r2", "r5")
+LEAVING_ABORTED = "r4"
+
+
+def _leaving_scenario(
+    h: _AsyncHarness, *, sampled: bool, stops: dict[str, int] | None = None
+) -> None:
+    """Two more requests than rows, of different lengths, so that once the
+    last one has joined requests finish in every row with nothing waiting:
+    by max_tokens, by a stop token (``stops``) and, on an asynchronous run,
+    one by an abort. With ``sampled`` every other request is a seeded sampled
+    one."""
+    for i, (req_id, prompt_len, max_tokens) in enumerate(LEAVING):
+        sampling: dict = {}
+        if sampled and i % 2:
+            sampling.update(temperature=0.8, top_k=5, seed=21 + i)
+        if stops and req_id in stops:
+            sampling.update(stop_token_ids=[stops[req_id]])
+        h.add(req_id, prompt_len, max_tokens=max_tokens, **sampling)
+    if not h.asynchronous:
+        return
+    update = h._update
+
+    def abort(scheduler_output, output):
+        update(scheduler_output, output)
+        request = h.scheduler.requests.get(LEAVING_ABORTED)
+        if request is not None and len(request.output_token_ids) >= 25:
+            h.scheduler.finish_requests(LEAVING_ABORTED, RequestStatus.FINISHED_ABORTED)
+
+    h._update = abort
+
+
+def _leaving_stops(num_blocks: int, sampled: bool) -> dict[str, int]:
+    """A stop token for each of ``LEAVING_STOPPED``: the first token of its
+    output that it had not produced before its eleventh."""
+    h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, asynchronous=False)
+    _leaving_scenario(h, sampled=sampled)
+    h.run()
+    stops = {}
+    for req_id in LEAVING_STOPPED:
+        out = h.outputs[req_id]
+        stops[req_id] = next(
+            t for i, t in enumerate(out) if i >= 10 and t not in out[:i]
+        )
+    return stops
+
+
+class _LeavingRows:
+    """Per ``execute_model`` call over an unread verify: the predecessor's
+    rows that leave (finished, or not scheduled), whether one of them was not
+    its last row, and whether the step chained."""
+
+    def __init__(self, h: _AsyncHarness):
+        self.steps: list[SimpleNamespace] = []
+        # Steps over an unread verify that schedule nothing.
+        self.empty_drains = 0
+        runner, execute = h.runner, h.runner.execute_model
+        controller = runner.async_decode
+
+        def record(scheduler_output):
+            with runner._steady_decode_lock:
+                pending = list(runner._pending_async_steps)
+            previous = (
+                list(pending[0].model_input.row_req_ids or ())
+                if len(pending) == 1 and hasattr(pending[0], "chain_successor")
+                else []
+            )
+            scheduled = set(scheduler_output.num_scheduled_tokens)
+            finished = set(scheduler_output.finished_req_ids)
+            before = controller._chained_verify_submissions
+            rows_drains = controller._chain_drains["rows"]
+            result = execute(scheduler_output)
+            leaving = [r for r in previous if r not in scheduled]
+            if previous and not scheduled:
+                self.empty_drains += 1
+            self.steps.append(
+                SimpleNamespace(
+                    finished=[r for r in leaving if r in finished],
+                    skipped=[r for r in leaving if r not in finished],
+                    moved=bool(leaving)
+                    and previous[: len(previous) - len(leaving)]
+                    != [r for r in previous if r in scheduled],
+                    prefill=bool(scheduler_output.scheduled_new_reqs),
+                    chained=controller._chained_verify_submissions > before,
+                    rows_drain=controller._chain_drains["rows"] > rows_drains,
+                    empty=not scheduled,
+                )
+            )
+            return result
+
+        runner.execute_model = record
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "sampled"), [(48, False), (80, False), (80, True)]
+)
+def test_a_chained_verify_continues_rows_that_moved(num_blocks, sampled):
+    """A request that finishes (max_tokens, a stop token, an abort) or that
+    vLLM leaves out because its in-flight step reaches max_tokens leaves the
+    persistent batch, and ``InputBatch.condense`` moves the last row into its
+    place. The next verify still chains: ``slot_remap`` names each row's
+    predecessor row, and the device builds the row from that row's count. The
+    device gets the same start blocks and window blocks as a drained run, row
+    for row and step for step, and leaves the same GDN state in every block;
+    the outputs equal a synchronous run's. Only steps that schedule nothing
+    drain for "rows". With 48 blocks a request is also preempted and
+    resumes."""
+
+    stops = _leaving_stops(num_blocks, sampled)
+
+    def harness(**kwargs) -> _AsyncHarness:
+        h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, **kwargs)
+        _leaving_scenario(h, sampled=sampled, stops=stops)
+        return h
+
+    reference = harness(asynchronous=False)
+    reference.run()
+    drained = harness(asynchronous=True)
+    drained.run()
+    h = harness(asynchronous=True, chained=True)
+    leaving = _LeavingRows(h)
+    h.run()
+
+    aborted = h.outputs.pop(LEAVING_ABORTED)
+    assert aborted == drained.outputs.pop(LEAVING_ABORTED)
+    assert 25 <= len(aborted) < 40
+    assert aborted == reference.outputs.pop(LEAVING_ABORTED)[: len(aborted)]
+    assert h.outputs == reference.outputs == drained.outputs
+    assert h.requests[LEAVING_ABORTED].status == RequestStatus.FINISHED_ABORTED
+    assert {h.requests[r].status for r in LEAVING_STOPPED} == {
+        RequestStatus.FINISHED_STOPPED
+    }
+    assert h.device.inputs == drained.device.inputs
+    assert h.ledger.states == drained.ledger.states
+    assert h.cached_states_checked
+    controller = h.runner.async_decode
+    assert controller._overlapped_unsafe_submissions == 0
+    assert h.device.chained == controller._chained_verify_submissions
+    # A finished row that was not the last one, and a row vLLM left out, were
+    # chained over.
+    assert h.device.moved_rows
+    assert any(s.chained and s.moved and s.finished for s in leaving.steps)
+    assert any(s.chained and s.skipped for s in leaving.steps)
+    # Every step over an unread verify that still schedules a predecessor
+    # row chains: what drains for "rows" schedules nothing (the empty step
+    # ``TTScheduler`` returns ahead of a prefill, or every row left).
+    assert controller._chain_drains["rows"] == leaving.empty_drains
+    if num_blocks == 48:
+        assert h.preempted
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "sampled", "scenario"),
+    [(80, False, "joins"), (28, False, "joins"), (80, True, "leaving")],
+)
+def test_a_prefill_runs_behind_the_unread_verify(num_blocks, sampled, scenario):
+    """With ``supports_prefill_over_pending_spec`` ``TTScheduler`` returns a
+    join's prefill while a verify is held, without the empty release step
+    before it, and ``TTModelRunner`` submits the prefill behind the unread
+    verify: the joining request often takes the state slot of a request that
+    finished in that verify's rows. The verify is read, committed and proposed
+    after the prefill, and the step after the prefill does not chain on it.
+    The device gets the same rows, start blocks and window blocks, step for
+    step, as the chained run that drains at the release step, and leaves the
+    same GDN state; the outputs equal a synchronous run's. With 28 blocks
+    requests are also preempted and resume: their prefill drains."""
+    if scenario == "joins":
+        stops = None
+
+        def setup(h):
+            _scenario(h)
+
+    else:
+        stops = _leaving_stops(num_blocks, sampled)
+
+        def setup(h):
+            _leaving_scenario(h, sampled=sampled, stops=stops)
+
+    def harness(**kwargs) -> _AsyncHarness:
+        h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, **kwargs)
+        setup(h)
+        return h
+
+    reference = harness(asynchronous=False)
+    reference.run()
+    base = harness(asynchronous=True, chained=True)
+    base.run()
+    h = harness(asynchronous=True, chained=True, prefill_over_pending=True)
+    leaving = _LeavingRows(h)
+    h.run()
+
+    if scenario == "leaving":
+        aborted = h.outputs.pop(LEAVING_ABORTED)
+        assert aborted == base.outputs.pop(LEAVING_ABORTED)
+        assert aborted == reference.outputs.pop(LEAVING_ABORTED)[: len(aborted)]
+    assert h.outputs == reference.outputs == base.outputs
+    assert h.device.inputs == base.device.inputs
+    assert h.ledger.states == base.ledger.states
+    assert h.cached_states_checked
+    controller = h.runner.async_decode
+    assert controller._overlapped_unsafe_submissions == 0
+    # Every prefill behind an unread verify is one the runner counted, and
+    # took the place of a release step that drained in the base run.
+    assert h.device.prefills_behind == controller._prefills_over_pending > 0
+    assert base.device.prefills_behind == 0
+    if num_blocks == 80:
+        assert h.device.slots_reused_behind, "no prefill took a finished row's slot"
+    # What drains for "rows" schedules nothing; the release steps ahead of
+    # the prefills that went behind a verify are gone.
+    assert all(step.empty for step in leaving.steps if step.rows_drain)
+    assert (
+        controller._chain_drains["rows"]
+        < base.runner.async_decode._chain_drains["rows"]
+    )
+    if num_blocks == 28:
+        assert h.preempted
 
 
 @pytest.mark.parametrize("chained", [False, True])

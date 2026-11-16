@@ -65,6 +65,9 @@ _SPEC_PLAN_KEY = "_tt_spec_plan"
 _SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 _SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
 _MAMBA_SPEC_LAYERS_KEY = "_tt_mamba_spec_layers"
+# Platform-derived from the model's ``supports_prefill_over_pending_spec``,
+# for ``TTScheduler``, which has no model to ask.
+_PREFILL_OVER_PENDING_SPEC_KEY = "_tt_prefill_over_pending_spec"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -310,6 +313,28 @@ def store_tt_supports_device_grammar(
         additional = {}
         vllm_config.additional_config = additional
     additional[_SUPPORTS_DEVICE_GRAMMAR_KEY] = supported
+
+
+def get_tt_prefill_over_pending_spec(vllm_config: "VllmConfig") -> bool:
+    """Return the model's validated ``supports_prefill_over_pending_spec``."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return additional.get(_PREFILL_OVER_PENDING_SPEC_KEY, False) is True
+
+
+def store_tt_prefill_over_pending_spec(
+    vllm_config: "VllmConfig", supported: bool
+) -> None:
+    """Store the model's validated ``supports_prefill_over_pending_spec``."""
+    if not isinstance(supported, bool):
+        raise ValueError(
+            "resolved TT supports_prefill_over_pending_spec must be a boolean, "
+            f"got {supported!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_PREFILL_OVER_PENDING_SPEC_KEY] = supported
 
 
 def get_tt_mamba_spec_layers(vllm_config: "VllmConfig") -> bool:

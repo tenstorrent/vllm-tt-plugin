@@ -11,12 +11,17 @@ verify's rows on the device from its own unread result instead, so the runner
 can submit step n + 1 over an unread verify n:
 
 1. ``plan_chain`` decides, before the build, whether step n + 1 continues
-   verify n row for row (``ChainPlan``), or drains it as before.
+   verify n row for row (``ChainPlan``), or drains it as before. A row can
+   move: when a predecessor row leaves, ``InputBatch.condense`` moves the
+   last row into its place, and the build's ``slot_remap`` names, for each
+   row, the predecessor row it continues.
 2. The build sends each live row as placeholders (``chained_rows``): tokens
    ``PLACEHOLDER_TOKEN_ID``, positions of a predecessor that accepted all its
    drafts, ``num_valid_drafts`` the most drafts the row may verify, count 1,
    and the predecessor's ``VerifyOutput`` as ``spec_predecessor``.
-   ``MambaCacheGroups.step_state`` names each count's start block.
+   ``MambaCacheGroups.step_state`` names each count's start block, and the
+   window vLLM allocated by the scheduled count, which a drained build of the
+   step names for every count too.
 3. After the submission the runner reads verify n, commits it and calls the
    model's ``propose_draft_tokens`` for it, whose drafts are the ones step
    n + 1 verified: ``fill_chained_input`` writes the rows step n + 1 really
@@ -39,9 +44,13 @@ import torch
 
 from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
+    prefill_qualifies_behind_verify,
     scheduler_output_has_prefill_work,
 )
-from vllm_tt_plugin.spec_admission import SUPPORTS_CHAINED_SPEC_VERIFY
+from vllm_tt_plugin.spec_admission import (
+    SUPPORTS_CHAINED_SPEC_VERIFY,
+    SUPPORTS_PREFILL_OVER_PENDING_SPEC,
+)
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
@@ -67,10 +76,9 @@ def plan_chain(
     Read before ``_update_states``: the persistent batch still holds the
     predecessor's rows. Returns the plan, or ``None`` and the reason the step
     drains instead. A row chains only when every count the predecessor can
-    commit gives the same build: the same rows at the same indices, the
-    scheduler's full ``1 + K`` tokens with ``K`` placeholders, room for two
-    more steps below ``max_model_len``, and, in mode ``align``, the same
-    window column (``MambaCacheGroups.chain_window_safe``).
+    commit gives the same build: a request of the predecessor's rows, the
+    scheduler's full ``1 + K`` tokens with ``K`` placeholders, and room for
+    two more steps below ``max_model_len``.
     """
     from vllm_tt_plugin.async_decode import AsyncTTSpecDecodeOutput
 
@@ -111,12 +119,15 @@ def plan_chain(
     batch = runner.input_batch
     if list(batch.req_ids[: batch.num_reqs]) != previous_rows:
         return None, "rows"
+    # A predecessor row whose request finished, or that the step does not
+    # schedule (vLLM leaves out a request whose in-flight step reaches
+    # max_tokens), leaves the batch, and ``InputBatch.condense`` moves the
+    # last row into its place: the chained call's ``slot_remap`` names each
+    # row's predecessor row. A request that is not a predecessor row drains.
     finished = set(scheduler_output.finished_req_ids)
-    rows = [r for r in previous_rows if r not in finished]
-    # Finished rows leave the batch; only a suffix leaves the others in place.
-    if not rows or previous_rows[: len(rows)] != rows:
-        return None, "rows"
-    if set(scheduler_output.num_scheduled_tokens) != set(rows):
+    scheduled = set(scheduler_output.num_scheduled_tokens)
+    rows = [r for r in previous_rows if r in scheduled and r not in finished]
+    if not rows or set(rows) != scheduled:
         return None, "rows"
     num_drafts = int(runner._num_speculative_tokens)
     computed = dict(
@@ -126,7 +137,6 @@ def plan_chain(
         )
     )
     max_model_len = int(runner.model_config.max_model_len)
-    mamba = runner._mamba_groups
     device_sampled = None
     for req_id in rows:
         if scheduler_output.num_scheduled_tokens[req_id] != 1 + num_drafts:
@@ -151,11 +161,47 @@ def plan_chain(
         # vLLM counted the predecessor's drafts as accepted.
         if computed.get(req_id) != length + num_drafts:
             return None, "counts"
-        if mamba is not None and not mamba.chain_window_safe(
-            length + num_drafts, 1 + num_drafts
-        ):
-            return None, "mamba_boundary"
     return ChainPlan(predecessor=predecessor), "chained"
+
+
+def prefill_over_pending(runner: Any, scheduler_output: SchedulerOutput) -> bool:
+    """Whether the prefill step about to be built goes behind the one unread
+    verify instead of draining it (``supports_prefill_over_pending_spec``).
+
+    The device runs the verify, then the prefill, with no idle between them.
+    The verify is read, committed and proposed after the prefill, at the
+    next build, as any completed step is; the step after the prefill finds
+    it read and does not chain on it. The rule for the step is
+    ``TTScheduler``'s (``prefill_qualifies_behind_verify``), which returned
+    the prefill without a release step; the verify must be an ``argmax_ids``
+    verify the model returned unread, and the only pending step.
+    """
+    from vllm_tt_plugin.async_decode import AsyncTTSpecDecodeOutput
+
+    if not (
+        getattr(runner, "async_decode_scheduling", False)
+        and getattr(runner, "_num_speculative_tokens", 0)
+        and getattr(runner, "_spec_drafts_from_model", False)
+    ):
+        return False
+    model = getattr(runner, "model", None)
+    capabilities = getattr(model, "model_capabilities", None) or {}
+    if capabilities.get(SUPPORTS_PREFILL_OVER_PENDING_SPEC, False) is not True:
+        return False
+    if not prefill_qualifies_behind_verify(scheduler_output):
+        return False
+    with runner._steady_decode_lock:
+        pending = list(runner._pending_async_steps)
+    if len(pending) != 1 or not isinstance(pending[0], AsyncTTSpecDecodeOutput):
+        return False
+    verify = pending[0]
+    return (
+        not verify.is_resolved()
+        and verify.chain_filled
+        and verify.model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
+        and verify.model_input.live_rows is None
+        and verify.verify_output is not None
+    )
 
 
 def _samples_on_device(
@@ -296,4 +342,5 @@ __all__ = [
     "check_chained_rows_certifiable",
     "fill_chained_input",
     "plan_chain",
+    "prefill_over_pending",
 ]

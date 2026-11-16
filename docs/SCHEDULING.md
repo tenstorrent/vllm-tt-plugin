@@ -420,6 +420,20 @@ interleave does not take the step for decode:
 3. The engine executes the empty step and commits the held step.
 4. The next `schedule()` call returns the kept prefill.
 
+With a model that declares `supports_prefill_over_pending_spec`, a held
+speculative decode step (every request carries scheduled drafts), and a
+prefill pass that schedules prefill work only, with no resumed or preempted
+request, no multimodal input and no forced-reset discard counts waiting,
+`schedule()` returns the prefill at step 2 instead of the empty step, with the
+cleanup from step 1 (`_prefill_runs_behind_verify`). `TTModelRunner` submits
+the prefill behind the unread verify, and the verify's tokens are published
+after the prefill (see
+[prefill behind an unread verify](MODEL_INTERFACE.md#prefill-behind-an-unread-verify)).
+When the runner finds no unread `argmax_ids` verify there (the held step ran
+as an ordinary decode, or its output was already read), it reads what is
+pending first, as for any prefill. The held prefill is still followed by an
+empty step.
+
 If the prefill pass schedules nothing (every slot taken, KV pressure, a request
 waiting for its grammar), `schedule()` returns the decode fallback with the
 cleanup from step 1, so running decodes keep their overlap; no empty step

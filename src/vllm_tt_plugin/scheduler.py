@@ -21,6 +21,7 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefill_over_pending_spec,
     get_tt_spec_plan,
     get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
@@ -376,6 +377,30 @@ def scheduler_output_has_prefill_work(scheduler_output: SchedulerOutput) -> bool
     return any(cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids)
 
 
+def prefill_qualifies_behind_verify(scheduler_output: SchedulerOutput) -> bool:
+    """Whether a step is prefill work that a model declaring
+    ``supports_prefill_over_pending_spec`` may run behind one unread verify:
+    every scheduled request is a new request or a chunked-prefill
+    continuation, none is resumed or preempted, and none carries multimodal
+    input. ``TTScheduler`` and ``TTModelRunner`` decide with this one rule."""
+    cached = scheduler_output.scheduled_cached_reqs
+    if (
+        cached.resumed_req_ids
+        or scheduler_output.preempted_req_ids
+        or get_tt_forced_reset_discard_counts(scheduler_output)
+    ):
+        return False
+    if any(
+        getattr(r, "mm_features", None) for r in scheduler_output.scheduled_new_reqs
+    ):
+        return False
+    prefill = {r.req_id for r in scheduler_output.scheduled_new_reqs} | {
+        r for r in cached.req_ids if cached.is_context_phase(r)
+    }
+    scheduled = set(scheduler_output.num_scheduled_tokens)
+    return bool(scheduled) and scheduled <= prefill
+
+
 def _carry_cleanup(earlier: SchedulerOutput, later: SchedulerOutput) -> None:
     """Add to ``later`` the cleanup that ``earlier`` drained.
 
@@ -469,6 +494,11 @@ class TTScheduler(AsyncScheduler):
         # kept for the next schedule() call. See _schedule_release_step.
         self._unreleased_step: SchedulerOutput | None = None
         self._deferred_prefill: SchedulerOutput | None = None
+        # The model's supports_prefill_over_pending_spec: a prefill may run
+        # behind a held verify, with no release step before it.
+        self._prefill_over_pending_spec = get_tt_prefill_over_pending_spec(
+            self.vllm_config
+        )
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -1179,6 +1209,14 @@ class TTScheduler(AsyncScheduler):
                 else None
             )
             prefill_result = self._schedule_prefill_only()
+            if release_step is not None and self._prefill_runs_behind_verify(
+                held, prefill_result
+            ):
+                _carry_cleanup(release_step, prefill_result)
+                self._decode_interleave.record_step(
+                    is_decode=False, prefill_pending=True
+                )
+                return self._finalize_scheduler_output(prefill_result, is_decode=False)
             if release_step is not None:
                 if prefill_result.total_num_scheduled_tokens > 0:
                     self._decode_interleave.record_step(
@@ -1290,6 +1328,39 @@ class TTScheduler(AsyncScheduler):
                 self.running.extend(partial_prefills)
         return result
 
+    def _prefill_runs_behind_verify(
+        self, held: SchedulerOutput, prefill: SchedulerOutput
+    ) -> bool:
+        """Whether ``prefill`` goes to the runner ahead of the release step.
+
+        With ``supports_prefill_over_pending_spec`` the model accepts a prefill
+        while one verify it returned is unread, and ``TTModelRunner`` then
+        submits the prefill behind that verify instead of reading it first
+        (``spec_chain.prefill_over_pending``). The verify's tokens are then
+        published after the prefill instead of before it. ``held`` must be a
+        speculative decode step (every request carries scheduled drafts; the
+        runner may still answer it as an ordinary decode, and then drains it)
+        and ``prefill`` a step the runner puts behind a verify: prefill work
+        only, with no resumed or preempted request, no multimodal input and no
+        forced-reset discard counts waiting.
+        """
+        if not (
+            self._prefill_over_pending_spec
+            and self.scheduler_config.async_scheduling
+            and prefill.total_num_scheduled_tokens > 0
+        ):
+            return False
+        scheduled = set(held.num_scheduled_tokens)
+        if (
+            not scheduled
+            or set(held.scheduled_spec_decode_tokens) != scheduled
+            or scheduler_output_has_prefill_work(held)
+        ):
+            return False
+        return prefill_qualifies_behind_verify(prefill) and not getattr(
+            self, "_pending_forced_reset_discard_counts", {}
+        )
+
     def _schedule_release_step(self) -> SchedulerOutput:
         """Schedule an empty step that lets the engine commit the held step.
 
@@ -1316,7 +1387,9 @@ class TTScheduler(AsyncScheduler):
         returns it. When it schedules nothing, there is no prefill to go ahead
         of, so this step is not returned and ``_carry_cleanup`` adds what it
         drained to the step returned instead; running decodes then keep their
-        overlap with the engine. Running this pass first keeps that cleanup
+        overlap with the engine. Nor is it returned when the prefill may run
+        behind the held verify (``_prefill_runs_behind_verify``); the prefill
+        then carries the cleanup. Running this pass first keeps that cleanup
         ahead of the prefill, in the order the runner receives the two steps.
 
         Between the two calls the engine commits the held step and handles
