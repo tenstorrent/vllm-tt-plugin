@@ -187,6 +187,10 @@ class _LedgerDevice:
         # Chained verifies whose ``slot_remap`` moves a live row.
         self.moved_rows = 0
         self.prefills = 0
+        # Prefills submitted while a verify was unread, and the requests of
+        # that verify whose rows' state slots they took.
+        self.prefills_behind = 0
+        self.slots_reused_behind: list[str] = []
         self.ordinary_decodes = 0
         # Ordinary decodes submitted right after another ordinary decode.
         self.plain_after_plain = 0
@@ -264,6 +268,23 @@ class _LedgerDevice:
     def prefill_forward(self, tokens, prompt_lens, start_pos, mamba_state, **kwargs):
         self.last_kind = "prefill"
         self.prefills += 1
+        runner = self.h.runner
+        unread = [
+            step
+            for step in runner._pending_async_steps
+            if isinstance(getattr(step, "verify_output", None), VerifyOutput)
+            and not step.is_resolved()
+        ]
+        if unread:
+            # The model's side of supports_prefill_over_pending_spec: one
+            # unread verify, whose propose comes after this prefill.
+            assert len(unread) == 1, unread
+            assert self.model_capabilities.get("supports_prefill_over_pending_spec")
+            self.prefills_behind += 1
+            verify_rows = unread[0].model_input.row_req_ids
+            for slot in kwargs.get("empty_slots") or ():
+                if slot < len(verify_rows):
+                    self.slots_reused_behind.append(verify_rows[slot])
         live = self._live()
         logits = torch.zeros((len(live), 1, VOCAB))
         rows = []
@@ -530,6 +551,7 @@ class _AsyncHarness:
         trace_mode: str = "none",
         device_sampling: bool = False,
         sampled_ids: bool = False,
+        prefill_over_pending: bool = False,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -585,6 +607,10 @@ class _AsyncHarness:
                 max_device_top_k=MAX_DEVICE_TOP_K,
                 supports_device_penalties=False,
             )
+        if prefill_over_pending:
+            # As TTPlatform stores the validated declaration for the scheduler.
+            self.device.model_capabilities["supports_prefill_over_pending_spec"] = True
+            self.scheduler._prefill_over_pending_spec = True
         self.runner.initialize_kv_cache(self.kv_cache_config)
         self.groups = list(self.runner._mamba_groups.group_indices)
         self.ledger = StateLedger()
@@ -902,6 +928,7 @@ class _LeavingRows:
             scheduled = set(scheduler_output.num_scheduled_tokens)
             finished = set(scheduler_output.finished_req_ids)
             before = controller._chained_verify_submissions
+            rows_drains = controller._chain_drains["rows"]
             result = execute(scheduler_output)
             leaving = [r for r in previous if r not in scheduled]
             if previous and not scheduled:
@@ -915,6 +942,8 @@ class _LeavingRows:
                     != [r for r in previous if r in scheduled],
                     prefill=bool(scheduler_output.scheduled_new_reqs),
                     chained=controller._chained_verify_submissions > before,
+                    rows_drain=controller._chain_drains["rows"] > rows_drains,
+                    empty=not scheduled,
                 )
             )
             return result
@@ -977,6 +1006,73 @@ def test_a_chained_verify_continues_rows_that_moved(num_blocks, sampled):
     # ``TTScheduler`` returns ahead of a prefill, or every row left).
     assert controller._chain_drains["rows"] == leaving.empty_drains
     if num_blocks == 48:
+        assert h.preempted
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "sampled", "scenario"),
+    [(80, False, "joins"), (28, False, "joins"), (80, True, "leaving")],
+)
+def test_a_prefill_runs_behind_the_unread_verify(num_blocks, sampled, scenario):
+    """With ``supports_prefill_over_pending_spec`` ``TTScheduler`` returns a
+    join's prefill while a verify is held, without the empty release step
+    before it, and ``TTModelRunner`` submits the prefill behind the unread
+    verify: the joining request often takes the state slot of a request that
+    finished in that verify's rows. The verify is read, committed and proposed
+    after the prefill, and the step after the prefill does not chain on it.
+    The device gets the same rows, start blocks and window blocks, step for
+    step, as the chained run that drains at the release step, and leaves the
+    same GDN state; the outputs equal a synchronous run's. With 28 blocks
+    requests are also preempted and resume: their prefill drains."""
+    if scenario == "joins":
+        stops = None
+
+        def setup(h):
+            _scenario(h)
+
+    else:
+        stops = _leaving_stops(num_blocks, sampled)
+
+        def setup(h):
+            _leaving_scenario(h, sampled=sampled, stops=stops)
+
+    def harness(**kwargs) -> _AsyncHarness:
+        h = _AsyncHarness(num_blocks, mode="align", sampled_ids=sampled, **kwargs)
+        setup(h)
+        return h
+
+    reference = harness(asynchronous=False)
+    reference.run()
+    base = harness(asynchronous=True, chained=True)
+    base.run()
+    h = harness(asynchronous=True, chained=True, prefill_over_pending=True)
+    leaving = _LeavingRows(h)
+    h.run()
+
+    if scenario == "leaving":
+        aborted = h.outputs.pop(LEAVING_ABORTED)
+        assert aborted == base.outputs.pop(LEAVING_ABORTED)
+        assert aborted == reference.outputs.pop(LEAVING_ABORTED)[: len(aborted)]
+    assert h.outputs == reference.outputs == base.outputs
+    assert h.device.inputs == base.device.inputs
+    assert h.ledger.states == base.ledger.states
+    assert h.cached_states_checked
+    controller = h.runner.async_decode
+    assert controller._overlapped_unsafe_submissions == 0
+    # Every prefill behind an unread verify is one the runner counted, and
+    # took the place of a release step that drained in the base run.
+    assert h.device.prefills_behind == controller._prefills_over_pending > 0
+    assert base.device.prefills_behind == 0
+    if num_blocks == 80:
+        assert h.device.slots_reused_behind, "no prefill took a finished row's slot"
+    # What drains for "rows" schedules nothing; the release steps ahead of
+    # the prefills that went behind a verify are gone.
+    assert all(step.empty for step in leaving.steps if step.rows_drain)
+    assert (
+        controller._chain_drains["rows"]
+        < base.runner.async_decode._chain_drains["rows"]
+    )
+    if num_blocks == 28:
         assert h.preempted
 
 

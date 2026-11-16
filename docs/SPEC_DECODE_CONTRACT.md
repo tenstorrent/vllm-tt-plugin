@@ -568,7 +568,10 @@ With `MambaSpec` groups such a verify names, for the count the model computes,
 the state blocks that a drained verify of the step names, also next to a block
 boundary. The runner then reads, commits and proposes for the unread verify
 before it builds anything else, so accept and propose still run once per
-verify, in step order. What
+verify, in step order. A model declaring `supports_prefill_over_pending_spec`
+also takes a join's prefill behind the unread verify: the runner submits the
+prefill first, and reads, commits and proposes for the verify after it
+([prefill behind an unread verify](MODEL_INTERFACE.md#prefill-behind-an-unread-verify)). What
 this path defers is the readback and the commit, not the order of the steps. A
 lane verify takes this same deferred path
 (`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step

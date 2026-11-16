@@ -90,6 +90,7 @@ from vllm_tt_plugin.spec_chain import (
     check_chained_rows_certifiable,
     fill_chained_input,
     plan_chain,
+    prefill_over_pending,
 )
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
@@ -3454,9 +3455,12 @@ class TTModelRunner:
         if chain is None and self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
-            if reason != "off":
-                self.async_decode._chain_drains[reason] += 1
-            self.async_decode.wait_for_all_pending_async_steps()
+            if prefill_over_pending(self, scheduler_output):
+                self.async_decode._prefills_over_pending += 1
+            else:
+                if reason != "off":
+                    self.async_decode._chain_drains[reason] += 1
+                self.async_decode.wait_for_all_pending_async_steps()
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = (

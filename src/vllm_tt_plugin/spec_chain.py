@@ -44,9 +44,13 @@ import torch
 
 from vllm_tt_plugin.scheduler import (
     get_tt_forced_reset_discard_counts,
+    prefill_qualifies_behind_verify,
     scheduler_output_has_prefill_work,
 )
-from vllm_tt_plugin.spec_admission import SUPPORTS_CHAINED_SPEC_VERIFY
+from vllm_tt_plugin.spec_admission import (
+    SUPPORTS_CHAINED_SPEC_VERIFY,
+    SUPPORTS_PREFILL_OVER_PENDING_SPEC,
+)
 from vllm_tt_plugin.spec_decode import ACCEPT_MODE_ARGMAX_IDS, PLACEHOLDER_TOKEN_ID
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
@@ -158,6 +162,46 @@ def plan_chain(
         if computed.get(req_id) != length + num_drafts:
             return None, "counts"
     return ChainPlan(predecessor=predecessor), "chained"
+
+
+def prefill_over_pending(runner: Any, scheduler_output: SchedulerOutput) -> bool:
+    """Whether the prefill step about to be built goes behind the one unread
+    verify instead of draining it (``supports_prefill_over_pending_spec``).
+
+    The device runs the verify, then the prefill, with no idle between them.
+    The verify is read, committed and proposed after the prefill, at the
+    next build, as any completed step is; the step after the prefill finds
+    it read and does not chain on it. The rule for the step is
+    ``TTScheduler``'s (``prefill_qualifies_behind_verify``), which returned
+    the prefill without a release step; the verify must be an ``argmax_ids``
+    verify the model returned unread, and the only pending step.
+    """
+    from vllm_tt_plugin.async_decode import AsyncTTSpecDecodeOutput
+
+    if not (
+        getattr(runner, "async_decode_scheduling", False)
+        and getattr(runner, "_num_speculative_tokens", 0)
+        and getattr(runner, "_spec_drafts_from_model", False)
+    ):
+        return False
+    model = getattr(runner, "model", None)
+    capabilities = getattr(model, "model_capabilities", None) or {}
+    if capabilities.get(SUPPORTS_PREFILL_OVER_PENDING_SPEC, False) is not True:
+        return False
+    if not prefill_qualifies_behind_verify(scheduler_output):
+        return False
+    with runner._steady_decode_lock:
+        pending = list(runner._pending_async_steps)
+    if len(pending) != 1 or not isinstance(pending[0], AsyncTTSpecDecodeOutput):
+        return False
+    verify = pending[0]
+    return (
+        not verify.is_resolved()
+        and verify.chain_filled
+        and verify.model_input.spec_mode == ACCEPT_MODE_ARGMAX_IDS
+        and verify.model_input.live_rows is None
+        and verify.verify_output is not None
+    )
 
 
 def _samples_on_device(
@@ -298,4 +342,5 @@ __all__ = [
     "check_chained_rows_certifiable",
     "fill_chained_input",
     "plan_chain",
+    "prefill_over_pending",
 ]

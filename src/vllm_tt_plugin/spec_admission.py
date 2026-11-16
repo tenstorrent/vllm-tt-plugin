@@ -353,9 +353,38 @@ def validate_chained_spec_verify(
         )
 
 
+SUPPORTS_PREFILL_OVER_PENDING_SPEC = "supports_prefill_over_pending_spec"
+
+
+def validate_prefill_over_pending_spec(
+    model_capabilities: Mapping[str, Any] | None, model_name: str
+) -> bool:
+    """Return the model's ``supports_prefill_over_pending_spec``; raise for a
+    declaration the plugin cannot honor: not a bool, or without
+    ``supports_async_spec_decode``, whose deferred readback leaves the verify
+    unread under the prefill."""
+    value = (model_capabilities or {}).get(SUPPORTS_PREFILL_OVER_PENDING_SPEC, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_PREFILL_OVER_PENDING_SPEC}="
+            f"{value!r}; the capability is a bool"
+        )
+    if value and not (model_capabilities or {}).get(
+        "supports_async_spec_decode", False
+    ):
+        raise ValueError(
+            f"TT model {model_name} declares {SUPPORTS_PREFILL_OVER_PENDING_SPEC} "
+            "without supports_async_spec_decode; the prefill runs behind a "
+            "verify whose readback is deferred"
+        )
+    return value
+
+
 __all__ = [
     "SUPPORTS_CHAINED_SPEC_VERIFY",
+    "SUPPORTS_PREFILL_OVER_PENDING_SPEC",
     "method_requirements",
     "resolve_speculative_plan",
     "validate_chained_spec_verify",
+    "validate_prefill_over_pending_spec",
 ]

@@ -139,3 +139,44 @@ structured output, a token filter, a pending `min_tokens`), drain the
 predecessor first. Sources:
 [spec_chain.py](../src/vllm_tt_plugin/spec_chain.py) and
 [mamba_state.py](../src/vllm_tt_plugin/mamba_state.py).
+
+## Prefill behind an unread verify
+
+A model that declares `supports_prefill_over_pending_spec` (see
+[model capabilities](MODEL_CAPABILITIES.md)) lets `TTModelRunner` call
+`prefill_forward` while one `argmax_ids` verify it returned unread has not
+been read, committed or proposed. Without it the runner reads that verify,
+commits it and calls `propose_draft_tokens` for it before it builds the
+prefill.
+
+In order, with verify n + 1 unread, request R finished at verify n (so R is
+a live row of n + 1) and request J waiting:
+
+1. `TTScheduler` returns J's prefill step, with R in `finished_req_ids`, and
+   no release step before it (`TTScheduler._prefill_runs_behind_verify`).
+2. `TTModelRunner.execute_model` does not read verify n + 1
+   (`spec_chain.prefill_over_pending`): it is the only pending step, an
+   unread `argmax_ids` verify, and the step is prefill work only, with no
+   resumed or preempted request, no multimodal input and no forced
+   prefix-cache reset (`scheduler.prefill_qualifies_behind_verify`, the rule
+   the scheduler applied).
+3. `_update_states` calls `release_request` for R's state slot, then the
+   build hands J a free slot, often R's (`empty_slots`), and calls
+   `prefill_forward`.
+4. After the prefill the engine reads verify n + 1; the next build commits
+   it and calls `propose_draft_tokens` for its rows, R's row included, with
+   the walk's commit.
+5. The verify after that is built from host state: it does not chain on
+   verify n + 1.
+
+The model must:
+
+| Duty | Prefill behind an unread verify |
+|---|---|
+| Order | Enqueue the prefill's device work after the verify and the reads it returned, on the same in-order queue. |
+| Results | Keep what `read_decode_output` and `propose_draft_tokens` of that verify use valid across the prefill. |
+| Slot reuse | Accept a prefill row in the state slot of a live row of that verify whose request finished. That verify's `propose_draft_tokens` reads none of the new request's per-slot state, and leaves the new request's per-slot state as a propose before the prefill would. |
+| Propose | Return the drafts and raise on a commit that differs from the model's own acceptance, as on any verify. |
+
+Tokens do not change. The verify's tokens are published after the prefill
+instead of before it.
