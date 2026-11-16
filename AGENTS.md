@@ -149,7 +149,8 @@ The script therefore fetches `requirements/common.txt` for the pinned version
 explicitly, installs it, and then installs vLLM itself with `--no-deps` and
 `--no-binary vllm`.
 
-`docs/vllm-overrides.txt` forces `numpy<2` and `opencv-python-headless==4.11.0.86`.
+`docs/vllm-overrides.txt` forces `numpy<2` and `opencv-python-headless==4.11.0.86`,
+and sets the whole `transformers` range of the install.
 `numpy<2` wins because tt-metal fixes it and it cannot be moved from here.
 
 **When bumping the pinned vLLM version, all of the following must change
