@@ -64,6 +64,7 @@ from vllm_tt_plugin.input_batch import (
     apply_cached_req_state_update,
     build_cached_request_state,
     clone_torch_generator,
+    drop_unbounded_top_k_top_p,
     log_prefill_chunks,
 )
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
@@ -4367,6 +4368,7 @@ class TTModelRunner:
                 temperature = _take(sampling_params.temperature)
                 top_k = _take(sampling_params.top_k)
                 top_p = _take(sampling_params.top_p)
+                top_k, top_p = drop_unbounded_top_k_top_p(top_k, top_p, self.vocab_size)
                 presence_penalty = _take(sampling_params.presence_penalty)
                 frequency_penalty = _take(sampling_params.frequency_penalty)
                 repetition_penalty = _take(sampling_params.repetition_penalty)
