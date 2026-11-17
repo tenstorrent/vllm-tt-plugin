@@ -45,6 +45,7 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
     get_tt_seeded_sampling_policy,
@@ -75,9 +76,11 @@ from vllm_tt_plugin.logprobs import build_device_logprobs
 from vllm_tt_plugin.model_input import (
     TTModelInput,
     TTSamplingParams,
+    build_mm_items,
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.scheduler import set_tt_prefill_errors
 from vllm_tt_plugin.spec_accept import (
     AcceptResult,
     SpecPenalties,
@@ -533,6 +536,7 @@ class TTModelRunner:
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
+        self.mm_modalities = get_tt_mm_modalities(vllm_config)
         self.supports_stage_outputs = get_tt_supports_stage_outputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
@@ -915,6 +919,19 @@ class TTModelRunner:
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        self._kv_connector = None
+        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            register = getattr(connector, "register_tt_kv_caches", None)
+            if register is None:
+                raise ValueError(
+                    f"KV connector {type(connector).__name__} cannot use TT device buffers "
+                    "(it has no register_tt_kv_caches); use vllm_tt_plugin.kv_connector.TTKVStoreConnector"
+                )
+            register(self.kv_caches)
+            self._kv_connector = connector
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -1280,8 +1297,10 @@ class TTModelRunner:
         """
         Gather and batch multi-modal inputs for the current persistent batch.
 
-        Currently only supports image inputs in the "pixel_values" and
-        "image_grid_thw" fields.
+        A model that declares ``model_capabilities["mm_modalities"]`` gets
+        ``{"mm_items": [...]}``: one entry per row of ``req_indices``, built by
+        ``build_mm_items``. Any other model gets image inputs only, in the
+        "pixel_values" and "image_grid_thw" fields described below.
 
         Returns a dict with keys "pixel_values" and "image_grid_thw".
         Each value is a list aligned with the persistent batch order
@@ -1308,13 +1327,23 @@ class TTModelRunner:
         }
         """
 
+        if req_indices is None:
+            req_indices = list(range(self.input_batch.num_reqs))
+        if self.mm_modalities is not None:
+            mm_items = []
+            for batch_index in req_indices:
+                req_id = self.input_batch.req_ids[batch_index]
+                mm_items.append(
+                    build_mm_items(
+                        req_id, self.requests[req_id].mm_features, self.mm_modalities
+                    )
+                )
+            return {"mm_items": mm_items}
+
         multi_modal_kwargs: dict[str, Any] = {
             "pixel_values": [],
             "image_grid_thw": [],
         }
-
-        if req_indices is None:
-            req_indices = list(range(self.input_batch.num_reqs))
         # The model input tensors are built in persistent batch order, so
         # multi-modal inputs must follow the same order (not just new reqs).
         for batch_index in req_indices:
@@ -3021,15 +3050,18 @@ class TTModelRunner:
         # step runs synchronously, so the lane batch layout is stable between
         # this enqueue and the deferred sample.
         self._pending_samples.append(
-            partial(
-                self._finish_lane_sync,
-                tt_out=tt_out,
-                tt_log_probs=tt_log_probs,
-                model_input=model_input,
-                scheduled_rows=scheduled_rows,
-                is_decode=is_decode,
-                lane_total=lane_total,
-                decode_submission=submission,
+            TTModelRunner._with_prefill_errors(
+                partial(
+                    self._finish_lane_sync,
+                    tt_out=tt_out,
+                    tt_log_probs=tt_log_probs,
+                    model_input=model_input,
+                    scheduled_rows=scheduled_rows,
+                    is_decode=is_decode,
+                    lane_total=lane_total,
+                    decode_submission=submission,
+                ),
+                model_input,
             )
         )
         return None
@@ -3217,6 +3249,32 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
+        """Run the step, with the KV connector's loads before it and its saves after it.
+
+        Loads (prefix KV from the host store into the blocks the scheduler allocated for it) finish before the
+        forward is enqueued. Saves are issued after the forward is enqueued, on the same command queue, so they copy
+        what the forward wrote; they block until the bytes are on the host, then publish.
+        """
+        connector = getattr(self, "_kv_connector", None)
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        if connector is None or meta is None:
+            return TTModelRunner._execute_model_step(self, scheduler_output)
+        connector.bind_connector_metadata(meta)
+        self._step_prefill_error_ids = set()
+        try:
+            connector.start_load_kv(None)
+            out = TTModelRunner._execute_model_step(self, scheduler_output)
+            # A row the model could not serve ran on placeholder embeddings: its KV must not reach the store.
+            connector.skip_save_req_ids = set(self._step_prefill_error_ids)
+            connector.wait_for_save()
+        finally:
+            connector.clear_connector_metadata()
+        return out
+
+    def _execute_model_step(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> ModelRunnerOutput | None:
         """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None`` after enqueuing a pending sampler; the engine computes
@@ -3286,7 +3344,11 @@ class TTModelRunner:
         # Synchronous path (prefill, or decode without async scheduling): run
         # the forward now and defer sampling to ``sample_tokens``.
         fwd = self._forward_with_model_input(model_input)
-        self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
+        self._pending_samples.append(
+            TTModelRunner._with_prefill_errors(
+                partial(self._finish_front_packed_sync, fwd=fwd), model_input
+            )
+        )
         return None
 
     def _reorder_grammar_bitmask(
@@ -4377,10 +4439,66 @@ class TTModelRunner:
             for i, req_id in enumerate(self.input_batch.req_ids):
                 self.requests[req_id].mrope_position_delta = rope_deltas[i].item()
             self.async_decode.note_prefill_submitted()
+            TTModelRunner._take_prefill_errors(self, model_input)
             return tt_out
         tt_out = self.model.prefill_forward(**kwargs)
         self.async_decode.note_prefill_submitted()
+        TTModelRunner._take_prefill_errors(self, model_input)
         return tt_out
+
+    def _take_prefill_errors(self, model_input: TTModelInput) -> None:
+        """Record the rows the prefill just run could not serve, by request id.
+
+        A model declaring ``reports_prefill_errors`` returns them from
+        ``take_prefill_errors()`` as ``{prefill row: reason}``. They go into
+        ``model_input.prefill_errors``; ``_with_prefill_errors`` puts them on the
+        step's output, and ``TTScheduler`` finishes those requests as errors.
+        """
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        if not capabilities.get("reports_prefill_errors", False):
+            return
+        errors = self.model.take_prefill_errors()
+        if not errors:
+            return
+        if model_input.row_req_ids is not None:
+            row_req_ids = list(model_input.row_req_ids)
+        else:
+            # A lane prefill's rows are the slots it seeds, in order.
+            row_req_ids = [
+                self.input_batch.req_ids[slot]
+                for slot in model_input.prefill_empty_slots
+            ]
+        for row, reason in errors.items():
+            if not 0 <= int(row) < len(row_req_ids) or not isinstance(reason, str):
+                raise ValueError(
+                    f"take_prefill_errors() returned {errors!r} for "
+                    f"{len(row_req_ids)} prefill rows; expected "
+                    "{prefill row: reason string}."
+                )
+            req_id = row_req_ids[int(row)]
+            model_input.prefill_errors[req_id] = reason
+            if getattr(self, "_step_prefill_error_ids", None) is not None:
+                self._step_prefill_error_ids.add(req_id)  # read by execute_model for the KV connector
+            logger.error(
+                "Request %s fails: its prefill (row %d) could not be served: %s",
+                req_id,
+                int(row),
+                reason,
+            )
+
+    @staticmethod
+    def _with_prefill_errors(finish, model_input: TTModelInput):
+        """``finish``, with the step's prefill errors set on the output it builds."""
+        errors = model_input.prefill_errors
+        if not errors:
+            return finish
+
+        def finish_and_report(grammar_output: GrammarOutput | None):
+            output = finish(grammar_output)
+            set_tt_prefill_errors(output, errors)
+            return output
+
+        return finish_and_report
 
     def _forward_with_model_input(
         self,

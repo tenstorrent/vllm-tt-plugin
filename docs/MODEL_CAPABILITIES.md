@@ -53,7 +53,7 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 
 | `model_capabilities` key | Default when absent | Meaning and current validation |
 |---|---|---|
-| `supports_chunked_prefill` | `False` | Permits scheduler-driven chunked prefill when `scheduler_config.enable_chunked_prefill` is also true. The platform disables chunked prefill for `output_tokens_per_step > 1` regardless of this declaration. When chunked prefill remains enabled, the platform sets `disable_chunked_mm_input=True`. |
+| `supports_chunked_prefill` | `False` | Permits scheduler-driven chunked prefill when `scheduler_config.enable_chunked_prefill` is also true. The platform disables chunked prefill for `output_tokens_per_step > 1` regardless of this declaration. When chunked prefill remains enabled, the platform sets `disable_chunked_mm_input=True` unless the model declares `mm_modalities`, whose `mm_items` place every item in the whole prompt so an item may straddle chunks. |
 | `supports_prefix_caching` | `False` | Permits vLLM automatic prefix caching. The platform disables requested prefix caching when this declaration is false. The platform rejects `supports_prefix_caching=True` together with `output_tokens_per_step > 1`. |
 | `output_tokens_per_step` | `1` | Declares the committed output width. The platform requires an integer at least 1 and rejects Boolean values. A value above 1 selects block-output execution. Contract-based speculation instead uses `output_tokens_per_step=1` and an admitted `SpecPlan`. |
 | `tt_adaptive_block_output` | `False` | Allows an eligible solo decode to commit a block and requires batched decode to use the ordinary one-token path. The platform rejects this declaration unless `output_tokens_per_step > 1`. Adaptive block output relaxes the plain block-output concurrency, data-parallel, executor, async-scheduling, and device-sampling restrictions described below. |
@@ -153,6 +153,17 @@ Sources: [config.py](../src/vllm_tt_plugin/config.py),
 [stage_outputs.py](../src/vllm_tt_plugin/stage_outputs.py),
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
+
+## Multimodal capability
+
+| `model_capabilities` key | Default when absent | Meaning and current validation |
+|---|---|---|
+| `reports_prefill_errors` | `False` | Declares `take_prefill_errors()`, which the runner calls after every `prefill_forward`. It returns `{prefill row: reason}` for the rows the model could not serve, and clears them. See [prefill errors](MODEL_EXECUTION.md#prefill-errors). |
+| `mm_modalities` | `None` | Declares the modalities the model encodes, as a non-empty set of vLLM modality names (`"image"`, `"video"`, `"audio"`). A declaring model receives `mm_items` with every prefill instead of `pixel_values` and `image_grid_thw`; see [multimodal inputs](MODEL_EXECUTION.md#multimodal-inputs). `resolve_tt_mm_modalities` sets `--limit-mm-per-prompt` to 0 for every other modality the model's vLLM processor accepts, so vLLM refuses a request carrying one while parsing it (HTTP 400) and leaves the modality out of the encoder budget. A multimodal model without the declaration is gated the same way to `{"image"}`, the modality its `pixel_values` lists carry. The platform rejects a value that is not a non-empty set, list, or tuple of strings; a declaration on a model vLLM serves text-only (no multimodal processor registered on the class); an operator `--limit-mm-per-prompt` above 0 for a modality the model does not encode; and `--enable-mm-embeds` for a declaring model. |
+
+Sources: `resolve_tt_mm_modalities` in [config.py](../src/vllm_tt_plugin/config.py),
+`build_mm_items` in [model_input.py](../src/vllm_tt_plugin/model_input.py), and
+`_gather_multi_modal_inputs` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Speculative capabilities and admission
 

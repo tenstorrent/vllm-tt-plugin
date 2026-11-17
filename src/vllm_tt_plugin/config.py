@@ -64,6 +64,7 @@ _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
 _SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 _SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
+_MM_MODALITIES_KEY = "_tt_mm_modalities"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -440,6 +441,179 @@ def resolve_tt_supports_stage_outputs(
         additional = {}
         vllm_config.additional_config = additional
     additional[_SUPPORTS_STAGE_OUTPUTS_KEY] = supported
+
+
+# What a multimodal model that does not declare ``mm_modalities`` encodes: its
+# prefill takes the image-only ``pixel_values`` and ``image_grid_thw`` lists.
+_PIXEL_VALUES_MODALITIES = frozenset({"image"})
+
+
+def get_tt_mm_modalities(vllm_config: "VllmConfig") -> frozenset[str] | None:
+    """The modalities a model taking ``mm_items`` encodes.
+
+    ``None`` when the model does not declare ``mm_modalities``: it is text-only
+    or takes the ``pixel_values`` lists.
+    """
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    modalities = additional.get(_MM_MODALITIES_KEY)
+    return None if modalities is None else frozenset(modalities)
+
+
+def _processor_modalities(
+    model_config: Any, model_class: type
+) -> frozenset[str] | None:
+    """The modalities vLLM's multimodal processor accepts for this launch.
+
+    ``None`` when vLLM serves the model text-only. A model class without a
+    registered processor is one: vLLM's ``MultiModalRegistry`` then logs that
+    it runs the model in text-only mode, even when the upstream architecture
+    the checkpoint names is multimodal (as for MiMo-V2.6-Flash).
+    """
+    if model_config.multimodal_config is None:
+        return None
+    # The attribute ``MultiModalRegistry.register_processor`` sets, and the one
+    # ``MultiModalRegistry`` itself checks before it builds a processor.
+    if not hasattr(model_class, "_processor_factory"):
+        return None
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    return frozenset(
+        MULTIMODAL_REGISTRY.get_processing_info(model_config).supported_mm_limits
+    )
+
+
+def _no_items_allowed(modality: str):
+    """A ``limit_mm_per_prompt`` entry of 0 for ``modality``.
+
+    The options class ``MultiModalConfig`` builds for that modality from the
+    command line: a processor's dummy-input builder asserts it.
+    """
+    from vllm.config.multimodal import (
+        AudioDummyOptions,
+        BaseDummyOptions,
+        ImageDummyOptions,
+        VideoDummyOptions,
+    )
+
+    options_cls = {
+        "image": ImageDummyOptions,
+        "video": VideoDummyOptions,
+        "audio": AudioDummyOptions,
+    }.get(modality, BaseDummyOptions)
+    return options_cls(count=0)
+
+
+TT_KV_STORE_CONNECTOR = "TTKVStoreConnector"
+
+
+def disable_kv_store_mm_embeds(vllm_config: "VllmConfig") -> bool:
+    """Turn off the multimodal embedding inputs vLLM derives for a KV consumer, when that consumer is
+    TTKVStoreConnector. Returns whether it changed the config.
+
+    vLLM turns pre-computed embedding inputs (``enable_mm_embeds``, ``allow_missing_mm_embeddings``) on for every
+    KV consumer, since a disaggregated decode engine is sent embeddings instead of media
+    (``VllmConfig._resolve_mm_embedding_inputs``). TTKVStoreConnector moves prefix KV only: every engine receives the
+    request's media and encodes them itself, and a model declaring ``mm_modalities`` cannot take embeddings. vLLM
+    derives the flags after the platform's config check, so this runs in the worker's own check
+    (``resolve_tt_mm_modalities``) and when the front end builds its InputProcessor, before any request is parsed.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    mm_config = getattr(model_config, "multimodal_config", None)
+    kv_config = getattr(vllm_config, "kv_transfer_config", None)
+    ec_config = getattr(vllm_config, "ec_transfer_config", None)
+    if mm_config is None or kv_config is None or kv_config.kv_connector != TT_KV_STORE_CONNECTOR:
+        return False
+    if ec_config is not None and getattr(ec_config, "is_ec_consumer", False):
+        return False  # an encoder-cache consumer is sent embeddings: keep them
+    if not (mm_config.enable_mm_embeds or getattr(mm_config, "allow_missing_mm_embeddings", False)):
+        return False
+    mm_config.enable_mm_embeds = False
+    mm_config.allow_missing_mm_embeddings = False
+    logger.info(
+        "%s moves prefix KV only (every engine encodes its requests' media): multimodal embedding inputs, which "
+        "vLLM turns on for a KV consumer, are off",
+        TT_KV_STORE_CONNECTOR,
+    )
+    return True
+
+
+def resolve_tt_mm_modalities(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``mm_modalities``, refuse the other modalities, and store it.
+
+    A model that declares ``model_capabilities["mm_modalities"]`` takes
+    ``mm_items`` in prefill and encodes those modalities. A multimodal model
+    that does not takes the ``pixel_values`` lists and encodes images only.
+    Every other modality the model's vLLM processor accepts gets a
+    ``--limit-mm-per-prompt`` of 0. vLLM then refuses a request carrying one
+    while it parses the request's multimodal data
+    (``BaseProcessingInfo.validate_num_items``, HTTP 400) instead of the runner
+    raising inside the engine, and leaves the modality out of the encoder
+    budget and of startup profiling.
+
+    Raises:
+        ValueError: the declaration is not a non-empty collection of modality
+            names; the model declares it but vLLM serves it text-only; the
+            operator's ``--limit-mm-per-prompt`` allows a modality the model
+            does not encode; or ``--enable-mm-embeds`` is set for a model that
+            declares it (precomputed embeddings skip the limit and reach the
+            model as ``*_embeds`` fields it does not take).
+    """
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    declared = (model_capabilities or {}).get("mm_modalities")
+    if declared is not None:
+        if (
+            not isinstance(declared, (set, frozenset, list, tuple))
+            or not declared
+            or not all(isinstance(m, str) for m in declared)
+        ):
+            raise ValueError(
+                f"Model {name} must declare model_capabilities['mm_modalities'] as "
+                f"a non-empty set of modality names, got {declared!r}"
+            )
+        declared = frozenset(declared)
+
+    model_config = vllm_config.model_config
+    supported = _processor_modalities(model_config, model_class)
+    if supported is None:
+        if declared is not None:
+            raise ValueError(
+                f"Model {name} declares model_capabilities['mm_modalities']="
+                f"{sorted(declared)}, but vLLM serves it text-only: the class has "
+                "no multimodal processor registered "
+                "(MULTIMODAL_REGISTRY.register_processor), or the checkpoint's "
+                "architecture is not multimodal."
+            )
+    else:
+        mm_config = model_config.multimodal_config
+        disable_kv_store_mm_embeds(vllm_config)
+        if declared is not None and mm_config.enable_mm_embeds:
+            raise ValueError(
+                f"Model {name} encodes its own multimodal items "
+                "(model_capabilities['mm_modalities']); --enable-mm-embeds is "
+                "not supported."
+            )
+        accepted = _PIXEL_VALUES_MODALITIES if declared is None else declared
+        limits = dict(mm_config.limit_per_prompt)
+        for modality in sorted(supported - accepted):
+            requested = limits.get(modality)
+            if requested is None:
+                limits[modality] = _no_items_allowed(modality)
+            elif requested.count > 0:
+                raise ValueError(
+                    f"--limit-mm-per-prompt allows {requested.count} {modality} "
+                    f"item(s), but model {name} encodes only {sorted(accepted)}."
+                )
+        mm_config.limit_per_prompt = limits
+
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_MM_MODALITIES_KEY] = None if declared is None else sorted(declared)
 
 
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
