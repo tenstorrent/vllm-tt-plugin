@@ -86,7 +86,7 @@ def _scheduler_output(*, preempted=None, scheduled=("KEEP",)):
         free_encoder_mm_hashes=[],
         num_scheduled_tokens=dict.fromkeys(scheduled, 1),
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], resumed_req_ids=set()),
     )
 
 
