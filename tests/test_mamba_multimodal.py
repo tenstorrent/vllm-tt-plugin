@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """Multimodal requests of a model with ``MambaSpec`` layers.
 
-Such a model (the Qwen3.8 adapter) builds the M-RoPE positions and vision rows
-of a prefill step from that step's tokens and starts a multimodal prompt at
-position 0. So ``TTScheduler`` keeps a multimodal request off the prefix cache
-and schedules every multimodal item of it in its first prefill chunk, the whole
+The Qwen3.8 adapter builds the M-RoPE positions and vision rows of a prefill
+step from that step's tokens, and declares
+``model_capabilities['supports_multimodal_prefill_resume']`` False. For such a
+model ``TTScheduler`` keeps a multimodal request off the prefix cache and
+schedules every multimodal item of it in its first prefill chunk, the whole
 prompt when one step holds it, and ``TTPlatform.validate_request`` rejects a
 multimodal prompt longer than one step. Text requests of the same launch keep
-prefix caching and chunked prefill.
+prefix caching and chunked prefill. A model that declares True, or omits the
+key, keeps vLLM's multimodal rules, with or without ``MambaSpec`` layers.
 
 The tests drive a real ``TTScheduler`` with its ``KVCacheManager`` and a real
 ``TTModelRunner`` through ``_Harness`` (``test_mamba_state_lifecycle.py``),
@@ -42,12 +44,16 @@ from tests.test_mamba_state_lifecycle import (
     _prompt,
     _scheduler,
 )
-from vllm_tt_plugin.config import store_tt_mamba_spec_layers
+from vllm_tt_plugin.config import get_tt_supports_multimodal_prefill_resume
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import multimodal_prefill_limit
 
 STEP = 4096
 ENCODER_BUDGET = 4096
+# The declaration of the Qwen3.8 adapter, Qwen36ForCausalLM in tt-metal.
+NO_RESUME = {"supports_multimodal_prefill_resume": False}
+# A model that resumes a multimodal prefill, by declaration or by default.
+RESUMES = [{"supports_multimodal_prefill_resume": True}, None]
 
 
 def _item(identifier: str, offset: int, length: int, modality: str = "image"):
@@ -68,8 +74,14 @@ class _MultimodalHarness(_Harness):
     """``_Harness`` with multimodal requests, an encoder budget, and a record
     of the pixels each prefill row hands the model."""
 
-    def __init__(self, *args, encoder_budget: int = ENCODER_BUDGET, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        *args,
+        encoder_budget: int = ENCODER_BUDGET,
+        model_capabilities: dict | None = NO_RESUME,
+        **kwargs,
+    ):
+        super().__init__(*args, model_capabilities=model_capabilities, **kwargs)
         self.runner.model_config.is_multimodal_model = True
         self.scheduler.max_num_encoder_input_tokens = encoder_budget
         self.scheduler.encoder_cache_manager = EncoderCacheManager(
@@ -162,17 +174,17 @@ def test_a_multimodal_prompt_is_admitted_exactly_when_one_step_holds_it(
         checkpoint_alignment=BLOCK_SIZE,
     )
     config = h.scheduler.vllm_config
-    store_tt_mamba_spec_layers(config, True)
+    assert get_tt_supports_multimodal_prefill_resume(config) is False
     image = {"image": [PlaceholderRange(offset=image_offset, length=256)]}
     if not admitted:
         with pytest.raises(VLLMValidationError) as raised:
             _admit(config, prompt_len, image)
         assert str(raised.value) == (
-            f"This multimodal prompt has {prompt_len} tokens. This model keeps "
-            "recurrent state in MambaSpec blocks and prefills a multimodal "
-            f"prompt in one scheduler step, which holds at most {STEP} prompt "
-            f"tokens (max_num_batched_tokens={STEP}). Send a shorter prompt, "
-            "or raise that limit at launch."
+            f"This multimodal prompt has {prompt_len} tokens. This model "
+            "prefills a multimodal prompt from position 0 in one scheduler "
+            f"step, which holds at most {STEP} prompt tokens "
+            f"(max_num_batched_tokens={STEP}). Send a shorter prompt, or raise "
+            "that limit at launch."
         )
         # A text prompt of the same length is chunked as before.
         _admit(config, prompt_len, {})
@@ -208,10 +220,18 @@ def test_the_step_limit_counts_draft_slots_and_ends_on_a_kv_block():
     assert multimodal_prefill_limit(config)[0] == 4997
 
 
-def test_a_model_without_mamba_spec_admits_long_multimodal_prompts():
-    h = _MultimodalHarness(num_blocks=64, max_num_batched_tokens=STEP, mode="align")
+@pytest.mark.parametrize("capabilities", RESUMES)
+def test_a_model_that_resumes_multimodal_prefill_admits_long_prompts(capabilities):
+    """A model with MambaSpec layers that declares
+    supports_multimodal_prefill_resume True, or omits it, gets no step limit."""
+    h = _MultimodalHarness(
+        num_blocks=64,
+        max_num_batched_tokens=STEP,
+        mode="align",
+        model_capabilities=capabilities,
+    )
     config = h.scheduler.vllm_config
-    store_tt_mamba_spec_layers(config, False)
+    assert get_tt_supports_multimodal_prefill_resume(config) is True
     _admit(config, 10_000, {"image": [PlaceholderRange(offset=4000, length=256)]})
 
 
@@ -363,12 +383,47 @@ def test_a_preempted_multimodal_request_replays_from_zero_with_its_pixels(mode):
     assert continued, "no replay continued after its first chunk"
 
 
+@pytest.mark.parametrize("capabilities", RESUMES)
+def test_a_model_that_resumes_multimodal_prefill_chunks_and_reads_the_cache(
+    capabilities,
+):
+    """With supports_multimodal_prefill_resume True, or the key absent, a
+    multimodal request of a model with MambaSpec layers is chunked at
+    long_prefill_token_threshold like the text request it shares steps with,
+    and a second request with the same tokens and image starts from the state
+    vLLM kept at 3072, before the image."""
+    h = _MultimodalHarness(
+        num_blocks=64,
+        max_num_batched_tokens=STEP,
+        mode="align",
+        checkpoint_alignment=BLOCK_SIZE,
+        model_capabilities=capabilities,
+    )
+    h.scheduler.scheduler_config.long_prefill_token_threshold = 1024
+    prompt = _prompt(4, 3400)
+    h.add("t", 6000)
+    h.add_mm("m1", prompt, [_item("img-a", 3100, 256)])
+    h.run()
+    h.add_mm("m2", list(prompt), [_item("img-a", 3100, 256)])
+    h.run()
+
+    assert len(h.prefill_spans["m1"]) > 1
+    assert max(b - a for a, b in h.prefill_spans["m1"]) <= 1024
+    assert h.hits["m2"] == [3072]
+    assert h.prefill_spans["m2"] == [(3072, 3400)]
+    for req_id in ("m1", "m2"):
+        assert not h.requests[req_id].skip_reading_prefix_cache
+    assert h.cached_states_checked
+
+
 # endregion
 
 # region Models without MambaSpec layers
 
 
-def _attention_only_scheduler(encoder_budget: int):
+def _attention_only_scheduler(
+    encoder_budget: int, model_capabilities: dict | None = None
+):
     """A real ``TTScheduler`` of a model with one attention group."""
     from tests.test_mamba_kv_cache import _vllm_config
 
@@ -376,7 +431,11 @@ def _attention_only_scheduler(encoder_budget: int):
         block_size=BLOCK_SIZE, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
     )
     specs = {f"model.layers.{i}.self_attn": attention for i in range(4)}
-    scheduler = _scheduler(_kv_cache_config(_vllm_config(), specs, 64), STEP)
+    scheduler = _scheduler(
+        _kv_cache_config(_vllm_config(), specs, 64),
+        STEP,
+        model_capabilities=model_capabilities,
+    )
     scheduler.max_num_encoder_input_tokens = encoder_budget
     scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=encoder_budget)
     return scheduler
@@ -397,9 +456,9 @@ def _request(req_id: str, prompt_len: int, items) -> Request:
 
 
 def test_multimodal_requests_of_a_model_without_mamba_spec_are_unchanged():
-    """Without MambaSpec layers vLLM's rules stay: the request may read the
-    prefix cache, a prompt longer than a step is chunked, and a full encoder
-    budget ends the chunk before the item."""
+    """Without MambaSpec layers and without the declaration vLLM's rules stay:
+    the request may read the prefix cache, a prompt longer than a step is
+    chunked, and a full encoder budget ends the chunk before the item."""
     scheduler = _attention_only_scheduler(encoder_budget=200)
     request = _request("m", 6000, [_item("img", 1000, 256)])
     scheduler.add_request(request)
@@ -407,3 +466,23 @@ def test_multimodal_requests_of_a_model_without_mamba_spec_are_unchanged():
 
     assert not request.skip_reading_prefix_cache
     assert out.num_scheduled_tokens == {"m": 1000}
+
+
+def test_the_declaration_alone_keeps_a_multimodal_prompt_whole():
+    """A model without MambaSpec layers that declares
+    supports_multimodal_prefill_resume False gets the same rules: no prefix
+    reads, the whole prompt in one step past long_prefill_token_threshold, and
+    a request that the encoder budget cannot take waits."""
+    scheduler = _attention_only_scheduler(ENCODER_BUDGET, NO_RESUME)
+    scheduler.scheduler_config.long_prefill_token_threshold = 1024
+    request = _request("m", 3000, [_item("img", 1000, 256)])
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+
+    assert request.skip_reading_prefix_cache
+    assert out.num_scheduled_tokens == {"m": 3000}
+
+    scheduler = _attention_only_scheduler(200, NO_RESUME)
+    request = _request("w", 3000, [_item("img", 1000, 256)])
+    scheduler.add_request(request)
+    assert scheduler.schedule().num_scheduled_tokens == {}

@@ -158,12 +158,17 @@ def _scheduler(
     prefill_chunk_alignment: int | None = None,
     spec_plan: SpecPlan | None = None,
     spec_method: str = MODEL_OWNED_DRAFT_METHOD,
+    model_capabilities: dict | None = None,
 ) -> TTScheduler:
     """A real ``TTScheduler`` over a real ``KVCacheManager``.
 
     Prefix caching is on exactly in mode ``align``. With ``spec_plan`` the
-    scheduler schedules the drafts of the model-owned drafter.
+    scheduler schedules the drafts of the model-owned drafter. The platform
+    hook reads ``model_capabilities`` off the stub model class.
     """
+    model_class = type(
+        "_StubModel", (_StubModel,), {"model_capabilities": model_capabilities}
+    )
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
         dtype="float16",
@@ -195,7 +200,7 @@ def _scheduler(
         ),
         patch(
             "vllm.model_executor.model_loader.utils.get_model_architecture",
-            return_value=(_StubModel, None),
+            return_value=(model_class, None),
         ),
     ):
         config = VllmConfig(
@@ -399,6 +404,7 @@ class _Harness:
         narrow_decode: bool = True,
         offers: tuple[int, ...] | None = None,
         spec_method: str = MODEL_OWNED_DRAFT_METHOD,
+        model_capabilities: dict | None = None,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -438,6 +444,7 @@ class _Harness:
             prefix_match_unit,
             spec_plan=spec_plan,
             spec_method=spec_method,
+            model_capabilities=model_capabilities,
         )
         self.hash_block_size = self.scheduler.hash_block_size
         self.model = (

@@ -64,7 +64,7 @@ _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
 _SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 _SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
-_MAMBA_SPEC_LAYERS_KEY = "_tt_mamba_spec_layers"
+_SUPPORTS_MULTIMODAL_PREFILL_RESUME_KEY = "_tt_supports_multimodal_prefill_resume"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -312,20 +312,37 @@ def store_tt_supports_device_grammar(
     additional[_SUPPORTS_DEVICE_GRAMMAR_KEY] = supported
 
 
-def get_tt_mamba_spec_layers(vllm_config: "VllmConfig") -> bool:
-    """Return whether the model class declares ``MambaSpec`` layers."""
+def get_tt_supports_multimodal_prefill_resume(vllm_config: "VllmConfig") -> bool:
+    """Return the model's validated ``supports_multimodal_prefill_resume``, or
+    ``True``, the capability's default, when the platform stored none."""
     additional = getattr(vllm_config, "additional_config", None) or {}
-    return bool(additional.get(_MAMBA_SPEC_LAYERS_KEY, False))
+    return bool(additional.get(_SUPPORTS_MULTIMODAL_PREFILL_RESUME_KEY, True))
 
 
-def store_tt_mamba_spec_layers(vllm_config: "VllmConfig", declared: bool) -> None:
-    """Store whether the model class declares ``MambaSpec`` layers, for the
-    frontend's request validation, which runs without the KV cache groups."""
+def validate_and_store_tt_supports_multimodal_prefill_resume(
+    vllm_config: "VllmConfig", model_capabilities: dict | None, model_class: type
+) -> None:
+    """Validate ``supports_multimodal_prefill_resume`` and store it, for
+    ``TTScheduler`` and the frontend's request validation, which have no model
+    class to ask.
+
+    Raises:
+        ValueError: the declaration is not a boolean.
+    """
+    supported = (model_capabilities or {}).get(
+        "supports_multimodal_prefill_resume", True
+    )
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {model_class.__module__}.{model_class.__name__} must declare "
+            "model_capabilities['supports_multimodal_prefill_resume'] as a "
+            f"boolean, got {supported!r}"
+        )
     additional = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional, dict):
         additional = {}
         vllm_config.additional_config = additional
-    additional[_MAMBA_SPEC_LAYERS_KEY] = bool(declared)
+    additional[_SUPPORTS_MULTIMODAL_PREFILL_RESUME_KEY] = supported
 
 
 def get_tt_supports_stage_inputs(vllm_config: "VllmConfig") -> bool:
