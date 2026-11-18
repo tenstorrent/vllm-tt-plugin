@@ -95,6 +95,7 @@ def _runner() -> SimpleNamespace:
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         supports_stage_inputs=False,
+        supports_prefill_next_token_ids=False,
         model_config=SimpleNamespace(
             is_multimodal_model=False, max_model_len=MAX_MODEL_LEN
         ),

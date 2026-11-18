@@ -444,6 +444,7 @@ def test_submit_prefill_forwards_plan_empty_slots_to_model():
         multi_modal_kwargs={},
         perform_device_sampling=False,
         prefill_empty_slots=[4],
+        prefill_next_token_ids=None,
     )
 
     # Multi-lane batch (len > 1) so the empty-slots path is exercised; the

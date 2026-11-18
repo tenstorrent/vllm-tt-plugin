@@ -27,6 +27,7 @@ from vllm_tt_plugin.config import (
     TT_LANE_SCHEDULER_CLS,
     TT_SCHEDULER_CLS,
     TT_WORKER_CLS,
+    get_tt_supports_prefill_next_token_ids,
     get_tt_supports_stage_inputs,
     get_tt_supports_stage_outputs,
     resolve_tt_scheduler_cls,
@@ -230,6 +231,42 @@ class TestDPModes:
 
         with pytest.raises(ValueError, match="lane mode does not pass stage inputs"):
             self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+    @pytest.mark.parametrize(
+        ("capabilities", "lane_count", "expected"),
+        [
+            ({"prefill_next_token_ids": True}, 1, True),
+            # Lane prefill builds pass the token too.
+            ({"prefill_next_token_ids": True}, 2, True),
+            ({}, 1, False),
+            # A non-boolean declaration is refused.
+            ({"prefill_next_token_ids": 1}, 1, None),
+        ],
+    )
+    def test_check_and_update_config_stores_prefill_next_token_ids(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+        capabilities: dict,
+        lane_count: int,
+        expected: bool | None,
+    ) -> None:
+        """The declaration reaches the flag ``TTModelRunner.__init__`` reads."""
+        if lane_count > 1:
+            vllm_config.additional_config = {"_tt_resolved_lane_count": lane_count}
+            vllm_config.parallel_config.data_parallel_size = 1
+        dummy_model_class.model_capabilities = capabilities
+
+        if expected is None:
+            with pytest.raises(
+                ValueError, match=r"prefill_next_token_ids'\] as a bool"
+            ):
+                self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+            return
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert get_tt_supports_prefill_next_token_ids(vllm_config) is expected
 
     def test_check_and_update_config_stores_stage_output_support(
         self,

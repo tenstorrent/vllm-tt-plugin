@@ -308,14 +308,18 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert b.occupied_rows() == []
 
 
-def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
+@pytest.mark.parametrize("num_lanes, lane", [(1, 0), (2, 1)])
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(
+    monkeypatch, num_lanes, lane
+):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
 
-    batch = _lane_batch(num_lanes=1, per_lane=1)
+    batch = _lane_batch(num_lanes=num_lanes, per_lane=1)
     request = _make_req("request", list(range(8)), [], dict(temperature=0.0))
-    row = _add_to_lane(batch, request, lane=0)
+    row = _add_to_lane(batch, request, lane=lane)
+    assert row == lane
     # Two prompt tokens already computed; this step schedules one more, so the
     # chunk ends at position 3 while the prompt runs to 8.
     batch.num_computed_tokens_cpu[row] = 2
@@ -325,12 +329,12 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
     scheduler_output.total_num_scheduled_tokens = 1
     plan = TTStepPlan(
         is_decode=False,
-        capacity=1,
+        capacity=num_lanes,
         scheduled_req_ids=("request",),
         scheduled_rows=(row,),
         input_rows=(row,),
         req_id_to_row={"request": row},
-        batch_size_per_dp=(1,),
+        batch_size_per_dp=tuple(int(i == lane) for i in range(num_lanes)),
         prefill_empty_slots=(row,),
     )
     runner = _without_speculation(
@@ -341,6 +345,7 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
             _output_tokens_per_step=1,
             model_config=SimpleNamespace(is_multimodal_model=False),
             requests={"request": request},
+            supports_prefill_next_token_ids=False,
         )
     )
 
@@ -362,8 +367,9 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
     assert model_input.perform_device_sampling is False
     assert model_input.prefill_next_token_ids is None
     # A model declaring prefill_next_token_ids also gets the next chunk's first
-    # prompt token, which ``input_tokens`` stops short of.
-    runner._prefill_next_token_ids = True
+    # prompt token, which ``input_tokens`` stops short of, read from the
+    # request's own row (lane 1's row in a two-lane batch).
+    runner.supports_prefill_next_token_ids = True
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
     assert model_input.prefill_next_token_ids.tolist() == [3]
 
@@ -1084,6 +1090,7 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         _output_tokens_per_step=1,
         _block_tables_per_layer=lambda _: None,
         requests={"prompt": prompt, "waiting": waiting},
+        supports_prefill_next_token_ids=False,
     )
     _without_speculation(runner)
     runner.check_perform_device_sampling = (

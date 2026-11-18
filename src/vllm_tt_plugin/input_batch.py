@@ -1593,7 +1593,7 @@ class TTLaneInputBatch(InputBatch):
                 prompt_lens,
                 intermediate_prefill_mask,
             )
-            if getattr(runner, "_prefill_next_token_ids", False)
+            if runner.supports_prefill_next_token_ids
             else None
         )
 
