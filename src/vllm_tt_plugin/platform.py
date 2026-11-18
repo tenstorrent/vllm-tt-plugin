@@ -21,11 +21,11 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
-    get_tt_mamba_spec_layers,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
+    get_tt_supports_multimodal_prefill_resume,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
@@ -35,12 +35,13 @@ from vllm_tt_plugin.config import (
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
-    store_tt_mamba_spec_layers,
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_multimodal_prefill_resume,
+    validate_and_store_tt_supports_prefill_resume_inside_kv_block,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
     validate_tt_scheduler_config,
@@ -332,10 +333,13 @@ def _allow_chunked_mm_input_in_mamba_align(vllm_config: "VllmConfig") -> None:
     ``mamba_cache_mode`` "align", because vLLM's roll-back to the start of a
     multimodal item would undo its block-aligned split.
     ``_apply_chunked_prefill_policy`` sets the flag for every model with
-    chunked prefill. ``TTScheduler._multimodal_prefill_grant`` keeps every
-    multimodal item of a ``MambaSpec`` model's request in its first prefill
-    chunk instead. Must run after prefix caching is resolved: turning prefix
-    caching off resets the mode to "none".
+    chunked prefill. For a model that declares
+    ``supports_multimodal_prefill_resume`` False,
+    ``TTScheduler._multimodal_prefill_grant`` keeps every multimodal item of a
+    request in its first prefill chunk instead; a model that declares True
+    must continue a prefill that starts or ends inside a multimodal item. Must
+    run after prefix caching is resolved: turning prefix caching off resets the
+    mode to "none".
     """
     if getattr(vllm_config.cache_config, "mamba_cache_mode", None) == "align":
         vllm_config.scheduler_config.disable_chunked_mm_input = False
@@ -2075,11 +2079,16 @@ class TTPlatform(Platform):
         )
 
         declares_mamba_spec = _declares_mamba_spec(vllm_config, model_class)
-        store_tt_mamba_spec_layers(vllm_config, declares_mamba_spec)
+        validate_and_store_tt_supports_multimodal_prefill_resume(
+            vllm_config, model_capabilities, model_class
+        )
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
+        validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+            vllm_config, model_capabilities, model_class
+        )
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
             raise ValueError(
@@ -2835,12 +2844,12 @@ class TTPlatform(Platform):
     def _reject_multimodal_prompt_longer_than_a_step(
         cls, processed_inputs: "EngineInput"
     ) -> None:
-        """Reject a multimodal prompt that a ``MambaSpec`` model cannot prefill.
+        """Reject a multimodal prompt longer than one scheduler step for a
+        model that declares ``supports_multimodal_prefill_resume`` False.
 
         ``TTScheduler._multimodal_prefill_grant`` prefills a multimodal prompt
-        of a model with ``MambaSpec`` layers in one scheduler step, so a longer
-        prompt could never be scheduled, even when each of its items fits a
-        step.
+        of such a model in one scheduler step, so a longer prompt could never
+        be scheduled, even when each of its items fits a step.
         """
         from vllm.exceptions import VLLMValidationError
 
@@ -2851,17 +2860,18 @@ class TTPlatform(Platform):
         vllm_config = _tt_request_vllm_config.get()
         if vllm_config is None:
             vllm_config = cls._resolve_tt_admission_handle()
-        if vllm_config is None or not get_tt_mamba_spec_layers(vllm_config):
+        if vllm_config is None or get_tt_supports_multimodal_prefill_resume(
+            vllm_config
+        ):
             return
         prompt_len = len(processed_inputs.get("prompt_token_ids") or ())
         limit, bound = multimodal_prefill_limit(vllm_config)
         if prompt_len > limit:
             raise VLLMValidationError(
                 f"This multimodal prompt has {prompt_len} tokens. This model "
-                "keeps recurrent state in MambaSpec blocks and prefills a "
-                "multimodal prompt in one scheduler step, which holds at most "
-                f"{limit} prompt tokens ({bound}). Send a shorter prompt, or "
-                "raise that limit at launch."
+                "prefills a multimodal prompt from position 0 in one scheduler "
+                f"step, which holds at most {limit} prompt tokens ({bound}). "
+                "Send a shorter prompt, or raise that limit at launch."
             )
 
     @classmethod

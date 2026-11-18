@@ -4,6 +4,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 from vllm.config import (
     CacheConfig,
@@ -16,7 +17,7 @@ from vllm.config import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from tests.test_block_scheduler import LOCAL_MODEL_CONFIG, _stub_model_resolution
-from vllm_tt_plugin.config import get_tt_mamba_spec_layers
+from vllm_tt_plugin.config import get_tt_supports_multimodal_prefill_resume
 
 
 def test_the_tt_class_decides_multimodal_input_support(monkeypatch):
@@ -54,9 +55,12 @@ def test_the_tt_class_decides_multimodal_input_support(monkeypatch):
     assert config.model_config.supports_multimodal_inputs is False
 
 
-def _launch(monkeypatch, *, mamba: bool, multimodal: bool) -> VllmConfig:
+def _launch(
+    monkeypatch, *, mamba: bool, multimodal: bool, capabilities: dict | None = None
+) -> VllmConfig:
     """A launch with prefix caching and chunked prefill of a TT model class
-    that declares both, for an architecture vLLM gives a Mamba cache config.
+    that declares both, and ``capabilities``, for an architecture vLLM gives a
+    Mamba cache config.
 
     The class's ``get_kv_cache_spec`` returns an attention layer and, with
     ``mamba``, a ``MambaSpec`` layer. ``multimodal`` makes the launch accept
@@ -67,6 +71,7 @@ def _launch(monkeypatch, *, mamba: bool, multimodal: bool) -> VllmConfig:
         model_capabilities = {
             "supports_prefix_caching": True,
             "supports_chunked_prefill": True,
+            **(capabilities or {}),
         }
 
         @staticmethod
@@ -123,17 +128,44 @@ def _launch(monkeypatch, *, mamba: bool, multimodal: bool) -> VllmConfig:
         )
 
 
-def test_multimodal_launch_of_a_mamba_model_keeps_align_and_chunking(monkeypatch):
-    """TTScheduler keeps a multimodal prompt of a MambaSpec model whole and
-    off the prefix cache, so the launch keeps both features for text."""
-    config = _launch(monkeypatch, mamba=True, multimodal=True)
+@pytest.mark.parametrize("supported", [False, True, None])
+def test_multimodal_launch_of_a_mamba_model_keeps_align_and_chunking(
+    monkeypatch, supported
+):
+    """The launch keeps both features for text whatever the model declares
+    for supports_multimodal_prefill_resume; the platform stores the
+    declaration, True when absent, for TTScheduler and the frontend."""
+    config = _launch(
+        monkeypatch,
+        mamba=True,
+        multimodal=True,
+        capabilities=(
+            None
+            if supported is None
+            else {"supports_multimodal_prefill_resume": supported}
+        ),
+    )
 
     assert config.cache_config.enable_prefix_caching is True
     assert config.cache_config.mamba_cache_mode == "align"
     assert config.scheduler_config.enable_chunked_prefill is True
     # VllmConfig.validate_block_size rejects the flag in mode align.
     assert config.scheduler_config.disable_chunked_mm_input is False
-    assert get_tt_mamba_spec_layers(config) is True
+    assert get_tt_supports_multimodal_prefill_resume(config) is (supported is not False)
+
+
+def test_a_non_boolean_multimodal_prefill_resume_is_rejected(monkeypatch):
+    with pytest.raises(
+        ValueError,
+        match=r"model_capabilities\['supports_multimodal_prefill_resume'\] as a "
+        "boolean, got 0",
+    ):
+        _launch(
+            monkeypatch,
+            mamba=True,
+            multimodal=True,
+            capabilities={"supports_multimodal_prefill_resume": 0},
+        )
 
 
 def test_text_only_launch_of_a_mamba_model_keeps_align_and_chunking(monkeypatch):
@@ -155,4 +187,4 @@ def test_multimodal_launch_of_a_model_without_mamba_spec_is_unchanged(monkeypatc
     assert config.cache_config.mamba_cache_mode == "align"
     assert config.scheduler_config.enable_chunked_prefill is True
     assert config.scheduler_config.disable_chunked_mm_input is True
-    assert get_tt_mamba_spec_layers(config) is False
+    assert get_tt_supports_multimodal_prefill_resume(config) is True
