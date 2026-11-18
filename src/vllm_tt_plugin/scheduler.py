@@ -432,6 +432,10 @@ class TTScheduler(AsyncScheduler):
         # kept for the next schedule() call. See _schedule_release_step.
         self._unreleased_step: SchedulerOutput | None = None
         self._deferred_prefill: SchedulerOutput | None = None
+        # Cleanup that waits for the kept prefill to run; see
+        # _order_cleanup_around_kept_prefill.
+        self._finished_after_kept_prefill: set[str] = set()
+        self._freed_encoder_after_kept_prefill: list[str] = []
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -929,11 +933,49 @@ class TTScheduler(AsyncScheduler):
             result = super().schedule()
             return self._finalize_scheduler_output(result, is_decode=True)
 
+        kept = getattr(self, "_deferred_prefill", None)
         result = self._schedule_default_mode(has_pending_prefill, has_running_decode)
+        self._order_cleanup_around_kept_prefill(kept, result)
         self._unreleased_step = (
             result if getattr(result, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()) else None
         )
         return result
+
+    def _order_cleanup_around_kept_prefill(
+        self, kept: SchedulerOutput | None, result: SchedulerOutput
+    ) -> None:
+        """Keep cleanup for a kept prefill's requests until that prefill has run.
+
+        ``_schedule_default_mode`` returns another step while a prefill is kept
+        only under a pause in mode "keep". The base pass of that step drains
+        the cleanup of a request aborted during the pause.
+        ``TTModelRunner._update_states`` applies ``finished_req_ids`` before it
+        reads the scheduled rows. If a kept row's request were finished first,
+        the kept prefill would recreate it from ``scheduled_new_reqs`` and
+        nothing would remove it again, or, for a chunked-prefill continuation,
+        would not find it in ``requests``. So those ``finished_req_ids``, and
+        every freed encoder entry (a kept chunk can read its request's encoder
+        output), go to the first step after the kept prefill. That is the order
+        an abort between the two calls gets outside a pause.
+        """
+        finished = getattr(self, "_finished_after_kept_prefill", set())
+        freed = getattr(self, "_freed_encoder_after_kept_prefill", [])
+        if result is kept:
+            return
+        if kept is not None:
+            kept_finished = result.finished_req_ids & kept.num_scheduled_tokens.keys()
+            result.finished_req_ids -= kept_finished
+            self._finished_after_kept_prefill = finished | kept_finished
+            self._freed_encoder_after_kept_prefill = (
+                freed + result.free_encoder_mm_hashes
+            )
+            result.free_encoder_mm_hashes = []
+            return
+        if finished or freed:
+            result.finished_req_ids |= finished
+            result.free_encoder_mm_hashes = freed + result.free_encoder_mm_hashes
+            self._finished_after_kept_prefill = set()
+            self._freed_encoder_after_kept_prefill = []
 
     def _schedule_default_mode(
         self, has_pending_prefill: bool, has_running_decode: bool
@@ -1130,7 +1172,9 @@ class TTScheduler(AsyncScheduler):
         the runner can discard them only after the prefill has run. A request
         aborted in between is still prefilled; the runner drops it with the
         next step's ``finished_req_ids``. Under a pause in mode "keep" the
-        prefill is not handed out until the pause ends.
+        prefill is not handed out until the pause ends, and
+        ``_order_cleanup_around_kept_prefill`` keeps the cleanup of its
+        requests until after it.
 
         Every queue is hidden, so the base scheduler schedules nothing and
         preempts nothing, and the step carries only what the pass drains.

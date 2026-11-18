@@ -534,3 +534,41 @@ def test_a_keep_pause_while_a_prefill_is_kept(clear_cache, abort_a):
         assert log.index(("discard", ("B",))) < log.index(("resume", ("B",)))
     assert engine.released == {"A": paused["released_a"] if abort_a else 6, "B": 3}
     _no_unreleased_token_applied(engine)
+
+
+@pytest.mark.parametrize("chunked", [False, True], ids=["new", "continuation"])
+def test_an_abort_of_the_kept_request_during_a_keep_pause(chunked):
+    # The abort makes the engine step during the pause. The empty step must not
+    # drop B from the runner before B's kept prefill runs: the prefill would
+    # recreate a new B and leave it behind, or miss a continued B.
+    paused = {"iterations": -1}
+    scheduler = _async_scheduler()
+    arrivals = _prefill_after_a_decode()
+    if chunked:
+        scheduler.scheduler_config.enable_chunked_prefill = True
+        scheduler.max_num_scheduled_tokens = 64
+        arrivals[3] = [_request(3, request_id="B", prompt_length=200)]
+
+    def between(engine) -> None:
+        if paused["iterations"] < 0:
+            kept = engine.scheduler._deferred_prefill
+            if kept is not None and (
+                not chunked or "B" in kept.scheduled_cached_reqs.req_ids
+            ):
+                paused["iterations"] = 0
+                EngineCore.pause_scheduler(engine, mode="keep", clear_cache=False)
+            return
+        paused["iterations"] += 1
+        if paused["iterations"] == 1:
+            engine.scheduler.finish_requests("B", RequestStatus.FINISHED_ABORTED)
+        if paused["iterations"] == 3:
+            EngineCore.resume_scheduler(engine)
+
+    engine = _serve(scheduler, arrivals, between)
+
+    assert paused["iterations"] >= 3
+    assert engine.released["A"] == 6
+    assert engine.released["B"] == 0
+    assert not engine.model_executor.runner.requests
+    assert not engine.scheduler._finished_after_kept_prefill
+    _no_unreleased_token_applied(engine)
