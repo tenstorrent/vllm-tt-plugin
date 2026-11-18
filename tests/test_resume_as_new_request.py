@@ -322,7 +322,11 @@ def test_lane_resume_rebuilds_the_row_from_its_record_and_held_state():
 
 def test_lane_request_scheduled_as_new_on_its_own_row_drops_its_old_row_state():
     """The coordinator keeps a row for a request that still holds one, so a
-    streaming-input continuation is placed on the row it already occupies."""
+    streaming-input continuation is placed on the row it already occupies.
+    The rebuilt row is a layout change: the coordinator reports one for this
+    step (``test_a_request_listed_as_new_on_the_row_it_holds_changes_the_layout``
+    in ``test_lane_scheduler.py``), and ``TTModelRunner`` requires the two to
+    agree."""
     b = _lane_batch(num_lanes=1, per_lane=2)
     requests: dict = {}
     b.apply_step_plan(
@@ -334,13 +338,14 @@ def test_lane_request_scheduled_as_new_on_its_own_row_drops_its_old_row_state():
     assert 0 in b.sampling.generators
 
     continuation = _record("a", PROMPT + [31, 32], num_computed_tokens=len(PROMPT))
-    b.apply_step_plan(
+    layout_changed = b.apply_step_plan(
         _step_output(new_reqs=[continuation]),
         _plan({"a": 0}, capacity=2),
         requests,
         {},
     )
 
+    assert layout_changed is True
     assert b.req_id_to_index == {"a": 0}
     assert 0 not in b.sampling.generators
     assert b.num_tokens[0] == len(PROMPT) + 2
