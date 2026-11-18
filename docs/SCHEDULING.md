@@ -461,7 +461,11 @@ finalized when it is kept and returned unchanged:
   its output, with the next step's `finished_req_ids`.
 - During a pause in mode "keep" the prefill is not returned until the pause
   ends, although the engine still calls `schedule()` while finished requests
-  wait to be reported.
+  wait to be reported. The empty steps of those calls do not carry the
+  `finished_req_ids` of the kept prefill's requests or any freed encoder
+  entries. `TTScheduler` adds them to the first step after the kept prefill,
+  so a request aborted during the pause is prefilled and then dropped, as
+  outside a pause.
 
 Each empty step costs one engine iteration, in which `EngineCoreProc` sleeps
 1 ms because nothing executed. The runner drains pending async decode for an
