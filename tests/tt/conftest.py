@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
+import httpx
 import openai
 import pytest
 
@@ -128,6 +129,19 @@ def recall_reasoning_token_budget(request):
             "--tt-recall-reasoning-token-budget must be non-negative"
         )
     return budget
+
+
+@pytest.fixture(scope="session")
+def server_speculates(tt_server_url):
+    """Whether the server runs speculative decoding.
+
+    vLLM registers its ``vllm:spec_decode_*`` counters at startup exactly when
+    ``speculative_config`` is set, so their presence in ``/metrics`` is the
+    launch flag, read before any request.
+    """
+    response = httpx.get(f"{tt_server_url.rstrip('/')}/metrics", timeout=30)
+    response.raise_for_status()
+    return "vllm:spec_decode_num_drafts_total" in response.text
 
 
 @pytest.fixture(scope="session")
