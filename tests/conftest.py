@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 # `TTPlatform.check_and_update_config` records its results on the class rather
 # than on the config it is handed, so one test that calls it configures every
@@ -23,9 +25,19 @@ def reset_tt_platform_class_state():
     # finished resolving its platform plugins, and that import is circular.
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
+    import vllm.v1.engine.core_client as core_client
     import vllm.v1.engine.input_processor as input_processor
+    from vllm.entrypoints.launchers.utils import server_utils
 
     from vllm_tt_plugin.platform import TTPlatform
+
+    saved_lifespan = server_utils.lifespan
+    saved_lifespan_aliases = {
+        name: module.lifespan
+        for name in ("vllm.entrypoints.launchers.app",)
+        if (module := sys.modules.get(name)) is not None and hasattr(module, "lifespan")
+    }
+    saved_empty_cache = torch.accelerator.empty_cache
 
     unset = object()
     saved = {
@@ -50,8 +62,44 @@ def reset_tt_platform_class_state():
     saved_original_pause_scheduler = engine_core.__dict__.get(
         "_tt_original_pause_scheduler", unset
     )
+    # The DP routing patch wraps one method the load-balancing client defines
+    # and one it inherits, so each is restored to its own class dict state.
+    dp_client = core_client.DPLBAsyncMPClient
+    saved_dp_client_methods = {
+        name: dp_client.__dict__.get(name, unset)
+        for name in ("get_core_engine_for_request", "reset_prefix_cache_async")
+    }
+    saved_dp_client_markers = {
+        name: core_client.__dict__.get(name, unset)
+        for name in (
+            "_tt_original_get_core_engine_for_request",
+            "_tt_original_dp_reset_prefix_cache_async",
+        )
+    }
 
     yield
+
+    for name, value in saved_dp_client_methods.items():
+        if value is unset:
+            if name in dp_client.__dict__:
+                delattr(dp_client, name)
+        else:
+            setattr(dp_client, name, value)
+    for name, value in saved_dp_client_markers.items():
+        if value is unset:
+            core_client.__dict__.pop(name, None)
+        else:
+            setattr(core_client, name, value)
+
+    server_utils.lifespan = saved_lifespan
+    for name in ("vllm.entrypoints.launchers.app",):
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "lifespan"):
+            if name in saved_lifespan_aliases:
+                module.lifespan = saved_lifespan_aliases[name]
+            elif getattr(module.lifespan, "_tt_lifespan_gc_patch", False):
+                module.lifespan = saved_lifespan
+    torch.accelerator.empty_cache = saved_empty_cache
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler
@@ -119,6 +167,7 @@ def vllm_config() -> SimpleNamespace:
             max_model_len=4,
             original_max_model_len=None,
             is_moe=False,
+            multimodal_config=None,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(

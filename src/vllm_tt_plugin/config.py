@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from vllm_tt_plugin.logger import init_tt_logger
 
@@ -11,6 +11,10 @@ if TYPE_CHECKING:
     from vllm_tt_plugin.spec_decode import SpecPlan
 
 logger = init_tt_logger(__name__)
+
+TT_WORKER_CLS = "vllm_tt_plugin.worker.TTWorker"
+TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
+TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 
 
 def _extract_tt_config(
@@ -34,6 +38,18 @@ def get_tt_config(vllm_config: "VllmConfig") -> dict[str, Any]:
     return dict(additional_config)
 
 
+def get_tt_seeded_sampling_policy(
+    vllm_config: "VllmConfig",
+) -> Literal["auto", "host"]:
+    """Resolve the operator's sampling policy for explicitly seeded requests."""
+    policy = get_tt_config(vllm_config).get("seeded_sampling_policy", "auto")
+    if policy not in ("auto", "host"):
+        raise ValueError(
+            f"seeded_sampling_policy must be 'auto' or 'host', got {policy!r}"
+        )
+    return policy
+
+
 # Internal keys recording resolved platform state. Stored at the top level of
 # additional_config -- deliberately outside the user "tt" namespace -- so they
 # never collide with user config and read as platform-derived state rather than
@@ -46,6 +62,8 @@ _RESOLVED_LANE_COUNT_KEY = "_tt_resolved_lane_count"
 _OUTPUT_TOKENS_PER_STEP_KEY = "_tt_output_tokens_per_step"
 _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
+_SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
+_SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -293,6 +311,114 @@ def store_tt_supports_device_grammar(
     additional[_SUPPORTS_DEVICE_GRAMMAR_KEY] = supported
 
 
+def get_tt_supports_stage_inputs(vllm_config: "VllmConfig") -> bool:
+    """Return whether prefill passes each row's stage inputs to the model."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_STAGE_INPUTS_KEY, False))
+
+
+def validate_and_store_tt_supports_stage_inputs(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+    is_lane_mode: bool,
+) -> None:
+    """Validate ``supports_stage_inputs`` and store it on the vLLM config.
+
+    Raises:
+        ValueError: the declaration is not a boolean, or it is declared in
+            lane mode, whose prefill does not carry per-row stage inputs.
+    """
+    supported = (model_capabilities or {}).get("supports_stage_inputs", False)
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {name} must declare model_capabilities['supports_stage_inputs'] "
+            f"as a boolean, got {supported!r}"
+        )
+    if supported and is_lane_mode:
+        raise ValueError(
+            f"Model {name} declares model_capabilities['supports_stage_inputs']"
+            "=True, but TT lane mode does not pass stage inputs to prefill; "
+            f"got {get_tt_data_parallel_size(vllm_config)} lanes."
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_STAGE_INPUTS_KEY] = supported
+
+
+def get_tt_supports_stage_outputs(vllm_config: "VllmConfig") -> bool:
+    """Return whether the runner collects stage outputs after every decode."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_STAGE_OUTPUTS_KEY, False))
+
+
+def tt_requests_cannot_resume(vllm_config: "VllmConfig") -> bool:
+    """Whether a running request's state is lost if it is preempted.
+
+    A resume re-prefills from the token history, which holds neither a block-output
+    model's half-generated canvas nor the stage frames a stage model already emitted.
+    """
+    return is_tt_block_output_model(vllm_config) or get_tt_supports_stage_outputs(
+        vllm_config
+    )
+
+
+def resolve_tt_supports_stage_outputs(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+    is_lane_mode: bool,
+) -> None:
+    """Validate ``supports_stage_outputs`` and store it on the vLLM config.
+
+    A stage output is one stage frame per request per one-token decode step,
+    tagged through the front-packed build's row request IDs and decode positions.
+
+    The scheduler checks the remaining condition once it knows the KV pool: a
+    stage model's request cannot be preempted and resumed, so the pool must hold
+    every sequence at its peak.
+
+    Raises:
+        ValueError: the declaration is not a boolean, or it is declared with lane
+            mode, block output, speculative decoding or async decode (whose
+            overlapped steps build from host positions one step behind).
+    """
+    supported = (model_capabilities or {}).get("supports_stage_outputs", False)
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {name} must declare model_capabilities['supports_stage_outputs'] "
+            f"as a boolean, got {supported!r}"
+        )
+    if supported:
+        conflicts = []
+        if is_lane_mode:
+            conflicts.append(
+                f"lane mode ({get_tt_data_parallel_size(vllm_config)} lanes)"
+            )
+        output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
+        if output_tokens_per_step > 1:
+            conflicts.append(f"output_tokens_per_step={output_tokens_per_step}")
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            conflicts.append("speculative decoding")
+        if (model_capabilities or {}).get("supports_async_decode", False):
+            conflicts.append("supports_async_decode")
+        if conflicts:
+            raise ValueError(
+                f"Model {name} declares model_capabilities['supports_stage_outputs']"
+                "=True, which needs one-token front-packed decode steps; got "
+                + ", ".join(conflicts)
+            )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_STAGE_OUTPUTS_KEY] = supported
+
+
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":
     """Return the admitted speculative plan, or ``None``.
 
@@ -408,6 +534,97 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     )
 
 
+def resolve_tt_scheduler_cls(
+    requested: "str | type | None",
+    worker_cls: "str | type",
+    is_lane_mode: bool,
+) -> "str | type":
+    """Pair the scheduler with the TT worker that runs it.
+
+    A TT worker names the scheduler it needs in ``tt_scheduler_cls``. A
+    requested scheduler that derives from that class is kept. A requested
+    scheduler that the worker's class derives from is replaced by it: vLLM's
+    default scheduler arrives this way, and so do the stage schedulers that
+    vLLM-Omni writes into every stage's engine args. The parent and the
+    worker's re-apply see the same pair, so both resolve the same class.
+
+    Lane mode checks the declaration, not the worker class: a TTWorker
+    subclass that inherits ``TTScheduler`` runs under ``TTLaneCoordinator``.
+
+    Raises:
+        ValueError: the requested scheduler and the worker's TT scheduler are
+            unrelated, the worker declares no TT scheduler, or lane mode is
+            asked to run a scheduler other than the defaults, or a worker that
+            declares a TT scheduler other than ``TTScheduler``.
+    """
+    if requested is None and worker_cls == TT_WORKER_CLS:
+        return TT_LANE_SCHEDULER_CLS if is_lane_mode else TT_SCHEDULER_CLS
+
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+
+    def as_cls(obj: "str | type") -> type:
+        return resolve_obj_by_qualname(obj) if isinstance(obj, str) else obj
+
+    # TTWorker's own declaration, read without importing the worker module
+    # into the API-server process.
+    if worker_cls == TT_WORKER_CLS:
+        tt_scheduler_cls: str | type = TT_SCHEDULER_CLS
+    else:
+        tt_scheduler_cls = getattr(as_cls(worker_cls), "tt_scheduler_cls", None)
+        if tt_scheduler_cls is None:
+            raise ValueError(
+                f"TT worker {worker_cls!r} declares no tt_scheduler_cls, so no "
+                f"scheduler can be paired with it (requested: {requested!r})."
+            )
+    tt_scheduler = as_cls(tt_scheduler_cls)
+    requested_cls = None if requested is None else as_cls(requested)
+
+    if is_lane_mode:
+        if tt_scheduler is as_cls(TT_SCHEDULER_CLS) and (
+            requested_cls is None
+            or requested_cls is as_cls(TT_LANE_SCHEDULER_CLS)
+            or issubclass(tt_scheduler, requested_cls)
+        ):
+            return TT_LANE_SCHEDULER_CLS
+        raise ValueError(
+            "TT lane mode runs TTLaneCoordinator, which needs a worker that "
+            f"declares {TT_SCHEDULER_CLS!r}; got scheduler {requested!r} with "
+            f"worker {worker_cls!r} declaring {tt_scheduler_cls!r}."
+        )
+
+    if requested_cls is None:
+        return tt_scheduler_cls
+    if issubclass(requested_cls, tt_scheduler):
+        return requested
+    if issubclass(tt_scheduler, requested_cls):
+        return tt_scheduler_cls
+    raise ValueError(
+        f"Scheduler {requested!r} cannot run on TT worker {worker_cls!r}: the "
+        f"worker needs a subclass of {tt_scheduler_cls!r}, and that class does "
+        "not derive from the requested scheduler."
+    )
+
+
+def validate_tt_scheduler_config(vllm_config: "VllmConfig") -> None:
+    """Let the paired scheduler refuse a resolved TT config it cannot run.
+
+    A scheduler class may define a ``validate_tt_config(vllm_config)`` classmethod.
+    It runs here, after pairing and capability resolution, so a refusal comes
+    before any device opens; vLLM builds the scheduler only after the model loads.
+    TT's own schedulers define none and are not imported here.
+    """
+    scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+    if scheduler_cls in (TT_SCHEDULER_CLS, TT_LANE_SCHEDULER_CLS):
+        return
+    if isinstance(scheduler_cls, str):
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        scheduler_cls = resolve_obj_by_qualname(scheduler_cls)
+    validate = getattr(scheduler_cls, "validate_tt_config", None)
+    if validate is not None:
+        validate(vllm_config)
+
+
 # Decode-interleave policy. TT executes a step as all-prefill or all-decode, so
 # a run of prefill steps stalls every running decode for its whole duration.
 # These bound that run. Read by the scheduler and by the lane coordinator.
@@ -436,6 +653,43 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
             f"additional_config['tt']['{key}'] must be an integer >= 1, got {value!r}"
         )
     return value
+
+
+_LANE_PREFIX_CACHE_ROUTING_KEY = "lane_prefix_cache_routing"
+_LANE_PREFIX_CACHE_ROUTING_DEFAULT = True
+
+
+def get_tt_lane_prefix_cache_routing(vllm_config: "VllmConfig") -> bool:
+    """Whether lane mode routes a request to the lane holding its cached prefix.
+
+    Lanes keep separate prefix caches, so a prompt only hits the cache if it
+    lands on the lane that computed its prefix; ``False`` keeps plain
+    least-loaded routing (see ``TTLaneCoordinator._pick_lane``).
+    """
+    return _read_tt_bool(
+        get_tt_config(vllm_config),
+        _LANE_PREFIX_CACHE_ROUTING_KEY,
+        _LANE_PREFIX_CACHE_ROUTING_DEFAULT,
+    )
+
+
+_DP_PREFIX_CACHE_ROUTING_KEY = "dp_prefix_cache_routing"
+_DP_PREFIX_CACHE_ROUTING_DEFAULT = True
+
+
+def get_tt_dp_prefix_cache_routing(vllm_config: "VllmConfig") -> bool:
+    """Whether standard DP routes a request to the engine holding its prefix.
+
+    The lane rule applied to vLLM's DP load balancer: each engine keeps its
+    own prefix cache, so a prompt only hits the cache on the engine that was
+    sent its prefix; ``False`` leaves every request to vLLM's least-loaded
+    routing (see ``vllm_tt_plugin.prefix_routing.route_dp_request``).
+    """
+    return _read_tt_bool(
+        get_tt_config(vllm_config),
+        _DP_PREFIX_CACHE_ROUTING_KEY,
+        _DP_PREFIX_CACHE_ROUTING_DEFAULT,
+    )
 
 
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"

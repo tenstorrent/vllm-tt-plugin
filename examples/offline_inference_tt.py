@@ -19,7 +19,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
     build_async_engine_client_from_engine_args,
 )
-from vllm.inputs.data import TokensPrompt
+from vllm.inputs import TokensPrompt
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.v1.engine.async_llm import AsyncLLM
 

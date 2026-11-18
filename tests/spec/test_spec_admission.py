@@ -8,6 +8,7 @@ drive the admission function against ``FakeSpecModel`` and against models with
 deliberately incomplete declarations.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,7 @@ from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_FUSED_SAMPLE,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFF_ON_DEVICE,
+    HIDDEN_HANDOFF_ROUNDTRIP,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     SPEC_REQUIREMENT_HIDDEN_FEED,
     SpecPlan,
@@ -240,6 +242,76 @@ def test_the_model_owned_drafter_needs_a_declared_hidden_handoff():
     assert "spec_hidden_handoff" in str(excinfo.value)
 
 
+_HIDDEN_FEED = [SPEC_REQUIREMENT_DEVICE_PROPOSE, SPEC_REQUIREMENT_HIDDEN_FEED]
+
+
+@pytest.mark.parametrize(
+    "method, capabilities, keeps_narrow_decode",
+    [
+        (
+            MODEL_OWNED_DRAFT_METHOD,
+            {
+                "spec_requirements": _HIDDEN_FEED,
+                "spec_hidden_handoff": [HIDDEN_HANDOFF_ROUNDTRIP],
+            },
+            False,
+        ),
+        (
+            MODEL_OWNED_DRAFT_METHOD,
+            {
+                "spec_requirements": _HIDDEN_FEED,
+                "spec_hidden_handoff": [HIDDEN_HANDOFF_ON_DEVICE],
+            },
+            True,
+        ),
+        (
+            MODEL_OWNED_DRAFT_METHOD,
+            {"spec_requirements": [SPEC_REQUIREMENT_DEVICE_PROPOSE]},
+            True,
+        ),
+        (
+            RUNNABLE_METHOD,
+            {
+                "spec_requirements": _HIDDEN_FEED,
+                "spec_hidden_handoff": [HIDDEN_HANDOFF_ROUNDTRIP],
+            },
+            True,
+        ),
+    ],
+    ids=["roundtrip", "on-device", "no-hidden-feed", "host-proposer"],
+)
+def test_narrow_decode_is_revoked_for_a_drafter_an_ordinary_decode_cannot_feed(
+    method, capabilities, keeps_narrow_decode
+):
+    """The plan carries the launch's effective narrow decode, decided once.
+
+    An ordinary decode returns no ``VerifyOutput``, so it produces no hidden
+    handle. A model-owned drafter fed its target hidden state through the
+    runner would then be asked to draft from nothing, so that plan comes back
+    without ``supports_narrow_decode`` and every step of the launch verifies.
+    A host proposer is handed no hidden state, so nothing constrains it.
+
+    Decided in the plan rather than when the model loads, because per-request
+    admission runs in the front-end process, where no model is loaded, and
+    refuses a sampled request exactly when every step verifies.
+    """
+    variant = make_fake_spec_model(supports_narrow_decode=True)
+    plan = _admit(
+        _config(
+            method=method,
+            model=(
+                MODEL_OWNED_DRAFT_SENTINEL
+                if method == MODEL_OWNED_DRAFT_METHOD
+                else None
+            ),
+        ),
+        model_class=variant,
+        capabilities={"supports_spec_decode": True, **capabilities},
+    )
+
+    assert plan.supports_narrow_decode is keeps_narrow_decode
+
+
 def test_a_model_that_cannot_draft_is_refused_the_model_owned_method():
     """A model declaring no ``device_propose`` cannot be asked to draft."""
     variant = make_fake_spec_model()
@@ -257,19 +329,24 @@ def test_a_model_that_cannot_draft_is_refused_the_model_owned_method():
     assert SPEC_REQUIREMENT_DEVICE_PROPOSE in str(excinfo.value)
 
 
-def test_a_logits_only_plan_is_refused():
+def test_a_logits_only_plan_is_admitted():
+    """The host accept walk drives ``logits`` on its own, greedy rows included."""
+    variant = make_fake_spec_model(accept_modes=("logits",))
+    assert _admit(_config(), model_class=variant).accept_modes == ("logits",)
+
+
+def test_a_fused_sample_only_plan_is_refused():
     """A mode the runner never asks for cannot be the only one offered.
 
-    The runner requests ``argmax_ids`` on every step and refuses any other
-    answer, so a plan offering only ``logits`` would pass admission and fail on
-    its first decode.
+    No runner path consumes ``fused_sample``, so a plan offering only it would
+    pass admission and fail on its first decode.
     """
-    variant = make_fake_spec_model(accept_modes=("logits",))
+    variant = make_fake_spec_model(accept_modes=("fused_sample",))
     with pytest.raises(ValueError) as excinfo:
         _admit(_config(), model_class=variant)
     message = str(excinfo.value)
-    assert "logits" in message
-    assert "argmax_ids" in message
+    assert "fused_sample" in message
+    assert "argmax_ids" in message and "logits" in message
 
 
 def test_a_plan_offering_more_than_the_runner_drives_is_still_admitted():
@@ -399,6 +476,39 @@ def test_a_plan_above_the_requested_draft_length_is_refused():
     assert "8" in str(excinfo.value)
 
 
+class _DraftCapByRowsModel(FakeSpecModel):
+    @classmethod
+    def spec_plan(cls, vllm_config, max_num_seqs, requested_k):
+        del vllm_config, max_num_seqs, requested_k
+        return SpecPlan(
+            effective_k=7,
+            lanes_per_request=8,
+            extra_bytes_per_seq=0,
+            extra_bytes_per_token=0,
+            accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+            drafter_state="internal",
+            k_by_rows=((4, 7), (8, 3)),
+        )
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 5, 8])
+def test_a_draft_cap_mapping_covering_the_concurrency_is_admitted(max_num_seqs):
+    plan = _admit(
+        _config(requested_k=7, max_num_seqs=max_num_seqs),
+        model_class=_DraftCapByRowsModel,
+    )
+    assert plan.k_by_rows == ((4, 7), (8, 3))
+
+
+def test_a_draft_cap_mapping_short_of_the_concurrency_is_refused():
+    """Nine live rows would otherwise raise inside the runner, mid-serving."""
+    with pytest.raises(ValueError, match="below max_num_seqs=9"):
+        _admit(
+            _config(requested_k=7, max_num_seqs=9),
+            model_class=_DraftCapByRowsModel,
+        )
+
+
 def test_a_plan_of_the_wrong_type_is_refused():
     class _WrongTypeModel(FakeSpecModel):
         @classmethod
@@ -436,6 +546,16 @@ def test_the_admitted_plan_round_trips_through_the_config():
     store_tt_spec_plan(config, plan)
     # Equal, not identical: the plan is stored as a dictionary so
     # additional_config stays JSON-encodable, and rebuilt on the way out.
+    assert get_tt_spec_plan(config) == plan
+
+
+def test_a_draft_cap_mapping_survives_a_json_round_trip_of_the_config():
+    # json.dumps writes a tuple as a list, and the rebuilt plan must still
+    # equal the admitted one.
+    config = _config(requested_k=7, max_num_seqs=8)
+    plan = _admit(config, model_class=_DraftCapByRowsModel)
+    store_tt_spec_plan(config, plan)
+    config.additional_config = json.loads(json.dumps(config.additional_config))
     assert get_tt_spec_plan(config) == plan
 
 

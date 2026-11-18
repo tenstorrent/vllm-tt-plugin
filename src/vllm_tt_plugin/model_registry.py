@@ -3,6 +3,7 @@
 
 from vllm_tt_plugin.platform import (
     _install_diffusion_gemma_architecture_patch,
+    _install_torch_accelerator_cleanup_patch,
     _install_tt_async_spec_method_patch,
     _should_pre_register_tt_test_models_from_cli,
     register_tt_models,
@@ -42,3 +43,4 @@ def register_tt_models_from_plugin() -> None:
     # the gate in the engine core by then. Without this, a model-owned drafter
     # launch fails upstream's async gate there after KV cache allocation.
     _install_tt_async_spec_method_patch()
+    _install_torch_accelerator_cleanup_patch()

@@ -251,6 +251,16 @@ def test_visible_devices_use_discovered_submesh_shape(
     assert _resolve_mesh_grid("TG", 4, "0,1,2,3") == (2, 2)
 
 
+def test_card_named_by_pci_address_keeps_its_discovered_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One N300 card per rank: one PCI address opens two chips, so counting the
+    entries of TT_VISIBLE_DEVICES would give a 1x1 mesh."""
+    monkeypatch.setattr(TTPlatform, "_standard_dp_mesh_grids", {"0000:b1:00.0": (1, 2)})
+
+    assert _resolve_mesh_grid("T3K", 2, "0000:b1:00.0") == (1, 2)
+
+
 def test_stored_groups_suppress_rediscovery_on_config_reapply(
     monkeypatch: pytest.MonkeyPatch,
     vllm_config: SimpleNamespace,

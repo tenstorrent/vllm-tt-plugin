@@ -4,7 +4,10 @@ Async device sampling deliberately allows the plugin's host token state to
 trail the TT device by one decode step. Only the plugin runner knows whether
 the host tensors are authoritative. A contract-aware tt-metal adapter declares
 `decode_input_update_contract = 1` and receives four independent boolean
-commands on every decode:
+commands on every decode.
+
+For model construction, forward-call arguments, output conversion, and state
+ownership, see the [model-plugin interface](MODEL_INTERFACE.md).
 
 ## Commands
 
@@ -100,10 +103,13 @@ transition are still represented by `slot_remap`.
 - **Device sampling:** tt-metal selects the token. A supporting adapter writes
   the selected token into the persistent token buffer for the next decode and
   advances its persistent position in the forward trace.
-- **Transition decode:** the first decode; the first decode after prefill; a
+- **Transition decode:** the first decode; the first decode after prefill; the
+  first ordinary decode after a speculative verification or after an ordinary
+  decode the model's drafter answered from the host
+  ([SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4d); a
   request-layout, sampling-mode, or resume transition. Pending work is drained
-  and applied first, then host-authoritative inputs and required sampling state
-  are reloaded.
+  and applied first, then host-authoritative inputs and required sampling
+  state are reloaded.
 - **Chunked-prefill continuation:** a later prompt chunk for a request already
   present in the persistent batch. Membership can remain unchanged, so the
   plugin classifies it using the scheduler's context-phase marker rather than
@@ -123,6 +129,9 @@ transition are still represented by `slot_remap`.
 | First decode or prefill → decode | reload | no | reload on device | reset on device |
 | Request add/remove/reuse/condense, preemption, or resume | reload | no | reload on device | reset on device |
 | Chunked-prefill continuation | reload | no | reload on device | reset on device |
+| Speculative verification → ordinary decode | reload | no | reload on device | reset on device |
+| Drafter-answered ordinary decode → ordinary decode | reload | no | reload on device | reset on device |
+| Decode accepted but its read raised → ordinary decode | reload | no | reload on device | reset on device |
 | Host → device sampling | reload | no | reload | reset |
 | Steady host sampling | reload every step | no | n/a | n/a |
 | Steady device sampling | keep resident | only if allocation changed | keep | keep |
@@ -145,23 +154,33 @@ the runner adds its token to local request state. The plugin uses these rules:
   it. The result that ended the request was already accepted.
 
 An ordinary preemption does not invalidate an in-flight decode. Its forward
-completed before the KV blocks were reused, so its token is valid. If its
-result is still in flight, the scheduler does not resume the request. After
-vLLM accepts the result, resumed prefill includes the token and gets a new
-output placeholder. This prevents two physical results from using one
-placeholder. It also prevents an extra sample from advancing seeded RNG state.
+completed before the KV blocks were reused, so its token is valid. vLLM marks
+that output stale: it sets `Request.num_stale_output_tokens` to the request's
+in-flight scheduled tokens and resets `num_output_placeholders` to zero. The
+stale output is still delivered and accepted, because `drop_stale_output` stays
+false. The scheduler does not resume the request until that deliverable stale
+output has drained (`num_stale_output_tokens` is zero). Resumed prefill
+therefore includes the token and gets a new output placeholder. This prevents
+two physical results from using one placeholder. It also prevents an extra
+sample from advancing seeded RNG state.
 
 A forced prefix-cache reset calls
 `reset_prefix_cache(reset_running_requests=True)`. It preempts live requests so
-all KV blocks can be freed. vLLM resumes each request from committed token
-history and records the number of in-flight results in its upstream
-`Request.async_tokens_to_discard` field. The plugin keeps those results visible
-to vLLM, but does not add their tokens to local request state. If the plugin
-removes one of these results, vLLM cannot reduce the discard count and discards
-the next valid result instead. This control path is used by an explicit
-live-request reset or by pause/sleep with cache clearing. Normal completion,
-ordinary scheduler preemption, and cache eviction do not use it. An ordinary
-`reset_prefix_cache()` only succeeds when no running request holds KV blocks.
+all KV blocks can be freed, with `drop_stale_output` set. vLLM resumes each
+request from committed token history in the same step and drops its stale
+output instead of delivering it. The two sides count different units:
+
+- vLLM's `num_stale_output_tokens` counts scheduled tokens. Each step's output
+  reduces it by the number of tokens scheduled in that step.
+- The plugin's forced-reset discard counts count output frames. One TT output
+  frame can carry several tokens, for example 1+K with speculative decoding.
+
+The plugin keeps forced-reset results visible to vLLM, which drops them, but
+does not add their tokens to local request state. This control path is used by
+an explicit live-request reset or by pause/sleep with cache clearing. Normal
+completion, ordinary scheduler preemption, and cache eviction do not use it. An
+ordinary `reset_prefix_cache()` only succeeds when no running request holds KV
+blocks.
 
 Under upstream async scheduling, a synchronously sampled final-prefill result
 uses the same deferred state-apply queue as an async decode result. This lets a
@@ -268,6 +287,13 @@ advance its resident counter exactly once per sampled token. Re-reading stale
 `start_pos` on a steady step makes a seeded stream depend on async readback
 timing and batch composition.
 
+This holds after an ordinary decode the model answered from its drafter
+([SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) section 4d) as after any
+other step. The runner makes the next ordinary decode a reloading transition
+(table above), so an adapter whose decode trace keeps tokens and positions
+resident refills them from that reload; it must not refill them from the
+`tokens` of a step sent `reload_inputs=False`.
+
 ## Correctness invariant
 
 Immediately after device-sampling step `k`, the resident token slot contains
@@ -300,14 +326,15 @@ when it is set, the caller must keep active and resubmitted IDs unique.
 When `SchedulerOutput` reports that a request is finished, the plugin removes
 any later result that vLLM has not consumed and does not add its token to runner
 state. The result that finished the request was already accepted. Ordinary
-preemption does not suppress its in-flight result. A preempted request cannot
-resume while it owns an output placeholder. Resumed prefill therefore includes
-the accepted token and owns a new placeholder for its next result.
+preemption does not suppress its in-flight result. vLLM delivers that stale
+output and does not resume the request until it has drained. Resumed prefill
+therefore includes the accepted token and owns a new placeholder for its next
+result.
 
 Forced-reset discard counts are scheduler-owned sidecar metadata on
-`SchedulerOutput`. They prevent runner-state updates for only the newest
-counted results. The results stay visible to vLLM so it can reduce its upstream
-discard count.
+`SchedulerOutput`. They count output frames, not tokens, and prevent
+runner-state updates for only the newest counted results. The results stay
+visible to vLLM, which drops them itself.
 
 ## Requirements for `decode_input_update_contract = 1`
 
@@ -373,7 +400,10 @@ deferred verification output as ineligible for overlap. Deferred readback
 therefore does not imply concurrent verification steps. A speculative launch
 can also issue ordinary width-1 decode steps when the admitted model supports
 that transition; those ordinary steps follow the reload rules in this
-document. See [Generic speculative decoding](SCHEDULING.md#generic-speculative-decoding)
+document. The first of them after a verification is a transition decode: the
+verification commits a number of tokens the host decides after the forward and
+writes none of them into the resident token and position buffers, which still
+hold what the last ordinary decode fed back. See [Generic speculative decoding](SCHEDULING.md#generic-speculative-decoding)
 for step selection and [Model capabilities](MODEL_CAPABILITIES.md) for the
 separate ordinary and speculative async declarations.
 

@@ -1,0 +1,50 @@
+name: Close stale pull requests and issues
+
+# Labels pull requests idle for 30 days and issues idle for 90 days as stale
+# with a warning comment, then closes them if nothing happens during the grace
+# period. Any push, comment, review or label change counts as activity and
+# removes the stale label. The keep-open label exempts an item.
+
+on:
+  schedule:
+    - cron: "0 5 * * 1-5"   # Weekdays, 05:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  pull-requests: write
+  # actions/stale stores its list of processed items in an Actions cache and
+  # refreshes it by deleting and re-saving the cache entry. Without
+  # actions: write the delete fails and the list freezes after the first run.
+  actions: write
+
+jobs:
+  close-stale:
+    if: github.repository == 'tenstorrent/vllm-tt-plugin'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-pr-stale: 30
+          days-before-pr-close: 7
+          stale-pr-label: stale
+          exempt-pr-labels: keep-open
+          stale-pr-message: >
+            **AUTOMATION**: This pull request has had no activity for 30 days.
+            It will be closed in 7 days unless it is updated or labeled
+            `keep-open`.
+          close-pr-message: >
+            **AUTOMATION**: This pull request was closed because it had no
+            activity for 37 days. Reopen it when you continue the work.
+          days-before-issue-stale: 90
+          days-before-issue-close: 14
+          stale-issue-label: stale
+          exempt-issue-labels: keep-open,type:bug
+          stale-issue-message: >
+            **AUTOMATION**: This issue has had no activity for 90 days. It will
+            be closed in 14 days unless it is updated or labeled `keep-open`.
+          close-issue-message: >
+            **AUTOMATION**: This issue was closed because it had no activity
+            for 104 days. Reopen it if it still applies.
+          remove-stale-when-updated: true
+          operations-per-run: 100

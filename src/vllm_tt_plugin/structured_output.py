@@ -163,3 +163,70 @@ def reorder_grammar_bitmask_for_tt_batch(
     # endregion
 
     return reordered_bitmask
+
+
+def spec_grammar_bitmask_for_tt_batch(
+    *,
+    bitmask: torch.Tensor,
+    structured_output_request_ids: Sequence[str],
+    rows_per_request: Mapping[str, int],
+    row_req_ids: Sequence[str | None],
+    batch_length: int,
+    width: int | None,
+) -> torch.Tensor:
+    """Unpack a speculating launch's bitmask into the TT batch layout.
+
+    On a launch with ``num_speculative_tokens`` set, vLLM's
+    ``StructuredOutputManager.grammar_bitmask`` writes each structured request
+    ``1 + len(scheduled_spec_decode_tokens[req])`` consecutive rows: row ``j``
+    is the grammar after the request's first ``j`` scheduled drafts, and the
+    last row is the bonus. An asynchronous launch schedules ``-1``
+    placeholders there, and every step of it reserves them, prefill and plain
+    decode included, so a request owns several rows even on a step that
+    verifies nothing. Row 0 is always the grammar at the request's committed
+    output, whatever was scheduled.
+
+    ``width=None`` returns ``[batch_length, W]``, each request's row 0, for a
+    step that commits one token per row. ``width=w`` returns
+    ``[batch_length, w, W]``: column ``j`` is the request's row ``j`` while it
+    has one and all ones past that. A row with no structured request is all
+    ones throughout, which is -1.
+
+    Raises when ``rows_per_request`` does not account for the bitmask exactly,
+    because a request whose row count is wrong shifts the mask of every
+    structured request after it.
+    """
+    words = int(bitmask.shape[1])
+    shape = (batch_length, words) if width is None else (batch_length, width, words)
+    unpacked = torch.full(shape, -1, dtype=bitmask.dtype, device=bitmask.device)
+
+    first_row: dict[str, int] = {}
+    offset = 0
+    for req_id in structured_output_request_ids:
+        count = rows_per_request.get(req_id)
+        if count is None or count < 1:
+            raise RuntimeError(
+                f"structured request {req_id} has a grammar bitmask but this "
+                f"step recorded {count!r} bitmask rows for it, so its rows "
+                "cannot be located"
+            )
+        first_row[req_id] = offset
+        offset += count
+    if offset != int(bitmask.shape[0]):
+        raise RuntimeError(
+            f"the grammar bitmask has {int(bitmask.shape[0])} rows, but the "
+            f"scheduled drafts account for {offset} across "
+            f"{list(structured_output_request_ids)}; the scheduler and this "
+            "step disagree about how many rows each request owns"
+        )
+
+    for local_row, req_id in enumerate(row_req_ids[:batch_length]):
+        start = first_row.get(req_id) if req_id is not None else None
+        if start is None:
+            continue
+        if width is None:
+            unpacked[local_row] = bitmask[start]
+            continue
+        columns = min(width, rows_per_request[req_id])
+        unpacked[local_row, :columns] = bitmask[start : start + columns]
+    return unpacked

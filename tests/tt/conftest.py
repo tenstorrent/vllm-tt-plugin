@@ -51,6 +51,24 @@ def pytest_addoption(parser):
         ),
     )
     parser.addoption(
+        "--tt-recall-reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help=(
+            "Use chat completions for the three chunked-prefill recall tests "
+            "with this reasoning effort. Default: legacy completions."
+        ),
+    )
+    parser.addoption(
+        "--tt-recall-reasoning-token-budget",
+        type=int,
+        default=0,
+        help=(
+            "Extra tokens added to the original 24-token recall cap when "
+            "--tt-recall-reasoning-effort is set. Other test caps are unchanged."
+        ),
+    )
+    parser.addoption(
         "--tt-chunked-prefill-budget",
         action="store",
         type=int,
@@ -93,6 +111,22 @@ def reasoning_token_budget(request):
     budget = request.config.getoption("--tt-reasoning-token-budget")
     if budget < 0:
         raise pytest.UsageError("--tt-reasoning-token-budget must be non-negative")
+    return budget
+
+
+@pytest.fixture(scope="session")
+def recall_reasoning_effort(request):
+    """An explicit chat-recall selection; never inferred from the model name."""
+    return request.config.getoption("--tt-recall-reasoning-effort")
+
+
+@pytest.fixture(scope="session")
+def recall_reasoning_token_budget(request):
+    budget = request.config.getoption("--tt-recall-reasoning-token-budget")
+    if budget < 0:
+        raise pytest.UsageError(
+            "--tt-recall-reasoning-token-budget must be non-negative"
+        )
     return budget
 
 

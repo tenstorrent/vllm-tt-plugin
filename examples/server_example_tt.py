@@ -35,7 +35,9 @@ def main():
             str(args.max_num_seqs),
         ]
     )
-    runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
+    runpy.run_module(
+        "vllm.entrypoints.openai.api_server", run_name="__main__", alter_sys=True
+    )
 
 
 if __name__ == "__main__":

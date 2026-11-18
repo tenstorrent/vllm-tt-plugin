@@ -11,6 +11,7 @@ from vllm.v1.sample.sampler import Sampler
 from tests.test_lane_input_batch import (
     BLOCK,
     MAX_MODEL_LEN,
+    _host_runner,
     _make_logitsprocs,
     _make_req,
     _plan,
@@ -104,7 +105,7 @@ def test_compact_bad_words_preserves_retained_output_history(resumed, output_mod
         model_output = TTCompactedHostLogits(logits[rows].clone(), tuple(rows))
     try:
         actual, _ = batch.extract_output(
-            SimpleNamespace(host_sampler=sample),
+            _host_runner(sample, vocab=vocab),
             model_output,
             None,
             SimpleNamespace(

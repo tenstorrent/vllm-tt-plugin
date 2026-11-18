@@ -253,6 +253,7 @@ def test_preemption_releases_its_state_slot():
     above drive ``_release_dead_state_slots`` directly and would not notice its loss."""
     r = _runner()
     r.encoder_cache = {}
+    r.supports_stage_outputs = False
     r._decode_layout_changed_since_last_decode = False
     r.input_batch = SimpleNamespace(
         req_id_to_index={"KEEP": 0}, refresh_logitsprocs=lambda: None

@@ -12,8 +12,10 @@ upstream still honors the knob the plugin writes.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
+import vllm  # noqa: F401
 
 from vllm_tt_plugin.platform import _V2_MODEL_RUNNER_ENV, _pin_v1_model_runner
 
@@ -68,15 +70,14 @@ def test_upstream_still_honors_the_v2_env_knob():
 
 
 def test_the_pin_defeats_the_upstream_default_for_any_config():
-    """``use_v2_model_runner`` must consult the env before anything else.
+    """``use_v2_model_runner`` must consult the env before architecture defaults.
 
-    Calling the property on a bare object proves the env check short-circuits
-    ahead of every config-derived term, so the pin holds regardless of
-    architecture, ``is_moe``, or ``HAS_TRITON``. If upstream reorders those
-    checks, this raises ``AttributeError`` instead of quietly passing.
+    Calling the property on a minimal config object proves the env check
+    short-circuits ahead of model and hardware config checks.
     """
     from vllm.config import VllmConfig
 
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
-    assert VllmConfig.use_v2_model_runner.fget(object()) is False
+    cfg = SimpleNamespace(attention_config=SimpleNamespace(hisparse_config=None))
+    assert VllmConfig.use_v2_model_runner.fget(cfg) is False

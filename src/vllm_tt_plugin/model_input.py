@@ -138,7 +138,9 @@ class TTModelInput:
 
     # Lists preserve the sampling-helper interface; each independent runner and
     # each merged lane step supplies one element.
-    # If not used, [None]
+    # If not used, [None]. ``[rows, W]`` packed for a step that commits one
+    # token per row; ``[rows, 1+K, W]``, one row per candidate column, for a
+    # verify.
     grammar_bitmask: list[torch.Tensor | None]
 
     # Host-only sampling params. Each independent rank supplies one list entry;
@@ -188,6 +190,8 @@ class TTModelInput:
     # committed, in [1, 1+K] and never 0, which is what a model reads to select
     # the candidate state slot it continues from. Both are ``[total_B]`` int32
     # in the same row order as ``input_tokens``, including its padding rows.
+    # A verify sets both. An ordinary decode sets ``accepted_counts`` alone,
+    # and only when a live row's previous step committed more than one token.
     # ``None`` on a prefill build and on a non-speculating launch.
     num_valid_drafts: torch.Tensor | None = None
     accepted_counts: torch.Tensor | None = None
@@ -197,11 +201,27 @@ class TTModelInput:
     # ``None`` for decode.
     intermediate_prefill_mask: torch.Tensor | None = None
 
-    # Request id per forward row. A prefill build can drop rows, so forward row
-    # order is not recoverable from the persistent batch; sample-time consumers
-    # must resolve rows through this. ``None`` for lane builds, whose rows are
-    # the persistent slots.
+    # Request id per live forward row. A prefill build can drop rows, so
+    # forward row order is not recoverable from the persistent batch;
+    # sample-time consumers must resolve rows through this. A lane decode
+    # build sets it to the scheduled requests in slot order, with ``live_rows``
+    # naming their slots; ``None`` for a lane prefill build, whose rows are the
+    # persistent slots.
     row_req_ids: list[str] | None = None
+
+    # The block row each ``row_req_ids`` entry sits at. ``None`` means the live
+    # rows are the first ``len(row_req_ids)`` rows of the block, which is the
+    # front-packed layout. A lane decode holds every request at its own stable
+    # slot, so its live rows are the scheduled slots and the padding rows sit
+    # between them; the speculative consumers (the accept walk, the commit,
+    # the proposal and the sampling capture) read rows through
+    # ``live_row_index`` rather than assuming the front-packed layout.
+    live_rows: tuple[int, ...] | None = None
+
+    # Prefill-only: each row's stage inputs, passed to ``prefill_forward`` as
+    # ``stage_inputs``. ``None`` unless the model declares
+    # ``supports_stage_inputs``.
+    stage_inputs: list[Any] | None = None
 
     # Decode-only: retain device logits until sample_tokens supplies the grammar,
     # then invoke the model's device sampler. Structured prefills stay on host.
@@ -215,3 +235,61 @@ class TTModelInput:
     # Immutable row identity used for sample-time grammar remapping. Includes
     # padding/gap rows as None and is never reconstructed from a mutable batch.
     grammar_row_req_ids: tuple[str | None, ...] = ()
+
+    # Speculating launch only, every build. How many grammar bitmask rows the
+    # scheduler writes for each scheduled request: one per scheduled draft
+    # position plus one for the bonus, so a structured request owns several
+    # consecutive rows rather than one. ``None`` on a launch that does not
+    # speculate, whose bitmask holds one row per structured request.
+    grammar_rows_per_request: dict[str, int] | None = None
+
+    # ``logits`` verify only. Live row position (the index into
+    # ``row_req_ids``) to ``(remaining, stop_token_ids)`` for each live row
+    # whose output is still shorter than its ``min_tokens``, captured at build
+    # time, because the walk may run on the readback thread after the
+    # request's output has grown.
+    spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
+
+
+def live_row_index(
+    model_input: TTModelInput, row_req_ids: list[str] | None = None
+) -> torch.Tensor:
+    """The block row of each live request, as an int64 index.
+
+    ``tensor[live_row_index(model_input)]`` selects the live rows of any
+    ``[B, ...]`` tensor of the step in ``row_req_ids`` order, whichever layout
+    built the step. A front-packed build leaves ``live_rows`` unset and gets
+    ``arange(len(row_req_ids))``. ``row_req_ids`` defaults to the step's own;
+    a caller handed the live requests separately passes those, so the rows
+    answer for the list it is iterating.
+    """
+    if row_req_ids is None:
+        row_req_ids = model_input.row_req_ids
+    if row_req_ids is None:
+        raise RuntimeError(
+            "live_row_index needs row_req_ids, which this build did not set"
+        )
+    live_rows = getattr(model_input, "live_rows", None)
+    if live_rows is None:
+        return torch.arange(len(row_req_ids), dtype=torch.int64)
+    if len(live_rows) != len(row_req_ids):
+        raise RuntimeError(
+            f"live_rows names {len(live_rows)} rows for {len(row_req_ids)} "
+            f"live requests {row_req_ids}: {live_rows}"
+        )
+    return torch.as_tensor(live_rows, dtype=torch.int64)
+
+
+def penalty_history(output_tokens: torch.Tensor) -> list[list[int]]:
+    """Each row's committed output, with TT's -1 padding removed."""
+    return [[token for token in row.tolist() if token != -1] for row in output_tokens]
+
+
+def penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Prompt ids as vLLM's penalty op reads them.
+
+    int64, with TT's -1 padding replaced by the vocabulary size, which is the
+    one index the op's bin count ignores.
+    """
+    ids = prompt_tokens.to(torch.int64)
+    return ids.masked_fill(ids == -1, vocab_size)

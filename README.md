@@ -12,6 +12,10 @@ validation, scheduling, worker execution, model loading, async decode, single-
 process standard and multi-lane execution, data-parallel execution all live
 here. Nothing TT-specific needs to touch vLLM core.
 
+For model authors, the [model-plugin interface](docs/MODEL_INTERFACE.md)
+documents registration, construction, KV storage, execution, and lifecycle,
+and links to the capability, speculative-decode, and input-reload contracts.
+
 ## Package Layout
 
 ```text
@@ -24,14 +28,14 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.26.0)
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.31.0)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
 |   +-- config.py            # TT plugin config access
 |   +-- spec_admission.py    # Speculative configuration and model-plan validation
 |   +-- spec_decode.py       # Candidate/verification types and greedy acceptance
-|   +-- spec_accept.py       # CPU sampled-acceptance helper (not yet used by the runner)
+|   +-- spec_accept.py       # Host sampled acceptance for the logits accept mode
 |   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
@@ -47,7 +51,7 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.26.0` from source with
+The installation script builds vLLM `0.31.0` from source with
 `VLLM_TARGET_DEVICE=empty`.
 
 To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),
@@ -288,6 +292,17 @@ submitted batch. If any request or batch feature cannot use on-device
 sampling, the batch uses vLLM's host-side path. Structured outputs have
 additional rules; see [Structured Output Sampling](#structured-output-sampling).
 
+Single-token-output models can explicitly use
+`"seeded_sampling_policy": "host"` to sample requests with an API seed on
+host during both prefill and decode. The default, `"auto"`, preserves the
+existing routing. With the host policy, one submitted seeded request moves
+the whole forward to host sampling, including its unseeded companions.
+Seeded greedy requests also use host sampling. This can reduce throughput
+and increase latency; batches without submitted seeded requests retain
+their existing routing. Models that own multi-token sampling and speculative
+decoding configurations reject this option. It does not promise
+batch-independent model logits or waive tests.
+
 For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
 base64 `data:image/...` URL or a real URL such as
@@ -309,6 +324,7 @@ Common options:
 | Key | Purpose |
 | --- | --- |
 | `sample_on_device_mode` | Select on-device sampling mode, currently `all` or `decode_only` when supported by the model. |
+| `seeded_sampling_policy` | `auto` (default) or `host`. Select host sampling for submitted seeded requests during prefill and decode; affects the whole submitted forward. Single-token-output models only; incompatible with speculative decoding. |
 | `trace_mode` | Control TT tracing: `all`, `decode_only`, or `none`. Default: `all`. |
 | `enable_model_warmup` | Warm up the model before the server reports healthy. Default: `true`. |
 | `trace_region_size` | Trace region size for TT runtime tracing. |
@@ -321,26 +337,55 @@ Common options:
 | `decode_interleave_enabled` | Insert decode-only steps into a run of consecutive prefill steps, so a running request's inter-token latency does not scale with another request's prompt length. Default: `true`. |
 | `decode_interleave_prefill_steps` | Consecutive prefill steps allowed before one insertion. Raise it to favor time to first token, lower it to favor inter-token latency. Default: `2`. |
 | `decode_interleave_decode_steps` | How many decode-only steps one insertion runs. Reaching this count stops the policy choosing decode; it never forces a prefill step. Does not loosen the latency bound; buys more decode progress per insertion, and more cheaply than a shorter prefill run does. Default: `1`. |
+| `lane_prefix_cache_routing` | Lane mode only (`folds_dp_into_lanes`): route a new request to the lane that already holds the most of its prompt in its prefix cache, unless that lane has no free running slot while the least-loaded one has, or the prefill queued ahead there outweighs the prefill the hit saves. `false` keeps plain least-loaded routing. Default: `true`. |
+| `dp_prefix_cache_routing` | Adds prefix-cache awareness to vLLM's load-aware routing for standard DP (see [Data parallelism](docs/SCHEDULING.md#standard-multi-process-dp)). Default: `true`; set to `false` to keep upstream routing. |
 | `optimizations` | Select model/runtime optimization profile, such as `accuracy` or `performance`. |
 | `register_test_models` | Register non-production TT test models for infrastructure tests. Default: `false`. |
+
+### Default top-k for device sampling
+
+The TT device sampler draws only from the 32 most probable tokens. A model class declares this limit as `max_device_top_k` (see [Sampling limits](#sampling-limits)). When a request has a temperature above 0 and a `top_k` that is unset or above the limit, the plugin samples the whole batch on host for that step. Host sampling reads back the full-vocabulary logits on every decode step, so decode is much slower than with device sampling.
+
+Most requests do not set `top_k`: the OpenAI Python client has no `top_k` argument, and `vllm bench serve` sends no sampling parameters. vLLM then uses the default from the model's `generation_config.json`. Llama 3.1, Llama 3.3 and GPT-OSS define no `top_k` default, which means all tokens. Gemma 3 and Gemma 4 define `top_k: 64`. So with these models, every request that does not set `top_k` samples on host.
+
+To keep these requests on the device, start the server with a default `top_k` equal to the device limit:
+
+```bash
+--override-generation-config '{"top_k": 32}'
+```
+
+vLLM merges this value into the model's default sampling parameters. It applies only to requests that do not set `top_k`. A request that sets its own `top_k` keeps it, and a value above 32 still samples on host.
+
+Use this setting when all of these are true:
+
+- `sample_on_device_mode` is set, and the model supports device sampling on the mesh.
+- The model's default temperature is above 0. Greedy requests do not use `top_k`.
+- The model's default `top_k` is unset or above 32.
+
+Do not use it when the model's default `top_k` is 32 or less, for example Qwen3 (`top_k: 20`). The override replaces the model default, so it would widen it. Do not use it when the server samples on host, because it then only changes the distribution and does not make decode faster.
+
+The setting is an approximation: "all tokens", or 64 for Gemma, becomes the 32 most probable tokens. A client that needs the model's full distribution sets `top_k` in the request (for example `extra_body={"top_k": 0}` with the OpenAI client) and accepts host sampling for that request.
+
+Some model classes do not declare `max_device_top_k`, for example the tt-metal `models/demos/gemma4` and `models/demos/llama31_8b_qb2` classes ([tenstorrent/tt-metal#60365](https://github.com/tenstorrent/tt-metal/issues/60365)). For them, the plugin does not route by `top_k`, and the device sampler changes any `top_k` above 32 to 32 without a message. The setting is still recommended for these models: the request then asks for what the device does.
 
 ### Structured Output Sampling
 
 Structured-output decode can use TT device sampling on models that declare
 `supports_device_grammar`. It is off by default. To enable it, set a
-`sample_on_device_mode` and turn off async scheduling:
+`sample_on_device_mode`. The example also sets
+the [default top-k](#default-top-k-for-device-sampling), because requests
+without `top_k` to the default Llama model would otherwise sample on host:
 
 ```bash
 MESH_DEVICE=T3K \
 python examples/server_example_tt.py \
-  --no-async-scheduling \
+  --override-generation-config '{"top_k": 32}' \
   --additional-config '{"tt": {"sample_on_device_mode": "decode_only"}}'
 ```
 
-vLLM enables async scheduling by default, and the platform disables it only
-for models without `supports_async_decode`. On models that declare it,
-structured requests keep host sampling unless the server is started with
-`--no-async-scheduling`.
+Device grammar works with and without async scheduling. Under async scheduling
+a structured decode step does not overlap with the next forward: the runner
+drains pending async work before it and samples after the mask arrives.
 
 | Step | Sampling path |
 | --- | --- |
@@ -360,14 +405,17 @@ Fallback is selected before forward submission. Once an eligible decode is
 submitted with deferred device sampling, its sample-time grammar mask must be
 present and valid. A missing mask or a device-sampling failure is terminal for
 that runner and requires recovery/restart; it is not retried on host, because
-the device decode and sampler state may already have advanced.
+the device decode and sampler state may already have advanced. One exception:
+under async scheduling, a request that finished while the step was in flight
+has no mask row. Its row samples unrestricted and vLLM drops the token.
 
 With `VLLM_LOGGING_LEVEL=DEBUG`, each device-grammar step logs
 `TT device grammar sampling active`. See
 [`docs/SCHEDULING.md`](docs/SCHEDULING.md#when-steady-async-decode-is-allowed)
 for the execution flow and
 [`docs/MODEL_CAPABILITIES.md`](docs/MODEL_CAPABILITIES.md#sampling-and-async-capabilities)
-for the capability contract.
+for the capability contract. Model authors implement the
+[device grammar contract](docs/DEVICE_GRAMMAR_CONTRACT.md).
 
 ### Model Fabric Configuration
 
@@ -405,16 +453,18 @@ worst-case block allocation and for sliding-window groups on hybrid models.
 latter is what reaches the engine-side KV planner, which in standard DP runs in
 a different process from the worker that set the override.
 
-That pool is the budget shared by *all* concurrent requests, and it is
-independent of `max_model_len`, the *per-request* context limit. Since vLLM
+That pool is the budget shared by *all* concurrent requests. It is set
+independently of `max_model_len`, the *per-request* context limit, except that
+eligible hybrid models raise it to admit one `max_model_len` request (see
+below). Since vLLM
 sizes and validates the KV cache against it, the two must be chosen together:
 
 | `--max-model-len` | Behavior |
 | --- | --- |
 | numeric, fits the pool | Used as given. Maximum concurrency is roughly `pool / max_model_len`. |
-| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. |
+| numeric, exceeds the pool | Startup fails in `get_kv_cache_configs` with the estimated maximum servable length. Block-output models fail earlier, in the TT worker: they must fit `max_model_len` plus one output canvas. Lower `--max-model-len` or raise `max_tokens_all_users`. Eligible hybrid models are the exception: those that set `_HYBRID_KV_CACHE_GROUPS_ENABLED` and whose `get_kv_cache_spec` hook returns a nonempty spec. For them the TT worker raises the pool to the smallest size upstream admits for one `max_model_len` request, plus the output reservation, and logs the change. That pool must still fit device memory, which TT does not profile; KV allocation fails at startup if it does not. With chunked prefill off, every sliding-window group is sized at the full context, so the raised pool can be several times `max_model_len`. |
 | `-1` | vLLM auto-fits `max_model_len` to the pool and syncs the result to the workers and the API-server process. For block-output models the TT worker fits `max_model_len` to the pool minus one output canvas before vLLM's auto-fit runs. |
-| omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool. |
+| omitted | vLLM uses the HF-derived value. Startup fails if that value exceeds the pool, except for eligible hybrid models, which raise the pool as in the numeric case. |
 
 Explicit `-1` auto-fit picks the largest length that fits **one** request, so it
 lands at roughly the whole pool with maximum concurrency `1.00x`: a single long
@@ -434,6 +484,14 @@ selects the TT-owned runtime classes through vLLM's extension points:
 | `parallel_config.worker_cls` | `vllm_tt_plugin.worker.TTWorker` |
 | `scheduler_config.scheduler_cls` | `vllm_tt_plugin.scheduler.TTScheduler` or `vllm_tt_plugin.lane_scheduler.TTLaneCoordinator` |
 
+A `TTWorker` subclass names the scheduler it runs with in `tt_scheduler_cls`,
+and sets `uses_token_kv_cache = False` for a stage with no token KV cache.
+A requested `scheduler_cls` is kept when it derives from that class, and replaced
+by it when that class derives from the request. Any other pair raises
+`ValueError`. Lane mode also raises unless the worker declares `TTScheduler`,
+inherited or explicit, and the request is unset, `TTLaneCoordinator`, or a class
+`TTScheduler` derives from.
+
 The execution model matches TT hardware characteristics:
 
 - A TT step is either prefill-only or decode-only.
@@ -445,17 +503,29 @@ The execution model matches TT hardware characteristics:
   not establish chunked-prefill support.
 - Async scheduling overlaps decode submission with host-side scheduling when
   the model declares support.
-- For Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS,
-  `--data_parallel_size N` runs as `N` in-process TT lanes scheduled by
-  `TTLaneCoordinator` (one engine, one device mesh); see
-  [Single-Process Galaxy Serving](#single-process-galaxy-serving).
+- For models that declare `model_capabilities["folds_dp_into_lanes"]`
+  (see [MODEL_CAPABILITIES.md](docs/MODEL_CAPABILITIES.md)), and for the
+  legacy Galaxy-generator models (Llama3 70B, Qwen3-32B) and GPT-OSS, which
+  fold without declaring it, `--data_parallel_size N` runs as `N` in-process
+  TT lanes scheduled by `TTLaneCoordinator`: one engine process owns the one
+  device mesh and submits one merged batch; see
+  [Single-Process Galaxy Serving](#single-process-galaxy-serving). A model
+  whose declaration is absent or `False` keeps standard multi-process DP.
 - For other models, `--data_parallel_size N` uses standard multi-process DP:
   each DP rank runs an independent engine core with its own TT submesh,
   scheduler, and KV cache. Device groups are discovered at startup and assigned
   via `TT_VISIBLE_DEVICES`. A per-rank assignment is accepted only when it
   exactly matches the discovered group; a conflicting GPU-style `--device-ids`
   assignment fails before mesh creation. This is upstream vLLM's standard DP
-  mechanism (no gather/scatter; ranks are fully independent).
+  mechanism (no gather/scatter; ranks are fully independent). Each rank also
+  gets its own tt-metal Inspector RPC address (`TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS`,
+  default port plus rank) and log directory (`TT_METAL_LOGS_PATH/dp_rank_<n>`,
+  which is where that rank's watcher, dprint, profiler and inspector output
+  lands), and the auto-triage command in
+  `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` is pointed at them, so a
+  dispatch-timeout triage reads the rank that hung. The variables are
+  tt-metal's own; [`docs/SCHEDULING.md`](docs/SCHEDULING.md#standard-multi-process-dp)
+  lists them.
 
 For a deeper walk-through of the scheduling and execution model, read
 [`docs/SCHEDULING.md`](docs/SCHEDULING.md). The model-facing rules that make
@@ -484,6 +554,7 @@ python examples/server_example_tt.py \
   --data_parallel_size 4 \
   --max_num_seqs 8 \
   --async-scheduling \
+  --override-generation-config '{"top_k": 32}' \
   --additional-config '{"tt": {"dispatch_core_axis": "col", "sample_on_device_mode": "all", "worker_l1_size": 1344544, "trace_region_size": 220000000}}'
 ```
 
@@ -578,10 +649,10 @@ family and are unrelated to the above.
 
 ## Speculative Decoding
 
-The plugin supports greedy speculative decoding through a runner-model
-contract. `TTModelRunner` builds candidate blocks, asks the selected tt-metal
-adapter to verify candidates, accepts matching draft tokens, and reports
-committed tokens to vLLM. The selected adapter must declare
+The plugin supports speculative decoding through a runner-model contract.
+`TTModelRunner` builds candidate blocks, asks the selected tt-metal adapter to
+verify candidates, accepts draft tokens, and reports committed tokens to
+vLLM. The selected adapter must declare
 `supports_spec_decode=True` and return an admissible `SpecPlan` from
 `spec_plan`. Architecture registration alone does not enable speculation.
 
@@ -592,12 +663,19 @@ Two drafting methods execute today:
 | `ngram` | vLLM's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
 | `custom_class` | The selected adapter's `propose_draft_tokens` | `spec_plan`, multi-position verification and `device_propose` in `spec_requirements` |
 
-Both methods currently use `argmax_ids` verification and host greedy
-acceptance. `docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`.
-The CPU sampled-acceptance helper exists in `spec_accept.py`, but
-`TTModelRunner` does not call it. `logits` and `fused_sample` execution,
-lossless sampled speculation, scheduler-owned paged drafter caches and
-`TTLaneCoordinator` execution are not implemented for this contract.
+Two accept modes execute, chosen per step from the adapter's `SpecPlan`. With
+`argmax_ids` the runner accepts drafts that equal the target argmax, which
+certifies greedy requests only. With `logits` the adapter returns
+full-vocabulary verify logits and the runner rejection-samples each row on the
+host (`spec_accept.accept_sampled_drafts`), so sampled and penalized requests
+speculate losslessly under temperature, top-k, top-p, presence, frequency and
+repetition penalties and seed, and under structured output, `allowed_token_ids`,
+`bad_words` and `min_tokens`, with logprobs returned for every committed token.
+No production tt-metal adapter declares `logits`
+yet; tt-metal's `DummySpecDecodeModel` validates the path.
+`docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`. `fused_sample`
+execution, scheduler-owned paged drafter caches and `TTLaneCoordinator`
+execution are not implemented for this contract.
 
 ### Model selection and launch settings
 
@@ -677,23 +755,57 @@ Two model-side limits require attention in current dFlash recipes:
 
 ### Request controls and sampling limits
 
-Use `temperature=0` with no penalties to exercise greedy speculation.
+On an adapter that serves only `argmax_ids`, which is every production adapter
+today, use `temperature=0` with no penalties to exercise speculation.
 `TTModelRunner._publish_draft` withholds drafts for requests with non-zero
-temperature or penalties. When the model supports narrow decode and the whole
-step has no drafts or unresolved multi-token commit, `TTModelRunner` uses
-ordinary decode and the selected model's normal sampling path.
+temperature or penalties.
 
-**Sampled requests can still receive greedy tokens.** If any row requires
-verification, every row enters the `argmax_ids` call. A sampled row then
-commits the target argmax without applying that row's temperature or penalties.
-`TTModelRunner._note_unspeculable_verify_rows` warns once and counts affected
-rows; `TTModelRunner.shutdown` logs the total. A model without narrow decode
-uses verification on every decode step. Use a server without
-`speculative_config` when sampled-request semantics must hold on every step.
+**A sampled request never enters an `argmax_ids` verify**, with one
+exception below. A verify in `argmax_ids` mode commits the target argmax on
+every row, so it cannot apply a row's temperature or penalties. When the model
+supports narrow decode, every step that includes a sampled or penalized
+request runs as the ordinary decode, with the selected model's normal sampling
+path; the other rows' drafts on that step are dropped, so no request
+speculates while a sampled one shares its batch. A model without narrow decode
+verifies every decode step, so `TTPlatform.validate_request` refuses a request
+with a non-zero temperature or a penalty on that launch. An adapter that also
+declares `logits` does not have this limit: a step with a sampled or penalized
+row verifies in `logits` mode, and the runner samples every row from its own
+distribution (section 4h of the contract).
 
-`TTPlatform.validate_request` rejects logprobs, structured output,
-`logit_bias`, `bad_words`, `allowed_token_ids` and nonzero `min_tokens` on a
-speculative launch. Prompt logprobs remain unsupported for all TT models.
+**The exception: an adapter declaring `spec_ids_are_sampled`.** Its
+`argmax_ids` verify of a step that samples on the device answers a drafted
+sampled row with the device sampler's draws under that row's own temperature,
+top-k, top-p and seed, so the id walk is exact rejection sampling and a
+request whose only non-greedy control is its temperature speculates. What to
+expect on such an adapter:
+
+- it applies only while the step actually samples on the device: configure a
+  `sample_on_device_mode` (the capability needs `supports_sample_on_device`),
+  and keep requests within the device sampler's limits (the
+  [default top-k](#default-top-k-for-device-sampling) above); a step any row
+  of which samples on the host withholds the drafts and runs as before;
+- a presence, frequency or repetition penalty keeps a request plain, and
+  logprobs, structured output, `bad_words`, `allowed_token_ids` and
+  `min_tokens` are refused on a speculative launch exactly as above;
+- on an adapter that also serves `logits`, the device draws take precedence on
+  a device-sampled step and the host `logits` walk serves the rest;
+- a launch without narrow decode still refuses sampled and penalized requests
+  per request: the capability lifts the temperature rule for draft
+  publication, not for admission.
+
+Section 4i of [the model contract](docs/SPEC_DECODE_CONTRACT.md) gathers the
+rules.
+
+On an adapter that serves `logits`, logprobs, structured output, `bad_words`,
+`allowed_token_ids` and `min_tokens` speculate too: the host accept walk
+applies each of them at every candidate column and returns each committed
+token's logprobs, as upstream's rejection sampler does. On an adapter that
+serves only `argmax_ids`, `TTPlatform.validate_request` rejects those five on
+a speculative launch. `logit_bias` is rejected on every speculative launch,
+and vLLM itself rejects it first. Prompt logprobs remain unsupported for all
+TT models. Only vLLM's Python frontend runs these checks, so a speculative
+launch with `VLLM_USE_RUST_FRONTEND=1` is refused at startup.
 
 See [the model contract](docs/SPEC_DECODE_CONTRACT.md) for candidate shapes,
 acceptance, K+1 lookahead reservation and lifecycle hooks. See
@@ -708,8 +820,11 @@ clear error before anything reaches the device:
 
 - Tensor parallel and pipeline parallel execution are provided by the models
   internal implementation, not exposed at the vLLM level.
-- Speculative decoding supports greedy `argmax_ids` verification with `ngram`
-  or the model-owned `custom_class` drafter on a compatible tt-metal adapter.
+- Speculative decoding supports `argmax_ids` verification for greedy requests
+  (and, on an adapter declaring `spec_ids_are_sampled`, for sampled requests
+  on device-sampled steps) and `logits` verification for sampled ones, with
+  `ngram` or the model-owned `custom_class` drafter on a compatible tt-metal
+  adapter.
   See [Speculative Decoding](#speculative-decoding) for launch settings,
   model selection and sampling limits.
 - LoRA is not currently supported.
@@ -718,11 +833,11 @@ clear error before anything reaches the device:
   `--no-enable-chunked-prefill` to opt out. When it stays on,
   `max_num_batched_tokens` is left as vLLM set it (2048 for `vllm serve` /
   `server_example_tt.py`, 8192 for `LLM()`, or an explicit
-  `--max-num-batched-tokens`). When it is disabled, a budget smaller than
-  `max_model_len` is raised to `max_model_len` so a full prompt still fits in
-  one step. Resume offsets need an alignment that depends on the model's
-  program config and on the length of each remaining span, and the tt-metal
-  generator corrects them itself.
+  `--max-num-batched-tokens`). When it is disabled, a `max_num_batched_tokens`
+  smaller than `max_model_len` is raised to `max_model_len`, and so is a set
+  `max_num_scheduled_tokens`, so a full prompt still fits in one step. Resume offsets need an
+  alignment that depends on the model's program config and on the length of
+  each remaining span, and the tt-metal generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
   chunk boundary.
 - Prompt logprobs are rejected at request validation time.
@@ -796,6 +911,38 @@ A reference that hits its discovery ceiling or runtime limit has not established
 a usable limit. Keep its failure
 visible and investigate it before treating a larger test budget as a fix.
 
+For GPT-OSS, run the chunked-prefill recall gate through its supported Harmony
+chat rendering. The recall-only options preserve the original user prompts,
+three rounds of four concurrent requests, and complete-identifier matching:
+
+Configure the GPT-OSS server with
+`--structured-outputs-config '{"reasoning_parser":"openai_gptoss"}'` so that
+analysis is separated from the final content returned by chat completions.
+
+```bash
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
+  --tt-server-url=http://localhost:8000 \
+  --tt-model-name=openai/gpt-oss-120b \
+  --tt-chunked-prefill-budget=8192 \
+  --tt-recall-reasoning-effort=low \
+  --tt-recall-reasoning-token-budget=1000
+```
+
+The recall cap is the original 24 plus the explicit 1,000-token allowance, totaling
+1024 for both reasoning and answer tokens. This finite diagnostic ceiling was
+used for all 14 original GPT-OSS 120B inputs; it is not inferred from a shorter
+observed answer. The gate requires normal stop and nonempty final content;
+analysis, tool handoffs and length-truncated answers cannot pass. The chosen
+effort is sent to chat completions without rewriting the user's text.
+
+Without `--tt-recall-reasoning-effort`, recall uses the existing legacy requests
+and 24-token cap, even if a recall allowance is supplied. The recall-only options
+do not change the bad-word/structured allowance or any other test's request cap.
+No model name is used to select this behavior. Check the server's effective
+chunked-prefill settings before running; a recall pass alone cannot prove that
+the scheduler split the prompt. Supported-input diagnostic evidence does not
+replace earlier raw-input scores or qualify an untested runtime revision.
+
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
@@ -803,15 +950,15 @@ Plugin-local unit tests that do not require a running server live directly
 under `tests/`, for example:
 
 ```bash
-pytest tests/test_lane_scheduler.py
+"$VIRTUAL_ENV/bin/python" -m pytest tests/test_lane_scheduler.py
 ```
 
 These need no Tenstorrent hardware, only an importable `ttnn`. On a host without
-tt-metal, put the CI stub on the path instead. This is what the `unit-tests`
-workflow job runs:
+tt-metal, put the CI stub on the path instead. This is what the
+`host-tests-stubbed` workflow job runs:
 
 ```bash
-PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
+PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 ```
 
 The stub answers only the device-independent `ttnn` names the plugin touches and
@@ -820,38 +967,16 @@ on real hardware fails loudly rather than passing against a fake.
 
 ## Hybrid Attention Models
 
-Hybrid attention models have mixed sliding-window and full-attention layers
-such as Gemma 3, Gemma 4, and GPT-OSS. They opt in to upstream vLLM's hybrid KV
-cache manager through a per-model spec hook on the registered TT model class.
+Hybrid attention models combine sliding-window and full-attention layers.
+The registered TT model class supplies `get_kv_cache_spec(vllm_config)` so
+vLLM can plan KV groups. The model adapter allocates physical storage through
+`allocate_kv_cache_per_layer(per_layer_specs)` and consumes
+`page_tables_per_layer` when the resolved cache has multiple groups.
 
-The hybrid manager packs sliding and full layers into separate
-`KVCacheGroupSpec`s, sized by upstream's
-[Hybrid KV Cache Manager design](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/).
-Sliding-window layers then occupy only `sliding_window` worth of KV state per
-request instead of `max_seq_len`. On Gemma 4 31B at 256k context this is roughly
-a 6x reduction in KV cache memory.
-
-To enable hybrid KV cache support for a TT model:
-
-1. Inherit from `models.tt_transformers.tt.generator_vllm.HybridAttentionForCausalLM`
-   instead of `Generator`. The base class provides a default
-   `get_kv_cache_spec` classmethod that builds per-layer specs from
-   `hf_config.text_config.layer_types`.
-2. Implement `prefill_forward` and `decode_forward` to consume the
-   `page_tables_per_group` kwarg and route each layer to the right group's page
-   table.
-3. Implement `allocate_kv_cache_per_layer(per_layer_specs)`. The base class
-   default delegates to `allocate_vllm_kv_cache_per_layer`.
-
-Models that do not opt in stay on the legacy `Generator` path: uniform
-single-group KV cache, one page table, and no behavioral change. The plugin only
-sends `page_tables_per_group` to model classes that expose `get_kv_cache_spec`.
-
-Hybrid models with `data_parallel_size > 1` have not been validated on
-hardware. Both DP modes carry the full per-group block tables (a standard-DP
-rank is an independent DP=1 engine, and lane-DP builds per-group tables for the
-merged batch), so there is no known blocker, but the combination is untested.
-
+See [model setup and KV storage](docs/MODEL_SETUP.md#kv-budget-and-specifications)
+for specification names, allocation triples, storage sharing, and page-table
+routing. Model-specific device and DP support must be validated for the
+selected adapter and mesh; the interface alone does not establish support.
 
 ## Development Notes
 
@@ -879,7 +1004,7 @@ reviewed weekly. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## Sampling limits
 
-Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing.
+Single-token-output models may declare `model_capabilities["max_device_top_k"]` to bound stochastic device sampling. Requests submitted in the current step outside `1..max_device_top_k`, including unbounded top-k, use the host sampler with the original distribution. Greedy requests are unaffected. Models without the capability keep their existing routing. To keep requests that do not set `top_k` on the device, see [Default top-k for device sampling](#default-top-k-for-device-sampling).
 
 Block-output models (`output_tokens_per_step > 1`) cannot declare this capability: their model-owned sampler produces a complete canvas, which the host sampler cannot replace. The combination is rejected at startup.
 

@@ -15,6 +15,8 @@ class and the corresponding model guide to determine model-specific support.
 See [README.md](../README.md) for launch instructions and
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) for speculative execution,
 request restrictions, and lifecycle requirements.
+Start with the [model-plugin interface](MODEL_INTERFACE.md) for construction,
+KV allocation, forward calls, and model lifecycle.
 
 ## Ownership and resolution
 
@@ -27,7 +29,8 @@ behavior by supplying internal `_tt_*` values.
    reads `model_capabilities` before model construction.
 2. `TTPlatform.check_and_update_config` updates scheduler and cache settings,
    validates incompatible combinations, and stores resolved TT values on
-   `VllmConfig.additional_config` through `store_tt_*` helpers.
+   `VllmConfig.additional_config` through `store_tt_*` and
+   `validate_and_store_tt_*` helpers.
 3. `TTWorker.init_device` repeats `TTPlatform.check_and_update_config` in each
    worker process and reads `model_capabilities["fabric_config"]` before
    `open_mesh_device` opens the device mesh.
@@ -56,6 +59,7 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `tt_adaptive_block_output` | `False` | Allows an eligible solo decode to commit a block and requires batched decode to use the ordinary one-token path. The platform rejects this declaration unless `output_tokens_per_step > 1`. Adaptive block output relaxes the plain block-output concurrency, data-parallel, executor, async-scheduling, and device-sampling restrictions described below. |
 | `tt_adaptive_block_max_prompt_tokens` | `0` | Limits prompts eligible for an adaptive block session. `0` means no declared limit. Requests with longer prompts use one-token decoding throughout their lifetime. The platform converts the value with `int`, rejects negative values, and rejects a nonzero value without `tt_adaptive_block_output`. The model must apply the same prompt-length limit as the scheduler. |
 | `tt_block_kv_extent_tokens` | `0` | Declares the total KV positions one block-output decode may touch, including verification and carried tokens beyond the committed output. `0` means undeclared. The platform converts the value with `int`, rejects negative values, and requires a nonzero value to cover at least `output_tokens_per_step`. `TTScheduler` reserves the maximum of existing lookahead, twice `output_tokens_per_step`, and `tt_block_kv_extent_tokens`. This declaration does not describe generic speculative proposal writes. |
+| `folds_dp_into_lanes` | `False` | Declares that `--data_parallel_size N` runs as `N` in-process TT lanes on one device mesh instead of multi-process DP (the Galaxy generators and GPT-OSS fold without declaring it). A Boolean, or a zero-argument callable that `TTPlatform.check_and_update_config` evaluates for env-gated rails; a callable that raises fails the launch rather than falling back to standard DP. |
 
 Plain block-output execution requires `max_num_seqs=1`, data-parallel size 1,
 `distributed_executor_backend` unset or `uni`, synchronous scheduling, and
@@ -80,9 +84,16 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 | `supports_sample_on_device` | `False` | Permits the requested `sample_on_device_mode`. The platform rejects any non-`None` sampling mode when this declaration is false. Runtime sampling requirements can still select host sampling. |
 | `max_device_top_k` | `None` | Bounds stochastic device sampling. `TTModelRunner.check_perform_device_sampling` selects host sampling when any selected sampling row has nonzero temperature and `top_k < 1` or `top_k > max_device_top_k`. Greedy rows do not trigger this restriction. The platform rejects any non-`None` value on a block-output model. The plugin does not otherwise validate the numeric type or range of `max_device_top_k`; model authors must supply the actual supported bound. |
 | `supports_device_penalties` | `True` | Permits device sampling with active penalties. When this declaration is false and `InputBatch.no_penalties` is false, `TTModelRunner.check_perform_device_sampling` selects host sampling. The default preserves the existing behavior of model implementations that predate this declaration. |
-| `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, with async scheduling, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. |
+| `supports_device_grammar` | `False` | Declares that decode sampling accepts vLLM's packed grammar bitmask after forward. The platform rejects a non-boolean value, a `True` value without `supports_sample_on_device`, and a `True` value on a block-output model. `TTModelRunner` keeps host grammar sampling without a `sample_on_device_mode`, when tracing without model warmup, or when the loaded model has no compatible sampler. Structured prefill remains host-sampled. The [device grammar contract](DEVICE_GRAMMAR_CONTRACT.md) lists what the model must implement. |
 | `supports_async_decode` | `False` | Declares split decode submission/readback and the resident-input behavior specified by `DECODE_RELOAD_CONTRACT.md`. The platform warns and disables requested async scheduling when this declaration is false. `TTAsyncDecodeController.plan_decode_reload` also reads this declaration when deciding whether ordinary device-sampled traced decode may reuse resident inputs. |
+| `spec_ids_are_sampled` | `False` | Declares that an `argmax_ids` verify of a device-sampled step returns the device sampler's draws (one per candidate column for a drafted row, the plain decode's draw for an undrafted one), so `TTModelRunner._request_is_argmax_certifiable` certifies sampled requests on such steps and the proposer offers them drafts (a penalised request stays uncertifiable: the draws carry no penalty history). On a model that also serves `logits`, the device draws take precedence over the host `logits` walk on a device-sampled step. Validated at config time as a boolean; `True` requires `supports_sample_on_device`. See [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md) sections 1 and 4d. |
 | `supports_async_spec_decode` | `False` | Declares that `read_decode_output` can read a wide speculative verify and preserve the verify hidden handle until proposal. If async scheduling remains enabled with `speculative_config`, the platform rejects a model without this declaration. `supports_async_decode=True` alone does not satisfy this requirement. |
+| `supports_compact_host_logits` | `False` | Permits `process_decode_output_host(..., sample_rows=...)` to return only selected lane-DP host-sampling rows in the supplied order. Active or custom logits processors can require full-slot output instead. |
+| `supports_selective_host_readback` | `False` | Permits `read_decode_output(..., async_read=True, sample_rows=...)` to read only selected lane-DP host-sampling rows. The adapter must also declare `supports_compact_host_logits` and retain an output handle for host processing. |
+
+The [selective-read contract](DECODE_RELOAD_CONTRACT.md#host-sampling-output-and-selective-reads)
+defines buffer ownership, row ordering, and output shapes for both host-output
+capabilities. Neither host-output capability changes decode input reloads.
 
 The async capability combination has a specific order: the platform first
 disables async scheduling for a model without `supports_async_decode`; the
@@ -95,9 +106,23 @@ Device sampling also falls back to the host for supported host-only sampling
 controls, structured output without an eligible `supports_device_grammar`
 decode, and unsupported logprob requests. These runtime
 restrictions remain in force when `supports_sample_on_device=True`. Generic
-speculative request restrictions remain separate from ordinary sampling:
-the current speculative acceptance path requires greedy requests. See
+speculative request restrictions remain separate from ordinary sampling: a
+model whose `spec_plan` offers only `argmax_ids` speculates for greedy
+requests only and refuses logprobs, structured output and token filters on a
+speculating launch, while a model that also offers `logits` speculates for
+sampled requests and applies all of those on the host. See
 [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md).
+
+`spec_ids_are_sampled` is the one exception to the greedy-only rule, and it
+holds only while the step actually samples on the device: a request whose
+only non-greedy control is its temperature is then drafted and its
+`argmax_ids` verify is answered with the device sampler's draws (exact
+rejection sampling). A penalty keeps a request plain, the token controls
+above stay refused, a host-sampled step withholds the drafts and drops a
+retained proposal, and on a model that also serves `logits` the device draws
+take precedence on such a step. Per-request admission on a launch without
+narrow decode is unchanged by the capability. The rules are gathered in
+[SPEC_DECODE_CONTRACT.md, section 4i](SPEC_DECODE_CONTRACT.md#4i-sampled-ids-spec_ids_are_sampled).
 
 Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 [model_runner.py](../src/vllm_tt_plugin/model_runner.py),
@@ -112,6 +137,19 @@ Sources: [platform.py](../src/vllm_tt_plugin/platform.py),
 
 Sources: [worker.py](../src/vllm_tt_plugin/worker.py) and the
 [README fabric configuration example](../README.md#model-fabric-configuration).
+
+## Pipeline-stage capability
+
+| `model_capabilities` key | Default when absent | Meaning and current validation |
+|---|---|---|
+| `supports_stage_inputs` | `False` | Declares that `prefill_forward` accepts `stage_inputs`: one entry per prefill row, holding that request's stage payload or `None`. The payload is vLLM-Omni's `additional_information` as it stood when the request arrived, decoded to a plain dict, engine bookkeeping entries included. vLLM-Omni's other channels, `model_intermediate_buffer` and mid-request `additional_information` updates on cached requests, are not delivered. The platform rejects a non-boolean value, and rejects `True` in lane mode, whose prefill does not carry the payload. Without the declaration the payload is not kept: vLLM-Omni puts one on every request. See [stage inputs](MODEL_LIFECYCLE.md#stage-inputs) for what the model must own. |
+| `supports_stage_outputs` | `False` | Declares `pop_stage_outputs()`, which the runner calls right after every `decode_forward`. See [stage outputs](MODEL_EXECUTION.md#stage-outputs). The platform rejects a non-boolean value, and rejects `True` with lane mode, `output_tokens_per_step > 1`, speculative decoding, or `supports_async_decode` (an overlapped decode builds from host positions one step behind, which would mistag stage frames). A stage model's request cannot be preempted and resumed, so the scheduler refuses to start unless the KV pool holds `max_num_seqs` requests at their peak (`max_model_len` in a full-attention group, the window plus in-flight tokens in a sliding-window group), and the runner raises if a preemption happens anyway. Forced prefix-cache resets are refused, or abort the request first, as for block-output models. |
+
+Sources: [config.py](../src/vllm_tt_plugin/config.py),
+[input_batch.py](../src/vllm_tt_plugin/input_batch.py),
+[stage_outputs.py](../src/vllm_tt_plugin/stage_outputs.py),
+[async_decode.py](../src/vllm_tt_plugin/async_decode.py), and
+[model_runner.py](../src/vllm_tt_plugin/model_runner.py).
 
 ## Speculative capabilities and admission
 
@@ -133,15 +171,22 @@ declarations when the launch has no `speculative_config`.
 | `medusa`, `mlp_speculator`, and vLLM `EagleModelTypes` values | `device_propose`, `hidden_feed` | Recognized, but rejected because the runner has no proposer for these method names. A model-owned implementation uses `custom_class` instead. |
 
 `TTPlatform.check_and_update_config` rejects generic speculative decoding with
-block-output execution or lane-DP. Standard multi-process DP does not use the
-lane-DP rejection, but the selected model must admit the concurrency of each
-engine. Admission is not device validation for a particular DP deployment.
+block-output execution. Single-process lane-DP is admitted, and its plan is
+resolved against the folded `max_num_seqs`, the total across lanes, because
+one device launch verifies every lane's rows together. Standard multi-process
+DP resolves the plan in each engine, against that engine's own concurrency.
+Admission is not device validation for a particular DP deployment.
 
-`TTModelRunner._narrow_steps_serve_the_drafter` reads `spec_requirements` and
-`spec_hidden_handoff` after model loading. If a model-owned drafter declares
-`hidden_feed` and includes `roundtrip`, the runner disables narrow draftless
-decode so every decode supplies a verify hidden handle. This applies even if
-the model also declares `on_device`.
+`resolve_speculative_plan` reads `spec_requirements` and
+`spec_hidden_handoff` at configuration time. If a model-owned drafter declares
+`hidden_feed` and includes `roundtrip`, the resolved plan comes back without
+`supports_narrow_decode`, so every decode supplies a verify hidden handle. This
+applies even if the model also declares `on_device`. Every decode step of
+that launch is a verify, so unless the model also serves `logits`,
+per-request admission refuses a request with a non-zero temperature or a
+penalty, whether or not the model declares `spec_ids_are_sampled` (that
+capability lifts the temperature rule for draft publication on a
+device-sampled step, not for admission).
 
 Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py), and
@@ -152,7 +197,7 @@ Sources: [spec_admission.py](../src/vllm_tt_plugin/spec_admission.py),
 The model class implements
 `spec_plan(vllm_config, max_num_seqs, requested_k)` and returns a `SpecPlan` or
 `SpecReject`. The platform passes the resolved engine-local concurrency as
-`max_num_seqs`. `spec_plan` must not rely on resolved `get_tt_*` state because
+`max_num_seqs`, which in lane mode is the folded total across lanes. `spec_plan` must not rely on resolved `get_tt_*` state because
 speculative admission does not guarantee that state exists yet.
 
 | `SpecPlan` field | Default | Meaning and current validation |
@@ -161,10 +206,11 @@ speculative admission does not guarantee that state exists yet.
 | `lanes_per_request` | Required | Model decode rows consumed by one speculative request, at least 1. This value does not mean lane-DP lanes. The plugin validates the lower bound but does not enforce a row budget. |
 | `extra_bytes_per_seq` | Required | Nonnegative fixed device bytes per speculative request. The plugin does not reserve or enforce this byte budget. |
 | `extra_bytes_per_token` | Required | Nonnegative device bytes per KV token beyond target KV storage. The plugin does not reserve or enforce this byte budget. |
-| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission currently requires `argmax_ids` among the offered modes because the runner implements greedy acceptance only. |
+| `accept_modes` | Required | Nonempty sequence using `logits`, `argmax_ids`, or `fused_sample`. `SpecPlan` normalizes the sequence to a tuple and rejects strings, unknown names, and duplicates. Admission requires `argmax_ids` or `logits` among the offered modes; `fused_sample` has no runner path. With both offered, the runner asks for `logits` on a step with at least one live row that `TTModelRunner._request_is_argmax_certifiable` rejects: a non-zero temperature, a penalty, logprobs (including `logprobs=0`), structured output, `allowed_token_ids`, `bad_words`, or a `min_tokens` the output has not reached yet. Otherwise it asks for `argmax_ids`. Without `logits`, `TTPlatform.validate_request` refuses logprobs, structured output, `allowed_token_ids`, `bad_words`, and `min_tokens` on a speculative launch. See section 4h of [SPEC_DECODE_CONTRACT.md](SPEC_DECODE_CONTRACT.md). |
 | `drafter_state` | Required | One of `internal`, `paged`, or `shared_with_target`. Admission rejects `paged` because the plugin has no scheduler-owned drafter-cache allocation. |
 | `drafter_target_cache_requires` | `()` | Sequence using `named_layer_caches` and `absolute_positions`. `SpecPlan` rejects strings, unknown names, duplicates, and a nonempty sequence unless `drafter_state="shared_with_target"`. The plugin does not verify that the target cache satisfies these requirements. |
 | `supports_narrow_decode` | `False` | Declares ordinary `[B, 1]` decode support alongside wide `[B, 1+K]` verification. The runner uses this permission for draftless steps when the drafter's hidden-state requirements allow narrow decode. This value is a `SpecPlan` field, not a `model_capabilities` key. |
+| `k_by_rows` | `()` | Per-step draft cap by live rows, as `(max_rows, k)` pairs in strictly ascending `max_rows` order. A step with R live rows (in lane mode, the live rows of the whole lane batch) carries at most the `k` of the first pair whose `max_rows` is at least R; empty means `effective_k` at every batch size. `SpecPlan` rejects a malformed pair, a `k` outside `[1, effective_k]`, and a mapping whose largest `k` is not `effective_k`. Admission rejects a mapping whose last `max_rows` is below `max_num_seqs`. The verify block stays `1 + effective_k` wide; only `num_valid_drafts` shrinks. |
 
 `SpecPlan.block_width` is `1 + effective_k` for wide verification.
 `SpecPlan.accepted_counts_range` is the inclusive range
@@ -202,8 +248,11 @@ Sources: [spec_decode.py](../src/vllm_tt_plugin/spec_decode.py),
 `release_request`, `release_persistent_capture`, and
 `note_state_slots_moved` define model state ownership and cleanup.
 `spec_plan` declares speculative feasibility, and `propose_draft_tokens`
-implements model-owned proposal. Adding a similarly named dictionary key
+implements model-owned proposal. `pop_stage_outputs` is consumed only with
+`supports_stage_outputs`. Adding a similarly named dictionary key
 does not implement any of these hooks.
+See [model setup](MODEL_SETUP.md), [execution](MODEL_EXECUTION.md), and
+[lifecycle](MODEL_LIFECYCLE.md) for the complete common hook interface.
 
 Model authors should add new feature gates through explicit capability
 declarations and matching plugin consumers, with linked changes when tt-metal

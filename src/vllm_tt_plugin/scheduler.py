@@ -11,6 +11,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -21,8 +22,10 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
+    get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
+    tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
@@ -46,7 +49,9 @@ def set_tt_forced_reset_discard_counts(
     scheduler_output: SchedulerOutput, counts: dict[str, int]
 ) -> None:
     if counts:
-        setattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts))
+        set_tt_scheduler_output_field(
+            scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts)
+        )
 
 
 def get_tt_forced_reset_discard_counts(
@@ -71,13 +76,50 @@ _TT_BLOCK_STEP_DECISIONS_ATTR = "_tt_block_step_decisions"
 def set_tt_block_step_decisions(
     scheduler_output: SchedulerOutput, decisions: dict[str, bool]
 ) -> None:
-    setattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions))
+    set_tt_scheduler_output_field(
+        scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, dict(decisions)
+    )
 
 
 def get_tt_block_step_decisions(
     scheduler_output: SchedulerOutput,
 ) -> dict[str, bool]:
     return dict(getattr(scheduler_output, _TT_BLOCK_STEP_DECISIONS_ATTR, {}))
+
+
+# The lane coordinator's per-step state; see ``lane_scheduler.py``.
+_TT_STEP_STATE_ATTR = "_tt_step_state"
+
+# Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
+# Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
+# carries them over with ``carry_tt_scheduler_output_fields``.
+TT_SCHEDULER_OUTPUT_FIELDS = (
+    _TT_FORCED_RESET_DISCARD_COUNTS_ATTR,
+    _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
+    _TT_BLOCK_STEP_DECISIONS_ATTR,
+    _TT_STEP_STATE_ATTR,
+)
+
+
+def set_tt_scheduler_output_field(
+    scheduler_output: SchedulerOutput, name: str, value
+) -> None:
+    """Attach a TT field; ``carry_tt_scheduler_output_fields`` copies only these."""
+    if name not in TT_SCHEDULER_OUTPUT_FIELDS:
+        raise ValueError(
+            f"TT SchedulerOutput field {name!r} is not in TT_SCHEDULER_OUTPUT_FIELDS "
+            f"{TT_SCHEDULER_OUTPUT_FIELDS}"
+        )
+    setattr(scheduler_output, name, value)
+
+
+def carry_tt_scheduler_output_fields(
+    src: SchedulerOutput, dst: SchedulerOutput
+) -> None:
+    """Copy the TT fields set on ``src`` onto ``dst``."""
+    for name in TT_SCHEDULER_OUTPUT_FIELDS:
+        if hasattr(src, name):
+            setattr(dst, name, getattr(src, name))
 
 
 class TTSchedulingMode(Enum):
@@ -242,6 +284,46 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
         )
 
 
+def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
+    """Refuse a KV pool that could make vLLM preempt a stage-output request.
+
+    vLLM preempts a running request when a step finds no free block, and a request
+    of a model with ``supports_stage_outputs`` cannot resume. While ``max_num_seqs``
+    requests at their peak fit in the pool at once, no step runs short. One
+    request's peak is upstream's admission bound: the full context for a
+    full-attention group, the window plus in-flight tokens for a sliding one.
+    Every request is charged the whole in-flight budget, an over-count when
+    several share it.
+    """
+    from vllm.v1.core.kv_cache_utils import (
+        _max_memory_usage_bytes_from_groups,
+        _pool_bytes_per_block,
+    )
+
+    groups = kv_cache_config.kv_cache_groups
+    if not groups:
+        # An attention-free model allocates no blocks, so nothing preempts.
+        return
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    max_model_len = vllm_config.model_config.max_model_len
+    per_request = -(
+        -_max_memory_usage_bytes_from_groups(vllm_config, groups)
+        // _pool_bytes_per_block(groups)
+    )
+    needed = max_num_seqs * per_request
+    # Block 0 is vLLM's null block, never handed to a request.
+    usable = kv_cache_config.num_blocks - 1
+    if usable < needed:
+        raise ValueError(
+            "a model with supports_stage_outputs cannot resume a preempted request, "
+            f"so its KV pool must hold max_num_seqs={max_num_seqs} requests at "
+            f"max_model_len={max_model_len}: {needed} blocks across "
+            f"{len(groups)} KV cache group(s), but only "
+            f"{usable} are usable. Lower max_num_seqs or max_model_len, or raise "
+            "the model's get_max_tokens_all_users budget."
+        )
+
+
 class TTScheduler(AsyncScheduler):
     """Scheduler for the TT (Tenstorrent) platform.
 
@@ -254,11 +336,13 @@ class TTScheduler(AsyncScheduler):
       the next chunk until the prompt is fully computed. Those continuations
       count as prefill work here, never as decodes.
 
-    The base scheduler holds temporarily blocked prefill requests (e.g. while
-    a structured-output grammar compiles) in ``skipped_waiting`` rather than
-    ``waiting``. Its prefill loop revisits that queue and promotes requests
-    whose dependency is ready. Decode-only scheduling must hide both queues so
-    that the base scheduler cannot admit a prefill into a decode step.
+    The base scheduler admits prefills from two queues: ``kv_holding_waiting``
+    (requests that still hold KV blocks, e.g. a streaming-input session waiting
+    for its next chunk), which it drains first, and ``waiting``. A temporarily
+    blocked request (e.g. while a structured-output grammar compiles) stays in
+    its queue, and the prefill loop skips it until its dependency is ready.
+    Decode-only scheduling must hide both queues so that the base scheduler
+    cannot admit a prefill into a decode step.
 
     Inherits from AsyncScheduler to get num_output_placeholders support.
     TT uses this scheduler in both sync and async execution modes:
@@ -273,15 +357,13 @@ class TTScheduler(AsyncScheduler):
       completion before the preempt freed any block, device submits form a
       strict queue, and every async op is forced to complete before the next
       prefill, so no later write can reach the KV they were computed against.
-      The base class appends them on arrival and the resumed prefill replays
-      them. ``Request.async_tokens_to_discard`` serves the wholesale
-      ``reset_prefix_cache`` teardown only; wiring ordinary preemption into it
+      The base class marks them stale, appends them on arrival without
+      touching the placeholder count, and keeps the request waiting until
+      they drain, so the resumed prefill replays them instead of sampling
+      against the old token history. Only the wholesale
+      ``reset_prefix_cache`` teardown drops stale output
+      (``Request.drop_stale_output``); wiring ordinary preemption into it
       drops valid tokens and silently truncates the response.
-      A preempted request with an outstanding output placeholder stays in the
-      waiting queue until that valid frame is accounted for. Resuming earlier
-      would replay and sample against the old token history, producing a second
-      physical frame for the same single placeholder and advancing seeded RNG
-      state for a token that must be discarded.
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
@@ -299,6 +381,13 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.aux_output_connector is not None:
+            # The base update_from_output asserts an auxiliary output for every
+            # request that emits tokens, and the TT model runner produces none.
+            raise ValueError(
+                "TT backend does not return auxiliary model outputs; remove "
+                "--enable-return-routed-experts."
+            )
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -309,6 +398,8 @@ class TTScheduler(AsyncScheduler):
         # its SchedulerOutput in update_from_output so _update_request_with_output
         # sees the decision that produced THIS output (not a later schedule).
         self._committing_block_step_decisions: dict[str, bool] = {}
+        # Set by TTLaneCoordinator on its lanes; see make_stats.
+        self.stats_made_by_coordinator = False
         # Request id that owns the adaptive model's SINGLE speculative
         # session, mirrored from scheduling-side facts (see
         # _mirror_spec_session). Only its owner can emit a block.
@@ -330,6 +421,9 @@ class TTScheduler(AsyncScheduler):
             )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
+        self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
+        if get_tt_supports_stage_outputs(self.vllm_config):
+            _require_kv_for_every_sequence(self.vllm_config, self.kv_cache_config)
         # Adaptive: emit the block only on a solo decode step; batch >1 decodes
         # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
         self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
@@ -398,11 +492,17 @@ class TTScheduler(AsyncScheduler):
     # Host-only sampling controls and their neutral values: any of these
     # forces the step onto host sampling (check_perform_device_sampling),
     # which cannot construct a multi-token canvas and kills the engine.
-    # Penalties do not force host sampling, but a non-neutral value flips
+    # Penalties force host sampling only for a model that declares
+    # supports_device_penalties=False. Otherwise a non-neutral value flips
     # InputBatch.no_penalties and makes every block decode step build (and
     # discard) penalty token tensors that grow with the committed session
     # length; the frontend neutralizes them, so mirror that here for
     # prebuilt requests that bypassed it.
+    # The predicate's other request-driven triggers cannot fire for a
+    # block-output model: _strip_unsupported_block_controls strips structured
+    # outputs, the block-output InputBatch drops logprobs (disable_logprobs),
+    # and the platform refuses seeded_sampling_policy="host" and
+    # max_device_top_k for block output at config time.
     _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
         ("min_p", 0.0),
         ("min_tokens", 0),
@@ -416,11 +516,33 @@ class TTScheduler(AsyncScheduler):
     )
 
     def add_request(self, request: Request) -> None:
+        """Admit a request, first repairing a block-output request that skipped
+        TT request validation.
+
+        Block-output requests normally pass ``TTPlatform.validate_request``
+        through the patched ``InputProcessor``, which rejects what a
+        block-output model cannot serve. A prebuilt ``EngineCoreRequest``
+        passed to ``AsyncLLM.add_request`` or ``LLMEngine.add_request`` (an
+        API upstream deprecates), or sent through ``EngineCoreClient``, skips
+        ``InputProcessor.process_inputs`` and so skips that validation. vLLM's
+        own entrypoints never build such a request, and the platform refuses
+        the Rust frontend for block-output models at startup, so this is a
+        safety net for programmatic engine callers, not a path the served API
+        reaches.
+
+        An exception from ``add_request`` tears down EngineCore for every
+        client. So instead of rejecting, the request repair layer
+        (``_repair_unvalidated_block_request``) changes the request until it
+        is servable, logs one warning per change, and lets the request finish
+        normally; the caller is not told. Because the change is silent, the
+        Rust frontend stays refused: it would send all traffic down this path
+        instead of rejecting unsupported requests.
+        """
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
                 # A continuation (next input chunk or the closing sentinel) of
-                # a session whose resumable flag the neutralization below
+                # a session whose resumable flag _strip_unsupported_block_controls
                 # scrubbed. The base scheduler asserts on the missing
                 # streaming_queue, which would tear down EngineCore. The
                 # session cannot accept more input, so drop the message; the
@@ -431,32 +553,24 @@ class TTScheduler(AsyncScheduler):
                     request.request_id,
                 )
                 return
-            self._truncate_unservable_block_prompt(request)
-            self._align_block_output_max_tokens(request)
-            self._neutralize_block_output_host_sampling(request)
+            self._repair_unvalidated_block_request(request)
         super().add_request(request)
 
-    def _truncate_unservable_block_prompt(self, request: Request) -> None:
-        """Contain a bypassed prompt that leaves no room for a whole canvas.
+    def _repair_unvalidated_block_request(self, request: Request) -> None:
+        """Make a block-output request that skipped validation servable.
 
-        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
-        skips it, and neither upstream EngineCore.add_request nor the base
-        scheduler re-checks prompt length. Admitted untouched, the prompt
-        either can never be scheduled (chunked prefill is disabled and the
-        prompt exceeds the token budget: parked in WAITING forever,
-        head-of-line blocking every later request), overflows the worker's
-        max_model_len-wide token buffer, or — even when it fits
-        max_model_len — trips the adapter's own canvas-capacity validation,
-        which raises out of execute_model in eager (no-upfront-capture) mode
-        where there is no graceful stop-canvas rejection. Truncate to the
-        largest tile-aligned prompt that still fits one whole canvas below
-        the tile-floored max_model_len, so every admitted request is
-        genuinely servable and finishes through the normal notifying path.
-        Prefix caching is disabled for block models (__init__ asserts it), so
-        the request's stale block hashes stay inert.
+        The prompt repairs run first, in this order, because each reads the
+        prompt the previous one left. The max_tokens clamp needs the final
+        prompt length. The control strip is independent of the prompt.
         """
-        from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
+        self._drop_unencodable_mm_features(request)
+        self._replace_prompt_embeds_with_placeholders(request)
+        self._pad_empty_prompt(request)
+        self._truncate_overlong_prompt(request)
+        self._clamp_max_tokens_to_whole_canvases(request)
+        self._strip_unsupported_block_controls(request)
 
+    def _drop_unencodable_mm_features(self, request: Request) -> None:
         if request.mm_features:
             # A text-only block model has a zero encoder budget: a feature at
             # offset 0 forces zero-token schedules forever (head-of-line
@@ -469,6 +583,8 @@ class TTScheduler(AsyncScheduler):
                 request.request_id,
             )
             request.mm_features = []
+
+    def _replace_prompt_embeds_with_placeholders(self, request: Request) -> None:
         if request.prompt_token_ids is None and request.num_prompt_tokens > 0:
             # The frontend rejects prompt_embeds for every TT model; admitted
             # bare, the worker's request-state builder raises
@@ -500,6 +616,8 @@ class TTScheduler(AsyncScheduler):
             )
             request.prompt_embeds = None
             request.prompt_is_token_ids = None
+
+    def _pad_empty_prompt(self, request: Request) -> None:
         if request.num_prompt_tokens == 0:
             # The frontend rejects empty prompts; admitted bare, the waiting
             # loop schedules zero new tokens and upstream's num_new_tokens
@@ -514,7 +632,28 @@ class TTScheduler(AsyncScheduler):
             request.prompt_embeds = None
             request._all_token_ids.append(0)
             request.num_prompt_tokens = 1
-            return
+
+    def _truncate_overlong_prompt(self, request: Request) -> None:
+        """Contain a bypassed prompt that leaves no room for a whole canvas.
+
+        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
+        skips it, and neither upstream EngineCore.add_request nor the base
+        scheduler re-checks prompt length. Admitted untouched, the prompt
+        either can never be scheduled (chunked prefill is disabled and the
+        prompt exceeds the token budget: parked in WAITING forever,
+        head-of-line blocking every later request), overflows the worker's
+        max_model_len-wide token buffer, or, even when it fits
+        max_model_len, trips the adapter's own canvas-capacity validation,
+        which raises out of execute_model in eager (no-upfront-capture) mode
+        where there is no graceful stop-canvas rejection. Truncate to the
+        largest tile-aligned prompt that still fits one whole canvas below
+        the tile-floored max_model_len, so every admitted request is
+        genuinely servable and finishes through the normal notifying path.
+        Prefix caching is disabled for block models (__init__ asserts it), so
+        the request's stale block hashes stay inert.
+        """
+        from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
+
         tile = _TT_TOKEN_TILE_SIZE
         max_model_len = int(self.vllm_config.model_config.max_model_len)
         aligned_max_model_len = max_model_len // tile * tile
@@ -538,7 +677,7 @@ class TTScheduler(AsyncScheduler):
         del request._all_token_ids[keep:]
         request.num_prompt_tokens = keep
 
-    def _align_block_output_max_tokens(self, request: Request) -> None:
+    def _clamp_max_tokens_to_whole_canvases(self, request: Request) -> None:
         """Clamp max_tokens so a bypassed EngineCoreRequest cannot overshoot.
 
         Frontend validation rejects an oversized limit. Prebuilt requests skip
@@ -559,8 +698,18 @@ class TTScheduler(AsyncScheduler):
         )
         if fitted == request.max_tokens:
             return
-        # The prompt truncation above guarantees at least one whole canvas
-        # fits, so a clamp always leaves a positive, servable budget.
+        # _truncate_overlong_prompt leaves room for one whole canvas, and the
+        # platform's startup floor (_min_block_output_max_model_len) makes
+        # that room exist. Deliberate fail-fast for developers: it fires only
+        # if the repair steps are reordered, never for a client request.
+        if fitted <= 0:
+            raise RuntimeError(
+                f"Block-output max_tokens clamp for request {request.request_id} "
+                f"left no budget: prompt_len={len(prompt_ids)}, "
+                f"max_tokens={request.max_tokens}, fitted={fitted}, "
+                f"output_tokens_per_step={self._output_tokens_per_step}, "
+                f"max_model_len={self.vllm_config.model_config.max_model_len}"
+            )
         logger.debug(
             "Clamping block-output max_tokens from %s to %s for request %s "
             "so physical canvases fit max_model_len",
@@ -571,7 +720,7 @@ class TTScheduler(AsyncScheduler):
         request.max_tokens = fitted
         request.sampling_params.max_tokens = fitted
 
-    def _neutralize_block_output_host_sampling(self, request: Request) -> None:
+    def _strip_unsupported_block_controls(self, request: Request) -> None:
         """Strip controls a block-output model cannot honor from a bypassed
         request: host-sampling forcers, structured outputs, and resumable
         streaming-input sessions.
@@ -591,8 +740,9 @@ class TTScheduler(AsyncScheduler):
             request.structured_output_request = None
             stripped.append("structured_outputs")
             # Request.__init__ parked the request on grammar compilation; with
-            # the structured-output request gone nothing would ever promote it
-            # out of skipped_waiting, so restore schedulability.
+            # the structured-output request gone no grammar ever arrives, and
+            # the base prefill loop would skip the request forever, so restore
+            # schedulability.
             if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
                 request.status = RequestStatus.WAITING
         if params.structured_outputs is not None:
@@ -618,47 +768,19 @@ class TTScheduler(AsyncScheduler):
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 
-        A request in ``skipped_waiting`` still needs a future prefill pass:
-        that is where the base scheduler retries promotion after its dependency
-        becomes ready. In decode-only mode this check also ensures both waiting
-        queues are hidden from the base scheduler.
+        A blocked request in ``waiting`` or ``kv_holding_waiting`` still needs
+        a future prefill pass: only the base scheduler's prefill loop checks
+        whether its dependency became ready. In decode-only mode this check also
+        ensures both waiting queues are hidden from the base scheduler.
 
         A running ``is_prefill_chunk`` request is a partial prefill whose next
         chunk can only be scheduled by a prefill step.
         """
         return (
             bool(self.waiting)
-            or bool(getattr(self, "skipped_waiting", False))
+            or bool(self.kv_holding_waiting)
             or any(request.is_prefill_chunk for request in self.running)
         )
-
-    def _take_preempted_requests_with_pending_outputs(self) -> RequestQueue | None:
-        """Temporarily remove resumes that still own an in-flight output.
-
-        Ordinary preemption preserves already-submitted frames. Waiting for the
-        corresponding placeholder to be consumed makes the accepted token part
-        of request history before resumed prefill is built, so replay samples
-        the next logical token and receives a fresh placeholder.
-
-        The temporary queue follows upstream's skipped-waiting convention:
-        ``prepend_request`` while collecting and ``prepend_requests`` while
-        restoring preserve FCFS order, while priority queues reorder by their
-        normal priority key.
-        """
-        deferred = [
-            request
-            for request in self.waiting
-            if request.status == RequestStatus.PREEMPTED
-            and request.num_output_placeholders > 0
-        ]
-        if not deferred:
-            return None
-
-        deferred_queue = create_request_queue(self.policy)
-        for request in deferred:
-            deferred_queue.prepend_request(request)
-        self.waiting.remove_requests(deferred)
-        return deferred_queue
 
     # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
     # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
@@ -701,13 +823,16 @@ class TTScheduler(AsyncScheduler):
 
         Chunks that finish the prompt, decode steps and multimodal prompts are
         left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request never gets an empty chunk.
+        the next step; a running request that cannot reach the grid ends its
+        chunk on a KV block instead, and waits a step if that is empty too.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if align <= 1 or num_new_tokens <= 0:
             return num_new_tokens
         end = start + num_new_tokens
-        if end >= request.num_prompt_tokens:
+        # A request resumed from preemption replays its output tokens too, so
+        # only a chunk that reaches the end of the sequence is the last one.
+        if end >= request.num_tokens:
             return num_new_tokens
         if getattr(request, "mm_features", None) or getattr(
             request, "has_encoder_inputs", False
@@ -716,7 +841,12 @@ class TTScheduler(AsyncScheduler):
         aligned_end = end // align * align
         if aligned_end <= start:
             if start != 0:
-                return num_new_tokens
+                # The next chunk resumes where this one ends, and the model
+                # takes a resume offset only on a KV block boundary. A running
+                # request whose chunk cannot reach the grid still ends on a
+                # block, or waits for the next step's budget.
+                block = self.block_size
+                return max(end // block * block - start, 0)
             # A new request waits only when this step's leftover budget is what
             # stopped it. If a full step could not reach the grid either (a
             # permanent cap below the alignment), it must still make progress.
@@ -734,16 +864,6 @@ class TTScheduler(AsyncScheduler):
         return limit
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        deferred_resumes = self._take_preempted_requests_with_pending_outputs()
-        try:
-            return self._schedule_without_pending_output_resumes(throttle_prefills)
-        finally:
-            if deferred_resumes:
-                self.waiting.prepend_requests(deferred_resumes)
-
-    def _schedule_without_pending_output_resumes(
-        self, throttle_prefills: bool = False
-    ) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
         has_pending_prefill = self._has_pending_prefill()
@@ -839,39 +959,43 @@ class TTScheduler(AsyncScheduler):
 
         Temporarily hides the running *decode* requests so the base scheduler's
         running loop only advances partial prefills, and its waiting loop
-        admits new ones.  Adjusts max_num_running_reqs so the waiting loop
-        respects the true capacity with the decodes hidden.
+        admits new ones.  Lowers both running caps by the hidden decodes so the
+        waiting loop respects the true capacity: the loop admits against
+        ``max_num_active_reqs``, and the end-of-step check asserts
+        ``max_num_running_reqs``.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        saved_active = self.max_num_active_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            self.max_num_active_reqs = saved_active
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
 
-        Temporarily hides both the ``waiting`` and ``skipped_waiting`` queues
-        so the base scheduler's waiting loop is a no-op and cannot promote a
-        grammar-ready structured-output request into this decode step, and
-        hides partial prefills so their next chunk is not scheduled into it
-        either.  Any requests that get preempted during decode scheduling are
-        merged back into the original queues afterwards.
+        Temporarily hides both the ``waiting`` and ``kv_holding_waiting``
+        queues so the base scheduler's waiting loop is a no-op and cannot admit
+        a prefill (for example a grammar-ready structured-output request) into
+        this decode step, and hides partial prefills so their next chunk is not
+        scheduled into it either.  Any requests that get preempted during
+        decode scheduling are merged back into the original queues afterwards.
         """
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_waiting = self.waiting
-        saved_skipped = getattr(self, "skipped_waiting", None)
+        saved_kv_holding = self.kv_holding_waiting
         self.waiting = create_request_queue(self.policy)
-        if saved_skipped is not None:
-            self.skipped_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy)
         if partial_prefills:
             self.running = [r for r in self.running if not r.is_prefill_chunk]
         try:
@@ -879,11 +1003,10 @@ class TTScheduler(AsyncScheduler):
         finally:
             if self.waiting:
                 saved_waiting.prepend_requests(self.waiting)
-            if saved_skipped is not None:
-                if self.skipped_waiting:
-                    saved_skipped.prepend_requests(self.skipped_waiting)
-                self.skipped_waiting = saved_skipped
+            if self.kv_holding_waiting:
+                saved_kv_holding.prepend_requests(self.kv_holding_waiting)
             self.waiting = saved_waiting
+            self.kv_holding_waiting = saved_kv_holding
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
@@ -901,24 +1024,26 @@ class TTScheduler(AsyncScheduler):
         bypassed the engine layer; refusing here beats silently removing a
         request someone is still waiting on.
         """
-        if self._is_block_output_model and reset_running_requests and self.running:
+        if self._requests_cannot_resume and reset_running_requests and self.running:
             message = (
-                "Cannot reset prefix cache while a block-output request is "
-                "running; finish or abort the request first."
+                "Cannot reset prefix cache while a request that cannot resume "
+                "(block output or stage outputs) is running; finish or abort the "
+                "request first."
             )
-            # pause_generation(mode="keep") reaches this through an unguarded
-            # idle-state callback while intentionally retaining live requests.
-            # Returning False preserves them without letting an exception
-            # escape EngineCore and strand the callback's Future.
+            # pause_generation(mode="keep") retains live requests on purpose,
+            # so a refused reset is an expected result there: return the
+            # refusal the reset API defines instead of raising.
+            # _install_block_output_pause_guard_patch refuses a keep-mode
+            # pause that would clear the cache before it reaches this.
             if self.pause_state == PauseState.PAUSED_ALL:
                 logger.error("%s", message)
                 return False
             raise RuntimeError(message)
-        # Upstream copies token reservations into ``async_tokens_to_discard``.
-        # TT receives one output frame for a speculative reservation of 1+K
-        # tokens, so publish frame counts to both the scheduler and runner. The
-        # stale frames remain visible to the scheduler but do not enter runner
-        # request state before resumed-prefill inputs are built.
+        # Upstream preempts these requests in drop mode and discards their stale
+        # output itself. TT receives one output frame for a speculative
+        # reservation of 1+K tokens, so publish frame counts to the runner,
+        # which must keep those frames out of request state before
+        # resumed-prefill inputs are built.
         reset_candidates = (
             [
                 (
@@ -935,8 +1060,6 @@ class TTScheduler(AsyncScheduler):
             return super().reset_prefix_cache(reset_running_requests, reset_connector)
         finally:
             for request, frame_count in reset_candidates:
-                if request.status == RequestStatus.PREEMPTED:
-                    request.async_tokens_to_discard = frame_count
                 if request.status == RequestStatus.PREEMPTED and frame_count > 0:
                     pending = self._pending_forced_reset_discard_counts
                     pending[request.request_id] = (
@@ -963,7 +1086,9 @@ class TTScheduler(AsyncScheduler):
         )
         # The parent computes whether this chunk produces output. Retain that
         # decision on this step because a later schedule changes the request.
-        setattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids)
+        set_tt_scheduler_output_field(
+            scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids
+        )
         pending = getattr(self, "_pending_async_output_frames", None)
         if pending is None:
             pending = self._pending_async_output_frames = {}
@@ -1126,6 +1251,16 @@ class TTScheduler(AsyncScheduler):
                 owner = None
         self._spec_session_owner = owner
 
+    def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        """None on a lane: TTLaneCoordinator.make_stats makes the step's one
+        SchedulerStats for every lane. A lane's own would count only its
+        requests, and the coordinator replaces it on the first client's output
+        alone.
+        """
+        if self.stats_made_by_coordinator:
+            return None
+        return super().make_stats(*args, **kwargs)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1143,20 +1278,31 @@ class TTScheduler(AsyncScheduler):
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
             self._committing_block_step_decisions = {}
-            pending = self._pending_async_output_frames
-            for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
-                count = pending.get(req_id, 0)
-                if count <= 1:
-                    pending.pop(req_id, None)
-                else:
-                    pending[req_id] = count - 1
+            self.tt_release_output_frames(scheduler_output)
+
+    def tt_release_output_frames(self, scheduler_output: SchedulerOutput) -> None:
+        """Release the output frames ``scheduler_output`` reserved.
+
+        Call it exactly once per committed step, as ``update_from_output`` does from
+        its ``finally``. A subclass whose ``update_from_output`` does not reach this
+        class's must call it the same way.
+        """
+        pending = self._pending_async_output_frames
+        for req_id in getattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, ()):
+            count = pending.get(req_id, 0)
+            if count <= 1:
+                pending.pop(req_id, None)
+            else:
+                pending[req_id] = count - 1
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int]
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
-            return super()._update_request_with_output(request, new_token_ids)
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
         # Adaptive: a request that decoded batched (or over-frontier) this step
         # committed a single baseline token (no block was reserved) -> plain
         # reconciliation. The decision is read from THIS step's SchedulerOutput
@@ -1188,14 +1334,16 @@ class TTScheduler(AsyncScheduler):
                         "baseline token -- the scheduler and model block gates "
                         "disagree"
                     )
-                return super()._update_request_with_output(request, new_token_ids)
-        if request.async_tokens_to_discard:
-            # A block step reserved K placeholders; the AsyncScheduler discard
-            # path drains only one per stale frame, so it cannot balance a
-            # dropped block. Block requests are never reset-preempted
-            # (reset_prefix_cache raises while one runs) and solo spec steps are
-            # not KV-preempted, so this must not happen -- fail loudly rather
-            # than silently leak placeholders.
+                return super()._update_request_with_output(
+                    request, new_token_ids, is_stale=is_stale
+                )
+        if is_stale:
+            # The request was preempted after this block was submitted, and
+            # preemption zeroed the K placeholders the block would reconcile.
+            # Block requests are never reset-preempted (reset_prefix_cache
+            # raises while one runs) and solo spec steps are not KV-preempted,
+            # so this must not happen -- fail loudly rather than commit a block
+            # against a reservation that no longer exists.
             raise RuntimeError(
                 "A stale async output reached block serving for a block step; "
                 "block-output frames cannot be discarded (reset/preempt of a "

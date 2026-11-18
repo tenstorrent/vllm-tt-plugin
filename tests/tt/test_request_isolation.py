@@ -13,13 +13,21 @@ class TestBatchIsolation:
     def test_mixed_params_batch(self, tt_server, tt_model_name, max_batch_size):
         """
         Batch where each request has completely different parameters.
+
+        The plugin picks one sampler per forward, for all requests in it, and
+        host and device sampling draw from different random streams. A seeded
+        request therefore reproduces across the shuffled runs only if no
+        companion can move its steps to host sampling. For that reason every
+        top_k set here is within the device sampler's bound
+        (max_device_top_k=32). Requests that set no top_k use the server
+        default, which must also be within that bound.
         """
         configs = [
             # Greedy
             RequestConfig(prompt="Count: ", max_tokens=5, temperature=0),
             # High temp with seed
             RequestConfig(
-                prompt="Random: ", max_tokens=5, temperature=2.0, top_k=100, seed=42
+                prompt="Random: ", max_tokens=5, temperature=2.0, top_k=32, seed=42
             ),
             # With repetition penalty
             RequestConfig(

@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import copy
+import fcntl
 import math
 import os
+import tempfile
 import time
 import warnings
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import ttnn
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils.torch_utils import (
+    OMP_NUM_THREADS_SET_BY_VLLM,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    set_torch_threads_for_runtime,
+)
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_uniform_page_size,
@@ -22,12 +30,15 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_tt_plugin.config import (
+    TT_SCHEDULER_CLS,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_output_tokens_per_step,
@@ -49,6 +60,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
     format_tt_visible_devices,
     parse_mesh_grid,
 )
+from vllm_tt_plugin.utils.dp_lane_metal_env import compute_dp_lane_metal_env
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -125,6 +137,36 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
     )
 
 
+def _bind_dp_lane_metal_env(vllm_config: VllmConfig) -> None:
+    """Give this standard-DP lane its own tt-metal Inspector address and logs.
+
+    Every lane is a separate tt-metal process on one host, so without this
+    they all bind the Inspector RPC default ``localhost:50051`` and share one
+    Inspector log directory, and the auto-triage run on a dispatch timeout
+    reads a neighbouring lane (tt-metal #63345). The overrides come from
+    ``compute_dp_lane_metal_env`` and must land before the first device open,
+    which is when tt-metal reads its runtime options. Launches without
+    discovered groups (MPI) keep the inherited values: tt-metal offsets by MPI
+    rank itself.
+    """
+    groups = _load_standard_dp_visible_groups(vllm_config)
+    if not groups:
+        return
+    overrides = compute_dp_lane_metal_env(
+        vllm_config.parallel_config.data_parallel_rank_local,
+        len(groups),
+        os.environ,
+    )
+    for key, value in overrides.items():
+        os.environ[key] = value
+    if overrides:
+        logger.info(
+            "Bound per-lane tt-metal diagnostics env for local DP rank %s: %s",
+            vllm_config.parallel_config.data_parallel_rank_local,
+            ", ".join(f"{k}={v}" for k, v in overrides.items()),
+        )
+
+
 def _resolve_mesh_grid(
     mesh_device_env: str | None,
     num_devices_available: int,
@@ -182,6 +224,21 @@ def _available_kv_cache_memory_bytes_for_num_blocks(
 
 
 class TTWorker(WorkerBase):
+    # Built by _create_model_runner; a subclass swaps the runner without
+    # copying the device and KV-pool steps of init_device.
+    model_runner_cls: type[TTModelRunner] = TTModelRunner
+
+    # The scheduler this worker runs with; resolve_tt_scheduler_cls pairs a
+    # requested scheduler against it. A stage worker names its own.
+    tt_scheduler_cls: str | type = TT_SCHEDULER_CLS
+
+    # False for a stage with no token KV cache, such as an audio decoder. Its
+    # empty KV spec makes vLLM treat the stage as attention-free: the engine
+    # skips determine_available_memory and hands initialize_from_config a
+    # config with no KV groups, which TTModelRunner refuses. Such a worker
+    # therefore names a runner that accepts it.
+    uses_token_kv_cache: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -219,10 +276,16 @@ class TTWorker(WorkerBase):
             self.enable_model_warmup = tt_config[enable_model_warmup_key]
 
     def init_device(self) -> None:
+        self._init_tt_device()
+        self._init_kv_pool()
+        self.model_runner: TTModelRunner = self._create_model_runner()
+
+    def _init_tt_device(self) -> None:
         # tt-metal latches the visible set at first cluster construction and never
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
         _bind_visible_devices_env(self.vllm_config)
+        _bind_dp_lane_metal_env(self.vllm_config)
 
         # Validate/apply TT config in this worker process (multiprocessing
         # means platform class attrs + config mutations must be applied per
@@ -252,6 +315,9 @@ class TTWorker(WorkerBase):
         assert self.mesh_device is not None
         self.num_devices = self.mesh_device.get_num_devices()
 
+    def _init_kv_pool(self) -> None:
+        if not self.uses_token_kv_cache:
+            return
         # Size the KV pool and settle --max-model-len here, not in
         # determine_available_memory: upstream runs the whole executor init
         # (init_device, then load_model) before it asks for available memory
@@ -266,8 +332,9 @@ class TTWorker(WorkerBase):
         )
         _fit_block_output_max_model_len(self.vllm_config, self._num_tt_blocks)
 
-        # Init ModelRunner here, so that we have access to self.mesh_device.
-        self.model_runner: TTModelRunner = TTModelRunner(
+    def _create_model_runner(self) -> TTModelRunner:
+        # Needs the mesh that _init_tt_device opened.
+        return self.model_runner_cls(
             vllm_config=self.vllm_config,
             mesh_device=self.mesh_device,
             trace_mode=self.trace_mode,
@@ -289,6 +356,11 @@ class TTWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        # TT cache setup handles only LBNHC's per-group packing; it is also
+        # block-compact, so models with mixed KV shapes still resolve to it.
+        return [KVCacheLayout.LBNHC.name]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -321,6 +393,8 @@ class TTWorker(WorkerBase):
            we don't run profiling for available memory and instead override
            num blocks via ``self.cache_config.num_gpu_blocks_override``.
         """
+        if not self.uses_token_kv_cache:
+            return {}
         spec_from_hook = self._try_get_spec_from_model_hook()
         if spec_from_hook is not None:
             return spec_from_hook
@@ -355,20 +429,7 @@ class TTWorker(WorkerBase):
         model_cls, _ = ModelRegistry.resolve_model_cls(
             arch, model_config=self.model_config
         )
-        hook = getattr(model_cls, "get_kv_cache_spec", None)
-        if hook is None:
-            return None
-        spec = hook(self.vllm_config)
-        if spec is None:
-            return None
-        if not isinstance(spec, dict) or not all(
-            isinstance(k, str) and isinstance(v, KVCacheSpec) for k, v in spec.items()
-        ):
-            raise TypeError(
-                f"{model_cls.__name__}.get_kv_cache_spec() must return "
-                f"dict[str, KVCacheSpec] or None, got {type(spec).__name__}"
-            )
-        return spec
+        return kv_cache_spec_from_model_class(model_cls, self.vllm_config)
 
     def _build_default_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Single-layer spec used by the legacy non-hybrid path. Downstream
@@ -420,6 +481,8 @@ class TTWorker(WorkerBase):
               synthetic byte budget that makes the upstream KV planner
               reconstruct that same block count in the engine process.
         """
+        if not self.uses_token_kv_cache:
+            return 0
         if self._num_tt_blocks is None:
             raise RuntimeError(
                 "The TT KV pool has not been sized; determine_available_memory "
@@ -435,10 +498,12 @@ class TTWorker(WorkerBase):
         )
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate TT KV cache and initialize persistent input batch.
+        """Hand the engine's KV cache config to the runner.
 
+        The runner allocates the TT KV cache and the persistent input batch.
         Every standard-DP rank owns its own TT mesh/KV cache, while
-        single-process lane mode has only one rank.
+        single-process lane mode has only one rank. Without a token KV cache
+        the config has no KV groups.
         """
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
@@ -460,11 +525,15 @@ class TTWorker(WorkerBase):
         # figure and zero for the (absent) encoder phase.
         if not self.enable_model_warmup:
             logger.warning("Skipping model warmup")
-            return CompilationTimes(language_model=0.0, encoder=0.0)
+            elapsed = 0.0
+        else:
+            start = time.perf_counter()
+            self.model_runner.warmup_model()
+            elapsed = time.perf_counter() - start
 
-        start = time.perf_counter()
-        self.model_runner.warmup_model()
-        elapsed = time.perf_counter() - start
+        # vLLM sizes multiproc workers' torch threads for startup only.
+        if os.environ.get(OMP_NUM_THREADS_SET_BY_VLLM) == "1":
+            set_torch_threads_for_runtime()
 
         return CompilationTimes(language_model=elapsed, encoder=0.0)
 
@@ -510,10 +579,31 @@ class TTWorker(WorkerBase):
         mesh left open wedges the board's ethernet cores for the *next*
         process ("Timed out while waiting for active ethernet core ... Try
         resetting the board").
+
+        Order matters: the model owns tensors, traces and captures allocated
+        *on* the mesh, so it must go before the mesh closes.
+        ``TTModelRunner.shutdown`` does that explicitly, because a plain ``del``
+        cannot establish the order -- the runner sits in reference cycles and is
+        reclaimed whenever the cyclic collector runs. ``__del__`` stays a
+        best-effort backstop and deliberately does not call it; see the note
+        there.
         """
-        runner = getattr(self, "model_runner", None)
-        if runner is not None:
-            runner.shutdown()
+        if getattr(self, "model_runner", None) is not None:
+            try:
+                self.model_runner.shutdown()
+            except Exception:
+                # The close below must not be skipped: a mesh left open wedges
+                # the board for the next process.
+                logger.exception(
+                    "Model runner shutdown failed; closing the mesh anyway"
+                )
+            del self.model_runner
+        # init_device sets these alongside mesh_device, so clearing only
+        # mesh_device would leave two live references to a closed device.
+        self.device = None
+        device_config = getattr(self, "device_config", None)
+        if device_config is not None:
+            device_config.device = None
         mesh_device = getattr(self, "mesh_device", None)
         if mesh_device is not None:
             close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
@@ -534,6 +624,10 @@ class TTWorker(WorkerBase):
 
     def __del__(self):
         # Delete model runner first in case there are model artifacts.
+        # Deliberately does NOT call ``TTModelRunner.shutdown``: from a
+        # destructor that risks raising something this ``suppress`` misses,
+        # which would skip the mesh close below.
+        #
         # Separate suppress blocks: init_device raises between opening the
         # mesh and assigning model_runner (sizing validation), and a missing
         # model_runner must not short-circuit closing the open mesh.
@@ -548,6 +642,90 @@ class TTWorker(WorkerBase):
 
         if hasattr(super(), "__del__"):
             super().__del__()  # type: ignore
+
+
+def kv_cache_spec_from_model_class(
+    model_cls: type, vllm_config: VllmConfig
+) -> dict[str, KVCacheSpec] | None:
+    """The model class's ``get_kv_cache_spec`` result, validated.
+
+    ``None`` when the class has no hook or the hook returns ``None`` (the
+    single-spec default applies). The worker's spec resolution and the
+    hybrid pool floor both go through here, so they cannot disagree.
+    """
+    hook = getattr(model_cls, "get_kv_cache_spec", None)
+    if hook is None:
+        return None
+    spec = hook(vllm_config)
+    if spec is None:
+        return None
+    if not isinstance(spec, dict) or not all(
+        isinstance(k, str) and isinstance(v, KVCacheSpec) for k, v in spec.items()
+    ):
+        raise TypeError(
+            f"{model_cls.__name__}.get_kv_cache_spec() must return "
+            f"dict[str, KVCacheSpec] or None, got {type(spec).__name__}"
+        )
+    return spec
+
+
+def _kv_cache_groups_for_sizing(vllm_config: VllmConfig, kv_cache_specs: dict):
+    """Group ``kv_cache_specs`` the way the engine will, for pool sizing.
+
+    vLLM 0.29+ packs heterogeneous groups by the KV cache layout, which the
+    engine core resolves only after ``init_device`` (``resolve_kv_cache_layout``),
+    so the real ``cache_config`` still has no layout here. TT advertises LBNHC
+    alone (``TTWorker.get_supported_kv_cache_layouts``), so that is what the
+    engine resolves; size against it on a shallow copy, leaving the shared
+    config for the engine to resolve itself.
+    """
+    cache_config = vllm_config.cache_config
+    if getattr(cache_config, "kv_cache_layout", None) is not None or not hasattr(
+        cache_config, "get_resolved_kv_cache_layout"
+    ):
+        return vllm_config, get_kv_cache_groups(vllm_config, kv_cache_specs)
+    sizing_config = copy.copy(vllm_config)
+    sizing_config.cache_config = copy.copy(cache_config)
+    sizing_config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
+    return sizing_config, get_kv_cache_groups(sizing_config, kv_cache_specs)
+
+
+def _upstream_admission_blocks(
+    vllm_config: VllmConfig, kv_cache_specs: dict[str, KVCacheSpec]
+) -> int:
+    """Smallest pool, in blocks, that upstream ``get_kv_cache_configs`` admits.
+
+    Mirrors its steps for one worker: tag sliding-window specs with
+    ``extra_retained_tokens`` (nonzero for multi-module MTP), group the specs, take
+    the memory one request at ``max_model_len`` needs, and add BlockPool's
+    null block, which the admission check subtracts from the pool before
+    comparing. The private helpers are imported here, not at module scope,
+    so a vLLM rename breaks only this path.
+    """
+    from vllm.v1.core.kv_cache_utils import (
+        _max_memory_usage_bytes_from_groups,
+        _pool_bytes_per_block,
+    )
+
+    extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
+    if extra_retained_tokens:
+        kv_cache_specs = {
+            name: (
+                replace(spec, extra_retained_tokens=extra_retained_tokens)
+                if isinstance(spec, SlidingWindowSpec)
+                else spec
+            )
+            for name, spec in kv_cache_specs.items()
+        }
+    sizing_config, groups = _kv_cache_groups_for_sizing(
+        vllm_config, dict(kv_cache_specs)
+    )
+    if not groups:
+        return 0
+    bytes_per_block = _pool_bytes_per_block(groups)
+    one_request_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
+    null_block = 1
+    return -(-one_request_bytes // bytes_per_block) + null_block
 
 
 def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -> int:
@@ -641,18 +819,55 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     )
     sliding_window = model_config.get_sliding_window()
     if hybrid_kv_cache_groups_enabled and sliding_window is not None:
-        # Conservative cap: assume up to a few sliding groups per buffer
-        # (typical for Gemma3 5:1 / GPT-OSS 1:1 hybrid patterns) and add
-        # ``sliding_window * max_batch`` worth of tokens per group as
-        # padding. The exact number of sliding groups isn't known here
-        # (the spec hook hasn't run yet); bound it with a small constant
-        # rather than walking the model layer types from raw HF config.
+        # Heuristic padding: ``sliding_window * max_batch`` tokens for up to
+        # eight sliding groups (Gemma3 5:1 / GPT-OSS 1:1 patterns). It ignores
+        # ``max_in_flight_tokens``, upstream's extra block per sliding group
+        # and the null block, so it under-counts at small ``max_batch``; for
+        # models with a ``get_kv_cache_spec`` hook the upstream admission
+        # floor below corrects that from the real groups.
         _MAX_SLIDING_GROUPS_HEURISTIC = 8
         max_tokens_all_users += (
             sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC
         )
 
     num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)
+    # Hybrid models: the budget above can be smaller than what upstream needs
+    # to admit one request at max_model_len (sliding groups retain blocks for
+    # in-flight prefill), and startup then fails in get_kv_cache_configs.
+    # Raise the pool to upstream's admission requirement plus the output
+    # reservation. Auto-fit (-1) keeps the model budget: vLLM fits the length
+    # to it instead.
+    specs = (
+        kv_cache_spec_from_model_class(model_class, vllm_config)
+        if hybrid_kv_cache_groups_enabled
+        and getattr(model_config, "original_max_model_len", None) != -1
+        else None
+    )
+    if specs:
+        output_reservation_blocks = (
+            math.ceil(per_user_output_reservation / cache_config.block_size) * max_batch
+        )
+        admission_floor = (
+            _upstream_admission_blocks(vllm_config, specs) + output_reservation_blocks
+        )
+        if admission_floor > num_tt_blocks:
+            # TT does not profile device memory, so nothing here checks that
+            # the larger pool fits; if it does not, KV allocation on the
+            # device fails at startup.
+            logger.warning(
+                "Raising the TT KV pool from %d to %d blocks: one request at "
+                "max_model_len=%d (max_in_flight_tokens=%d) needs %d blocks "
+                "upstream (including the null block) plus %d "
+                "output-reservation blocks, more than max_tokens_all_users "
+                "provides. Device memory for the larger pool is not checked.",
+                num_tt_blocks,
+                admission_floor,
+                model_config.max_model_len,
+                vllm_config.max_in_flight_tokens,
+                admission_floor - output_reservation_blocks,
+                output_reservation_blocks,
+            )
+            num_tt_blocks = admission_floor
     if is_tt_block_output_model(vllm_config):
         resolved_kv_tokens = num_tt_blocks * cache_config.block_size
         required_kv_tokens = model_config.max_model_len + output_tokens_per_step
@@ -863,6 +1078,29 @@ def get_mesh_grid(*args: Any, **kwargs: Any):
     return mesh_grid
 
 
+def _device_open_lock_path() -> str:
+    return os.path.join(
+        tempfile.gettempdir(), f"vllm_tt_open_mesh_device.{os.getuid()}.lock"
+    )
+
+
+@contextmanager
+def _device_open_lock():
+    """Serialize device bring-up between TT worker processes on one host.
+
+    Standard-DP ranks open their cards at the same moment. On a T3K, concurrent
+    firmware and fabric bring-up made ranks time out on the ethernet remote-IO
+    flush to their remote chip, so ranks open one at a time; once open, they
+    load and serve in parallel.
+    """
+    with open(_device_open_lock_path(), "a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def open_mesh_device(
     tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
 ):
@@ -871,15 +1109,16 @@ def open_mesh_device(
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
 
-    # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested, model_fabric_config)
+    with _device_open_lock():
+        # Set fabric before opening the device
+        set_fabric(tt_config, num_devices_requested, model_fabric_config)
 
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(*mesh_grid),
-        dispatch_core_config=get_dispatch_core_config(tt_config),
-        **device_params,
-    )
+        mesh_device = ttnn.open_mesh_device(
+            ttnn.MeshShape(*mesh_grid),
+            dispatch_core_config=get_dispatch_core_config(tt_config),
+            **device_params,
+        )
     logger.info(
         "multidevice with %d devices and grid %s is created",
         mesh_device.get_num_devices(),

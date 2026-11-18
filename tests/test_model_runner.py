@@ -4,14 +4,26 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+)
+from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.worker import TTWorker
 
 # region Constants
 VOCAB_SIZE = 64
@@ -69,6 +81,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,
         tt_data_parallel_size=DP_SIZE,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
+        supports_stage_inputs=False,
         model_config=SimpleNamespace(is_multimodal_model=False),
         check_perform_device_sampling=lambda **_: False,
         _block_tables_per_layer=lambda _: None,
@@ -83,7 +96,82 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     runner._tt_committed_width = lambda toks: TTModelRunner._tt_committed_width(
         runner, toks
     )
+    # The builder asks the speculative row helpers on every step; on a launch
+    # that does not speculate they return the rows unchanged.
+    for name in (
+        "_spec_decode_rows",
+        "_decode_device_sampled",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
     return runner
+
+
+def test_hybrid_kv_cache_uses_v029_tensor_layers():
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=1024,
+                layers=["model.layers.0.self_attn", "model.layers.1.self_attn"],
+                layer_stride=512,
+                block_stride=256,
+            ),
+            KVCacheTensor(
+                size=1024,
+                layers=["model.layers.2.self_attn"],
+                layer_stride=512,
+                block_stride=256,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn", "model.layers.1.self_attn"], spec
+            ),
+            KVCacheGroupSpec(["model.layers.2.self_attn"], spec),
+        ],
+    )
+    runner = SimpleNamespace(
+        num_devices=1,
+        tt_data_parallel_size=1,
+    )
+    runner._kv_cache_shape = lambda spec, num_blocks: TTModelRunner._kv_cache_shape(
+        runner, spec, num_blocks
+    )
+
+    per_layer = TTModelRunner._build_per_layer_specs(runner, config, 3)
+
+    # Groups alias from byte 0: the i-th layer of each group shares buffer i.
+    assert [entry[2] for entry in per_layer] == [0, 1, 0]
+
+
+def test_kv_cache_layout_resolves_to_lbnhc_for_mixed_specs():
+    specs = [
+        FullAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=num_kv_heads,
+            head_size=8,
+            dtype=torch.float32,
+        )
+        for num_kv_heads in (1, 4)
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_layout=None),
+        kv_transfer_config=None,
+    )
+    supported = TTWorker.get_supported_kv_cache_layouts(TTWorker.__new__(TTWorker))
+
+    layout = resolve_kv_cache_layout(vllm_config, [supported], specs)
+
+    assert supported == ["LBNHC"]
+    assert layout.name == "LBNHC"
 
 
 def _prepare(runner, *rows):
@@ -188,6 +276,112 @@ def test_resumed_replay_past_prompt_length_remains_prefill():
 
 
 # endregion Prefill classification
+
+
+class _RecordingLogger:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def info(self, msg: str, *args) -> None:
+        self.lines.append(msg % args)
+
+
+@pytest.fixture
+def chunk_log(monkeypatch) -> list[str]:
+    """Lines the runner logs while building inputs."""
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(input_batch_module, "logger", recorder)
+    return recorder.lines
+
+
+@pytest.mark.parametrize(
+    "num_computed_tokens, num_scheduled_tokens, expected",
+    [
+        (0, 2, ["Prefill chunk for request r: tokens [0, 2) of 8."]),
+        (2, 4, ["Prefill chunk for request r: tokens [2, 6) of 8."]),
+        (6, 2, ["Prefill chunk for request r: tokens [6, 8) of 8, final."]),
+        (0, 8, []),
+    ],
+)
+def test_each_chunk_of_a_split_prompt_is_logged(
+    chunk_log, num_computed_tokens, num_scheduled_tokens, expected
+):
+    """Every chunk of a split prompt leaves one line; an unsplit prompt none.
+
+    An intermediate chunk emits no token, so this line is the only per-request
+    evidence outside the process that the prompt was split.
+    """
+    batch, request = _batch_with_one_request(8, 0, num_computed_tokens)
+
+    _prepare(
+        _fake_runner(batch, request),
+        ("r", num_scheduled_tokens, num_computed_tokens, 0),
+    )
+
+    assert chunk_log == expected
+
+
+@pytest.mark.parametrize(
+    "num_computed_tokens, num_scheduled_tokens, expected",
+    [
+        (0, 16, ["Prefill chunk for request r: tokens [0, 16) of 20."]),
+        (16, 4, ["Prefill chunk for request r: tokens [16, 20) of 20, final."]),
+    ],
+)
+def test_each_chunk_of_a_replay_past_the_prompt_is_logged(
+    chunk_log, num_computed_tokens, num_scheduled_tokens, expected
+):
+    """After preemption vLLM replays the 8 prompt tokens and the 12 generated
+    ones to rebuild the KV cache. The final replay chunk starts past the prompt
+    but is still prefill work, so it is logged like a prompt's final chunk."""
+    batch, request = _batch_with_one_request(8, 12, num_computed_tokens)
+
+    _prepare(
+        _fake_runner(batch, request),
+        ("r", num_scheduled_tokens, num_computed_tokens, 12),
+    )
+
+    assert chunk_log == expected
+
+
+def test_decode_row_beside_a_chunk_is_not_logged(chunk_log):
+    batch, chunking = _batch_with_one_request(8, 0, num_computed_tokens=2)
+    batch.add_request(
+        CachedRequestState(
+            req_id="r2",
+            prompt_token_ids=list(range(8)),
+            mm_features=None,
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            block_ids=([1],),
+            num_computed_tokens=8,
+            output_token_ids=[100],
+        )
+    )
+
+    _prepare(_fake_runner(batch, chunking), ("r", 2, 2, 0), ("r2", 1, 8, 1))
+
+    assert chunk_log == ["Prefill chunk for request r: tokens [2, 4) of 8."]
+
+
+def test_prefix_cache_hit_on_a_new_request_is_not_a_chunk(chunk_log):
+    """A new request that starts at a cached offset and finishes its prompt
+    in one step was not split."""
+    batch, _ = _batch_with_one_request(8, 0, num_computed_tokens=4)
+    no_running = CachedRequestData.make_empty()
+
+    input_batch_module.log_prefill_chunks(
+        batch,
+        [0],
+        np.array([4]),
+        np.array([8]),
+        torch.tensor([False]),
+        no_running,
+        output_tokens_per_step=1,
+    )
+
+    assert chunk_log == []
+
 
 # region Decode input construction
 
@@ -315,6 +509,31 @@ def test_block_resume_replay_past_one_canvas_remains_prefill():
     assert model_input.prompt_lens.tolist() == [16]
 
 
+def test_decode_with_bad_words_carries_the_output_history_without_penalties():
+    """vLLM's bad-words op bans a word's last token only after the rest of it.
+
+    It reads the rest of the word from the output history the host sampler is
+    handed, so a decode with bad words carries that history even when no row
+    has a penalty.
+    """
+    params = SamplingParams(temperature=1.0)
+    params._bad_words_token_ids = [[9, 10]]
+    batch, request = _batch_with_one_request(
+        prompt_len=8, output_len=2, num_computed_tokens=9, sampling_params=params
+    )
+    assert batch.no_penalties
+
+    model_input = _prepare(_fake_runner(batch, request), ("r", 1, 9, 2))
+
+    assert model_input.output_tokens is not None
+    history = [[t for t in model_input.output_tokens[0].tolist() if t != -1]]
+    assert history == [[8, 9]]
+    logits = torch.zeros(1, VOCAB_SIZE)
+    apply_bad_words(logits, model_input.bad_words_token_ids_list[0], history)
+    assert logits[0, 10] == -torch.inf
+    assert torch.isfinite(logits[0, :10]).all()
+
+
 # endregion Decode input construction
 
 # region Output state
@@ -362,6 +581,7 @@ def test_device_penalties_follow_model_capability(declared, has_penalties):
     capabilities = {} if declared is None else {"supports_device_penalties": declared}
     runner = SimpleNamespace(
         sample_on_device_mode="all",
+        seeded_sampling_policy="auto",
         num_devices=4,
         tt_data_parallel_size=1,
         model=SimpleNamespace(model_capabilities=capabilities),

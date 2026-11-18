@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
-"""Import-only ``ttnn`` stand-in so the unit suite can run without tt-metal.
+r"""Import-only ``ttnn`` stand-in so the unit suite can run without tt-metal.
 
 ``vllm_tt_plugin.entrypoints.platform_plugin`` gates the whole TT platform on
 ``import ttnn``, and several plugin modules import it at module scope, so a
@@ -15,7 +15,8 @@ loudly here instead of silently passing against a fake device.
 
 Put this directory's parent on ``PYTHONPATH`` to use it:
 
-    PYTHONPATH=ci/host-stubs pytest tests/ --ignore=tests/tt
+    PYTHONPATH=tests/host-stubs \
+        "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 """
 
 from enum import Enum
@@ -57,8 +58,13 @@ class DispatchCoreConfig:
 
 
 class MeshShape:
+    """Iterable like native ttnn's, whose ``dims`` is a method, not the dimensions."""
+
     def __init__(self, *dims):
-        self.dims = dims
+        self._dims = dims
+
+    def __iter__(self):
+        return iter(self._dims)
 
 
 class MeshDevice:
@@ -83,6 +89,9 @@ class ClusterType(Enum):
 class _Cluster:
     ClusterType = ClusterType
     get_cluster_type = staticmethod(_no_device("cluster.get_cluster_type"))
+    serialize_cluster_descriptor = staticmethod(
+        _no_device("cluster.serialize_cluster_descriptor")
+    )
 
 
 cluster = _Cluster()

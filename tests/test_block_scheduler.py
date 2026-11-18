@@ -27,12 +27,16 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_tt_plugin.config import (
+    resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_output_tokens_per_step,
@@ -41,6 +45,7 @@ from vllm_tt_plugin.input_batch import InputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.scheduler import (
     TTScheduler,
+    _require_kv_for_every_sequence,
     get_tt_block_step_decisions,
     get_tt_forced_reset_discard_counts,
 )
@@ -91,6 +96,8 @@ def _scheduler(
     adaptive: bool = False,
     max_num_seqs: int = 1,
     kv_extent: int = 0,
+    stage_outputs: bool = False,
+    num_blocks: int | None = None,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -132,11 +139,16 @@ def _scheduler(
         config.model_config.__dict__.pop("is_diffusion", None)
         assert config.model_config.is_diffusion is False
     store_tt_output_tokens_per_step(config, output_width)
+    if stage_outputs:
+        resolve_tt_supports_stage_outputs(
+            config, {"supports_stage_outputs": True}, object, False
+        )
     if adaptive:
         store_tt_adaptive_block_output(config, True)
     if kv_extent:
         store_tt_block_kv_extent_tokens(config, kv_extent)
-    num_blocks = max_model_len // BLOCK_SIZE + 2
+    if num_blocks is None:
+        num_blocks = max_model_len // BLOCK_SIZE + 2
     cache_config.num_gpu_blocks = num_blocks
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -190,8 +202,14 @@ def _scheduled(
     output_width: int = CANVAS,
     ignore_eos: bool = True,
     async_scheduling: bool = False,
+    stage_outputs: bool = False,
 ) -> tuple[TTScheduler, Request, SchedulerOutput]:
-    scheduler = _scheduler(output_width, async_scheduling=async_scheduling)
+    # A stage-output model decodes one token per step.
+    if stage_outputs:
+        output_width = 1
+    scheduler = _scheduler(
+        output_width, async_scheduling=async_scheduling, stage_outputs=stage_outputs
+    )
     request = _request(max_tokens, ignore_eos=ignore_eos)
     scheduler.add_request(request)
     return scheduler, request, scheduler.schedule()
@@ -227,6 +245,7 @@ def test_prefill_fallback_releases_finished_runner_state(async_scheduling):
     runner._pending_state_slot_settle = None
     runner.requests = {}
     runner.encoder_cache = {}
+    runner.supports_stage_inputs = False
     runner._decode_layout_changed_since_last_decode = False
     released_slots = []
     runner.model = SimpleNamespace(release_request=released_slots.append)
@@ -341,11 +360,9 @@ def test_add_request_clamps_max_tokens_that_would_overshoot_max_model_len():
     assert request.sampling_params.max_tokens == 224
 
 
-def test_add_request_strips_host_sampling_controls_from_bypassed_request():
-    """A prebuilt EngineCoreRequest skips frontend validation; any of these
-    controls flips the step onto host sampling, which cannot construct a
-    multi-token canvas and would kill the engine."""
-    scheduler = _scheduler()
+def _bypassed_host_sampling_request() -> Request:
+    """A prebuilt EngineCoreRequest that skipped frontend validation and
+    carries every request-level control that can force host sampling."""
     init_none_hash(sha256)
     params = SamplingParams(
         max_tokens=CANVAS,
@@ -358,6 +375,7 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         presence_penalty=0.5,
         frequency_penalty=0.5,
         repetition_penalty=1.1,
+        logprobs=1,
         structured_outputs=StructuredOutputsParams(json_object=True),
     )
     params.update_from_generation_config({}, eos_token_id=2)
@@ -365,7 +383,7 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     # (InputBatch reads bad_words_token_ids, not the strings); with
     # skip_tokenizer_init it stays unset unless seeded here.
     params._bad_words_token_ids = [[7]]
-    request = Request(
+    return Request(
         request_id="bypass-0",
         prompt_token_ids=[1] * 32,
         sampling_params=params,
@@ -373,6 +391,15 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
         resumable=True,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
     )
+
+
+def test_add_request_strips_host_sampling_controls_from_bypassed_request():
+    """A prebuilt EngineCoreRequest skips frontend validation; any of these
+    controls flips the step onto host sampling, which cannot construct a
+    multi-token canvas and would kill the engine."""
+    scheduler = _scheduler()
+    request = _bypassed_host_sampling_request()
+    params = request.sampling_params
     assert request.use_structured_output
     assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
@@ -394,11 +421,86 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     # A resumable session would park the stopped request forever and leak the
     # model-owned state slot.
     assert request.resumable is False
-    # With the structured-output request gone, nothing could ever promote the
-    # request out of skipped_waiting; it must be schedulable immediately.
+    # With the structured-output request gone, no grammar ever arrives and the
+    # base prefill loop would skip the request forever; it must be schedulable
+    # immediately.
     assert request.status == RequestStatus.WAITING
     scheduled = scheduler.schedule()
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
+
+
+def test_max_tokens_clamp_before_prompt_truncation_fails_loudly():
+    """The clamp relies on the prompt truncation having left room for a whole
+    canvas; run out of order, it must raise instead of admitting a request with
+    a zero budget."""
+    scheduler = _scheduler()
+    request = _request(CANVAS, prompt_length=MAX_MODEL_LEN)
+
+    with pytest.raises(RuntimeError, match="left no budget"):
+        scheduler._clamp_max_tokens_to_whole_canvases(request)
+
+
+@pytest.mark.parametrize("repaired", [False, True])
+def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired):
+    """Drive the runner's own predicate rather than a field list, so a host
+    trigger the repair misses fails here. The four-device mesh is outside the
+    device-logprobs set, and the model declares no device penalties, so
+    logprobs and penalties would both force host sampling if they reached the
+    predicate."""
+    request = _bypassed_host_sampling_request()
+    if repaired:
+        _scheduler().add_request(request)
+    batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_MODEL_LEN,
+        vocab_size=64,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+        logitsprocs=build_logitsprocs(
+            SimpleNamespace(
+                speculative_config=None,
+                scheduler_config=SimpleNamespace(max_num_seqs=1),
+            ),
+            torch.device("cpu"),
+            is_pin_memory=False,
+            is_pooling_model=False,
+        ),
+        disable_logprobs=True,
+        output_tokens_per_step=CANVAS,
+    )
+    batch.add_request(
+        CachedRequestState(
+            req_id=request.request_id,
+            prompt_token_ids=list(request.prompt_token_ids),
+            mm_features=None,
+            sampling_params=request.sampling_params,
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=len(request.prompt_token_ids),
+            output_token_ids=[],
+        )
+    )
+    batch.refresh_logitsprocs()
+    runner = SimpleNamespace(
+        sample_on_device_mode="all",
+        model=SimpleNamespace(model_capabilities={"supports_device_penalties": False}),
+        num_devices=4,
+        tt_data_parallel_size=1,
+        input_batch=batch,
+        seeded_sampling_policy="auto",
+        model_config=SimpleNamespace(logits_processors=[]),
+        supports_device_grammar=False,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        supports_topk_logprobs=False,
+    )
+
+    assert (
+        TTModelRunner.check_perform_device_sampling(
+            runner, True, request.use_structured_output
+        )
+        is repaired
+    )
 
 
 # Largest tile-aligned prompt that still fits one whole canvas: the
@@ -704,6 +806,34 @@ def test_empty_bypassed_prompt_is_padded_and_served():
     assert scheduler.running == []
 
 
+def test_embeds_only_oversized_bypassed_request_is_repaired_in_order():
+    """Enter through add_request with an embeds-only prompt and an oversized
+    max_tokens together. The max_tokens clamp reads the prompt the embeds
+    replacement leaves, so a wrong step order leaves max_tokens unclamped."""
+    scheduler = _scheduler()
+    init_none_hash(sha256)
+    params = SamplingParams(max_tokens=MAX_MODEL_LEN * 4, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=2)
+    request = Request(
+        request_id="combined-0",
+        prompt_token_ids=None,
+        prompt_embeds=torch.zeros(8, 4),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+    scheduler.add_request(request)
+
+    assert request.prompt_token_ids == [0] * 8
+    assert request.prompt_embeds is None
+    assert request.num_prompt_tokens == 8
+    assert 0 < request.max_tokens < MAX_MODEL_LEN * 4
+    assert request.max_tokens % CANVAS == 0
+    assert 8 + request.max_tokens <= MAX_MODEL_LEN
+    assert request.sampling_params.max_tokens == request.max_tokens
+
+
 def test_zero_max_tokens_bypassed_request_finishes_after_first_canvas():
     """A hand-crafted prebuilt request can carry max_tokens=0 (SamplingParams
     itself forbids it); the stop check must finish it length-capped on its
@@ -738,10 +868,11 @@ def test_zero_max_tokens_bypassed_request_finishes_after_first_canvas():
     assert scheduler.running == []
 
 
-def test_running_block_request_rejects_prefix_cache_reset():
+@pytest.mark.parametrize("stage_outputs", [False, True])
+def test_running_block_request_rejects_prefix_cache_reset(stage_outputs):
     # Direct scheduler-level backstop: the engine-layer patch aborts running
     # block requests first, so reaching this guard means it was bypassed.
-    scheduler, request, _ = _scheduled()
+    scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
 
     assert scheduler.running == [request]
     with pytest.raises(RuntimeError, match="Cannot reset prefix cache"):
@@ -760,8 +891,9 @@ def _patched_engine(scheduler: TTScheduler, sent: list) -> SimpleNamespace:
     return SimpleNamespace(scheduler=scheduler, _send_abort_outputs=sent.append)
 
 
-def test_engine_level_reset_aborts_running_block_requests():
-    scheduler, request, _ = _scheduled()
+@pytest.mark.parametrize("stage_outputs", [False, True])
+def test_engine_level_reset_aborts_running_block_requests(stage_outputs):
+    scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
     sent: list = []
     engine = _patched_engine(scheduler, sent)
 
@@ -826,14 +958,19 @@ def _pause_guarded_engine(scheduler: TTScheduler) -> SimpleNamespace:
     from vllm_tt_plugin.platform import _install_block_output_pause_guard_patch
 
     _install_block_output_pause_guard_patch()
-    return SimpleNamespace(scheduler=scheduler)
+    return SimpleNamespace(
+        scheduler=scheduler,
+        _finish_pause=lambda clear_cache: None,
+    )
 
 
-def test_keep_pause_with_clear_cache_is_refused_up_front():
-    # The keep-mode reset runs from an idle callback whose result upstream
-    # discards, so the only honest failure is a synchronous one before any
-    # pause state changes.
-    scheduler, request, _ = _scheduled()
+@pytest.mark.parametrize("stage_outputs", [False, True])
+def test_keep_pause_with_clear_cache_is_refused_up_front(stage_outputs):
+    # The keep-mode reset runs from an idle callback after the scheduler is
+    # paused, and upstream reports its refusal there only as a generic cache
+    # reset failure, so the guard fails synchronously before any pause state
+    # changes.
+    scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
     engine = _pause_guarded_engine(scheduler)
 
     with pytest.raises(ValueError, match="clear_cache=False or mode='abort'"):
@@ -858,7 +995,7 @@ def test_keep_pause_guard_covers_engine_core_proc():
     scheduler, request, _ = _scheduled()
     engine = _pause_guarded_engine(scheduler)
 
-    with pytest.raises(ValueError, match="live block-output request"):
+    with pytest.raises(ValueError, match="cannot be preempted and resumed"):
         EngineCoreProc.pause_scheduler(engine, mode="keep", clear_cache=True)
 
     assert scheduler.running == [request]
@@ -888,7 +1025,7 @@ def test_deferred_keep_reset_returns_false_without_preempting_block_request():
     )
     assert scheduler.running == [request]
     assert request.status == RequestStatus.RUNNING
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
 
 
 def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
@@ -900,8 +1037,74 @@ def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
     )
     assert scheduler.running == []
     assert request.status == RequestStatus.PREEMPTED
-    assert request.async_tokens_to_discard == 1
+    assert request.drop_stale_output is True
     assert request.num_output_placeholders == 0
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 3])
+def test_a_stage_output_model_needs_kv_for_every_sequence_at_full_length(
+    max_num_seqs,
+):
+    """Its requests cannot resume, so no step may run short of blocks and preempt."""
+    per_sequence = MAX_MODEL_LEN // BLOCK_SIZE
+    enough = max_num_seqs * per_sequence + 1  # plus vLLM's null block
+
+    _scheduler(1, stage_outputs=True, max_num_seqs=max_num_seqs, num_blocks=enough)
+    with pytest.raises(
+        ValueError, match=f"max_num_seqs={max_num_seqs} requests at max_model_len"
+    ):
+        _scheduler(
+            1, stage_outputs=True, max_num_seqs=max_num_seqs, num_blocks=enough - 1
+        )
+    # Other models may still run short and preempt.
+    _scheduler(1, max_num_seqs=max_num_seqs, num_blocks=enough - 1)
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 2])
+def test_a_stage_output_model_counts_sliding_groups_by_their_window(max_num_seqs):
+    """A sliding-window group frees blocks behind its window, so a hybrid pool
+    sized for full context in one group and the window in the rest suffices."""
+    block_size, window, in_flight, max_model_len = 32, 513, 1024, 1 << 20
+    common = dict(
+        block_size=block_size, num_kv_heads=4, head_size=128, dtype=torch.bfloat16
+    )
+    specs = [FullAttentionSpec(**common)] + [
+        SlidingWindowSpec(**common, sliding_window=window) for _ in range(4)
+    ]
+    groups = [
+        KVCacheGroupSpec([f"layer.{g}.{i}" for i in range(10)], spec)
+        for g, spec in enumerate(specs)
+    ]
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        max_in_flight_tokens=in_flight,
+    )
+    full = max_model_len // block_size
+    sliding = -(-(window - 1 + in_flight) // block_size) + 1
+    enough = max_num_seqs * (full + 4 * sliding) + 1  # plus vLLM's null block
+
+    def pool(num_blocks):
+        return KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+
+    _require_kv_for_every_sequence(config, pool(enough))
+    with pytest.raises(ValueError, match=f"max_num_seqs={max_num_seqs} requests"):
+        _require_kv_for_every_sequence(config, pool(enough - 1))
+
+
+def test_a_stage_output_model_without_kv_groups_passes_the_pool_check():
+    """An attention-free model gets only the null block and never preempts."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+    )
+    _require_kv_for_every_sequence(
+        config, KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
+    )
 
 
 def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
@@ -909,7 +1112,8 @@ def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
     scheduler.running.remove(request)
     scheduler._preempt_request(request, time.monotonic())
 
-    assert request.num_output_placeholders == 1
+    assert request.num_output_placeholders == 0
+    assert request.num_stale_output_tokens > 0
     outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert outputs[0].outputs[0].new_token_ids == [7]
     assert list(request.output_token_ids) == [7]
@@ -927,7 +1131,8 @@ def test_preempted_request_waits_for_inflight_output_before_resume():
     blocked = scheduler.schedule()
     assert blocked.total_num_scheduled_tokens == 0
     assert request.status == RequestStatus.PREEMPTED
-    assert request.num_output_placeholders == 1
+    assert request.num_output_placeholders == 0
+    assert request.num_stale_output_tokens > 0
 
     older = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert older[0].outputs[0].new_token_ids == [7]
@@ -952,7 +1157,7 @@ def test_forced_reset_discards_stale_frame_before_following_valid_frame():
     assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
     stale = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert stale[0].outputs == []
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
     assert list(request.output_token_ids) == []
 
     valid = scheduler.update_from_output(resumed, _runner_output(resumed, [8]))
@@ -974,13 +1179,13 @@ def test_forced_reset_counts_one_speculative_forward_as_one_output_frame():
     resumed = scheduler.schedule()
 
     assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
-    assert request.async_tokens_to_discard == 1
+    assert request.drop_stale_output is True
 
     stale = scheduler.update_from_output(
         submitted, _runner_output(submitted, [8, 9, 10, 11])
     )
     assert stale[0].outputs == []
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
 
     valid = scheduler.update_from_output(resumed, _runner_output(resumed, [12]))
     assert valid[0].outputs[0].new_token_ids == [12]
@@ -991,7 +1196,7 @@ def test_forced_reset_counts_one_speculative_forward_as_one_output_frame():
     ("mutate", "width", "exc", "match"),
     [
         pytest.param(
-            lambda r: setattr(r, "async_tokens_to_discard", 1),
+            lambda r: setattr(r, "num_stale_output_tokens", r.num_in_flight_tokens),
             CANVAS,
             RuntimeError,
             "stale async output",

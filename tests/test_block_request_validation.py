@@ -6,6 +6,7 @@ from functools import cached_property
 from types import SimpleNamespace
 
 import pytest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import (
     RepetitionDetectionParams,
     SamplingParams,
@@ -20,8 +21,8 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.platform import (
     TTPlatform,
     _fit_block_output_max_tokens,
-    _install_block_output_input_processor_patch,
     _install_block_output_streaming_input_patch,
+    _install_tt_input_processor_patch,
 )
 
 
@@ -82,7 +83,7 @@ def _patch_upstream_boundary(monkeypatch):
 def _processor_harness(monkeypatch, *, output_size=256, max_model_len=1024):
     """Install the vLLM 0.25.1 validate -> clone -> default boundary."""
     input_processor = _patch_upstream_boundary(monkeypatch)
-    _install_block_output_input_processor_patch()
+    _install_tt_input_processor_patch()
 
     config = _set_platform_contract(
         monkeypatch,
@@ -235,6 +236,7 @@ def _config(
             original_max_model_len=None,
             max_logprobs=20,
             is_moe=False,
+            multimodal_config=None,
             generation_config="auto",
             logits_processors=None,
             get_sliding_window=lambda: None,
@@ -242,6 +244,7 @@ def _config(
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=1024,
+            max_num_scheduled_tokens=None,
             enable_chunked_prefill=True,
             long_prefill_token_threshold=128,
             async_scheduling=async_scheduling,
@@ -541,14 +544,14 @@ def test_adaptive_block_model_with_the_move_hook_starts(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("model_class", "expected_max_tokens", "expected_wrapped"),
+    ("model_class", "expected_max_tokens"),
     [
-        (BlockModel, 768, True),
-        (ARModel, 824, False),
+        (BlockModel, 768),
+        (ARModel, 824),
     ],
 )
-def test_startup_installs_input_processor_patch_only_for_block_models(
-    monkeypatch, model_class, expected_max_tokens, expected_wrapped
+def test_startup_installs_input_processor_patch_with_model_specific_defaults(
+    monkeypatch, model_class, expected_max_tokens
 ):
     input_processor = _patch_upstream_boundary(monkeypatch)
     config = _config()
@@ -556,10 +559,8 @@ def test_startup_installs_input_processor_patch_only_for_block_models(
 
     TTPlatform.check_and_update_config(config)
 
-    assert (
-        input_processor.InputProcessor.process_inputs is not _upstream_process_inputs
-    ) is expected_wrapped
-    assert hasattr(input_processor, "_tt_original_process_inputs") is expected_wrapped
+    assert input_processor.InputProcessor.process_inputs is not _upstream_process_inputs
+    assert hasattr(input_processor, "_tt_original_process_inputs")
 
     params = SamplingParams(max_tokens=16)
     params.max_tokens = None
@@ -686,6 +687,22 @@ def test_second_engine_config_is_rejected_when_a_block_model_is_involved(
     other = _config()
     with pytest.raises(ValueError, match="One TT engine per process"):
         TTPlatform.check_and_update_config(other)
+
+
+def test_a_config_without_a_model_leaves_the_live_engine_alone(monkeypatch):
+    """vLLM builds model-less configs (a default one, test fixtures); they start no
+    engine, so they must neither fail the hook nor take a live engine's handle."""
+    from vllm.config import DeviceConfig, VllmConfig
+
+    _patch_model_resolution(monkeypatch)
+    config = _config()
+    TTPlatform.check_and_update_config(config)
+
+    VllmConfig(device_config=DeviceConfig(device="cpu"))
+
+    assert TTPlatform._tt_vllm_config is config
+    with pytest.raises(ValueError, match=r"requires 512 physical"):
+        _validate(SamplingParams(max_tokens=257), prompt_len=513)
 
 
 def test_failed_same_config_reentry_restores_live_block_contract(monkeypatch):
@@ -929,10 +946,21 @@ def test_input_processor_preserves_resumable_ar_request(monkeypatch):
 def test_prompt_embeds_are_rejected_for_every_tt_model(monkeypatch, output_size):
     _set_platform_contract(monkeypatch, output_size=output_size)
 
-    with pytest.raises(ValueError, match=r"prompt_embeds are not supported"):
+    with pytest.raises(VLLMValidationError, match=r"prompt_embeds are not supported"):
         TTPlatform.validate_request(
             {"prompt_token_ids": None, "prompt_embeds": [0] * 513},
             SamplingParams(max_tokens=257),
+        )
+
+
+@pytest.mark.parametrize("output_size", [1, 256], ids=["ar", "block"])
+def test_prompt_logprobs_are_rejected_for_every_tt_model(monkeypatch, output_size):
+    _set_platform_contract(monkeypatch, output_size=output_size)
+
+    with pytest.raises(VLLMValidationError, match=r"prompt_logprobs"):
+        TTPlatform.validate_request(
+            {"prompt_token_ids": [1, 2, 3], "prompt_embeds": None},
+            SamplingParams(max_tokens=1, prompt_logprobs=1),
         )
 
 
@@ -1010,3 +1038,56 @@ def test_startup_rejects_top_k_host_fallback_for_block_output(monkeypatch):
     _patch_model_resolution(monkeypatch, BoundedBlockModel)
     with pytest.raises(ValueError, match="max_device_top_k.*block-output"):
         TTPlatform.check_and_update_config(_config())
+
+
+def test_startup_rejects_seeded_host_policy_for_block_output(monkeypatch):
+    _patch_model_resolution(monkeypatch, BlockModel)
+    config = _config()
+    config.additional_config["tt"]["seeded_sampling_policy"] = "host"
+    with pytest.raises(ValueError, match="seeded_sampling_policy.*single-token"):
+        TTPlatform.check_and_update_config(config)
+
+
+@pytest.mark.parametrize("output_tokens_per_step", [1, 256])
+def test_seeded_host_policy_rejects_speculation_before_model_registration(
+    monkeypatch, output_tokens_per_step
+):
+    model = ARModel if output_tokens_per_step == 1 else BlockModel
+    _patch_model_resolution(monkeypatch, model)
+    config = _ar_config()
+    config.additional_config["tt"]["seeded_sampling_policy"] = "host"
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    registrations = []
+
+    def register(*_args, **_kwargs):
+        registrations.append(True)
+        pytest.fail("Incompatible policy must reject before model registration")
+
+    monkeypatch.setattr(
+        "vllm_tt_plugin.platform.register_tt_models",
+        register,
+    )
+    with pytest.raises(ValueError):
+        TTPlatform.check_and_update_config(config)
+    assert registrations == []
+
+
+@pytest.mark.parametrize("policy", [None, "auto"])
+def test_auto_seeded_policy_leaves_speculative_model_registration_unchanged(
+    monkeypatch, policy
+):
+    _patch_model_resolution(monkeypatch, ARModel)
+    config = _ar_config()
+    if policy is not None:
+        config.additional_config["tt"]["seeded_sampling_policy"] = policy
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+
+    class RegistrationReached(Exception):
+        pass
+
+    def register(*_args, **_kwargs):
+        raise RegistrationReached
+
+    monkeypatch.setattr("vllm_tt_plugin.platform.register_tt_models", register)
+    with pytest.raises(RegistrationReached):
+        TTPlatform.check_and_update_config(config)
