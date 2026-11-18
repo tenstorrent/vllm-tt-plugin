@@ -528,10 +528,9 @@ class MambaCacheGroups:
         vLLM 0.31 queues copy-on-write copies only for a prefix-cache hit that
         ends inside a block. Mode ``none`` has no prefix caching. In mode
         ``align`` such a hit needs a ``prefix_match_unit`` below the block
-        size, which ``TTScheduler`` rejects for a model with MambaSpec groups:
-        its prefill chunk alignment is the KV block size
-        (``get_tt_prefill_chunk_alignment``), and ``prefix_match_unit`` must
-        be a multiple of the alignment. The TT model has no copy hook.
+        size, which ``TTScheduler`` rejects at startup for a model with
+        MambaSpec groups (``mamba_partial_cache_hit``). The TT model has no
+        copy hook.
         """
         if copies:
             raise RuntimeError(
@@ -686,12 +685,13 @@ def declares_mamba_spec(model_class: type, vllm_config: VllmConfig) -> bool:
 def mamba_attention_block_size(
     kv_cache_groups: Sequence[KVCacheGroupSpec],
 ) -> int | None:
-    """The KV block size a prefill chunk of a model with ``MambaSpec`` groups
-    must start on, or ``None`` without ``MambaSpec`` groups.
+    """The attention KV block size of a model with ``MambaSpec`` groups, or
+    ``None`` without ``MambaSpec`` groups.
 
-    That is the attention block size: the TT model writes a chunk's attention
-    keys and values only from the start of a block. Several attention groups
-    give the least common multiple of their block sizes.
+    A prefill chunk of a model that declares
+    ``supports_prefill_resume_inside_kv_block`` False must start on it
+    (``get_tt_prefill_chunk_alignment``). Several attention groups give the
+    least common multiple of their block sizes.
     """
     if not any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups):
         return None

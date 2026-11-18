@@ -22,6 +22,7 @@ from vllm_tt_plugin.config import (
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
+    get_tt_supports_multimodal_prefill_resume,
     get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -267,8 +268,9 @@ def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
 
 
 def multimodal_prefill_limit(vllm_config) -> tuple[int, str]:
-    """The longest multimodal prompt a model with ``MambaSpec`` layers can
-    prefill, and the setting that bounds it.
+    """The longest multimodal prompt a model that declares
+    ``supports_multimodal_prefill_resume`` False can prefill, and the setting
+    that bounds it.
 
     ``TTScheduler._multimodal_prefill_grant`` prefills such a prompt in one
     step, past ``long_prefill_token_threshold``. vLLM takes a scheduled
@@ -447,9 +449,17 @@ class TTScheduler(AsyncScheduler):
         mamba_block_size = mamba_attention_block_size(
             self.kv_cache_config.kv_cache_groups
         )
-        # The KV block size of a model with MambaSpec layers, whose multimodal
-        # requests _multimodal_prefill_grant schedules; 0 for other models.
-        self._mamba_mm_block_size = mamba_block_size or 0
+        # The attention KV block size when the model declares
+        # supports_multimodal_prefill_resume False, whose multimodal requests
+        # add_request and _multimodal_prefill_grant handle; 0 when it declares
+        # True. self.block_size, the least common multiple of every group's
+        # block size, is the attention block size only without MambaSpec
+        # groups, whose block size can be max_model_len.
+        self._multimodal_prefill_block_size = (
+            0
+            if get_tt_supports_multimodal_prefill_resume(self.vllm_config)
+            else mamba_block_size or self.block_size
+        )
         # Tokens, and tokens plus draft slots, granted through
         # _mamba_block_aligned_split in the current step.
         self._step_granted_tokens = 0
@@ -464,27 +474,23 @@ class TTScheduler(AsyncScheduler):
             _validate_prefill_chunk_alignment(
                 self._prefill_chunk_alignment, self.scheduler_config
             )
-            # With fine-grained Mamba prefix hits vLLM's block-aligned split
-            # also ends a prefill chunk at the prompt's last multiple of
-            # hash_block_size. _align_prefill_chunk_end floors a chunk end off
-            # the alignment grid down to the grid, so a chunk that starts on
-            # the last grid point below such a stop gets no tokens and the
-            # request never finishes its prefill.
-            if (
-                getattr(self, "mamba_partial_cache_hit", False)
-                and self.hash_block_size % self._prefill_chunk_alignment
-            ):
-                raise ValueError(
-                    f"cache_config.prefix_match_unit={self.hash_block_size} "
-                    "with mamba_cache_mode 'align' makes vLLM end prefill "
-                    "chunks on multiples of it, off the grid of "
-                    "additional_config['tt']['prefill_chunk_alignment']="
-                    f"{self._prefill_chunk_alignment}. Set prefix_match_unit "
-                    "to a multiple of the alignment."
-                )
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
+            )
+        # vLLM sets mamba_partial_cache_hit for MambaSpec groups in mode align
+        # with a prefix_match_unit below the block size. It then makes
+        # prefix-cache hits that end inside a block and queues a copy of the
+        # block for each, and TT copies no blocks
+        # (MambaCacheGroups.refuse_block_copies).
+        if getattr(self, "mamba_partial_cache_hit", False):
+            raise ValueError(
+                f"cache_config.prefix_match_unit={self.hash_block_size} is below "
+                f"the KV block size {self.block_size} with mamba_cache_mode "
+                "'align', so vLLM would copy a KV cache block for every "
+                "prefix-cache hit that ends inside a block. TT copies no KV cache "
+                "blocks for a model with MambaSpec KV cache groups; leave "
+                f"prefix_match_unit unset or set it to {self.block_size}."
             )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
@@ -605,15 +611,15 @@ class TTScheduler(AsyncScheduler):
         Rust frontend stays refused: it would send all traffic down this path
         instead of rejecting unsupported requests.
 
-        A multimodal request of a model with ``MambaSpec`` layers never reads
-        the prefix cache. vLLM's ``strip_covered_mm_data`` drops the pixels of
-        an item a prefix-cache hit covers, and such a model computes the M-RoPE
-        positions and vision rows of a prompt from position 0. vLLM still
-        caches the request's blocks: their hashes carry the item identifiers
-        from the first item on, so only the text before the first item can
-        match another request.
+        A multimodal request of a model that declares
+        ``supports_multimodal_prefill_resume`` False never reads the prefix
+        cache: such a model computes a multimodal prompt only from position 0,
+        and vLLM's ``strip_covered_mm_data`` drops the pixels of an item a
+        prefix-cache hit covers. vLLM still caches the request's blocks: their
+        hashes carry the item identifiers from the first item on, so only the
+        text before the first item can match another request.
         """
-        if getattr(self, "_mamba_mm_block_size", 0) and request.mm_features:
+        if getattr(self, "_multimodal_prefill_block_size", 0) and request.mm_features:
             # Request.__init__ derives the flag from the sampling parameters;
             # the KV cache manager reads it at the prefix-cache lookup.
             request.skip_reading_prefix_cache = True
@@ -863,11 +869,14 @@ class TTScheduler(AsyncScheduler):
 
     # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
     # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
-    # hook so chunk ends can be aligned before any block is allocated.
+    # hook so chunk ends can be aligned, and the first chunk of a multimodal
+    # request sized (_multimodal_prefill_grant), before any block is allocated.
     @property
     def need_mamba_block_aligned_split(self) -> bool:
-        return bool(getattr(self, "_base_need_mamba_split", False)) or (
-            getattr(self, "_prefill_chunk_alignment", 0) > 1
+        return (
+            bool(getattr(self, "_base_need_mamba_split", False))
+            or getattr(self, "_prefill_chunk_alignment", 0) > 1
+            or getattr(self, "_multimodal_prefill_block_size", 0) > 0
         )
 
     @need_mamba_block_aligned_split.setter
@@ -914,13 +923,14 @@ class TTScheduler(AsyncScheduler):
     def _multimodal_prefill_grant(
         self, request: Request, start: int, num_new_tokens: int
     ) -> int | None:
-        """Tokens to grant the multimodal part of a prefill of a model with
-        ``MambaSpec`` layers, or ``None`` for any other chunk.
+        """Tokens to grant the multimodal part of a prefill of a model that
+        declares ``supports_multimodal_prefill_resume`` False, or ``None`` for
+        any other chunk.
 
-        Such a model starts a multimodal prompt at position 0 (``add_request``
-        keeps the request off the prefix cache) and builds the M-RoPE positions
-        and vision rows of a step from the step's own tokens, so a chunk must
-        not end inside a multimodal item. The first chunk covers every item:
+        Such a model computes a multimodal prompt from position 0
+        (``add_request`` keeps the request off the prefix cache) with every
+        multimodal item in the first prefill step, so the first chunk covers
+        every item:
 
         - the whole rest of the request when it fits what is left of this step,
           past ``long_prefill_token_threshold``, which vLLM applied before this
@@ -938,7 +948,7 @@ class TTScheduler(AsyncScheduler):
 
         The chunks after the last item are text and take the ordinary rules.
         """
-        block = getattr(self, "_mamba_mm_block_size", 0)
+        block = getattr(self, "_multimodal_prefill_block_size", 0)
         if not block or num_new_tokens <= 0 or not request.mm_features:
             return None
         items_end = max(
@@ -970,9 +980,10 @@ class TTScheduler(AsyncScheduler):
             logger.warning(
                 "TT scheduler: request %s has multimodal items up to token %d, "
                 "past what one step from token %d holds (%d tokens); its "
-                "prefill is split inside an item, which a model with MambaSpec "
-                "layers cannot compute. TTPlatform.validate_request rejects "
-                "such a prompt; this request skipped it.",
+                "prefill is split inside an item, which a model that declares "
+                "supports_multimodal_prefill_resume False cannot compute. "
+                "TTPlatform.validate_request rejects such a prompt; this "
+                "request skipped it.",
                 request.request_id,
                 items_end,
                 start,
@@ -988,14 +999,14 @@ class TTScheduler(AsyncScheduler):
         encoder_compute_budget: int,
         shift_computed_tokens: int = 0,
     ) -> tuple[list[int], int, int, list[int]]:
-        """vLLM's encoder scheduling, all or nothing for a model with
-        ``MambaSpec`` layers.
+        """vLLM's encoder scheduling, all or nothing for a model that declares
+        ``supports_multimodal_prefill_resume`` False.
 
         When the encoder cache or this step's encoder budget cannot take an
         item of the chunk, vLLM shortens the chunk to end before that item. A
-        multimodal chunk of a model with ``MambaSpec`` layers must hold every
-        item (``_multimodal_prefill_grant``), so the request waits instead,
-        with nothing allocated in the encoder cache.
+        multimodal chunk of such a model must hold every item
+        (``_multimodal_prefill_grant``), so the request waits instead, with
+        nothing allocated in the encoder cache.
         """
         scheduled = super()._try_schedule_encoder_inputs(
             request,
@@ -1004,7 +1015,10 @@ class TTScheduler(AsyncScheduler):
             encoder_compute_budget,
             shift_computed_tokens=shift_computed_tokens,
         )
-        if getattr(self, "_mamba_mm_block_size", 0) and scheduled[1] < num_new_tokens:
+        if (
+            getattr(self, "_multimodal_prefill_block_size", 0)
+            and scheduled[1] < num_new_tokens
+        ):
             return [], 0, encoder_compute_budget, []
         return scheduled
 
@@ -1014,9 +1028,10 @@ class TTScheduler(AsyncScheduler):
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
         Chunks that finish the prompt and decode steps are left alone, and so
-        are multimodal prompts of a model without ``MambaSpec`` layers (the
-        multimodal part of a prompt of a model with them never reaches here;
-        see ``_multimodal_prefill_grant``). A new request whose aligned chunk
+        are multimodal prompts of a model that declares
+        ``supports_multimodal_prefill_resume`` True (the multimodal part of a
+        prompt of a model that declares False never reaches here; see
+        ``_multimodal_prefill_grant``). A new request whose aligned chunk
         would be empty waits for the next step; a running request that cannot
         reach the grid ends its chunk on a KV block instead, and waits a step
         if that is empty too.
@@ -1029,7 +1044,7 @@ class TTScheduler(AsyncScheduler):
         # only a chunk that reaches the end of the sequence is the last one.
         if end >= request.num_tokens:
             return num_new_tokens
-        if not getattr(self, "_mamba_mm_block_size", 0) and (
+        if not getattr(self, "_multimodal_prefill_block_size", 0) and (
             getattr(request, "mm_features", None)
             or getattr(request, "has_encoder_inputs", False)
         ):
