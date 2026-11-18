@@ -39,6 +39,7 @@ from vllm_tt_plugin.config import (
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
+    validate_and_store_tt_supports_prefill_resume_inside_kv_block,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
     validate_tt_scheduler_config,
@@ -2116,6 +2117,9 @@ class TTPlatform(Platform):
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
+        validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+            vllm_config, model_capabilities, model_class
+        )
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
             raise ValueError(
