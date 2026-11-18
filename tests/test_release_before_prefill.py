@@ -61,6 +61,7 @@ def _runner(max_num_reqs: int) -> TTModelRunner:
     runner = TTModelRunner.__new__(TTModelRunner)
     runner.tt_per_lane_max_num_seqs = max_num_reqs
     runner._req_state_slot = {}
+    runner._proposed_draft_token_ids = {}
     runner._pending_state_slot_settle = None
     runner.requests = {}
     runner.encoder_cache = {}
