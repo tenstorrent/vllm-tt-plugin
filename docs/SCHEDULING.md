@@ -224,13 +224,16 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
-#### Multimodal requests of a model with MambaSpec layers
+#### Multimodal requests without prefill resume
 
-A model that keeps recurrent state in `MambaSpec` blocks (the Qwen3.8
-adapter) builds the M-RoPE positions and vision rows of a prefill step from
-that step's tokens, and starts a multimodal prompt at position 0. A chunk end
-inside a multimodal item would cut an item's positions, and a prefix-cache hit
-would start the prompt in its middle. So for such a model, and only for it:
+A model that declares `model_capabilities['supports_multimodal_prefill_resume']`
+False (see [model capabilities](MODEL_CAPABILITIES.md)) computes a multimodal
+prompt only from position 0, with every multimodal item in its first prefill
+step. The Qwen3.8 adapter declares False: it builds the M-RoPE positions and
+vision rows of a prefill step from that step's tokens. A prefix-cache hit would
+start the prompt in its middle, and a chunk end before the end of the last item
+would leave an item, or part of it, to a later step. So for such a model, and
+only for it:
 
 - `TTScheduler.add_request` sets `skip_reading_prefix_cache` on a request
   with multimodal items, so it never reads the prefix cache. (vLLM's
@@ -258,7 +261,8 @@ would start the prompt in its middle. So for such a model, and only for it:
   multiple of the KV block size when chunked prefill is on. The check covers
   the whole prompt, not only its items.
 
-Text requests of the same launch keep prefix caching and chunked prefill.
+Text requests of the same launch keep prefix caching and chunked prefill. A
+model that declares True, or omits the key, keeps vLLM's multimodal rules.
 
 ### Decode interleave
 
