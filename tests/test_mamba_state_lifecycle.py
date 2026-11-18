@@ -99,6 +99,9 @@ GDN_DTYPES = (torch.bfloat16, torch.float32)
 MAX_MODEL_LEN = 8192
 MAX_NUM_SEQS = 4
 LOCAL_MODEL_CONFIG = Path(__file__).parent / "model_configs" / "qwen2"
+# The declaration of the Qwen3.8 adapter, Qwen36ForCausalLM in tt-metal, that
+# these tests exercise.
+QWEN38_CAPABILITIES = {"supports_prefill_resume_inside_kv_block": False}
 # The state a block holds after padding rows wrote into it, and after the
 # model zeroed it.
 GARBAGE = ("garbage",)
@@ -158,7 +161,7 @@ def _scheduler(
     prefill_chunk_alignment: int | None = None,
     spec_plan: SpecPlan | None = None,
     spec_method: str = MODEL_OWNED_DRAFT_METHOD,
-    model_capabilities: dict | None = None,
+    model_capabilities: dict | None = QWEN38_CAPABILITIES,
 ) -> TTScheduler:
     """A real ``TTScheduler`` over a real ``KVCacheManager``.
 
@@ -215,8 +218,9 @@ def _scheduler(
     cache_config.prefix_match_unit = prefix_match_unit
     cache_config.num_gpu_blocks = kv_cache_config.num_blocks
     if prefill_chunk_alignment is not None:
-        config.additional_config = {
-            "tt": {"prefill_chunk_alignment": prefill_chunk_alignment}
+        # Next to the platform's stored values, which the scheduler reads.
+        config.additional_config["tt"] = {
+            "prefill_chunk_alignment": prefill_chunk_alignment
         }
     # The stub declares no chunked-prefill support, so the platform hook turned
     # chunked prefill off; these tests split long prompts into chunks.
@@ -404,7 +408,7 @@ class _Harness:
         narrow_decode: bool = True,
         offers: tuple[int, ...] | None = None,
         spec_method: str = MODEL_OWNED_DRAFT_METHOD,
-        model_capabilities: dict | None = None,
+        model_capabilities: dict | None = QWEN38_CAPABILITIES,
     ):
         cfg = _vllm_config(mode)
         cfg.model_config.max_model_len = MAX_MODEL_LEN
@@ -1042,10 +1046,11 @@ def test_prefill_checkpoints_match_the_blocks_mambamanager_reserves(
 
 @pytest.mark.parametrize("mode", ["none", "align"])
 def test_prefill_chunks_resume_at_kv_block_boundaries(mode):
-    """The TT model writes a prefill chunk's attention keys and values only
-    from the start of a KV block, so with MambaSpec groups every chunk that
-    does not finish its prompt ends on a multiple of the 1024-token block, not
-    on the default 128-token grid.
+    """A model that declares supports_prefill_resume_inside_kv_block False,
+    as the Qwen3.8 adapter does, writes a prefill chunk's attention keys and
+    values only from the start of a KV block, so every chunk that does not
+    finish its prompt ends on a multiple of the 1024-token block, not on the
+    default 128-token grid.
 
     Request a's 1300-token prompt leaves 748 tokens of the 2048-token step for
     request b. On the 128-token grid b would prefill 640 tokens and its next
@@ -1065,10 +1070,35 @@ def test_prefill_chunks_resume_at_kv_block_boundaries(mode):
             assert start % BLOCK_SIZE == end % BLOCK_SIZE == 0, (req_id, spans)
 
 
+# A model with MambaSpec groups that resumes a prefill inside a KV block, by
+# declaration or by default.
+RESUMES_INSIDE_A_BLOCK = [{"supports_prefill_resume_inside_kv_block": True}, None]
+
+
+@pytest.mark.parametrize("capabilities", RESUMES_INSIDE_A_BLOCK)
+def test_a_model_that_resumes_inside_a_kv_block_keeps_the_default_grid(
+    capabilities,
+):
+    """The same requests in mode none: b prefills 640 tokens on the 128-token
+    grid next to a, and its next chunk starts inside block 0."""
+    h = _Harness(
+        num_blocks=40, max_num_batched_tokens=2048, model_capabilities=capabilities
+    )
+    assert h.scheduler._prefill_chunk_alignment == 128
+    for req_id, prompt_len in (("a", 1300), ("b", 3000), ("c", 2600), ("d", 900)):
+        h.add(req_id, prompt_len, max_tokens=4)
+    h.run()
+
+    assert h.prefill_spans["b"][0] == (0, 640)
+    for spans in h.prefill_spans.values():
+        assert all(end % 128 == 0 for _, end in spans[:-1]), spans
+
+
 def test_an_operator_chunk_alignment_must_be_a_multiple_of_the_kv_block():
     """``additional_config['tt']['prefill_chunk_alignment']`` defaults to the
-    KV block size for a model with MambaSpec groups and must be a positive
-    multiple of it; a model without them keeps the 128-token default."""
+    KV block size for a model that declares
+    supports_prefill_resume_inside_kv_block False and must be a positive
+    multiple of it; a model that resumes inside a block takes any grid."""
     kv_cache_config = _Harness(num_blocks=32).kv_cache_config
 
     for alignment in (640, 0):
@@ -1080,18 +1110,44 @@ def test_an_operator_chunk_alignment_must_be_a_multiple_of_the_kv_block():
             _scheduler(kv_cache_config, 2048, prefill_chunk_alignment=alignment)
     scheduler = _scheduler(kv_cache_config, 4096, prefill_chunk_alignment=2048)
     assert scheduler._prefill_chunk_alignment == 2048
+    for capabilities in RESUMES_INSIDE_A_BLOCK:
+        scheduler = _scheduler(
+            kv_cache_config,
+            2048,
+            prefill_chunk_alignment=640,
+            model_capabilities=capabilities,
+        )
+        assert scheduler._prefill_chunk_alignment == 640
 
 
-def test_prefix_match_unit_below_the_kv_block_fails_at_startup():
-    """A ``prefix_match_unit`` below the block size makes vLLM end prefill
-    chunks, and resume prefix hits, inside a block, off the KV block grid
-    that prefill chunks of a MambaSpec model must start on; the scheduler
-    refuses to start rather than stall."""
+@pytest.mark.parametrize("capabilities", [QWEN38_CAPABILITIES, *RESUMES_INSIDE_A_BLOCK])
+def test_prefix_match_unit_below_the_kv_block_fails_at_startup(capabilities):
+    """A ``prefix_match_unit`` below the block size makes vLLM end prefix-cache
+    hits inside a block and copy that block for the hitting request. TT copies
+    no blocks, so a model with MambaSpec groups refuses it at startup, whatever
+    it declares for supports_prefill_resume_inside_kv_block, instead of failing
+    at the first copy."""
     kv_cache_config = _Harness(num_blocks=32, mode="align").kv_cache_config
 
-    with pytest.raises(ValueError, match="prefix_match_unit=128"):
-        _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=128)
-    _scheduler(kv_cache_config, 2048, "align", prefix_match_unit=BLOCK_SIZE)
+    with pytest.raises(
+        ValueError,
+        match=r"prefix_match_unit=128 is below the KV block size 1024 .* TT "
+        "copies no KV cache blocks",
+    ):
+        _scheduler(
+            kv_cache_config,
+            2048,
+            "align",
+            prefix_match_unit=128,
+            model_capabilities=capabilities,
+        )
+    _scheduler(
+        kv_cache_config,
+        2048,
+        "align",
+        prefix_match_unit=BLOCK_SIZE,
+        model_capabilities=capabilities,
+    )
 
 
 @pytest.mark.parametrize("mode", ["none", "align"])

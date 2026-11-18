@@ -51,7 +51,10 @@ from vllm_tt_plugin.scheduler import multimodal_prefill_limit
 STEP = 4096
 ENCODER_BUDGET = 4096
 # The declaration of the Qwen3.8 adapter, Qwen36ForCausalLM in tt-metal.
-NO_RESUME = {"supports_multimodal_prefill_resume": False}
+NO_RESUME = {
+    "supports_multimodal_prefill_resume": False,
+    "supports_prefill_resume_inside_kv_block": False,
+}
 # A model that resumes a multimodal prefill, by declaration or by default.
 RESUMES = [{"supports_multimodal_prefill_resume": True}, None]
 

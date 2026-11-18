@@ -731,6 +731,44 @@ _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # that starts off that grid is realigned down by the model and the whole
 # chunk is then padded up to the next power of two (4096 + delta -> 8192).
 _PREFILL_CHUNK_ALIGNMENT_DEFAULT = 128
+# Platform-derived from the model's ``supports_prefill_resume_inside_kv_block``,
+# for ``TTScheduler``, which has no model class to ask; see the internal keys
+# at the top of this module.
+_SUPPORTS_PREFILL_RESUME_INSIDE_KV_BLOCK_KEY = (
+    "_tt_supports_prefill_resume_inside_kv_block"
+)
+
+
+def get_tt_supports_prefill_resume_inside_kv_block(vllm_config: "VllmConfig") -> bool:
+    """Return the model's validated ``supports_prefill_resume_inside_kv_block``,
+    or ``True``, the capability's default, when the platform stored none."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_PREFILL_RESUME_INSIDE_KV_BLOCK_KEY, True))
+
+
+def validate_and_store_tt_supports_prefill_resume_inside_kv_block(
+    vllm_config: "VllmConfig", model_capabilities: dict | None, model_class: type
+) -> None:
+    """Validate ``supports_prefill_resume_inside_kv_block`` and store it for
+    ``get_tt_prefill_chunk_alignment``.
+
+    Raises:
+        ValueError: the declaration is not a boolean.
+    """
+    supported = (model_capabilities or {}).get(
+        "supports_prefill_resume_inside_kv_block", True
+    )
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {model_class.__module__}.{model_class.__name__} must declare "
+            "model_capabilities['supports_prefill_resume_inside_kv_block'] as a "
+            f"boolean, got {supported!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_PREFILL_RESUME_INSIDE_KV_BLOCK_KEY] = supported
 
 
 def get_tt_prefill_chunk_alignment(
@@ -742,12 +780,19 @@ def get_tt_prefill_chunk_alignment(
     chunk on an odd offset; aligning chunk ends keeps the model's chunk walk on
     its native grid for every model served through this plugin.
 
-    ``kv_block_size`` is the attention block size of a model with
-    ``MambaSpec`` KV cache groups, ``None`` otherwise. Such a model resumes a
-    prefill only at the start of a KV block, which can be larger than the
-    default grid (Qwen3.8 uses 512 or 1024 tokens), so the alignment defaults
-    to the block size and an operator value must be a positive multiple of it.
+    A model that declares ``supports_prefill_resume_inside_kv_block`` False
+    resumes a prefill only at the start of an attention KV block, which can be
+    larger than the default grid (Qwen3.8 uses 512 or 1024 tokens). For such a
+    model the alignment defaults to the attention block size, and an operator
+    value must be a positive multiple of it. ``kv_block_size`` is that size for
+    a model with ``MambaSpec`` KV cache groups (``mamba_attention_block_size``),
+    whose own block size is not an attention block size; ``None`` otherwise,
+    and ``cache_config.block_size`` is the attention block size then.
     """
+    if get_tt_supports_prefill_resume_inside_kv_block(vllm_config):
+        kv_block_size = None
+    elif kv_block_size is None:
+        kv_block_size = int(vllm_config.cache_config.block_size)
     tt_config = get_tt_config(vllm_config)
     value = tt_config.get(
         _PREFILL_CHUNK_ALIGNMENT_KEY, kv_block_size or _PREFILL_CHUNK_ALIGNMENT_DEFAULT
@@ -760,10 +805,11 @@ def get_tt_prefill_chunk_alignment(
     if kv_block_size is not None and (value == 0 or value % kv_block_size):
         raise ValueError(
             f"additional_config['tt']['{_PREFILL_CHUNK_ALIGNMENT_KEY}']={value} is "
-            f"not a positive multiple of the KV block size {kv_block_size}. A model "
-            "with MambaSpec KV cache groups resumes a chunked prefill only at the "
-            f"start of a KV block; set a multiple of {kv_block_size} or leave the "
-            f"key unset ({kv_block_size})."
+            f"not a positive multiple of the KV block size {kv_block_size}. This "
+            "model declares model_capabilities"
+            "['supports_prefill_resume_inside_kv_block']=False and resumes a "
+            "chunked prefill only at the start of a KV block; set a multiple of "
+            f"{kv_block_size} or leave the key unset ({kv_block_size})."
         )
     return value
 
