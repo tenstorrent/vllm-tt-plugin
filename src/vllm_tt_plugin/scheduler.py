@@ -21,13 +21,16 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefill_over_pending_spec,
     get_tt_spec_plan,
+    get_tt_supports_multimodal_prefill_resume,
     get_tt_supports_stage_outputs,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     tt_requests_cannot_resume,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.mamba_state import mamba_attention_block_size
 from vllm_tt_plugin.spec_admission import MODEL_OWNED_DRAFT_METHOD
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
@@ -265,6 +268,43 @@ def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
     return limit, name
 
 
+def multimodal_prefill_limit(vllm_config) -> tuple[int, str]:
+    """The longest multimodal prompt a model that declares
+    ``supports_multimodal_prefill_resume`` False can prefill, and the setting
+    that bounds it.
+
+    ``TTScheduler._multimodal_prefill_grant`` prefills such a prompt in one
+    step, past ``long_prefill_token_threshold``. vLLM takes a scheduled
+    request's tokens out of ``max_num_scheduled_tokens`` (when set) and its
+    tokens plus draft slots out of ``max_num_batched_tokens``. With chunked
+    prefill on, the limit is also a multiple of the KV block size: a request
+    replayed after preemption carries its output tokens and can outgrow one
+    step, and its first chunk then ends on a KV block boundary at or after the
+    end of its last multimodal item, within one step.
+    """
+    scheduler_config = vllm_config.scheduler_config
+    batched = int(scheduler_config.max_num_batched_tokens)
+    spec = vllm_config.speculative_config
+    drafts = (
+        int(getattr(spec, "max_num_new_slots_for_drafting", 0) or 0)
+        if spec is not None
+        else 0
+    )
+    limit = batched - drafts
+    bound = f"max_num_batched_tokens={batched}"
+    if drafts:
+        bound += f" less {drafts} draft slots"
+    scheduled = scheduler_config.max_num_scheduled_tokens
+    if scheduled is not None and int(scheduled) < limit:
+        limit, bound = int(scheduled), f"max_num_scheduled_tokens={scheduled}"
+    if scheduler_config.enable_chunked_prefill:
+        block = int(vllm_config.cache_config.block_size)
+        if limit % block:
+            limit = limit // block * block
+            bound += f", rounded down to a multiple of the {block}-token KV block"
+    return limit, bound
+
+
 def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
     """Reject caps that can never let a new request reach the alignment grid.
 
@@ -337,6 +377,30 @@ def scheduler_output_has_prefill_work(scheduler_output: SchedulerOutput) -> bool
     if scheduler_output.scheduled_new_reqs or cached_reqs.resumed_req_ids:
         return True
     return any(cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids)
+
+
+def prefill_qualifies_behind_verify(scheduler_output: SchedulerOutput) -> bool:
+    """Whether a step is prefill work that a model declaring
+    ``supports_prefill_over_pending_spec`` may run behind one unread verify:
+    every scheduled request is a new request or a chunked-prefill
+    continuation, none is resumed or preempted, and none carries multimodal
+    input. ``TTScheduler`` and ``TTModelRunner`` decide with this one rule."""
+    cached = scheduler_output.scheduled_cached_reqs
+    if (
+        cached.resumed_req_ids
+        or scheduler_output.preempted_req_ids
+        or get_tt_forced_reset_discard_counts(scheduler_output)
+    ):
+        return False
+    if any(
+        getattr(r, "mm_features", None) for r in scheduler_output.scheduled_new_reqs
+    ):
+        return False
+    prefill = {r.req_id for r in scheduler_output.scheduled_new_reqs} | {
+        r for r in cached.req_ids if cached.is_context_phase(r)
+    }
+    scheduled = set(scheduler_output.num_scheduled_tokens)
+    return bool(scheduled) and scheduled <= prefill
 
 
 def _carry_cleanup(earlier: SchedulerOutput, later: SchedulerOutput) -> None:
@@ -432,6 +496,11 @@ class TTScheduler(AsyncScheduler):
         # kept for the next schedule() call. See _schedule_release_step.
         self._unreleased_step: SchedulerOutput | None = None
         self._deferred_prefill: SchedulerOutput | None = None
+        # The model's supports_prefill_over_pending_spec: a prefill may run
+        # behind a held verify, with no release step before it.
+        self._prefill_over_pending_spec = get_tt_prefill_over_pending_spec(
+            self.vllm_config
+        )
         # Cleanup that waits for the kept prefill to run; see
         # _order_cleanup_around_kept_prefill.
         self._finished_after_kept_prefill: set[str] = set()
@@ -449,8 +518,27 @@ class TTScheduler(AsyncScheduler):
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
         self._widest_decode_batch_size = 0
+        mamba_block_size = mamba_attention_block_size(
+            self.kv_cache_config.kv_cache_groups
+        )
+        # The attention KV block size when the model declares
+        # supports_multimodal_prefill_resume False, whose multimodal requests
+        # add_request and _multimodal_prefill_grant handle; 0 when it declares
+        # True. self.block_size, the least common multiple of every group's
+        # block size, is the attention block size only without MambaSpec
+        # groups, whose block size can be max_model_len.
+        self._multimodal_prefill_block_size = (
+            0
+            if get_tt_supports_multimodal_prefill_resume(self.vllm_config)
+            else mamba_block_size or self.block_size
+        )
+        # Tokens, and tokens plus draft slots, granted through
+        # _mamba_block_aligned_split in the current step.
+        self._step_granted_tokens = 0
+        self._step_granted_rows = 0
+        self._warned_mm_split = False
         self._prefill_chunk_alignment = (
-            get_tt_prefill_chunk_alignment(self.vllm_config)
+            get_tt_prefill_chunk_alignment(self.vllm_config, mamba_block_size)
             if self.scheduler_config.enable_chunked_prefill
             else 0
         )
@@ -461,6 +549,20 @@ class TTScheduler(AsyncScheduler):
             logger.info(
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
+            )
+        # vLLM sets mamba_partial_cache_hit for MambaSpec groups in mode align
+        # with a prefix_match_unit below the block size. It then makes
+        # prefix-cache hits that end inside a block and queues a copy of the
+        # block for each, and TT copies no blocks
+        # (MambaCacheGroups.refuse_block_copies).
+        if getattr(self, "mamba_partial_cache_hit", False):
+            raise ValueError(
+                f"cache_config.prefix_match_unit={self.hash_block_size} is below "
+                f"the KV block size {self.block_size} with mamba_cache_mode "
+                "'align', so vLLM would copy a KV cache block for every "
+                "prefix-cache hit that ends inside a block. TT copies no KV cache "
+                "blocks for a model with MambaSpec KV cache groups; leave "
+                f"prefix_match_unit unset or set it to {self.block_size}."
             )
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
@@ -580,7 +682,19 @@ class TTScheduler(AsyncScheduler):
         normally; the caller is not told. Because the change is silent, the
         Rust frontend stays refused: it would send all traffic down this path
         instead of rejecting unsupported requests.
+
+        A multimodal request of a model that declares
+        ``supports_multimodal_prefill_resume`` False never reads the prefix
+        cache: such a model computes a multimodal prompt only from position 0,
+        and vLLM's ``strip_covered_mm_data`` drops the pixels of an item a
+        prefix-cache hit covers. vLLM still caches the request's blocks: their
+        hashes carry the item identifiers from the first item on, so only the
+        text before the first item can match another request.
         """
+        if getattr(self, "_multimodal_prefill_block_size", 0) and request.mm_features:
+            # Request.__init__ derives the flag from the sampling parameters;
+            # the KV cache manager reads it at the prefix-cache lookup.
+            request.skip_reading_prefix_cache = True
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
@@ -827,11 +941,14 @@ class TTScheduler(AsyncScheduler):
 
     # vLLM runs ``_mamba_block_aligned_split`` on every prefill chunk when
     # ``need_mamba_block_aligned_split`` is set; the TT scheduler reuses that
-    # hook so chunk ends can be aligned before any block is allocated.
+    # hook so chunk ends can be aligned, and the first chunk of a multimodal
+    # request sized (_multimodal_prefill_grant), before any block is allocated.
     @property
     def need_mamba_block_aligned_split(self) -> bool:
-        return bool(getattr(self, "_base_need_mamba_split", False)) or (
-            getattr(self, "_prefill_chunk_alignment", 0) > 1
+        return (
+            bool(getattr(self, "_base_need_mamba_split", False))
+            or getattr(self, "_prefill_chunk_alignment", 0) > 1
+            or getattr(self, "_multimodal_prefill_block_size", 0) > 0
         )
 
     @need_mamba_block_aligned_split.setter
@@ -845,29 +962,151 @@ class TTScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        if getattr(self, "_base_need_mamba_split", False):
-            num_new_tokens = super()._mamba_block_aligned_split(
-                request,
-                num_new_tokens,
-                num_new_local_computed_tokens,
-                num_external_computed_tokens,
-            )
         start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+        grant = self._multimodal_prefill_grant(request, start, num_new_tokens)
+        if grant is None:
+            if getattr(self, "_base_need_mamba_split", False):
+                num_new_tokens = super()._mamba_block_aligned_split(
+                    request,
+                    num_new_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
+            grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
+        if grant > 0:
+            self._step_granted_tokens = getattr(self, "_step_granted_tokens", 0) + grant
+            self._step_granted_rows = (
+                getattr(self, "_step_granted_rows", 0) + grant + self._draft_slots()
+            )
+        return grant
+
+    def _draft_slots(self) -> int:
+        """Input rows vLLM takes out of ``max_num_batched_tokens`` for each
+        scheduled request beyond its tokens."""
+        spec = getattr(getattr(self, "vllm_config", None), "speculative_config", None)
+        if spec is None:
+            return 0
+        return int(getattr(spec, "max_num_new_slots_for_drafting", 0) or 0)
+
+    def _multimodal_prefill_grant(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int | None:
+        """Tokens to grant the multimodal part of a prefill of a model that
+        declares ``supports_multimodal_prefill_resume`` False, or ``None`` for
+        any other chunk.
+
+        Such a model computes a multimodal prompt from position 0
+        (``add_request`` keeps the request off the prefix cache) with every
+        multimodal item in the first prefill step, so the first chunk covers
+        every item:
+
+        - the whole rest of the request when it fits what is left of this step,
+          past ``long_prefill_token_threshold``, which vLLM applied before this
+          hook. What is left is counted from this step's grants through this
+          hook (tokens, and tokens plus draft slots). In a prefill step every
+          scheduled request passes here, and a grant vLLM later shrinks or
+          drops still counts, so a grant never overdraws vLLM's budgets;
+        - when it fits an empty step but not this one, 0: vLLM stops admitting
+          for this step or skips the running request;
+        - when it is longer than an empty step, which only a request replayed
+          after preemption reaches (it carries its output tokens, and
+          ``TTPlatform.validate_request`` rejects a longer prompt), the longest
+          chunk that fits this step and ends on a KV block boundary at or after
+          the end of the last item, or 0 to wait for a step with room.
+
+        The chunks after the last item are text and take the ordinary rules.
+        """
+        block = getattr(self, "_multimodal_prefill_block_size", 0)
+        if not block or num_new_tokens <= 0 or not request.mm_features:
+            return None
+        items_end = max(
+            f.mm_position.offset + f.mm_position.length for f in request.mm_features
+        )
+        if start >= items_end:
+            return None
+        tokens_left = self.max_num_scheduled_tokens - self._step_granted_tokens
+        rows_left = (
+            self.scheduler_config.max_num_batched_tokens - self._step_granted_rows
+        )
+        drafts = self._draft_slots()
+        room = min(tokens_left, rows_left - drafts)
+        remaining = request.num_tokens - start
+        if remaining <= room:
+            return remaining
+        step = min(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens - drafts,
+        )
+        if remaining <= step:
+            return 0
+        first_end = -(-items_end // block) * block
+        if first_end - start <= step:
+            end = (start + room) // block * block
+            return end - start if end >= first_end else 0
+        if not getattr(self, "_warned_mm_split", False):
+            self._warned_mm_split = True
+            logger.warning(
+                "TT scheduler: request %s has multimodal items up to token %d, "
+                "past what one step from token %d holds (%d tokens); its "
+                "prefill is split inside an item, which a model that declares "
+                "supports_multimodal_prefill_resume False cannot compute. "
+                "TTPlatform.validate_request rejects such a prompt; this "
+                "request skipped it.",
+                request.request_id,
+                items_end,
+                start,
+                step,
+            )
+        return None
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        """vLLM's encoder scheduling, all or nothing for a model that declares
+        ``supports_multimodal_prefill_resume`` False.
+
+        When the encoder cache or this step's encoder budget cannot take an
+        item of the chunk, vLLM shortens the chunk to end before that item. A
+        multimodal chunk of such a model must hold every item
+        (``_multimodal_prefill_grant``), so the request waits instead, with
+        nothing allocated in the encoder cache.
+        """
+        scheduled = super()._try_schedule_encoder_inputs(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens=shift_computed_tokens,
+        )
+        if (
+            getattr(self, "_multimodal_prefill_block_size", 0)
+            and scheduled[1] < num_new_tokens
+        ):
+            return [], 0, encoder_compute_budget, []
+        return scheduled
 
     def _align_prefill_chunk_end(
         self, request: Request, start: int, num_new_tokens: int
     ) -> int:
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
-        Chunks that finish the prompt, decode steps and multimodal prompts are
-        left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request that cannot reach the grid ends its
-        chunk on a KV block instead, and waits a step if that is empty too.
+        Chunks that finish the prompt and decode steps are left alone, and so
+        are multimodal prompts of a model that declares
+        ``supports_multimodal_prefill_resume`` True (the multimodal part of a
+        prompt of a model that declares False never reaches here; see
+        ``_multimodal_prefill_grant``). A new request whose aligned chunk
+        would be empty waits for the next step; a running request that cannot
+        reach the grid ends its chunk on a KV block instead, and waits a step
+        if that is empty too.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
         if align <= 1 or num_new_tokens <= 0:
@@ -877,8 +1116,9 @@ class TTScheduler(AsyncScheduler):
         # only a chunk that reaches the end of the sequence is the last one.
         if end >= request.num_tokens:
             return num_new_tokens
-        if getattr(request, "mm_features", None) or getattr(
-            request, "has_encoder_inputs", False
+        if not getattr(self, "_multimodal_prefill_block_size", 0) and (
+            getattr(request, "mm_features", None)
+            or getattr(request, "has_encoder_inputs", False)
         ):
             return num_new_tokens
         aligned_end = end // align * align
@@ -909,6 +1149,8 @@ class TTScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
+        self._step_granted_tokens = 0
+        self._step_granted_rows = 0
         has_pending_prefill = self._has_pending_prefill()
         # A partial prefill occupies ``running`` but cannot produce a decode
         # token, so it must not make the decode fallback below look viable.
@@ -1024,6 +1266,14 @@ class TTScheduler(AsyncScheduler):
                 else None
             )
             prefill_result = self._schedule_prefill_only()
+            if release_step is not None and self._prefill_runs_behind_verify(
+                held, prefill_result
+            ):
+                _carry_cleanup(release_step, prefill_result)
+                self._decode_interleave.record_step(
+                    is_decode=False, prefill_pending=True
+                )
+                return self._finalize_scheduler_output(prefill_result, is_decode=False)
             if release_step is not None:
                 if prefill_result.total_num_scheduled_tokens > 0:
                     self._decode_interleave.record_step(
@@ -1135,6 +1385,39 @@ class TTScheduler(AsyncScheduler):
                 self.running.extend(partial_prefills)
         return result
 
+    def _prefill_runs_behind_verify(
+        self, held: SchedulerOutput, prefill: SchedulerOutput
+    ) -> bool:
+        """Whether ``prefill`` goes to the runner ahead of the release step.
+
+        With ``supports_prefill_over_pending_spec`` the model accepts a prefill
+        while one verify it returned is unread, and ``TTModelRunner`` then
+        submits the prefill behind that verify instead of reading it first
+        (``spec_chain.prefill_over_pending``). The verify's tokens are then
+        published after the prefill instead of before it. ``held`` must be a
+        speculative decode step (every request carries scheduled drafts; the
+        runner may still answer it as an ordinary decode, and then drains it)
+        and ``prefill`` a step the runner puts behind a verify: prefill work
+        only, with no resumed or preempted request, no multimodal input and no
+        forced-reset discard counts waiting.
+        """
+        if not (
+            self._prefill_over_pending_spec
+            and self.scheduler_config.async_scheduling
+            and prefill.total_num_scheduled_tokens > 0
+        ):
+            return False
+        scheduled = set(held.num_scheduled_tokens)
+        if (
+            not scheduled
+            or set(held.scheduled_spec_decode_tokens) != scheduled
+            or scheduler_output_has_prefill_work(held)
+        ):
+            return False
+        return prefill_qualifies_behind_verify(prefill) and not getattr(
+            self, "_pending_forced_reset_discard_counts", {}
+        )
+
     def _schedule_release_step(self) -> SchedulerOutput:
         """Schedule an empty step that lets the engine commit the held step.
 
@@ -1161,7 +1444,9 @@ class TTScheduler(AsyncScheduler):
         returns it. When it schedules nothing, there is no prefill to go ahead
         of, so this step is not returned and ``_carry_cleanup`` adds what it
         drained to the step returned instead; running decodes then keep their
-        overlap with the engine. Running this pass first keeps that cleanup
+        overlap with the engine. Nor is it returned when the prefill may run
+        behind the held verify (``_prefill_runs_behind_verify``); the prefill
+        then carries the cleanup. Running this pass first keeps that cleanup
         ahead of the prefill, in the order the runner receives the two steps.
 
         Between the two calls the engine commits the held step and handles

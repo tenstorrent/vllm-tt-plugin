@@ -224,6 +224,46 @@ Two things follow for the TT execution path:
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
 
+#### Multimodal requests without prefill resume
+
+A model that declares `model_capabilities['supports_multimodal_prefill_resume']`
+False (see [model capabilities](MODEL_CAPABILITIES.md)) computes a multimodal
+prompt only from position 0, with every multimodal item in its first prefill
+step. The Qwen3.8 adapter declares False: it builds the M-RoPE positions and
+vision rows of a prefill step from that step's tokens. A prefix-cache hit would
+start the prompt in its middle, and a chunk end before the end of the last item
+would leave an item, or part of it, to a later step. So for such a model, and
+only for it:
+
+- `TTScheduler.add_request` sets `skip_reading_prefix_cache` on a request
+  with multimodal items, so it never reads the prefix cache. (vLLM's
+  `strip_covered_mm_data` would also drop the pixels of an item a hit
+  covers.) vLLM still caches its blocks. Their hashes carry the item
+  identifiers from the first item on, so only the text before the first item
+  can match another request, and the model writes that state like any other.
+- `TTScheduler._multimodal_prefill_grant` gives the first prefill chunk of
+  such a request every multimodal item: the whole prompt when it fits what is
+  left of the step, past `long_prefill_token_threshold`. When it fits an empty
+  step but not this one, the request waits for the next step. A request
+  replayed after preemption carries its output tokens and can outgrow one
+  step; its first chunk then ends on a KV block boundary at or after the end
+  of its last item, and the rest follows as text chunks. What is left of a
+  step is counted from the grants of the step, tokens against
+  `max_num_scheduled_tokens` and tokens plus draft slots against
+  `max_num_batched_tokens`.
+- `TTScheduler._try_schedule_encoder_inputs` makes vLLM's encoder scheduling
+  all or nothing: when the encoder cache or the step's encoder budget cannot
+  take an item of the chunk, vLLM would end the chunk before that item; the
+  request waits instead.
+- `TTPlatform.validate_request` rejects a multimodal prompt longer than one
+  step (`multimodal_prefill_limit`): at most `max_num_scheduled_tokens` (when
+  set) and `max_num_batched_tokens` less the draft slots, rounded down to a
+  multiple of the KV block size when chunked prefill is on. The check covers
+  the whole prompt, not only its items.
+
+Text requests of the same launch keep prefix caching and chunked prefill. A
+model that declares True, or omits the key, keeps vLLM's multimodal rules.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.
@@ -383,6 +423,20 @@ interleave does not take the step for decode:
    keeps it and returns the empty step from step 1.
 3. The engine executes the empty step and commits the held step.
 4. The next `schedule()` call returns the kept prefill.
+
+With a model that declares `supports_prefill_over_pending_spec`, a held
+speculative decode step (every request carries scheduled drafts), and a
+prefill pass that schedules prefill work only, with no resumed or preempted
+request, no multimodal input and no forced-reset discard counts waiting,
+`schedule()` returns the prefill at step 2 instead of the empty step, with the
+cleanup from step 1 (`_prefill_runs_behind_verify`). `TTModelRunner` submits
+the prefill behind the unread verify, and the verify's tokens are published
+after the prefill (see
+[prefill behind an unread verify](MODEL_INTERFACE.md#prefill-behind-an-unread-verify)).
+When the runner finds no unread `argmax_ids` verify there (the held step ran
+as an ordinary decode, or its output was already read), it reads what is
+pending first, as for any prefill. The held prefill is still followed by an
+empty step.
 
 If the prefill pass schedules nothing (every slot taken, KV pressure, a request
 waiting for its grammar), `schedule()` returns the decode fallback with the

@@ -303,6 +303,7 @@ class InputBatch:
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
+        max_num_blocks: list[int] | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -341,7 +342,8 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             # Per-group max blocks per request; TT runs without context
             # parallelism (cp_world_size == 1).
-            max_num_blocks=[cdiv(max_model_len, bs) for bs in block_sizes],
+            max_num_blocks=max_num_blocks
+            or [cdiv(max_model_len, bs) for bs in block_sizes],
         )
 
         self.req_output_token_ids: list[list[int] | None] = []

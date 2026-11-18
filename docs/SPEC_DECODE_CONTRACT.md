@@ -556,7 +556,22 @@ Ordering first, because it bounds everything below. A speculative step is
 registered as not overlap-safe, so the runner drains it before it builds the
 next step, and it applies the drained result before it builds. A verify is
 therefore never submitted while the previous verify's acceptance is still
-unapplied, and verify, accept and propose stay serialized per request. What
+unapplied, and verify, accept and propose stay serialized per request. The one
+exception is a model declaring `supports_chained_spec_verify`: there the
+runner may submit a verify that continues the unread one row for row, a moved
+row naming its predecessor row through `slot_remap` (greedy
+rows, and with `spec_ids_are_sampled` the sampled rows of a device-sampled
+step; section 4i),
+and the model builds its rows on the device from the unread result
+([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
+With `MambaSpec` groups such a verify names, for the count the model computes,
+the state blocks that a drained verify of the step names, also next to a block
+boundary. The runner then reads, commits and proposes for the unread verify
+before it builds anything else, so accept and propose still run once per
+verify, in step order. A model declaring `supports_prefill_over_pending_spec`
+also takes a join's prefill behind the unread verify: the runner submits the
+prefill first, and reads, commits and proposes for the verify after it
+([prefill behind an unread verify](MODEL_INTERFACE.md#prefill-behind-an-unread-verify)). What
 this path defers is the readback and the commit, not the order of the steps. A
 lane verify takes this same deferred path
 (`TTAsyncDecodeController.submit_async_lane_decode` routes a `spec_mode` step
@@ -718,7 +733,10 @@ runner never sends those drafts again, and the next `propose_draft_tokens` call
 continues from the token the ordinary decode committed. A model whose ordinary
 decode cannot read the state a verify leaves behind, for example recurrent
 state that only the verify path updates, must not declare
-`supports_narrow_decode`.
+`supports_narrow_decode`. A model that keeps recurrent state in `MambaSpec`
+blocks reads it from `mamba_state.start_blocks` on both calls, and the runner
+points `start_blocks` at the block the verify left for the committed count
+(see [speculative verification](MODEL_EXECUTION.md#speculative-verification)).
 
 **An ordinary decode may return host token ids.** On a launch that samples on
 device, a model may answer an ordinary decode step for some or all rows from
@@ -1153,6 +1171,18 @@ for a sampled row before; the host `logits` walk remains the mode for the
 controls the device draws do not carry (penalties, logprobs, grammars, token
 filters) and for host-sampled steps.
 
+**Chained verifies.** On a model that also declares
+`supports_chained_spec_verify`, a sampled row chains like a greedy row when
+the unread verify and the step being built both sample on the device
+(`spec_chain.plan_chain`; otherwise the sampled row drains with reason
+`sampling`).
+The model counts the predecessor's acceptance over its draws, draws the
+chained row's columns with the row's own sampling settings, and derives a
+seeded row's seeds from the positions it computes on the device, so the
+runner's walk of the chained verify certifies the same rejection sampling as
+an unchained one
+([chained verification](MODEL_INTERFACE.md#chained-speculative-verification)).
+
 **Admission is unchanged.** On a launch whose plan keeps no
 `supports_narrow_decode` and serves no `logits`, every decode step is a verify
 and `TTPlatform.validate_request` refuses a request with a non-zero
@@ -1188,7 +1218,10 @@ step names who acts.
    `supports_narrow_decode` would receive the `[B, 1+K]` verify here instead,
    with `num_valid_drafts` 0 on every row.
 3. Bootstrap. **The adapter** must initialize whatever drafter state it needs
-   from whichever of those two calls it received. An adapter that initializes
+   from whichever of those two calls it received, or from A's last prefill
+   chunk. **`TTModelRunner`** tells a model with `MambaSpec` groups which
+   prefill rows end their prefill through
+   `mamba_state.intermediate_prefill_mask`. An adapter that initializes
    its drafter only inside the verify call never drafts on a launch whose first
    decode step is the ordinary one, and the plugin reports nothing, because
    declining to draft is a legal answer.
