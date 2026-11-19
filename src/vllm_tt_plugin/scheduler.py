@@ -308,7 +308,7 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
     max_model_len = vllm_config.model_config.max_model_len
     per_request = -(
         -_max_memory_usage_bytes_from_groups(vllm_config, groups)
-        // _pool_bytes_per_block(groups)
+        // _pool_bytes_per_block(vllm_config, groups)
     )
     needed = max_num_seqs * per_request
     # Block 0 is vLLM's null block, never handed to a request.

@@ -39,7 +39,6 @@ def _lane_batch(num_lanes=1, per_lane=5):
         max_num_batched_tokens=MAX_MODEL_LEN * num_lanes * per_lane,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
     )
 
 

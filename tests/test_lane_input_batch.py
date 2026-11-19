@@ -103,7 +103,6 @@ def _lane_batch(num_lanes, per_lane, with_custom=True, disable_logprobs=False):
         max_num_batched_tokens=MAX_MODEL_LEN * num_lanes * per_lane,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(num_lanes * per_lane, with_custom=with_custom),
         disable_logprobs=disable_logprobs,
     )
@@ -724,7 +723,6 @@ def _plain_batch_of_one(
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(1, with_custom=with_custom),
         disable_logprobs=disable_logprobs,
         output_tokens_per_step=output_tokens_per_step,
