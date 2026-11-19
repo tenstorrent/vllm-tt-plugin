@@ -288,6 +288,17 @@ def test_worker_publishes_the_confirmer_at_load_model_only_when_declared(
     assert tt_scheduler._published_confirmer is None
     assert loaded == [1, 1, 1]
 
+    # the loaded model's declaration is checked as the platform checks the class
+    class NotABool(_Confirming):
+        model_capabilities = {
+            **_Confirming.model_capabilities,
+            "confirms_prefix_cache_hits": "yes",
+        }
+
+    with pytest.raises(ValueError, match="as a boolean, got 'yes'"):
+        TTWorker.load_model(_worker(NotABool(), loaded))
+    assert tt_scheduler._published_confirmer is None
+
 
 def _config(backend=None):
     return SimpleNamespace(
@@ -309,6 +320,15 @@ def test_platform_validates_the_declaration():
     validate_tt_prefix_hit_confirmation(_config("mp"), {}, object)
     validate_tt_prefix_hit_confirmation(_config("mp"), None, object)
 
+    # a non-boolean declaration is refused, as prefill_next_token_ids' is
+    with pytest.raises(
+        ValueError, match=r"confirms_prefix_cache_hits'\] as a boolean, got 1"
+    ):
+        validate_tt_prefix_hit_confirmation(
+            _config(),
+            {**_Confirming.model_capabilities, "confirms_prefix_cache_hits": 1},
+            _Confirming,
+        )
     with pytest.raises(ValueError, match="without supports_prefix_caching=True"):
         validate_tt_prefix_hit_confirmation(
             _config(), {"confirms_prefix_cache_hits": True}, _Confirming

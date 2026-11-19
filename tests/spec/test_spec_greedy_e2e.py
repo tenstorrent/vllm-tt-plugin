@@ -757,15 +757,15 @@ def test_a_verify_answering_in_another_mode_is_refused():
     )
     with pytest.raises(ValueError, match="at least one column"):
         _verify_output_tensor(empty, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
-    # a padding row whose column 0 is a placeholder still commits it, count 1
-    padding = VerifyOutput(
+    # a row whose column 0 is a placeholder commits nothing, which no row may:
+    # a padding row commits its column 0, count 1, like any other
+    empty = VerifyOutput(
         spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
         accepted_token_ids=torch.tensor([[pad, pad]]),
         accepted_counts=torch.tensor([1], dtype=torch.int32),
     )
-    assert _verify_output_tensor(
-        padding, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE
-    ).tolist() == [[pad, pad]]
+    with pytest.raises(ValueError, match=r"commits nothing on rows \[0\]"):
+        _verify_output_tensor(empty, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
 
     # one draft sent for row 0, five tokens committed: the walk takes them all
     step = SimpleNamespace(
@@ -795,6 +795,12 @@ def test_a_verify_answering_in_another_mode_is_refused():
     with pytest.raises(ValueError, match="at least one"):
         TTModelRunner.walk_spec_acceptance(
             SimpleNamespace(), step, torch.zeros(2, 0, dtype=torch.int64)
+        )
+    # and never the placeholder as a live row's token: the walk also reads what
+    # a model's read_decode_output returned, past the unwrap's check
+    with pytest.raises(ValueError, match=r"commits nothing on rows \[0\]"):
+        TTModelRunner.walk_spec_acceptance(
+            SimpleNamespace(), step, torch.tensor([[pad, pad], [4, pad]])
         )
 
 
@@ -956,6 +962,56 @@ def test_a_full_draft_set_commits_every_step_with_the_model_drafting():
 
     # The first step has no drafts in flight yet, and every step after it does.
     assert widths == [1] + [DRAFT_LEN + 1] * 3
+
+
+def _drafted_run(accept_modes, extra: int):
+    """Three model-drafted steps: no drafts, one of the proposal's, all of it."""
+    model = make_fake_spec_model(accept_modes=accept_modes, fused_extra_tokens=extra)()
+    runner = _model_drafter_runner(model)
+    runner._spec_accept_modes = accept_modes
+    _add_request(runner, "r")
+    committed: list[list[int]] = []
+    proposal: list[int] = []
+    for keep in (0, 1, DRAFT_LEN):
+        drafts = {"r": proposal[:keep]} if keep else None
+        output = _step(runner, "r", drafts=drafts)
+        committed.append(list(output.sampled_token_ids[0]))
+        proposal = list(runner.take_draft_token_ids().draft_token_ids[0])
+    return model, runner, committed
+
+
+@pytest.mark.parametrize("extra", [0, 2])
+def test_a_fused_sample_verify_commits_the_device_s_walk_and_past_it(extra):
+    """``fused_sample`` through the synchronous step, the model drafting.
+
+    The stand-in walks acceptance where a device would and returns the commit,
+    so with nothing past the walk a fused run commits what an ``argmax_ids``
+    run of the same steps commits. With ``fused_extra_tokens`` a row commits
+    past the ``1 + d`` tokens its drafts allow, up to the block's ``1+K``,
+    and the next verify and the drafter continue from that commit.
+    """
+    model, runner, committed = _drafted_run((ACCEPT_MODE_FUSED_SAMPLE,), extra)
+
+    assert [call["spec_mode"] for call in model.verify_calls] == [
+        ACCEPT_MODE_FUSED_SAMPLE
+    ] * 3
+    assert [len(tokens) for tokens in committed] == [
+        min(1 + drafts + extra, DRAFT_LEN + 1) for drafts in (0, 1, DRAFT_LEN)
+    ]
+    # This model chooses each token's successor, whichever step committed it.
+    last = PROMPT_LEN
+    flat = [token for tokens in committed for token in tokens]
+    assert flat == [(last + 1 + i) % FAKE_VOCAB_SIZE for i in range(len(flat))]
+    # Each commit's count reaches the next verify and the drafter.
+    assert [int(call["accepted_counts"][0]) for call in model.verify_calls[1:]] == [
+        len(tokens) for tokens in committed[:2]
+    ]
+    assert [int(call["accepted_counts"][0]) for call in model.propose_calls] == [
+        len(tokens) for tokens in committed
+    ]
+    assert runner._req_accepted_counts["r"] == len(committed[-1])
+    if extra == 0:
+        assert committed == _drafted_run((ACCEPT_MODE_ARGMAX_IDS,), 0)[2]
 
 
 def test_a_drafter_returning_the_wrong_shape_is_refused():
