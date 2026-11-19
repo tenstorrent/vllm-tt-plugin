@@ -463,20 +463,29 @@ def validate_tt_prefix_hit_confirmation(
     ``confirm_prefix_cache_hit`` for the scheduler of its process, which trims
     vLLM's prefix-cache hit to the answer.
 
-    Raises:
-        ValueError: the declaration comes without ``supports_prefix_caching``
-            or without the method, or the executor runs the worker outside the
-            scheduler's process (anything but the uniproc executor), where the
-            published method would never reach the scheduler, or the launch
-            runs single-process lane-DP, whose lanes would share one
-            lane-blind confirmer, or a KV connector is configured
-            (``--kv-transfer-config``), whose external tokens would extend
-            the hit past the confirmed one.
+    Raises
+    ------
+    ValueError
+        If the declaration is not a boolean, or it comes without
+        ``supports_prefix_caching`` or without the method, or the executor
+        runs the worker outside the scheduler's process (anything but the
+        uniproc executor), where the published method would never reach the
+        scheduler, or the launch runs single-process lane-DP, whose lanes
+        would share one lane-blind confirmer, or a KV connector is configured
+        (``--kv-transfer-config``), whose external tokens would extend the hit
+        past the confirmed one.
     """
     capabilities = model_capabilities or {}
-    if not capabilities.get("confirms_prefix_cache_hits", False):
-        return
     name = f"{model_class.__module__}.{model_class.__name__}"
+    confirms = capabilities.get("confirms_prefix_cache_hits", False)
+    if not isinstance(confirms, bool):
+        raise ValueError(
+            f"Model {name} must declare "
+            "model_capabilities['confirms_prefix_cache_hits'] as a boolean, got "
+            f"{confirms!r}"
+        )
+    if not confirms:
+        return
     if not capabilities.get("supports_prefix_caching", False):
         raise ValueError(
             f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
@@ -485,7 +494,7 @@ def validate_tt_prefix_hit_confirmation(
     if not callable(getattr(model_class, "confirm_prefix_cache_hit", None)):
         raise ValueError(
             f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
-            "=True without a confirm_prefix_cache_hit(prompt_token_ids, mm_items, "
+            "=True without a confirm_prefix_cache_hit(token_ids, mm_items, "
             "num_computed_tokens) method"
         )
     backend = vllm_config.parallel_config.distributed_executor_backend

@@ -242,19 +242,23 @@ class TTDecodeInterleavePolicy:
 
 
 def _effective_prefill_step_limit(scheduler_config) -> tuple[int, str]:
-    """The most tokens one scheduling step can hand a single new request, named.
+    """The most tokens one scheduling step can hand a single request, named.
 
-    Resolved exactly as vLLM's ``Scheduler.__init__`` resolves its per-step
-    token budget: ``max_num_scheduled_tokens`` when it is set, otherwise
-    ``max_num_batched_tokens``. A positive ``long_prefill_token_threshold``
-    then caps that limit. Returns ``(limit, name_of_the_binding_cap)``; the
-    limit is ``sys.maxsize`` when nothing is configured.
+    Resolved as vLLM's ``Scheduler.schedule`` caps one request: by its token
+    budget, ``max_num_scheduled_tokens`` when it is set and otherwise
+    ``max_num_batched_tokens``, and by its input budget,
+    ``max_num_batched_tokens``, which a larger ``max_num_scheduled_tokens``
+    does not lift. A positive ``long_prefill_token_threshold`` then caps that
+    limit. Returns ``(limit, name_of_the_binding_cap)``; the limit is
+    ``sys.maxsize`` when nothing is configured.
     """
     scheduled = getattr(scheduler_config, "max_num_scheduled_tokens", None)
+    batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
     if scheduled is not None:
         limit, name = int(scheduled), "max_num_scheduled_tokens"
+        if 0 < batched < limit:
+            limit, name = batched, "max_num_batched_tokens"
     else:
-        batched = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
         limit, name = (
             (batched, "max_num_batched_tokens")
             if batched > 0
@@ -274,9 +278,10 @@ def _validate_prefill_chunk_alignment(align: int, scheduler_config) -> None:
 
     ``_align_prefill_chunk_end`` defers a new request whose chunk falls short
     of the grid; that only converges if a later step can offer a larger chunk.
-    The binding cap is the one vLLM schedules with (``max_num_scheduled_tokens``
-    when set, else ``max_num_batched_tokens``), further capped by a positive
-    ``long_prefill_token_threshold``.
+    The binding cap is the one vLLM schedules a request with
+    (``_effective_prefill_step_limit``): the smaller of
+    ``max_num_scheduled_tokens``, when set, and ``max_num_batched_tokens``,
+    further capped by a positive ``long_prefill_token_threshold``.
     """
     limit, name = _effective_prefill_step_limit(scheduler_config)
     if limit < align:

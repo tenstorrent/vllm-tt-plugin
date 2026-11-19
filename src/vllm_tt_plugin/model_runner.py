@@ -3615,7 +3615,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             # past the drafts the runner sent -- a model running several
             # device steps per call -- up to the block's 1+K columns, which
             # the scheduler's lookahead reservation (effective_k + 1) covers.
-            from vllm_tt_plugin.async_decode import fused_sample_counts
+            from vllm_tt_plugin.async_decode import (
+                fused_sample_counts,
+                refuse_empty_fused_rows,
+            )
 
             ids = torch.as_tensor(tt_out).to(torch.int64)
             if model_input.max_num_logprobs[0] is not None:
@@ -3639,6 +3642,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                     f"the block's {width} columns; got {tuple(ids.shape)}"
                 )
             counts = fused_sample_counts(ids)
+            # Checked here too: on the asynchronous path the walk reads what
+            # the model's read_decode_output returned, after the unwrap's check.
+            refuse_empty_fused_rows(counts)
             # Laid out as the argmax walk lays it out: [B, 1+K] at the block's
             # width, each row's committed prefix followed by placeholders.
             committed = torch.full(
