@@ -236,8 +236,9 @@ a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids`, `logits` or `fused_sample`, the
 return formats the runner executes. A `fused_sample` verify returns
 `accepted_token_ids` `[B, 1+K]` (each row's committed prefix, its tail padded
-with `PLACEHOLDER_TOKEN_ID`; every submitted row, and at least one and at most
-`1+K` columns) and `accepted_counts` `[B]` in `[1, 1+K]`, which must agree;
+with `PLACEHOLDER_TOKEN_ID`; every submitted row, each committing at least its
+column 0, a padding row included, and at least one and at most `1+K` columns)
+and `accepted_counts` `[B]` in `[1, 1+K]`, which must agree;
 the runner refuses an answer that breaks any of these, and commits the
 prefixes as they are, under the certification rules
 of `argmax_ids`. The runner reads both on the host as soon as `decode_forward`

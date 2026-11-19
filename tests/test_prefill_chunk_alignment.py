@@ -175,6 +175,15 @@ def test_max_num_scheduled_tokens_is_the_step_limit_when_set():
     cfg.long_prefill_token_threshold = 100
     assert _effective_prefill_step_limit(cfg) == (100, "long_prefill_token_threshold")
     assert s._full_step_prefill_cap() == 100
+    # a max_num_scheduled_tokens above max_num_batched_tokens does not lift
+    # vLLM's per-request input budget, so the batched cap binds, and an
+    # alignment between the two is refused rather than waited for forever
+    cfg.max_num_scheduled_tokens = 8192
+    cfg.long_prefill_token_threshold = 0
+    assert _effective_prefill_step_limit(cfg) == (4096, "max_num_batched_tokens")
+    assert s._full_step_prefill_cap() == 4096
+    with pytest.raises(ValueError, match="max_num_batched_tokens=4096"):
+        _validate_prefill_chunk_alignment(8192, cfg)
 
 
 def test_init_rejects_a_scheduled_token_limit_below_the_alignment():

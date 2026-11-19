@@ -360,13 +360,24 @@ class TTWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def _prefix_hit_confirmer(self):
-        """The loaded model's ``confirm_prefix_cache_hit(prompt_token_ids,
-        mm_items, num_computed_tokens) -> int`` when it declares
+        """The loaded model's ``confirm_prefix_cache_hit(token_ids, mm_items,
+        num_computed_tokens) -> int`` when it declares
         ``model_capabilities["confirms_prefix_cache_hits"]`` (the platform
-        checked the method is there), else None."""
+        checked the method is there), else None.
+
+        Raises:
+            ValueError: the loaded model's declaration is not a boolean.
+        """
         model = self.model_runner.model
         capabilities = getattr(model, "model_capabilities", None) or {}
-        if not capabilities.get("confirms_prefix_cache_hits", False):
+        confirms = capabilities.get("confirms_prefix_cache_hits", False)
+        if not isinstance(confirms, bool):
+            raise ValueError(
+                f"Model {type(model).__module__}.{type(model).__name__} must "
+                "declare model_capabilities['confirms_prefix_cache_hits'] as a "
+                f"boolean, got {confirms!r}"
+            )
+        if not confirms:
             return None
         return model.confirm_prefix_cache_hit
 

@@ -31,16 +31,32 @@ from vllm_tt_plugin.structured_output import has_structured_outputs
 
 def fused_sample_counts(ids: torch.Tensor) -> torch.Tensor:
     """Each row's committed count in a ``fused_sample`` block: the columns before
-    its first ``PLACEHOLDER_TOKEN_ID``, or the whole width. Never 0: column 0 is
-    always a committed token (a padding row commits its column 0, count 1)."""
+    its first ``PLACEHOLDER_TOKEN_ID``, or the whole width. 0 for a row whose
+    column 0 is the placeholder, which ``refuse_empty_fused_rows`` refuses."""
     pad = ids == PLACEHOLDER_TOKEN_ID
     width = int(ids.shape[1])
-    first = torch.where(
+    return torch.where(
         pad.any(dim=1),
         pad.to(torch.int64).argmax(dim=1),
         torch.full((int(ids.shape[0]),), width, dtype=torch.int64),
     )
-    return first.clamp(min=1)
+
+
+def refuse_empty_fused_rows(counts: torch.Tensor) -> None:
+    """Refuse a ``fused_sample`` block in which a row commits nothing.
+
+    Every row commits its column 0, a padding row included (count 1, as an
+    ``argmax_ids`` padding row). A row whose column 0 is
+    ``PLACEHOLDER_TOKEN_ID`` would publish the placeholder as a live request's
+    output token, or hand the drafter a count of 0 for a padding row.
+    """
+    empty = (counts < 1).nonzero().reshape(-1).tolist()
+    if empty:
+        raise ValueError(
+            f"a fused_sample verify commits nothing on rows {empty}: their "
+            "column 0 is PLACEHOLDER_TOKEN_ID, and every row, a padding row "
+            "included, commits its column 0"
+        )
 
 
 def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
@@ -60,8 +76,7 @@ def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
         )
     # A count, in [1, 1+K] like the counts a verify takes (spec_decode's
     # check_spec_side_tensors): 0 is never valid, not even on a padding row,
-    # which commits its column 0 with a count of 1. Compared unclamped, so a
-    # 0 cannot pass as the 1 its ids derive.
+    # which commits its column 0 with a count of 1.
     width = int(ids.shape[1])
     out_of_range = counts[(counts < 1) | (counts > width)]
     if out_of_range.numel():
@@ -71,6 +86,7 @@ def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
             f"{out_of_range.tolist()}"
         )
     derived = fused_sample_counts(ids)
+    refuse_empty_fused_rows(derived)
     if not torch.equal(derived, counts):
         raise ValueError(
             "a fused_sample verify's accepted_counts disagree with its ids' "

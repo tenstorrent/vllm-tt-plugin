@@ -19,9 +19,11 @@ runner code most likely to be wrong, and a second mode costs nothing here. A
 test pins that the two return the same ids, so a test of one is evidence about
 the other.
 
-``fused_sample`` is refused: this fake serves ``argmax_ids`` and ``logits``
-only. The runner's ``fused_sample`` path is tested with constructed verify
-outputs (``test_spec_greedy_e2e.py``).
+``fused_sample`` is served to a variant that declares it: the stand-in runs
+the ``argmax_ids`` walk itself, where a device would, and returns the commit,
+so a fused run commits what an ``argmax_ids`` run of the same steps commits.
+``fused_extra_tokens`` lets each live row commit past that, the way a model
+chaining several device steps per call commits past the drafts it was sent.
 """
 
 import types
@@ -34,6 +36,7 @@ from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_INTERNAL,
     HIDDEN_HANDOFF_ON_DEVICE,
+    PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     SPEC_REQUIREMENT_HIDDEN_FEED,
     DraftOutput,
@@ -84,6 +87,9 @@ class FakeSpecModel:
     # Published in the plan, which is what per-request admission reads: a
     # launch without it verifies every step and refuses a sampled request.
     supports_narrow_decode: bool = False
+    # ``fused_sample`` only: how many more of its own tokens a live row commits
+    # past the walk's commit, up to the block's 1+K columns.
+    fused_extra_tokens: int = 0
 
     def __init__(self) -> None:
         self.propose_calls: list[dict] = []
@@ -220,14 +226,6 @@ class FakeSpecModel:
                 f"FakeSpecModel serves {list(self.accept_modes)}, "
                 f"asked for {spec_mode!r}"
             )
-        if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
-            # Reachable only through a configured variant that declares the
-            # mode. Refused by name rather than falling through to the logits
-            # return, which VerifyOutput would reject for this mode.
-            raise NotImplementedError(
-                "FakeSpecModel serves argmax_ids and logits only; the "
-                "runner's fused_sample path is tested in test_spec_greedy_e2e.py"
-            )
         rows, block_width = self._check_block("verify", tokens, positions)
         num_drafts = block_width - 1
         check_spec_side_tensors(num_valid_drafts, accepted_counts, rows, num_drafts)
@@ -243,6 +241,16 @@ class FakeSpecModel:
 
         verified = self._verified_ids(tokens, num_valid_drafts)
         self.verify_hidden = object()
+        if spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            ids, counts = self._fused_commit(
+                tokens, positions, verified, num_valid_drafts
+            )
+            return VerifyOutput(
+                spec_mode=spec_mode,
+                accepted_token_ids=ids,
+                accepted_counts=counts,
+                hidden=self.verify_hidden,
+            )
         if spec_mode == ACCEPT_MODE_ARGMAX_IDS:
             return VerifyOutput(
                 spec_mode=spec_mode, argmax_ids=verified, hidden=self.verify_hidden
@@ -389,6 +397,37 @@ class FakeSpecModel:
         bonus = (tokens[:, 0].to(torch.int64) + valid + 1) % self.vocab_size
         verified.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
         return verified.to(torch.int32)
+
+    def _fused_commit(self, tokens, positions, verified, num_valid_drafts):
+        """The ``fused_sample`` answer: the ``argmax_ids`` walk, run here.
+
+        Row ``i`` commits the drafts its verify agrees with, in order, then the
+        verify's id at the first column that disagrees, or the bonus past its
+        last valid draft: the prefix the runner's walk over ``argmax_ids``
+        commits. A live row (column 0 at a position >= 0) then commits
+        ``fused_extra_tokens`` more, each its predecessor plus one, which is
+        what this model chooses next, up to the block's ``1+K`` columns. A
+        padding row commits its column 0, count 1.
+        """
+        rows, width = int(tokens.shape[0]), int(tokens.shape[1])
+        drafted = tokens[:, 1:].to(torch.int64)
+        first_positions = positions.reshape(rows, -1)[:, 0]
+        ids = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+        counts = torch.ones(rows, dtype=torch.int32)
+        for row in range(rows):
+            accepted = 0
+            while accepted < int(num_valid_drafts[row]) and int(
+                verified[row, accepted]
+            ) == int(drafted[row, accepted]):
+                accepted += 1
+            committed = [int(token) for token in verified[row, : accepted + 1]]
+            if int(first_positions[row]) >= 0:
+                total = min(width, len(committed) + self.fused_extra_tokens)
+                while len(committed) < total:
+                    committed.append((committed[-1] + 1) % self.vocab_size)
+            ids[row, : len(committed)] = torch.tensor(committed, dtype=torch.int32)
+            counts[row] = len(committed)
+        return ids, counts
 
 
 def make_fake_spec_model(**knobs) -> type[FakeSpecModel]:
