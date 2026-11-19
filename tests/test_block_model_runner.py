@@ -794,3 +794,13 @@ def test_prefill_continuation_keeps_its_slot_when_a_new_request_joins_at_a_lower
     runner._req_state_slot = {"req-a": 0, "req-b": 0}
     with pytest.raises(RuntimeError, match=r"slots \[0\] are recorded for more"):
         runner._alloc_prefill_state_slots(["req-a", "req-b"])
+    # two off-batch holders on one slot: held collapses them to {0}, so a new
+    # request would be allocated as if the map still described the device
+    runner.requests = {"req-a": object(), "req-b": object(), "req-c": object()}
+    runner._req_state_slot = {"req-a": 0, "req-b": 0}
+    with pytest.raises(RuntimeError, match=r"slots \[0\] are recorded for more"):
+        runner._alloc_prefill_state_slots(["req-c"])
+    # a record left by a request that is gone is no live owner
+    runner.requests = {"req-a": object(), "req-c": object()}
+    runner._req_state_slot = {"req-a": 0, "req-z": 0}
+    assert runner._alloc_prefill_state_slots(["req-c"]) == [1]

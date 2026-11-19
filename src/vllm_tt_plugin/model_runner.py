@@ -1334,7 +1334,16 @@ class TTModelRunner:
             if req_id in prefilling
         }
         kept_slots = list(kept.values())
-        shared = sorted({s for s in kept_slots if s in held or kept_slots.count(s) > 1})
+        # Checked over every live request's record rather than ``held``, a set
+        # that collapses two off-batch holders recorded at one slot into one
+        # entry and would hand the third request a slot as if nothing were
+        # wrong.
+        live_slots = [
+            slot
+            for req_id, slot in self._req_state_slot.items()
+            if req_id in prefilling or req_id in self.requests
+        ]
+        shared = sorted({s for s in live_slots if live_slots.count(s) > 1})
         if shared:
             # The map records one live request per slot; two requests on one
             # slot means it has stopped describing the device, and handing
@@ -3534,11 +3543,19 @@ class TTModelRunner:
                     "logprobs, which ids cannot answer; _spec_mode_for_step "
                     "asks for logits for such a row"
                 )
-            width = int(model_input.input_tokens.shape[1])
-            if ids.dim() != 2 or int(ids.shape[1]) > width:
+            # Both dimensions against the submitted block: the commit and the
+            # prefixes index the walk by the submitted row layout, so a
+            # missing row would shift every row after it.
+            rows, width = (int(size) for size in model_input.input_tokens.shape)
+            if (
+                ids.dim() != 2
+                or int(ids.shape[0]) != rows
+                or not 1 <= int(ids.shape[1]) <= width
+            ):
                 raise ValueError(
-                    "a fused_sample verify commits at most the block's "
-                    f"{width} columns per row, got {tuple(ids.shape)}"
+                    f"a fused_sample verify returns [{rows}, 1..{width}]: one row "
+                    "per submitted row, each committing at least one and at most "
+                    f"the block's {width} columns; got {tuple(ids.shape)}"
                 )
             counts = fused_sample_counts(ids)
             # Laid out as the argmax walk lays it out: [B, 1+K] at the block's

@@ -740,6 +740,25 @@ def test_a_verify_answering_in_another_mode_is_refused():
     )
     with pytest.raises(ValueError, match="disagree"):
         _verify_output_tensor(wrong, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
+    # a count is never 0 (nor negative): one committed token does not let a 0
+    # pass as the 1 the ids derive
+    for bad in (0, -1):
+        zero = VerifyOutput(
+            spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+            accepted_token_ids=torch.tensor([[42, pad]]),
+            accepted_counts=torch.tensor([bad], dtype=torch.int32),
+        )
+        with pytest.raises(ValueError, match=r"must lie in \[1, 2\]"):
+            _verify_output_tensor(zero, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
+    # a padding row whose column 0 is a placeholder still commits it, count 1
+    padding = VerifyOutput(
+        spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+        accepted_token_ids=torch.tensor([[pad, pad]]),
+        accepted_counts=torch.tensor([1], dtype=torch.int32),
+    )
+    assert _verify_output_tensor(
+        padding, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE
+    ).tolist() == [[pad, pad]]
 
     # one draft sent for row 0, five tokens committed: the walk takes them all
     step = SimpleNamespace(
@@ -760,6 +779,16 @@ def test_a_verify_answering_in_another_mode_is_refused():
     step.input_tokens = torch.zeros(2, 4, dtype=torch.int32)
     with pytest.raises(ValueError, match="at most the block"):
         TTModelRunner.walk_spec_acceptance(SimpleNamespace(), step, out)
+    # one row per submitted row: a short answer would shift every later row
+    step.input_tokens = torch.zeros(3, 8, dtype=torch.int32)
+    with pytest.raises(ValueError, match="one row per submitted row"):
+        TTModelRunner.walk_spec_acceptance(SimpleNamespace(), step, out)
+    # and at least one column: column 0 is always committed
+    step.input_tokens = torch.zeros(2, 8, dtype=torch.int32)
+    with pytest.raises(ValueError, match="at least one"):
+        TTModelRunner.walk_spec_acceptance(
+            SimpleNamespace(), step, torch.zeros(2, 0, dtype=torch.int64)
+        )
 
 
 def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():

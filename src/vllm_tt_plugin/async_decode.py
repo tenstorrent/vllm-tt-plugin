@@ -53,8 +53,20 @@ def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
             "a fused_sample verify returns [B, 1+K] accepted_token_ids and [B] "
             f"accepted_counts, got {tuple(ids.shape)} / {tuple(counts.shape)}"
         )
+    # A count, in [1, 1+K] like the counts a verify takes (spec_decode's
+    # check_spec_side_tensors): 0 is never valid, not even on a padding row,
+    # which commits its column 0 with a count of 1. Compared unclamped, so a
+    # 0 cannot pass as the 1 its ids derive.
+    width = int(ids.shape[1])
+    out_of_range = counts[(counts < 1) | (counts > width)]
+    if out_of_range.numel():
+        raise ValueError(
+            "a fused_sample verify's accepted_counts must lie in "
+            f"[1, {width}], its accepted_token_ids' columns, got "
+            f"{out_of_range.tolist()}"
+        )
     derived = fused_sample_counts(ids)
-    if not torch.equal(derived, counts.clamp(min=1)):
+    if not torch.equal(derived, counts):
         raise ValueError(
             "a fused_sample verify's accepted_counts disagree with its ids' "
             f"committed prefixes: counts {counts.tolist()}, prefixes "

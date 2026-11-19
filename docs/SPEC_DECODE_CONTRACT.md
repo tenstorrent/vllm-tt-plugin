@@ -236,8 +236,10 @@ a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids`, `logits` or `fused_sample`, the
 return formats the runner executes. A `fused_sample` verify returns
 `accepted_token_ids` `[B, 1+K]` (each row's committed prefix, its tail padded
-with `PLACEHOLDER_TOKEN_ID`) and `accepted_counts` `[B]`, which must agree;
-the runner commits the prefixes as they are, under the certification rules
+with `PLACEHOLDER_TOKEN_ID`; every submitted row, and at least one and at most
+`1+K` columns) and `accepted_counts` `[B]` in `[1, 1+K]`, which must agree;
+the runner refuses an answer that breaks any of these, and commits the
+prefixes as they are, under the certification rules
 of `argmax_ids`. The runner reads both on the host as soon as `decode_forward`
 returns, before any `read_decode_output`, so they are host tensors even on a
 `read_from_device=False` call: the commit is complete when the verify
@@ -993,9 +995,11 @@ closed and must not touch the device.
 
 **When the runner asks for it.** `TTModelRunner._spec_mode_for_step` chooses
 per verify step from `SpecPlan.accept_modes` and the step's live rows. A model
-offering only `logits` is always asked for `logits`. A model offering both is
-asked for `argmax_ids` while every live row is certifiable by id equality, and
-for `logits` as soon as one live row is not:
+offering only `logits` is always asked for `logits`. A model offering `logits`
+and an id mode (`argmax_ids`, or `fused_sample`, which certifies the same rows
+and is asked for in its place when offered) is asked for the id mode while
+every live row is certifiable by id equality, and for `logits` as soon as one
+live row is not:
 `TTModelRunner._request_is_argmax_certifiable` is false for a non-zero
 temperature, a penalty, logprobs (including `logprobs=0`), structured output,
 `allowed_token_ids`, `bad_words`, and a `min_tokens` the output has not
