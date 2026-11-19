@@ -48,10 +48,15 @@ def fused_sample_ids(verify: VerifyOutput) -> torch.Tensor:
     its counts."""
     ids = torch.as_tensor(verify.accepted_token_ids).to(torch.int64)
     counts = torch.as_tensor(verify.accepted_counts).reshape(-1).to(torch.int64)
-    if ids.dim() != 2 or int(counts.numel()) != int(ids.shape[0]):
+    if (
+        ids.dim() != 2
+        or int(ids.shape[1]) < 1
+        or int(counts.numel()) != int(ids.shape[0])
+    ):
         raise ValueError(
-            "a fused_sample verify returns [B, 1+K] accepted_token_ids and [B] "
-            f"accepted_counts, got {tuple(ids.shape)} / {tuple(counts.shape)}"
+            "a fused_sample verify returns [B, 1+K] accepted_token_ids (at least "
+            "one column) and [B] accepted_counts, got "
+            f"{tuple(ids.shape)} / {tuple(counts.shape)}"
         )
     # A count, in [1, 1+K] like the counts a verify takes (spec_decode's
     # check_spec_side_tensors): 0 is never valid, not even on a padding row,

@@ -750,6 +750,14 @@ def test_a_verify_answering_in_another_mode_is_refused():
         )
         with pytest.raises(ValueError, match=r"must lie in \[1, 2\]"):
             _verify_output_tensor(zero, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
+    # an answer without columns is refused by its shape, not by its counts
+    empty = VerifyOutput(
+        spec_mode=ACCEPT_MODE_FUSED_SAMPLE,
+        accepted_token_ids=torch.zeros(1, 0, dtype=torch.int64),
+        accepted_counts=torch.tensor([1], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="at least one column"):
+        _verify_output_tensor(empty, "FakeSpecModel", ACCEPT_MODE_FUSED_SAMPLE)
     # a padding row whose column 0 is a placeholder still commits it, count 1
     padding = VerifyOutput(
         spec_mode=ACCEPT_MODE_FUSED_SAMPLE,

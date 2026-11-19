@@ -19,9 +19,9 @@ runner code most likely to be wrong, and a second mode costs nothing here. A
 test pins that the two return the same ids, so a test of one is evidence about
 the other.
 
-``fused_sample`` is refused because no implementation serves it today, on
-either side. The contract keeps the mode for a model that will; a stand-in that
-served it would give a passing test for a path nothing can run.
+``fused_sample`` is refused: this fake serves ``argmax_ids`` and ``logits``
+only. The runner's ``fused_sample`` path is tested with constructed verify
+outputs (``test_spec_greedy_e2e.py``).
 """
 
 import types
@@ -225,8 +225,8 @@ class FakeSpecModel:
             # mode. Refused by name rather than falling through to the logits
             # return, which VerifyOutput would reject for this mode.
             raise NotImplementedError(
-                "FakeSpecModel does not implement on-device rejection "
-                "sampling; no model does"
+                "FakeSpecModel serves argmax_ids and logits only; the "
+                "runner's fused_sample path is tested in test_spec_greedy_e2e.py"
             )
         rows, block_width = self._check_block("verify", tokens, positions)
         num_drafts = block_width - 1
