@@ -429,7 +429,7 @@ def test_the_two_accept_modes_return_the_same_token_ids():
     assert torch.equal(logits.argmax(dim=-1).to(torch.int32), ids)
 
 
-def test_fused_sample_is_refused_because_no_implementation_serves_it():
+def test_fake_refuses_fused_sample():
     model = FakeSpecModel()
     tokens, positions = _block(1, 4)
     with pytest.raises(ValueError):
