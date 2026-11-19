@@ -217,6 +217,7 @@ def test_update_states_releases_model_request_before_removing_row(
     # State parked at a slot different from the batch row: release must
     # target the slot, not the row.
     runner._req_state_slot = {"req-0": 5}
+    runner._proposed_draft_token_ids = {}
 
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.finished_req_ids = finished_req_ids
@@ -673,6 +674,7 @@ def test_finishing_one_request_releases_only_its_own_slot():
     # Deliberately NOT equal to the batch rows: a release that leaked the row
     # instead of the slot would name 0 here and look correct by accident.
     runner._req_state_slot = {"req-a": 7, "req-b": 4}
+    runner._proposed_draft_token_ids = {}
 
     scheduler_output = SchedulerOutput.make_empty()
     scheduler_output.finished_req_ids = {"req-a"}

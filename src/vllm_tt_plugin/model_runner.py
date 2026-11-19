@@ -986,6 +986,7 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self._proposed_draft_token_ids.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -1016,6 +1017,9 @@ class TTModelRunner:
                     f"this step: {sorted(scheduler_output.preempted_req_ids)}"
                 )
             self._release_model_request(req_id)
+            # A resume re-prefills, and its first decode verifies nothing, as
+            # ``Scheduler._preempt_request`` clears ``spec_token_ids``.
+            self._proposed_draft_token_ids.pop(req_id, None)
 
         # Only after the model released by slot: the release calls above read
         # the request's slot from the ownership map before it is dropped.
@@ -1028,7 +1032,13 @@ class TTModelRunner:
         # they will be scheduled again sometime in the future.
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        # A forced prefix-cache reset (``reset_prefix_cache`` with
+        # ``reset_running_requests``) preempts running requests and resumes
+        # them in the same step, on new blocks. Their rows still hold the freed
+        # blocks, so they leave the persistent batch here and come back through
+        # the resumed-request path below, as in upstream's GPU runner.
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1938,27 +1948,33 @@ class TTModelRunner:
             if counts_by_row[row] < 1:
                 continue
             if declined:
-                # Erase, as ``_publish_draft`` does for an empty offer, for a
-                # request that still holds a row (the published-for rows of the
-                # full loop below).
-                if req_id in self.input_batch.req_id_to_index:
-                    self._proposed_draft_token_ids.pop(req_id, None)
+                # Erase, as ``_publish_draft`` does for an empty offer.
+                self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             # Two row spaces meet here. ``counts`` and ``draft_token_ids`` are
             # indexed by the step's rows, which is the order the model answered
             # in; the persistent batch is indexed by where the request sits
             # now, and a completion between this step's submission and its
-            # commit makes ``condense`` slide a request into another row. A
-            # request with no row has no current length for max-model-length
-            # trimming, so this step records its retained accepted count but
-            # does not publish a proposal.
+            # commit makes ``condense`` slide a request into another row.
             batch_row = self.input_batch.req_id_to_index.get(req_id)
-            if batch_row is None:
+            if batch_row is not None:
+                num_tokens = int(self.input_batch.num_tokens[batch_row])
+            elif req_id in self._req_state_slot:
+                # A running request the step being built left out. Under
+                # asynchronous scheduling this commit runs at that step's
+                # build, and a prefill step leaves out every decode row. The
+                # proposal waits for the step that schedules the request
+                # again, as a synchronous launch's drafts wait on
+                # ``request.spec_token_ids``; without it that step verifies
+                # nothing for the row.
+                num_tokens = self.requests[req_id].num_tokens
+            else:
+                # Finished or preempted: no step continues this commit.
                 continue
             # Trimmed to what the request can still hold, the way the host
             # proposer trims itself. Drafts past ``max_model_len`` would be
             # verified and then dropped at the commit.
-            room = max_model_len - int(self.input_batch.num_tokens[batch_row])
+            room = max_model_len - num_tokens
             row_offered = num_drafts if offered_by_row is None else offered_by_row[row]
             usable = max(0, min(row_offered, room))
             self._publish_draft(
