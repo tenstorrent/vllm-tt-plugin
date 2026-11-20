@@ -214,6 +214,41 @@ def test_async_scheduling_speculates_for_a_model_that_declares_it(
     assert plan.effective_k == 7
 
 
+@pytest.mark.parametrize("async_scheduling", [True, False])
+@pytest.mark.parametrize(
+    "accept_modes", [("fused_sample",), ("argmax_ids", "fused_sample")]
+)
+def test_a_fused_sample_plan_is_served_synchronously_only(
+    monkeypatch, vllm_config, async_scheduling, accept_modes
+):
+    # A fused_sample verify may commit past the drafts it was sent, and
+    # asynchronous scheduling has already scheduled the next step from the
+    # positions before that commit (test_spec_kv_lookahead's queued-step
+    # regression). The runner asks for fused_sample whenever a plan offers it,
+    # so offering argmax_ids beside it does not help. Both async declarations
+    # are present, so only the accept mode refuses the asynchronous launch.
+    vllm_config.scheduler_config.async_scheduling = async_scheduling
+    model = make_fake_spec_model(
+        max_supported_num_seqs=4,
+        accept_modes=accept_modes,
+        model_capabilities={
+            **FakeSpecModel.model_capabilities,
+            "supports_async_decode": True,
+            "supports_async_spec_decode": True,
+        },
+    )
+    launch = _speculative(vllm_config, requested_k=3)
+    if not async_scheduling:
+        _run_hook(monkeypatch, launch, model)
+        assert get_tt_spec_plan(vllm_config).accept_modes == accept_modes
+        return
+    with pytest.raises(ValueError) as excinfo:
+        _run_hook(monkeypatch, launch, model)
+    message = str(excinfo.value)
+    assert "'fused_sample'" in message and "--no-async-scheduling" in message
+    assert vllm_config.scheduler_config.async_scheduling is True
+
+
 def test_declaring_async_spec_decode_does_not_admit_async_decode_itself(
     monkeypatch, vllm_config
 ):

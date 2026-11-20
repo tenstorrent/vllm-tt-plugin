@@ -33,8 +33,9 @@ serve speculative decoding within the following execution limits:
   device's committed ids as the walk's result, so a model may commit more
   tokens per call than the drafts it was sent (several device steps per
   call), at most the block's `1 + effective_k` columns. Section 4f states
-  the KV the scheduler reserves for such a call, and what a commit past the
-  drafts does to vLLM's counters. An ordinary narrow decode does not send
+  the KV the scheduler reserves for such a call, what a commit past the
+  drafts does to vLLM's counters, and why such a plan is served with
+  synchronous scheduling only. An ordinary narrow decode does not send
   `spec_mode`.
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
@@ -545,6 +546,10 @@ these checks in this order:
 3. `TTPlatform` also requires `supports_spec_decode` and an admissible
    `SpecPlan`. Both async declarations are necessary for the combined path,
    but do not replace the other admission checks.
+4. `TTPlatform` refuses a `SpecPlan` that offers `fused_sample` while async
+   scheduling is enabled, whatever else the plan offers (section 4f). The
+   model can leave `fused_sample` out of `accept_modes` when
+   `vllm_config.scheduler_config.async_scheduling` is set.
 
 `_install_tt_async_spec_method_patch` admits `custom_class` through the upstream
 async method check before platform validation. TT plugin bootstrap installs
@@ -936,6 +941,15 @@ chain of at most `M` steps writes through `p + effective_k + K`, one position
 short of the end. It also shortens the chain where the row's page table stops.
 An `ngram` launch reserves nothing past the step's own `1 + d` tokens, so there
 a `fused_sample` verify may commit at most `1 + d` tokens.
+
+**Synchronous scheduling only.** Asynchronous scheduling schedules a
+request's next step before the previous step's output arrives, from the
+positions that step scheduled. After a commit past the drafts, that queued
+step would start behind the request, and the runner would read the gap as
+prompt and prefill it. `TTPlatform` therefore refuses a plan that offers
+`fused_sample` on an asynchronous launch (section 4c), and
+`TTScheduler._count_commit_past_scheduled_drafts` raises if such a commit
+ever arrives while a later step of the request is scheduled.
 
 **What vLLM's counters show for such a commit.** At schedule time vLLM
 advances `num_computed_tokens`, and through `AsyncScheduler`

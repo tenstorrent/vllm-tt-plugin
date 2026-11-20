@@ -50,7 +50,7 @@ from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
 )
-from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_FUSED_SAMPLE, ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -2587,6 +2587,28 @@ class TTPlatform(Platform):
                     "Speculative decoding requires the Python frontend: the "
                     "Rust frontend bypasses the TT request validation; unset "
                     "VLLM_USE_RUST_FRONTEND or drop the speculative flags"
+                )
+            # The runner asks for fused_sample whenever a plan offers it, and
+            # such a verify may commit more tokens than the drafts it was sent.
+            # Asynchronous scheduling schedules the next step from this step's
+            # scheduled positions before the commit is known, so that queued
+            # step would start behind the request and the runner would read
+            # the gap as prompt to prefill. Until the queued positions are
+            # reconciled, fused_sample is served synchronously only.
+            if (
+                vllm_config.scheduler_config.async_scheduling
+                and ACCEPT_MODE_FUSED_SAMPLE in spec_plan.accept_modes
+            ):
+                raise ValueError(
+                    f"{model_class.__name__}.spec_plan offers the "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r} accept mode, which TT serves "
+                    "with synchronous scheduling only: a fused_sample verify "
+                    "may commit past the drafts it was sent, and asynchronous "
+                    "scheduling has already scheduled the next step from the "
+                    "positions before that commit. Launch with "
+                    "--no-async-scheduling, or leave fused_sample out of "
+                    "accept_modes when "
+                    "vllm_config.scheduler_config.async_scheduling is set"
                 )
             requested_k = vllm_config.speculative_config.num_speculative_tokens
             if spec_plan.effective_k != requested_k:

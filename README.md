@@ -671,7 +671,8 @@ certifies greedy requests only. With `fused_sample` the adapter accepts on the
 device and returns each row's committed ids and count; it certifies the same
 rows as `argmax_ids` and is asked for in its place when offered, and a call may
 commit more tokens than the drafts it was sent, at most the block's
-`1 + effective_k`. With `logits` the adapter returns
+`1 + effective_k`, so a plan offering it is served with synchronous scheduling
+only. With `logits` the adapter returns
 full-vocabulary verify logits and the runner rejection-samples each row on the
 host (`spec_accept.accept_sampled_drafts`), so sampled and penalized requests
 speculate losslessly under temperature, top-k, top-p, presence, frequency and
