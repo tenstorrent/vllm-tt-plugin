@@ -1843,6 +1843,12 @@ def test_a_fused_sample_commit_past_the_drafts_crosses_the_deferral():
     proposal the first commit published, commits the whole ``1+K`` block. Each
     commit is published at resolve, applied at the drain, and its count is
     what the next verify is handed.
+
+    Each step here is built after the previous commit is known. A served
+    asynchronous launch schedules the next step before that, which a commit
+    past the drafts leaves stale, so ``TTPlatform`` serves ``fused_sample``
+    synchronously only (``test_spec_kv_lookahead``'s queued-step test). This
+    pins the runner's deferral mechanics alone.
     """
     model = make_fake_spec_model(
         accept_modes=(ACCEPT_MODE_FUSED_SAMPLE,), fused_extra_tokens=2
