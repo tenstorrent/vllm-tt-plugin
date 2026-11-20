@@ -79,6 +79,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.repetition_guard import RepetitionGuard
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -104,6 +105,44 @@ if TYPE_CHECKING:
 import numpy as np
 
 logger = init_tt_logger(__name__)
+
+
+def _guard_repetition(
+    runner, req_ids: list[str | None], token_lists: list[list[int]]
+) -> list[list[int]]:
+    """Apply the repetition guard to one step's published token lists.
+
+    See ``repetition_guard``. The stop id is one of the request's own
+    ``all_stop_token_ids`` (the end-of-sequence id is among them), so the engine
+    ends the request exactly as it ends one that sampled it. A request with
+    ``ignore_eos`` is never touched. Runner-like test doubles without a guard
+    publish unchanged.
+    """
+    guard = getattr(runner, "_repetition_guard", None)
+    if guard is None:
+        return token_lists
+    guarded = None
+    for row, (req_id, tokens) in enumerate(zip(req_ids, token_lists)):
+        if req_id is None or not tokens:
+            continue
+        params = getattr(runner.requests.get(req_id), "sampling_params", None)
+        stop_ids = getattr(params, "all_stop_token_ids", None)
+        if params is None or params.ignore_eos or not stop_ids:
+            continue
+        out = guard.apply(req_id, tokens, min(stop_ids))
+        if out is not tokens:
+            logger.warning(
+                "Request %s stopped: more than %d identical tokens in a row "
+                "(token id %d)",
+                req_id,
+                guard.max_run,
+                tokens[len(out) - 1],
+            )
+            if guarded is None:
+                guarded = list(token_lists)
+            guarded[row] = out
+    return token_lists if guarded is None else guarded
+
 
 # Matches the upstream attention-layer naming convention used by registered
 # vLLM models (e.g. "model.language_model.layers.5.self_attn") as well as
@@ -314,6 +353,7 @@ class TTModelRunner:
         self._shutdown_complete = False
         self._is_adaptive_block_output = is_tt_adaptive_block_output_model(vllm_config)
         self._device_grammar_poisoned = False
+        self._repetition_guard = RepetitionGuard()
 
         # Resolved and validated by the platform's config-time admission;
         # ``None`` means the launch asked for no speculation. The draft length
@@ -986,6 +1026,9 @@ class TTModelRunner:
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            guard = getattr(self, "_repetition_guard", None)
+            if guard is not None:
+                guard.drop(req_id)
 
         # Remove the finished requests from the persistent batch.
         # Upstream input processing gives resubmissions fresh internal IDs, but
@@ -1311,11 +1354,14 @@ class TTModelRunner:
             self._req_state_slot.pop(req_id, None)
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
-        """Pick each prefilling request's state slot, skipping slots that live
-        off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        """Pick each prefilling request's state slot. A request that already owns one
+        keeps it: a continuing chunk reads the state its earlier chunks wrote there,
+        and only decode gathers move state, so re-placing it by row would leave the
+        state behind (and hand the slot to another request). A request without a slot
+        gets its own row (where it decodes) when that is free, so the steady state
+        moves nothing, and otherwise the first free slot.
 
-        Exhaustion is unreachable: holders and prefills are disjoint and both count
+        Exhaustion is unreachable: existing holders and new prefills both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
         stopped describing the device, and nothing on the host can recover it, so fail
         rather than guess and return plausible, wrong text.
@@ -1327,13 +1373,21 @@ class TTModelRunner:
                 "slots; admission is the scheduler's job, not this function's"
             )
         prefilling = set(row_req_ids)
-        held = {
-            slot
+        owned = {
+            req_id: slot
             for req_id, slot in self._req_state_slot.items()
-            if req_id not in prefilling and req_id in self.requests
+            if req_id in prefilling or req_id in self.requests
         }
+        held = set(owned.values())
+        if len(held) != len(owned):
+            raise RuntimeError(
+                f"two requests own one device state slot: map={self._req_state_slot}"
+            )
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            if req_id in owned:
+                slots.append(owned[req_id])
+                continue
             if row not in held:
                 slot = row
             else:
@@ -1552,8 +1606,8 @@ class TTModelRunner:
         """
         if draft_cap is None:
             draft_cap = num_drafts
-        if not 1 <= draft_cap <= num_drafts:
-            raise ValueError(f"draft_cap must be in [1, {num_drafts}], got {draft_cap}")
+        if not 0 <= draft_cap <= num_drafts:
+            raise ValueError(f"draft_cap must be in [0, {num_drafts}], got {draft_cap}")
         drafts = torch.full(
             (len(row_req_ids), num_drafts), PLACEHOLDER_TOKEN_ID, dtype=torch.int32
         )
@@ -1773,6 +1827,14 @@ class TTModelRunner:
         nothing.
         """
         if self._spec_method != "ngram" or not committed:
+            return
+        plan = getattr(self, "_spec_plan", None)
+        live = sum(req_id is not None for req_id in self.input_batch.req_ids)
+        if plan is not None and live and plan.draft_cap(live) == 0:
+            # More live requests than the plan lets draft (a draft cap of 0): propose nothing, so these steps stay
+            # ordinary decodes, which can overlap the next step.
+            for req_id in committed:
+                self._publish_draft(req_id, [], device_sampled)
             return
         if self._ngram_proposer is None:
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -3750,7 +3812,9 @@ class TTModelRunner:
         return ModelRunnerOutput(
             req_ids=list(row_req_ids),
             req_id_to_index={req: idx for idx, req in enumerate(row_req_ids)},
-            sampled_token_ids=[list(prefix) for prefix in prefixes],
+            sampled_token_ids=_guard_repetition(
+                self, row_req_ids, [list(prefix) for prefix in prefixes]
+            ),
             logprobs=logprobs,
             prompt_logprobs_dict=dict.fromkeys(row_req_ids, None),
             pooler_output=[],
@@ -3963,7 +4027,7 @@ class TTModelRunner:
                 if req_id_to_index is not None
                 else {req_id: idx for idx, req_id in enumerate(req_ids)}
             ),
-            sampled_token_ids=sampled_token_id_lists,
+            sampled_token_ids=_guard_repetition(self, req_ids, sampled_token_id_lists),
             logprobs=logprobs,
             prompt_logprobs_dict=dict.fromkeys(req_ids, None),
             pooler_output=[],
@@ -4624,7 +4688,9 @@ class TTModelRunner:
         output = ModelRunnerOutput(
             req_ids=output_req_ids,
             req_id_to_index=output_req_id_to_index,
-            sampled_token_ids=sampled_token_id_lists,
+            sampled_token_ids=_guard_repetition(
+                self, output_req_ids, sampled_token_id_lists
+            ),
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],

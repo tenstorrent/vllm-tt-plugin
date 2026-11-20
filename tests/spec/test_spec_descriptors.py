@@ -20,8 +20,13 @@ import pytest
 import torch
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
-from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
+from vllm_tt_plugin.model_runner import TTModelRunner, _step_verifies
+from vllm_tt_plugin.spec_decode import (
+    ACCEPT_MODE_ARGMAX_IDS,
+    DRAFTER_STATE_INTERNAL,
+    PLACEHOLDER_TOKEN_ID,
+    SpecPlan,
+)
 from vllm_tt_plugin.worker import TTWorker
 
 
@@ -126,6 +131,69 @@ def test_the_row_state_gatherer_is_callable_on_an_instance():
     assert drafts.tolist() == [[11, 12, PLACEHOLDER_TOKEN_ID]]
     assert num_valid.tolist() == [2]
     assert counts.tolist() == [3]
+
+
+def test_a_draft_cap_of_zero_verifies_no_draft():
+    runner = _bare_runner()
+
+    drafts, num_valid, counts = runner._spec_row_state(
+        {"r": 3}, {"r": [11, 12]}, ["r"], 3, 0
+    )
+
+    assert drafts.tolist() == [[PLACEHOLDER_TOKEN_ID] * 3]
+    assert num_valid.tolist() == [0]
+    assert counts.tolist() == [3]
+
+
+def test_no_proposals_are_made_while_the_live_rows_are_capped_at_zero_drafts():
+    from types import SimpleNamespace
+
+    runner = _bare_runner()
+    runner._spec_method = "ngram"
+    runner._spec_plan = SpecPlan(
+        effective_k=5,
+        lanes_per_request=6,
+        extra_bytes_per_seq=0,
+        extra_bytes_per_token=0,
+        accept_modes=(ACCEPT_MODE_ARGMAX_IDS,),
+        drafter_state=DRAFTER_STATE_INTERNAL,
+        k_by_rows=((1, 5), (4, 3), (32, 0)),
+    )
+    runner._ngram_proposer = None  # a proposer would be built on first use; the cap must return before that
+    runner._proposed_draft_token_ids = {"a": [1, 2], "b": [3]}
+    runner.input_batch = SimpleNamespace(req_ids=["a", "b", "c", "d", "e"])
+    published = []
+    runner._publish_draft = lambda req_id, tokens, sampled: published.append((req_id, tokens))
+
+    runner._propose_ngram_drafts({"a": [9], "b": [8]}, False)
+
+    assert published == [("a", []), ("b", [])]
+    assert runner._ngram_proposer is None
+
+
+def test_pending_drafts_are_dropped_but_the_commit_stays_when_the_cap_drops_to_zero():
+    """Four requests drafted and committed several tokens, then four more arrive: eight live rows are capped at 0.
+
+    No row carries a draft, but the step after a multi-token commit is still a (draftless) verify block, so a model
+    must answer a verify at that row count.
+    """
+    runner = _bare_runner()
+    rows = [f"r{i}" for i in range(8)]
+    counts = {f"r{i}": 3 for i in range(4)}
+    drafts = {f"r{i}": [11, 12, 13] for i in range(4)}
+
+    _, num_valid, accepted = runner._spec_row_state(counts, drafts, rows, 5, 0)
+
+    assert num_valid.tolist() == [0] * 8
+    assert accepted.tolist() == [3] * 4 + [1] * 4
+    assert _step_verifies(True, True, num_valid, accepted, 8) is True
+
+
+def test_a_draft_cap_above_the_block_is_refused():
+    runner = _bare_runner()
+
+    with pytest.raises(ValueError, match="draft_cap"):
+        runner._spec_row_state({}, {}, ["r"], 3, 4)
 
 
 def test_a_speculative_step_missing_its_side_tensors_raises_by_name():
