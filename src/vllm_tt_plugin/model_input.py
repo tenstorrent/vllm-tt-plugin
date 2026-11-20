@@ -16,7 +16,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.v1.sample.logits_processor import LogitsProcessors
+
+from vllm_tt_plugin.sample.logits_processor import LogitsProcessors
 
 
 @dataclass(frozen=True)

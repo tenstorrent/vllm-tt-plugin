@@ -86,7 +86,6 @@ def _device_sampling_runner(*, supports_device_grammar: bool):
             ),
             max_num_logprobs=None,
         ),
-        model_config=SimpleNamespace(logits_processors=[]),
         model=SimpleNamespace(model_capabilities={}),
     )
 

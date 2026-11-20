@@ -33,14 +33,15 @@ lossless for any drafter, sampling ones included, whose choice does not read
 the walk's own random draws: the drafted id ``d`` commits with probability
 ``p(d)`` and any other id ``x`` with ``(1 - p(d)) * p(x) / (1 - p(d)) = p(x)``.
 
-The target distribution is the one vLLM's ordinary sampler would use, built in
+The target distribution is the one the ordinary host sampler would use, built in
 the ordinary sampler's order: the grammar bitmask, which the runner applies to
 the logits before the sampler sees them; then allowed_token_ids, bad_words and
 min_tokens; then the penalties; then temperature and top-k/top-p. min_p is
 absent because vLLM refuses a min_p above 1e-5 on a speculating launch and
-builds no min_p processor for it. ``accept_sampled_drafts`` applies everything
-up to the penalties per candidate column, against column ``j``'s own state: the
-committed output plus the first ``j`` drafts.
+``build_logitsprocs`` builds no min_p processor for it.
+``accept_sampled_drafts`` applies everything up to the penalties per candidate
+column, against column ``j``'s own state: the committed output plus the first
+``j`` drafts.
 
 One place differs from upstream's rejection sampler, towards the ordinary
 sampler. Upstream masks the stop tokens at the bonus position whenever the
@@ -50,8 +51,8 @@ drafts is below it, which is where the ordinary sampler would mask that token.
 
 Logprobs are the raw logprobs, after the grammar bitmask and before any other
 control, of each committed token at its own column. That is what the plugin's
-ordinary host sampler returns, because it runs vLLM's ``Sampler`` in its
-default ``raw_logprobs`` mode on logits the grammar has already masked.
+ordinary host sampler returns, because its ``Sampler`` runs in the default
+``raw_logprobs`` mode on logits the grammar has already masked.
 
 The accept walk uses host PyTorch and the plugin's placeholder constant. Every
 vLLM helper is imported inside the function that uses it. This module reads no
@@ -72,6 +73,7 @@ from vllm_tt_plugin.model_input import (
     penalty_history,
     penalty_prompt_ids,
 )
+from vllm_tt_plugin.sample.bad_words import apply_bad_words
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
 
 if TYPE_CHECKING:
@@ -236,9 +238,9 @@ def spec_sampling_inputs(
         )
 
     # Deferred for the same import cycle as the top-k/top-p helper below.
-    from vllm.v1.sample.sampler import _SAMPLING_EPS
+    from vllm_tt_plugin.sample.sampler import _SAMPLING_EPS
 
-    # vLLM's sampler samples a row below this temperature greedily, and the
+    # The host sampler samples a row below this temperature greedily, and the
     # persistent batch keeps the raw value, so the walk is told the same.
     temperature = per_row(params.temperature, torch.float32)
     temperature = temperature.masked_fill(temperature < _SAMPLING_EPS, 0.0)
@@ -405,11 +407,8 @@ def apply_speculative_token_filters(
         logits.masked_fill_(filters.allowed_token_ids_mask.unsqueeze(1), float("-inf"))
 
     if filters.bad_words_token_ids:
-        # Deferred for the same import cycle as the top-k/top-p helper below.
-        # vLLM's own op, so a multi-token word matches exactly as it does in
-        # the ordinary sampler, which hands the same op a single column.
-        from vllm.v1.sample.ops.bad_words import apply_bad_words
-
+        # The ordinary sampler's op, so a multi-token word matches exactly as
+        # it does there, where the op gets a single column.
         if filters.output_token_ids is None:
             raise ValueError(
                 "accept_sampled_drafts filters.bad_words_token_ids needs "
@@ -445,12 +444,13 @@ def committed_logprobs(
     """Each committed token's logprob, rank and top ``num_logprobs``, at its column.
 
     Only the committed columns are read, so a rejected draft's column costs no
-    log-softmax. vLLM's ``Sampler`` does the arithmetic, which is what the
+    log-softmax. The host ``Sampler`` does the arithmetic, which is what the
     ordinary host sampler calls for one column.
     """
     # Deferred for the same import cycle as the top-k/top-p helper below.
     from vllm.v1.outputs import LogprobsTensors
-    from vllm.v1.sample.sampler import Sampler
+
+    from vllm_tt_plugin.sample.sampler import Sampler
 
     rows, width, _ = raw_logits.shape
     committed = _within_count(rows, width, accepted_counts)
@@ -473,13 +473,13 @@ def apply_speculative_penalties(
 
     Column ``j`` is scored after the row's committed output and its first
     ``min(j, num_valid_drafts)`` drafts, so the bonus column reads every valid
-    draft and a padding column reads no padding. vLLM's own penalty op does
-    the arithmetic, which keeps it identical to the ordinary sampler's.
+    draft and a padding column reads no padding. The ordinary sampler's
+    penalty op does the arithmetic, which keeps the two identical.
 
     Returns a new tensor; the caller's logits are not modified.
     """
     # Deferred for the same import cycle as the top-k/top-p helper below.
-    from vllm.v1.sample.ops.penalties import apply_all_penalties
+    from vllm_tt_plugin.sample.penalties import apply_all_penalties
 
     rows, width, vocab = target_logits.shape
     histories: list[list[int]] = []
@@ -832,7 +832,7 @@ def _race_argmax(weights: torch.Tensor, race: torch.Tensor) -> torch.Tensor:
     seeded request draws the same number of values however many positions it
     carries.
 
-    The weights are divided by the race, as vLLM's ``random_sample`` does, so a
+    The weights are divided by the race, as ``random_sample`` does, so a
     seeded row with no drafts draws exactly the token the ordinary sampler
     draws from the same distribution.
     """

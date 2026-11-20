@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 """The block tables handed to the model carry no stale columns.
 
-vLLM's ``BlockTable`` tracks only each row's live block count; condense and
+``BlockTable`` tracks only each row's live block count; condense and
 move leave earlier occupants' block ids past that prefix. A model that writes
 padded rows through those columns reaches another request's KV, so the plugin
 zeroes them (0 is the null block, never allocated).

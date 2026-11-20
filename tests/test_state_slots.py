@@ -256,7 +256,9 @@ def test_preemption_releases_its_state_slot():
     r.supports_stage_outputs = False
     r._decode_layout_changed_since_last_decode = False
     r.input_batch = SimpleNamespace(
-        req_id_to_index={"KEEP": 0}, refresh_logitsprocs=lambda: None
+        req_id_to_index={"KEEP": 0},
+        refresh_logitsprocs=lambda: None,
+        release_custom_logitsproc_slots=lambda scheduler_output: None,
     )
     r._release_dead_state_slots = lambda so: _release(
         r, finished=so.finished_req_ids, preempted=so.preempted_req_ids

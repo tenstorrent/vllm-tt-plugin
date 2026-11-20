@@ -252,7 +252,10 @@ def test_preempting_a_stage_request_fails_loudly():
         free_encoder_mm_hashes=[],
         preempted_req_ids={"a"},
     )
-    runner.input_batch = SimpleNamespace(remove_request=lambda req_id: None)
+    runner.input_batch = SimpleNamespace(
+        remove_request=lambda req_id: None,
+        release_custom_logitsproc_slots=lambda scheduler_output: None,
+    )
 
     with pytest.raises(RuntimeError, match="Request a was preempted"):
         TTModelRunner._update_states(runner, scheduler_output)

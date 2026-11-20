@@ -1119,10 +1119,7 @@ def _refuse_unimplemented_v2_features(vllm_config: "VllmConfig") -> None:
     ``_pin_v2_model_runner`` would let them through silently. Watermarking
     (``--watermark-config``) and HiSparse attention
     (``attention_config.hisparse_config``) select V2 whatever the pin says, and
-    ``TTModelRunner`` implements neither. Custom logits
-    processors are refused because vLLM's ``InputProcessor`` loads them with the
-    V2 interface under V2, while ``TTModelRunner`` builds them with the V1
-    ``build_logitsprocs``: neither interface would load in both places.
+    ``TTModelRunner`` implements neither.
     """
     model_config = vllm_config.model_config
     options = [
@@ -1134,7 +1131,6 @@ def _refuse_unimplemented_v2_features(vllm_config: "VllmConfig") -> None:
     ]
     if model_config is not None:
         options += [
-            ("--logits-processors", bool(model_config.logits_processors)),
             ("--enable-trace-replay", model_config.enable_trace_replay),
             ("--return-sampling-mask", model_config.return_sampling_mask),
         ]
@@ -2489,10 +2485,16 @@ class TTPlatform(Platform):
                     "Rust frontend bypasses the TT request validation; unset "
                     "VLLM_USE_RUST_FRONTEND"
                 )
-            if model_config.logits_processors:
+            from vllm_tt_plugin.sample.logits_processor.custom import (
+                custom_logitsproc_names,
+            )
+
+            if names := custom_logitsproc_names(model_config.logits_processors or ()):
                 raise ValueError(
-                    "Block-output models do not support --logits-processors "
-                    "because output is sampled inside the model"
+                    "Block-output models do not support custom logits "
+                    "processors because output is sampled inside the model; "
+                    "loaded from --logits-processors or installed "
+                    f"vllm.logits_processors entry points: {names}"
                 )
             if (
                 vllm_config.scheduler_config.async_scheduling

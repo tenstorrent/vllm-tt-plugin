@@ -7,7 +7,7 @@ candidate column against that column's own history, then temperature and
 top-k/top-p, then rejection sampling. These tests hold it to two
 references that do not share its code.
 
-vLLM's own ``Sampler``, for a row that carries no drafts. Such a row commits
+The host ``Sampler``, for a row that carries no drafts. Such a row commits
 exactly one token, the bonus, and it must be the token an ordinary sampled step
 draws: the same distribution, the same arithmetic, and the same consumption of
 the request's generator. A seeded request then reads the same.
@@ -26,11 +26,11 @@ from itertools import product
 
 import pytest
 import torch
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.penalties import apply_all_penalties
-from vllm.v1.sample.sampler import Sampler
 
+from vllm_tt_plugin.sample.logits_processor import LogitsProcessors
+from vllm_tt_plugin.sample.metadata import SamplingMetadata
+from vllm_tt_plugin.sample.penalties import apply_all_penalties
+from vllm_tt_plugin.sample.sampler import Sampler
 from vllm_tt_plugin.spec_accept import (
     SpecPenalties,
     SpecSamplingInputs,
@@ -68,7 +68,8 @@ def _ordinary_sample(
     frequency: torch.Tensor | None = None,
     repetition: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One ordinary sampled step through vLLM's ``Sampler``, as the runner builds it."""
+    """One ordinary sampled step through the host ``Sampler``, as the runner
+    builds it."""
     rows = int(logits.shape[0])
     no_penalties = presence is None
     zeros = torch.zeros(rows)

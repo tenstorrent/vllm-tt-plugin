@@ -851,7 +851,6 @@ def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
         bad_words_token_ids={}, has_active_logitsprocs=lambda: False
     )
     input_batch.max_num_logprobs = None
-    runner.model_config = SimpleNamespace(logits_processors=[])
     runner.check_perform_device_sampling = lambda **kwargs: True
     assert controller.steady_decode_scheduler_invariants_met(
         scheduler_output, decode_layout_changed=False
@@ -873,7 +872,6 @@ def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
         model=SimpleNamespace(decode_input_update_contract=1),
         input_batch=input_batch,
         requests={req_id: SimpleNamespace(sampling_params=None) for req_id in req_ids},
-        model_config=SimpleNamespace(logits_processors=[]),
         _decode_layout_changed_since_last_decode=False,
         check_perform_device_sampling=lambda **kwargs: True,
     )
