@@ -111,6 +111,7 @@ The diagram above shows the call order. The requirements are:
 | `warmup_model_decode(..., can_sample_device_grammar=True)` | Compile, and capture when tracing, the grammar-on sampling variant of every warmed sampling configuration except logprobs. |
 | `decode_forward(..., defer_device_sampling=True)` | See section 2a. |
 | `sample_deferred_decode(payload, sampling_params=..., grammar_bitmask=...)` | See section 2b. |
+| `read_decode_output(tokens, async_read=True)` | When async decode is enabled, start token readback and return host output handles plus read events, as for ordinary async decode. Without this hook, sampling must already return host torch tensors. |
 | `process_decode_output_host(tokens, is_tokens=True)` | Accept the device output of `sample_deferred_decode`, as for ordinary device sampling. |
 
 ### 2a. `decode_forward(..., defer_device_sampling=True)`

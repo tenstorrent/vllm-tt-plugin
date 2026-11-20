@@ -4,11 +4,13 @@
 
 import threading
 from collections import deque
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import CachedRequestData
 
 from vllm_tt_plugin.async_decode import (
@@ -618,7 +620,16 @@ def test_submit_decode_delivers_page_table_only_refresh():
     assert calls[1]["reset_sampling_state"] is False
 
 
-def test_v0_preserves_host_to_device_overlap_predicate():
+@pytest.mark.parametrize("deferred_grammar", [False, True])
+def test_v0_preserves_host_to_device_overlap_predicate(deferred_grammar):
+    """Check how legacy and version-1 models decide whether decode can overlap.
+
+    For a device-sampled step, compare a previous host-sampled step with a
+    previous device-sampled step, with and without deferred grammar sampling.
+    The legacy predicate keeps its existing result, while version 1 rejects
+    host-to-device transitions and a captured plan that requires input reload.
+    """
+    # region Prepare shared runner settings and a device-sampled decode input
     common_runner = dict(
         async_decode_scheduling=True,
         parallel_config=SimpleNamespace(data_parallel_size=1),
@@ -628,6 +639,7 @@ def test_v0_preserves_host_to_device_overlap_predicate():
         prompt_lens=None,
         perform_device_sampling=True,
         decode_layout_changed=False,
+        defer_device_sampling=deferred_grammar,
         spec_mode=None,
         grammar_bitmask=[None],
         prompt_tokens=None,
@@ -637,14 +649,20 @@ def test_v0_preserves_host_to_device_overlap_predicate():
         max_num_logprobs=[None],
         block_tables_per_group=[torch.zeros((1, 1), dtype=torch.int32)],
     )
+    # endregion
 
+    # region Check the legacy predicate after host sampling
     v0 = TTAsyncDecodeController(
         SimpleNamespace(model=SimpleNamespace(), **common_runner)
     )
     v0._decode_chain_valid = True
     v0._previous_device_sampling = False
-    assert v0.can_use_steady_decode_fast_path(model_input)
+    assert v0.can_use_steady_decode_fast_path(model_input), (
+        "Legacy overlap eligibility should retain its existing host-to-device behavior."
+    )
+    # endregion
 
+    # region Check version 1 rejects a host-to-device transition
     v1 = TTAsyncDecodeController(
         SimpleNamespace(
             model=SimpleNamespace(
@@ -656,7 +674,26 @@ def test_v0_preserves_host_to_device_overlap_predicate():
     )
     v1._decode_chain_valid = True
     v1._previous_device_sampling = False
-    assert not v1.can_use_steady_decode_fast_path(model_input)
+    assert not v1.can_use_steady_decode_fast_path(model_input), (
+        "Version 1 should reject overlap when the previous step sampled on the host."
+    )
+    # endregion
+
+    # region Check version 1 allows a device-to-device continuation
+    v1._previous_device_sampling = True
+    assert v1.can_use_steady_decode_fast_path(model_input), (
+        "Version 1 should allow overlap when both steps sample on device."
+    )
+    # endregion
+
+    # region Check the captured reload plan overrides apparently steady state
+    # Submission has already committed controller state when its sampling tail
+    # runs. Eligibility must still respect commands captured before that commit.
+    assert not v1.can_use_steady_decode_fast_path(
+        model_input,
+        reload_plan=TTDecodeReloadPlan(True, False, True, True),
+    ), "A captured plan requiring input reload should still prevent overlap."
+    # endregion
 
 
 def test_failed_deferred_readback_is_terminal():
@@ -857,7 +894,18 @@ def test_scheduler_context_phase_distinguishes_chunked_prefill_from_decode():
     )
 
 
-def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
+@pytest.mark.parametrize("structured_signal", ["none", "request", "pending"])
+def test_scheduler_prediction_rejects_every_front_packed_layout_transition(
+    structured_signal: str,
+) -> None:
+    """Check which scheduled batches may overlap an earlier token readback.
+
+    Start with two requests that keep their batch rows, using either plain
+    sampling or structured output, then change the batch or sampling needs.
+    Check that unchanged device-sampled decode can overlap, while layout
+    changes, prefill work and sampling that requires the host must wait.
+    """
+    # region Prepare two requests and a controller continuing device sampling
     req_ids = ["a", "b"]
     input_batch = SimpleNamespace(
         req_id_to_index={"a": 0, "b": 1},
@@ -869,17 +917,41 @@ def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
         max_num_logprobs=None,
     )
     runner = SimpleNamespace(
-        model=SimpleNamespace(decode_input_update_contract=1),
+        model=SimpleNamespace(
+            decode_input_update_contract=1,
+            model_capabilities={"supports_async_decode": True},
+        ),
         input_batch=input_batch,
-        requests={req_id: SimpleNamespace(sampling_params=None) for req_id in req_ids},
+        requests={
+            req_id: SimpleNamespace(
+                sampling_params=SamplingParams(
+                    structured_outputs=(
+                        StructuredOutputsParams(choice=["yes", "no"])
+                        if structured_signal != "none"
+                        else None
+                    )
+                )
+            )
+            for req_id in req_ids
+        },
         model_config=SimpleNamespace(logits_processors=[]),
         _decode_layout_changed_since_last_decode=False,
-        check_perform_device_sampling=lambda **kwargs: True,
+        sample_on_device_mode="decode_only",
+        seeded_sampling_policy="auto",
+        num_devices=1,
+        tt_data_parallel_size=1,
+        supports_device_grammar=True,
+        supports_topk_logprobs=False,
+    )
+    runner.check_perform_device_sampling = partial(
+        TTModelRunner.check_perform_device_sampling, runner
     )
     controller = TTAsyncDecodeController(runner)
     controller._decode_chain_valid = True
     controller._previous_device_sampling = True
+    # endregion
 
+    # region Define a helper to describe the next scheduled batch
     def output(ids, *, context=(), resumed=(), scheduled_counts=None):
         ids = list(ids)
         return SimpleNamespace(
@@ -888,24 +960,68 @@ def test_scheduler_prediction_rejects_every_front_packed_layout_transition():
             scheduled_cached_reqs=_cached_reqs(
                 ids, context_phase=context, resumed=resumed
             ),
-            pending_structured_output_tokens=False,
+            pending_structured_output_tokens=structured_signal == "pending",
         )
 
-    assert controller.steady_decode_scheduler_invariants_met(output(req_ids))
-    assert not controller.steady_decode_scheduler_invariants_met(output(["a"]))
+    # endregion
+
+    # region Check an unchanged batch can overlap
+    assert controller.steady_decode_scheduler_invariants_met(output(req_ids)), (
+        "The same two requests in the same rows should remain eligible for overlap."
+    )
+    # endregion
+
+    # region Check requests leaving, joining or resuming prevent overlap
+    assert not controller.steady_decode_scheduler_invariants_met(output(["a"])), (
+        "Removing a request should prevent overlap with the previous batch."
+    )
     assert not controller.steady_decode_scheduler_invariants_met(
         output(["a", "b", "c"])
-    )
+    ), "Adding a request should prevent overlap with the previous batch."
     assert not controller.steady_decode_scheduler_invariants_met(
         output(req_ids, resumed=["b"])
-    )
+    ), "Resuming a request should prevent overlap even if request IDs are unchanged."
+    # endregion
+
+    # region Distinguish prefill work from decode scheduling several tokens
     assert not controller.steady_decode_scheduler_invariants_met(
         output(req_ids, context=["b"])
-    )
-    # A speculative decode may schedule several tokens and remains decode work.
+    ), "A request in its prefill phase should prevent decode overlap."
     assert controller.steady_decode_scheduler_invariants_met(
         output(req_ids, scheduled_counts={"a": 1, "b": 4})
+    ), "Scheduling several decode tokens alone should not classify a step as prefill."
+    # endregion
+
+    # region Check structured output needs device grammar support to overlap
+    runner.supports_device_grammar = False
+    assert controller.steady_decode_scheduler_invariants_met(output(req_ids)) is (
+        structured_signal == "none"
+    ), (
+        "Without device grammar support, only plain sampling should remain "
+        "eligible for overlap."
     )
+    # endregion
+
+    # region Check even logprobs=0 prevents overlap
+    runner.supports_device_grammar = True
+    input_batch.max_num_logprobs = 0
+    assert not controller.steady_decode_scheduler_invariants_met(output(req_ids)), (
+        "Requesting logprobs=0 should still prevent overlap."
+    )
+    # endregion
+
+    # region Check a pending grammar flag without structured requests prevents overlap
+    input_batch.max_num_logprobs = None
+    if structured_signal != "none":
+        for req in runner.requests.values():
+            req.sampling_params = None
+        pending_only = output(req_ids)
+        pending_only.pending_structured_output_tokens = True
+        assert not controller.steady_decode_scheduler_invariants_met(pending_only), (
+            "A pending grammar flag without a scheduled structured request "
+            "should prevent overlap."
+        )
+    # endregion
 
 
 def test_contract_v1_receives_commands_without_legacy_reset():
