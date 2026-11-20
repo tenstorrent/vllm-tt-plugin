@@ -93,6 +93,20 @@ string per item, present even when the item's payload was stripped as
 prefix-cached. A model that keeps its own prefix records matches a cached
 item by it without the pixels (`None` when vLLM assigned none).
 
+An LLM-based speech model (an audio encoder whose output replaces audio
+placeholder tokens in the decoder prompt, such as Qwen3-ASR) uses the same
+path. The plugin makes no separate encoder call and keeps no encoder output:
+`prefill_forward` receives the processor's audio fields (for Qwen3-ASR,
+`input_audio_features`, `audio_feature_lengths` and `feature_attention_mask`,
+one entry per audio item), runs the encoder and places its output over each
+item's placeholders. The model's registered multimodal processor sets the
+placeholder count, which `mm_placeholder_lengths` reports per item; the
+encoder must emit exactly that many rows per item. Keeping the encoder output
+on the device between encoder and decoder is the model's choice; the plugin
+never reads it. A prefix-cached item arrives without its audio fields, so a
+model that does not keep its own encoder outputs must leave
+`supports_prefix_caching` false.
+
 When `model_config.uses_mrope` enables request-specific RoPE, `prefill_forward`
 returns `(output, rope_deltas)`, with one delta per request. On decode,
 `TTAsyncDecodeController` supplies `rope_deltas_all_users` after a layout
