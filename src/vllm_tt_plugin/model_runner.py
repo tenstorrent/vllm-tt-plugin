@@ -2875,8 +2875,12 @@ class TTModelRunner:
         # Update scheduler-owned state before accepting any older async result.
         # Reject late results for request IDs already reported finished. The
         # result that finished the request was accepted earlier. Ordinary
-        # preemption or resume keeps a completed token valid for replay. Only a
-        # forced prefix-cache reset marks an in-flight result for discard.
+        # preemption or resume keeps a completed token valid for replay. A
+        # forced prefix-cache reset marks an in-flight result for discard. A
+        # result submitted before its request was rebuilt from
+        # ``scheduled_new_reqs`` (``SubmittedStepContext.rebuilt_req_ids``)
+        # stays published but is not applied: the rebuilt record already holds
+        # the tokens vLLM accepted.
         self._update_states(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
@@ -4625,8 +4629,8 @@ class TTModelRunner:
         # coordinator's free list sends it. The live row is still the right
         # target, because ``InputBatch.add_request`` re-derives ``num_tokens``
         # from the request state when it places the request. ``skip_req_ids``
-        # (finished requests and forced-reset frames) is checked before any
-        # row is resolved.
+        # (finished requests, forced-reset frames, and requests rebuilt since
+        # the step was submitted) is checked before any row is resolved.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         num_out_tokens = self._tt_committed_width(sampled_token_ids)
