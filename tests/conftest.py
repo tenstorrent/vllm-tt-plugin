@@ -25,8 +25,10 @@ def reset_tt_platform_class_state():
     # finished resolving its platform plugins, and that import is circular.
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
+    import vllm.v1.engine.core_client as core_client
     import vllm.v1.engine.input_processor as input_processor
     from vllm.entrypoints.launchers.utils import server_utils
+    from vllm.v1.structured_output import backend_xgrammar
 
     from vllm_tt_plugin.platform import TTPlatform
 
@@ -42,6 +44,10 @@ def reset_tt_platform_class_state():
     saved = {
         name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
     }
+    saved_xgrammar_post_init = backend_xgrammar.XgrammarBackend.__post_init__
+    saved_original_xgrammar_post_init = backend_xgrammar.__dict__.get(
+        "_tt_original_xgrammar_post_init", unset
+    )
     saved_process_inputs = input_processor.InputProcessor.process_inputs
     saved_original_process_inputs = input_processor.__dict__.get(
         "_tt_original_process_inputs", unset
@@ -61,8 +67,34 @@ def reset_tt_platform_class_state():
     saved_original_pause_scheduler = engine_core.__dict__.get(
         "_tt_original_pause_scheduler", unset
     )
+    # The DP routing patch wraps one method the load-balancing client defines
+    # and one it inherits, so each is restored to its own class dict state.
+    dp_client = core_client.DPLBAsyncMPClient
+    saved_dp_client_methods = {
+        name: dp_client.__dict__.get(name, unset)
+        for name in ("get_core_engine_for_request", "reset_prefix_cache_async")
+    }
+    saved_dp_client_markers = {
+        name: core_client.__dict__.get(name, unset)
+        for name in (
+            "_tt_original_get_core_engine_for_request",
+            "_tt_original_dp_reset_prefix_cache_async",
+        )
+    }
 
     yield
+
+    for name, value in saved_dp_client_methods.items():
+        if value is unset:
+            if name in dp_client.__dict__:
+                delattr(dp_client, name)
+        else:
+            setattr(dp_client, name, value)
+    for name, value in saved_dp_client_markers.items():
+        if value is unset:
+            core_client.__dict__.pop(name, None)
+        else:
+            setattr(core_client, name, value)
 
     server_utils.lifespan = saved_lifespan
     for name in ("vllm.entrypoints.launchers.app",):
@@ -92,6 +124,14 @@ def reset_tt_platform_class_state():
     else:
         async_llm._tt_original_add_streaming_input_request = (
             saved_original_add_streaming_input_request
+        )
+
+    backend_xgrammar.XgrammarBackend.__post_init__ = saved_xgrammar_post_init
+    if saved_original_xgrammar_post_init is unset:
+        backend_xgrammar.__dict__.pop("_tt_original_xgrammar_post_init", None)
+    else:
+        backend_xgrammar._tt_original_xgrammar_post_init = (
+            saved_original_xgrammar_post_init
         )
 
     input_processor.InputProcessor.process_inputs = saved_process_inputs

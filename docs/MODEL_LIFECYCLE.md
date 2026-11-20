@@ -49,8 +49,8 @@ serve different purposes; the adapter must honor both.
 |---|---|
 | `prefill_forward(empty_slots=[...])` | Write each prefill row's state into the corresponding destination slot; preserve live state in other slots. Stateless adapters can ignore `empty_slots`. |
 | `decode_forward(slot_remap=...)` | Gather old state so destination slot `i` reads old slot `slot_remap[i]` before decode uses that state. `None` means identity. Apply the whole permutation without overwriting state still needed by another destination. |
-| `note_state_slots_moved(moves)` | Optional front-packed execution callback receiving `{old_slot: new_slot}` after the plugin commits a movement. Update adapter-owned session identities; do not repeat a device gather already performed by `decode_forward`. |
-| `release_request(slot)` | Optional front-packed execution callback that releases the state of the request currently owning `slot`. The plugin passes the current slot, not necessarily the original prefill slot. |
+| `note_state_slots_moved(moves)` | Optional front-packed execution callback receiving `{old_slot: new_slot}` after the plugin commits a movement. Update adapter-owned session identities; do not repeat a device gather already performed by `decode_forward`. Lane-DP never moves a slot, so it never calls this. |
+| `release_request(slot)` | Optional callback that releases the state of the request currently owning `slot`. The plugin passes the current slot: in front-packed execution not necessarily the original prefill slot, in lane-DP the request's stable row. |
 
 `TTModelRunner._decode_state_slot_remap` covers the full state-slot capacity,
 which can exceed a bucketed decode's token row count. The adapter must preserve
@@ -65,10 +65,16 @@ A request omitted from a prefill-only step can still own live decode state;
 absence from one submitted batch does not authorize the adapter to release
 that request's state.
 
-Lane-DP uses scheduler-owned stable slots. `TTLaneInputBatch.apply_step_plan`
-removes finished and preempted requests without calling `release_request`;
-the lane path also does not issue `note_state_slots_moved` callbacks. A model
-adapter that requires those callbacks cannot assume lane-DP supplies them.
+Lane-DP uses scheduler-owned stable slots, and a request's row is its slot
+for its whole life. `TTLaneInputBatch.apply_step_plan` calls `release_request`
+with that row for every request whose row the step frees -- a finished
+request, a preempted one, and a resumed one that still held a row -- while
+the request still holds it, before the row can be reused. A request that
+holds no row when it finishes (aborted while queued, or preempted and aborted
+before its resume) releases nothing; a preempted request that holds no row is
+a bookkeeping fault and raises. Lane-DP never moves a slot (`condense` is a
+no-op and `slot_remap` the identity), so it never issues
+`note_state_slots_moved`.
 
 Block-output models must implement callable `release_request` and
 `release_persistent_capture`. Adaptive block-output models with

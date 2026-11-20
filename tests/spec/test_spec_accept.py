@@ -25,7 +25,6 @@ import torch
 
 from vllm_tt_plugin.spec_accept import (
     AcceptResult,
-    _sample_per_row,
     accept_speculated_tokens,
 )
 from vllm_tt_plugin.spec_decode import PLACEHOLDER_TOKEN_ID
@@ -161,6 +160,37 @@ def test_a_mixed_batch_walks_each_row_by_its_own_temperature():
 
     assert result.accepted_counts.tolist() == [3, 3]
     assert result.committed_token_ids.tolist() == [[1, 2, 7], [1, 2, 7]]
+
+
+def test_a_mixed_batch_walks_only_its_random_rows_on_the_random_path():
+    """A greedy row takes no part in the random path's draws.
+
+    The random path's softmax, top-k/top-p pass and full-vocabulary races are
+    the costly part of the walk, and a greedy row reads none of them. With the
+    only random row seeded, a draw made for the greedy row could come only from
+    the global stream. The random row still walks with its own generator, so
+    it commits what it commits when walked alone.
+    """
+    logits = torch.randn(2, 3, VOCAB)
+    drafts = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    before = torch.get_rng_state()
+    mixed = accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=drafts,
+        num_valid_drafts=torch.tensor([2, 2], dtype=torch.int32),
+        temperature=torch.tensor([0.0, 1.0]),
+        generators={1: torch.Generator().manual_seed(5)},
+    )
+    assert torch.equal(torch.get_rng_state(), before)
+
+    alone = accept_speculated_tokens(
+        target_logits=logits[1:],
+        draft_token_ids=drafts[1:],
+        num_valid_drafts=torch.tensor([2], dtype=torch.int32),
+        temperature=torch.tensor([1.0]),
+        generators={0: torch.Generator().manual_seed(5)},
+    )
+    assert torch.equal(mixed.committed_token_ids[1], alone.committed_token_ids[0])
 
 
 @pytest.mark.parametrize("temperature_of", [_greedy, _random])
@@ -423,7 +453,7 @@ def test_a_draftless_seeded_row_consumes_only_its_bonus_draw():
 
     Deliberately white box: a generator-consumption contract is only visible in
     the generator's state, so the test compares that state against the one
-    draw the row is permitted, using the same helper the walk draws with.
+    draw the row is permitted: one full-vocabulary exponential race.
     """
     target = torch.tensor([0.30, 0.25, 0.20, 0.15, 0.06, 0.03, 0.01, 0.00])
     logits = target.log().view(1, 1, VOCAB).expand(1, 4, VOCAB).contiguous()
@@ -438,7 +468,7 @@ def test_a_draftless_seeded_row_consumes_only_its_bonus_draw():
     )
 
     bonus_only = torch.Generator().manual_seed(99)
-    _sample_per_row(target.view(1, 1, VOCAB), {0: bonus_only}, 1, VOCAB)
+    torch.empty(VOCAB).exponential_(generator=bonus_only)
 
     assert torch.equal(walked.get_state(), bonus_only.get_state()), (
         "a draftless row advanced its generator past its bonus draw, so every "
@@ -468,17 +498,67 @@ def test_a_seeded_row_is_reproducible():
     assert torch.equal(first.accepted_counts, second.accepted_counts)
 
 
+def test_an_unseeded_walk_repeats_under_the_same_global_seed():
+    """Unseeded rows draw concurrently and still repeat under ``manual_seed``.
+
+    Each row draws on a worker thread from a private generator, seeded from
+    the global stream on the calling thread, so the draws' interleaving across
+    threads cannot change what any row reads.
+    """
+    logits = torch.randn(4, 3, VOCAB)
+    drafts = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 0]], dtype=torch.int32)
+
+    def run() -> AcceptResult:
+        torch.manual_seed(2024)
+        return accept_speculated_tokens(
+            target_logits=logits,
+            draft_token_ids=drafts,
+            num_valid_drafts=torch.tensor([2, 2, 1, 0], dtype=torch.int32),
+            temperature=torch.ones(4),
+        )
+
+    first, second = run(), run()
+    assert torch.equal(first.committed_token_ids, second.committed_token_ids)
+    assert torch.equal(first.accepted_counts, second.accepted_counts)
+
+
+def test_seeded_rows_do_not_draw_from_the_global_stream():
+    """A walk whose rows all carry a seed and drafts leaves the global stream alone.
+
+    A seeded row's values come from its own generator. Filling that row from
+    the global stream first and then overwriting it costs a full-vocabulary
+    draw per row, the largest cost of the walk, and moves the global stream
+    for values nothing reads.
+    """
+    logits = torch.randn(3, 4, VOCAB)
+    before = torch.get_rng_state()
+    accept_speculated_tokens(
+        target_logits=logits,
+        draft_token_ids=torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 0, 1]], dtype=torch.int32
+        ),
+        num_valid_drafts=torch.tensor([3, 2, 1], dtype=torch.int32),
+        temperature=torch.ones(3),
+        generators={row: torch.Generator().manual_seed(row) for row in range(3)},
+    )
+
+    assert torch.equal(torch.get_rng_state(), before)
+
+
 # endregion The distribution
 
 # region Sampling constraints
 
 
-def test_top_k_of_one_makes_a_random_row_behave_greedily():
+@pytest.mark.parametrize("top_p", [None, 0.0], ids=["top-k only", "top-p of 0"])
+def test_top_k_of_one_makes_a_random_row_behave_greedily(top_p: float | None):
     """The constraints apply before the accept test, not after it.
 
     The distribution acceptance must preserve is the one the operator asked
     for. With top-k of 1 the target is a point mass at its argmax, so a random
-    row commits exactly what a greedy row would.
+    row commits exactly what a greedy row would. The input batch pairs a top-k
+    of 1 with a top-p of 0, whose top-p cut keeps no token before the unsorted
+    cut's floor of one.
     """
     logits = torch.randn(4, 3, VOCAB)
     drafts = torch.tensor([[1, 2]] * 4, dtype=torch.int32)
@@ -496,6 +576,7 @@ def test_top_k_of_one_makes_a_random_row_behave_greedily():
         num_valid_drafts=num_valid,
         temperature=torch.ones(4),
         top_k=torch.ones(4, dtype=torch.int32),
+        top_p=None if top_p is None else torch.full((4,), top_p),
     )
 
     assert torch.equal(greedy.accepted_counts, constrained.accepted_counts)
@@ -549,6 +630,105 @@ def test_top_k_and_top_p_together_constrain_the_committed_distribution():
 
     committed = set(result.committed_token_ids[:, 0].tolist())
     assert committed <= {0, 1}, f"committed outside the top 2: {sorted(committed)}"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "random k and p",
+        "top-p of 1 on some rows",
+        "top-k of 1 with top-p of 0 on some rows",
+        "seeded rows among unseeded rows",
+        "rows without top-k",
+    ],
+)
+def test_the_unsorted_top_k_top_p_cut_matches_the_sorted_one(case: str):
+    """Without ties, the cut from the k largest logits equals vLLM's sorted cut.
+
+    An unseeded row with a top-k takes the unsorted path, which skips sorting
+    the whole vocabulary of every candidate column. The two cuts can differ
+    only where logits tie at the cut or a cumulative sum lands within rounding
+    of ``1 - p``; random float32 logits have no ties, and with this seed no
+    sum lands that close.
+
+    The cases mix rows that each lean on one part of the unsorted cut or of
+    the per-row split. A top-p of 1 keeps the zero-probability tail of a row
+    whose k is below the largest k it is cut with, which only the floor at
+    the k-th logit removes; those rows' logits are also spread so far that
+    their smallest top-k probabilities lie below float32 rounding of 1, where
+    a descending sum reaches 1 before them but vLLM still keeps them. A top-k
+    of 1, which the input batch pairs with a top-p of 0, keeps no token before
+    the floor of one. Seeded rows, and rows whose top-k is the vocabulary
+    size, take the sort while their neighbours do not, so their results are
+    written back into a shared batch.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    from vllm_tt_plugin.spec_accept import _constrained_probs
+
+    generator = torch.Generator().manual_seed(3)
+    rows, width, vocab = 64, 4, 2048
+    logits = torch.randn(rows, width, vocab, generator=generator) * 3.0
+    temperature = torch.full((rows,), 0.7)
+    k = torch.randint(1, 64, (rows,), dtype=torch.int32, generator=generator)
+    p = torch.rand(rows, generator=generator) * 0.9 + 0.1
+    seeded_rows: frozenset[int] = frozenset()
+    if case == "top-p of 1 on some rows":
+        p[::3] = 1.0
+        logits[::3] *= 4.0
+    elif case == "top-k of 1 with top-p of 0 on some rows":
+        k[::3] = 1
+        p[::3] = 0.0
+    elif case == "seeded rows among unseeded rows":
+        seeded_rows = frozenset(range(0, rows, 2))
+    elif case == "rows without top-k":
+        k[::4] = vocab
+
+    sorted_cut = apply_top_k_top_p_pytorch(
+        (logits / temperature.view(rows, 1, 1)).reshape(rows * width, vocab),
+        k.repeat_interleave(width),
+        p.repeat_interleave(width),
+    )
+    probs = _constrained_probs(logits, temperature, k, p, seeded_rows=seeded_rows)
+
+    assert torch.equal(probs, sorted_cut.softmax(dim=-1).reshape(rows, width, vocab))
+
+
+@pytest.mark.parametrize("vocab", [8, 2048])
+def test_a_row_that_needs_the_sort_does_not_send_its_neighbours_to_it(
+    monkeypatch, vocab: int
+):
+    """Only seeded rows and rows without a top-k sort.
+
+    The input batch stores a row without a top-k as the vocabulary size, and a
+    seeded row keeps the ordinary sampler's sort. A vocabulary below the
+    unsorted limit must still send a row without a top-k to the sort. An
+    unseeded row with a small top-k next to either still takes the unsorted
+    cut, so the sort receives only the columns of the rows that need it.
+    """
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    from vllm_tt_plugin.spec_accept import _constrained_probs
+
+    sort = topk_topp_sampler.apply_top_k_top_p_pytorch
+    sorted_columns = []
+
+    def recording_sort(logits, *args, **kwargs):
+        sorted_columns.append(logits.shape[0])
+        return sort(logits, *args, **kwargs)
+
+    monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_pytorch", recording_sort)
+    rows, width = 4, 3
+
+    _constrained_probs(
+        torch.randn(rows, width, vocab),
+        torch.ones(rows),
+        top_k=torch.tensor([2, vocab, 2, 2], dtype=torch.int32),
+        top_p=torch.full((rows,), 0.9),
+        seeded_rows=frozenset({2}),
+    )
+
+    assert sorted_columns == [2 * width]
 
 
 def test_the_caller_s_logits_are_not_modified():

@@ -60,12 +60,38 @@ hook. `TTModelRunner` suppresses output for intermediate prefill chunks and
 selects host sampling when a submitted prefill contains intermediate chunks,
 so intermediate chunks must not advance a device sampler.
 
-### Image inputs and request-specific RoPE
+### Multimodal inputs and request-specific RoPE
 
-For multimodal prefill, `_gather_multi_modal_inputs` adds `pixel_values` and
-`image_grid_thw`. Each value is a list in submitted request order. A text-only
-request has `None`; an image request has a list per image, with `None` for
-missing payloads. The plugin currently accepts image features only.
+For multimodal prefill, `_gather_multi_modal_inputs` forwards every field the
+model's multimodal processor put on an item under its own name: `pixel_values`
+and `image_grid_thw` are always present (as `None` entries when a processor
+does not emit them), and any further field is forwarded without the runner
+knowing the model's contract (for example `pixel_position_ids`,
+`pixel_values_videos` / `pixel_position_ids_videos` for video and
+`input_features` / `input_features_mask` for audio). Image, video and audio
+items are accepted; any other item kind raises `NotImplementedError`.
+
+The return value is a dict keyed by field name. Each value is a list in
+submitted request order (the persistent batch order the model input tensors
+use). A text-only request has `None`; a request with items has a list in
+that request's multimodal-item order, one entry per item. An item whose
+payload is absent (a prefix-cached item arrives with its tensors stripped) or
+that lacks the field contributes `None` for that field.
+
+Two integer metadata fields are appended after the processor fields, so
+positional readers of the processor fields are unchanged:
+`mm_placeholder_offsets` and `mm_placeholder_lengths`. Both are in absolute
+prompt-token coordinates: the offset is the index of the item's first
+placeholder token in the request's prompt and the length is its placeholder
+count, so a model that prefills in chunks can tell which items the current
+chunk covers (an item whose placeholders lie past the chunk end has no slots
+yet). They are `None` when the item carries no placeholder position.
+
+A third field, `mm_identifiers`, is appended after the two placeholder fields:
+vLLM's content identifier of the item (the key its block hashes carry), one
+string per item, present even when the item's payload was stripped as
+prefix-cached. A model that keeps its own prefix records matches a cached
+item by it without the pixels (`None` when vLLM assigned none).
 
 When `model_config.uses_mrope` enables request-specific RoPE, `prefill_forward`
 returns `(output, rope_deltas)`, with one delta per request. On decode,
@@ -83,7 +109,7 @@ request-specific RoPE.
 | `start_pos` | CPU integer tensor `[B]` of absolute positions; inactive rows contain `-1`. |
 | `page_table`, `kv_cache` | Block addresses and adapter-owned KV storage. |
 | `enable_trace` | True for `tt.trace_mode="all"` or `"decode_only"`. |
-| `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling or selective readback. The adapter must support the readback mode its execution path requests. |
+| `read_from_device` | `False` for front-packed and asynchronous decode. Synchronous lane-DP requests `True`, except for deferred grammar sampling, selective readback, or a speculative verify, which is submitted as a front-packed verify is. The adapter must support the readback mode its execution path requests. |
 | `page_tables_per_layer` | Supplied for multiple KV groups. |
 | `slot_remap` | When present, destination slot `i` reads previous slot `slot_remap[i]`. Supplied for both host and device sampling. See [state ownership](MODEL_LIFECYCLE.md#request-state). |
 | `sampling_params` | Supplied for immediate device sampling; absent for host sampling and deferred grammar sampling. |
@@ -125,7 +151,12 @@ A model that declares `supports_stage_outputs` implements
 
 A stage model's request cannot be preempted and resumed: a resume re-prefills
 from the token history, which does not hold the stage frames already emitted.
-The platform therefore requires `max_num_seqs=1`, refuses a forced
+The scheduler therefore refuses to start unless the KV pool holds
+`max_num_seqs` requests at their peak, so no step runs short of blocks and
+preempts one. The pool comes from the model's `get_max_tokens_all_users`
+(see [KV budget and specifications](MODEL_SETUP.md#kv-budget-and-specifications)).
+For a model with only full-attention layers, returning at least
+`max_model_len * max_num_seqs` meets the rule. The platform refuses a forced
 prefix-cache reset while such a request runs (or aborts it first when the
 engine can tell its client), and `TTModelRunner` raises if a preemption
 reaches it anyway.
@@ -138,7 +169,9 @@ reaches it anyway.
    `read_decode_output(output, async_read=True)` when the adapter exposes
    `read_decode_output`. The adapter returns `(output_handles, read_events)`.
    Without `read_decode_output`, `decode_forward` must already return host
-   torch output. Keep asynchronous output buffers valid until consumption.
+   torch output: a tensor, or a tuple whose elements are host tensors, `None`,
+   or such tuples (the device logprob payloads below nest one). Keep
+   asynchronous output buffers valid until consumption.
 3. `TTAsyncDecodeController.finalize_decode` synchronizes each TTNN read event.
    For output that is not already host torch output, the controller calls
    `process_decode_output_host(output_handles, is_tokens=perform_device_sampling)`.
@@ -156,7 +189,13 @@ only position `S - 1`. Lane-DP host extraction also accepts `[B, V]` logits.
 For device logprobs, the adapter returns `(token_ids, logprobs)` through the
 same prefill or decode output boundary. `build_device_logprobs` accepts sampled
 logprobs or `(topk_logprobs, topk_indices)` according to the selected model's
-support. Exact payload handling is in
+support. It reports each sampled token's rank as vLLM defines it: the number
+of vocabulary scores at or above the sampled one, ties included. From a sorted
+top-K set the plugin counts it, exactly unless the sampled score ties the lowest
+returned score. A single sampled logprob cannot be ranked, so an adapter that
+can rank on device returns an object with `sampled_logprobs` and
+`selected_token_ranks` attributes, such as a named tuple, instead of the bare
+logprob tensor; a bare tensor reports rank `-1`. Exact payload handling is in
 [logprobs.py](../src/vllm_tt_plugin/logprobs.py).
 
 The optional `supports_compact_host_logits` and
@@ -197,9 +236,12 @@ Each bit in `grammar_bitmask` names one vocabulary token; a one bit permits
 that token. The model adapter must apply the submitted row order.
 
 Structured prefill uses host sampling. Deferred grammar sampling requires
-synchronous scheduling and effective runtime support. A missing mask or a
+effective runtime support. A missing mask or a
 failure after deferred submission invalidates the runner's grammar path;
 the plugin raises instead of resampling an already advanced step on the host.
+Under async scheduling, a request that finished while the step was in flight
+has no mask row and samples unrestricted; when no structured request is left,
+`grammar_bitmask` is `None`.
 
 Sources: `submit_prefill`, `check_perform_device_sampling`, and
 `_get_output_tokens` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
@@ -304,7 +346,11 @@ class MyLaneModel:
         return concat(outs)  # [L * per_lane, 1, V] in slot order
 ```
 
-Lane-DP rejects request-specific RoPE and speculative decode. Lane-DP output
+Lane-DP rejects request-specific RoPE. A speculating lane launch submits a
+verify as this same slot batch widened to `[L * per_lane, 1+K]`, with the
+scheduled slots live and every other slot, an occupied one the step did not
+schedule included, a padding row with `start_pos=-1`; see the
+[speculative contract](SPEC_DECODE_CONTRACT.md). Lane-DP output
 handling is in
 [Decode readback and output conversion](#decode-readback-and-output-conversion).
 

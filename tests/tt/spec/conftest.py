@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +126,15 @@ def pytest_addoption(parser):
         ),
     )
     group.addoption(
+        "--tt-spec-accept-modes",
+        default="argmax_ids",
+        help=(
+            "The launched TT_SPEC_ACCEPT_MODES, comma-separated: what the "
+            "dummy's verify can return. The sampled tests skip unless it "
+            "includes 'logits'."
+        ),
+    )
+    group.addoption(
         "--tt-metal-home",
         default=None,
         help="tt-metal checkout whose commit and dirty diff go in the manifest.",
@@ -141,6 +150,7 @@ class SpecConfig:
     target: str
     drafter: str
     draft_policy: str = "always"
+    accept_modes: tuple[str, ...] = ("argmax_ids",)
 
     @property
     def speculating(self) -> bool:
@@ -172,6 +182,7 @@ class SpecConfig:
             "target": self.target,
             "drafter": self.drafter,
             "draft_policy": self.draft_policy,
+            "accept_modes": list(self.accept_modes),
         }
 
 
@@ -185,6 +196,13 @@ def spec_config(request) -> SpecConfig:
         target=str(request.config.getoption("--tt-spec-target")),
         drafter=str(request.config.getoption("--tt-spec-drafter")),
         draft_policy=str(request.config.getoption("--tt-spec-draft-policy")),
+        accept_modes=tuple(
+            mode.strip()
+            for mode in str(request.config.getoption("--tt-spec-accept-modes")).split(
+                ","
+            )
+            if mode.strip()
+        ),
     )
 
 
@@ -237,7 +255,7 @@ class RunManifest:
         self.records.append(
             {
                 "test": name,
-                "at": datetime.now(timezone.utc).isoformat(),
+                "at": datetime.now(UTC).isoformat(),
                 **payload,
             }
         )
@@ -247,7 +265,7 @@ class RunManifest:
         if metrics is not None:
             (self.directory / "metrics-final.txt").write_text(metrics.raw)
         manifest = {
-            "written_at": datetime.now(timezone.utc).isoformat(),
+            "written_at": datetime.now(UTC).isoformat(),
             "declared_config": self.config,
             "launch_args": self.launch_args,
             "environment": self.environment,
@@ -328,6 +346,8 @@ def run_manifest(request, spec_config, tt_server_url, tt_model_name):
             for name in (
                 "TT_SPEC_ACCEPT_DEPTH",
                 "TT_SPEC_TARGET",
+                "TT_SPEC_ACCEPT_MODES",
+                "TT_SPEC_DRAFT_POLICY",
                 "MESH_DEVICE",
                 "PYTHONPATH",
             )

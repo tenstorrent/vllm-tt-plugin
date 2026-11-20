@@ -14,8 +14,9 @@ on:
       python-versions:
         description: "JSON list of interpreters"
         type: string
-        # The interpreters of tt-metal's Ubuntu 22.04 and 24.04 environments.
-        default: '["3.10", "3.12"]'
+        # The interpreter of tt-metal's Ubuntu 24.04 environment. vLLM no longer
+        # supports 3.10, the interpreter of the 22.04 environment.
+        default: '["3.12"]'
       report:
         description: "Upload results as an artifact instead of failing on install or test errors"
         type: boolean

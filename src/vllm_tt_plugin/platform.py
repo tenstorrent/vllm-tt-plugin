@@ -48,6 +48,7 @@ from vllm_tt_plugin.spec_admission import (
     MODEL_OWNED_DRAFT_METHOD,
     resolve_speculative_plan,
 )
+from vllm_tt_plugin.spec_decode import ACCEPT_MODE_LOGITS
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -520,7 +521,35 @@ def _model_folds_dp_into_lanes(model_class) -> bool:
     """
     if _galaxy_generator_version() is not None:
         return True
+    # A model class declares the fold itself through
+    # ``model_capabilities["folds_dp_into_lanes"]`` (e.g. gemma4's Galaxy
+    # one-instance lanes), so an env-gated rail opts in without a plugin
+    # change per model.
+    if _model_capability_flag(model_class, "folds_dp_into_lanes"):
+        return True
     return getattr(model_class, "__name__", None) == _GPT_OSS_ARCH
+
+
+def _model_capability_flag(model_class, key: str) -> bool:
+    """A Boolean ``model_capabilities`` entry, or a zero-argument callable one.
+
+    The lane declarations may depend on the serving environment (an env-gated
+    rail), so a model may declare them as callables that the platform evaluates
+    at config time. A declaration that raises fails the launch: silently falling
+    back to standard DP would run the model in the wrong execution mode.
+    """
+    capabilities = getattr(model_class, "model_capabilities", None) or {}
+    value = capabilities.get(key, False)
+    if callable(value):
+        try:
+            value = value()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{getattr(model_class, '__name__', model_class)}."
+                f"model_capabilities[{key!r}] raised while resolving the lane "
+                f"declaration: {exc}"
+            ) from exc
+    return bool(value)
 
 
 def _collapse_parallel_config_to_single_process(parallel_config) -> None:
@@ -838,6 +867,59 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+# What upstream's xgrammar backend passes for ``disable_any_whitespace``, and
+# what TT passes instead.
+_XGRAMMAR_COMPACT_JSON_SEPARATORS = (",", ":")
+_XGRAMMAR_SPACED_JSON_SEPARATORS = (", ", ": ")
+
+
+class _TTSpacedJsonSeparatorsCompiler:
+    """Forward to an ``xgrammar.GrammarCompiler``, with spaced JSON separators."""
+
+    def __init__(self, compiler: Any) -> None:
+        self._compiler = compiler
+
+    def compile_json_schema(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("separators") == _XGRAMMAR_COMPACT_JSON_SEPARATORS:
+            kwargs["separators"] = _XGRAMMAR_SPACED_JSON_SEPARATORS
+        return self._compiler.compile_json_schema(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._compiler, name)
+
+
+def _install_tt_xgrammar_json_separators_patch() -> None:
+    """Allow one space after ``,`` and ``:`` in TT's whitespace-free JSON.
+
+    TT sets ``disable_any_whitespace`` (``_apply_check_and_update_config``).
+    The xgrammar backend turns it into ``separators=(",", ":")``, a grammar that
+    forbids the ``": "`` and ``", "`` that models emit between JSON fields.
+    Under that grammar Llama-3.1-8B and Qwen2.5-VL on TT fill string fields
+    with filler such as ``", "``. ``(", ", ": ")`` is xgrammar's own default for
+    ``any_whitespace=False``: still no free whitespace, so the whitespace loop
+    that flag prevents stays impossible.
+
+    EngineCore builds the backend on its first structured request. With vLLM's
+    default ``fork`` start method, EngineCore inherits this patch from the
+    process that ran the config hook. ``__post_init__`` is the hook because it
+    creates the compiler that every JSON request of the backend compiles through.
+    """
+    from vllm.v1.structured_output import backend_xgrammar
+
+    if hasattr(backend_xgrammar, "_tt_original_xgrammar_post_init"):
+        return
+
+    original = backend_xgrammar.XgrammarBackend.__post_init__
+    backend_xgrammar._tt_original_xgrammar_post_init = original
+
+    def xgrammar_post_init_tt(self) -> None:
+        original(self)
+        if self.disable_any_whitespace:
+            self.compiler = _TTSpacedJsonSeparatorsCompiler(self.compiler)
+
+    backend_xgrammar.XgrammarBackend.__post_init__ = xgrammar_post_init_tt
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 
@@ -1091,6 +1173,45 @@ def _install_tt_input_processor_patch() -> None:
     input_processor.InputProcessor.process_inputs = process_inputs_tt
 
 
+def _install_tt_dp_prefix_cache_routing_patch() -> None:
+    """Route a standard-DP request to the engine holding its cached prefix.
+
+    vLLM's DP load balancer, ``DPLBAsyncMPClient.get_core_engine_for_request``,
+    picks the least-loaded engine and honors a ``data_parallel_rank`` the
+    request already carries. It runs in the API server, which reads no
+    engine's prefix cache, so ``vllm_tt_plugin.prefix_routing`` keeps a record
+    of which engine each prompt block was sent to and pins the request through
+    that field. A prefix-cache reset clears the record. Only the load-balancing
+    client is patched: the other clients serve one engine and route nothing.
+    The record is per client, so a launch with several API servers routes on
+    each server's own dispatches.
+
+    TODO: remove once vLLM exposes a routing hook for DP engines.
+    """
+    import vllm.v1.engine.core_client as core_client
+
+    from vllm_tt_plugin.prefix_routing import forget_dp_prefix_mirror, route_dp_request
+
+    if hasattr(core_client, "_tt_original_get_core_engine_for_request"):
+        return
+
+    client_cls = core_client.DPLBAsyncMPClient
+    original = client_cls.get_core_engine_for_request
+    core_client._tt_original_get_core_engine_for_request = original
+    original_reset = client_cls.reset_prefix_cache_async
+    core_client._tt_original_dp_reset_prefix_cache_async = original_reset
+
+    def get_core_engine_for_request_tt(self, request):
+        return route_dp_request(self, request, original)
+
+    async def reset_prefix_cache_async_tt(self, *args, **kwargs):
+        forget_dp_prefix_mirror(self)
+        return await original_reset(self, *args, **kwargs)
+
+    client_cls.get_core_engine_for_request = get_core_engine_for_request_tt
+    client_cls.reset_prefix_cache_async = reset_prefix_cache_async_tt
+
+
 def _install_block_output_streaming_input_patch() -> None:
     """Reject streaming-input sessions before vLLM creates a final request."""
     import vllm.v1.engine.async_llm as async_llm
@@ -1126,7 +1247,7 @@ def _install_block_output_reset_abort_patch() -> None:
     fall through to the scheduler guard's raise instead.
     ``pause_generation(mode="keep")`` reaches the same method from its deferred
     idle callback while intentionally retaining live requests; that path is
-    left to the scheduler guard, which refuses the reset without raising.
+    left to the scheduler guard, which refuses the reset by returning False.
     """
     import vllm.v1.engine.core as engine_core
     from vllm.v1.core.sched.interface import PauseState
@@ -1177,11 +1298,11 @@ def _install_block_output_pause_guard_patch() -> None:
     block requests.
 
     The keep-mode cache reset runs from the engine's deferred idle callback,
-    whose result upstream discards: ``EngineCore._reset_caches`` ignores the
-    scheduler's ``False`` and the pause Future resolves regardless, so the
-    caller would be told the pause succeeded with a cleared cache while the
-    retained canvases kept their state. Refusing here, before any pause state
-    changes, surfaces the conflict synchronously — the raise is caught by
+    after the scheduler is already paused. ``EngineCore._reset_caches`` turns
+    the scheduler's ``False`` into a generic "Failed to reset the KV connector
+    cache" error on the pause Future, which does not name the live request
+    that blocked the reset. Refusing here, before any pause state changes,
+    surfaces the conflict synchronously and names it: the raise is caught by
     ``_invoke_utility_method`` and returned to the client as a failed call.
     ``EngineCoreProc`` overrides ``pause_scheduler``, so both classes are
     wrapped.
@@ -1887,6 +2008,7 @@ class TTPlatform(Platform):
         # fall back to guidance (which also honors this flag); outlines and
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
+        _install_tt_xgrammar_json_separators_patch()
 
         # Import and register models from tt-metal.
         #
@@ -1930,6 +2052,13 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+        # ModelConfig caches whether the model takes multimodal input, and
+        # ModelConfig.__post_init__ fills that cache while the architecture
+        # still names the upstream class. Drop it so the next read resolves the
+        # TT class: a text-only TT class behind a multimodal upstream
+        # architecture (Gemma4) otherwise keeps the upstream True, and the
+        # renderer builds a multimodal processor the TT class does not have.
+        vars(model_config).pop("_supports_multimodal_inputs_cache", None)
 
         # Verify that the TT architecture is registered in the model registry
         from vllm.model_executor.models.registry import ModelRegistry
@@ -2084,6 +2213,25 @@ class TTPlatform(Platform):
             raise ValueError(
                 f"Model {model_class.__module__}.{model_class.__name__} "
                 "declares model_capabilities['supports_device_grammar']=True "
+                "without model_capabilities['supports_sample_on_device']=True"
+            )
+        # ``spec_ids_are_sampled`` answers only device-sampled steps, so a
+        # declaration without device sampling could never take effect.
+        spec_ids_are_sampled = (
+            model_capabilities.get("spec_ids_are_sampled", False)
+            if model_capabilities
+            else False
+        )
+        if not isinstance(spec_ids_are_sampled, bool):
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "must declare model_capabilities['spec_ids_are_sampled'] "
+                f"as a boolean, got {spec_ids_are_sampled!r}"
+            )
+        if spec_ids_are_sampled and not supports_sample_on_device:
+            raise ValueError(
+                f"Model {model_class.__module__}.{model_class.__name__} "
+                "declares model_capabilities['spec_ids_are_sampled']=True "
                 "without model_capabilities['supports_sample_on_device']=True"
             )
         if is_block_output_model and supports_device_grammar:
@@ -2325,6 +2473,7 @@ class TTPlatform(Platform):
                 model_config.generation_config = "vllm"
 
         _install_tt_input_processor_patch()
+        _install_tt_dp_prefix_cache_routing_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
 
@@ -2391,8 +2540,9 @@ class TTPlatform(Platform):
             # proposal wait for the engine thread. That path places two demands
             # on a model that supports_async_decode does not cover, because the
             # decode reload contract was written for a decode committing one
-            # token per forward: read_decode_output is handed a [B, 1+K] verify
-            # whose committed length the host decides after the forward, and
+            # token per forward: read_decode_output is handed a verify's return
+            # in its mode, [B, 1+K] ids or [B, 1+K, V] logits, whose committed
+            # length the host decides after the forward, and
             # the verify's hidden handle must stay valid across the readback
             # and until the next step's propose call. Declared separately
             # rather than derived, so a model already declaring async decode
@@ -2407,8 +2557,9 @@ class TTPlatform(Platform):
                     "does not declare "
                     "model_capabilities['supports_async_spec_decode']. The "
                     "deferred speculative path hands read_decode_output a "
-                    "[B, 1+K] verify whose committed length is decided after "
-                    "the forward, and holds the verify's hidden handle across "
+                    "verify's [B, 1+K] ids or [B, 1+K, V] logits, whose "
+                    "committed length is decided after the forward, and holds "
+                    "the verify's hidden handle across "
                     "the readback until the next step's propose call; "
                     "supports_async_decode covers neither. Launch with "
                     "--no-async-scheduling, or drop the speculative flags"
@@ -2417,21 +2568,14 @@ class TTPlatform(Platform):
             # method check. These capability checks determine whether the
             # selected model can serve the combined async speculative path.
 
-        if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
-            raise ValueError(
-                "TT lane mode and speculative decoding cannot be combined. "
-                "Lane mode builds its device input from TTLaneInputBatch, "
-                "which has no candidate-block builder, so a speculating lane "
-                "launch would send plain single-token decodes and silently "
-                "serve no speculation. Drop the speculative flags, or set "
-                "--data-parallel-size 1 to leave lane mode"
-            )
-
         # After the lane fold: _convert_dp_to_lanes rewrites
         # scheduler_config.max_num_seqs and stores the lane count, and a plan is
         # dimensioned against the concurrency it was resolved for. Admitting
         # earlier would resolve a plan for the per-lane batch and then have the
-        # engine-core re-run resolve it for the global one.
+        # engine-core re-run resolve it for the global one. The folded total is
+        # the right concurrency for a lane launch: one device launch verifies
+        # every lane's rows together, so that is the batch the verify cost and
+        # SpecPlan.k_by_rows are dimensioned against.
         spec_plan = resolve_speculative_plan(
             vllm_config,
             model_class,
@@ -2617,30 +2761,29 @@ class TTPlatform(Platform):
     def _reject_unsupported_speculative_request(cls, params) -> None:
         """Refuse a request this launch cannot serve faithfully at all.
 
-        Speculation runs in the ``argmax_ids`` mode, where no logits cross the
-        boundary: the runner compares drafted ids against the target's argmax
-        and commits ids. That certifies plain greedy decoding exactly, and
-        nothing else.
+        A model serving ``logits`` speculates for every request admission lets
+        through: the runner rejection-samples each verify row on the host under
+        the row's temperature, top-k, top-p, penalties, logprobs, grammar,
+        allowed_token_ids, bad_words and min_tokens. On a model serving only
+        ``argmax_ids``, which certifies greedy decoding only:
 
-        A non-zero temperature and the penalties are served without
-        speculation where the launch has an ordinary decode to serve them
-        with. On a model that declares ``supports_narrow_decode``,
-        ``TTModelRunner._publish_draft`` offers such a request no drafts, and
-        every step it shares runs as the ordinary decode, which applies its
-        full sampling (``_step_verifies`` in the runner). Refusing them would
-        make a speculating launch unusable for any sampled client. A model
-        without ``supports_narrow_decode`` sends every decode step as a verify,
-        which commits the target argmax on every row, so there the request is
-        refused.
+        - logprobs, structured output, allowed_token_ids, bad_words and
+          min_tokens are refused, because the greedy walk cannot apply them and
+          a verify would answer the request without them, silently;
+        - a sampled or penalized request decodes without speculation when the
+          model declares ``supports_narrow_decode``
+          (``TTModelRunner._publish_draft`` offers it no drafts, and
+          ``_step_verifies`` runs the step as the ordinary decode), and is
+          refused when it does not, because then every decode step is a verify
+          that commits the target argmax. On a model declaring
+          ``spec_ids_are_sampled`` a non-zero temperature alone no longer rules
+          a request out on a device-sampled step (SPEC_DECODE_CONTRACT.md,
+          section 4d rule 2); a penalty still does.
 
-        Refused on every speculating launch: controls that need logits or a
-        token filter the model-owned sampler does not apply. A request asking
-        for those would be answered without them, silently -- a grammar or
-        token filter unapplied, requested logprobs arriving empty.
-
-        Refused per request rather than at config time because these are
-        per-request controls, and a launch may legitimately mix requests that
-        speculate with requests that cannot.
+        vLLM itself refuses logit_bias, and a min_p above 1e-5, on a
+        speculating launch before this runs. Refused per request rather than at
+        config time because a launch may mix requests that speculate with
+        requests that cannot.
         """
         from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingType
@@ -2652,27 +2795,32 @@ class TTPlatform(Platform):
         spec_plan = None if vllm_config is None else get_tt_spec_plan(vllm_config)
         if spec_plan is None:
             return
+        serves_logits = ACCEPT_MODE_LOGITS in spec_plan.accept_modes
 
         unsupported = []
-        if params.logprobs is not None:
-            unsupported.append(f"logprobs={params.logprobs!r}")
-        if getattr(params, "structured_outputs", None) is not None:
-            unsupported.append("structured_outputs")
         if params.logit_bias:
             unsupported.append("logit_bias")
-        if params.bad_words:
-            unsupported.append("bad_words")
-        if params.allowed_token_ids:
-            unsupported.append("allowed_token_ids")
-        if params.min_tokens:
-            unsupported.append(f"min_tokens={params.min_tokens!r}")
+        # temperature and the penalties are absent: those requests speculate
+        # in logits mode, or decode without speculation. ``sampled`` below
+        # covers a launch that has neither.
+        if not serves_logits:
+            if params.logprobs is not None:
+                unsupported.append(f"logprobs={params.logprobs!r}")
+            if getattr(params, "structured_outputs", None) is not None:
+                unsupported.append("structured_outputs")
+            if params.bad_words:
+                unsupported.append("bad_words")
+            if params.allowed_token_ids:
+                unsupported.append("allowed_token_ids")
+            if params.min_tokens:
+                unsupported.append(f"min_tokens={params.min_tokens!r}")
 
         # The same four conditions under which vLLM's InputBatch.add_request
         # files the request into random_reqs or a penalty set, which is what
         # TTModelRunner._request_is_speculable reads. min_p, top_p and top_k
         # are absent because they do not move a greedy request's argmax.
         sampled = []
-        if not spec_plan.supports_narrow_decode:
+        if not spec_plan.supports_narrow_decode and not serves_logits:
             if params.sampling_type != SamplingType.GREEDY:
                 sampled.append(f"temperature={params.temperature!r}")
             for name, neutral in (
@@ -2692,12 +2840,23 @@ class TTPlatform(Platform):
                 "without them would change what was asked for without saying "
                 "so."
             )
+        if unsupported and not serves_logits:
+            reasons.append(
+                "Logprobs, grammars and token filters need a model that "
+                "serves the logits accept mode."
+            )
         if sampled:
             reasons.append(
                 "This launch's model sends every decode step as a verify (its "
-                "SpecPlan does not keep supports_narrow_decode), and a verify "
-                f"commits the target argmax on every row, so {sampled} would "
-                "not be applied. Send temperature 0 without penalties."
+                "SpecPlan does not keep supports_narrow_decode) and does not "
+                "serve logits, so a verify commits the target argmax on every "
+                f"row, and {sampled} would not be applied. Send temperature 0 "
+                "without penalties."
+            )
+        elif serves_logits:
+            reasons.append(
+                "Sampled requests (temperature, top-k, top-p, the penalties) "
+                "ARE served here -- they speculate in logits mode."
             )
         elif spec_plan.supports_narrow_decode:
             reasons.append(

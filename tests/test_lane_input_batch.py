@@ -32,6 +32,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 import vllm_tt_plugin  # noqa: F401  (activates tt platform / ttnn import)
+from vllm_tt_plugin import input_batch as input_batch_module
 from vllm_tt_plugin.input_batch import InputBatch, TTLaneInputBatch
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -102,7 +103,6 @@ def _lane_batch(num_lanes, per_lane, with_custom=True, disable_logprobs=False):
         max_num_batched_tokens=MAX_MODEL_LEN * num_lanes * per_lane,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(num_lanes * per_lane, with_custom=with_custom),
         disable_logprobs=disable_logprobs,
     )
@@ -115,6 +115,22 @@ def _host_runner(host_sampler=None, *, vocab=VOCAB, **attrs):
         host_sampler=host_sampler, model=SimpleNamespace(), vocab_size=vocab, **attrs
     )
     runner._check_host_logits = MethodType(TTModelRunner._check_host_logits, runner)
+    return runner
+
+
+def _without_speculation(runner):
+    """Bind the speculative row helpers a lane build calls on every step.
+
+    On a launch that does not speculate they return the rows unchanged.
+    """
+    runner._num_speculative_tokens = 0
+    for name in (
+        "_spec_decode_rows",
+        "_decode_device_sampled",
+        "_reset_spec_state_for_prefill",
+        "_spec_grammar_rows_per_request",
+    ):
+        setattr(runner, name, getattr(TTModelRunner, name).__get__(runner))
     return runner
 
 
@@ -291,7 +307,7 @@ def test_apply_step_plan_finished_request_releases_slot():
     assert b.occupied_rows() == []
 
 
-def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
+def test_lane_prefill_input_ends_at_scheduled_chunk_boundary(monkeypatch):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_tt_plugin.lane_scheduler import TTStepPlan
@@ -316,16 +332,27 @@ def test_lane_prefill_input_ends_at_scheduled_chunk_boundary():
         batch_size_per_dp=(1,),
         prefill_empty_slots=(row,),
     )
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests={"request": request},
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _output_tokens_per_step=1,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={"request": request},
+        )
+    )
+
+    logged: list[str] = []
+    monkeypatch.setattr(
+        input_batch_module,
+        "logger",
+        SimpleNamespace(info=lambda msg, *args: logged.append(msg % args)),
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
 
+    assert logged == ["Prefill chunk for request request: tokens [2, 3) of 8."]
     assert model_input.input_positions.tolist() == [2]
     assert model_input.prompt_lens.tolist() == [3]
     assert model_input.input_tokens.tolist() == [[0, 1, 2]]
@@ -352,13 +379,15 @@ def test_lane_structured_decode_captures_expected_grammar_request_ids():
     scheduler_output.num_scheduled_tokens = {"request": 1}
     scheduler_output.total_num_scheduled_tokens = 1
     plan = _plan({"request": row}, is_decode=True, capacity=2)
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _decode_layout_changed_since_last_decode=False,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests={"request": request},
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests={"request": request},
+        )
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -429,13 +458,15 @@ def test_sparse_two_lane_grammar_uses_submitted_row_snapshot():
         capacity=4,
         num_lanes=2,
     )
-    runner = SimpleNamespace(
-        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
-        _block_tables_per_layer=lambda _: None,
-        check_perform_device_sampling=lambda **_: True,
-        _decode_layout_changed_since_last_decode=False,
-        model_config=SimpleNamespace(is_multimodal_model=False),
-        requests=requests,
+    runner = _without_speculation(
+        SimpleNamespace(
+            max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+            _block_tables_per_layer=lambda _: None,
+            check_perform_device_sampling=lambda **_: True,
+            _decode_layout_changed_since_last_decode=False,
+            model_config=SimpleNamespace(is_multimodal_model=False),
+            requests=requests,
+        )
     )
 
     model_input = batch.build_model_input(runner, scheduler_output, None, plan)
@@ -534,6 +565,90 @@ def test_apply_step_plan_preempted_request_frees_its_row_and_keeps_its_state():
     assert requests["a"].block_ids == ([7],)
 
 
+def test_apply_step_plan_releases_a_freed_slot_to_the_model_first():
+    """Finish and preemption hand the model the request's row before freeing it.
+
+    The row is the device state slot, and a model-owned drafter keeps a
+    session per slot, so the model has to hear of the release while the slot
+    mapping still names the request, exactly as the front-packed path does
+    through ``_release_model_request``.
+    """
+    released: list[tuple[int, dict]] = []
+    b = _lane_batch(num_lanes=2, per_lane=2)
+    requests: dict = {}
+
+    def release(slot):
+        # Captured with the batch's occupancy at the time of the call.
+        released.append((slot, dict(b.req_id_to_index)))
+
+    b.apply_step_plan(
+        _step_output(
+            new_reqs=[_new_req("a", [1]), _new_req("b", [2]), _new_req("c", [3])]
+        ),
+        _plan({"a": 0, "b": 1, "c": 3}, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released == []
+
+    # "c" finishes in lane 1's last slot: released while it still holds row 3.
+    b.apply_step_plan(
+        _step_output(finished=["c"]),
+        _plan({"a": 0, "b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released == [(3, {"a": 0, "b": 1, "c": 3})]
+    assert b.occupied_rows() == [0, 1]
+
+    # "a" is preempted: its slot is released the same way, and its request
+    # state is kept for the resume.
+    b.apply_step_plan(
+        _step_output(preempted=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert released[-1] == (0, {"a": 0, "b": 1})
+    assert "a" in requests and "a" not in b.req_id_to_index
+
+    # "a" is aborted before it resumes: it holds no row and its slot was
+    # already released, so the model hears nothing more.
+    b.apply_step_plan(
+        _step_output(finished=["a"]),
+        _plan({"b": 1}, is_decode=True, capacity=4, num_lanes=2),
+        requests,
+        {},
+        release_request=release,
+    )
+    assert len(released) == 2
+    assert "a" not in requests
+
+
+def test_apply_step_plan_refuses_a_preemption_of_a_request_without_a_row():
+    b = _lane_batch(num_lanes=1, per_lane=2)
+    requests: dict = {}
+    b.apply_step_plan(
+        _step_output(new_reqs=[_new_req("b", [2])]),
+        _plan({"b": 1}, capacity=2),
+        requests,
+        {},
+    )
+    with pytest.raises(
+        RuntimeError, match="'ghost' was preempted but holds no lane row"
+    ):
+        b.apply_step_plan(
+            _step_output(preempted=["ghost"]),
+            _plan({"b": 1}, is_decode=True, capacity=2),
+            requests,
+            {},
+            release_request=lambda slot: None,
+        )
+
+
 def test_lane_full_raises():
     b = _lane_batch(num_lanes=1, per_lane=2)
     _add_to_lane(b, _make_req("a", [1], [], dict(temperature=0.0)), 0)
@@ -608,7 +723,6 @@ def _plain_batch_of_one(
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=_make_logitsprocs(1, with_custom=with_custom),
         disable_logprobs=disable_logprobs,
         output_tokens_per_step=output_tokens_per_step,
@@ -795,6 +909,13 @@ def test_max_num_logprobs_over_gappy_layout():
     assert b.max_num_logprobs is None  # no logprobs requested
     _add_to_lane(b, _make_req("b", [1], [], dict(temperature=0.0, logprobs=5)), 1)
     assert b.max_num_logprobs == 5  # found despite the gappy (row 0 + row 4) layout
+    # The speculative input reads the SCHEDULED rows only: a step that
+    # schedules the greedy row 0 while row 4 (logprobs) sits in its prefill
+    # carries no logprob request, so an argmax_ids verify is not refused.
+    assert b.max_num_logprobs_for_rows([0]) is None
+    assert b.max_num_logprobs_for_rows([4]) == 5
+    assert b.max_num_logprobs_for_rows([0, 4]) == 5
+    assert b.max_num_logprobs_for_rows([]) is None
 
 
 def test_merged_sampling_metadata_filters_generators_to_scheduled_rows():
@@ -952,9 +1073,11 @@ def test_lane_top_k_uses_rows_in_submitted_step(scheduled_top_k, is_decode):
         model_config=SimpleNamespace(is_multimodal_model=False, logits_processors=[]),
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
         _decode_layout_changed_since_last_decode=False,
+        _output_tokens_per_step=1,
         _block_tables_per_layer=lambda _: None,
         requests={"prompt": prompt, "waiting": waiting},
     )
+    _without_speculation(runner)
     runner.check_perform_device_sampling = (
         lambda **kwargs: TTModelRunner.check_perform_device_sampling(runner, **kwargs)
     )

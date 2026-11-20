@@ -97,7 +97,6 @@ def _runner(
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=FAKE_VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     runner = SimpleNamespace(
         model=model,
@@ -687,19 +686,27 @@ def test_a_verify_output_from_an_unspeculated_step_is_refused():
 
 
 def test_a_verify_answering_in_another_mode_is_refused():
-    """A mode the runner cannot walk fails by name, not by misreading ids.
+    """A verify answers in the mode it was asked for, or fails by name.
 
-    ``logits`` is a legal accept mode and a model may offer it, but nothing
-    drives it yet. A model that ignores the requested mode and answers in its
-    own must not have its ``[B, 1+K, V]`` logits read as token ids: that would
-    commit vocabulary indices of float rows as output. A conformant stand-in
-    refuses the request instead, so the guard is exercised on its own.
+    A model that ignores the requested mode and answers in its own must not
+    have its ``[B, 1+K, V]`` logits read as token ids: that would commit
+    vocabulary indices of float rows as output. Nor may ``[B, 1+K]`` ids be
+    read as logits, which would sample over a vocabulary as wide as the block.
     """
     logits = torch.zeros(1, 4, FAKE_VOCAB_SIZE)
-    answer = VerifyOutput(spec_mode=ACCEPT_MODE_LOGITS, logits=logits)
+    as_logits = VerifyOutput(spec_mode=ACCEPT_MODE_LOGITS, logits=logits)
+    as_ids = VerifyOutput(
+        spec_mode=ACCEPT_MODE_ARGMAX_IDS,
+        argmax_ids=torch.zeros(1, 4, dtype=torch.int32),
+    )
 
-    with pytest.raises(NotImplementedError, match="no accept walk for that mode"):
-        _verify_output_tensor(answer, "FakeSpecModel", ACCEPT_MODE_ARGMAX_IDS)
+    with pytest.raises(NotImplementedError, match="answers in the mode it was asked"):
+        _verify_output_tensor(as_logits, "FakeSpecModel", ACCEPT_MODE_ARGMAX_IDS)
+    with pytest.raises(NotImplementedError, match="answers in the mode it was asked"):
+        _verify_output_tensor(as_ids, "FakeSpecModel", ACCEPT_MODE_LOGITS)
+    assert (
+        _verify_output_tensor(as_logits, "FakeSpecModel", ACCEPT_MODE_LOGITS) is logits
+    )
 
 
 def test_a_tuple_of_host_tensors_does_not_pass_as_a_verify():
@@ -943,6 +950,73 @@ def test_a_drafter_offering_nothing_for_a_row_proposes_nothing():
 
     assert "r" not in runner._proposed_draft_token_ids
     assert runner._proposed_draft_token_ids["s"] == [7]
+
+
+def test_a_declined_step_is_the_plain_decode_and_a_later_offer_still_verifies():
+    """A drafter that declines every row costs the step the plain decode only.
+
+    The common step of a drafter with a batch policy: it is asked after every
+    step and offers nothing, so the next step has nothing to verify and runs
+    as the ordinary decode. The builder then skips the candidate block it would
+    discard, and the drafter's answer is erased rather than range-checked and
+    trimmed row by row. Nothing of the contract goes with it: the drafter is
+    still asked with the padded ``[B, 1+K]`` block and every count 1, and once
+    it offers again the step after that offer verifies its drafts.
+    """
+    from vllm_tt_plugin.spec_decode import DraftOutput
+
+    model = FakeSpecModel()
+    runner = _model_drafter_runner(model)
+    runner._spec_supports_narrow_decode = True
+    _add_request(runner, "r")
+    built: list = []
+    runner._spec_row_state = lambda *args: built.append(args) or (
+        TTModelRunner._spec_row_state(*args)
+    )
+    offering: list[bool] = []
+    drafts_from = model.propose_draft_tokens
+
+    def declines_until_told(num_drafts, committed, positions, counts, hidden=None):
+        drafted = drafts_from(num_drafts, committed, positions, counts, hidden=hidden)
+        if offering:
+            return drafted
+        return DraftOutput(
+            draft_token_ids=drafted.draft_token_ids,
+            num_valid=torch.zeros(int(committed.shape[0]), dtype=torch.int32),
+        )
+
+    model.propose_draft_tokens = declines_until_told
+
+    output = _step(runner, "r")
+
+    assert len(output.sampled_token_ids[0]) == 1
+    assert model.verify_calls == []
+    assert [call["width"] for call in model.plain_calls] == [1]
+    assert built == [], "a declined step built the candidate block it discards"
+    # The drafter was asked all the same, with the contract's block.
+    (asked,) = model.propose_calls
+    assert asked["committed_tokens"].shape == (MAX_NUM_REQS, DRAFT_LEN + 1)
+    assert asked["accepted_counts"].tolist() == [1] * MAX_NUM_REQS
+    assert runner._proposed_draft_token_ids == {}
+    assert runner.take_draft_token_ids() is None
+
+    # The drafter offers after the next plain step, which is built before its
+    # offer exists and so is still the plain decode.
+    offering.append(True)
+    _step(runner, "r")
+    assert built == []
+    assert [call["width"] for call in model.plain_calls] == [1, 1]
+    handoff = runner.take_draft_token_ids()
+    assert handoff.req_ids == ["r"]
+    drafts = handoff.draft_token_ids[0]
+    assert len(drafts) == DRAFT_LEN
+
+    output = _step(runner, "r", drafts={"r": drafts})
+
+    assert len(built) == 1, "the step verifying the offer skipped the full build"
+    assert len(model.verify_calls) == 1
+    assert output.sampled_token_ids[0][:DRAFT_LEN] == drafts
+    assert runner._req_accepted_counts["r"] == DRAFT_LEN + 1
 
 
 def test_an_unoffered_row_may_carry_any_ids_including_the_placeholder():

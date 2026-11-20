@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import copy
+import fcntl
 import math
 import os
+import tempfile
 import time
 import warnings
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -58,6 +60,7 @@ from vllm_tt_plugin.utils.dp_discovery import (
     format_tt_visible_devices,
     parse_mesh_grid,
 )
+from vllm_tt_plugin.utils.dp_lane_metal_env import compute_dp_lane_metal_env
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -132,6 +135,36 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
         parallel_config.data_parallel_rank_local,
         inherited,
     )
+
+
+def _bind_dp_lane_metal_env(vllm_config: VllmConfig) -> None:
+    """Give this standard-DP lane its own tt-metal Inspector address and logs.
+
+    Every lane is a separate tt-metal process on one host, so without this
+    they all bind the Inspector RPC default ``localhost:50051`` and share one
+    Inspector log directory, and the auto-triage run on a dispatch timeout
+    reads a neighbouring lane (tt-metal #63345). The overrides come from
+    ``compute_dp_lane_metal_env`` and must land before the first device open,
+    which is when tt-metal reads its runtime options. Launches without
+    discovered groups (MPI) keep the inherited values: tt-metal offsets by MPI
+    rank itself.
+    """
+    groups = _load_standard_dp_visible_groups(vllm_config)
+    if not groups:
+        return
+    overrides = compute_dp_lane_metal_env(
+        vllm_config.parallel_config.data_parallel_rank_local,
+        len(groups),
+        os.environ,
+    )
+    for key, value in overrides.items():
+        os.environ[key] = value
+    if overrides:
+        logger.info(
+            "Bound per-lane tt-metal diagnostics env for local DP rank %s: %s",
+            vllm_config.parallel_config.data_parallel_rank_local,
+            ", ".join(f"{k}={v}" for k, v in overrides.items()),
+        )
 
 
 def _resolve_mesh_grid(
@@ -252,6 +285,7 @@ class TTWorker(WorkerBase):
         # re-reads the env var, so bind before `check_and_update_config` ->
         # `get_model_architecture` imports the tt-metal model module.
         _bind_visible_devices_env(self.vllm_config)
+        _bind_dp_lane_metal_env(self.vllm_config)
 
         # Validate/apply TT config in this worker process (multiprocessing
         # means platform class attrs + config mutations must be applied per
@@ -662,7 +696,7 @@ def _upstream_admission_blocks(
     """Smallest pool, in blocks, that upstream ``get_kv_cache_configs`` admits.
 
     Mirrors its steps for one worker: tag sliding-window specs with
-    ``extra_retained_tokens`` (multi-module MTP only), group the specs, take
+    ``extra_retained_tokens`` (nonzero for multi-module MTP), group the specs, take
     the memory one request at ``max_model_len`` needs, and add BlockPool's
     null block, which the admission check subtracts from the pool before
     comparing. The private helpers are imported here, not at module scope,
@@ -673,12 +707,7 @@ def _upstream_admission_blocks(
         _pool_bytes_per_block,
     )
 
-    spec_config = vllm_config.speculative_config
-    extra_retained_tokens = (
-        spec_config.num_speculative_tokens - 1
-        if spec_config is not None and spec_config.use_multi_module_mtp()
-        else 0
-    )
+    extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
     if extra_retained_tokens:
         kv_cache_specs = {
             name: (
@@ -693,7 +722,7 @@ def _upstream_admission_blocks(
     )
     if not groups:
         return 0
-    bytes_per_block = _pool_bytes_per_block(groups)
+    bytes_per_block = _pool_bytes_per_block(sizing_config, groups)
     one_request_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
     null_block = 1
     return -(-one_request_bytes // bytes_per_block) + null_block
@@ -867,7 +896,7 @@ def _fit_block_output_max_model_len(
     """Fit ``--max-model-len -1`` to the block-output KV pool.
 
     Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
-    (vllm/v1/core/kv_cache_utils.py:2092): the TT pool is a fixed budget
+    (vllm/v1/core/kv_cache_utils.py): the TT pool is a fixed budget
     rather than profiled memory, and the upstream fit would hand the whole
     pool to ``max_model_len``, while a block-output request also needs one
     full output canvas of headroom. The engine snapshots ``max_model_len``
@@ -1049,6 +1078,29 @@ def get_mesh_grid(*args: Any, **kwargs: Any):
     return mesh_grid
 
 
+def _device_open_lock_path() -> str:
+    return os.path.join(
+        tempfile.gettempdir(), f"vllm_tt_open_mesh_device.{os.getuid()}.lock"
+    )
+
+
+@contextmanager
+def _device_open_lock():
+    """Serialize device bring-up between TT worker processes on one host.
+
+    Standard-DP ranks open their cards at the same moment. On a T3K, concurrent
+    firmware and fabric bring-up made ranks time out on the ethernet remote-IO
+    flush to their remote chip, so ranks open one at a time; once open, they
+    load and serve in parallel.
+    """
+    with open(_device_open_lock_path(), "a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def open_mesh_device(
     tt_config, trace_mode, local_dp_rank=0, *, model_fabric_config=None
 ):
@@ -1057,15 +1109,16 @@ def open_mesh_device(
 
     device_params = device_params_from_tt_config(tt_config, trace_mode)
 
-    # Set fabric before opening the device
     num_devices_requested = mesh_grid[0] * mesh_grid[1]
-    set_fabric(tt_config, num_devices_requested, model_fabric_config)
+    with _device_open_lock():
+        # Set fabric before opening the device
+        set_fabric(tt_config, num_devices_requested, model_fabric_config)
 
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(*mesh_grid),
-        dispatch_core_config=get_dispatch_core_config(tt_config),
-        **device_params,
-    )
+        mesh_device = ttnn.open_mesh_device(
+            ttnn.MeshShape(*mesh_grid),
+            dispatch_core_config=get_dispatch_core_config(tt_config),
+            **device_params,
+        )
     logger.info(
         "multidevice with %d devices and grid %s is created",
         mesh_device.get_num_devices(),

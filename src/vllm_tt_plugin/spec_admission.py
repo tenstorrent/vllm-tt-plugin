@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, get_args
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_LOGITS,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
@@ -42,11 +43,10 @@ logger = init_tt_logger(__name__)
 # refused; a plan offering more keeps its extra modes and is still admitted,
 # so declaring a real capability never makes a model less admissible.
 #
-# ``logits`` is a legal mode and a model may serve it, but the runner asks for
-# ``argmax_ids`` on every step and refuses any other answer, so admitting a
-# logits-only plan would pass a launch that fails on its first decode. The
-# sampled accept walk is what adds it back.
-_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS,)
+# ``argmax_ids`` certifies greedy rows only. ``logits`` certifies every row the
+# platform admits on a speculating launch, by rejection sampling on the host,
+# so a logits-only plan is runnable too. ``fused_sample`` has no runner path.
+_RUNNABLE_ACCEPT_MODES = (ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_LOGITS)
 
 # Upstream custom_class is a user-provided proposer extension that needs no
 # separate draft checkpoint configuration. The TT runner uses that category
