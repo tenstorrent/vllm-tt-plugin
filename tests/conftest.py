@@ -189,6 +189,8 @@ def vllm_config() -> SimpleNamespace:
             scheduler_cls=None,
             max_num_seqs=4,
             max_num_batched_tokens=4,
+            max_num_encoder_input_tokens=4,
+            encoder_cache_size=4,
             verify_max_model_len=lambda _max_model_len: None,
         ),
         speculative_config=None,
