@@ -263,6 +263,7 @@ def _config(
         diffusion_config=None,
         speculative_config=None,
         lora_config=None,
+        kv_transfer_config=None,
     )
 
 
