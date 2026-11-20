@@ -38,7 +38,6 @@ def _lane_batch(num_lanes=1, per_lane=5):
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
     )
 
 

@@ -56,7 +56,6 @@ def _runner() -> SimpleNamespace:
         max_model_len=MAX_MODEL_LEN,
         vocab_size=TARGET_VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     released: list[int] = []
     runner = SimpleNamespace(

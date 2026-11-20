@@ -94,28 +94,22 @@ def test_the_pin_defeats_the_upstream_default_for_any_config():
     assert VllmConfig.use_v2_model_runner.fget(cfg) is True
 
 
-def _config(*, method=None, mamba_cache_mode="none"):
-    """The fields vLLM 0.31's ``_get_v2_model_runner_unsupported_features``
+def _config(*, method=None, executor_backend=None, pipeline_parallel_size=1):
+    """The fields vLLM 0.32's ``_get_v2_model_runner_unsupported_features``
     reads, set to what a TT config has, with its real method bound."""
-    from vllm.config import CompilationMode, VllmConfig
+    from vllm.config import VllmConfig
 
     cfg = SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            mode=CompilationMode.NONE, pass_config=SimpleNamespace(enable_sp=False)
-        ),
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            distributed_executor_backend=None,
+            pipeline_parallel_size=pipeline_parallel_size,
+            distributed_executor_backend=executor_backend,
             use_ubatching=False,
-            enable_elastic_ep=False,
         ),
         speculative_config=(
             None
             if method is None
             else SimpleNamespace(method=method, parallel_drafting=False)
         ),
-        cache_config=SimpleNamespace(mamba_cache_mode=mamba_cache_mode),
     )
     cfg._get_v2_model_runner_unsupported_features = (
         lambda: VllmConfig._get_v2_model_runner_unsupported_features(cfg)
@@ -123,20 +117,31 @@ def _config(*, method=None, mamba_cache_mode="none"):
     return cfg
 
 
-@pytest.mark.parametrize("method", ["ngram", "custom_class"])
-def test_upstream_still_names_the_tt_drafters_as_the_patch_expects(method):
-    """Fail loudly if upstream stops refusing a TT drafter or renames the refusal:
-    the patch would then filter nothing, or the TODO on it could be acted on."""
+def test_upstream_still_names_the_model_owned_drafter_as_the_patch_expects():
+    """Fail loudly if upstream stops refusing ``custom_class`` under V2 or renames
+    the refusal: the patch would then filter nothing, or the TODO on it could be
+    acted on."""
     from vllm.config import VllmConfig
 
     from vllm_tt_plugin.platform import _UPSTREAM_V2_SPEC_METHOD_REFUSALS
 
     refusals = VllmConfig._get_v2_model_runner_unsupported_features(
-        _config(method=method)
+        _config(method="custom_class")
     )
 
-    assert refusals == [f"speculative method '{method}'"]
-    assert set(refusals) <= _UPSTREAM_V2_SPEC_METHOD_REFUSALS
+    assert refusals == ["speculative method 'custom_class'"]
+    assert set(refusals) == _UPSTREAM_V2_SPEC_METHOD_REFUSALS
+
+
+def test_upstream_accepts_the_ngram_drafter_under_v2():
+    """The patch filters no ``ngram`` refusal, so an upstream refusal of
+    ``ngram`` under V2 would stop every TT n-gram config."""
+    from vllm.config import VllmConfig
+
+    assert (
+        VllmConfig._get_v2_model_runner_unsupported_features(_config(method="ngram"))
+        == []
+    )
 
 
 @pytest.mark.parametrize("method", [None, "ngram", "custom_class"])
@@ -165,10 +170,17 @@ def test_every_other_v2_refusal_still_raises():
 
     with pytest.raises(
         ValueError,
-        match="^Model Runner V2 does not yet support: mamba cache mode 'all'$",
+        match=(
+            "^Model Runner V2 does not yet support: "
+            "pipeline parallelism with external_launcher$"
+        ),
     ):
         VllmConfig._validate_v2_model_runner(
-            _config(method="ngram", mamba_cache_mode="all")
+            _config(
+                method="custom_class",
+                executor_backend="external_launcher",
+                pipeline_parallel_size=2,
+            )
         )
 
 

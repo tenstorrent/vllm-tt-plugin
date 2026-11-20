@@ -52,7 +52,6 @@ def _runner(*, supports_stage_inputs: bool) -> SimpleNamespace:
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     runner = SimpleNamespace(
         model=_StageModel(),

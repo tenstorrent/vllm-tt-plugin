@@ -38,7 +38,6 @@ def _batch() -> InputBatch:
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=build_logitsprocs(config),
     )
 

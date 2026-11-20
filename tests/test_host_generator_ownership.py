@@ -22,7 +22,6 @@ def test_host_sampling_matches_direct_request_generator(seed, row):
         max_model_len=16,
         vocab_size=128,
         block_sizes=[16],
-        kernel_block_sizes=[16],
     )
     batch.sampling.generators = {row: generator, row + 1: unscheduled}
     probs = torch.full((1, 128), 1 / 128)

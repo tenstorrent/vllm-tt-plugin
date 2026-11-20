@@ -335,7 +335,6 @@ class InputBatch:
         max_model_len: int,
         vocab_size: int,
         block_sizes: list[int],  # The block_size of each kv cache group
-        kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
@@ -371,7 +370,6 @@ class InputBatch:
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
             block_sizes=block_sizes,
-            kernel_block_sizes=kernel_block_sizes,
             # Per-group max blocks per request; TT runs without context
             # parallelism (cp_world_size == 1).
             max_num_blocks=[cdiv(max_model_len, bs) for bs in block_sizes],
@@ -911,7 +909,6 @@ class TTLaneInputBatch(InputBatch):
         max_model_len: int,
         vocab_size: int,
         block_sizes: list[int],
-        kernel_block_sizes: list[int],
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
@@ -928,7 +925,6 @@ class TTLaneInputBatch(InputBatch):
             max_model_len=max_model_len,
             vocab_size=vocab_size,
             block_sizes=block_sizes,
-            kernel_block_sizes=kernel_block_sizes,
             logitsprocs=logitsprocs,
             disable_logprobs=disable_logprobs,
             output_tokens_per_step=output_tokens_per_step,

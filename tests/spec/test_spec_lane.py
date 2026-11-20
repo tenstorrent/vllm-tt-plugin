@@ -80,7 +80,6 @@ def _lane_runner(
         max_model_len=MAX_MODEL_LEN,
         vocab_size=vocab_size,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     runner = SimpleNamespace(
         model=model,

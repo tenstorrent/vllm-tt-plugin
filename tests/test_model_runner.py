@@ -49,7 +49,6 @@ def _batch_with_one_request(
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB_SIZE,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     request = CachedRequestState(
         req_id="r",

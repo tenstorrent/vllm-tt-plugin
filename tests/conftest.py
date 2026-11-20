@@ -29,6 +29,7 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.input_processor as input_processor
     from vllm.config import vllm as vllm_config_module
     from vllm.entrypoints.launchers.utils import server_utils
+    from vllm.v1.structured_output import backend_xgrammar
 
     from vllm_tt_plugin.platform import TTPlatform
 
@@ -47,6 +48,10 @@ def reset_tt_platform_class_state():
     saved_validate_v2 = vllm_config_module.VllmConfig._validate_v2_model_runner
     saved_original_validate_v2 = vllm_config_module.__dict__.get(
         "_tt_original_validate_v2_model_runner", unset
+    )
+    saved_xgrammar_post_init = backend_xgrammar.XgrammarBackend.__post_init__
+    saved_original_xgrammar_post_init = backend_xgrammar.__dict__.get(
+        "_tt_original_xgrammar_post_init", unset
     )
     saved_process_inputs = input_processor.InputProcessor.process_inputs
     saved_original_process_inputs = input_processor.__dict__.get(
@@ -132,6 +137,14 @@ def reset_tt_platform_class_state():
     else:
         vllm_config_module._tt_original_validate_v2_model_runner = (
             saved_original_validate_v2
+        )
+
+    backend_xgrammar.XgrammarBackend.__post_init__ = saved_xgrammar_post_init
+    if saved_original_xgrammar_post_init is unset:
+        backend_xgrammar.__dict__.pop("_tt_original_xgrammar_post_init", None)
+    else:
+        backend_xgrammar._tt_original_xgrammar_post_init = (
+            saved_original_xgrammar_post_init
         )
 
     input_processor.InputProcessor.process_inputs = saved_process_inputs

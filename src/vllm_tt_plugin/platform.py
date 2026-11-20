@@ -867,6 +867,59 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+# What upstream's xgrammar backend passes for ``disable_any_whitespace``, and
+# what TT passes instead.
+_XGRAMMAR_COMPACT_JSON_SEPARATORS = (",", ":")
+_XGRAMMAR_SPACED_JSON_SEPARATORS = (", ", ": ")
+
+
+class _TTSpacedJsonSeparatorsCompiler:
+    """Forward to an ``xgrammar.GrammarCompiler``, with spaced JSON separators."""
+
+    def __init__(self, compiler: Any) -> None:
+        self._compiler = compiler
+
+    def compile_json_schema(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("separators") == _XGRAMMAR_COMPACT_JSON_SEPARATORS:
+            kwargs["separators"] = _XGRAMMAR_SPACED_JSON_SEPARATORS
+        return self._compiler.compile_json_schema(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._compiler, name)
+
+
+def _install_tt_xgrammar_json_separators_patch() -> None:
+    """Allow one space after ``,`` and ``:`` in TT's whitespace-free JSON.
+
+    TT sets ``disable_any_whitespace`` (``_apply_check_and_update_config``).
+    The xgrammar backend turns it into ``separators=(",", ":")``, a grammar that
+    forbids the ``": "`` and ``", "`` that models emit between JSON fields.
+    Under that grammar Llama-3.1-8B and Qwen2.5-VL on TT fill string fields
+    with filler such as ``", "``. ``(", ", ": ")`` is xgrammar's own default for
+    ``any_whitespace=False``: still no free whitespace, so the whitespace loop
+    that flag prevents stays impossible.
+
+    EngineCore builds the backend on its first structured request. With vLLM's
+    default ``fork`` start method, EngineCore inherits this patch from the
+    process that ran the config hook. ``__post_init__`` is the hook because it
+    creates the compiler that every JSON request of the backend compiles through.
+    """
+    from vllm.v1.structured_output import backend_xgrammar
+
+    if hasattr(backend_xgrammar, "_tt_original_xgrammar_post_init"):
+        return
+
+    original = backend_xgrammar.XgrammarBackend.__post_init__
+    backend_xgrammar._tt_original_xgrammar_post_init = original
+
+    def xgrammar_post_init_tt(self) -> None:
+        original(self)
+        if self.disable_any_whitespace:
+            self.compiler = _TTSpacedJsonSeparatorsCompiler(self.compiler)
+
+    backend_xgrammar.XgrammarBackend.__post_init__ = xgrammar_post_init_tt
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 
@@ -1013,28 +1066,26 @@ def _pin_v2_model_runner() -> None:
     os.environ[_V2_MODEL_RUNNER_ENV] = "1"
 
 
-# How vLLM 0.31's ``VllmConfig._get_v2_model_runner_unsupported_features`` names
-# the speculative methods TT drafts inside ``TTModelRunner``: the n-gram drafter,
-# and ``MODEL_OWNED_DRAFT_METHOD``.
+# How vLLM 0.32's ``VllmConfig._get_v2_model_runner_unsupported_features`` names
+# the one speculative method that ``TTModelRunner`` drafts and vLLM refuses under
+# V2: ``MODEL_OWNED_DRAFT_METHOD``.
 _UPSTREAM_V2_SPEC_METHOD_REFUSALS = frozenset(
-    {"speculative method 'ngram'", f"speculative method '{MODEL_OWNED_DRAFT_METHOD}'"}
+    {f"speculative method '{MODEL_OWNED_DRAFT_METHOD}'"}
 )
 
 
 def _install_tt_v2_model_runner_validation_patch() -> None:
     """Validate a V2 config against what the TT runner needs, not vLLM's GPU runner.
 
-    vLLM 0.31's ``VllmConfig._validate_v2_model_runner`` refuses V2 without
-    Triton, and refuses the ``ngram`` and ``custom_class`` speculative methods.
-    These checks describe vLLM's GPU V2 model runner, which a TT engine does not
-    run: ``TTWorker`` runs ``TTModelRunner`` instead, which drafts n-gram tokens
-    with ``NgramProposer`` and takes model-owned drafts from the TT model. Every
-    other refusal is kept.
+    vLLM 0.32's ``VllmConfig._validate_v2_model_runner`` refuses V2 without
+    Triton, and refuses the ``custom_class`` speculative method. These checks
+    describe vLLM's GPU V2 model runner, which a TT engine does not run:
+    ``TTWorker`` runs ``TTModelRunner`` instead, which takes model-owned drafts
+    from the TT model. Every other refusal is kept.
 
-    TODO: narrow at each vLLM bump. vLLM 0.32 accepts ``ngram`` under V2 but still
-    requires Triton; vLLM 0.33 drops the Triton requirement; 0.32 and 0.33 still
-    refuse ``custom_class``. Upstream main removes ``custom_class`` and the V1
-    runner, and TT must then register its drafter as a custom speculator
+    TODO: narrow at each vLLM bump. vLLM 0.33 drops the Triton requirement and
+    still refuses ``custom_class``. Upstream main removes ``custom_class`` and the
+    V1 runner, and TT must then register its drafter as a custom speculator
     (vllm-project/vllm#63205).
     """
     from vllm.config import vllm as vllm_config_module
@@ -2017,6 +2068,7 @@ class TTPlatform(Platform):
         # fall back to guidance (which also honors this flag); outlines and
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
+        _install_tt_xgrammar_json_separators_patch()
 
         # Import and register models from tt-metal.
         #
