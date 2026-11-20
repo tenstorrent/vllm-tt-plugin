@@ -35,7 +35,9 @@ from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
+from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
 
 
 class FakeKVMetadata(KVConnectorMetadata):
@@ -130,6 +132,43 @@ def worker_connector(monkeypatch, vllm_config):
     connector = FakeKVConnector(config, KVConnectorRole.WORKER, None)
     monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector)
     return connector
+
+
+def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
+    pytest.importorskip("nixl")
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+        NixlConnector,
+    )
+
+    vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="NixlConnector", kv_role="kv_producer", kv_buffer_device="cpu"
+    )
+    model_config = vllm_config.model_config
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=model_config.get_total_num_kv_heads(),
+        head_size=model_config.get_head_size(),
+        dtype=model_config.dtype,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.self_attn"], spec)],
+    )
+    # The platform config hook installs this in a server.
+    _install_tt_nixl_single_rank_patch()
+
+    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    try:
+        connector.register_kv_caches(kv_cache_descriptions(kv_cache_config))
+
+        # NIXL transfers its own CPU buffer, one vLLM page per block.
+        (buffer,) = connector.connector_worker.host_xfer_buffers.values()
+        assert buffer.device.type == "cpu"
+        assert buffer.shape[0] == kv_cache_config.num_blocks
+        assert buffer[0].nbytes == spec.page_size_bytes
+    finally:
+        connector.shutdown()
 
 
 def _scheduler_output() -> SchedulerOutput:
