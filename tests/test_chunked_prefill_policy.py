@@ -25,6 +25,7 @@ def _vllm_config(
     max_model_len: int = 16384,
     long_prefill_token_threshold: int = 512,
     max_num_scheduled_tokens: int | None = None,
+    max_num_seqs: int = 8,
 ):
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(
@@ -33,6 +34,10 @@ def _vllm_config(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             long_prefill_token_threshold=long_prefill_token_threshold,
             disable_chunked_mm_input=False,
+            max_num_seqs=max_num_seqs,
+            # vLLM's own defaults for both.
+            max_num_encoder_input_tokens=max_num_batched_tokens,
+            encoder_cache_size=max_num_batched_tokens,
         ),
         model_config=SimpleNamespace(max_model_len=max_model_len),
     )
@@ -170,3 +175,31 @@ def test_block_output_model_loses_chunked_prefill_even_when_declared():
     assert config.scheduler_config.max_num_batched_tokens == 16384
     assert config.scheduler_config.long_prefill_token_threshold == 0
     assert config.scheduler_config.disable_chunked_mm_input is False
+
+
+@pytest.mark.parametrize("was_enabled", [True, False])
+def test_unsplit_prefill_never_runs_out_of_encoder_budget(was_enabled):
+    # Out of encoder budget or encoder cache, the base scheduler schedules only
+    # the tokens before a multimodal item even with chunked prefill off. Sized
+    # to all in-flight tokens, neither can bind.
+    config = _vllm_config(
+        enable_chunked_prefill=was_enabled,
+        max_num_batched_tokens=2048,
+        max_model_len=2048,
+        max_num_seqs=8,
+    )
+
+    _apply(config, None)
+
+    sched = config.scheduler_config
+    assert sched.max_num_encoder_input_tokens == 8 * 2048
+    assert sched.encoder_cache_size == 8 * 2048
+
+
+def test_split_prefill_keeps_the_encoder_budget():
+    config = _vllm_config(max_num_batched_tokens=3000)
+
+    _apply(config, {"supports_chunked_prefill": True})
+
+    assert config.scheduler_config.max_num_encoder_input_tokens == 3000
+    assert config.scheduler_config.encoder_cache_size == 3000
