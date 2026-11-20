@@ -1,42 +1,86 @@
 # Contributing to `vllm-tt-plugin`
 
-Thank you for your interest in contributing to `vllm-tt-plugin`! There are many ways to contribute to the project: from improving the docs to bringing up new major features. Consider asking your questions in the [discussions](https://github.com/tenstorrent/vllm-tt-plugin/discussions) page, raising your concerns in [issues](https://github.com/tenstorrent/vllm-tt-plugin/issues), and/or proposing your solutions in [PRs](https://github.com/tenstorrent/vllm-tt-plugin/pulls).
+Thank you for your interest in contributing to `vllm-tt-plugin`! Contributions include
+documentation, bug fixes, tests, performance improvements, and model integrations.
+Start with the problem, agree on the scope, and keep the result small enough for a human
+to understand and validate end to end.
 
 ## How to Contribute
 
-Before contributing, please make sure that your ideas and concerns are not covered in our issues, PRs, and discussions pages. When made sure, please follow the instructions above.
+Search existing [discussions](https://github.com/tenstorrent/vllm-tt-plugin/discussions),
+[issues](https://github.com/tenstorrent/vllm-tt-plugin/issues), and
+[pull requests](https://github.com/tenstorrent/vllm-tt-plugin/pulls) before starting.
+Coordinate on existing work instead of opening a competing pull request.
 
 ### Asking Questions
 
-[Discussions](https://github.com/tenstorrent/vllm-tt-plugin/discussions) are dedicated to Q&A, ideas, announcements, polls, and other types of general information. Don't hesitate to share your questions or concerns here first. Keep in mind that not every issue becomes a planned task, nor is every PR merged – so if not sure, begin your chat here.
+Use Discussions for questions, ideas, and uncertain proposals. Not every idea
+needs an implementation; establish the requirement before starting a large change.
 
 ### Creating Issues
 
-If you find bugs or propose required / planned enhancements, please open an issue on [Issues](https://github.com/tenstorrent/vllm-tt-plugin/issues). Follow the project's [issue templates](./github/ISSUE_TEMPLATE/); if irrelevant, get inspirations from the templates, then make sure to briefly summarize your issue, explain details, and provide other relevant information for reproduction and/or comparison. Always mark labels. If applicable, mark assignees, add project tasks, and specify priority labels.
+Open an issue for a reproducible bug or a planned enhancement. Use the applicable
+[issue template](.github/ISSUE_TEMPLATE/); if none fits, describe the problem,
+expected behavior, and evidence needed to reproduce or assess it. Include relevant
+versions and runtime configuration. Add appropriate labels, plus assignees,
+project information, and priority when applicable.
 
-### Submitting Pull Requests
+**Open the corresponding issue before submitting a pull request to `main`.**
+The issue describes the problem or proposal; the pull request describes its
+implementation and validation.
 
-**_PRs to `main` must be followed by their corresponding issues first._** This way, we separate the problem / idea in Issues and the solution in PRs.
+## Prepare the Change
+
+Use the [README environment setup](README.md#environment-setup), or the
+[host-only setup](AGENTS.md#3-environment-and-installation) when working without
+Tenstorrent hardware.
+
+The [engineering standards](AGENTS.md#7-engineering-standards) define design,
+typing, numpydoc, examples, exceptions, and test expectations. Consult
+[state and fixture isolation](AGENTS.md#8-state-and-fixture-isolation) when
+changing shared state or test setup.
+
+For model integrations, start with the
+[model-plugin interface](docs/MODEL_INTERFACE.md) and its linked contracts.
+Update affected interface pages with model-facing changes. Follow the
+[repository boundaries](AGENTS.md#repository-boundaries) and cross-link paired
+plugin and model pull requests.
+
+## Submitting Pull Requests
 
 Pull requests are reviewed on a **weekly basis**.
 
-#### Pull Request Guidelines
+### Pull Request Guidelines
 
-- Follow the [PR template](./github/pull_request_template.md) to create your PR.
-- Keep PRs focused on a single logical change to simplify review.
-- Add tests for new functionality where applicable.
-- Follow the existing code style, incl. the `numpydoc` format, type hints, package structure, and documentation practices. Set up `pre-commit` to check the code every commit. Record the commands and results in the pull request's Validation section.
-- Write clear and concise commit messages in the imperative mood. Your first message should be a short lable (e.g., "[feat]") and a one-liner (e.g., "Enable on-device grammar sampling.") followed by optional listed quick implementation details.
-- If you're a codeowner, specify a priority label.
-- **_Mark your PR ready for a review only after all validation steps pass._** This includes automatic and manual workflow runs as well. So by default, your PR should be a draft.
+- Fill in the [pull request template](.github/pull_request_template.md) and link
+  the corresponding issue.
+- Keep the pull request focused on one logical change.
+- Follow the [engineering standards](AGENTS.md#7-engineering-standards) and
+  [validation instructions](AGENTS.md#4-linting-formatting-and-pre-commit).
+  Record commands, results, and validation gaps in the template's Validation
+  section.
+- Use the [pull request conventions](AGENTS.md#9-pull-request-conventions) for
+  titles and branches.
+- Write concise, imperative commit subjects with a bracketed label, for example
+  `[feat] Enable on-device grammar sampling.` Add details when useful.
+- Add appropriate labels; codeowners should specify priority.
 
+**Keep the pull request in draft while implementation, local checks, or applicable**
+**manually dispatched validation are incomplete.** Once those checks pass, mark it
+ready to trigger automatic PR checks. The
+[CI workflow](.github/workflows/lint-and-host-tests.yaml) skips draft PRs, so
+its automatic checks cannot be a prerequisite for leaving draft. Confirm the
+required checks and applicable manual validation pass before requesting final
+review and merging.
 
-P.S. For model integrations, use the [model-plugin interface](docs/MODEL_INTERFACE.md) for construction, KV storage, execution, and lifecycle responsibilities, with links to the capability, reload, and speculative contracts. Update the affected interface pages when changing model-facing behavior. Keep plugin changes in this repository and model adapter changes in `tenstorrent/tt-metal`; cross-link paired pull requests.
+### Responding to Change Requests
 
-#### Responding to Change Requests
+Address feedback with focused commits. If you rewrite commits with
+`git rebase -i`, coordinate with collaborators and use `git push --force-with-lease`
+when updating the remote branch. Re-run checks affected by the revisions and
+update Validation before requesting another review.
 
-Address review feedback with new commits or by amending existing commits via
-`git rebase -i`. Force-push your updated branch when ready for re-review.
+AI-assisted contributions must also follow [AGENTS.md](AGENTS.md).
 
 ## Code of Conduct
 
