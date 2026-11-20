@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -21,8 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 
+from tests.test_block_scheduler import BLOCK_SIZE, _request
+from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
@@ -44,6 +48,8 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         # Scheduler half: tokens of external KV to offer per request ID.
         self.external_tokens: dict[str, int] = {}
         self.pending_loads: dict[str, list[int]] = {}
+        # Scheduler half: finished requests it was told of when building metadata.
+        self.finished_requests: set[str] = set()
         # Worker half: loads it was told to start, and what to report next.
         self.loads_started: dict[str, list[int]] = {}
         self.finished_recving: set[str] = set()
@@ -88,6 +94,7 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
             self.pending_loads[request.request_id] = block_ids
 
     def build_connector_meta(self, scheduler_output):
+        self.finished_requests |= scheduler_output.finished_req_ids
         meta = FakeKVMetadata(self.pending_loads)
         self.pending_loads = {}
         return meta
@@ -228,3 +235,63 @@ def test_a_step_without_a_connector_reports_no_connector_output(vllm_config):
     output = TTModelRunner.sample_tokens(runner, None)
 
     assert output.kv_connector_output is None
+
+
+def _scheduler_with_running_decode():
+    """A two-slot scheduler with a connector, whose request ``A`` is decoding."""
+    scheduler = _real_scheduler(
+        output_width=1,
+        max_num_seqs=2,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="FakeKVConnector",
+            kv_connector_module_path=__name__,
+            kv_role="kv_both",
+        ),
+    )
+    scheduler.add_request(_request(8, request_id="A"))
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, _decode_output(prefill))
+    return scheduler
+
+
+def _decode_output(scheduler_output, **connector_results) -> ModelRunnerOutput:
+    output = _block_runner_output(scheduler_output, [7])
+    if connector_results:
+        output.kv_connector_output = KVConnectorOutput(**connector_results)
+    return output
+
+
+def test_a_remote_load_is_not_lost_when_the_step_falls_back_to_decode():
+    scheduler = _scheduler_with_running_decode()
+    # The connector holds B's first block; B computes the rest itself.
+    scheduler.connector.external_tokens["B"] = BLOCK_SIZE
+    request = _request(8, request_id="B", prompt_length=BLOCK_SIZE + 40)
+    scheduler.add_request(request)
+
+    # The prefill pass parks B and schedules nothing, so A's decode runs.
+    step = scheduler.schedule()
+
+    assert set(step.num_scheduled_tokens) == {"A"}
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    (b_block_ids,) = scheduler.kv_cache_manager.get_block_ids("B")
+    assert step.kv_connector_metadata.loads == {"B": b_block_ids}
+
+    scheduler.update_from_output(step, _decode_output(step, finished_recving={"B"}))
+    step = scheduler.schedule()
+
+    assert step.num_scheduled_tokens == {"B": 40}
+
+
+def test_a_finished_request_reaches_the_connector_when_the_step_falls_back_to_decode():
+    scheduler = _scheduler_with_running_decode()
+    # B parks on a remote load, so the prefill pass schedules nothing.
+    scheduler.connector.external_tokens["B"] = BLOCK_SIZE
+    scheduler.add_request(_request(8, request_id="B", prompt_length=BLOCK_SIZE + 40))
+    scheduler.add_request(_request(8, request_id="C"))
+    scheduler.finish_requests("C", RequestStatus.FINISHED_ABORTED)
+
+    step = scheduler.schedule()
+
+    assert set(step.num_scheduled_tokens) == {"A"}
+    assert scheduler.connector.finished_requests == {"C"}
+    assert step.finished_req_ids == {"C"}
