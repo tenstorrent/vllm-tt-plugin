@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,11 @@ import vllm.config  # noqa: F401  # finish vLLM init before the plugin package,
 
 # whose bare import re-enters vllm.platforms mid-initialization
 import vllm_tt_plugin.platform as tt_platform
+
+# Captured at import, before any test can monkeypatch it away: worker.py runs
+# the real registration at module scope during collection, so this is the value
+# that actually decided what got registered.
+_EXTRA_MODELS_DIR_AT_IMPORT = os.environ.get("EXTRA_MODELS_DIR")
 
 
 def test_diffusion_gemma_uses_tt_architecture_before_upstream_config_hooks(
@@ -155,3 +161,123 @@ def test_gemma4_parsers_are_owned_by_upstream_vllm():
         ReasoningParserManager.get_reasoning_parser("diffusion_gemma")
     with pytest.raises(KeyError):
         ToolParserManager.get_tool_parser("diffusion_gemma")
+
+
+def test_gemma4_bare_architectures_are_owned_by_upstream_vllm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Upstream vLLM owns the three bare Gemma4 architectures."""
+    # register_tt_models (src/vllm_tt_plugin/platform.py) registers only the TT
+    # aliases, because _register_model_if_missing never overrides an upstream
+    # entry. If upstream drops a bare name, that registration needs rechecking.
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    # worker.py runs the real registration at module import, so it has already
+    # happened once under the shell's environment by collection time. Clear the
+    # gates and re-invoke, so anything not already registered is deterministic:
+    # TT_VLLM_BUILTIN_MODELS=0 returns before the Gemma4 aliases, and a
+    # TT_*_VER gate raises on a value it does not recognize.
+    for var in ["TT_VLLM_BUILTIN_MODELS"] + [
+        k for k in os.environ if k.startswith("TT_") and k.endswith("_VER")
+    ]:
+        monkeypatch.delenv(var, raising=False)
+
+    # EXTRA_MODELS_DIR cannot be undone here: the first registration wins, so a
+    # bundle that claimed a TT Gemma4 name during collection already owns it.
+    if _EXTRA_MODELS_DIR_AT_IMPORT:
+        pytest.skip(
+            "EXTRA_MODELS_DIR was set at collection time, so the TT rows may be "
+            "bundle-owned and this test cannot attribute them"
+        )
+
+    tt_platform.register_tt_models()
+    registry = ModelRegistry.models
+    supported = ModelRegistry.get_supported_archs()
+
+    # Positive identity per arch, not "is not the TT bridge" -- a
+    # transformers-backend fallback would satisfy that too. Coupled to upstream
+    # layout on purpose: if these move, platform.py's comment needs rechecking.
+    for bare, module in (
+        ("Gemma4ForCausalLM", "gemma4"),
+        ("Gemma4ForConditionalGeneration", "gemma4_mm"),
+        ("Gemma4UnifiedForConditionalGeneration", "gemma4_unified"),
+    ):
+        assert bare in supported, (
+            f"{bare} is expected to be an upstream vLLM registration"
+        )
+        # Exact, not substring: "...models.gemma4" is a prefix of gemma4_mm,
+        # gemma4_unified and gemma4_mtp.
+        assert registry[bare].module_name == f"vllm.model_executor.models.{module}", (
+            f"{bare} no longer resolves to upstream's {module}: {registry[bare]!r}"
+        )
+
+    # The rewritten names are the ones the plugin owns.
+    for tt_arch in (
+        "TTGemma4ForCausalLM",
+        "TTGemma4ForConditionalGeneration",
+        "TTGemma4UnifiedForConditionalGeneration",
+    ):
+        assert tt_arch in supported, (
+            f"{tt_arch} was not registered; the builtin model map did not run"
+        )
+        # Exact, for the same reason as the upstream rows above.
+        assert registry[tt_arch].module_name == "models.demos.gemma4.tt.generator_vllm"
+        assert registry[tt_arch].class_name == "Gemma4ForCausalLM"
+
+
+def test_gemma4_conditional_archs_are_multimodal_upstream():
+    """The TT prefix does not change upstream's multimodal inspection of the
+    bare name."""
+    # ModelConfig inspects the bare architecture and builds multimodal_config
+    # before check_and_update_config rewrites it, so two of the three names
+    # arrive with upstream's multimodal config, which
+    # _reconcile_multimodal_config (src/vllm_tt_plugin/platform.py) then drops.
+    # The DiffusionGemma get_config patch avoids this because the
+    # vllm.general_plugins entry point installs it before ModelConfig runs.
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    expected = {
+        "Gemma4ForCausalLM": False,
+        "Gemma4ForConditionalGeneration": True,
+        "Gemma4UnifiedForConditionalGeneration": True,
+    }
+    # Single-arch inspection: the public entry point wants a ModelConfig, and
+    # building one would load a checkpoint.
+    #
+    # It imports the class, so the multimodal archs need the full processor
+    # dependency set (torchvision). Registration is asserted either way -- that
+    # is import-free -- and the multimodal flag is skipped rather than failed
+    # where those deps are absent, as on the host-only CI job. The registration
+    # test above pins the same claim import-free, via module identity.
+    supported = ModelRegistry.get_supported_archs()
+    actual = {}
+    for arch in expected:
+        assert arch in supported, (
+            f"{arch} is expected to be an upstream vLLM registration"
+        )
+        info = ModelRegistry._try_inspect_model_cls(arch)
+        if info is None:
+            pytest.skip(
+                f"upstream inspection of {arch} could not import it; this "
+                "environment lacks the multimodal processor dependencies"
+            )
+        actual[arch] = info.supports_multimodal
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("tt_class_is_multimodal", [False, True])
+def test_multimodal_config_follows_the_tt_class(tt_class_is_multimodal):
+    """A text-only TT class drops the multimodal config built from the bare
+    architecture; a multimodal TT class keeps it."""
+    model_class = type("TTModel", (), {"supports_multimodal": tt_class_is_multimodal})
+    upstream_mm_config = object()
+    model_config = SimpleNamespace(
+        model="checkpoint", multimodal_config=upstream_mm_config
+    )
+
+    tt_platform._reconcile_multimodal_config(model_config, model_class)
+
+    assert model_config.multimodal_config is (
+        upstream_mm_config if tt_class_is_multimodal else None
+    )

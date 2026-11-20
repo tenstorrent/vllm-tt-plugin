@@ -60,18 +60,18 @@ def test_register_tt_models_applies_overrides_first(
     )
     monkeypatch.setenv(
         "TT_MODEL_CLASS_OVERRIDES",
-        "Gemma4ForCausalLM=models.demos.gemma4.tt.generator_vllm:Gemma4MTPForCausalLM",
+        "TTGemma4ForCausalLM=models.demos.gemma4.tt.generator_vllm:Gemma4MTPForCausalLM",
     )
 
     tt_platform.register_tt_models()
 
     assert (
-        registered["Gemma4ForCausalLM"]
+        registered["TTGemma4ForCausalLM"]
         == "models.demos.gemma4.tt.generator_vllm:Gemma4MTPForCausalLM"
     )
     # Architectures without an override keep their built-in targets.
     assert (
-        registered["Gemma4ForConditionalGeneration"]
+        registered["TTGemma4ForConditionalGeneration"]
         == "models.demos.gemma4.tt.generator_vllm:Gemma4ForCausalLM"
     )
 
