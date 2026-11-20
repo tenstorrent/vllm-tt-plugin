@@ -159,9 +159,11 @@ def build_cached_request_state(
     ``None``: a request resumed after preemption, or a resumable streaming-input
     request back with its next input chunk. The record cannot carry a seeded
     request's host ``torch.Generator``, which has advanced once per draw, so a
-    held request keeps ``held.generator``; a fresh one would repeat the draws
-    already made. Upstream's V1 runner keeps it the same way: it updates a
-    streaming request's ``CachedRequestState`` in place.
+    held request with an unchanged seed keeps ``held.generator``; a fresh one
+    would repeat the draws already made. A streaming-input continuation that
+    brings a different seed gets a generator seeded from it, because
+    ``InputBatch.add_request`` gives the device path that new seed, as vLLM's V2
+    runner does for its own sampler.
     """
     assert new_req_data.sampling_params is not None, (
         "Pooling is not supported for TT yet"
@@ -184,7 +186,11 @@ def build_cached_request_state(
     sampling_params = new_req_data.sampling_params
     if sampling_params.sampling_type != SamplingType.RANDOM_SEED:
         generator = None
-    elif held is not None and held.generator is not None:
+    elif (
+        held is not None
+        and held.generator is not None
+        and held.sampling_params.seed == sampling_params.seed
+    ):
         generator = held.generator
     else:
         generator = torch.Generator(device="cpu")

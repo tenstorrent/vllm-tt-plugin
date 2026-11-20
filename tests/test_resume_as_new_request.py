@@ -149,6 +149,25 @@ def test_a_streaming_continuation_keeps_its_advanced_generator():
     assert torch.equal(state.generator.get_state(), advanced)
 
 
+def test_a_streaming_continuation_with_a_new_seed_samples_from_that_seed():
+    """``InputBatch.add_request`` gives the device path the continuation's new
+    seed, so the host generator must start from that seed too."""
+    held = build_cached_request_state(
+        _record("a", PROMPT, seed=SEED), supports_stage_inputs=False
+    )
+    _sampled_from(held)
+
+    state = build_cached_request_state(
+        _record("a", PROMPT + GENERATED + [31], generated=[], seed=SEED + 1),
+        supports_stage_inputs=False,
+        held=held,
+    )
+
+    assert state.generator is not held.generator
+    fresh = torch.Generator().manual_seed(SEED + 1).get_state()
+    assert torch.equal(state.generator.get_state(), fresh)
+
+
 def test_a_new_request_gets_a_generator_seeded_from_its_params():
     state = build_cached_request_state(
         _record("a", PROMPT, seed=SEED), supports_stage_inputs=False
