@@ -64,6 +64,7 @@ _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
 _SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 _SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
+_SUPPORTS_PREFILL_NEXT_TOKEN_IDS_KEY = "_tt_supports_prefill_next_token_ids"
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:
@@ -349,6 +350,36 @@ def validate_and_store_tt_supports_stage_inputs(
     additional[_SUPPORTS_STAGE_INPUTS_KEY] = supported
 
 
+def get_tt_supports_prefill_next_token_ids(vllm_config: "VllmConfig") -> bool:
+    """Return whether prefill passes each row's next prompt token to the model."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_SUPPORTS_PREFILL_NEXT_TOKEN_IDS_KEY, False))
+
+
+def validate_and_store_tt_supports_prefill_next_token_ids(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``prefill_next_token_ids`` and store it on the vLLM config.
+
+    Raises:
+        ValueError: the declaration is not a boolean.
+    """
+    supported = (model_capabilities or {}).get("prefill_next_token_ids", False)
+    if not isinstance(supported, bool):
+        raise ValueError(
+            f"Model {model_class.__module__}.{model_class.__name__} must declare "
+            "model_capabilities['prefill_next_token_ids'] as a boolean, got "
+            f"{supported!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_SUPPORTS_PREFILL_NEXT_TOKEN_IDS_KEY] = supported
+
+
 def get_tt_supports_stage_outputs(vllm_config: "VllmConfig") -> bool:
     """Return whether the runner collects stage outputs after every decode."""
     additional = getattr(vllm_config, "additional_config", None) or {}
@@ -417,6 +448,65 @@ def resolve_tt_supports_stage_outputs(
         additional = {}
         vllm_config.additional_config = additional
     additional[_SUPPORTS_STAGE_OUTPUTS_KEY] = supported
+
+
+def validate_tt_prefix_hit_confirmation(
+    vllm_config: "VllmConfig",
+    model_capabilities: dict | None,
+    model_class: type,
+) -> None:
+    """Validate ``confirms_prefix_cache_hits``.
+
+    ``TTWorker.load_model`` publishes the loaded model's
+    ``confirm_prefix_cache_hit`` for the scheduler of its process, which trims
+    vLLM's prefix-cache hit to the answer.
+
+    Raises:
+        ValueError: the declaration is not a boolean, or it comes without
+            ``supports_prefix_caching`` or without the method, or the executor
+            runs the worker outside the scheduler's process (anything but the
+            uniproc executor), where the published method would never reach
+            the scheduler, or the launch runs single-process lane-DP, whose
+            lanes would share one lane-blind confirmer.
+    """
+    capabilities = model_capabilities or {}
+    name = f"{model_class.__module__}.{model_class.__name__}"
+    confirms = capabilities.get("confirms_prefix_cache_hits", False)
+    if not isinstance(confirms, bool):
+        raise ValueError(
+            f"Model {name} must declare "
+            "model_capabilities['confirms_prefix_cache_hits'] as a boolean, got "
+            f"{confirms!r}"
+        )
+    if not confirms:
+        return
+    if not capabilities.get("supports_prefix_caching", False):
+        raise ValueError(
+            f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
+            "=True without supports_prefix_caching=True"
+        )
+    if not callable(getattr(model_class, "confirm_prefix_cache_hit", None)):
+        raise ValueError(
+            f"Model {name} declares model_capabilities['confirms_prefix_cache_hits']"
+            "=True without a confirm_prefix_cache_hit(token_ids, mm_items, "
+            "num_computed_tokens) method"
+        )
+    backend = vllm_config.parallel_config.distributed_executor_backend
+    if backend not in (None, "uni"):
+        raise ValueError(
+            f"Model {name} confirms prefix-cache hits from the worker that loaded "
+            "it, which must share the scheduler's process (the uniproc executor); "
+            f"got distributed_executor_backend={backend!r}"
+        )
+    if uses_tt_lane_coordinator(vllm_config):
+        raise ValueError(
+            f"Model {name} confirms prefix-cache hits through one confirmer per "
+            "process, and single-process lane-DP runs "
+            f"{get_tt_data_parallel_size(vllm_config)} TT lanes, each a "
+            "scheduler over its own KV cache: every lane would ask the same "
+            "confirmer, which cannot tell one lane's requests from another's. "
+            "Serve this model without TT lanes (data_parallel_size=1)."
+        )
 
 
 def get_tt_spec_plan(vllm_config: "VllmConfig") -> "SpecPlan | None":

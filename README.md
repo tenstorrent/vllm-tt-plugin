@@ -665,9 +665,14 @@ Two drafting methods execute today:
 | `ngram` | vLLM's host `NgramProposer` | `spec_plan` and multi-position verification; no model-side proposer |
 | `custom_class` | The selected adapter's `propose_draft_tokens` | `spec_plan`, multi-position verification and `device_propose` in `spec_requirements` |
 
-Two accept modes execute, chosen per step from the adapter's `SpecPlan`. With
+Three accept modes execute, chosen per step from the adapter's `SpecPlan`. With
 `argmax_ids` the runner accepts drafts that equal the target argmax, which
-certifies greedy requests only. With `logits` the adapter returns
+certifies greedy requests only. With `fused_sample` the adapter accepts on the
+device and returns each row's committed ids and count; it certifies the same
+rows as `argmax_ids` and is asked for in its place when offered, and a call may
+commit more tokens than the drafts it was sent, at most the block's
+`1 + effective_k`, so a plan offering it is served with synchronous scheduling
+only. With `logits` the adapter returns
 full-vocabulary verify logits and the runner rejection-samples each row on the
 host (`spec_accept.accept_sampled_drafts`), so sampled and penalized requests
 speculate losslessly under temperature, top-k, top-p, presence, frequency and
@@ -675,9 +680,9 @@ repetition penalties and seed, and under structured output, `allowed_token_ids`,
 `bad_words` and `min_tokens`, with logprobs returned for every committed token.
 No production tt-metal adapter declares `logits`
 yet; tt-metal's `DummySpecDecodeModel` validates the path.
-`docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`. `fused_sample`
-execution, scheduler-owned paged drafter caches and `TTLaneCoordinator`
-execution are not implemented for this contract.
+`docs/install-vllm-tt.sh` installs `numba` for `NgramProposer`.
+Scheduler-owned paged drafter caches and `TTLaneCoordinator` execution are not
+implemented for this contract.
 
 ### Model selection and launch settings
 
