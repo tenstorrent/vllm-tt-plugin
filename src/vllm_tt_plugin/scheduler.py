@@ -1698,7 +1698,7 @@ class TTScheduler(AsyncScheduler):
     def _count_commit_past_scheduled_drafts(
         self, request: Request, new_token_ids: list[int], is_stale: bool
     ) -> None:
-        """Advance a draftless row's counts by a commit of more than one token.
+        """Reconcile a commit past the drafts, or refuse it under a queued step.
 
         Schedule time advanced ``num_computed_tokens`` and
         ``num_output_placeholders`` by the step's 1 + d tokens. vLLM reconciles
@@ -1712,12 +1712,40 @@ class TTScheduler(AsyncScheduler):
         schedule the c - 1 tokens again as new input. The same reconciliation
         is applied here, under vLLM's guards, just before the tokens are
         appended.
+
+        Either correction is right only while no later step of the request is
+        scheduled. A step scheduled before this commit started from this
+        step's scheduled positions, so after a commit past the drafts it would
+        start behind the request, and the runner would read the gap as prompt
+        and prefill it. Only asynchronous scheduling schedules a step before
+        the previous one's output, and ``TTPlatform`` refuses ``fused_sample``
+        there, so such a commit is refused here rather than reconciled.
+
+        Raises
+        ------
+        RuntimeError
+            If the row committed past its drafts while a later step of the
+            request was already scheduled.
         """
         drafts = self._committing_spec_drafts
-        if drafts is None or is_stale or drafts.get(request.request_id):
+        if drafts is None or is_stale:
             return
+        num_drafts = len(drafts.get(request.request_id) or ())
         num_accepted = len(new_token_ids) - self.num_sampled_tokens_per_step
-        if num_accepted <= 0:
+        if num_accepted <= num_drafts:
+            return
+        # update_from_output has already taken this step's tokens off the
+        # count, so what remains belongs to steps scheduled after it.
+        if request.num_in_flight_tokens > 0:
+            raise RuntimeError(
+                f"request {request.request_id} committed {len(new_token_ids)} "
+                f"tokens on a step that scheduled {num_drafts} drafts, while "
+                f"{request.num_in_flight_tokens} tokens of a later step were "
+                "already scheduled from the positions before this commit. "
+                "Only a fused_sample verify commits past its drafts, and "
+                "TTPlatform serves it with synchronous scheduling only"
+            )
+        if num_drafts:
             return
         if request.num_computed_tokens > 0:
             request.num_computed_tokens += num_accepted
