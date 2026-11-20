@@ -471,7 +471,30 @@ class TTWorker(WorkerBase):
         single-process lane mode has only one rank. Without a token KV cache
         the config has no KV groups.
         """
+        # A KV connector (--kv-transfer-config) is created here, as the GPU worker does, because it needs the
+        # kv_cache_config; the runner registers its device buffers with it once they exist. Not through
+        # ensure_kv_transfer_initialized: that syncs the engine id over vLLM's TP group, which a TT worker (one
+        # process for the whole mesh) does not create.
+        kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
+        if kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance:
+            from vllm.distributed.kv_transfer import kv_transfer_state
+            from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+            from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+            if kv_transfer_state._KV_CONNECTOR_AGENT is None:
+                kv_transfer_state._KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
+                    config=self.vllm_config, role=KVConnectorRole.WORKER, kv_cache_config=kv_cache_config
+                )
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        # EngineCore asks every worker when a KV connector is configured; TT connectors exchange none.
+        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        return None if metadata is None else {(0, 0): metadata}
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -662,7 +685,7 @@ def _upstream_admission_blocks(
     """Smallest pool, in blocks, that upstream ``get_kv_cache_configs`` admits.
 
     Mirrors its steps for one worker: tag sliding-window specs with
-    ``extra_retained_tokens`` (multi-module MTP only), group the specs, take
+    ``extra_retained_tokens`` (nonzero for multi-module MTP), group the specs, take
     the memory one request at ``max_model_len`` needs, and add BlockPool's
     null block, which the admission check subtracts from the pool before
     comparing. The private helpers are imported here, not at module scope,
@@ -673,12 +696,7 @@ def _upstream_admission_blocks(
         _pool_bytes_per_block,
     )
 
-    spec_config = vllm_config.speculative_config
-    extra_retained_tokens = (
-        spec_config.num_speculative_tokens - 1
-        if spec_config is not None and spec_config.use_multi_module_mtp()
-        else 0
-    )
+    extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
     if extra_retained_tokens:
         kv_cache_specs = {
             name: (

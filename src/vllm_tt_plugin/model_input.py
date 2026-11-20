@@ -12,10 +12,11 @@ without importing the runner.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
 
@@ -103,6 +104,57 @@ def slice_tt_sampling_params(
         num_logprobs=num_logprobs,
         enable_log_probs=num_logprobs >= 0,
     )
+
+
+def build_mm_items(
+    req_id: str,
+    mm_features: list[MultiModalFeatureSpec] | None,
+    modalities: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """One prefill row's ``mm_items`` entry: the request's items, or ``None``.
+
+    Every prefill of the request carries all of its items in prompt order (vLLM
+    orders ``mm_features`` by placeholder offset), whichever part of the prompt
+    the prefill covers. ``offset`` and ``length`` are the item's placeholder
+    range in the whole prompt; ``is_embed`` marks the positions inside it that
+    take the item's embeddings, ``None`` meaning all of them; ``data`` holds the
+    processor's fields for the item, those of an item prefix caching covers
+    included (``TTScheduler._restore_prefix_cached_mm_data``).
+
+    Raises:
+        ValueError: an item's modality is not in ``modalities``, or it has no
+            fields. The platform refuses such a modality before admission
+            (``resolve_tt_mm_modalities``) and the scheduler restores stripped
+            fields, so either is a broken invariant.
+    """
+    if not mm_features:
+        return None
+    items = []
+    for feature in mm_features:
+        position = feature.mm_position
+        if feature.modality not in modalities:
+            raise ValueError(
+                f"Request {req_id} carries a {feature.modality!r} item at prompt "
+                f"offset {position.offset}, but the model encodes only "
+                f"{sorted(modalities)}."
+            )
+        if feature.data is None:
+            raise ValueError(
+                f"Request {req_id}'s {feature.modality!r} item at prompt offset "
+                f"{position.offset} (identifier {feature.identifier}) arrived "
+                "without its processor fields."
+            )
+        items.append(
+            {
+                "modality": feature.modality,
+                "identifier": feature.identifier,
+                "offset": position.offset,
+                "length": position.length,
+                "is_embed": position.is_embed,
+                "data": feature.data.get_data(),
+            }
+        )
+    return items
 
 
 @dataclass(frozen=True)
@@ -211,6 +263,11 @@ class TTModelInput:
     # ``stage_inputs``. ``None`` unless the model declares
     # ``supports_stage_inputs``.
     stage_inputs: list[Any] | None = None
+
+    # Prefill-only: request id to reason for each row the model could not serve,
+    # filled by ``submit_prefill`` from a model declaring
+    # ``reports_prefill_errors``; the step's output carries it to the scheduler.
+    prefill_errors: dict[str, str] = field(default_factory=dict)
 
     # Decode-only: retain device logits until sample_tokens supplies the grammar,
     # then invoke the model's device sampler. Structured prefills stay on host.

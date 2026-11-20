@@ -368,6 +368,44 @@ def test_lane_structured_decode_captures_expected_grammar_request_ids():
     assert model_input.defer_device_sampling is True
 
 
+def test_lane_decode_input_gaps_a_slot_still_in_chunked_prefill():
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    batch = _lane_batch(num_lanes=1, per_lane=2, with_custom=False)
+    decoding = _make_req("decoding", [1, 2, 3], [4], dict(temperature=0.0))
+    decoding.block_ids = ([3],)
+    # Four of the eight prompt tokens are written; the coordinator interleaves
+    # a decode step of the other request before the next chunk.
+    prefilling = _make_req("prefilling", list(range(8)), [], dict(temperature=0.0))
+    prefilling.block_ids = ([5],)
+    prefilling.num_computed_tokens = 4
+    decoding_row = _add_to_lane(batch, decoding, lane=0)
+    prefilling_row = _add_to_lane(batch, prefilling, lane=0)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"decoding": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    plan = _plan({"decoding": decoding_row}, is_decode=True, capacity=2)
+    runner = SimpleNamespace(
+        max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK,
+        _block_tables_per_layer=lambda _: None,
+        check_perform_device_sampling=lambda **_: True,
+        _decode_layout_changed_since_last_decode=False,
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        requests={"decoding": decoding, "prefilling": prefilling},
+    )
+
+    model_input = batch.build_model_input(runner, scheduler_output, None, plan)
+
+    # The partial prefill decodes nothing: no position, no token, no blocks.
+    assert model_input.input_positions.tolist()[prefilling_row] == -1
+    assert model_input.input_tokens.tolist()[prefilling_row] == [0]
+    table = model_input.block_tables_per_group[0]
+    assert not table[prefilling_row].any()
+    assert model_input.input_positions.tolist()[decoding_row] == 3
+    assert model_input.input_tokens.tolist()[decoding_row] == [4]
+    assert table[decoding_row, 0] == 3
+
+
 def test_slot_grammar_bitmask_default_preserves_non_strict_mapping():
     batch = _lane_batch(num_lanes=1, per_lane=2, with_custom=False)
     request = _make_req(
@@ -894,11 +932,19 @@ def test_scheduled_seeded_row_isolated_from_unscheduled_random_row():
 # --------------------------------------------------------------------------
 
 
-def _runner_with(data_parallel_size, tt_data_parallel_size):
+def _runner_with(data_parallel_size, tt_data_parallel_size, single_lane=False):
+    from vllm_tt_plugin import config as tt_config
     from vllm_tt_plugin.model_runner import TTModelRunner
 
     r = TTModelRunner.__new__(TTModelRunner)
     r.parallel_config = SimpleNamespace(data_parallel_size=data_parallel_size)
+    r.vllm_config = SimpleNamespace(
+        parallel_config=r.parallel_config, additional_config={}
+    )
+    if single_lane:
+        tt_config.store_tt_single_lane(r.vllm_config)
+    elif tt_data_parallel_size > 1:
+        tt_config.store_tt_lane_count(r.vllm_config, tt_data_parallel_size)
     r.tt_data_parallel_size = tt_data_parallel_size
     return r
 
@@ -909,6 +955,10 @@ def test_runner_is_lane_mode_property():
     assert _runner_with(data_parallel_size=1, tt_data_parallel_size=4)._is_lane_mode
     # Non-DP: one engine, one lane -> plain InputBatch.
     assert not _runner_with(data_parallel_size=1, tt_data_parallel_size=1)._is_lane_mode
+    # One lane of a model that folds DP into lanes -> TTLaneInputBatch.
+    assert _runner_with(
+        data_parallel_size=1, tt_data_parallel_size=1, single_lane=True
+    )._is_lane_mode
     # Standard multi-process DP: each rank is its own engine -> plain InputBatch.
     assert not _runner_with(data_parallel_size=4, tt_data_parallel_size=4)._is_lane_mode
 

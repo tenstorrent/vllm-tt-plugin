@@ -5,7 +5,9 @@ name: Lint and host tests
 
 on:
   pull_request:
-    branches: [main, "release/*"]
+    # mimo-v2.6-flash/vllm-plugin-dev: the MiMo dev line ships the vLLM patch
+    # stack in patches/, whose behaviour tests (tests/vllm_patches) only run here.
+    branches: [main, "release/*", "mimo-v2.6-flash/vllm-plugin-dev"]
     # converted_to_draft starts an all-skipped run that cancels the in-flight one.
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:

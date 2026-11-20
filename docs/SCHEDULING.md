@@ -48,12 +48,15 @@ Upstream vLLM is more general:
 There are three important scheduler-side collections:
 
 - `waiting`: requests not yet admitted into active execution
-- `skipped_waiting`: pending prefill requests temporarily blocked, for example
-  while their structured-output grammar is compiled
+- `kv_holding_waiting`: requests not yet admitted that already hold KV blocks,
+  for example a streaming-input session waiting for its next chunk. vLLM admits
+  from this queue before `waiting`.
 - `running`: requests already admitted and holding active scheduler state
 
-TT treats `waiting` and `skipped_waiting` together when checking for pending
-prefill work. A partly prefilled request sits in `running` with
+A request that is temporarily blocked, for example while its structured-output
+grammar is compiled, stays in its waiting queue, and vLLM's prefill pass skips
+it until it is ready. TT treats `waiting` and `kv_holding_waiting` together when
+checking for pending prefill work. A partly prefilled request sits in `running` with
 `is_prefill_chunk` set; TT counts it as pending prefill work too, because only
 a prefill step can advance it. What TT changes is not the existence of these
 collections, but the rules for choosing what kind of work a step may contain
@@ -69,7 +72,7 @@ For TT, it is useful to think in terms of two batch types:
 That is a simplification compared with upstream vLLM, but it matches how the TT path is intentionally organized today.
 
 TT still performs continuous batching in the broad sense: requests arrive in
-`waiting`, may be held in `skipped_waiting`, are admitted while other requests
+`waiting`, may wait there while blocked, are admitted while other requests
 remain active, can be preempted back to `waiting`, and leave independently as
 they finish. The restriction is within each device step: TT does not mix
 prefill and decode work in the same batch.
@@ -163,10 +166,9 @@ That lag is intentional and is what creates host/device overlap.
 
 The TT scheduler behaves like this:
 
-- if `waiting` or `skipped_waiting` contains pending prefill work, or any
+- if `waiting` or `kv_holding_waiting` contains pending prefill work, or any
   running request is a partial-prefill continuation, run the prefill scheduling
-  pass so newly ready requests can be promoted and admitted and continuations
-  can advance.
+  pass so newly ready requests can be admitted and continuations can advance.
 - otherwise, advance decode work
 - if pending prefill work cannot be admitted, fall back to decode to free
   capacity. Partial prefills do not make this fallback viable: a decode step
@@ -623,7 +625,7 @@ Overlap is disabled and pending async work is drained when correctness would oth
 
 - prompt activity or resumed prefill work
 - layout change in the decode batch
-- structured output bookkeeping
+- structured output sampled on host (no effective device grammar)
 - penalties, allowed-token masks, bad-word filtering, or logits processors
 - any other requirement for host-side sampling
 - logprobs, including an explicit `logprobs=0`, or other features that force a
@@ -634,11 +636,14 @@ When device sampling is operator-enabled, a model declares
 support, and the submitted batch has no logprobs or other host-only option, a
 structured decode keeps logits on device until `sample_tokens()` supplies and
 remaps the packed grammar mask. Sampling-path eligibility is batch-wide: one
-ineligible request moves the whole submitted TT batch to host sampling. The
-runner drains pending async work before that forward and completes device
-sampling synchronously after the mask arrives. This initial path also requires
-`async_scheduling=False`, because upstream's batch queue can otherwise submit
-another forward before the current grammar arrives. Structured prefill and
+ineligible request moves the whole submitted TT batch to host sampling.
+Synchronously, the runner completes device sampling after the mask arrives.
+Under async scheduling it starts a non-blocking read of the sampled tokens
+instead, and the step is steady under the same rules as an ordinary
+device-sampled decode: its sampler writes the masked token into the next
+decode's resident input. Upstream's `step_with_batch_queue` calls
+`sample_tokens()` for a deferred step before `execute_model()` for the next
+one, so the model never holds two unsampled forwards. Structured prefill and
 ineligible structured decode retain host sampling. Block-output models reject
 structured outputs.
 
@@ -694,6 +699,13 @@ generators selected with `TT_LLAMA_TEXT_VER=llama3_70b_galaxy` or
 architecture, and model classes that declare
 `model_capabilities["folds_dp_into_lanes"]`. The user-provided `--max_num_seqs M` remains the capacity per
 lane, so the engine's global capacity becomes `N * M`.
+
+A model class that declares `folds_dp_into_lanes` takes the lane path at
+`--data_parallel_size 1` too, with one lane. Several such engines can then each
+serve one submesh of a larger machine (`TT_VISIBLE_DEVICES`), scheduling
+independently: MiMo-V2.6-Flash serves a Galaxy as one engine per row this way.
+The Galaxy generators and GPT-OSS, which fold DP without declaring it, keep the
+non-DP path at `--data_parallel_size 1`.
 
 The fold happens while the engine config is built, after `vllm serve` has
 chosen its API-server count, so a lane-DP launch keeps upstream's default of

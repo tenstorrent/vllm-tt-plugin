@@ -41,7 +41,7 @@ from vllm.v1.core.sched.output import (
     GrammarOutput,
     SchedulerOutput,
 )
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutputs
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -244,6 +244,11 @@ def merge_lane_scheduler_outputs(
         num_invalid_spec_tokens=num_invalid_spec_tokens,
     )
     set_tt_forced_reset_discard_counts(merged, forced_reset_discard_counts)
+    # KV connector metadata: each lane scheduler owns its connector; with one lane (one engine per row) its
+    # metadata is the step's. Several lanes would need one connector per lane on the worker side too.
+    metas = [out.kv_connector_metadata for out in lane_outputs if out.kv_connector_metadata is not None]
+    if len(lane_outputs) == 1 and metas:
+        merged.kv_connector_metadata = metas[0]
     if finishing_req_ids:
         set_tt_scheduler_output_field(
             merged, _TT_FINISHING_REQ_IDS_ATTR, tuple(finishing_req_ids)
@@ -293,7 +298,7 @@ class TTLaneCoordinator(SchedulerInterface):
         self._free_slots_by_lane: list[list[int]] = [
             list(range(self._per_lane_max)) for _ in range(self.num_lanes)
         ]
-        # No KV or encoder-cache connector on TT; EngineCore reads both.
+        # EngineCore reads both. A KV connector (one per lane scheduler) is exposed only with one lane.
         self.connector: KVConnectorBase_V1 | None = None
         self.ec_connector: ECConnectorBase | None = None
         # One policy for the whole step, not one per lane. Every lane executes
@@ -341,6 +346,10 @@ class TTLaneCoordinator(SchedulerInterface):
         # which drops them with stats off; the lanes keep them for make_stats.
         for sched in self.lanes:
             sched.collect_spec_decoding_stats = log_stats
+        if vllm_config.kv_transfer_config is not None:
+            if self.num_lanes != 1:
+                raise ValueError("a KV connector needs one lane per engine (--data-parallel-size 1)")
+            self.connector = self.lanes[0].connector
 
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
         """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
@@ -348,9 +357,15 @@ class TTLaneCoordinator(SchedulerInterface):
         Shallow-copies ``vllm_config`` and its ``scheduler_config`` so the
         per-lane ``max_num_seqs`` override does not leak back onto the shared
         config the coordinator and model runner read for global sizing. All
-        lanes share this one view; the base scheduler only reads
-        ``max_num_seqs`` from it (to set ``max_num_running_reqs``), never
+        lanes share this one view; the base scheduler reads it and never
         mutates it.
+
+        ``max_num_active_seqs`` passes through unchanged because it is already
+        per-lane: only ``_convert_dp_to_lanes`` enters lane mode, so the user's
+        ``--max-num-seqs`` and ``--max-num-active-seqs`` are per-rank values,
+        and vLLM checks ``max_num_active_seqs <= max_num_seqs`` when it builds
+        ``SchedulerConfig``, before that conversion multiplies ``max_num_seqs``
+        by the lane count.
         """
         per_lane_vllm_config = copy.copy(vllm_config)
         per_lane_scheduler_config = copy.copy(vllm_config.scheduler_config)
@@ -365,7 +380,8 @@ class TTLaneCoordinator(SchedulerInterface):
     def _pick_lane(self) -> int:
         """Choose the least-loaded lane for a newly arriving request.
 
-        Scores each lane ``waiting * 4 + running`` and picks the lowest
+        Scores each lane ``waiting * 4 + running`` (both from vLLM's
+        ``Scheduler.get_request_counts``) and picks the lowest
         (ties resolve to the lowest lane index). This is intentionally the same
         load score vLLM uses to route requests across DP engines
         (``DPLBAsyncMPClient.get_core_engine_for_request`` in
@@ -384,7 +400,8 @@ class TTLaneCoordinator(SchedulerInterface):
         best_lane = 0
         best_score: int | None = None
         for lane, sched in enumerate(self.lanes):
-            score = len(sched.waiting) * 4 + len(sched.running)
+            num_running, num_waiting = sched.get_request_counts()
+            score = num_waiting * 4 + num_running
             if best_score is None or score < best_score:
                 best_score = score
                 best_lane = lane
@@ -401,12 +418,12 @@ class TTLaneCoordinator(SchedulerInterface):
         lane at capacity: it already holds one of those slots and only a
         prefill step can advance it.
 
-        ``skipped_waiting`` holds prefill requests blocked on grammar
-        compilation. We want to try to schedule them, because otherwise the
-        base scheduler won't revisit and promote them - decode intent hides
-        that queue.
+        A request blocked on grammar compilation still counts as waiting. We
+        want to try to schedule it, because only the base scheduler's prefill
+        loop checks whether the grammar is ready, and decode intent hides the
+        waiting queues from that loop.
         """
-        has_waiting = bool(sched.waiting) or bool(sched.skipped_waiting)
+        has_waiting = sched.get_request_counts()[1] > 0
         has_running = bool(sched.running)
         has_partial_prefill = any(r.is_prefill_chunk for r in sched.running)
         has_capacity = len(sched.running) < self._per_lane_max
@@ -605,6 +622,29 @@ class TTLaneCoordinator(SchedulerInterface):
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        scheduled_ts = time.monotonic()
+        merged = self._schedule_lanes(throttle_prefills)
+        if self.log_stats:
+            self._record_scheduled_events(merged, scheduled_ts)
+        return merged
+
+    def _record_scheduled_events(self, merged: SchedulerOutput, scheduled_ts: float) -> None:
+        """Record SCHEDULED on the requests this step takes from waiting (new or resumed after a preemption).
+
+        vLLM's request-timing metrics (vllm:request_queue_time_seconds, request_prefill_time_seconds,
+        request_inference_time_seconds) come from a request's QUEUED and SCHEDULED events, which the base scheduler
+        records only with log_stats on. The lanes run with log_stats off (the coordinator owns the stats), so the
+        coordinator records both events itself: QUEUED in add_request, SCHEDULED here, with the step's start time
+        as the base scheduler uses."""
+        req_ids = [r.req_id for r in merged.scheduled_new_reqs]
+        req_ids += list(merged.scheduled_cached_reqs.resumed_req_ids)
+        for req_id in req_ids:
+            lane = self._req_to_lane.get(req_id)
+            request = self.lanes[lane].requests.get(req_id) if lane is not None else None
+            if request is not None:
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_ts)
+
+    def _schedule_lanes(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if self._hold_for_prefill_gather():
             # A decode-only pass hides the waiting queues, and nothing runs, so
             # this step schedules nothing; the engine loop takes in new
@@ -794,6 +834,9 @@ class TTLaneCoordinator(SchedulerInterface):
             lane = self._pick_lane()
             self._req_to_lane[request.request_id] = lane
         self.lanes[lane].add_request(request)
+        if self.log_stats:
+            # The lanes run with log_stats off: QUEUED (with SCHEDULED in schedule) feeds vLLM's queue time metric.
+            request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
         self,
@@ -913,4 +956,4 @@ class TTLaneCoordinator(SchedulerInterface):
             sched.shutdown()
 
     def get_kv_connector(self) -> KVConnectorBase_V1 | None:
-        return None
+        return self.connector

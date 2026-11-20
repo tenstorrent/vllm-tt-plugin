@@ -417,8 +417,9 @@ def test_add_request_strips_host_sampling_controls_from_bypassed_request():
     # A resumable session would park the stopped request forever and leak the
     # model-owned state slot.
     assert request.resumable is False
-    # With the structured-output request gone, nothing could ever promote the
-    # request out of skipped_waiting; it must be schedulable immediately.
+    # With the structured-output request gone, no grammar ever arrives and the
+    # base prefill loop would skip the request forever; it must be schedulable
+    # immediately.
     assert request.status == RequestStatus.WAITING
     scheduled = scheduler.schedule()
     assert scheduled.num_scheduled_tokens == {"bypass-0": 32}
@@ -961,9 +962,10 @@ def _pause_guarded_engine(scheduler: TTScheduler) -> SimpleNamespace:
 
 @pytest.mark.parametrize("stage_outputs", [False, True])
 def test_keep_pause_with_clear_cache_is_refused_up_front(stage_outputs):
-    # The keep-mode reset runs from an idle callback whose result upstream
-    # discards, so the only honest failure is a synchronous one before any
-    # pause state changes.
+    # The keep-mode reset runs from an idle callback after the scheduler is
+    # paused, and upstream reports its refusal there only as a generic cache
+    # reset failure, so the guard fails synchronously before any pause state
+    # changes.
     scheduler, request, _ = _scheduled(stage_outputs=stage_outputs)
     engine = _pause_guarded_engine(scheduler)
 

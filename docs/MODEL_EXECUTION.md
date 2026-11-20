@@ -46,6 +46,8 @@ keyword arguments below, not a `TTModelInput` object. Source:
 | `empty_slots` | When supplied, one destination device-state slot per submitted row. Preserve state belonging to other slots. |
 | `page_tables_per_layer` | Supplied for multiple KV groups, as described above. |
 | `sampling_params` | Supplied only when this prefill uses device sampling. See the sampling section. |
+| `mm_items` | Supplied only when the model declares `mm_modalities`. One entry per row; see [multimodal inputs](#multimodal-inputs). |
+| `pixel_values`, `image_grid_thw` | Supplied for a multimodal model that does not declare `mm_modalities`. See [multimodal inputs](#multimodal-inputs). |
 | `stage_inputs` | Supplied only when the model declares `supports_stage_inputs`. One entry per row: the request's stage payload as a plain dict, or `None`. The same payload arrives with every prefill of a request, so a chunked or resumed prefill sees it again. Decode receives none; see [stage inputs](MODEL_LIFECYCLE.md#stage-inputs). |
 
 For row `i`, `prefill_forward` computes
@@ -60,12 +62,55 @@ hook. `TTModelRunner` suppresses output for intermediate prefill chunks and
 selects host sampling when a submitted prefill contains intermediate chunks,
 so intermediate chunks must not advance a device sampler.
 
-### Image inputs and request-specific RoPE
+### Prefill errors
 
-For multimodal prefill, `_gather_multi_modal_inputs` adds `pixel_values` and
-`image_grid_thw`. Each value is a list in submitted request order. A text-only
-request has `None`; an image request has a list per image, with `None` for
-missing payloads. The plugin currently accepts image features only.
+A model that declares `reports_prefill_errors` can fail a prefill row instead
+of raising, since an exception out of `prefill_forward` kills the engine. After
+every `prefill_forward`, `submit_prefill` calls `take_prefill_errors()`, which
+returns `{row: reason}` for the rows of that call the model could not serve
+(the row index into `tokens`, the reason a string) and clears them. The row
+still needs a valid output; the plugin discards whatever the model returns for
+it. `TTScheduler` finishes each such request `FINISHED_ERROR`, on an
+intermediate chunk as on the final one: vLLM's finish reason `error`, which the
+OpenAI server answers with HTTP 500, or with an error event followed by
+`[DONE]` on a stream. The request's other state is released as for any finished
+request, and the other rows of the step are unaffected.
+
+### Multimodal inputs
+
+For multimodal prefill, `_gather_multi_modal_inputs` adds one of two inputs.
+Both are lists in submitted row order, with `None` for a text-only request, and
+both arrive with every prefill of a request, chunked or resumed.
+
+A model that declares `mm_modalities` receives `mm_items`. A request's entry
+lists all of its items in prompt order, whichever part of the prompt the
+prefill covers, so the model selects the rows that fall inside
+`[start_pos, prompt_lens)` itself. Chunked prefill may split an item across
+chunks (the platform leaves `disable_chunked_mm_input` to vLLM for such a
+model), so a chunk can start or end inside one:
+
+```python
+{"modality": "video",            # one of the declared modalities
+ "identifier": "9f86d081...",    # vLLM's item hash, stable across chunks and requests
+ "offset": 14, "length": 10,     # placeholder range in the whole prompt
+ "is_embed": tensor([False, False, False, False, True, True, True, True,
+                     False, False]),  # positions taking embeddings; None = all
+ "data": {"pixel_values_videos": tensor(...), "video_grid_thw": tensor([1, 2, 6]),
+          ...}}                  # the processor's fields for this item
+```
+
+`data` is present for every item, one that prefix caching covers whole
+included: vLLM strips such an item's fields (`strip_covered_mm_data`) because
+it schedules no encoder run for it, and `TTScheduler` hands them back, since a
+model may recompute positions in front of its chunk start. The platform refuses
+a request with any other modality at the API, so a model never receives one.
+
+A multimodal model without the declaration receives `pixel_values` and
+`image_grid_thw`: an image request has one tensor per image in each list, with
+`None` for a missing payload. The platform refuses every other modality for
+such a model at the API.
+
+### Request-specific RoPE
 
 When `model_config.uses_mrope` enables request-specific RoPE, `prefill_forward`
 returns `(output, rope_deltas)`, with one delta per request. On decode,
@@ -193,19 +238,23 @@ For an eligible structured decode:
 3. After vLLM supplies the grammar, `TTAsyncDecodeController` calls
    `sample_deferred_decode(output, sampling_params=..., grammar_bitmask=...)`.
    The adapter applies the packed int32 grammar mask and returns sampled
-   output through the ordinary decode conversion path.
+   output through the ordinary decode conversion path. Under async scheduling
+   the controller then starts `read_decode_output(output, async_read=True)`, as
+   for an ordinary async decode, and the next decode may be submitted before
+   that read completes.
 
 Each bit in `grammar_bitmask` names one vocabulary token; a one bit permits
 that token. The model adapter must apply the submitted row order.
 
 Structured prefill uses host sampling. Deferred grammar sampling requires
-synchronous scheduling and effective runtime support. A missing mask or a
+effective runtime support. A missing mask or a
 failure after deferred submission invalidates the runner's grammar path;
 the plugin raises instead of resampling an already advanced step on the host.
 
 Sources: `submit_prefill`, `check_perform_device_sampling`, and
 `_get_output_tokens` in [model_runner.py](../src/vllm_tt_plugin/model_runner.py);
-`submit_decode`, `finalize_decode`, and `complete_deferred_device_sampling` in
+`submit_decode`, `finalize_decode`, `complete_deferred_device_sampling`, and
+`sample_deferred_async_decode` in
 [async_decode.py](../src/vllm_tt_plugin/async_decode.py).
 
 ## Adapter sketches: DP=1 and lane-DP

@@ -6,20 +6,24 @@
 #
 # numpy<2 wins: it is fixed by the tt-metal env this plugin runs inside
 # (tt-metal pyproject.toml and tt_metal/python_env/requirements-dev.txt) and
-# cannot be moved from here. opencv is reached only by vLLM's lazy video-IO
-# path (vllm/multimodal/video.py), which no TT-registered model uses, so 4.11 —
-# the last release without a numpy 2 floor — is safe.
+# cannot be moved from here. opencv is reached by vLLM's lazy video-IO path
+# (vllm/multimodal/video.py), which decodes the videos of MiMo-V2.6-Flash's
+# multimodal class (tt-metal models/experimental/mimo_v2_6_flash), and by that
+# model's own frame resize. 4.11, the last release without a numpy 2 floor,
+# serves both: vLLM 0.31.0's OpenCV backend calls only VideoCapture, cvtColor
+# and resize, and on 4.11.0.86 with numpy 1.26.4 it decodes an mp4 sampled by
+# frame count and by fps.
 #
 # Revisit when bumping the pinned vLLM version (upstream may relax the opencv
-# floor again), or if a TT-supported model gains video input, or if tt-metal
-# bumps the numpy requirement
+# floor again, or call an OpenCV API newer than 4.11), or if tt-metal bumps the
+# numpy requirement
 # (https://github.com/tenstorrent/tt-metal/issues/30193).
 opencv-python-headless==4.11.0.86
 numpy>=1.24.4,<2
 
 # Retarget this ceiling when the pinned vLLM moves; do not just delete it. common.txt
-# declares no upper bound, so an uncapped install resolves the newest transformers
-# release, which is validated against neither the pinned vLLM nor the tt-metal env
+# caps transformers only below 5.18.0, so without this line the install resolves the
+# newest release below that cap, which is not validated against the tt-metal env
 # (tt_metal/python_env/requirements-dev.txt pins transformers 5.12.1). The cap was
 # set because vLLM 0.26.0 read Gemma 4's head_dim off the global HF config, which
 # transformers 5.15.0 rejects with AmbiguousGlobalPerLayerAttributeError; vLLM 0.28.0
@@ -27,3 +31,12 @@ numpy>=1.24.4,<2
 # release is validated. The floor restates vLLM's own: --override replaces a
 # requirement instead of intersecting it.
 transformers>=5.10.4,<5.15.0
+
+# vLLM 0.31.0 pins xgrammar 0.2.7. The MiMo tool parser backported in
+# patches/vllm-0.31.0/until-0.32/ uses xgrammar's builtin `mimo` structural tag,
+# which first shipped in 0.2.8 (mlc-ai/xgrammar#916); vLLM 0.32.0 pins 0.2.8 for
+# the same reason. 0.2.9 is what the MiMo endpoint was measured on. vLLM 0.31.0's
+# structured-output code is unchanged by the bump (tests/vllm_patches covers its
+# xgrammar backend). Revisit when the pinned vLLM moves: drop this line once
+# vLLM's own pin is at least 0.2.8.
+xgrammar==0.2.9

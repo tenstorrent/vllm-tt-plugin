@@ -28,7 +28,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.30.0)
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.31.0)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
@@ -51,8 +51,11 @@ for the appropriate tt-metal and vLLM commits.
 vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
 Ubuntu 22.04.
 
-The installation script builds vLLM `0.30.0` from source with
+The installation script builds vLLM `0.31.0` from source with
 `VLLM_TARGET_DEVICE=empty`.
+It then applies the tool-calling patch stack in
+`patches/vllm-0.31.0/series` to the installed vLLM; see
+`patches/vllm-0.31.0/README.md`.
 
 To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),
 check out the `compat/vllm-X.Y.Z` tag (e.g., `compat/vllm-0.25.1`), the last plugin state
@@ -307,6 +310,8 @@ For vision models, start the server with the correct `--model`, then send a chat
 completion request with image content. Qwen 2.5-VL models can use either a
 base64 `data:image/...` URL or a real URL such as
 `https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg`.
+A request carrying a modality the TT model does not encode (video or audio, for
+a model that takes images only) is refused with HTTP 400.
 
 ## Configuration
 
@@ -370,22 +375,22 @@ Some model classes do not declare `max_device_top_k`, for example the tt-metal `
 
 Structured-output decode can use TT device sampling on models that declare
 `supports_device_grammar`. It is off by default. To enable it, set a
-`sample_on_device_mode` and turn off async scheduling. The example also sets
+`sample_on_device_mode`. The example also sets
 the [default top-k](#default-top-k-for-device-sampling), because requests
 without `top_k` to the default Llama model would otherwise sample on host:
 
 ```bash
 MESH_DEVICE=T3K \
 python examples/server_example_tt.py \
-  --no-async-scheduling \
   --override-generation-config '{"top_k": 32}' \
   --additional-config '{"tt": {"sample_on_device_mode": "decode_only"}}'
 ```
 
-vLLM enables async scheduling by default, and the platform disables it only
-for models without `supports_async_decode`. On models that declare it,
-structured requests keep host sampling unless the server is started with
-`--no-async-scheduling`.
+Device grammar works with and without async scheduling. Under async
+scheduling a steady structured decode overlaps the step in flight as any
+device-sampled decode does: the device writes the grammar-sampled token where
+the next decode reads its input, and vLLM builds a step's mask while that
+step's forward runs.
 
 | Step | Sampling path |
 | --- | --- |
@@ -805,7 +810,8 @@ clear error before anything reaches the device:
   alignment that depends on the model's program config and on the length of
   each remaining span, and the tt-metal generator corrects them itself.
 - Where chunked prefill is active, multimodal inputs are never split across a
-  chunk boundary.
+  chunk boundary, except for a model that declares `mm_modalities`: its items
+  may straddle chunks, so one item may exceed `max_num_batched_tokens`.
 - Prompt logprobs are rejected at request validation time.
 - Prefix caching is enabled only for models that declare TT support for it.
 - Async decode overlap is enabled only for models that declare the capability.

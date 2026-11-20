@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import copy
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -19,6 +20,7 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
@@ -57,6 +59,23 @@ def set_tt_verified_drafts(
 
 def get_tt_verified_drafts(runner_output: ModelRunnerOutput) -> dict[str, int]:
     return dict(getattr(runner_output, _TT_VERIFIED_DRAFTS_ATTR, {}))
+
+
+# Request id to reason for each prefill row a model declaring
+# ``reports_prefill_errors`` could not serve, attached to that step's
+# ModelRunnerOutput by the runner; ``TTScheduler.update_from_output`` finishes
+# those requests as errors.
+_TT_PREFILL_ERRORS_ATTR = "_tt_prefill_errors"
+
+
+def set_tt_prefill_errors(
+    runner_output: ModelRunnerOutput, errors: dict[str, str]
+) -> None:
+    setattr(runner_output, _TT_PREFILL_ERRORS_ATTR, dict(errors))
+
+
+def get_tt_prefill_errors(runner_output: ModelRunnerOutput) -> dict[str, str]:
+    return dict(getattr(runner_output, _TT_PREFILL_ERRORS_ATTR, {}))
 
 
 def set_tt_forced_reset_discard_counts(
@@ -337,11 +356,13 @@ class TTScheduler(AsyncScheduler):
       the next chunk until the prompt is fully computed. Those continuations
       count as prefill work here, never as decodes.
 
-    The base scheduler holds temporarily blocked prefill requests (e.g. while
-    a structured-output grammar compiles) in ``skipped_waiting`` rather than
-    ``waiting``. Its prefill loop revisits that queue and promotes requests
-    whose dependency is ready. Decode-only scheduling must hide both queues so
-    that the base scheduler cannot admit a prefill into a decode step.
+    The base scheduler admits prefills from two queues: ``kv_holding_waiting``
+    (requests that still hold KV blocks, e.g. a streaming-input session waiting
+    for its next chunk), which it drains first, and ``waiting``. A temporarily
+    blocked request (e.g. while a structured-output grammar compiles) stays in
+    its queue, and the prefill loop skips it until its dependency is ready.
+    Decode-only scheduling must hide both queues so that the base scheduler
+    cannot admit a prefill into a decode step.
 
     Inherits from AsyncScheduler to get num_output_placeholders support.
     TT uses this scheduler in both sync and async execution modes:
@@ -380,6 +401,13 @@ class TTScheduler(AsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.aux_output_connector is not None:
+            # The base update_from_output asserts an auxiliary output for every
+            # request that emits tokens, and the TT model runner produces none.
+            raise ValueError(
+                "TT backend does not return auxiliary model outputs; remove "
+                "--enable-return-routed-experts."
+            )
         self._forced_mode = TTSchedulingMode.DEFAULT
         # Read only in DEFAULT mode. A lane coordinator sets a forced mode
         # before every one of its lanes' schedule() calls and owns the one
@@ -404,6 +432,7 @@ class TTScheduler(AsyncScheduler):
         # flight reaches their max_tokens; read at each schedule().
         self._finishing_candidates: list[str] = []
         self._widest_decode_batch_size = 0
+        self._takes_mm_items = get_tt_mm_modalities(self.vllm_config) is not None
         self._prefill_chunk_alignment = (
             get_tt_prefill_chunk_alignment(self.vllm_config)
             if self.scheduler_config.enable_chunked_prefill
@@ -736,8 +765,9 @@ class TTScheduler(AsyncScheduler):
             request.structured_output_request = None
             stripped.append("structured_outputs")
             # Request.__init__ parked the request on grammar compilation; with
-            # the structured-output request gone nothing would ever promote it
-            # out of skipped_waiting, so restore schedulability.
+            # the structured-output request gone no grammar ever arrives, and
+            # the base prefill loop would skip the request forever, so restore
+            # schedulability.
             if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
                 request.status = RequestStatus.WAITING
         if params.structured_outputs is not None:
@@ -763,17 +793,17 @@ class TTScheduler(AsyncScheduler):
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 
-        A request in ``skipped_waiting`` still needs a future prefill pass:
-        that is where the base scheduler retries promotion after its dependency
-        becomes ready. In decode-only mode this check also ensures both waiting
-        queues are hidden from the base scheduler.
+        A blocked request in ``waiting`` or ``kv_holding_waiting`` still needs
+        a future prefill pass: only the base scheduler's prefill loop checks
+        whether its dependency became ready. In decode-only mode this check also
+        ensures both waiting queues are hidden from the base scheduler.
 
         A running ``is_prefill_chunk`` request is a partial prefill whose next
         chunk can only be scheduled by a prefill step.
         """
         return (
             bool(self.waiting)
-            or bool(getattr(self, "skipped_waiting", False))
+            or bool(self.kv_holding_waiting)
             or any(request.is_prefill_chunk for request in self.running)
         )
 
@@ -943,6 +973,8 @@ class TTScheduler(AsyncScheduler):
                     rows,
                 )
             self._record_finishing_requests(scheduler_output)
+        if getattr(self, "_takes_mm_items", False):
+            self._restore_prefix_cached_mm_data(scheduler_output)
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -950,6 +982,22 @@ class TTScheduler(AsyncScheduler):
             set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
             self._pending_forced_reset_discard_counts = {}
         return scheduler_output
+
+    def _restore_prefix_cached_mm_data(self, scheduler_output: SchedulerOutput) -> None:
+        """Give a newly scheduled request's items back the fields vLLM stripped.
+
+        ``NewRequestData.from_request`` drops the processor fields of every item
+        the request's prefix-cache hit covers whole (``strip_covered_mm_data``),
+        since vLLM schedules no encoder run for it. A model taking ``mm_items``
+        may still recompute positions inside such an item: it can move a chunk
+        start back onto its own alignment, or recompute a short prompt with a
+        prefix hit from position 0. The scheduler's request holds the fields for
+        its whole lifetime, so with the uniproc executor handing them on adds no
+        copy.
+        """
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.mm_features:
+                new_req.mm_features = list(self.requests[new_req.req_id].mm_features)
 
     def _record_finishing_requests(self, scheduler_output: SchedulerOutput) -> None:
         """Name the requests this decode step left out because they finish.
@@ -986,39 +1034,43 @@ class TTScheduler(AsyncScheduler):
 
         Temporarily hides the running *decode* requests so the base scheduler's
         running loop only advances partial prefills, and its waiting loop
-        admits new ones.  Adjusts max_num_running_reqs so the waiting loop
-        respects the true capacity with the decodes hidden.
+        admits new ones.  Lowers both running caps by the hidden decodes so the
+        waiting loop respects the true capacity: the loop admits against
+        ``max_num_active_reqs``, and the end-of-step check asserts
+        ``max_num_running_reqs``.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
+        saved_active = self.max_num_active_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
         try:
             result = super().schedule()
         finally:
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
+            self.max_num_active_reqs = saved_active
         return result
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
 
-        Temporarily hides both the ``waiting`` and ``skipped_waiting`` queues
-        so the base scheduler's waiting loop is a no-op and cannot promote a
-        grammar-ready structured-output request into this decode step, and
-        hides partial prefills so their next chunk is not scheduled into it
-        either.  Any requests that get preempted during decode scheduling are
-        merged back into the original queues afterwards.
+        Temporarily hides both the ``waiting`` and ``kv_holding_waiting``
+        queues so the base scheduler's waiting loop is a no-op and cannot admit
+        a prefill (for example a grammar-ready structured-output request) into
+        this decode step, and hides partial prefills so their next chunk is not
+        scheduled into it either.  Any requests that get preempted during
+        decode scheduling are merged back into the original queues afterwards.
         """
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_waiting = self.waiting
-        saved_skipped = getattr(self, "skipped_waiting", None)
+        saved_kv_holding = self.kv_holding_waiting
         self.waiting = create_request_queue(self.policy)
-        if saved_skipped is not None:
-            self.skipped_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy)
         if partial_prefills:
             self.running = [r for r in self.running if not r.is_prefill_chunk]
         try:
@@ -1026,11 +1078,10 @@ class TTScheduler(AsyncScheduler):
         finally:
             if self.waiting:
                 saved_waiting.prepend_requests(self.waiting)
-            if saved_skipped is not None:
-                if self.skipped_waiting:
-                    saved_skipped.prepend_requests(self.skipped_waiting)
-                self.skipped_waiting = saved_skipped
+            if self.kv_holding_waiting:
+                saved_kv_holding.prepend_requests(self.kv_holding_waiting)
             self.waiting = saved_waiting
+            self.kv_holding_waiting = saved_kv_holding
             if partial_prefills:
                 self.running.extend(partial_prefills)
         return result
@@ -1054,10 +1105,11 @@ class TTScheduler(AsyncScheduler):
                 "(block output or stage outputs) is running; finish or abort the "
                 "request first."
             )
-            # pause_generation(mode="keep") reaches this through an unguarded
-            # idle-state callback while intentionally retaining live requests.
-            # Returning False preserves them without letting an exception
-            # escape EngineCore and strand the callback's Future.
+            # pause_generation(mode="keep") retains live requests on purpose,
+            # so a refused reset is an expected result there: return the
+            # refusal the reset API defines instead of raising.
+            # _install_block_output_pause_guard_patch refuses a keep-mode
+            # pause that would clear the cache before it reaches this.
             if self.pause_state == PauseState.PAUSED_ALL:
                 logger.error("%s", message)
                 return False
@@ -1289,11 +1341,48 @@ class TTScheduler(AsyncScheduler):
             )
         if self.num_spec_tokens and self.scheduler_config.async_scheduling:
             self._mark_unverified_drafts_invalid(scheduler_output, model_runner_output)
+        model_runner_output = self._fail_unserved_prefills(
+            scheduler_output, model_runner_output
+        )
         try:
             return super().update_from_output(scheduler_output, model_runner_output)
         finally:
             self._committing_block_step_decisions = {}
             self.tt_release_output_frames(scheduler_output)
+
+    def _fail_unserved_prefills(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> ModelRunnerOutput:
+        """Have this update finish as errors the prefills the model could not serve.
+
+        The runner reports them on the step's output (``set_tt_prefill_errors``),
+        on a final chunk or an intermediate one. Each such request of this
+        scheduler loses the token the model sampled for it, so it does not stop
+        on that token, and joins vLLM's request-error set
+        (``grammar_compile_error_reqs``, which grammar compile failures also
+        feed), whose requests the base update finishes ``FINISHED_ERROR``.
+        Their finish reason ``error`` reaches the OpenAI server, which answers
+        HTTP 500, or an error event and ``[DONE]`` on a stream. The returned
+        output is a copy; the merged output a lane coordinator hands every lane
+        stays as it was.
+        """
+        failed = [
+            req_id
+            for req_id in get_tt_prefill_errors(model_runner_output)
+            if req_id in scheduler_output.num_scheduled_tokens
+        ]
+        if not failed:
+            return model_runner_output
+        sampled = list(model_runner_output.sampled_token_ids)
+        if sampled:
+            for req_id in failed:
+                sampled[model_runner_output.req_id_to_index[req_id]] = []
+        model_runner_output = copy.copy(model_runner_output)
+        model_runner_output.sampled_token_ids = sampled
+        self.grammar_compile_error_reqs.update(failed)
+        return model_runner_output
 
     def tt_release_output_frames(self, scheduler_output: SchedulerOutput) -> None:
         """Release the output frames ``scheduler_output`` reserved.

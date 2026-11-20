@@ -23,12 +23,15 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
+    get_tt_mm_modalities,
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
+    has_tt_lane_count,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_mm_modalities,
     resolve_tt_scheduler_cls,
     resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
@@ -36,6 +39,7 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_single_lane,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
@@ -264,11 +268,15 @@ def _apply_chunked_prefill_policy(
         _disable_chunked_prefill(vllm_config, reason)
         return
 
-    # A chunk boundary inside a multimodal item would split its embeddings from
-    # their positions. Only meaningful while prefill can be split, and vLLM
-    # rejects the flag outright when one item exceeds the token budget, so it
-    # stays off for every model that does not reach here.
-    scheduler_config.disable_chunked_mm_input = True
+    # The pixel_values lists carry no placeholder positions, so a chunk boundary
+    # inside an item would split its embeddings from their positions. A model
+    # taking mm_items gets every item's whole-prompt range with every chunk and
+    # embeds the rows a chunk covers itself, so its items may straddle chunks:
+    # vLLM's setting stands. Only meaningful while prefill can be split, and
+    # vLLM rejects the flag outright when one item exceeds the token budget, so
+    # it stays off for every model that does not reach here.
+    if get_tt_mm_modalities(vllm_config) is None:
+        scheduler_config.disable_chunked_mm_input = True
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
@@ -593,10 +601,27 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     No-op unless ``data_parallel_size > 1`` and the model folds DP into lanes
     (``_model_folds_dp_into_lanes``). Idempotent: after conversion
     ``data_parallel_size == 1``, so re-entry short-circuits.
+
+    A model class that declares ``model_capabilities["folds_dp_into_lanes"]``
+    and is launched with ``--data-parallel-size 1`` runs one lane
+    (``store_tt_single_lane``), so several such engines can each serve one
+    submesh (``TT_VISIBLE_DEVICES``) of a larger machine.
     """
     parallel_config = vllm_config.parallel_config
     data_parallel_size = parallel_config.data_parallel_size
     if data_parallel_size <= 1:
+        capabilities = getattr(model_class, "model_capabilities", None) or {}
+        if (
+            data_parallel_size == 1
+            and capabilities.get("folds_dp_into_lanes", False) is True
+            and not has_tt_lane_count(vllm_config)
+        ):
+            store_tt_single_lane(vllm_config)
+            logger.info(
+                "Model %s folds DP into lanes and was launched with "
+                "--data-parallel-size 1: running one TT lane",
+                getattr(model_class, "__name__", model_class),
+            )
         return
     if not _model_folds_dp_into_lanes(model_class):
         return
@@ -1058,6 +1083,18 @@ def _install_tt_input_processor_patch() -> None:
     original = input_processor.InputProcessor.process_inputs
     input_processor._tt_original_process_inputs = original
 
+    # The front end's chat parsing reads enable_mm_embeds from this config: turn off the embedding inputs vLLM
+    # derives for a TTKVStoreConnector consumer before the server takes any request (disable_kv_store_mm_embeds).
+    original_init = input_processor.InputProcessor.__init__
+
+    def init_tt(self, vllm_config, *args, **kwargs):
+        from vllm_tt_plugin.config import disable_kv_store_mm_embeds
+
+        disable_kv_store_mm_embeds(vllm_config)
+        original_init(self, vllm_config, *args, **kwargs)
+
+    input_processor.InputProcessor.__init__ = init_tt
+
     def process_inputs_tt(self, request_id, prompt, params, *args, **kwargs):
         output_size = get_tt_output_tokens_per_step(self.vllm_config)
         is_block_output_model = is_tt_block_output_model(self.vllm_config)
@@ -1141,7 +1178,7 @@ def _install_block_output_reset_abort_patch() -> None:
     fall through to the scheduler guard's raise instead.
     ``pause_generation(mode="keep")`` reaches the same method from its deferred
     idle callback while intentionally retaining live requests; that path is
-    left to the scheduler guard, which refuses the reset without raising.
+    left to the scheduler guard, which refuses the reset by returning False.
     """
     import vllm.v1.engine.core as engine_core
     from vllm.v1.core.sched.interface import PauseState
@@ -1192,11 +1229,11 @@ def _install_block_output_pause_guard_patch() -> None:
     block requests.
 
     The keep-mode cache reset runs from the engine's deferred idle callback,
-    whose result upstream discards: ``EngineCore._reset_caches`` ignores the
-    scheduler's ``False`` and the pause Future resolves regardless, so the
-    caller would be told the pause succeeded with a cleared cache while the
-    retained canvases kept their state. Refusing here, before any pause state
-    changes, surfaces the conflict synchronously — the raise is caught by
+    after the scheduler is already paused. ``EngineCore._reset_caches`` turns
+    the scheduler's ``False`` into a generic "Failed to reset the KV connector
+    cache" error on the pause Future, which does not name the live request
+    that blocked the reset. Refusing here, before any pause state changes,
+    surfaces the conflict synchronously and names it: the raise is caught by
     ``_invoke_utility_method`` and returned to the client as a failed call.
     ``EngineCoreProc`` overrides ``pause_scheduler``, so both classes are
     wrapped.
@@ -1951,6 +1988,13 @@ class TTPlatform(Platform):
         for i in range(len(arch_names)):
             if not arch_names[i].startswith("TT"):
                 arch_names[i] = "TT" + arch_names[i]
+        # ModelConfig caches whether the model takes multimodal input, and
+        # ModelConfig.__post_init__ fills that cache while the architecture
+        # still names the upstream class. Drop it so the next read resolves the
+        # TT class: a text-only TT class behind a multimodal upstream
+        # architecture (Gemma4) otherwise keeps the upstream True, and the
+        # renderer builds a multimodal processor the TT class does not have.
+        vars(model_config).pop("_supports_multimodal_inputs_cache", None)
 
         # Verify that the TT architecture is registered in the model registry
         from vllm.model_executor.models.registry import ModelRegistry
@@ -2010,6 +2054,7 @@ class TTPlatform(Platform):
             model_class, "model_capabilities", None
         )
 
+        resolve_tt_mm_modalities(vllm_config, model_capabilities, model_class)
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
