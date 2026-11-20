@@ -394,6 +394,7 @@ def _runner(model: DeferredVerifyTarget) -> SimpleNamespace:
         _proposed_draft_token_ids={},
         _ngram_proposer=None,
         _req_state_slot={},
+        _mamba_groups=None,
         released_slots=released,
         # The asynchronous half of the runner's state.
         async_decode_scheduling=True,
