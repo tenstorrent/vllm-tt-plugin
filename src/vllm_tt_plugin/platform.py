@@ -1066,28 +1066,26 @@ def _pin_v2_model_runner() -> None:
     os.environ[_V2_MODEL_RUNNER_ENV] = "1"
 
 
-# How vLLM 0.31's ``VllmConfig._get_v2_model_runner_unsupported_features`` names
-# the speculative methods TT drafts inside ``TTModelRunner``: the n-gram drafter,
-# and ``MODEL_OWNED_DRAFT_METHOD``.
+# How vLLM 0.32's ``VllmConfig._get_v2_model_runner_unsupported_features`` names
+# the one speculative method that ``TTModelRunner`` drafts and vLLM refuses under
+# V2: ``MODEL_OWNED_DRAFT_METHOD``.
 _UPSTREAM_V2_SPEC_METHOD_REFUSALS = frozenset(
-    {"speculative method 'ngram'", f"speculative method '{MODEL_OWNED_DRAFT_METHOD}'"}
+    {f"speculative method '{MODEL_OWNED_DRAFT_METHOD}'"}
 )
 
 
 def _install_tt_v2_model_runner_validation_patch() -> None:
     """Validate a V2 config against what the TT runner needs, not vLLM's GPU runner.
 
-    vLLM 0.31's ``VllmConfig._validate_v2_model_runner`` refuses V2 without
-    Triton, and refuses the ``ngram`` and ``custom_class`` speculative methods.
-    These checks describe vLLM's GPU V2 model runner, which a TT engine does not
-    run: ``TTWorker`` runs ``TTModelRunner`` instead, which drafts n-gram tokens
-    with ``NgramProposer`` and takes model-owned drafts from the TT model. Every
-    other refusal is kept.
+    vLLM 0.32's ``VllmConfig._validate_v2_model_runner`` refuses V2 without
+    Triton, and refuses the ``custom_class`` speculative method. These checks
+    describe vLLM's GPU V2 model runner, which a TT engine does not run:
+    ``TTWorker`` runs ``TTModelRunner`` instead, which takes model-owned drafts
+    from the TT model. Every other refusal is kept.
 
-    TODO: narrow at each vLLM bump. vLLM 0.32 accepts ``ngram`` under V2 but still
-    requires Triton; vLLM 0.33 drops the Triton requirement; 0.32 and 0.33 still
-    refuse ``custom_class``. Upstream main removes ``custom_class`` and the V1
-    runner, and TT must then register its drafter as a custom speculator
+    TODO: narrow at each vLLM bump. vLLM 0.33 drops the Triton requirement and
+    still refuses ``custom_class``. Upstream main removes ``custom_class`` and the
+    V1 runner, and TT must then register its drafter as a custom speculator
     (vllm-project/vllm#63205).
     """
     from vllm.config import vllm as vllm_config_module
