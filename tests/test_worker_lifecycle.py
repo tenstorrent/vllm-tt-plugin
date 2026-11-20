@@ -15,10 +15,6 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1,
-    SupportsHMA,
-)
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
@@ -26,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from tests.test_kv_connector import FakeKVConnector
 from vllm_tt_plugin import worker
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
@@ -228,54 +225,23 @@ def test_a_worker_without_token_kv_refuses_an_ar_runner(monkeypatch):
     worker_instance.shutdown()
 
 
-class _NoOpConnector(KVConnectorBase_V1, SupportsHMA):
-    """A connector that transfers nothing; only its lifecycle is observed."""
-
-    handshake_metadata = None
-
-    def get_handshake_metadata(self):
-        return self.handshake_metadata
-
-    def start_load_kv(self, forward_context, **kwargs):
-        pass
-
-    def wait_for_layer_load(self, layer_name):
-        pass
-
-    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
-        pass
-
-    def wait_for_save(self):
-        pass
-
-    def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        return 0, False
-
-    def update_state_after_alloc(self, request, blocks, num_external_tokens):
-        pass
-
-    def build_connector_meta(self, scheduler_output):
-        return None
-
-    def request_finished_all_groups(self, request, block_ids):
-        return False, None
-
-
 @pytest.mark.parametrize("handshake_metadata", [None, object()])
 def test_a_worker_owns_the_worker_side_kv_connector(monkeypatch, handshake_metadata):
     worker_instance, steps = _worker(monkeypatch, _ARWorker)
 
-    # Configure a connector; vLLM loads the class by name from this module.
+    # Configure a connector; vLLM loads the class by name from its module.
     worker_instance.vllm_config.kv_transfer_config = KVTransferConfig(
-        kv_connector="_NoOpConnector",
-        kv_connector_module_path=__name__,
+        kv_connector="FakeKVConnector",
+        kv_connector_module_path=FakeKVConnector.__module__,
         kv_role="kv_both",
     )
-    monkeypatch.setattr(_NoOpConnector, "handshake_metadata", handshake_metadata)
+    monkeypatch.setattr(
+        FakeKVConnector, "get_handshake_metadata", lambda _self: handshake_metadata
+    )
 
     # Record the connector's shutdown so its order can be checked below.
     monkeypatch.setattr(
-        _NoOpConnector, "shutdown", lambda _self: steps.append("connector shutdown")
+        FakeKVConnector, "shutdown", lambda _self: steps.append("connector shutdown")
     )
 
     # The platform config hook, stubbed out above, installs this in a server.
@@ -289,7 +255,7 @@ def test_a_worker_owns_the_worker_side_kv_connector(monkeypatch, handshake_metad
     # initialize_from_config creates the connector.
     worker_instance.initialize_from_config(_engine_kv_cache_config(worker_instance))
     connector = get_kv_transfer_group()
-    assert isinstance(connector, _NoOpConnector)
+    assert isinstance(connector, FakeKVConnector)
 
     # The handshake is None without metadata, otherwise keyed by rank (0, 0).
     expected = None if handshake_metadata is None else {(0, 0): handshake_metadata}

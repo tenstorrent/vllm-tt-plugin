@@ -22,7 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.test_block_scheduler import BLOCK_SIZE, _request
@@ -48,11 +48,15 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         # Scheduler half: tokens of external KV to offer per request ID.
         self.external_tokens: dict[str, int] = {}
         self.pending_loads: dict[str, list[int]] = {}
-        # Scheduler half: finished requests it was told of when building metadata.
+        # Either half: finished requests it was told of. The scheduler half hears
+        # when building metadata, the worker half when asked what has finished.
         self.finished_requests: set[str] = set()
         # Worker half: loads it was told to start, and what to report next.
         self.loads_started: dict[str, list[int]] = {}
         self.finished_recving: set[str] = set()
+        self.finished_sending: set[str] = set()
+        # Scheduler half: keep a finished request's blocks until its KV is sent.
+        self.delay_free = False
 
     # Worker half.
 
@@ -75,8 +79,10 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_finished(self, finished_req_ids):
         self.calls.append("get_finished")
+        self.finished_requests |= finished_req_ids
+        finished_sending, self.finished_sending = self.finished_sending, set()
         finished_recving, self.finished_recving = self.finished_recving, set()
-        return None, finished_recving
+        return finished_sending, finished_recving
 
     def clear_connector_metadata(self):
         self.calls.append("clear")
@@ -100,7 +106,7 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         return meta
 
     def request_finished_all_groups(self, request, block_ids):
-        return False, None
+        return self.delay_free, None
 
 
 @pytest.fixture
@@ -117,22 +123,31 @@ def worker_connector(monkeypatch, vllm_config):
     return connector
 
 
-def _scheduler_output(*, scheduled: bool) -> SchedulerOutput:
+def _scheduler_output() -> SchedulerOutput:
     output = SchedulerOutput.make_empty()
     output.kv_connector_metadata = FakeKVMetadata({"parked": [3]})
-    if scheduled:
-        output.num_scheduled_tokens = {"req-0": 1}
-        output.total_num_scheduled_tokens = 1
+    output.num_scheduled_tokens = {"req-0": 1}
+    output.total_num_scheduled_tokens = 1
     return output
-
-
-def _runner_output() -> ModelRunnerOutput:
-    return ModelRunnerOutput(req_ids=["req-0"], req_id_to_index={"req-0": 0})
 
 
 def _runner(vllm_config, calls: list[str], *, async_decode: bool) -> SimpleNamespace:
     """A runner whose forward and sampling are doubles, as in the grammar tests."""
     model_input = _model_input()
+    scheduled: list[str] = []
+
+    def build_model_input(scheduler_output, _grammar):
+        scheduled[:] = scheduler_output.num_scheduled_tokens
+        return model_input if scheduled else None
+
+    def _runner_output(*_args, **_kwargs):
+        return ModelRunnerOutput(
+            req_ids=list(scheduled),
+            req_id_to_index={req_id: i for i, req_id in enumerate(scheduled)},
+            sampled_token_ids=[[7] for _ in scheduled],
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
 
     def forward(received_input):
         calls.append("forward")
@@ -142,7 +157,7 @@ def _runner(vllm_config, calls: list[str], *, async_decode: bool) -> SimpleNames
         calls.append("forward")
         controller = SimpleNamespace(
             complete_decode_step=lambda **_kwargs: SimpleNamespace(),
-            build_runner_output_from_completed_step=lambda _done: _runner_output(),
+            build_runner_output_from_completed_step=_runner_output,
             enqueue_completed_decode_step=lambda _done: None,
         )
         return AsyncTTModelRunnerOutput(
@@ -160,12 +175,10 @@ def _runner(vllm_config, calls: list[str], *, async_decode: bool) -> SimpleNames
         async_decode_scheduling=async_decode,
         scheduler_config=SimpleNamespace(async_scheduling=async_decode),
         _pending_samples=deque(),
-        build_model_input=lambda scheduler_output, _grammar: (
-            model_input if scheduler_output.total_num_scheduled_tokens else None
-        ),
+        build_model_input=build_model_input,
         _forward_with_model_input=forward,
         _sample_sync_forward=lambda _fwd: ([torch.tensor([[42]])], [None]),
-        apply_and_build_runner_output=lambda *_args, **_kwargs: _runner_output(),
+        apply_and_build_runner_output=_runner_output,
         _num_speculative_tokens=0,
     )
     for name in (
@@ -186,9 +199,7 @@ def test_a_forward_step_runs_inside_the_connector_step(
     calls = worker_connector.calls
     runner = _runner(vllm_config, calls, async_decode=async_decode)
 
-    assert (
-        TTModelRunner.execute_model(runner, _scheduler_output(scheduled=True)) is None
-    )
+    assert TTModelRunner.execute_model(runner, _scheduler_output()) is None
     output = TTModelRunner.sample_tokens(runner, None)
     if async_decode:
         output = output.get_output()
@@ -206,32 +217,10 @@ def test_a_forward_step_runs_inside_the_connector_step(
     assert output.kv_connector_output.finished_recving == {"parked"}
 
 
-def test_a_zero_token_step_still_polls_the_connector(vllm_config, worker_connector):
-    # A request parked on a remote load schedules no tokens. With nothing else
-    # running, this step is the only one that can report its load as finished.
-    worker_connector.finished_recving = {"parked"}
-    runner = _runner(vllm_config, worker_connector.calls, async_decode=False)
-
-    output = TTModelRunner.execute_model(runner, _scheduler_output(scheduled=False))
-
-    assert worker_connector.calls == [
-        "bind",
-        "start_load_kv",
-        "wait_for_save",
-        "get_finished",
-        "clear",
-    ]
-    assert worker_connector.loads_started == {"parked": [3]}
-    assert output.kv_connector_output.finished_recving == {"parked"}
-    assert not runner._pending_samples
-
-
 def test_a_step_without_a_connector_reports_no_connector_output(vllm_config):
     runner = _runner(vllm_config, [], async_decode=False)
 
-    assert (
-        TTModelRunner.execute_model(runner, _scheduler_output(scheduled=True)) is None
-    )
+    assert TTModelRunner.execute_model(runner, _scheduler_output()) is None
     output = TTModelRunner.sample_tokens(runner, None)
 
     assert output.kv_connector_output is None
@@ -250,48 +239,60 @@ def _scheduler_with_running_decode():
     )
     scheduler.add_request(_request(8, request_id="A"))
     prefill = scheduler.schedule()
-    scheduler.update_from_output(prefill, _decode_output(prefill))
+    scheduler.update_from_output(prefill, _block_runner_output(prefill, [7]))
     return scheduler
 
 
-def _decode_output(scheduler_output, **connector_results) -> ModelRunnerOutput:
-    output = _block_runner_output(scheduler_output, [7])
-    if connector_results:
-        output.kv_connector_output = KVConnectorOutput(**connector_results)
-    return output
+def _run_step(scheduler, runner) -> SchedulerOutput:
+    """One engine step: schedule, run the forward, sample, report back."""
+    step = scheduler.schedule()
+    output = TTModelRunner.execute_model(runner, step)
+    if output is None:
+        output = TTModelRunner.sample_tokens(runner, None)
+    scheduler.update_from_output(step, output)
+    return step
 
 
-def test_a_remote_load_is_not_lost_when_the_step_falls_back_to_decode():
+@pytest.mark.parametrize("another_request_is_decoding", [False, True])
+def test_a_request_loads_remote_kv_then_holds_its_blocks_until_sent(
+    worker_connector, another_request_is_decoding
+):
+    """One request through the whole connector lifecycle, scheduler to runner."""
     scheduler = _scheduler_with_running_decode()
-    # The connector holds B's first block; B computes the rest itself.
+    runner = _runner(scheduler.vllm_config, [], async_decode=False)
+    # C is aborted before the step, so the step must tell both halves about it.
+    scheduler.add_request(_request(8, request_id="C"))
+    aborted = {"C"} if another_request_is_decoding else {"A", "C"}
+    scheduler.finish_requests(aborted, RequestStatus.FINISHED_ABORTED)
     scheduler.connector.external_tokens["B"] = BLOCK_SIZE
-    request = _request(8, request_id="B", prompt_length=BLOCK_SIZE + 40)
+    scheduler.connector.delay_free = True
+    request = _request(1, request_id="B", prompt_length=BLOCK_SIZE + 40)
     scheduler.add_request(request)
 
-    # The prefill pass parks B and schedules nothing, so A's decode runs.
-    step = scheduler.schedule()
-
-    assert set(step.num_scheduled_tokens) == {"A"}
+    # B is parked on its load. The instruction reaches the worker half, either
+    # with A's decode or on a step that schedules no tokens at all.
+    step = _run_step(scheduler, runner)
+    scheduled = {"A"} if another_request_is_decoding else set()
+    assert set(step.num_scheduled_tokens) == scheduled
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     (b_block_ids,) = scheduler.kv_cache_manager.get_block_ids("B")
-    assert step.kv_connector_metadata.loads == {"B": b_block_ids}
+    assert worker_connector.loads_started == {"B": b_block_ids}
+    assert scheduler.connector.finished_requests == aborted
+    assert worker_connector.finished_requests == aborted
 
-    scheduler.update_from_output(step, _decode_output(step, finished_recving={"B"}))
-    step = scheduler.schedule()
+    # The worker half reports the load; the scheduler hears it on that step's
+    # output and prefills the rest of B's prompt on the next one.
+    worker_connector.finished_recving = {"B"}
+    _run_step(scheduler, runner)
+    step = _run_step(scheduler, runner)
+    assert step.num_scheduled_tokens["B"] == 40
 
-    assert step.num_scheduled_tokens == {"B": 40}
-
-
-def test_a_finished_request_reaches_the_connector_when_the_step_falls_back_to_decode():
-    scheduler = _scheduler_with_running_decode()
-    # B parks on a remote load, so the prefill pass schedules nothing.
-    scheduler.connector.external_tokens["B"] = BLOCK_SIZE
-    scheduler.add_request(_request(8, request_id="B", prompt_length=BLOCK_SIZE + 40))
-    scheduler.add_request(_request(8, request_id="C"))
-    scheduler.finish_requests("C", RequestStatus.FINISHED_ABORTED)
-
-    step = scheduler.schedule()
-
-    assert set(step.num_scheduled_tokens) == {"A"}
-    assert scheduler.connector.finished_requests == {"C"}
-    assert step.finished_req_ids == {"C"}
+    # B's one token finished it, but the connector asked to send its KV first.
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    block_pool = scheduler.kv_cache_manager.block_pool
+    free_blocks_while_held = block_pool.get_num_free_blocks()
+    assert "B" in scheduler.requests
+    worker_connector.finished_sending = {"B"}
+    _run_step(scheduler, runner)
+    assert "B" not in scheduler.requests
+    assert block_pool.get_num_free_blocks() == free_blocks_while_held + 2
