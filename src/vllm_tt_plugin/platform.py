@@ -40,6 +40,7 @@ from vllm_tt_plugin.config import (
     tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
+    validate_tt_kv_transfer_config,
     validate_tt_lane_config,
     validate_tt_scheduler_config,
 )
@@ -2609,6 +2610,7 @@ class TTPlatform(Platform):
                 )
         store_tt_spec_plan(vllm_config, spec_plan)
 
+        validate_tt_kv_transfer_config(vllm_config)
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
             getattr(model_config, "is_moe", False)
