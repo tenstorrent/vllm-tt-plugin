@@ -1026,14 +1026,9 @@ class TTModelRunner:
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
-        # A request resumed in the step that reports its preemption (after
-        # ``reset_prefix_cache(reset_running_requests=True)``) is scheduled but
-        # its row lists the freed blocks, so it is removed here and re-added
-        # with the new ones, as upstream's V1 runner does.
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1068,23 +1063,19 @@ class TTModelRunner:
             )
             req_ids_to_add.append(req_id)
 
-        # Update the states of the running/resumed requests.
+        # Update the states of the running requests.
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_id in req_data.resumed_req_ids
 
             # Update the cached states.
-            apply_cached_req_state_update(
-                req_state, num_computed_tokens, new_block_ids, resumed_from_preemption
-            )
+            apply_cached_req_state_update(req_state, num_computed_tokens, new_block_ids)
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
-                # The request is not in the persistent batch.
-                # The request was either preempted and resumed later, or was not
+                # The request is not in the persistent batch: it was not
                 # scheduled in the previous step and needs to be added again.
                 req_ids_to_add.append(req_id)
                 continue
@@ -2433,21 +2424,15 @@ class TTModelRunner:
             )
 
         # A "prefill" step can contain:
-        # - brand new requests (scheduled_new_reqs), and/or
-        # - resumed-from-preemption requests (scheduled_cached_reqs with
-        #   resumed_req_ids set) that need to replay tokens to rebuild KV,
-        #   and/or
+        # - new requests (scheduled_new_reqs), which include requests resumed
+        #   after preemption that replay their tokens to rebuild KV, and/or
         # - chunked-prefill continuations: cached requests that have not
-        #   computed all their prompt tokens yet.
+        #   computed all their prompt tokens, or all of a resume's replay, yet.
         has_chunked_continuation = any(
-            _is_still_prefilling(req_id)
-            for req_id in cached_reqs.req_ids
-            if req_id not in cached_reqs.resumed_req_ids
+            _is_still_prefilling(req_id) for req_id in cached_reqs.req_ids
         )
         is_prompt = (
-            len(scheduler_output.scheduled_new_reqs) > 0
-            or bool(cached_reqs.resumed_req_ids)
-            or has_chunked_continuation
+            len(scheduler_output.scheduled_new_reqs) > 0 or has_chunked_continuation
         )
         sample_params = input_batch.sampling
         intermediate_prefill_mask: torch.Tensor | None = None
@@ -2894,8 +2879,12 @@ class TTModelRunner:
         # Update scheduler-owned state before accepting any older async result.
         # Reject late results for request IDs already reported finished. The
         # result that finished the request was accepted earlier. Ordinary
-        # preemption or resume keeps a completed token valid for replay. Only a
-        # forced prefix-cache reset marks an in-flight result for discard.
+        # preemption or resume keeps a completed token valid for replay. A
+        # forced prefix-cache reset marks an in-flight result for discard. A
+        # result submitted before its request was rebuilt from
+        # ``scheduled_new_reqs`` (``SubmittedStepContext.rebuilt_req_ids``)
+        # stays published but is not applied: the rebuilt record already holds
+        # the tokens vLLM accepted.
         self._update_states(scheduler_output)
         if (
             self.async_decode.decode_input_update_contract_version() < 1
@@ -4645,8 +4634,8 @@ class TTModelRunner:
         # coordinator's free list sends it. The live row is still the right
         # target, because ``InputBatch.add_request`` re-derives ``num_tokens``
         # from the request state when it places the request. ``skip_req_ids``
-        # (finished requests and forced-reset frames) is checked before any
-        # row is resolved.
+        # (finished requests, forced-reset frames, and requests rebuilt since
+        # the step was submitted) is checked before any row is resolved.
         use_captured_req_ids = req_ids is not None
         num_reqs = len(req_ids) if req_ids is not None else self.input_batch.num_reqs
         num_out_tokens = self._tt_committed_width(sampled_token_ids)

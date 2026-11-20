@@ -96,7 +96,7 @@ def test_pre_register_reinstalls_the_architecture_patch(
 ):
     # VLLM_PLUGINS=tt keeps the platform but drops the general-plugins entry
     # point, so this hook must reinstall the (idempotent) rewrite.
-    monkeypatch.setattr(tt_platform, "_pin_v1_model_runner", lambda: None)
+    monkeypatch.setattr(tt_platform, "_pin_v2_model_runner", lambda: None)
     monkeypatch.setattr(
         tt_platform, "_install_tt_harmony_truncation_patch", lambda: None
     )
