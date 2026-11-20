@@ -5,7 +5,7 @@
 The tests start their server from vLLM-Omni's CUDA deploy config, which puts both
 stages on device 0. This pytest plugin swaps in the TT deploy config, and optionally
 another checkpoint, on every collected test before its server starts. The test files
-themselves run unchanged. From a vLLM-Omni v0.30.0 checkout:
+themselves run unchanged. From a vLLM-Omni v0.32.0 checkout:
 
     PYTHONPATH=<this dir> python -m pytest -p e2e_tt_plugin --run-level full_model \\
         tests/e2e/online_serving/test_qwen3_tts_base.py \\

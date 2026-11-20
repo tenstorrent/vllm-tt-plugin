@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
     KVCacheConfig,
     KVCacheGroupSpec,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout  # noqa: E402
 from vllm.v1.outputs import ModelRunnerOutput  # noqa: E402
 from vllm.v1.request import RequestStatus  # noqa: E402
 from vllm.v1.structured_output import StructuredOutputManager  # noqa: E402
@@ -124,6 +125,8 @@ def _omni_scheduler(
             device_config=DeviceConfig(device="cpu"),
         )
     config.scheduler_config.async_scheduling = async_scheduling
+    # The engine core resolves the layout before building the scheduler.
+    config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
     store_tt_output_tokens_per_step(config, 1)
     if stage_outputs:
         resolve_tt_supports_stage_outputs(

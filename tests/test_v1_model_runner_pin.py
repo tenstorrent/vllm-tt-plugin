@@ -79,5 +79,10 @@ def test_the_pin_defeats_the_upstream_default_for_any_config():
 
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
-    cfg = SimpleNamespace(attention_config=SimpleNamespace(hisparse_config=None))
+    # model_config: importing vLLM-Omni wraps the property and reads it first;
+    # a non-Omni model config falls through to the upstream property.
+    cfg = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(),
+    )
     assert VllmConfig.use_v2_model_runner.fget(cfg) is False
