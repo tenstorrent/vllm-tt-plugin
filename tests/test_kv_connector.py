@@ -22,6 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -55,6 +60,7 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         self.loads_started: dict[str, list[int]] = {}
         self.finished_recving: set[str] = set()
         self.finished_sending: set[str] = set()
+        self.kv_caches = None
         # Scheduler half: keep a finished request's blocks until its KV is sent.
         self.delay_free = False
 
@@ -63,6 +69,9 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_connector_metadata(self, connector_metadata):
         self.calls.append("bind")
         super().bind_connector_metadata(connector_metadata)
+
+    def register_kv_caches(self, kv_caches):
+        self.kv_caches = kv_caches
 
     def start_load_kv(self, forward_context, **kwargs):
         self.calls.append("start_load_kv")
@@ -241,6 +250,48 @@ def _scheduler_with_running_decode():
     prefill = scheduler.schedule()
     scheduler.update_from_output(prefill, _block_runner_output(prefill, [7]))
     return scheduler
+
+
+def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
+    """``TTModelRunner.initialize_kv_cache`` over a model holding ``kv_caches``."""
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    runner = SimpleNamespace(
+        tt_max_batch_size=2,
+        model_config=SimpleNamespace(max_model_len=BLOCK_SIZE),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=BLOCK_SIZE),
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
+        vocab_size=8,
+        _is_lane_mode=False,
+        _host_logitsprocs=None,
+        _is_block_output_model=False,
+        _output_tokens_per_step=1,
+        _validate_kv_cache_groups=TTModelRunner._validate_kv_cache_groups,
+        _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
+    )
+    TTModelRunner.initialize_kv_cache(
+        runner,
+        KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names, spec)],
+        ),
+    )
+
+
+def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
+    layer_names = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
+
+    _initialize_kv_cache(layer_names, [["k0", "v0"], ["k1", "v1"]])
+
+    assert list(worker_connector.kv_caches) == layer_names
+    for description in worker_connector.kv_caches.values():
+        # (num_blocks, num_kv_heads, block_size, K and V of head_size 1)
+        assert description.shape == (4, 1, BLOCK_SIZE, 2)
+        assert description.dtype == torch.float32
+        # One element stands in for the whole shape.
+        assert description.untyped_storage().nbytes() == 4
 
 
 def _run_step(scheduler, runner) -> SchedulerOutput:

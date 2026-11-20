@@ -43,6 +43,21 @@ storage, device execution, and any model-specific state.
    releases to optional model hooks. `TTWorker.shutdown` releases persistent
    captures before mesh close.
 
+## KV connectors
+
+With `--kv-transfer-config`, the single-process path without data parallelism
+runs vLLM's KV connector lifecycle; lane-DP and multi-process DP reject the
+option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
+`register_kv_caches` once, after the model adapter allocates KV storage. The
+argument is a dictionary keyed by the layer names in `kv_cache_config`. Each
+value is a torch tensor that only describes that layer's KV cache: it has
+vLLM's logical shape `(num_blocks, num_kv_heads, block_size, 2 * head_size)`
+and the spec's dtype, and holds no KV. The KV stays in the ttnn tensors the
+adapter allocated.
+
+A model class without a `get_kv_cache_spec` hook gets one layer name per
+attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
+
 ## Minimum implementation
 
 An ordinary text adapter needs `initialize_vllm_model`, `prefill_forward`,

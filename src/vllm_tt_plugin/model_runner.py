@@ -16,7 +16,7 @@ import regex as re
 import torch
 import ttnn
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import set_forward_context
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -72,6 +72,7 @@ from vllm_tt_plugin.input_batch import (
     drop_unbounded_top_k_top_p,
     log_prefill_chunks,
 )
+from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
@@ -748,6 +749,10 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(
+                kv_cache_descriptions(kv_cache_config)
+            )
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
