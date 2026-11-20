@@ -4,7 +4,7 @@
 
 """N-gram draft proposals from a request's own token history.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/spec_decode/ngram_proposer.py``. The
+Adapted from vLLM v0.32.0 ``vllm/v1/spec_decode/ngram_proposer.py``. The
 proposer runs on host arrays and needs numba, which only n-gram speculation
 uses, so import this module lazily.
 """

@@ -4,7 +4,7 @@
 
 """Top-k and top-p filtering followed by random sampling, in PyTorch.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/ops/topk_topp_sampler.py``, keeping
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/ops/topk_topp_sampler.py``, keeping
 only the PyTorch-native sampler: the TT host sampler runs on CPU tensors.
 """
 

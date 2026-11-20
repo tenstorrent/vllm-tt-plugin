@@ -4,10 +4,11 @@
 
 """The host sampler.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/sampler.py``, without the inputs the
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/sampler.py``, without the inputs the
 TT runner never sets (logprob token ids, speculative tokens, thinking budget),
-and with the custom logits processors applied after the penalties, where
-vLLM's V2 interface places them.
+without the CPU-platform greedy kernel (``torch.ops._C.greedy_argmax``), and
+with the custom logits processors applied after the penalties, where vLLM's V2
+interface places them.
 """
 
 import torch

@@ -4,7 +4,7 @@
 
 """Host logits processors.
 
-``build_logitsprocs`` is adapted from vLLM v0.31.0
+``build_logitsprocs`` is adapted from vLLM v0.32.0
 ``vllm/v1/sample/logits_processor/__init__.py``. Custom processors use vLLM's
 V2 interface; see ``custom.py``.
 """

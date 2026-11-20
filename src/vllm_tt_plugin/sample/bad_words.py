@@ -4,7 +4,7 @@
 
 """Bad-words exclusion.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/ops/bad_words.py``.
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/ops/bad_words.py``.
 """
 
 import torch

@@ -4,7 +4,7 @@
 
 """Presence, frequency and repetition penalties on host logits.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/ops/penalties.py``.
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/ops/penalties.py``.
 """
 
 import numpy as np

@@ -4,7 +4,7 @@
 
 """Batch-update collection and the set of loaded host logits processors.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/logits_processor/state.py``.
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/logits_processor/state.py``.
 """
 
 from collections.abc import Iterable, Iterator

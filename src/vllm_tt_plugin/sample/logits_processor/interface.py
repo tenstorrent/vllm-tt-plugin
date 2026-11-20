@@ -4,7 +4,7 @@
 
 """How host logits processors follow the persistent batch.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/logits_processor/interface.py``.
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/logits_processor/interface.py``.
 A processor here keeps per-row state: the runner reports each step's
 additions, removals and moves of persistent-batch rows as a ``BatchUpdate``,
 and ``apply`` receives logits whose row ``i`` is persistent-batch row ``i``.

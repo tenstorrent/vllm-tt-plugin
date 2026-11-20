@@ -4,7 +4,7 @@
 
 """Built-in host logits processors: min_p, logit_bias and min_tokens.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/logits_processor/builtin.py``, with
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/logits_processor/builtin.py``, with
 all state on the host.
 """
 

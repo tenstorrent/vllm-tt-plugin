@@ -92,7 +92,6 @@ def _batch(max_num_reqs=4, processors=(BoostFromParams, Recorder)):
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=build_logitsprocs(
             _config(max_num_reqs), custom_logitsprocs=list(processors)
         ),
@@ -182,7 +181,6 @@ def test_lane_gap_rows_are_not_shown_to_the_processors():
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=build_logitsprocs(
             _config(num_lanes * per_lane),
             custom_logitsprocs=[BoostFromParams, Recorder],
@@ -349,7 +347,6 @@ def _front_packed_runner(*processors):
         max_model_len=stage.MAX_MODEL_LEN,
         vocab_size=stage.VOCAB_SIZE,
         block_sizes=[stage.BLOCK_SIZE],
-        kernel_block_sizes=[stage.BLOCK_SIZE],
         logitsprocs=build_logitsprocs(
             _config(stage.MAX_NUM_REQS), custom_logitsprocs=list(processors)
         ),
@@ -457,7 +454,6 @@ def test_lane_requests_keep_their_slot_until_finish_or_preemption():
         max_model_len=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=build_logitsprocs(_config(2), custom_logitsprocs=[CountsSteps]),
     )
     (counter,) = batch.sampling.logitsprocs.custom.processors

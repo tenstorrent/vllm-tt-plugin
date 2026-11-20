@@ -4,7 +4,7 @@
 
 """Per-request state that the TT model runner keeps across scheduler steps.
 
-Adapted from ``CachedRequestState`` in vLLM v0.31.0
+Adapted from ``CachedRequestState`` in vLLM v0.32.0
 ``vllm/v1/worker/gpu_input_batch.py``, reduced to the fields the TT runner
 reads.
 """

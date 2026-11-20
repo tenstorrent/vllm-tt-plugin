@@ -4,7 +4,7 @@
 
 """Per-step sampling inputs of the host sampler.
 
-Adapted from vLLM v0.31.0 ``vllm/v1/sample/metadata.py``, without the fields
+Adapted from vLLM v0.32.0 ``vllm/v1/sample/metadata.py``, without the fields
 the TT runner never sets (logprob token ids, speculative token ids, thinking
 budget).
 """
