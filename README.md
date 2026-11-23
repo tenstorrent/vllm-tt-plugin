@@ -36,6 +36,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- spec_admission.py    # Speculative configuration and model-plan validation
 |   +-- spec_decode.py       # Candidate/verification types and greedy acceptance
 |   +-- spec_accept.py       # Host sampled acceptance for the logits accept mode
+|   +-- parsers/             # Model-output adapters and lazy parser registration
 |   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
@@ -167,6 +168,23 @@ If `VLLM_PLUGINS` is set, it must allow both TT entry point names:
 ```bash
 export VLLM_PLUGINS=tt,tt_model_registry
 ```
+
+### Model-output parsers
+
+The general plugin entry point also calls
+[`parsers.registration.register_parsers`](src/vllm_tt_plugin/parsers/registration.py).
+It registers missing names lazily and preserves existing upstream or third-party
+registrations. Importing `parsers` itself loads no parser implementations.
+
+| Parser name | Reasoning | Tool calls |
+|---|---|---|
+| `kolibri1` | [Kolibri adapter](src/vllm_tt_plugin/parsers/kolibri1.py) over Qwen3, matching the model's thinking switches and assistant continuations | Upstream Hermes parser alias |
+
+Serve Kolibri with `--reasoning-parser kolibri1 --enable-auto-tool-choice
+--tool-call-parser kolibri1`. Gemma4 uses the parsers provided by upstream vLLM.
+Local adapters belong in `parsers/` while the pinned upstream version lacks
+their required behavior; their module docstrings describe that difference and
+when upstream can replace them.
 
 ## Hugging Face Access
 

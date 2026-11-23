@@ -1,13 +1,15 @@
 # Tests
 
-Tests follow the component and boundary they exercise. The logprobs pilot uses
-this layout; existing tests at the root and under `spec/` remain in place until
-their owning area is reorganized.
+Tests follow the component and boundary they exercise. Logprobs, logging, and
+model-output parsers use this layout; existing tests at the root and under
+`spec/` remain in place until their owning area is reorganized.
 
 | Location | Scope |
 |---|---|
 | [unit/test_logprobs.py](unit/test_logprobs.py) | Public packing helpers, deterministic tensor inputs, shapes, ranks, and ownership |
 | [unit/test_logger.py](unit/test_logger.py) | Logger setup, warning deduplication, record context, and stdlib-only startup |
+| [unit/parsers/test_kolibri1.py](unit/parsers/test_kolibri1.py) | Kolibri thinking switches, reasoning/content extraction, streaming, and input ownership |
+| [integration/test_parser_registration.py](integration/test_parser_registration.py) | General entry point and vLLM registries: lazy resolution, aliases, repeated setup, and existing-name precedence |
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
@@ -50,11 +52,12 @@ Check the import origin before running:
 "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 ```
 
-Run the executable examples in the logger and logprobs modules:
+Run the executable examples in the logger, logprobs, and parser modules:
 
 ```bash
 PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest --doctest-modules \
-  src/vllm_tt_plugin/logger.py src/vllm_tt_plugin/logprobs.py
+  src/vllm_tt_plugin/logger.py src/vllm_tt_plugin/logprobs.py \
+  src/vllm_tt_plugin/parsers
 ```
 
 To narrow a run, replace the suite directory with a file or node ID, retaining
@@ -85,6 +88,13 @@ keeps unit tests independent of engine-reset setup. Unit tests still import the
 software dependencies of the component under test, including vLLM output types.
 
 Integration tests inherit [the root fixtures](conftest.py), which restore runtime
-patches and platform state. Their model-input fixture is local and uses the real
-`TTModelInput` and `TTSamplingParams` data classes. Both pilot modules import
-their shared ranked payload from `support/logprobs.py`.
+patches and platform state. Decode/logprob integration tests keep their model-input
+fixture local and use the real `TTModelInput` and `TTSamplingParams` data classes.
+The logprob unit and integration modules import their shared ranked payload from
+`support/logprobs.py`.
+
+Parser registration integration tests use the real vLLM managers with copied
+eager and lazy registries, restored after each test. They replace model
+registration when exercising the general entry point so the check stays focused
+on parser activation. Kolibri unit tests use a deterministic tokenizer and real
+chat request objects, with no downloaded model files.
