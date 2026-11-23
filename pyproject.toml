@@ -7,7 +7,7 @@ name = "vllm-tt-plugin"
 dynamic = ["version"]
 description = "Tenstorrent backend plugin for vLLM"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 # The prepared environment owns the runtime stack; see README.md#dependency-ownership.
 dependencies = ["PyYAML", "regex"]

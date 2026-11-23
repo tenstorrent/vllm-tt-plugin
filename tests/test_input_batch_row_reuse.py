@@ -45,7 +45,6 @@ def _batch() -> InputBatch:
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
         logitsprocs=build_logitsprocs(
             config, torch.device("cpu"), is_pin_memory=False, is_pooling_model=False
         ),

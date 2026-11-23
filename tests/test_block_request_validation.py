@@ -244,6 +244,8 @@ def _config(
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=1024,
+            max_num_encoder_input_tokens=1024,
+            encoder_cache_size=1024,
             max_num_scheduled_tokens=None,
             enable_chunked_prefill=True,
             long_prefill_token_threshold=128,

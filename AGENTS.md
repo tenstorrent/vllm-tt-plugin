@@ -110,7 +110,8 @@ There are two environments, and most work needs only the first.
 
 The host suite requires no Tenstorrent hardware. `tests/host-stubs/ttnn/`
 supplies an import-only `ttnn` stand-in whose device entry points raise.
-Work from the repository root with `uv` installed. CI covers Python 3.12.
+Work from the repository root with `uv` installed. vLLM requires Python 3.11
+or newer; CI covers Python 3.12.
 
 ```bash
 export VIRTUAL_ENV="$PWD/.venv"
@@ -163,7 +164,8 @@ The script therefore fetches `requirements/common.txt` for the pinned version
 explicitly, installs it, and then installs vLLM itself with `--no-deps` and
 `--no-binary vllm`.
 
-`docs/vllm-overrides.txt` forces `numpy<2` and `opencv-python-headless==4.11.0.86`.
+`docs/vllm-overrides.txt` forces `numpy<2` and `opencv-python-headless==4.11.0.86`,
+and sets the whole `transformers` range of the install.
 `numpy<2` wins because tt-metal fixes it and it cannot be moved from here.
 
 **When bumping the pinned vLLM version, all of the following must change
@@ -229,8 +231,9 @@ cancels an in-progress run. `required-checks` gates on `pre-commit` and all
 The [stubbed host workflow](.github/workflows/host-tests-stubbed.yaml) tests
 Python 3.12 through the documented install script. The release watcher
 also uses it for compatibility checks. `host-tests-ttnn` tests real `ttnn`
-release images without hardware and is advisory. Its tag resolution is
-independent of the required stubbed job. Both install pytest through `.[dev]`.
+Ubuntu 24.04 release images without hardware and is advisory. Its tag
+resolution is independent of the required stubbed job. Both install pytest
+through `.[dev]`.
 
 CI resolves torch from tt-metal's `tt_metal/python_env/requirements-dev.txt`
 using [.github/scripts/tt-metal-torch-pin.sh](.github/scripts/tt-metal-torch-pin.sh):

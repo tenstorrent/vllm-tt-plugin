@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.sample.logits_processor import build_logitsprocs
@@ -129,6 +130,8 @@ def _scheduler(
             device_config=DeviceConfig(device="cpu"),
         )
     config.scheduler_config.async_scheduling = async_scheduling
+    # EngineCore resolves the KV cache layout before it builds the scheduler.
+    config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
     if diffusion_checkpoint:
         # Reproduce the platform hook's post-update state, including
         # invalidation of ModelConfig.is_diffusion's cached True value.
@@ -255,7 +258,6 @@ def test_prefill_fallback_releases_finished_runner_state(async_scheduling):
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=64,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
 
     prefill = scheduler.schedule()
@@ -456,7 +458,6 @@ def test_repaired_bypassed_request_keeps_block_step_on_device_sampling(repaired)
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=64,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
         logitsprocs=build_logitsprocs(
             SimpleNamespace(
                 speculative_config=None,
@@ -1078,6 +1079,9 @@ def test_a_stage_output_model_counts_sliding_groups_by_their_window(max_num_seqs
     config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=max_model_len),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC
+        ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         attention_config=SimpleNamespace(hisparse_config=None),
         max_in_flight_tokens=in_flight,

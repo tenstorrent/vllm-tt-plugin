@@ -308,7 +308,7 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
     max_model_len = vllm_config.model_config.max_model_len
     per_request = -(
         -_max_memory_usage_bytes_from_groups(vllm_config, groups)
-        // _pool_bytes_per_block(groups)
+        // _pool_bytes_per_block(vllm_config, groups)
     )
     needed = max_num_seqs * per_request
     # Block 0 is vLLM's null block, never handed to a request.
@@ -360,10 +360,11 @@ class TTScheduler(AsyncScheduler):
       The base class marks them stale, appends them on arrival without
       touching the placeholder count, and keeps the request waiting until
       they drain, so the resumed prefill replays them instead of sampling
-      against the old token history. Only the wholesale
-      ``reset_prefix_cache`` teardown drops stale output
-      (``Request.drop_stale_output``); wiring ordinary preemption into it
-      drops valid tokens and silently truncates the response.
+      against the old token history. Stale output is dropped
+      (``Request.drop_stale_output``) only by the wholesale
+      ``reset_prefix_cache`` teardown and when a resumable streaming-input
+      request stops; wiring ordinary preemption into it drops valid tokens and
+      silently truncates the response.
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting

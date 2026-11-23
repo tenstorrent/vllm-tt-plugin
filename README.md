@@ -29,7 +29,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
-|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.31.0)
+|   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.32.0)
 |   +-- loader.py            # TT model loader
 |   +-- input_batch.py       # TT input-batch representation
 |   +-- async_decode.py      # Decode overlap helpers
@@ -50,10 +50,12 @@ If testing a specific model, check the
 [TT-Metal LLMs table](https://github.com/tenstorrent/tt-metal?tab=readme-ov-file#llms)
 for the appropriate tt-metal and vLLM commits.
 
-vLLM requires Python `>=3.10,<3.14`. Python 3.10.12 is the default `python3` on
-Ubuntu 22.04.
+The plugin requires Python `>=3.11,<3.14`; vLLM 0.32.0 requires 3.11 or newer.
+tt-metal's Ubuntu 24.04 environment (Python 3.12) qualifies. The Ubuntu 22.04
+default `python3` (3.10) does not: on Python 3.10, use the `compat/vllm-0.31.0`
+tag (vLLM 0.31.0) as described below.
 
-The installation script builds vLLM `0.31.0` from source with
+The installation script builds vLLM `0.32.0` from source with
 `VLLM_TARGET_DEVICE=empty`.
 
 To install against older supported vLLM versions `X.Y.Z` instead (e.g., `0.25.1`),
@@ -91,7 +93,7 @@ does not describe or install the full serving stack.
 | vLLM, Transformers, and vLLM's common requirements | [install script](docs/install-vllm-tt.sh), subject to [dependency overrides](docs/vllm-overrides.txt) |
 | `torchvision` and `numba` | Install script, at explicit pins |
 | `PyYAML` and `regex` | Plugin runtime requirements in [pyproject.toml](pyproject.toml), also supplied by vLLM's common requirements |
-| `cloudpickle` | vLLM's common requirements; used by the retained MPI launcher, which upstream vLLM 0.31.0 does not hook into |
+| `cloudpickle` | vLLM's common requirements; used by the retained MPI launcher, which upstream vLLM 0.32.0 does not hook into |
 | `qwen-vl-utils` | Optional `examples` extra |
 | Test and lint tools | Optional `dev` extra; see the [testing guide](tests/README.md) |
 
@@ -422,8 +424,9 @@ python examples/server_example_tt.py \
 ```
 
 Device grammar works with and without async scheduling. Under async scheduling
-a structured decode step does not overlap with the next forward: the runner
-drains pending async work before it and samples after the mask arrives.
+steady structured decode can overlap token readback and host grammar updates
+with the next forward. Sampling waits for that step's grammar mask; transitions
+that require current host state still drain pending work before the forward.
 
 | Step | Sampling path |
 | --- | --- |

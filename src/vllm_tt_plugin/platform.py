@@ -217,6 +217,19 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     # for a model that cannot resume one.
     scheduler_config.long_prefill_token_threshold = 0
 
+    # When the encoder compute budget or encoder cache runs out, the base
+    # scheduler schedules only the tokens before a multimodal item, whatever
+    # ``enable_chunked_prefill`` says. A TT model runs its encoder inside
+    # ``prefill_forward`` and the runner keeps no encoder cache, so both only
+    # gate scheduling; sized to every token that can be in flight, they never do.
+    in_flight = scheduler_config.max_num_seqs * model_config.max_model_len
+    scheduler_config.max_num_encoder_input_tokens = max(
+        scheduler_config.max_num_encoder_input_tokens, in_flight
+    )
+    scheduler_config.encoder_cache_size = max(
+        scheduler_config.encoder_cache_size, in_flight
+    )
+
 
 def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
     """Fail here rather than at the first scheduler step in a worker subprocess."""
@@ -867,6 +880,59 @@ def _install_tt_harmony_truncation_patch() -> None:
         renderer_registry.cached_tokenizer_from_config = cached_tokenizer_from_config_tt
 
 
+# What upstream's xgrammar backend passes for ``disable_any_whitespace``, and
+# what TT passes instead.
+_XGRAMMAR_COMPACT_JSON_SEPARATORS = (",", ":")
+_XGRAMMAR_SPACED_JSON_SEPARATORS = (", ", ": ")
+
+
+class _TTSpacedJsonSeparatorsCompiler:
+    """Forward to an ``xgrammar.GrammarCompiler``, with spaced JSON separators."""
+
+    def __init__(self, compiler: Any) -> None:
+        self._compiler = compiler
+
+    def compile_json_schema(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("separators") == _XGRAMMAR_COMPACT_JSON_SEPARATORS:
+            kwargs["separators"] = _XGRAMMAR_SPACED_JSON_SEPARATORS
+        return self._compiler.compile_json_schema(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._compiler, name)
+
+
+def _install_tt_xgrammar_json_separators_patch() -> None:
+    """Allow one space after ``,`` and ``:`` in TT's whitespace-free JSON.
+
+    TT sets ``disable_any_whitespace`` (``_apply_check_and_update_config``).
+    The xgrammar backend turns it into ``separators=(",", ":")``, a grammar that
+    forbids the ``": "`` and ``", "`` that models emit between JSON fields.
+    Under that grammar Llama-3.1-8B and Qwen2.5-VL on TT fill string fields
+    with filler such as ``", "``. ``(", ", ": ")`` is xgrammar's own default for
+    ``any_whitespace=False``: still no free whitespace, so the whitespace loop
+    that flag prevents stays impossible.
+
+    EngineCore builds the backend on its first structured request. With vLLM's
+    default ``fork`` start method, EngineCore inherits this patch from the
+    process that ran the config hook. ``__post_init__`` is the hook because it
+    creates the compiler that every JSON request of the backend compiles through.
+    """
+    from vllm.v1.structured_output import backend_xgrammar
+
+    if hasattr(backend_xgrammar, "_tt_original_xgrammar_post_init"):
+        return
+
+    original = backend_xgrammar.XgrammarBackend.__post_init__
+    backend_xgrammar._tt_original_xgrammar_post_init = original
+
+    def xgrammar_post_init_tt(self) -> None:
+        original(self)
+        if self.disable_any_whitespace:
+            self.compiler = _TTSpacedJsonSeparatorsCompiler(self.compiler)
+
+    backend_xgrammar.XgrammarBackend.__post_init__ = xgrammar_post_init_tt
+
+
 def _install_tt_async_spec_method_patch() -> None:
     """Let the TT model-owned drafter through upstream's async-scheduling gate.
 
@@ -981,31 +1047,38 @@ def _uninstall_tt_async_spec_method_patch() -> None:
 def _pin_v1_model_runner() -> None:
     """Keep the engine on vLLM's V1 model runner.
 
-    ``VllmConfig.use_v2_model_runner`` defaults on for every dense architecture,
-    and the V2 scheduler drops two things the TT runner reads: it folds
-    preemption-resumed requests into ``scheduled_new_reqs`` (so
-    ``CachedRequestData.resumed_req_ids`` is always empty) and stops populating
-    ``all_token_ids``, moving the history to
-    ``NewRequestData.prefill_token_ids``. ``build_cached_request_state`` reads
-    neither, so a resume after preemption would rebuild the request with an empty
-    ``output_token_ids`` while ``num_computed_tokens`` still counts the generated
-    tokens: silent output corruption.
+    ``VllmConfig.use_v2_model_runner`` defaults on for every architecture when
+    Triton is present and no requested feature is refused under V2.
+    The TT runner reads the V2 scheduler output, where a request resumed after
+    preemption arrives in ``scheduled_new_reqs`` with its history in
+    ``NewRequestData.prefill_token_ids``. Known V2 differences the TT backend
+    does not handle yet:
+
+    - ``InputProcessor`` loads custom logits processors with the V2 loader
+      (``vllm.v1.worker.gpu.sample.logits_processor``), which rejects a class
+      without the V2 interface, while ``TTModelRunner`` builds its processors
+      with the V1 ``build_logitsprocs``.
+    - ``VllmConfig`` refuses the ``ngram`` speculative method under V2, and TT
+      n-gram drafting uses the V1 ``NgramProposer``.
 
     Upstream only spares TT today because ``HAS_TRITON`` is false on a TT host,
     which flips when an NVIDIA driver is present or ``CUDA_VISIBLE_DEVICES`` is
-    set to the empty string. Pin the variable rather than rely on that.
+    set to the empty string. Pin the variable rather than rely on that. Two
+    options select V2 whatever the variable says: ``--watermark-config``, and
+    ``attention_config.hisparse_config``, which raises when the variable is 0.
 
-    Refuse an explicit opt-in instead of honoring it: the corruption is silent,
-    so a clear failure is strictly more useful than a wrong answer.
+    Refuse an explicit opt-in instead of honoring it: the TT backend has not
+    been validated on the V2 path, so a clear failure is more useful than an
+    unvalidated run.
     """
     requested = os.environ.get(_V2_MODEL_RUNNER_ENV)
     if requested is not None and requested != "0":
         raise ValueError(
             f"{_V2_MODEL_RUNNER_ENV}={requested!r} selects vLLM's V2 model "
-            "runner. The TT backend implements only the V1 model-runner "
-            "contract: under V2 a request resumed after preemption silently "
-            f"loses every generated token. Unset {_V2_MODEL_RUNNER_ENV} or set "
-            "it to 0."
+            "runner. The TT backend does not implement all of the V2 "
+            "model-runner contract yet: custom logits processors are loaded "
+            "for V2 but run as V1, and n-gram drafting needs V1. Unset "
+            f"{_V2_MODEL_RUNNER_ENV} or set it to 0."
         )
     os.environ[_V2_MODEL_RUNNER_ENV] = "0"
 
@@ -1933,6 +2006,7 @@ class TTPlatform(Platform):
         # fall back to guidance (which also honors this flag); outlines and
         # lm-format-enforcer ignore it.
         vllm_config.structured_outputs_config.disable_any_whitespace = True
+        _install_tt_xgrammar_json_separators_patch()
 
         # Import and register models from tt-metal.
         #
