@@ -7,6 +7,7 @@ their owning area is reorganized.
 | Location | Scope |
 |---|---|
 | [unit/test_logprobs.py](unit/test_logprobs.py) | Public packing helpers, deterministic tensor inputs, shapes, ranks, and ownership |
+| [unit/test_logger.py](unit/test_logger.py) | Logger setup, warning deduplication, record context, and stdlib-only startup |
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |

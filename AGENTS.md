@@ -127,7 +127,7 @@ on failure because it is designed to run in the caller's shell.
 
 The `dev` extra pins `pytest>=8,<9` because pytest 9's `caplog`
 double-captures records on non-propagating loggers (see
-`tests/test_logger.py`). This is a plugin test requirement, independent of
+`tests/unit/test_logger.py`). This is a plugin test requirement, independent of
 tt-metal's pytest version. CI installs the extra; do not install an unpinned
 pytest over it.
 

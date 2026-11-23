@@ -30,7 +30,7 @@ examples = ["qwen-vl-utils"]
 # Development tooling. ruff is pinned to match the .pre-commit-config.yaml hook
 # so a direct `ruff` invocation and the commit hook enforce identical rules.
 # pytest is pinned below 9 because 9.x caplog double-captures on non-propagating
-# loggers (see AGENTS.md and tests/test_logger.py).
+# loggers (see AGENTS.md and tests/unit/test_logger.py).
 dev = ["pre-commit", "ruff==0.14.0", "pytest>=8,<9"]
 
 [project.entry-points."vllm.general_plugins"]
