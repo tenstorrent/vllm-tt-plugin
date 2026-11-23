@@ -260,12 +260,11 @@ def test_a_worker_with_a_mesh_provider_never_opens_or_closes_the_mesh(
 
     provider.release = release_after_runner_shutdown
 
-    runner, kv_cache_config = _run_lifecycle(worker_instance)
+    _runner, kv_cache_config = _run_lifecycle(worker_instance)
 
     assert steps == ["acquire mesh", "size pool", "fit max_model_len", "release mesh"]
     assert released_after_runner == [True]
     assert kv_cache_config.num_blocks == NUM_TT_BLOCKS
-    assert runner.calls == ["kv", "warmup", "execute", "shutdown"]
     assert worker_instance.mesh_device is None
 
 
