@@ -87,6 +87,7 @@ def _device_sampling_runner(*, supports_device_grammar: bool):
             no_penalties=True,
             sampling=SimpleNamespace(
                 bad_words_token_ids={},
+                logprob_token_ids={},
                 has_active_logitsprocs=lambda: False,
             ),
             max_num_logprobs=None,

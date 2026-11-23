@@ -250,6 +250,11 @@ class TTModelInput:
     # request's output has grown.
     spec_min_tokens: dict[int, tuple[int, tuple[int, ...]]] | None = None
 
+    # Host sampling only, one entry per rank like ``bad_words_token_ids_list``:
+    # req_index -> ``SamplingParams.logprob_token_ids``. ``None`` when the
+    # builder never fills it (lane mode reads the merged batch instead).
+    logprob_token_ids_list: list[dict[int, list[int]]] | None = None
+
 
 def live_row_index(
     model_input: TTModelInput, row_req_ids: list[str] | None = None

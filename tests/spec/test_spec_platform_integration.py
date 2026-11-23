@@ -408,6 +408,20 @@ def test_logit_bias_stays_refused_whatever_the_model_serves(
         _validate(params)
 
 
+@pytest.mark.parametrize(
+    "modes", [("argmax_ids",), ("logits",), ("argmax_ids", "logits")]
+)
+def test_logprob_token_ids_are_refused_whatever_the_model_serves(
+    monkeypatch, vllm_config, modes
+):
+    """Neither walk reads named-token logprobs, so a verify would drop them."""
+    from vllm.sampling_params import SamplingParams
+
+    _speculating_platform(monkeypatch, vllm_config, accept_modes=modes)
+    with pytest.raises(VLLMValidationError, match="logprob_token_ids"):
+        _validate(SamplingParams(temperature=0.0, logprob_token_ids=[3, 4]))
+
+
 _SAMPLED = [
     ("temperature", 0.7),
     ("presence_penalty", 0.5),
