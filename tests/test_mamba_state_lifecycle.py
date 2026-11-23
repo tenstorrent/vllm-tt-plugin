@@ -1284,9 +1284,11 @@ def test_partial_hits_restore_the_longest_kept_state_and_write_new_checkpoints()
 
 def test_diverging_continuations_read_one_kept_prefix_and_leave_it_intact():
     """Requests b, c and d share request a's first 2048 tokens and then
-    diverge. All three hit the same kept block in one step, each writes its
-    own blocks, and they decode across the 3072-token boundary. The kept block
-    keeps the state of the shared 2048 tokens throughout:
+    diverge. All three hit the same kept block, each writes its own blocks,
+    and they decode across the 3072-token boundary. ``MambaManager`` admits
+    them in different steps: it defers a hit whose last block another
+    request's allocation entered in ``cached_blocks_this_step``. The kept
+    block keeps the state of the shared 2048 tokens throughout:
     ``_Harness.check_cached_states`` compares it after every step, and no
     block a row reads as its start state is written in the same step."""
     h = _Harness(num_blocks=48, max_num_batched_tokens=4096, mode="align")
@@ -1299,7 +1301,6 @@ def test_diverging_continuations_read_one_kept_prefix_and_leave_it_intact():
 
     assert h.hits == {"b": [2048], "c": [2048], "d": [2048]}
     assert len({block for blocks in h.hit_blocks.values() for block in blocks}) == 1
-    assert len({h.first_step[r] for r in "bcd"}) == 1, "the hits ran in two steps"
     assert h.crossings >= 4, "not every request crossed into a new column"
 
 

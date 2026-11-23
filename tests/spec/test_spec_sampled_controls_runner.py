@@ -139,7 +139,6 @@ def _with_min_tokens(runner) -> None:
         max_num_batched_tokens=sync_harness.MAX_MODEL_LEN,
         vocab_size=SAMPLED_VOCAB_SIZE,
         block_sizes=[sync_harness.BLOCK_SIZE],
-        kernel_block_sizes=[sync_harness.BLOCK_SIZE],
         logitsprocs=LogitsProcessors(
             [MinTokensLogitsProcessor(None, torch.device("cpu"), False)]
         ),

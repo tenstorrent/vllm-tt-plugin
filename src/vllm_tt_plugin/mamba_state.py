@@ -54,7 +54,12 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroupSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
 
 from vllm_tt_plugin.config import is_tt_block_output_model, uses_tt_lane_coordinator
 from vllm_tt_plugin.mamba_checkpoints import prefill_checkpoints
@@ -215,10 +220,13 @@ class MambaCacheGroups:
     # ``num_prefill_checkpoint_blocks`` 1, the same in every Mamba group;
     # ``None`` without prefill checkpoint blocks.
     prefill_checkpoint_alignment: int | None = None
-    # ``cache_config.prefix_match_unit``, the token granularity of prefix
-    # hits and of vLLM's prefill checkpoint positions; ``block_size`` when
-    # ``None``.
-    prefix_match_unit: int | None = None
+    # ``KVCacheConfig.hash_block_size`` and
+    # ``KVCacheConfig.cache_hit_alignment_tokens``, which the engine core
+    # resolves before the runner allocates the KV cache; vLLM's prefill
+    # checkpoint rule reads both. Set whenever ``prefill_checkpoint_alignment``
+    # is.
+    hash_block_size: int | None = None
+    cache_hit_alignment_tokens: int | None = None
     # ``MambaSpec.num_speculative_blocks`` K, the same in every Mamba group
     # and equal to the launch's speculative tokens: a window has ``1 + K``
     # columns.
@@ -508,7 +516,8 @@ class MambaCacheGroups:
             [int(c) for c in num_computed_tokens],
             [int(s) for s in num_scheduled_tokens],
             mamba_block_size=self.block_size,
-            prefix_match_unit=self.prefix_match_unit or self.block_size,
+            hash_block_size=self.hash_block_size,
+            cache_hit_alignment_tokens=self.cache_hit_alignment_tokens,
             checkpoint_alignment=self.prefill_checkpoint_alignment,
         )
 
@@ -761,12 +770,13 @@ def mamba_attention_block_size(
 
 
 def mamba_cache_groups(
-    kv_cache_groups: Sequence[KVCacheGroupSpec], vllm_config: VllmConfig
+    kv_cache_config: KVCacheConfig, vllm_config: VllmConfig
 ) -> MambaCacheGroups | None:
-    """The Mamba groups of ``kv_cache_groups``, or ``None`` when there are none.
+    """The Mamba groups of ``kv_cache_config``, or ``None`` when there are none.
 
     Raises for a Mamba configuration the TT runner does not implement.
     """
+    kv_cache_groups = kv_cache_config.kv_cache_groups
     group_indices = tuple(
         i
         for i, group in enumerate(kv_cache_groups)
@@ -819,6 +829,17 @@ def mamba_cache_groups(
             f"{sorted(checkpoints, key=str)}; declare one for every group"
         )
     num_checkpoint_blocks, checkpoint_alignment = checkpoints.pop()
+    if num_checkpoint_blocks and (
+        kv_cache_config.hash_block_size is None
+        or kv_cache_config.cache_hit_alignment_tokens is None
+    ):
+        raise ValueError(
+            "MambaSpec groups declare prefill checkpoint blocks, but the KV cache "
+            "config has unresolved hash_block_size="
+            f"{kv_cache_config.hash_block_size} and cache_hit_alignment_tokens="
+            f"{kv_cache_config.cache_hit_alignment_tokens}; vLLM's prefill "
+            "checkpoint rule needs both"
+        )
     return MambaCacheGroups(
         group_indices=group_indices,
         layer_names=tuple(tuple(kv_cache_groups[i].layer_names) for i in group_indices),
@@ -828,7 +849,8 @@ def mamba_cache_groups(
         prefill_checkpoint_alignment=(
             checkpoint_alignment if num_checkpoint_blocks else None
         ),
-        prefix_match_unit=getattr(vllm_config.cache_config, "prefix_match_unit", None),
+        hash_block_size=kv_cache_config.hash_block_size,
+        cache_hit_alignment_tokens=kv_cache_config.cache_hit_alignment_tokens,
         # check_mamba_launch made it the launch's draft length in every group.
         num_speculative_blocks=specs[0].num_speculative_blocks,
     )

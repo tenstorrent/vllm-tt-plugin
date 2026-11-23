@@ -39,7 +39,6 @@ def _lane_batch(num_lanes=1, per_lane=5):
         max_num_batched_tokens=MAX_MODEL_LEN * num_lanes * per_lane,
         vocab_size=VOCAB,
         block_sizes=[BLOCK],
-        kernel_block_sizes=[BLOCK],
     )
 
 
@@ -552,6 +551,7 @@ def test_async_lane_decode_uses_batch_extraction():
         req_ids=["req-4"],
         req_id_to_index={"req-4": 0},
         submit_time_ns=123,
+        request_states=(None,),
     )
     model_input = object()
 

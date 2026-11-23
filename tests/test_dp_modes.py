@@ -957,10 +957,11 @@ def test_dp_a_prefix_cache_reset_forgets_what_the_engines_were_sent():
     _snapshot(client, [0, 0, 0.0], [0, 0, 0.0], [0, 1, 0.0])
     utility_calls = []
 
-    async def call_utility_async(method, *args):
+    async def call_utility_all_async(method, *args):
         utility_calls.append((method, args))
+        return [True] * len(client.core_engines)
 
-    client.call_utility_async = call_utility_async
+    client.call_utility_all_async = call_utility_all_async
     asyncio.run(
         core_client.DPLBAsyncMPClient.reset_prefix_cache_async(
             client, reset_running_requests=True

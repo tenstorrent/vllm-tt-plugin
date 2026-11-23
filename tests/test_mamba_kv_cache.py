@@ -20,7 +20,12 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, get_kv_cache_configs
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockCopy,
+    get_kv_cache_configs,
+    resolve_cache_hit_alignment_tokens,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     NewRequestData,
@@ -122,6 +127,7 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
             prefix_cache_retention_interval=0,
             mamba_cache_mode=mamba_cache_mode,
             enable_prefix_caching=mamba_cache_mode != "none",
+            prefix_match_unit=None,
         ),
         attention_config=SimpleNamespace(hisparse_config=None),
         additional_config={},
@@ -154,11 +160,20 @@ def _num_blocks(cfg, specs: dict, max_tokens_all_users: int) -> int:
 
 
 def _kv_cache_config(cfg, specs: dict, num_blocks: int):
-    """vLLM's own plan for ``specs`` at exactly ``num_blocks`` blocks."""
+    """vLLM's own plan for ``specs`` at exactly ``num_blocks`` blocks, with the
+    prefix-cache granularity that ``EngineCore`` resolves before it hands the
+    config to the workers."""
     cfg.cache_config.num_gpu_blocks_override = num_blocks
     available = _available_kv_cache_memory_bytes_for_num_blocks(cfg, specs, num_blocks)
     [kv_cache_config] = get_kv_cache_configs(cfg, [specs], [available])
     assert kv_cache_config.num_blocks == num_blocks
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, cfg
+    )
+    kv_cache_config.hash_block_size = hash_block_size
+    kv_cache_config.cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
+        kv_cache_config, cfg, scheduler_block_size, hash_block_size
+    )
     return kv_cache_config
 
 
@@ -571,6 +586,9 @@ def _align_groups(num_groups=1, alignment=None):
         mamba_cache_mode="align",
         block_size=BLOCK_SIZE,
         prefill_checkpoint_alignment=alignment,
+        # What EngineCore resolves when every group has one block size.
+        hash_block_size=BLOCK_SIZE,
+        cache_hit_alignment_tokens=BLOCK_SIZE,
     )
 
 
@@ -1007,6 +1025,8 @@ def _spec_groups(mode: str, num_spec: int, alignment=None, num_groups=1):
         mamba_cache_mode=mode,
         block_size=MAX_MODEL_LEN if mode == "none" else BLOCK_SIZE,
         prefill_checkpoint_alignment=alignment,
+        hash_block_size=BLOCK_SIZE,
+        cache_hit_alignment_tokens=BLOCK_SIZE,
         num_speculative_blocks=num_spec,
     )
 

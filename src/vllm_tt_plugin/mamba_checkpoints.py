@@ -38,17 +38,19 @@ def prefill_checkpoints(
     num_scheduled_tokens: Sequence[int],
     *,
     mamba_block_size: int,
-    prefix_match_unit: int,
+    hash_block_size: int,
+    cache_hit_alignment_tokens: int,
     checkpoint_alignment: int,
 ) -> list[tuple[int, int] | None]:
     """Each row's ``(position, block-table column)`` checkpoint, or ``None``.
 
     ``position`` is the token count whose state the row must write, and
     ``column`` the block-table column of the block vLLM reserves for it.
-    ``prefix_match_unit`` is ``cache_config.prefix_match_unit``, or the Mamba
-    block size when unset, as upstream's ``MambaPrefillCheckpointBuilder``
-    passes it. TT serves no EAGLE-style speculative method (it admits
-    ``ngram`` and the model-owned drafter, ``custom_class``, for which
+    ``hash_block_size`` and ``cache_hit_alignment_tokens`` are the values the
+    engine core resolves into ``KVCacheConfig``, which upstream's
+    ``MambaPrefillCheckpointBuilder`` reads from ``cache_config``. TT serves no
+    EAGLE-style speculative method (it admits ``ngram`` and the model-owned
+    drafter, ``custom_class``, for which
     ``SpeculativeConfig.use_eagle_block_drop`` is false), so vLLM drops no
     EAGLE block.
     """
@@ -56,10 +58,11 @@ def prefill_checkpoints(
     offsets, columns = compute_mamba_prefill_checkpoints(
         seq_lens,
         list(num_scheduled_tokens),
-        hash_block_size=prefix_match_unit,
+        hash_block_size=hash_block_size,
         mamba_block_size=mamba_block_size,
         checkpoint_alignment=checkpoint_alignment,
         drop_eagle_block=False,
+        cache_hit_alignment_tokens=cache_hit_alignment_tokens,
     )
     return [
         (computed + offset, column) if column >= 0 else None
