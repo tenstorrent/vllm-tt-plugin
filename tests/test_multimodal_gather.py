@@ -182,3 +182,58 @@ def test_the_item_identifier_is_forwarded_even_without_a_payload():
     assert out["mm_identifiers"] == [None, ["img-aaa", "img-bbb"]]
     assert out["mm_placeholder_offsets"] == [None, [3, 10]]
     assert out["pixel_values"] == [None, [None, pv]]
+
+
+def test_qwen3_asr_audio_items_reach_prefill_with_their_placeholder_counts():
+    # Qwen3-ASR's processor lays the mel frames of all audio items side by side;
+    # each item must reach prefill_forward as its own slice, next to the
+    # placeholder count the processor expanded for it, which is the number of
+    # rows the model's audio encoder emits for that slice.
+    from transformers import BatchFeature
+    from vllm.model_executor.models.qwen3_asr import (
+        _get_feat_extract_output_lengths,
+        _qwen3asr_field_config,
+    )
+    from vllm.multimodal.inputs import MultiModalKwargsItems
+
+    frames = torch.tensor([318, 2879])
+    flat = torch.randn(128, int(frames.sum()))
+    mask = torch.zeros(2, int(frames.max()), dtype=torch.long)
+    for i, n in enumerate(frames.tolist()):
+        mask[i, :n] = 1
+    hf_inputs = BatchFeature(
+        {
+            "input_audio_features": flat,
+            "audio_feature_lengths": frames,
+            "feature_attention_mask": mask,
+        }
+    )
+    items = MultiModalKwargsItems.from_hf_inputs(
+        hf_inputs, _qwen3asr_field_config(hf_inputs)
+    )["audio"]
+    counts = _get_feat_extract_output_lengths(frames).tolist()
+    offsets = [9, 9 + counts[0] + 4]
+    features = []
+    for item, offset, count in zip(items, offsets, counts):
+        feature = _feature(item, "audio")
+        feature.mm_position = SimpleNamespace(
+            offset=offset, length=count, is_embed=None
+        )
+        features.append(feature)
+    runner = _runner(
+        {
+            "asr": SimpleNamespace(mm_features=features),
+            "text": SimpleNamespace(mm_features=[]),
+        },
+        ["text", "asr"],
+    )
+
+    out = TTModelRunner._gather_multi_modal_inputs(runner)
+
+    first, second = out["input_audio_features"][1]
+    assert torch.equal(first, flat[:, :318])
+    assert torch.equal(second, flat[:, 318:])
+    assert [int(n) for n in out["audio_feature_lengths"][1]] == [318, 2879]
+    assert out["mm_placeholder_offsets"][1] == offsets
+    assert out["mm_placeholder_lengths"][1] == counts == [42, 374]
+    assert out["input_audio_features"][0] is None
