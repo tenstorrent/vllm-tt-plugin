@@ -885,11 +885,16 @@ You can also pass `--random-prefix-len <N>` to `vllm bench serve`.
 
 ## Testing
 
+Run commands from the repository root with the intended virtual environment
+active. The [testing guide](tests/README.md#run-tests) lists the unit, integration,
+stubbed-host, real-TTNN host, doctest, and device commands, including how to select
+individual tests. Test commands use the active environment's interpreter directly.
+
 The plugin ships server-facing tests under `tests/tt`. Start a vLLM server with
-a TT model, then run:
+a TT model, use the prepared tt-metal environment without host stubs, then run:
 
 ```bash
-pytest tests/tt -v \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
   --tt-server-url=http://localhost:8000 \
   --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
@@ -946,8 +951,9 @@ replace earlier raw-input scores or qualify an untested runtime revision.
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
-Plugin-local unit tests that do not require a running server live directly
-under `tests/`, for example:
+Hardware-free tests include module unit tests under `tests/unit/`, integration
+tests under `tests/integration/`, and legacy tests directly under `tests/` and
+`tests/spec/`. For example, with real `ttnn` installed:
 
 ```bash
 "$VIRTUAL_ENV/bin/python" -m pytest tests/test_lane_scheduler.py

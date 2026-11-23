@@ -131,6 +131,9 @@ double-captures records on non-propagating loggers (see
 tt-metal's pytest version. CI installs the extra; do not install an unpinned
 pytest over it.
 
+See the [test commands](tests/README.md#run-tests) for isolated unit tests,
+integration tests, both host-suite modes, doctests, and device tests.
+
 ### On a Tenstorrent host
 
 Install tt-metal first, activate its environment, then run
@@ -141,10 +144,12 @@ inside the script assume that working directory.
 
 ```bash
 "$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
-  --tt-server-url http://localhost:8000 --tt-model-name <model>
+  --tt-server-url=http://localhost:8000 --tt-model-name=MODEL
 ```
 
-See `tests/tt/conftest.py` for the full option set, including
+Replace `MODEL` with the served model name. Use the real TTNN environment
+without host stubs for device tests. See
+`tests/tt/conftest.py` for the full option set, including
 `--tt-max-num-seqs` and `--tt-chunked-prefill-budget`.
 
 ### The install script owns the dependency set
@@ -362,11 +367,21 @@ starts reading that environment variable.
 
 ## 7. Engineering standards
 
+Use [logprobs.py](src/vllm_tt_plugin/logprobs.py) as the reference example for
+module responsibilities, public input contracts, typing, numpydoc, and runnable
+examples. Apply those patterns to the actual responsibility and callers of the
+code being changed; its payload forms and implementation are specific to logprobs.
+
 ### Responsibilities, state, and dependencies
 
 - Give each module one explainable responsibility. Its module docstring must
   state its purpose, principal entry points, and relevant boundaries. Organize
   its contents so a reader can follow those entry points into their helpers.
+- Order class members by their role: construction (`__new__`, `__init__`,
+  `__post_init__`, and alternative-constructor classmethods), primary public
+  attributes, properties, and methods, secondary public members, then protected
+  and private helpers. Place helper staticmethods at the bottom. Keep field
+  declarations together where required by Python or dataclasses.
 - Use functions for operations and classes for cohesive state, identity, or
   lifecycle behavior. Introduce an abstraction only when actual callers need
   a responsibility that existing objects cannot express clearly. Do not add
@@ -388,6 +403,11 @@ starts reading that environment variable.
 
 ### Types, docstrings, and examples
 
+- Use concise, meaningful names for objects and arguments. Use the enclosing
+  module, class, or function to supply context instead of repeating it in every
+  name: prefer `from_top_k_logprobs(logprobs, ...)` over
+  `from_top_k_logprobs(top_k_logprobs, ...)`. Retain distinctions needed to
+  understand the value; avoid cryptic abbreviations.
 - Annotate new and substantively changed function and method parameters,
   return values, and non-obvious stored state. Types must describe the runtime
   values callers actually pass. Avoid `Any` or unstructured containers when
@@ -440,11 +460,12 @@ starts reading that environment variable.
 - **Strictly follow test-driven-development best practices.** Do not invent
   post-hoc tests addressing only symptoms to fool yourself and others that your
   implementation is correct.
-- Organize unit tests around the source module and its intended interfaces.
-  Integration tests exercise collaboration between real plugin components;
-  hardware-free does not necessarily mean unit-level. Device tests belong in
-  `tests/tt/`. Apply this distinction incrementally when adding or reorganizing
-  tests; do not assume the current directory layout provides isolation.
+- Place new or reorganized module unit tests in `tests/unit/test_<module>.py`.
+  Tests of collaborating plugin components belong in `tests/integration/`,
+  including hardware-free integration tests; device tests belong in `tests/tt/`.
+  Keep unaffected legacy tests in place. See the [testing map](tests/README.md)
+  for commands and fixture boundaries, and [test_logprobs.py](tests/unit/test_logprobs.py)
+  for the unit-test reference example.
 - Test behavior and the mechanism that guarantees it. Private helpers may be
   tested when they own the relevant mechanism; avoid tests that merely repeat
   implementation steps or freeze an incidental call shape or full error string.
@@ -452,11 +473,15 @@ starts reading that environment variable.
   equivalent cases with meaningful IDs; keep distinct behaviors readable.
   Test classes are optional, not a required mirror of production classes, but
   preferred when have local fixtures and specific, focused testing scenarios or
-  helpers.
+  helpers. Give reused or non-obvious fixture and case structures typed, named
+  fields so readers can identify each value without tracing tuple positions.
 - Keep inputs deterministic unless randomness is under test. Restore mutable
   global state. Share builders through test support modules or fixtures, never
   imports from neighboring test files. Unit setup must avoid unrelated engine,
   platform, or device initialization; inspect inherited fixtures as well.
+  Verify isolation both when running unit tests alone and through normal host
+  collection. Keep engine-reset fixtures scoped to the integration tests that
+  need them; see the [unit fixture override](tests/unit/conftest.py).
 - A bug fix needs a regression test that exercises the failed mechanism and
   fails on the old code, or an explanation of how existing coverage already
   exercises it. A behavior-preserving refactor may use retained coverage;
@@ -519,6 +544,8 @@ plugin imports into the fixture body, as `tests/conftest.py` does.
 - **Link the tt-metal or tt-transformers counterpart** when the change pairs with
   one, in both directions.
 - **Branch naming.** `<user>/<label>.<short-description>`, dashes not underscores.
+- **Commit messages.** Follow the [contribution guidelines](CONTRIBUTING.md#pull-request-guidelines)
+  for message content and where validation evidence belongs.
 - **Reviewers are assigned by** `.github/CODEOWNERS`.
 
 ### Before opening a pull request

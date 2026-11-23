@@ -19,8 +19,9 @@ is documented in [host and TT setup](../AGENTS.md#3-environment-and-installation
 ## Run tests
 
 Run from the repository root with the intended virtual environment active.
-The examples use the host stub; omit the `PYTHONPATH` assignment when testing
-with real `ttnn`.
+Use that environment's interpreter explicitly; no task runner is required.
+The unit, integration, and doctest commands below use the import-only TTNN stub.
+Each `PYTHONPATH` assignment applies only to its command.
 
 Run the unit suite without loading ancestor conftests:
 
@@ -28,10 +29,10 @@ Run the unit suite without loading ancestor conftests:
 PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/unit --confcutdir=tests/unit
 ```
 
-Run the decode integration tests with the root host fixtures:
+Run all integration tests with the root host fixtures:
 
 ```bash
-PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/integration/test_decode_logprobs.py
+PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/integration
 ```
 
 The normal host-suite command discovers both groups and the existing host tests:
@@ -40,7 +41,41 @@ The normal host-suite command discovers both groups and the existing host tests:
 PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 ```
 
-See [server testing](../README.md#testing) for device prerequisites and commands.
+To run the same host suite against installed `ttnn`, use the prepared tt-metal
+environment and ensure its `PYTHONPATH` does not contain `tests/host-stubs`.
+Check the import origin before running:
+
+```bash
+"$VIRTUAL_ENV/bin/python" -c "import ttnn; print(ttnn.__file__)"
+"$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
+```
+
+Run the executable examples in the logger and logprobs modules:
+
+```bash
+PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest --doctest-modules \
+  src/vllm_tt_plugin/logger.py src/vllm_tt_plugin/logprobs.py
+```
+
+To narrow a run, replace the suite directory with a file or node ID, retaining
+the command's environment and fixture options. For example:
+
+```bash
+PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest \
+  tests/unit/test_logger.py --confcutdir=tests/unit -q -k warning
+```
+
+For device tests, start a TT model server first, use the prepared tt-metal
+environment without host stubs, and pass the server's URL and served model name:
+
+```bash
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
+  --tt-server-url=http://localhost:8000 --tt-model-name=MODEL
+```
+
+Replace `MODEL` with the actual served name. See [server testing](../README.md#testing)
+for model-specific options and [speculative regression tests](tt/spec/README.md)
+for their launch configurations, evidence requirements, and driver.
 
 ## Fixture boundaries
 

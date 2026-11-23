@@ -40,6 +40,10 @@ typing, numpydoc, examples, exceptions, and test expectations. Consult
 [state and fixture isolation](AGENTS.md#8-state-and-fixture-isolation) when
 changing shared state or test setup.
 
+Start with the reference examples linked from those standards. The
+[testing map](tests/README.md) explains the unit, integration, support, and
+device-test layout and the commands for each group.
+
 For model integrations, start with the
 [model-plugin interface](docs/MODEL_INTERFACE.md) and its linked contracts.
 Update affected interface pages with model-facing changes. Follow the
@@ -63,6 +67,9 @@ Pull requests are reviewed on a **weekly basis**.
   titles and branches.
 - Write concise, imperative commit subjects with a bracketed label, for example
   `[feat] Enable on-device grammar sampling.` Add details when useful.
+  Commit messages describe what changed and why. Keep validation commands,
+  results, and pass/fail notes in the PR's Validation section or the task
+  handoff, not in commit messages.
 - Add appropriate labels; codeowners should specify priority.
 
 **Keep the pull request in draft while implementation, local checks, or applicable**
