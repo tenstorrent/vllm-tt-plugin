@@ -25,6 +25,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- platform.py          # TTPlatform and config validation
 |   +-- model_registry.py    # TT model architecture registration
 |   +-- worker.py            # TT worker implementation
+|   +-- mesh_provider.py     # Shared-mesh mode: a host-supplied mesh for every worker
 |   +-- model_runner.py      # TT model execution bridge
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
@@ -536,6 +537,47 @@ resident async decode safe are documented in
 [`docs/DECODE_RELOAD_CONTRACT.md`](docs/DECODE_RELOAD_CONTRACT.md).
 The defaults, validation and consumers of each `model_capabilities` key are
 documented in [`docs/MODEL_CAPABILITIES.md`](docs/MODEL_CAPABILITIES.md).
+
+### Shared Mesh
+
+A chip can be opened by one process at a time, so engines that share chips
+must share one process and one mesh. A host that runs several engines in its
+process registers a mesh provider before the first worker initializes its
+device:
+
+```python
+from vllm_tt_plugin.mesh_provider import set_mesh_provider
+from vllm_tt_plugin.worker import close_mesh_device, open_mesh_device
+
+
+class SharedMesh:
+    def __init__(self):
+        self.mesh = None
+
+    def acquire(self, tt_config, trace_mode, *, model_fabric_config):
+        if self.mesh is None:  # the first engine opens it as it would alone
+            self.mesh = open_mesh_device(
+                tt_config, trace_mode, model_fabric_config=model_fabric_config
+            )
+        return self.mesh
+
+    def release(self, mesh_device):
+        pass  # the host closes it once every engine has shut down
+
+
+set_mesh_provider(SharedMesh())
+```
+
+Each `TTWorker` then acquires its mesh from the provider, with the arguments it
+would have passed to `open_mesh_device`, instead of opening one, so it sets no
+fabric configuration. `TTWorker.shutdown` releases the mesh to the provider it
+came from, after the model's captures are released, instead of closing it and
+resetting fabric. The host closes the mesh at the end, for example with
+`close_mesh_device(mesh, tt_config)`. Without a provider, the worker opens and
+closes its own mesh. The provider is per process, so standard multi-process DP
+ranks never see it. Engines in one process also share `TTPlatform`'s
+process-level state, which admits several autoregressive engines but only one
+engine when a block-output model is involved.
 
 ## Single-Process Galaxy Serving
 

@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_tt_plugin import worker
+from vllm_tt_plugin.mesh_provider import set_mesh_provider
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.worker import TTWorker
@@ -210,3 +211,128 @@ def test_a_worker_without_token_kv_refuses_an_ar_runner(monkeypatch):
         worker_instance.initialize_from_config(_engine_kv_cache_config(worker_instance))
 
     worker_instance.shutdown()
+
+
+class _MeshProvider:
+    """Hands every worker one mesh and records what the workers do with it."""
+
+    def __init__(self, steps: list[str]):
+        self.steps = steps
+        self.mesh_device = SimpleNamespace(get_num_devices=lambda: 1)
+        self.acquired: list[tuple] = []
+
+    def acquire(self, tt_config, trace_mode, *, model_fabric_config):
+        self.steps.append("acquire mesh")
+        self.acquired.append((tt_config, trace_mode, model_fabric_config))
+        return self.mesh_device
+
+    def release(self, mesh_device):
+        assert mesh_device is self.mesh_device
+        self.steps.append("release mesh")
+
+
+@pytest.fixture
+def mesh_provider():
+    """Registers a recording provider and restores the default afterwards."""
+
+    def register(steps: list[str]) -> _MeshProvider:
+        provider = _MeshProvider(steps)
+        set_mesh_provider(provider)
+        return provider
+
+    yield register
+    set_mesh_provider(None)
+
+
+def test_a_worker_with_a_mesh_provider_never_opens_or_closes_the_mesh(
+    monkeypatch, mesh_provider
+):
+    worker_instance, steps = _worker(monkeypatch, _ARWorker)
+    provider = mesh_provider(steps)
+    released_after_runner: list[bool] = []
+    release = provider.release
+
+    def release_after_runner_shutdown(mesh_device):
+        released_after_runner.append(
+            getattr(worker_instance, "model_runner", None) is None
+        )
+        release(mesh_device)
+
+    provider.release = release_after_runner_shutdown
+
+    runner, kv_cache_config = _run_lifecycle(worker_instance)
+
+    assert steps == ["acquire mesh", "size pool", "fit max_model_len", "release mesh"]
+    assert released_after_runner == [True]
+    assert kv_cache_config.num_blocks == NUM_TT_BLOCKS
+    assert runner.calls == ["kv", "warmup", "execute", "shutdown"]
+    assert worker_instance.mesh_device is None
+
+
+def test_the_provider_receives_what_open_mesh_device_would(monkeypatch, mesh_provider):
+    tt_config = {"trace_region_size": 1234}
+    fabric_config = {"config": "FABRIC_1D_RING"}
+    model_class = SimpleNamespace(model_capabilities={"fabric_config": fabric_config})
+
+    def same_config_and_model():
+        monkeypatch.setattr(worker, "get_tt_config", lambda _cfg: tt_config)
+        monkeypatch.setattr(
+            worker, "get_model_architecture", lambda _cfg: (model_class, "m")
+        )
+
+    worker_instance, _steps = _worker(monkeypatch, _ARWorker)
+    same_config_and_model()
+    opened: list[tuple] = []
+    open_mesh = worker.open_mesh_device
+
+    def record_open(tt_cfg, trace_mode, local_dp_rank, *, model_fabric_config):
+        opened.append((tt_cfg, trace_mode, model_fabric_config))
+        return open_mesh(
+            tt_cfg, trace_mode, local_dp_rank, model_fabric_config=model_fabric_config
+        )
+
+    monkeypatch.setattr(worker, "open_mesh_device", record_open)
+    worker_instance.init_device()
+    worker_instance.shutdown()
+
+    provided_worker, steps = _worker(monkeypatch, _ARWorker)
+    same_config_and_model()
+    provider = mesh_provider(steps)
+    provided_worker.init_device()
+    provided_worker.shutdown()
+
+    assert opened == [(tt_config, "all", fabric_config)]
+    assert provider.acquired == opened
+
+
+def test_a_worker_releases_to_the_provider_it_acquired_from(monkeypatch, mesh_provider):
+    worker_instance, steps = _worker(monkeypatch, _ARWorker)
+    mesh_provider(steps)
+    worker_instance.init_device()
+    set_mesh_provider(None)
+
+    worker_instance.shutdown()
+
+    assert steps == ["acquire mesh", "size pool", "fit max_model_len", "release mesh"]
+
+
+def test_a_worker_that_opened_its_mesh_closes_it_under_a_later_provider(
+    monkeypatch, mesh_provider
+):
+    worker_instance, steps = _worker(monkeypatch, _ARWorker)
+    worker_instance.init_device()
+    mesh_provider(steps)
+
+    worker_instance.shutdown()
+
+    assert steps == ["open mesh", "size pool", "fit max_model_len", "close mesh"]
+
+
+def test_the_destructor_releases_a_provided_mesh(monkeypatch, mesh_provider):
+    worker_instance, steps = _worker(monkeypatch, _ARWorker)
+    mesh_provider(steps)
+    worker_instance.init_device()
+
+    worker_instance.__del__()
+
+    assert steps == ["acquire mesh", "size pool", "fit max_model_len", "release mesh"]
