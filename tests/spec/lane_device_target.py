@@ -138,7 +138,6 @@ class LaneDeviceTarget:
         self.calls: list[dict] = []
         self.propose_calls: list[dict] = []
         self.engine_thread: int | None = None
-        self.freed: list[int] = []
         self.unresolved_at_prefill: list[int] = []
         self.prefill_spans: list[tuple[int, int, int]] = []
 
@@ -273,17 +272,8 @@ class LaneDeviceTarget:
             "defer_read": kwargs.get("defer_read", False),
             "chain_rows": kwargs.get("chain_rows"),
             "chain_tip": kwargs.get("chain_tip"),
-            "finishing_slots": kwargs.get("finishing_slots"),
         }
         self.calls.append(call)
-        if call["finishing_slots"] is not None:
-            if not self.model_capabilities.get("supports_finishing_slots", False):
-                raise ValueError("finishing_slots without supports_finishing_slots")
-            for slot in call["finishing_slots"]:
-                # Freed like a finished request: nothing chains on it.
-                self.resident.pop(slot, None)
-                self.device_drafts.pop(slot, None)
-                self.freed.append(slot)
         if spec_mode is None:
             self._invalidate_chain()
             return self._plain(tokens, start_pos, kwargs)
