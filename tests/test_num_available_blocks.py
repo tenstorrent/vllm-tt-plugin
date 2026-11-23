@@ -60,6 +60,7 @@ def cfg():
     c.device_config.num_devices = 1
     c.scheduler_config.max_num_seqs = 32
     c.cache_config.block_size = 64
+    c.cache_config.num_gpu_blocks_override = None
     c.additional_config = {}
     return c
 
@@ -279,6 +280,73 @@ def test_determine_available_memory_requires_a_sized_pool():
 
     with pytest.raises(RuntimeError, match="has not been sized"):
         worker_mod.TTWorker.determine_available_memory(w)
+
+
+@pytest.mark.parametrize("override", [100, 5000])
+def test_num_gpu_blocks_override_replaces_the_derived_count(cfg, override):
+    """Below and above the 2080 blocks the fallback budget gives."""
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.cache_config.num_gpu_blocks_override = override
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+    ):
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
+
+    assert n == override
+
+
+def test_uniproc_engine_plans_the_operators_num_gpu_blocks_override(cfg, monkeypatch):
+    """With the uniproc executor the worker shares the engine's cache_config.
+
+    ``determine_available_memory`` publishes the worker's count as
+    ``num_gpu_blocks_override`` on that shared config, so the engine's KV
+    planner sees the operator's value only if the worker sized the pool by it.
+    """
+    from vllm_tt_plugin import worker as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_available_kv_cache_memory_bytes_for_num_blocks",
+        lambda _cfg, _spec, num_blocks: num_blocks * 1024,
+    )
+    cfg.cache_config.num_gpu_blocks_override = 100
+    w = worker_mod.TTWorker.__new__(worker_mod.TTWorker)
+    w.vllm_config = cfg
+    w.cache_config = cfg.cache_config
+    w.num_devices = 1
+    w.get_kv_cache_spec = dict
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _fallback_arch(),
+    ):
+        w._init_kv_pool()
+
+    assert w.determine_available_memory() == 100 * 1024
+    assert cfg.cache_config.num_gpu_blocks_override == 100
+
+
+def test_block_output_validates_the_num_gpu_blocks_override(cfg):
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.model_config.max_model_len = 1024
+    cfg.model_config.original_max_model_len = 1024
+    cfg.scheduler_config.max_num_seqs = 1
+    tt_config.store_tt_output_tokens_per_step(cfg, 256)
+    canvas_blocks = (1024 + 256) // cfg.cache_config.block_size
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        _model_budget(1 << 20),
+    ):
+        cfg.cache_config.num_gpu_blocks_override = canvas_blocks
+        assert get_num_available_blocks_tt(cfg) == canvas_blocks
+
+        cfg.cache_config.num_gpu_blocks_override = canvas_blocks - 1
+        with pytest.raises(ValueError, match="Raise --num-gpu-blocks-override"):
+            get_num_available_blocks_tt(cfg)
 
 
 def test_sliding_window_adds_headroom(cfg):
