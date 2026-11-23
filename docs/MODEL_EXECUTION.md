@@ -231,14 +231,24 @@ For an eligible structured decode:
    `sample_deferred_decode(output, sampling_params=..., grammar_bitmask=...)`.
    The adapter applies the packed int32 grammar mask and returns sampled
    output through the ordinary decode conversion path.
+4. With async decode enabled, the controller starts token readback using
+   `read_decode_output(sampled_output, async_read=True)` and returns a deferred
+   runner output. Finalization waits for its read events before host conversion.
+   Without that hook, sampling must already return host torch tensors, as for
+   ordinary async decode. Synchronous execution finalizes tokens immediately.
+   A steady async continuation can submit its next forward before readback
+   completes. The adapter must order the transfer before later operations that
+   overwrite its source buffer, as for ordinary device-sampled async decode.
 
 Each bit in `grammar_bitmask` names one vocabulary token; a one bit permits
 that token. The model adapter must apply the submitted row order.
 
 Structured prefill uses host sampling. Deferred grammar sampling requires
 effective runtime support. A missing mask or a
-failure after deferred submission invalidates the runner's grammar path;
+failure during sampling submission invalidates the runner's grammar path;
 the plugin raises instead of resampling an already advanced step on the host.
+Deferred readback and conversion errors propagate through the output future;
+the output object caches the failure instead of retrying completion.
 Under async scheduling, a request that finished while the step was in flight
 has no mask row and samples unrestricted; when no structured request is left,
 `grammar_bitmask` is `None`.
