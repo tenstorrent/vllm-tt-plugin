@@ -339,8 +339,15 @@ class TTLaneCoordinator(SchedulerInterface):
         ]
         # vLLM computes spec-decode stats inside each lane's update_from_output,
         # which drops them with stats off; the lanes keep them for make_stats.
+        # A KV cache manager built with stats off records no prefix-cache
+        # stats, so each lane's manager gets them turned on. The lane's own
+        # make_stats still returns None, which leaves
+        # _merged_prefix_cache_stats as the only reader that resets them.
         for sched in self.lanes:
             sched.collect_spec_decoding_stats = log_stats
+            if log_stats:
+                sched.kv_cache_manager.log_stats = True
+                sched.kv_cache_manager.prefix_cache_stats = PrefixCacheStats()
 
     def _build_per_lane_vllm_config(self, vllm_config: VllmConfig) -> VllmConfig:
         """Return a ``vllm_config`` view whose ``max_num_seqs`` is per-lane.
