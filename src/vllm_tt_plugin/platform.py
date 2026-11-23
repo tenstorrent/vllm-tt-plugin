@@ -1568,6 +1568,11 @@ def register_tt_models(register_test_models=False) -> None:
         "TTQwen3ASRForConditionalGeneration",
         "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ASRForConditionalGeneration",
     )
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3ASRRealtimeGeneration",
+        "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ASRRealtimeGeneration",
+    )
 
     # Mistral - Text only
     _register_model_if_missing(
