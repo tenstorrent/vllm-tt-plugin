@@ -52,11 +52,12 @@ Check the import origin before running:
 "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=tests/tt
 ```
 
-Run the executable examples in the logger, logprobs, and parser modules:
+Run the executable examples in the exception, logger, logprobs, and parser modules:
 
 ```bash
 PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest --doctest-modules \
-  src/vllm_tt_plugin/logger.py src/vllm_tt_plugin/logprobs.py \
+  src/vllm_tt_plugin/exceptions.py src/vllm_tt_plugin/logger.py \
+  src/vllm_tt_plugin/logprobs.py \
   src/vllm_tt_plugin/parsers
 ```
 

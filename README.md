@@ -22,6 +22,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 .
 +-- src/vllm_tt_plugin/
 |   +-- entrypoints.py       # vLLM plugin entry points
+|   +-- exceptions.py        # Shared plugin exception categories
 |   +-- platform.py          # TTPlatform and config validation
 |   +-- model_registry.py    # TT model architecture registration
 |   +-- worker.py            # TT worker implementation
