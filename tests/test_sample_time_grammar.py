@@ -21,7 +21,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import GrammarOutput
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
@@ -63,6 +65,20 @@ def _model_input(**overrides) -> TTModelInput:
             batch_length - len(row_req_ids)
         )
     return TTModelInput(**base)
+
+
+def _request_state(req_id: str) -> CachedRequestState:
+    """Build a live decode request for submission-context snapshots."""
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=[0],
+        mm_features=None,
+        sampling_params=SamplingParams(temperature=0.0),
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=1,
+        output_token_ids=[0],
+    )
 
 
 def _grammar(num_structured: int) -> GrammarOutput:
@@ -588,6 +604,9 @@ def _real_deferred_grammar_tail(
     runner._apply_grammar_to_input = partial(
         TTModelRunner._apply_grammar_to_input, runner
     )
+    runner._poison_device_grammar = partial(
+        TTModelRunner._poison_device_grammar, runner
+    )
     controller = TTAsyncDecodeController(runner)
     runner.async_decode = SimpleNamespace(
         can_attempt_steady_decode_from_scheduler=lambda _output: False,
@@ -663,6 +682,11 @@ def test_async_device_grammar_samples_finished_in_flight_rows_unmasked(
     """Under async, a request finished in flight samples unmasked on device."""
     model_input = _deferred_decode_input(structured, plain=("req-plain",))
     runner = _grammar_runner(
+        requests={
+            req_id: _request_state(req_id)
+            for req_id in model_input.row_req_ids
+            if req_id != "req-done"
+        },
         defer_state_apply_and_build_runner_output=(
             lambda sampled, _logprobs, **_kwargs: sampled
         ),
@@ -916,6 +940,7 @@ def test_deferred_device_sampling_transports_sample_time_grammar(
         _tt_committed_width=lambda _tokens: 1,
         _num_speculative_tokens=0,
         _get_output_tokens=lambda **kwargs: ([kwargs["tt_out"]], [None]),
+        requests={"req-0": _request_state("req-0")},
     )
     runner._build_runner_output = partial(TTModelRunner._build_runner_output, runner)
     runner._poison_device_grammar = partial(
