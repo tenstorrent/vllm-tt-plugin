@@ -93,6 +93,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
         _sampling_params_for_padded_decode=lambda params, req_indices, n: params,
         _decode_layout_changed_since_last_decode=False,
         _build_host_generators=TTModelRunner._build_host_generators,
+        _mamba_groups=None,
     )
     # The output-commit methods resolve the step's committed width through
     # _tt_committed_width (reads _is_adaptive_block_output + _output_tokens_per_step).
