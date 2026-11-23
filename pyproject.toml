@@ -4,33 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-tt-plugin"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Tenstorrent backend plugin for vLLM"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
-# vLLM is intentionally absent: it must be the locally built TT `empty` target,
-# which is not the (CUDA) `vllm` on PyPI. Declaring it as a resolvable dependency
-# lets a version conflict silently uninstall the TT build and pull the PyPI wheel.
-# The install order (build vLLM, then this plugin) guarantees it is present.
-# tblib is required at runtime for cross-process traceback serialization and is
-# not provided by the tt-metal env or by vLLM core's runtime requirements.
-dependencies = ["tblib>=3.1.0"]
+# The prepared environment owns the runtime stack; see README.md#dependency-ownership.
+dependencies = ["PyYAML", "regex"]
 
 [project.optional-dependencies]
-# The plugin runs only inside a tt-metal env, which already owns torch,
-# transformers, and numpy; restating them here only risks conflicts. torchvision
-# is not among them: the ttnn wheel declares neither torch nor torchvision, so
-# only environments built from tt-metal's requirements-dev.txt happen to carry
-# it, and docs/install-vllm-tt.sh installs it explicitly.
-# qwen-vl-utils is used solely by the offline Qwen-VL example
-# (examples/offline_inference_tt.py), not by the serving path, and the tt-metal
-# env does not provide it.
+# Offline Qwen-VL example support.
 examples = ["qwen-vl-utils"]
-# Development tooling. ruff is pinned to match the .pre-commit-config.yaml hook
-# so a direct `ruff` invocation and the commit hook enforce identical rules.
-# pytest is pinned below 9 because 9.x caplog double-captures on non-propagating
-# loggers (see AGENTS.md and tests/unit/test_logger.py).
+# Tool pins and their rationale: AGENTS.md sections 3 and 4.
 dev = ["pre-commit", "ruff==0.14.0", "pytest>=8,<9"]
 
 [project.entry-points."vllm.general_plugins"]
@@ -42,6 +27,15 @@ tt = "vllm_tt_plugin.entrypoints:platform_plugin"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vllm_tt_plugin*"]
+
+# Versions use ``MAJOR.MINOR.PATCH``. Major and minor follow the targeted vLLM
+# series; patch counts plugin releases independently, starting at zero for each
+# new series. For example, ``0.31.2`` is the third plugin release targeting vLLM
+# 0.31, regardless of vLLM's patch number. The exact vLLM build is pinned in
+# ``docs/install-vllm-tt.sh``; a shared series does not guarantee compatibility
+# with every upstream patch.
+[tool.setuptools.dynamic]
+version = {attr = "vllm_tt_plugin.__version__"}
 
 # Linting aligned to upstream vLLM rules
 [tool.ruff.lint]

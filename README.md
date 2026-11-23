@@ -74,10 +74,29 @@ inside assume:
 source docs/install-vllm-tt.sh
 ```
 
-The script installs vLLM with
-`VLLM_TARGET_DEVICE=empty` because `tt` platform is provided by this plugin
-at runtime. It then installs the plugin with a few dependencies.
-Most dependencies come from the active tt-metal env.
+The script installs vLLM with `VLLM_TARGET_DEVICE=empty` because this plugin
+provides the `tt` platform at runtime. It then installs the plugin and its
+declared dependencies.
+
+### Dependency ownership
+
+The plugin requires a prepared TT environment; its package metadata alone
+does not describe or install the full serving stack.
+
+| Dependencies | Installed by |
+|---|---|
+| `ttnn`, `torch`, and the compatible NumPy build | tt-metal environment; host-only setup substitutes the TTNN stub and installs CPU torch |
+| vLLM, Transformers, and vLLM's common requirements | [install script](docs/install-vllm-tt.sh), subject to [dependency overrides](docs/vllm-overrides.txt) |
+| `torchvision` and `numba` | Install script, at explicit pins |
+| `PyYAML` and `regex` | Plugin runtime requirements in [pyproject.toml](pyproject.toml), also supplied by vLLM's common requirements |
+| `cloudpickle` | vLLM's common requirements; used by the retained MPI launcher, which upstream vLLM 0.31.0 does not hook into |
+| `qwen-vl-utils` | Optional `examples` extra |
+| Test and lint tools | Optional `dev` extra; see the [testing guide](tests/README.md) |
+
+The plugin metadata declares lightweight direct dependencies used by supported
+execution paths: PyYAML reads TT cluster descriptors during standard-DP discovery,
+and `regex` parses layer names in the model runner. The remaining runtime versions
+are coordinated by the environment and installer.
 
 The script also installs vLLM's dependency list itself, fetched from
 `requirements/common.txt` at the pinned vLLM tag, and installs vLLM with

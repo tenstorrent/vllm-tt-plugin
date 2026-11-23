@@ -50,6 +50,14 @@ Update affected interface pages with model-facing changes. Follow the
 [repository boundaries](AGENTS.md#repository-boundaries) and cross-link paired
 plugin and model pull requests.
 
+### Package versions
+
+Follow the versioning rule in [pyproject.toml](pyproject.toml). Update the literal
+`__version__` in [the package initializer](src/vllm_tt_plugin/__init__.py) for each
+plugin release; `pyproject.toml` reads it dynamically.
+When moving to another vLLM series, also follow the
+[upstream upgrade checklist](AGENTS.md#the-install-script-owns-the-dependency-set).
+
 ## Submitting Pull Requests
 
 Pull requests are reviewed on a **weekly basis**.
