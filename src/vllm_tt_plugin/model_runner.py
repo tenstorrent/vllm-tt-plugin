@@ -1038,9 +1038,14 @@ class TTModelRunner:
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
+        # A request resumed in the step that reports its preemption (after
+        # ``reset_prefix_cache(reset_running_requests=True)``) is scheduled but
+        # its row lists the freed blocks, so it is removed here and re-added
+        # with the new ones, as upstream's V1 runner does.
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1055,8 +1060,23 @@ class TTModelRunner:
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            # A scheduled_new_reqs entry rebuilds the request from its record;
+            # ``build_cached_request_state`` keeps from the held state only what
+            # the record cannot carry. The id still holds a row when the request
+            # was in the previous step and comes back as new in this one: a
+            # resumable streaming-input request with its next input chunk, or,
+            # in vLLM's V2 scheduler output, a request that resumes in the same
+            # step that reports its preemption. Model-owned state is not
+            # released here: only the finish and preemption handling above
+            # releases it, so a streaming-input continuation keeps it.
+            req_index = self.input_batch.remove_request(req_id)
+            if req_index is not None:
+                removed_req_indices.append(req_index)
+                persistent_batch_layout_changed = True
             self.requests[req_id] = build_cached_request_state(
-                new_req_data, supports_stage_inputs=self.supports_stage_inputs
+                new_req_data,
+                supports_stage_inputs=self.supports_stage_inputs,
+                held=self.requests.get(req_id),
             )
             req_ids_to_add.append(req_id)
 
@@ -2986,7 +3006,7 @@ class TTModelRunner:
         if plan.is_decode:
             # ``slot_grammar_bitmask`` reorders against the full decode capacity.
             lane_total = plan.capacity
-            if model_input.defer_device_sampling:
+            if model_input.defer_device_sampling and not steady_decode_candidate:
                 self.async_decode.wait_for_all_pending_async_steps()
             if self.async_decode_scheduling and not model_input.defer_device_sampling:
                 req_ids = [
@@ -3059,9 +3079,9 @@ class TTModelRunner:
                 tt_out, _ = tt_out
             is_decode = False
 
-        # Forward done; defer the lane sampling tail to ``sample_tokens``. The
-        # step runs synchronously, so the lane batch layout is stable between
-        # this enqueue and the deferred sample.
+        # Forward done; defer the lane sampling tail to ``sample_tokens``.
+        # model_input retains submitted row identities for sampling and any
+        # deferred token readback.
         self._pending_samples.append(
             partial(
                 self._finish_lane_sync,
@@ -3087,7 +3107,7 @@ class TTModelRunner:
         is_decode: bool,
         lane_total: int,
         decode_submission: TTDecodeSubmission | None = None,
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         deferred = bool(getattr(model_input, "defer_device_sampling", False))
         try:
             return TTModelRunner._finish_lane_sync_impl(
@@ -3117,8 +3137,8 @@ class TTModelRunner:
         is_decode: bool,
         lane_total: int,
         decode_submission: TTDecodeSubmission | None = None,
-    ) -> ModelRunnerOutput:
-        """Sample and build the runner output for a deferred lane forward."""
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Sample a lane forward, optionally deferring token readback."""
         model_input = self._apply_grammar_to_input(
             model_input, grammar_output, lane_total=lane_total
         )
@@ -3127,6 +3147,15 @@ class TTModelRunner:
                 raise RuntimeError(
                     "deferred lane decode is missing its device submission"
                 )
+
+            if self.async_decode_scheduling:
+                return self.async_decode.complete_deferred_device_sampling(
+                    decode_submission,
+                    model_input,
+                    async_read=True,
+                    scheduled_rows=scheduled_rows,
+                )
+
             finalized = self.async_decode.complete_deferred_device_sampling(
                 decode_submission,
                 model_input,
@@ -3233,7 +3262,7 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if model_input.defer_device_sampling:
+        if model_input.defer_device_sampling and not steady_decode_candidate:
             self.async_decode.wait_for_all_pending_async_steps()
         if (
             self.async_decode_scheduling
@@ -3257,8 +3286,8 @@ class TTModelRunner:
             )
             return None
 
-        # Synchronous path (prefill, or decode without async scheduling): run
-        # the forward now and defer sampling to ``sample_tokens``.
+        # Prefill and deferred device sampling submit their forward here;
+        # ``sample_tokens`` receives the grammar and chooses readback timing.
         fwd = self._forward_with_model_input(model_input)
         self._pending_samples.append(partial(self._finish_front_packed_sync, fwd=fwd))
         return None
@@ -3817,7 +3846,7 @@ class TTModelRunner:
 
     def _finish_front_packed_sync(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         deferred = bool(fwd is not None and fwd.model_input.defer_device_sampling)
         try:
             return TTModelRunner._finish_front_packed_sync_impl(
@@ -3832,8 +3861,8 @@ class TTModelRunner:
 
     def _finish_front_packed_sync_impl(
         self, grammar_output: GrammarOutput | None, *, fwd: _SyncForward | None
-    ) -> ModelRunnerOutput:
-        """Sample and build output for a deferred front-packed forward.
+    ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
+        """Sample a front-packed forward, optionally deferring token readback.
 
         A synchronous lane verify lands here too: the speculative tail below
         reads its rows through ``TTModelInput.live_rows`` and assumes nothing
@@ -3851,6 +3880,17 @@ class TTModelRunner:
         )
         if fwd.model_input.spec_mode is not None:
             return self._finish_spec_decode(fwd)
+
+        if (
+            getattr(fwd.model_input, "defer_device_sampling", False)
+            and self.async_decode_scheduling
+        ):
+            if fwd.decode_submission is None:
+                raise RuntimeError("deferred decode is missing its device submission")
+
+            return self.async_decode.complete_deferred_device_sampling(
+                fwd.decode_submission, fwd.model_input, async_read=True
+            )
 
         sampled_token_ids_per_dp, logprobs_per_dp = self._sample_sync_forward(fwd)
         sampled_token_ids = sampled_token_ids_per_dp[0]
@@ -4001,8 +4041,8 @@ class TTModelRunner:
 
         Structured outputs use the device only for decode. Async scheduling
         keeps the single traced logits buffer safe: the engine samples each
-        forward before submitting the next, and a deferred forward first drains
-        pending async steps.
+        forward before submitting the next. Stable device-sampled continuations
+        can overlap readback; transitions requiring host state drain first.
         """
         want_device_sampling = self.sample_on_device_mode == "all" or (
             self.sample_on_device_mode == "decode_only" and is_decode
@@ -4457,6 +4497,17 @@ class TTModelRunner:
                     "grammar bitmask is set but device sampling can't apply it"
                 )
 
+                output_shape = tuple(tt_out.shape)
+                if not output_shape or output_shape[0] < start + sz:
+                    raise ValueError(
+                        f"TT device-sampled {'decode' if is_decode else 'prefill'} "
+                        f"output has shape={output_shape}, but DP segment {dp_rank} "
+                        f"requires rows [{start}, {start + sz}); "
+                        f"batch_size_per_dp={batch_size_per_dp}, "
+                        "submitted_request_ids="
+                        f"{getattr(model_input, 'row_req_ids', None)}"
+                    )
+
                 next_token_ids = _take(tt_out).reshape(sz, -1)
                 allowed_widths = (
                     (1, self._output_tokens_per_step)
@@ -4812,6 +4863,7 @@ class TTModelRunner:
                     req_ids=list(req_ids),
                     req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
                     submit_time_ns=now,
+                    request_states=tuple(self.requests.get(rid) for rid in req_ids),
                 ),
                 completion_time_ns=now,
                 runner_output=runner_output,
