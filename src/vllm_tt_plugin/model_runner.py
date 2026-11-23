@@ -4887,60 +4887,69 @@ class TTModelRunner:
         self._enqueue_deferred_state_apply(sampled_token_ids, req_ids, runner_output)
         return runner_output
 
-    def warmup_model(self) -> None:
-        # Two-phase warmup: eager preparation, then trace-enabled warmup.
-        #
-        # Phase 1 warms the eager prefill/decode paths without capturing
-        # traces. Generators own preparation of the programs and persistent
-        # buffers their traces need. Keep prefill first in Phase 2 because
-        # some custom adapters defer its preparation to that call.
-        #
-        # Assumptions / limitations:
-        #   1. Traced and non-traced code paths must use the same ops.
-        #      If a model uses different operators when enable_trace=False
-        #      vs True, Phase 1 will not compile the ops that Phase 2
-        #      traces, and new compilations during trace capture will
-        #      allocate corruptible buffers.
-        #   2. Prefill warmup must cover all supported sequence lengths.
-        #      If a new sequence length appears during inference, its
-        #      first compilation will allocate new kernel cache entries
-        #      (including reshape caches) that can corrupt active traces.
-        #
-        # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
-        trace_prefill_mode = self.trace_mode in ["all"]
-        trace_decode_mode = self.trace_mode in ["all", "decode_only"]
-        sample_on_device_mode = getattr(TTPlatform, "sample_on_device_mode", None)
-        assert sample_on_device_mode in (None, "all", "decode_only")
+    # Two-phase warmup: eager preparation (compile_model), then trace-enabled
+    # warmup (capture_model). TTWorker.compile_or_warm_up_model runs one after
+    # the other; a host running several models in one process can compile
+    # every model before any model captures.
+    #
+    # compile_model warms the eager prefill/decode paths without capturing
+    # traces. Generators own preparation of the programs and persistent
+    # buffers their traces need. Keep prefill first in capture_model because
+    # some custom adapters defer its preparation to that call.
+    #
+    # Assumptions / limitations:
+    #   1. Traced and non-traced code paths must use the same ops.
+    #      If a model uses different operators when enable_trace=False
+    #      vs True, compile_model will not compile the ops that
+    #      capture_model traces, and new compilations during trace capture
+    #      will allocate corruptible buffers.
+    #   2. Prefill warmup must cover all supported sequence lengths.
+    #      If a new sequence length appears during inference, its
+    #      first compilation will allocate new kernel cache entries
+    #      (including reshape caches) that can corrupt active traces.
+    #
+    # See: https://github.com/tenstorrent/tt-metal/commit/5043de3df5
+
+    def _warmup_kwargs(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        # This runner's sampling mode, not TTPlatform's: another engine in the
+        # process may have reconfigured the platform between the two phases.
         prefill_kwargs = dict(
             kv_cache=self.kv_caches,
-            can_sample_on_device=sample_on_device_mode == "all",
+            can_sample_on_device=self.sample_on_device_mode == "all",
         )
         decode_kwargs = dict(
             kv_cache=self.kv_caches,
             max_batch_size=self.tt_max_batch_size,
             num_blocks=self.max_num_blocks_per_req,
-            can_sample_on_device=sample_on_device_mode in ("all", "decode_only"),
+            can_sample_on_device=self.sample_on_device_mode in ("all", "decode_only"),
         )
         if self.supports_device_grammar:
             decode_kwargs["can_sample_device_grammar"] = True
+        return prefill_kwargs, decode_kwargs
 
-        # Phase 1: eager warmup (no trace capture). tt-metal #55343 also
-        # stages generic decode trace inputs here, using the profiled
-        # num_blocks above, so Phase 2 can reuse their device allocations.
+    def compile_model(self) -> None:
+        """Warm up every path with tracing off; captures no trace."""
+        prefill_kwargs, decode_kwargs = self._warmup_kwargs()
+        # tt-metal #55343 also stages generic decode trace inputs here, using
+        # the profiled num_blocks in decode_kwargs, so capture_model can reuse
+        # their device allocations.
         self.model.warmup_model_prefill(enable_trace=False, **prefill_kwargs)
         self.model.warmup_model_decode(enable_trace=False, **decode_kwargs)
 
-        # Reset prefill warmup flag so Phase 2 re-runs with tracing
+        # Reset prefill warmup flag so capture_model re-runs with tracing
         if hasattr(self.model, "already_warmed_up_prefill"):
             self.model.already_warmed_up_prefill = False
 
-        # Phase 2: capture prefill before decode. Custom adapters such as
-        # Qwen can defer persistent prefill allocations / compilation until
-        # this trace-enabled warmup; they must not run behind decode traces.
+    def capture_model(self) -> None:
+        """Capture the traces ``trace_mode`` asks for; run after compile_model."""
+        prefill_kwargs, decode_kwargs = self._warmup_kwargs()
+        # Capture prefill before decode. Custom adapters such as Qwen can
+        # defer persistent prefill allocations / compilation until this
+        # trace-enabled warmup; they must not run behind decode traces.
         # Generic decode inputs are already staged by tt-metal #55343, so
         # restoring this order does not require allocating them after prefill
         # capture. Older tt-metal revisions lack that protection (see #122).
-        if trace_prefill_mode:
+        if self.trace_mode in ["all"]:
             self.model.warmup_model_prefill(enable_trace=True, **prefill_kwargs)
-        if trace_decode_mode:
+        if self.trace_mode in ["all", "decode_only"]:
             self.model.warmup_model_decode(enable_trace=True, **decode_kwargs)
