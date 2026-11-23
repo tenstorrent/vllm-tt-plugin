@@ -19,7 +19,7 @@ def register() -> None:
 # only while the name is free, so a future upstream parser wins.
 _TT_REASONING_PARSERS = {
     "kolibri1": (
-        "vllm_tt_plugin.kolibri1_reasoning_parser",
+        "vllm_tt_plugin.parsers.kolibri1",
         "Kolibri1ReasoningParser",
     ),
 }

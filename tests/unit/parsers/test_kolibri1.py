@@ -7,7 +7,7 @@ import pytest
 import vllm.config  # noqa: F401  # finish vLLM init before the plugin package
 
 from vllm_tt_plugin import entrypoints
-from vllm_tt_plugin.kolibri1_reasoning_parser import thinking_enabled
+from vllm_tt_plugin.parsers.kolibri1 import thinking_enabled
 
 # The Kolibri wrapper tokens are single special tokens; the parser engine looks
 # them up in the vocabulary. A deterministic stand-in keeps these tests running
@@ -55,7 +55,7 @@ def test_register_adds_kolibri1_parsers_once():
     from vllm.tool_parsers import ToolParserManager
     from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 
-    from vllm_tt_plugin.kolibri1_reasoning_parser import Kolibri1ReasoningParser
+    from vllm_tt_plugin.parsers.kolibri1 import Kolibri1ReasoningParser
 
     entrypoints._register_tt_reasoning_parsers()
     entrypoints._register_tt_tool_parsers()
@@ -73,7 +73,7 @@ def test_register_adds_kolibri1_parsers_once():
 
 
 def _parser(tokenizer, **chat_template_kwargs):
-    from vllm_tt_plugin.kolibri1_reasoning_parser import Kolibri1ReasoningParser
+    from vllm_tt_plugin.parsers.kolibri1 import Kolibri1ReasoningParser
 
     return Kolibri1ReasoningParser(tokenizer, chat_template_kwargs=chat_template_kwargs)
 
