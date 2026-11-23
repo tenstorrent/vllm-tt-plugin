@@ -2680,7 +2680,13 @@ class TTModelRunner:
             prefill_empty_slots=prefill_empty_slots,
             prefill_req_ids=(
                 list(row_req_ids)
-                if is_prompt and get_prefix_hook() is not None and get_tt_prefix_hit_policy(self.vllm_config) == "model"
+                if is_prompt
+                and get_prefix_hook() is not None
+                and (
+                    get_tt_prefix_hit_policy(self.vllm_config) == "model"
+                    # a model whose hook asks for ids (Hy4: row-local cache, plugin prefix cache off) gets them too (hy4sched; default: hooks without the attribute behave as before)
+                    or bool(getattr(get_prefix_hook(), "wants_request_ids", False))
+                )
                 else None
             ),
             intermediate_prefill_mask=intermediate_prefill_mask,
