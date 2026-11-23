@@ -42,4 +42,8 @@ def register() -> None:
     OmniModelRegistry.register_model(
         TT_QWEN3_TTS_CODE2WAV_ARCH, TT_QWEN3_TTS_CODE2WAV_TARGET
     )
+    OmniModelRegistry.register_model(
+        "TTQwen3ASRForConditionalGeneration",
+        "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ASRForConditionalGeneration",
+    )
     register_tt_pipelines()
