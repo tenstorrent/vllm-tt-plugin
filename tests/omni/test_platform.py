@@ -116,7 +116,7 @@ def test_the_tts_stage_architectures_are_registered(monkeypatch: pytest.MonkeyPa
     )
 
 
-def test_the_omni_plugin_registers_the_tts_stages_where_omni_validates_them(
+def test_the_omni_plugin_registers_the_tt_stages_where_omni_validates_them(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_omni.config import pipeline_registry
@@ -136,6 +136,9 @@ def test_the_omni_plugin_registers_the_tts_stages_where_omni_validates_them(
         tt_platform.TT_QWEN3_TTS_TALKER_ARCH: tt_platform.TT_QWEN3_TTS_TALKER_TARGET,
         tt_platform.TT_QWEN3_TTS_CODE2WAV_ARCH: (
             tt_platform.TT_QWEN3_TTS_CODE2WAV_TARGET
+        ),
+        "TTQwen3ASRForConditionalGeneration": (
+            "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ASRForConditionalGeneration"
         ),
     }
     assert "tt_qwen3_tts_talker" in pipeline_registry.OMNI_PIPELINES
