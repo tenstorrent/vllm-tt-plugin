@@ -370,16 +370,33 @@ starts reading that environment variable.
 
 ## 7. Engineering standards
 
-Use [logprobs.py](src/vllm_tt_plugin/logprobs.py) as the reference example for
-module responsibilities, public input contracts, typing, numpydoc, and runnable
-examples. Apply those patterns to the actual responsibility and callers of the
-code being changed; its payload forms and implementation are specific to logprobs.
+### Design direction and reference examples
+
+Favor clear module and class hierarchies, compact names that use their context,
+small cohesive files, and implementations a reader can follow from entry point
+to result. Apply the same direction to tests: focused scenarios, visible setup
+and assertions, and purposeful fixtures and helpers. Keep code, abstractions,
+comments, and test scaffolding proportional to the behavior they explain or
+verify. Prefer direct control flow and remove duplication and obsolete code
+while preserving explicit contracts and meaningful coverage.
+
+Use these implementations and tests as worked examples of the standards below.
+Adapt their patterns to the responsibility and actual callers of the code being
+changed.
+
+| Area | Implementation | Tests |
+|---|---|---|
+| Logprobs | [logprobs.py](src/vllm_tt_plugin/logprobs.py) | [Unit](tests/unit/test_logprobs.py), [decode integration](tests/integration/test_decode_logprobs.py) |
+| Logging | [logger.py](src/vllm_tt_plugin/logger.py) | [Unit](tests/unit/test_logger.py) |
+| Parsers | [Kolibri adapter](src/vllm_tt_plugin/parsers/kolibri1.py), [registration](src/vllm_tt_plugin/parsers/registration.py) | [Unit](tests/unit/parsers/test_kolibri1.py), [registration integration](tests/integration/test_parser_registration.py) |
 
 ### Responsibilities, state, and dependencies
 
 - Give each module one explainable responsibility. Its module docstring must
   state its purpose, principal entry points, and relevant boundaries. Organize
   its contents so a reader can follow those entry points into their helpers.
+  Keep files compact; split a growing file along responsibility boundaries
+  when its size obscures that flow, keeping related behavior together.
 - Order class members by their role: construction (`__new__`, `__init__`,
   `__post_init__`, and alternative-constructor classmethods), primary public
   attributes, properties, and methods, secondary public members, then protected
@@ -467,13 +484,14 @@ code being changed; its payload forms and implementation are specific to logprob
   Tests of collaborating plugin components belong in `tests/integration/`,
   including hardware-free integration tests; device tests belong in `tests/tt/`.
   Keep unaffected legacy tests in place. See the [testing map](tests/README.md)
-  for commands and fixture boundaries, and [test_logprobs.py](tests/unit/test_logprobs.py)
-  for the unit-test reference example.
+  for commands and fixture boundaries.
 - Test behavior and the mechanism that guarantees it. Private helpers may be
   tested when they own the relevant mechanism; avoid tests that merely repeat
   implementation steps or freeze an incidental call shape or full error string.
-- Group related guarantees and explain non-obvious test intent. Parameterize
-  equivalent cases with meaningful IDs; keep distinct behaviors readable.
+- Group related guarantees in focused test files and explain non-obvious intent.
+  Keep setup compact and fixtures and helpers close to the cases they serve.
+  Parameterize equivalent cases with meaningful IDs; keep distinct behaviors
+  readable.
   Test classes are optional, not a required mirror of production classes, but
   preferred when have local fixtures and specific, focused testing scenarios or
   helpers. Give reused or non-obvious fixture and case structures typed, named

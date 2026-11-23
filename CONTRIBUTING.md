@@ -35,14 +35,14 @@ Use the [README environment setup](README.md#environment-setup), or the
 [host-only setup](AGENTS.md#3-environment-and-installation) when working without
 Tenstorrent hardware.
 
-The [engineering standards](AGENTS.md#7-engineering-standards) define design,
+The shared [engineering standards](AGENTS.md#7-engineering-standards) define design,
 typing, numpydoc, examples, exceptions, and test expectations. Consult
 [state and fixture isolation](AGENTS.md#8-state-and-fixture-isolation) when
 changing shared state or test setup.
 
-Start with the reference examples linked from those standards. The
-[testing map](tests/README.md) explains the unit, integration, support, and
-device-test layout and the commands for each group.
+Start with the [design direction and reference examples](AGENTS.md#design-direction-and-reference-examples)
+for logprobs, logging, parsers, and their tests. The [testing map](tests/README.md)
+explains the unit, integration, support, and device-test layout and commands.
 
 For model integrations, start with the
 [model-plugin interface](docs/MODEL_INTERFACE.md) and its linked contracts.
