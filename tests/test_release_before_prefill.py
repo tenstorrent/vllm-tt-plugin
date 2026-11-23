@@ -75,7 +75,6 @@ def _runner(max_num_reqs: int) -> TTModelRunner:
         max_num_batched_tokens=MAX_MODEL_LEN,
         vocab_size=64,
         block_sizes=[BLOCK_SIZE],
-        kernel_block_sizes=[BLOCK_SIZE],
     )
     runner.scheduler_config = SimpleNamespace(async_scheduling=True)
     runner.model_config = SimpleNamespace(max_model_len=MAX_MODEL_LEN)
@@ -218,6 +217,7 @@ def _engine(scheduler, log: list) -> SimpleNamespace:
         capture_iteration_details=lambda scheduler_output: nullcontext(),
         _process_aborts_queue=lambda: None,
         _attach_iteration_details=lambda outputs, details: None,
+        _attach_weight_version=lambda outputs: None,
         _finish_pause=finish_pause,
     )
 

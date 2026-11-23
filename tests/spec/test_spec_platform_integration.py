@@ -523,7 +523,6 @@ def test_admission_refuses_exactly_what_the_runner_will_not_speculate(
         max_num_batched_tokens=16,
         vocab_size=64,
         block_sizes=[16],
-        kernel_block_sizes=[16],
     )
     batch.add_request(
         CachedRequestState(
