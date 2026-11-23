@@ -919,19 +919,6 @@ class TTModelRunner:
             self._layer_to_group_idx = mapping  # type: ignore[assignment]
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
-        self._kv_connector = None
-        from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-
-        if has_kv_transfer_group():
-            connector = get_kv_transfer_group()
-            register = getattr(connector, "register_tt_kv_caches", None)
-            if register is None:
-                raise ValueError(
-                    f"KV connector {type(connector).__name__} cannot use TT device buffers "
-                    "(it has no register_tt_kv_caches); use vllm_tt_plugin.kv_connector.TTKVStoreConnector"
-                )
-            register(self.kv_caches)
-            self._kv_connector = connector
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:
@@ -3249,32 +3236,6 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
-        """Run the step, with the KV connector's loads before it and its saves after it.
-
-        Loads (prefix KV from the host store into the blocks the scheduler allocated for it) finish before the
-        forward is enqueued. Saves are issued after the forward is enqueued, on the same command queue, so they copy
-        what the forward wrote; they block until the bytes are on the host, then publish.
-        """
-        connector = getattr(self, "_kv_connector", None)
-        meta = getattr(scheduler_output, "kv_connector_metadata", None)
-        if connector is None or meta is None:
-            return TTModelRunner._execute_model_step(self, scheduler_output)
-        connector.bind_connector_metadata(meta)
-        self._step_prefill_error_ids = set()
-        try:
-            connector.start_load_kv(None)
-            out = TTModelRunner._execute_model_step(self, scheduler_output)
-            # A row the model could not serve ran on placeholder embeddings: its KV must not reach the store.
-            connector.skip_save_req_ids = set(self._step_prefill_error_ids)
-            connector.wait_for_save()
-        finally:
-            connector.clear_connector_metadata()
-        return out
-
-    def _execute_model_step(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> ModelRunnerOutput | None:
         """Run this rank's front-packed or lane-DP device forward.
 
         Returns ``None`` after enqueuing a pending sampler; the engine computes
@@ -4477,8 +4438,6 @@ class TTModelRunner:
                 )
             req_id = row_req_ids[int(row)]
             model_input.prefill_errors[req_id] = reason
-            if getattr(self, "_step_prefill_error_ids", None) is not None:
-                self._step_prefill_error_ids.add(req_id)  # read by execute_model for the KV connector
             logger.error(
                 "Request %s fails: its prefill (row %d) could not be served: %s",
                 req_id,
