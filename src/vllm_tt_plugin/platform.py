@@ -223,6 +223,19 @@ def _disable_chunked_prefill(vllm_config: "VllmConfig", reason: str) -> None:
     # for a model that cannot resume one.
     scheduler_config.long_prefill_token_threshold = 0
 
+    # When the encoder compute budget or encoder cache runs out, the base
+    # scheduler schedules only the tokens before a multimodal item, whatever
+    # ``enable_chunked_prefill`` says. A TT model runs its encoder inside
+    # ``prefill_forward`` and the runner keeps no encoder cache, so both only
+    # gate scheduling; sized to every token that can be in flight, they never do.
+    in_flight = scheduler_config.max_num_seqs * model_config.max_model_len
+    scheduler_config.max_num_encoder_input_tokens = max(
+        scheduler_config.max_num_encoder_input_tokens, in_flight
+    )
+    scheduler_config.encoder_cache_size = max(
+        scheduler_config.encoder_cache_size, in_flight
+    )
+
 
 def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> None:
     """Fail here rather than at the first scheduler step in a worker subprocess."""

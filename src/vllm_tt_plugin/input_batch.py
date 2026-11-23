@@ -242,6 +242,22 @@ def clone_torch_generator(generator: torch.Generator) -> torch.Generator:
     return clone
 
 
+def drop_unbounded_top_k_top_p(
+    top_k: torch.Tensor, top_p: torch.Tensor, vocab_size: int
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return ``None`` for a filter no row uses, as vLLM's GPU input batch does.
+
+    An all-``vocab_size`` top_k or an all-1.0 top_p truncates nothing, but a
+    tensor still makes vLLM's native sampler sort the whole vocabulary.
+    Each filter is decided on its own; a mixed batch keeps its tensor.
+    """
+    if bool((top_k == vocab_size).all()):
+        top_k = None
+    if bool((top_p == 1.0).all()):
+        top_p = None
+    return top_k, top_p
+
+
 class SamplingInputBatch:
     # Default values for padding sampling parameters in decode mode.
     DEFAULTS = {
@@ -1298,12 +1314,7 @@ class TTLaneInputBatch(InputBatch):
         top_p = sampling.top_p[rows]
         top_k = sampling.top_k[rows]
         if compact:
-            # A supplied all-ones top_p still sorts the entire vocabulary in
-            # vLLM's native sampler. None expresses that there is no filter.
-            if bool((top_p == 1.0).all()):
-                top_p = None
-            if bool((top_k == self.vocab_size).all()):
-                top_k = None
+            top_k, top_p = drop_unbounded_top_k_top_p(top_k, top_p, self.vocab_size)
         return SamplingMetadata(
             temperature=temperature if not all_greedy else None,
             all_greedy=all_greedy,
