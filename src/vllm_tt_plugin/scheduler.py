@@ -173,6 +173,17 @@ def spec_lookahead_tokens(plan, num_spec_tokens: int, method: str | None) -> int
     return num_spec_tokens + 1
 
 
+def _env_float(name: str):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return None
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    return f if f > 0 else None
+
+
 class TTDecodeInterleavePolicy:
     """Bounds how many consecutive prefill steps may stall running decodes.
 
@@ -202,6 +213,55 @@ class TTDecodeInterleavePolicy:
         ) = get_tt_decode_interleave_config(vllm_config)
         self._prefill_run = 0
         self._decode_run = 0
+        # Hy4 chunked prefill (default off, TT_DECODE_INTERLEAVE_WORK_MS unset and no switch file => the step-count policy above, unchanged): a prefill step of the Hy4 engine is a few 1.7 s chunks, so
+        # the bound that matters is wall time, not steps: a decode burst of ``burst`` steps after ``work_ms`` ms of prefill since the last decode step (the work_ms of the Kernelize sched_interleave policy).
+        self._work_ms = _env_float("TT_DECODE_INTERLEAVE_WORK_MS")
+        _b = _env_float("TT_DECODE_INTERLEAVE_BURST")
+        self._burst = max(1, int(_b)) if _b else None
+        self._file = os.environ.get("TT_DECODE_INTERLEAVE_FILE")
+        self._file_read = 0.0
+        self._file_off = False
+        self._prefill_ms = 0.0  # prefill wall time since the last decode step
+        self._last = None  # (kind, monotonic time) of the previous step
+        self.bursts = 0  # diagnostics: bursts started
+        self.work_decode_steps = 0
+
+    def _read_file(self) -> None:
+        """live switch (re-read at most every 0.5 s): a file with ``key=value`` pairs, ``work_ms``, ``burst`` (decode steps per burst), ``prefill_steps``, ``decode_steps``, or ``off`` / ``0`` (policy never
+        takes a step away from prefill) / ``default`` (back to the launch configuration). A missing / unreadable file changes nothing."""
+        if not self._file:
+            return
+        now = time.monotonic()
+        if now - self._file_read < 0.5:
+            return
+        self._file_read = now
+        try:
+            with open(self._file) as fh:
+                txt = fh.read().strip()
+        except OSError:
+            return
+        self._file_off = txt in ("off", "0")
+        if txt in ("", "default", "off", "0"):
+            if txt == "default":
+                self._work_ms = _env_float("TT_DECODE_INTERLEAVE_WORK_MS")
+                _b = _env_float("TT_DECODE_INTERLEAVE_BURST")
+                self._burst = max(1, int(_b)) if _b else None
+            return
+        for item in filter(None, (x.strip() for x in txt.replace("\n", ",").split(","))):
+            if "=" not in item:
+                continue
+            k, v = (x.strip() for x in item.split("=", 1))
+            try:
+                if k == "work_ms":
+                    self._work_ms = float(v) if float(v) > 0 else None
+                elif k == "burst":
+                    self._burst = max(1, int(v))
+                elif k == "prefill_steps":
+                    self._prefill_steps = max(1, int(v))
+                elif k == "decode_steps":
+                    self._decode_steps = max(1, int(v))
+            except ValueError:
+                pass
 
     def wants_decode_step(
         self, *, has_pending_prefill: bool, has_running_decode: bool
@@ -212,8 +272,19 @@ class TTDecodeInterleavePolicy:
         decode step cannot advance one, so interleaving on its account would
         trade a productive prefill step for an empty one.
         """
+        self._read_file()
+        if self._file_off:
+            return False
         if not self._enabled or not has_pending_prefill or not has_running_decode:
             return False
+        if self._work_ms is not None:
+            ran = self._prefill_ms
+            if self._last is not None and self._last[0] == "prefill":
+                ran += (time.monotonic() - self._last[1]) * 1000
+            burst = self._burst if self._burst is not None else self._decode_steps
+            if self._decode_run > 0:  # a burst in progress
+                return self._decode_run < burst
+            return ran >= self._work_ms
         return (
             self._prefill_run >= self._prefill_steps
             and self._decode_run < self._decode_steps
@@ -236,9 +307,29 @@ class TTDecodeInterleavePolicy:
         allowance already spent, and the next arriving prompt would then lose
         its first prefill step to an insertion it was never part of.
         """
+        now = time.monotonic()
+        if self._last is not None and self._last[0] == "prefill":
+            self._prefill_ms += (now - self._last[1]) * 1000
+        self._last = ("decode" if is_decode else "prefill", now)
         if not prefill_pending:
             self._prefill_run = 0
             self._decode_run = 0
+            self._prefill_ms = 0.0
+            return
+        if self._work_ms is not None and not self._file_off:
+            burst = self._burst if self._burst is not None else self._decode_steps
+            if is_decode:
+                if self._decode_run == 0:
+                    self.bursts += 1
+                self._decode_run += 1
+                self.work_decode_steps += 1
+                self._prefill_ms = 0.0
+                if self._decode_run >= burst:
+                    self._decode_run = 0
+                    self._prefill_run = 0
+            else:
+                self._prefill_run += 1
+                self._decode_run = 0
             return
         if is_decode:
             self._decode_run += 1
