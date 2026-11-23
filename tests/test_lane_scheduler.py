@@ -579,9 +579,9 @@ def test_merge_combines_nonempty_lane_outputs():
     lane0.scheduled_new_reqs = ["new-a"]
     lane0.scheduled_cached_reqs = CachedRequestData(
         req_ids=["a"],
-        resumed_req_ids={"a"},
+        resumed_req_ids=set(),
         new_token_ids=[[11]],
-        all_token_ids={"a": [1, 11]},
+        all_token_ids={},
         new_block_ids=[([0],)],
         num_computed_tokens=[1],
         num_output_tokens=[1],
@@ -601,7 +601,7 @@ def test_merge_combines_nonempty_lane_outputs():
         req_ids=["b"],
         resumed_req_ids=set(),
         new_token_ids=[[22]],
-        all_token_ids={"b": [2, 22]},
+        all_token_ids={},
         new_block_ids=[([0],)],
         num_computed_tokens=[5],
         num_output_tokens=[2],
@@ -625,8 +625,6 @@ def test_merge_combines_nonempty_lane_outputs():
     assert c.new_block_ids == [([0],), ([0],)]
     assert c.num_computed_tokens == [1, 5]
     assert c.num_output_tokens == [1, 2]
-    assert c.all_token_ids == {"a": [1, 11], "b": [2, 22]}
-    assert c.resumed_req_ids == {"a"}
     # Scheduled-token dicts merged; total recomputed from the merged dict.
     assert merged.num_scheduled_tokens == {"a": 1, "b": 1}
     assert merged.total_num_scheduled_tokens == 2

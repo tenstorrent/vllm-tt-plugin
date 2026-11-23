@@ -162,9 +162,10 @@ def merge_lane_scheduler_outputs(
     for out in lane_outputs:
         scheduled_new_reqs.extend(out.scheduled_new_reqs)
         # ``CachedRequestData`` is a struct-of-arrays (parallel ``req_ids`` /
-        # ``new_token_ids`` / ``new_block_ids`` / ... lists plus
-        # ``resumed_req_ids`` and ``all_token_ids``); concatenate each field so
-        # the merged object stays internally consistent. An idle lane returns a
+        # ``new_token_ids`` / ``new_block_ids`` / ... lists); concatenate each
+        # list so the merged object stays internally consistent. The V2
+        # scheduler output leaves ``resumed_req_ids`` and ``all_token_ids``
+        # empty, so they are not merged. An idle lane returns a
         # ``CachedRequestData.make_empty()`` struct (all-empty arrays), so the
         # ``num_reqs > 0`` guard just skips lanes that would contribute nothing
         # -- it is a clarity/efficiency skip, not a correctness guard
@@ -173,9 +174,7 @@ def merge_lane_scheduler_outputs(
         lane_cached = out.scheduled_cached_reqs
         if lane_cached.num_reqs > 0:
             cached.req_ids.extend(lane_cached.req_ids)
-            cached.resumed_req_ids |= lane_cached.resumed_req_ids
             cached.new_token_ids.extend(lane_cached.new_token_ids)
-            cached.all_token_ids.update(lane_cached.all_token_ids)
             cached.new_block_ids.extend(lane_cached.new_block_ids)
             cached.num_computed_tokens.extend(lane_cached.num_computed_tokens)
             cached.num_output_tokens.extend(lane_cached.num_output_tokens)
@@ -632,11 +631,6 @@ class TTLaneCoordinator(SchedulerInterface):
             # The resume recomputes the whole prompt: its queued-prefill
             # estimate is the prompt again, not the admission-time remainder.
             self._uncached_tokens.pop(req_id, None)
-
-        resumed_req_ids = set(merged.scheduled_cached_reqs.resumed_req_ids)
-        for req_id in resumed_req_ids:
-            decode_layout_changed |= req_id in self._req_to_row
-            self._release_slot(req_id)
 
         # A request listed as new while it still holds its row is placed on that
         # row again with a rebuilt state (``TTLaneInputBatch.apply_step_plan``):

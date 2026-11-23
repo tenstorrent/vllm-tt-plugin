@@ -68,13 +68,14 @@ that request's state.
 Lane-DP uses scheduler-owned stable slots, and a request's row is its slot
 for its whole life. `TTLaneInputBatch.apply_step_plan` calls `release_request`
 with that row for every request whose row the step frees -- a finished
-request, a preempted one, and a resumed one that still held a row -- while
-the request still holds it, before the row can be reused. A request that
-comes back in `scheduled_new_reqs` while it still holds its row (a
-streaming-input continuation) is placed on the same row and is not released.
-A request that holds no row when it finishes (aborted while queued, or
-preempted and aborted before its resume) releases nothing; a preempted request
-that holds no row is a bookkeeping fault and raises. Lane-DP never moves a slot (`condense` is a
+request and a preempted one -- while the request still holds it, before the
+row can be reused. A resume arrives in `scheduled_new_reqs` after its
+preemption already released the row. A request that comes back in
+`scheduled_new_reqs` while it still holds its row (a streaming-input
+continuation) is placed on the same row and is not released. A request that
+holds no row when it finishes (aborted while queued, or preempted and aborted
+before its resume) releases nothing; a preempted request that holds no row is
+a bookkeeping fault and raises. Lane-DP never moves a slot (`condense` is a
 no-op and `slot_remap` the identity), so it never issues
 `note_state_slots_moved`.
 

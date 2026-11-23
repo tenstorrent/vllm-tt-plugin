@@ -27,6 +27,7 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.core_client as core_client
     import vllm.v1.engine.input_processor as input_processor
+    from vllm.config import vllm as vllm_config_module
     from vllm.entrypoints.launchers.utils import server_utils
     from vllm.v1.structured_output import backend_xgrammar
 
@@ -44,6 +45,10 @@ def reset_tt_platform_class_state():
     saved = {
         name: TTPlatform.__dict__.get(name, unset) for name in _TT_PLATFORM_CONFIG_ATTRS
     }
+    saved_validate_v2 = vllm_config_module.VllmConfig._validate_v2_model_runner
+    saved_original_validate_v2 = vllm_config_module.__dict__.get(
+        "_tt_original_validate_v2_model_runner", unset
+    )
     saved_xgrammar_post_init = backend_xgrammar.XgrammarBackend.__post_init__
     saved_original_xgrammar_post_init = backend_xgrammar.__dict__.get(
         "_tt_original_xgrammar_post_init", unset
@@ -126,6 +131,14 @@ def reset_tt_platform_class_state():
             saved_original_add_streaming_input_request
         )
 
+    vllm_config_module.VllmConfig._validate_v2_model_runner = saved_validate_v2
+    if saved_original_validate_v2 is unset:
+        vllm_config_module.__dict__.pop("_tt_original_validate_v2_model_runner", None)
+    else:
+        vllm_config_module._tt_original_validate_v2_model_runner = (
+            saved_original_validate_v2
+        )
+
     backend_xgrammar.XgrammarBackend.__post_init__ = saved_xgrammar_post_init
     if saved_original_xgrammar_post_init is unset:
         backend_xgrammar.__dict__.pop("_tt_original_xgrammar_post_init", None)
@@ -181,6 +194,9 @@ def vllm_config() -> SimpleNamespace:
             original_max_model_len=None,
             is_moe=False,
             multimodal_config=None,
+            logits_processors=None,
+            enable_trace_replay=False,
+            return_sampling_mask=False,
             get_sliding_window=lambda: None,
         ),
         scheduler_config=SimpleNamespace(
@@ -195,4 +211,6 @@ def vllm_config() -> SimpleNamespace:
         lora_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         structured_outputs_config=SimpleNamespace(disable_any_whitespace=False),
+        watermark_config=None,
+        attention_config=SimpleNamespace(hisparse_config=None),
     )
