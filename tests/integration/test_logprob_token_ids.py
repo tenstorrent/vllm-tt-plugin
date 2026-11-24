@@ -10,6 +10,7 @@ both host-sampling paths (the merged lane batch and the per-rank
 row that names ids, and that such rows never take the device sampler.
 """
 
+from dataclasses import dataclass
 from itertools import repeat
 from types import MethodType, SimpleNamespace
 
@@ -66,6 +67,16 @@ def _assert_label_logprobs(logprobs_tensors, out_row, logits_row, ids):
     n = len(ids)
     assert logprobs_tensors.logprob_token_ids[out_row, 1 : n + 1].tolist() == ids
     torch.testing.assert_close(logprobs_tensors.logprobs[out_row, 1 : n + 1], expected)
+
+
+@dataclass(frozen=True)
+class _RowCase:
+    """One batch row: ``num_logprobs`` is what the output processor keeps
+    (``len(ids)`` for a row that names ids), ``ids`` is ``None`` for top-N."""
+
+    row: int
+    num_logprobs: int
+    ids: list[int] | None = None
 
 
 def _public_logprobs(logprobs_tensors, out_row, num_logprobs):
@@ -149,15 +160,19 @@ def test_mixed_lane_batch_keeps_top_n_rows_top_n(compact, plain_logprobs):
 
     position = {row: i for i, row in enumerate(rows)} if compact else None
     cases = (
-        (1, 3, {"ids": [5, 9, 2]}),
-        (6, 1, {"ids": [7]}),
-        (3, plain_logprobs, {"num_logprobs": plain_logprobs}),
+        _RowCase(row=1, num_logprobs=3, ids=[5, 9, 2]),
+        _RowCase(row=6, num_logprobs=1, ids=[7]),
+        _RowCase(row=3, num_logprobs=plain_logprobs),
     )
-    for row, num_logprobs, want in cases:
-        out_row = position[row] if compact else row
+    for case in cases:
+        out_row = position[case.row] if compact else case.row
         _assert_public_logprobs(
-            _public_logprobs(out.logprobs_tensors, out_row, num_logprobs),
-            _expected_public_logprobs(logits[row], **want),
+            _public_logprobs(out.logprobs_tensors, out_row, case.num_logprobs),
+            _expected_public_logprobs(
+                logits[case.row],
+                ids=case.ids,
+                num_logprobs=None if case.ids else case.num_logprobs,
+            ),
         )
 
 
