@@ -42,6 +42,14 @@ def _multi_modal_kwargs(new_req: NewRequestData) -> dict[str, list]:
     return {key: [values] for key, values in fields.items()}
 
 
+def _prompt_token_ids_cpu(prompts: list[list[int]]) -> torch.Tensor:
+    """Prompts as one [num_reqs, max_len] tensor; -1 pads, as no token has that ID."""
+    ids = torch.full((len(prompts), max(map(len, prompts))), -1, dtype=torch.long)
+    for i, prompt in enumerate(prompts):
+        ids[i, : len(prompt)] = torch.tensor(prompt, dtype=torch.long)
+    return ids
+
+
 def execute_pooling_step(
     model: Any, scheduler_output: SchedulerOutput
 ) -> ModelRunnerOutput:
@@ -55,7 +63,7 @@ def execute_pooling_step(
         return EMPTY_MODEL_RUNNER_OUTPUT
     pooler = model.pooler
     tasks = pooler.get_supported_tasks()
-    req_ids, params, lens, states = [], [], [], []
+    req_ids, params, prompts, states = [], [], [], []
     for new_req in new_reqs:
         pooling_params = new_req.pooling_params
         if pooling_params is None or pooling_params.task not in tasks:
@@ -79,14 +87,17 @@ def execute_pooling_step(
         )
         req_ids.append(new_req.req_id)
         params.append(pooling_params)
-        lens.append(len(prompt))
+        prompts.append(prompt)
         states.append(state)
 
+    lens = [len(prompt) for prompt in prompts]
     prompt_lens = torch.tensor(lens, dtype=torch.int32)
+    # As vLLM's GPU runner: the CPU IDs only, and only when a pooler asks (STEP).
+    needs_ids = any(p.requires_token_ids for p in params)
     metadata = PoolingMetadata(
         prompt_lens=prompt_lens,
         prompt_token_ids=None,
-        prompt_token_ids_cpu=None,
+        prompt_token_ids_cpu=_prompt_token_ids_cpu(prompts) if needs_ids else None,
         pooling_params=params,
         pooling_states=[PoolingStates() for _ in params],
     )

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import PoolerConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.pooler.activations import PoolerClassify
 from vllm.model_executor.layers.pooler.tokwise.heads import TokenClassifierPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import get_tok_pooling_method
@@ -31,10 +31,10 @@ class _TokenClassifier:
 
     is_pooling_model = True
 
-    def __init__(self):
+    def __init__(self, pooling_type="ALL"):
         with set_current_vllm_config(VllmConfig()):
             self.pooler = TokenPooler(
-                pooling=get_tok_pooling_method("ALL"),
+                pooling=get_tok_pooling_method(pooling_type),
                 head=TokenClassifierPoolerHead(
                     head_dtype=torch.float32, activation=PoolerClassify()
                 ),
@@ -46,10 +46,18 @@ class _TokenClassifier:
         return [torch.tensor([LOGITS] * prompt_lens[0])]
 
 
-def _params(**kwargs):
+class _PositionClassifier(_TokenClassifier):
+    """Row j of its logits is [prompt[j], j, 0], so pooled rows show their source."""
+
+    def prefill_forward(self, tokens, prompt_lens=None, **kwargs):
+        (prompt,) = tokens.tolist()
+        return [torch.tensor([[t, j, 0.0] for j, t in enumerate(prompt)])]
+
+
+def _params(pooler_config=None, **kwargs):
     params = PoolingParams(task="token_classify", **kwargs)
     # As vLLM's frontend does before a request reaches the engine.
-    params.verify(SimpleNamespace(pooler_config=None))
+    params.verify(SimpleNamespace(pooler_config=pooler_config))
     return params
 
 
@@ -115,6 +123,21 @@ def test_each_request_is_prefilled_alone_with_its_audio():
     assert tokens.tolist() == [[7, 8, 9]] and lens == [3]
     assert kwargs["input_audio_features"] == [[mel_a]]
     assert model.calls[1][2] == {}
+
+
+def test_step_pooling_keeps_the_rows_of_the_step_tag_in_request_order():
+    step = PoolerConfig(tok_pooling_type="STEP", step_tag_id=8)
+    reqs = [
+        _new_req("a", [7, 8, 9, 8], params=_params(step, use_activation=False)),
+        _new_req("b", [8, 5], params=_params(step, use_activation=False)),
+    ]
+
+    out = _execute(_PositionClassifier("STEP"), _step(reqs))
+
+    assert out.req_ids == ["a", "b"]
+    a, b = out.pooler_output
+    torch.testing.assert_close(a, torch.tensor([[8.0, 1.0, 0.0], [8.0, 3.0, 0.0]]))
+    torch.testing.assert_close(b, torch.tensor([[8.0, 0.0, 0.0]]))
 
 
 def test_a_task_the_pooler_does_not_serve_is_rejected():
