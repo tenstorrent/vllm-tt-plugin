@@ -6,45 +6,49 @@ excludeAgent: "cloud-agent"
 
 # Code review instructions
 
-Be concise. For each finding, give a concrete failure scenario: the input or state, and the wrong result.
+Read [AGENTS.md](../../AGENTS.md) and its applicable references before reviewing.
+It defines the repository's engineering, validation, and authorization rules.
+During a review, edit files or publish comments only when explicitly requested.
 
-## 1. Describe the pull request
+## 1. Establish intent
 
-Start the review with a short description of the pull request:
+Read the pull request description, linked issues, and complete diff. Identify
+the intended behavior, affected interfaces, and motivation. If the motivation or
+required context is missing, say what remains unclear rather than guessing.
 
-- What the pull request changes. Name the changed functions, classes, and behavior.
-- Why the pull request makes the change. Use the pull request description and the linked issues. If the reason is not clear, say so.
+## 2. Trace impact and check evidence
 
-## 2. New model capabilities, environment variables, and `--additional-config` options
+- Inspect affected callers, state transitions, and tests alongside the diff.
+  Follow the relevant paths in each affected
+  [execution mode](../../docs/SCHEDULING.md).
+- Apply the [engineering standards](../../AGENTS.md#7-engineering-standards)
+  and, where relevant, [state and fixture isolation](../../AGENTS.md#8-state-and-fixture-isolation).
+- For interface additions, apply the
+  [authorization and necessity rules](../../AGENTS.md#model-capabilities-and-plugin-configuration-require-human-authorization).
+  Trace the supporting evidence and required documentation. Check measurements
+  when an addition claims a performance benefit. Comment on a demonstrated
+  violation; a compliant addition does not need a separate comment.
+- Assess validation under
+  [test design and review evidence](../../AGENTS.md#test-design-and-review-evidence).
+  Distinguish fixes, features, refactors, and documentation changes when judging
+  coverage. Identify the material behavior left untested, if any.
 
-Apply the strictest review when the pull request does one of these:
+## 3. Report the review
 
-- adds a key or a value to `model_capabilities`, or adds an equivalent support check (a model-name condition, an attribute check)
-- makes the plugin read an environment variable that the plugin did not read before
-- accepts a new `--additional-config` key, including keys under `tt`
+Start with a short description of what changed and why, naming the principal
+functions, classes, or documentation involved.
 
-For each addition, write a separate comment that states:
+For each finding, give the affected file and precise location, the evidence,
+and the consequence:
 
-1. What the addition does and why the pull request needs it.
-2. The category of the addition:
-   - performance optimization: state the measured gain
-   - true model necessity: state what makes this model different from all other models
-   - workaround for a bug or a missing feature: mark the addition as blocking
-3. Whether an existing mechanism can already do the same thing.
-4. Whether the pull request documents the addition in all relevant locations: `docs/MODEL_CAPABILITIES.md` for model capabilities, the "Configuration" section of `README.md` for `--additional-config` options, and the code that reads the value.
-5. Whether the pull request description identifies the human request or approval for the addition.
+- For a correctness defect, identify a reachable input or state and the wrong
+  result introduced or exposed by the change.
+- For a requirements violation, link the specific rule and show how the change
+  violates it. A runtime failure is not necessary to establish a policy defect.
 
-`AGENTS.md`, section "Model capabilities and plugin configuration require human authorization", gives the full rules.
+Be concise, group duplicate findings, and put blocking findings first. Label
+optional suggestions separately. If no supported findings remain, say so.
+Do not comment on formatting handled by `pre-commit`.
 
-## 3. Standard review
-
-Then review the diff for:
-
-- correctness bugs: wrong logic, unhandled edge cases, wrong state lifetime, race conditions
-- regressions in the other execution modes: single-process non-DP, single-process lane-DP, multi-process DP
-- broken invariants that the code does not detect: the code must raise with the offending values, not continue in a degraded state
-- comments that describe a different mechanism than the code
-- dead code, duplication, and hunks that the pull request title does not explain
-- missing tests: a change needs a host test that fails on the old code
-
-Do not comment on formatting that `pre-commit` checks.
+Finish with the validation reviewed, checks you ran, and any remaining gaps.
+Distinguish the submitter's reported results from checks you performed yourself.

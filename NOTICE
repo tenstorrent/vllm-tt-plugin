@@ -20,10 +20,15 @@ Third-Party Dependencies:
 The following separate and independent dependencies are utilized by this
 project. Each is subject to its own license terms:
 
-- tblib
-  Licensed under BSD-2-Clause
-  https://github.com/ionelmc/python-tblib
-  https://github.com/ionelmc/python-tblib/blob/master/LICENSE
+- PyYAML
+  Licensed under MIT
+  https://github.com/yaml/pyyaml
+  https://github.com/yaml/pyyaml/blob/main/LICENSE
+
+- regex
+  Licensed under Apache-2.0 AND CNRI-Python
+  https://github.com/mrabarnett/mrab-regex
+  https://github.com/mrabarnett/mrab-regex/blob/hg/LICENSE.txt
 
 - vLLM
   Licensed under Apache-2.0

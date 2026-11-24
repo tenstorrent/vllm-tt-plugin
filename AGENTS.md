@@ -2,63 +2,76 @@
 
 These instructions apply to all AI-assisted contributions to
 `tenstorrent/vllm-tt-plugin`. Read this file before changing anything in the
-repository.
+repository. Repository-owned agent instructions, skills, and prompts must
+follow these rules too.
+
+## Before making a change
+
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the task-specific references
+   below. Follow their links as needed to understand the affected contract.
+2. Inspect the implementation, callers, and existing tests. Establish the
+   current behavior from code; do not treat nearby code as a design standard.
+3. Identify the responsibility being changed, the behavior to preserve or
+   correct, and the validation that will demonstrate it. Keep the change small
+   enough for a human to follow from its entry point to its result.
+4. Update the implementation, docstrings, examples, and affected reference
+   documentation together. Report the checks actually run and any gaps.
+
+| Task | Required reference |
+|---|---|
+| Model registration, construction, KV storage, execution, lifecycle | [Model interface](docs/MODEL_INTERFACE.md) and its relevant linked contracts |
+| Capability declarations or consumers | [Model capabilities](docs/MODEL_CAPABILITIES.md) and section 6 below |
+| Scheduling or execution modes | [Scheduling](docs/SCHEDULING.md) |
+| Installation or dependency changes | Section 3 below, [install script](docs/install-vllm-tt.sh), and [dependency overrides](docs/vllm-overrides.txt) |
+| vLLM compatibility assessment | [Upgrade assessment prompt](.github/prompts/vllm-upgrade-assessment.prompt.md) |
+| Tests or test setup | Sections 3, 5, 7, and 8 below, plus the applicable `conftest.py` |
+
+The engineering standards in section 7 apply to new and substantively changed
+code, including internal helpers. A mechanical edit does not require rewriting
+unrelated code. Existing debt is not permission to repeat it.
+
+### Recommended skills for Claude and Codex
+
+Installing [`tt-buddy`](https://github.com/tenstorrent/skills/tree/main/plugins/tt-buddy)
+is **strongly recommended** for sustained plugin work, but is optional. Follow
+the upstream installation instructions for
+[Claude Code](https://github.com/tenstorrent/skills#claude-code) or
+[Codex](https://github.com/tenstorrent/skills#codex).
+
+When available, use its plugin recipes for setup, serving, tests, and benchmarks;
+`learn` for source-based research and reuse of current notes; and `note` for
+meaningful findings, decisions, attempts, and results across sessions. These
+instructions and the current repository contracts take precedence over skills.
+
+The upstream [host-test recipe](https://github.com/tenstorrent/skills/blob/fb21b80/plugins/tt-buddy/recipes/vllm-tt-plugin/test.md#L9)
+references `ci/host-stubs`; use this repository's `tests/host-stubs` path and
+the command in section 3.
 
 ## 1. What this repository is
 
 `vllm-tt-plugin` integrates Tenstorrent hardware into vLLM through vLLM's
 standard out-of-tree plugin mechanism. Two entry points, both declared in
-`pyproject.toml`, are the whole hook surface:
+`pyproject.toml`, activate platform detection and registration:
 
 - `vllm.platform_plugins:tt` maps to `vllm_tt_plugin.entrypoints:platform_plugin`
 - `vllm.general_plugins:tt_model_registry` maps to `vllm_tt_plugin.entrypoints:register`
 
-Both gate on `import ttnn`. When `ttnn` is not importable, the plugin declines
-to activate and vLLM proceeds as if it were not installed.
+Platform detection and model registration gate on `import ttnn`; without it,
+the plugin does not select the TT platform or register TT models.
 
 The plugin is self-contained by design. Model registration, platform detection,
 config validation, scheduling, worker execution, model loading, async decode,
-and all three execution modes live here:
+and all three (data-parallelism) execution modes live here.
 
-- single-process non-DP
-- single-process lane-DP
-- standard multi-process DP (per-rank mesh and `TT_VISIBLE_DEVICES` discovery)
-
-See `docs/SCHEDULING.md` and `src/vllm_tt_plugin/utils/dp_discovery.py`.
-`src/vllm_tt_plugin/launcher.py` is retained MPI / tt-run and is not hooked by
-vLLM; it is not a fourth live mode.
-
-| Term | Meaning |
-|---|---|
-| DP | Data parallelism |
-| standard DP | Multi-process, one device mesh per rank |
-| lane-DP | Single-process, multiple TT lanes in one engine |
-| mesh | Device mesh (`MESH_DEVICE`), not a service mesh |
-| `python_env` | tt-metal virtualenv at `$PYTHON_ENV_DIR` |
-
-Do not open TT-feature pull requests against `vllm-project/vllm` or the
-deprecated `tenstorrent/vllm` fork. When plugin entry points cannot express
-the behaviour, runtime-monkeypatch vLLM from this repo next to the existing
-`_install_*` helpers in `src/vllm_tt_plugin/platform.py`. An upstream-general
-bug may still be fixed in vLLM core (see the TODO on
-`_install_tt_harmony_truncation_patch`). Neighbors for a new patch:
-`_install_diffusion_gemma_architecture_patch`,
-`_install_tt_harmony_truncation_patch`, `_pin_v1_model_runner`, and the
-`_install_block_output_*` functions.
-
-### Repository boundaries, and what changed recently
-
-Three repositories used to carry TT vLLM work. Their roles now:
+### Repository boundaries
 
 | Repository | Role today |
 |---|---|
 | `tenstorrent/vllm-tt-plugin` | The plugin. The only place plugin code lives. |
-| `tenstorrent/tt-metal` | The model side. Generators, model classes, and the `model_capabilities` declarations the plugin reads. |
-| `tenstorrent/vllm` | **Deprecated as of 2026-08-24** (see `tenstorrent/vllm#476`). It formerly vendored a copy of this plugin under `plugins/vllm-tt-plugin/`. Do not mirror changes there. Do not cite it as a reference for current behaviour. |
-
-Historical pull request titles in this repository carry markers such as
-`(port of tenstorrent/vllm#466)`. Those record a mirroring practice that has
-ended. Do not start new ones.
+| `tenstorrent/tt-metal` | TTNN ops and the (legacy) model side. Generators, model classes, and the `model_capabilities` declarations the plugin reads. |
+| `tenstorrent/tt-transformers` | Newly established package for model implementations. |
+| `tenstorrent/vllm` | Deprecated fork. Do not mirror changes there or use it as a reference for current behavior. |
+| `vllm-project/vllm` | Upstream vLLM. |
 
 ## 2. Hard rules
 
@@ -67,8 +80,9 @@ Violating any of these means the change is wrong, not merely imperfect.
 1. **Do not land TT features in vLLM core.** Do not open TT-feature pull
    requests against `vllm-project/vllm` or `tenstorrent/vllm`. Extend this
    plugin: add a hook if one exists, otherwise add a runtime monkeypatch next
-   to the `_install_*` functions in `platform.py`. An upstream-general bug
-   (not TT-specific) may still be fixed in vLLM core. See section 1.
+   to the `_install_*` functions in `src/vllm_tt_plugin/platform.py`. An
+   upstream-general bug may still be fixed in vLLM core; see the TODO on
+   `_install_tt_harmony_truncation_patch` for an example.
 2. **Never use system `python3` or bare `pip`.** The plugin runs inside a
    tt-metal `python_env`. Use that environment's interpreter, or `uv` when
    creating a fresh one. Invoke tests as `$VIRTUAL_ENV/bin/python -m pytest`,
@@ -78,7 +92,7 @@ Violating any of these means the change is wrong, not merely imperfect.
    do not copy them, and do not rip them out in an unrelated pull request. See
    section 6.
 4. **Never use `assert` to enforce a new runtime invariant.** Python run with
-   `-O` removes asserts. Raise instead, and print the offending values. `assert`
+   `-O` removes asserts. Raise instead, and include the offending values. `assert`
    in pytest tests is required. Existing production asserts in `src/` are debt;
    do not convert them in an unrelated pull request. See section 7.
 5. **Run `pre-commit run` before every commit.** Agent shells often have no
@@ -94,11 +108,10 @@ There are two environments, and most work needs only the first.
 
 ### Host-only, no Tenstorrent hardware
 
-The whole unit suite runs on any machine. `tests/host-stubs/ttnn/` supplies an
-import-only `ttnn` stand-in whose every device-reaching entry point raises. A
-test that starts depending on real hardware fails loudly there rather than
-passing against a fake device. Work from the repository root. `uv` must
-already be installed. vLLM requires Python 3.11 or newer.
+The host suite requires no Tenstorrent hardware. `tests/host-stubs/ttnn/`
+supplies an import-only `ttnn` stand-in whose device entry points raise.
+Work from the repository root with `uv` installed. vLLM requires Python 3.11
+or newer; CI covers Python 3.12.
 
 ```bash
 export VIRTUAL_ENV="$PWD/.venv"
@@ -113,13 +126,14 @@ PYTHONPATH=tests/host-stubs "$VIRTUAL_ENV/bin/python" -m pytest tests/ --ignore=
 `docs/install-vllm-tt.sh` must be **sourced**, not executed. It uses `return`
 on failure because it is designed to run in the caller's shell.
 
-`pytest` is pinned below 9 because pytest 9's `caplog` attaches its own capture
-handler to non-propagating loggers and double-captures records (see
-`tests/test_logger.py`). That pin is **not** "match tt-metal": tt-metal
-`python_env` currently ships pytest 9.x. Plugin CI installs pytest through
-`.[dev]`, as does tt-metal's plugin host job. The
-`dev` extra pins `pytest>=8,<9` so `uv pip install -e ".[dev]"` cannot float
-to 9. Do not install an unpinned pytest over that extra.
+The `dev` extra pins `pytest>=8,<9` because pytest 9's `caplog`
+double-captures records on non-propagating loggers (see
+`tests/unit/test_logger.py`). This is a plugin test requirement, independent of
+tt-metal's pytest version. CI installs the extra; do not install an unpinned
+pytest over it.
+
+See the [test commands](tests/README.md#run-tests) for isolated unit tests,
+integration tests, both host-suite modes, doctests, and device tests.
 
 ### On a Tenstorrent host
 
@@ -131,17 +145,18 @@ inside the script assume that working directory.
 
 ```bash
 "$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
-  --tt-server-url http://localhost:8000 --tt-model-name <model>
+  --tt-server-url=http://localhost:8000 --tt-model-name=MODEL
 ```
 
-See `tests/tt/conftest.py` for the full option set, including
+Replace `MODEL` with the served model name. Use the real TTNN environment
+without host stubs for device tests. See
+`tests/tt/conftest.py` for the full option set, including
 `--tt-max-num-seqs` and `--tt-chunked-prefill-budget`.
 
 ### The install script owns the dependency set
 
-This is the single most fragile part of the repository, and its rationale is
-written out in the script and in `docs/vllm-overrides.txt`. Read both before
-touching either.
+Read `docs/install-vllm-tt.sh` and `docs/vllm-overrides.txt` before changing
+either. The script owns dependency resolution for vLLM.
 
 Summary of the constraint: vLLM's PyPI metadata is generated on a CUDA machine,
 so `uv` resolves `requirements/cuda.txt` regardless of `VLLM_TARGET_DEVICE`.
@@ -158,24 +173,21 @@ together:**
 
 - `docs/install-vllm-tt.sh`, the `common.txt` URL (the `v0.x` tag)
 - `docs/install-vllm-tt.sh`, the `vllm==0.x` install line. Do **not** touch
-  `torchvision==0.x` a few lines above it: that pin tracks tt-metal's
-  `requirements-dev.txt`, not vLLM, and the two currently carry the same
-  version string by coincidence. A find-and-replace on the version breaks the
-  torch pair.
-- `README.md`, twice: the stated version, and the `launcher.py` line in the
-  package layout. The `compat/vllm-X.Y.Z` guidance below them is generic and
-  stays as it is.
-- `docs/diffusion-gemma.md`, twice: the pinned-build line and the `gemma4`
-  reasoning and tool parsers line.
-- `docs/vllm-overrides.txt`, re-checked against the new `common.txt` (upstream
-  may have relaxed the opencv floor)
+  `torchvision==0.x` line as part of a vLLM version replacement: that pin
+  tracks tt-metal's `requirements-dev.txt` and must match its torch pair.
+- `README.md`: the stated version and the `launcher.py` package-layout note.
+  Leave generic `compat/vllm-X.Y.Z` guidance generic.
+- `docs/diffusion-gemma.md`: the pinned-build version and any affected
+  reasoning/tool parser compatibility guidance.
+- `docs/vllm-overrides.txt`: re-check every override against the new
+  `common.txt` and the tt-metal environment, including version ceilings.
 
 The pin is spread across a sourced shell script that installs with `--no-deps`,
 so what resolved and what the docs claim can diverge silently. After
 installing, confirm the version rather than trusting the pin:
 
 ```bash
-python -c "import vllm; print(vllm.__version__)"
+"$VIRTUAL_ENV/bin/python" -c "import vllm; print(vllm.__version__)"
 ```
 
 ## 4. Linting, formatting and pre-commit
@@ -198,10 +210,8 @@ pre-commit run              # staged files
 pre-commit run --all-files
 ```
 
-**Record the result in the pull request body.** This repository has a clean CI
-record and that is not an accident: pull requests here carry pre-push evidence,
-and the habit of pushing follow-up `lint`, `lint2`, `lint3` fixup commits
-stopped when work moved to this repository. Do not restart it.
+Record the command and result in the pull request's Validation section. Resolve
+hook failures before committing.
 
 Every Python source file carries an SPDX header. New ones need it. Markdown in
 this repository does not carry SPDX headers.
@@ -213,44 +223,22 @@ this repository does not carry SPDX headers.
 
 ## 5. Continuous integration
 
-`.github/workflows/lint-and-host-tests.yaml` runs on pull requests into `main`
-and `release/*` that are not drafts: when opened, reopened, pushed to, or
-marked ready for review. Draft pull requests run nothing, and converting a
-pull request to draft cancels its run in progress. Its jobs:
+[Lint and host tests](.github/workflows/lint-and-host-tests.yaml) runs for
+non-draft pull requests into `main` and `release/*`. Converting to draft
+cancels an in-progress run. `required-checks` gates on `pre-commit` and all
+`host-tests-stubbed` legs; require that aggregate check in branch rules.
 
-- `pre-commit` on `ubuntu-latest`
-- `host-tests-stubbed` on Python 3.12 with `tests/host-stubs`, which
-  installs through `docs/install-vllm-tt.sh`. That job therefore also fails
-  when the documented install path rots, which is intentional. It calls the
-  reusable `.github/workflows/host-tests-stubbed.yaml`, which
-  `vllm-release-watch.yml` also runs against the pinned and the latest vLLM.
-- `host-tests-ttnn` with real `ttnn`, inside tt-metal's Ubuntu 24.04
-  release image for the latest stable tag and the latest release tag (dev or
-  rc). Its failures show on the pull request but do not block merging, and
-  `required-checks` does not wait for it. A `workflow_dispatch` run
-  can name one tt-metal tag instead.
-- `required-checks`, which fails unless `pre-commit` and every
-  `host-tests-stubbed` leg pass. It is the check to require in the branch
-  ruleset, so matrix changes never touch the ruleset.
+The [stubbed host workflow](.github/workflows/host-tests-stubbed.yaml) tests
+Python 3.12 through the documented install script. The release watcher
+also uses it for compatibility checks. `host-tests-ttnn` tests real `ttnn`
+Ubuntu 24.04 release images without hardware and is advisory. Its tag
+resolution is independent of the required stubbed job. Both install pytest
+through `.[dev]`.
 
-Torch comes from tt-metal's `tt_metal/python_env/requirements-dev.txt`, read by
-`.github/scripts/tt-metal-torch-pin.sh`: `host-tests-ttnn` installs the pin of
-the tag each leg tests, and `host-tests-stubbed`, which tests no tag, installs
-the latest stable tag's pin. The two lookups are independent:
-`host-tests-stubbed` resolves its own, and `resolve-tt-metal` feeds only
-`host-tests-ttnn`, so a newer or requested tag that cannot be resolved fails
-only the advisory job. Both test jobs install pytest through the `dev` extra.
-
-Two scheduled workflows close inactive work. `close-stale.yaml` runs
-`actions/stale`: a pull request idle for 30 days, or an issue idle for 90 days,
-gets the `stale` label and a warning comment, and is closed 7 days (pull
-request) or 14 days (issue) later unless it is updated. The `keep-open` label
-exempts both, and the `type:bug` label exempts issues.
-`remove-stale-branches.yaml` comments on the head commit of a branch whose
-author date is 60 or more days old and deletes the branch 7 days later unless
-it gets a newly authored commit. Rebasing or amending keeps the old author
-date, so it does not reset the timer. It skips `main`, `stable`, `release/*`,
-and branches with an open pull request.
+CI resolves torch from tt-metal's `tt_metal/python_env/requirements-dev.txt`
+using [.github/scripts/tt-metal-torch-pin.sh](.github/scripts/tt-metal-torch-pin.sh):
+the stable tag for stubbed tests and each tested tag for real-`ttnn` tests.
+Read the workflows for matrix and dispatch details.
 
 **There is no hardware CI in this repository.** Plugin pull requests do not
 dispatch tt-metal `vllm-model-tests`. That workflow is workflow_dispatch, and
@@ -259,6 +247,11 @@ pasted host, model, and mesh result in Validation, or a named tt-metal job
 with `vllm-tt-plugin-ref` set to this branch. The pull request template has a
 `Validation` section for exactly this.
 
+Inactivity automation is defined in
+[close-stale.yaml](.github/workflows/close-stale.yaml) and
+[remove-stale-branches.yaml](.github/workflows/remove-stale-branches.yaml).
+Consult those files for timers, exemptions, and whether deletion is enabled.
+
 ## 6. Model interface and capabilities
 
 Before changing model registration, construction, KV allocation, forward calls,
@@ -266,7 +259,7 @@ or lifecycle hooks, read [docs/MODEL_INTERFACE.md](docs/MODEL_INTERFACE.md)
 and the relevant linked references. Update the affected interface pages in the
 same PR when changing model-facing arguments, return values, capability
 consumers, or state ownership. Keep API reference details in `docs/`; keep
-contribution rules in `AGENTS.md`.
+agent contribution rules in `AGENTS.md`.
 
 New behaviour is gated on capabilities a model class declares, not on a new
 model-type allowlist. `TTPlatform.check_and_update_config` reads a
@@ -289,14 +282,14 @@ fail-on-missing for a new key unless the matching tt-metal generators will
 declare it in the same change. Raise when a *present* value contradicts
 another resolved property (block-output plus prefix caching; DiffusionGemma
 without `output_tokens_per_step > 1`) or when an operator request is
-unsupported. Copy those existing `ValueError` messages.
+unsupported. Use the existing validation conventions and include the
+contradictory values in the error.
 
 Leftover identity gates still exist. Do not copy them for new work, and do
 not remove them in an unrelated pull request:
 
-- lane-DP folding: Galaxy generator version plus `model_class.__name__ == "GptOssForCausalLM"`
+- lane-DP folding: legacy Galaxy-generator and GPT-OSS identity checks
 - GPT-OSS top-K logprobs: `hf_config.model_type == "gpt_oss"`
-- hybrid KV: `get_kv_cache_spec` on the model class, not `model_capabilities`
 
 Other contracts are methods, not dictionary keys: hybrid KV opt-in is
 `get_kv_cache_spec`; recurrent state declared through `MambaSpec` uses
@@ -308,8 +301,11 @@ classmethod specified in [docs/SPEC_DECODE_CONTRACT.md](docs/SPEC_DECODE_CONTRAC
 `SpecPlan` resource declarations do not yet enforce row or byte budgets.
 
 The model classes and their capability declarations live in **tt-metal**, under
-`models.tt_transformers.tt.generator_vllm` and the per-demo generators such as
-`models.demos.llama3_70b_galaxy.tt.generator_vllm`.
+`models.ttt_compat.tt.generator_vllm` and the per-demo generators such as
+`models.demos.llama3_70b_galaxy.tt.generator_vllm`. However, `ttt_compat` is a
+legacy subpackage and accepts only bug fixes; the new **tenstorrent/tt-transformers**
+repository re-implements model building blocks and we should strive to adapt to
+it as much as possible. tt-metal's `models/tt_transformers` is deprecated.
 
 Consequence: a plugin change that consumes a new capability needs a matching
 tt-metal change that declares it. Those two land as a pair. Say so in both pull
@@ -373,53 +369,152 @@ starts reading that environment variable.
    added complexity is justified. Missing authorization or an unsupported
    necessity claim blocks acceptance.
 
-## 7. What reviewers in this repository actually enforce
+## 7. Engineering standards
 
-These are the recurring review themes. Check your own diff against them before
-opening a pull request.
+### Design direction and reference examples
 
-**Dead code and leftovers.** If the change makes something unreachable, delete
-it in the same pull request. Recurring reviewer comments: "this is unused
-right?", "is this used anywhere? not seeing it", "if X is never used anymore,
-should delete the file", "this should never happen right? can we remove the
-guardrail if unnecessary".
+Favor clear module and class hierarchies, compact names that use their context,
+small cohesive files, and implementations a reader can follow from entry point
+to result. Apply the same direction to tests: focused scenarios, visible setup
+and assertions, and purposeful fixtures and helpers. Keep code, abstractions,
+comments, and test scaffolding proportional to the behavior they explain or
+verify. Prefer direct control flow and remove duplication and obsolete code
+while preserving explicit contracts and meaningful coverage.
 
-**Comments that state the wrong invariant.** A comment must describe the actual
-mechanism, not the intended one. This is enforced precisely here. Example of the
-standard being applied: "This comment is slightly misleading. Base scheduler not
-adding `skipped_waiting` to a decode batch relies on us hiding `skipped_waiting`
-when scheduling decodes, not on `skipped_waiting` implying prefill intent."
-A comment that is approximately true is a defect.
+Use these implementations and tests as worked examples of the standards below.
+Adapt their patterns to the responsibility and actual callers of the code being
+changed.
 
-**Scope creep.** Every hunk must be explained by the pull request title. This is
-the most consistent complaint on large changes. A silently changed constant is
-the classic case: a review caught `trace_region_size` moving inside a change
-described as a config-mechanism rename. If a constant changes, say why in the
-body.
+| Area | Implementation | Tests |
+|---|---|---|
+| Logprobs | [logprobs.py](src/vllm_tt_plugin/logprobs.py) | [Unit](tests/unit/test_logprobs.py), [decode integration](tests/integration/test_decode_logprobs.py) |
+| Logging | [logger.py](src/vllm_tt_plugin/logger.py) | [Unit](tests/unit/test_logger.py) |
+| Parsers | [Kolibri adapter](src/vllm_tt_plugin/parsers/kolibri1.py), [registration](src/vllm_tt_plugin/parsers/registration.py) | [Unit](tests/unit/parsers/test_kolibri1.py), [registration integration](tests/integration/test_parser_registration.py) |
 
-**Duplication.** A new code path that mirrors an existing one draws a
-de-duplication request. Prefer extending the existing path.
+### Responsibilities, state, and dependencies
 
-**Fail loudly, do not recover.** Where an invariant is broken, raise with a
-message that prints the offending values. Do not add fallback logic that
-continues in a degraded state. Using `assert` for a new runtime invariant is
-rejected because `-O` removes asserts. pytest `assert` is required. Existing
-production asserts are debt; do not convert them here.
+- Give each module one explainable responsibility. Its module docstring must
+  state its purpose, principal entry points, and relevant boundaries. Organize
+  its contents so a reader can follow those entry points into their helpers.
+  Keep files compact; split a growing file along responsibility boundaries
+  when its size obscures that flow, keeping related behavior together.
+- Order class members by their role: construction (`__new__`, `__init__`,
+  `__post_init__`, and alternative-constructor classmethods), primary public
+  attributes, properties, and methods, secondary public members, then protected
+  and private helpers. Place helper staticmethods at the bottom. Keep field
+  declarations together where required by Python or dataclasses.
+- Use functions for operations and classes for cohesive state, identity, or
+  lifecycle behavior. Introduce an abstraction only when actual callers need
+  a responsibility that existing objects cannot express clearly. Do not add
+  wrappers, base classes, or delegation layers just to follow a pattern.
+- Give mutable state an explicit owner. Document who initializes, mutates, and
+  releases it, its lifetime, and any ordering or concurrency constraints.
+  Distinguish borrowed and owned buffers where that affects correctness.
+- Keep dependencies directed from orchestration to the operations it uses.
+  Extract behavior that can be understood through a clear interface; moving
+  coupled code to several files without clarifying its contract is insufficient.
+  Prefer an existing responsible module over a miscellaneous helpers module.
+- Identify which interfaces callers may rely on and which helpers are internal.
+  Check callers before changing either. State which observable behaviors a
+  refactor preserves and explain intentional corrections, including changes to
+  exceptions, warnings, or logging.
+- Reuse existing paths, delete code made unreachable by the change, and keep
+  unrelated cleanup separate. Every hunk must serve the stated change; explain
+  changed constants and defaults explicitly.
 
-**File size and layering.** `model_runner.py` and `platform.py` are already
-thousands of lines. The predecessor repository accumulated a multi-thousand-line
-file and drew "we really need to do something about this before it becomes
-completely unmaintainable". Adding a new conditional branch to either file is a
-prompt to split into an existing neighbor (`config.py`, `scheduler.py`,
-`lane_scheduler.py`, `model_registry.py`) rather than grow the file.
+### Types, docstrings, and examples
 
-**Tests: cover the mechanism, not the symptom.** Do not add a test that freezes
-one error string or one call shape. Add a host test that exercises the
-mechanism that failed and will keep exercising it. A change ships with a host
-test that would fail on the old code, or names the existing test that already
-exercises that mechanism. "Unsure" is not a skip.
+- Use concise, meaningful names for objects and arguments. Use the enclosing
+  module, class, or function to supply context instead of repeating it in every
+  name: prefer `from_top_k_logprobs(logprobs, ...)` over
+  `from_top_k_logprobs(top_k_logprobs, ...)`. Retain distinctions needed to
+  understand the value; avoid cryptic abbreviations.
+- Annotate new and substantively changed function and method parameters,
+  return values, and non-obvious stored state. Types must describe the runtime
+  values callers actually pass. Avoid `Any` or unstructured containers when
+  the contract is known; do not introduce a runtime wrapper merely to add types.
+- Document every module, class, function or method, and nontrivial variable, including
+  internal ones. Each docstring should begin with a one-liner and followed by optional
+  details (see the table below). Use [**numpydoc**](https://numpydoc.readthedocs.io/en/latest/format.html): a concise purpose followed by the
+  applicable sections below. Omit empty sections and information already clear from the
+  signature.
 
-## 8. Testing notes that will bite you
+  | Section | Required content when applicable |
+  |---|---|
+  | `Parameters` | Meaning, constraints, defaults with behavioral significance, and input ownership |
+  | `Returns` / `Yields` | Result meaning, ordering, ownership, and sentinel values |
+  | `Raises` | Deliberate exception types and the conditions that trigger them |
+  | `Attributes` | Caller-visible state and its meaning |
+  | `Notes` | Non-obvious algorithm, mutation, lifecycle, or concurrency rules |
+  | `Examples` | Minimal use of the principal standalone interfaces |
+  | `See Also` | References to owners of the object, related objects, etc. |
+
+- Document tensor shapes, dimension meanings, dtypes, layouts, and units where
+  they form part of the contract. Describe mutation and other side effects.
+  Do not list every incidental exception a dependency might raise.
+- Give principal standalone APIs small, deterministic examples with explicit
+  inputs and observable results. Include imports and required setup; do not
+  require unrelated engine scaffolding. State hardware prerequisites when
+  needed. Run executable examples with doctest or a named test exercising the
+  same example, and record the command and result.
+- Put durable explanations in docstrings. Keep inline comments concise and
+  local to a non-obvious operation, ordering constraint, or invariant. Bug-fix
+  history belongs in commits, pull requests, or issues, not comment blocks
+  above repaired code. Update inaccurate comments and docstrings with the code.
+
+### Validation, exceptions, and diagnostics
+
+- Validate at the boundary that owns the requirement. Distinguish invalid
+  caller input from broken execution state. Raise useful exceptions with the
+  relevant offending values; never use runtime `assert` or invent a fallback
+  that continues after a broken invariant.
+- Reuse an appropriate exception type. Prefer domain exceptions or a hierarchy,
+  esp. when callers need that distinction. Preserve the cause when translating
+  exceptions with `raise ... from exc`.
+- Warn for recoverable conditions that need attention. Log meaningful events
+  at the appropriate level with enough context to act. Make the logs concise,
+  readable, traceable, and searchable. Avoid duplicate reports, routine per-step
+  noise, and expensive formatting when logging is disabled.
+
+### Test design and review evidence
+
+- **Strictly follow test-driven-development best practices.** Do not invent
+  post-hoc tests addressing only symptoms to fool yourself and others that your
+  implementation is correct.
+- Place new or reorganized module unit tests in `tests/unit/test_<module>.py`.
+  Tests of collaborating plugin components belong in `tests/integration/`,
+  including hardware-free integration tests; device tests belong in `tests/tt/`.
+  Keep unaffected legacy tests in place. See the [testing map](tests/README.md)
+  for commands and fixture boundaries.
+- Test behavior and the mechanism that guarantees it. Private helpers may be
+  tested when they own the relevant mechanism; avoid tests that merely repeat
+  implementation steps or freeze an incidental call shape or full error string.
+- Group related guarantees in focused test files and explain non-obvious intent.
+  Keep setup compact and fixtures and helpers close to the cases they serve.
+  Parameterize equivalent cases with meaningful IDs; keep distinct behaviors
+  readable.
+  Test classes are optional, not a required mirror of production classes, but
+  preferred when have local fixtures and specific, focused testing scenarios or
+  helpers. Give reused or non-obvious fixture and case structures typed, named
+  fields so readers can identify each value without tracing tuple positions.
+- Keep inputs deterministic unless randomness is under test. Restore mutable
+  global state. Share builders through test support modules or fixtures, never
+  imports from neighboring test files. Unit setup must avoid unrelated engine,
+  platform, or device initialization; inspect inherited fixtures as well.
+  Verify isolation both when running unit tests alone and through normal host
+  collection. Keep engine-reset fixtures scoped to the integration tests that
+  need them; see the [unit fixture override](tests/unit/conftest.py).
+- A bug fix needs a regression test that exercises the failed mechanism and
+  fails on the old code, or an explanation of how existing coverage already
+  exercises it. A behavior-preserving refactor may use retained coverage;
+  do not manufacture tests solely to validate a move or rename. Documentation
+  changes need applicable link, example, and consistency checks.
+- Review findings must identify a concrete violated requirement or reachable
+  incorrect behavior, with evidence from the affected code or documentation.
+  Separate optional suggestions from defects; a review with no findings is
+  valid. Do not demand speculative guards, configuration, or abstractions.
+
+## 8. State and fixture isolation
 
 Resolved TT state lives in two places. Pick the bucket that matches the
 lifetime of the value:
@@ -433,20 +528,17 @@ lifetime of the value:
   `tests/conftest.py` `_TT_PLATFORM_CONFIG_ATTRS`:
   `_standard_dp_visible_device_groups`, `_standard_dp_mesh_grids`,
   `sample_on_device_mode`, `always_compat_sampling`, `_tt_vllm_config`.
-  `always_compat_sampling` is assigned at runtime inside
-  `_apply_check_and_update_config`, not declared as a `ClassVar` on the class
-  body.
+  `always_compat_sampling` is assigned during config validation, not declared
+  on the class body.
 
 If you add a new class-level attribute to `TTPlatform`, add its name to
 `_TT_PLATFORM_CONFIG_ATTRS`, or you will leak state into unrelated tests.
 
-The same autouse fixture, `reset_tt_platform_class_state` in
-`tests/conftest.py`, also saves and restores the patches `platform.py`
-installs: `InputProcessor.process_inputs`,
-`AsyncLLM._add_streaming_input_request`, `EngineCore.reset_prefix_cache`,
-`EngineCore.pause_scheduler`, `EngineCoreProc.pause_scheduler`, and the
-`_tt_original_*` markers. A new `_install_*_patch` must extend that restore
-set. A leaked wrapper raises in unrelated tests.
+The autouse `reset_tt_platform_class_state` fixture in
+[tests/conftest.py](tests/conftest.py) also restores runtime patches, their
+aliases, and original-function markers. When adding an `_install_*_patch`,
+extend its restore set for every modified target and marker. Restoring class
+attributes alone does not undo installed wrappers.
 
 **`tests/tt/conftest.py` deliberately neutralizes that fixture by using the
 same name.** Those tests drive a server over HTTP and never touch
@@ -464,17 +556,18 @@ plugin imports into the fixture body, as `tests/conftest.py` does.
 
 - **Title prefix.** Use one of `[bug]`, `[feat]`, `[perf]`, `[ref]`, `[test]`,
   `[ci]`, `[doc]`, `[deps]`. Example: `[bug] Reject invalid device IDs for
-  standard TT DP.` The history contains a second style using a module prefix
-  such as `platform:`. Follow the template's bracket form for new work.
+  standard TT DP.`
 - **Fill in the template.** `.github/pull_request_template.md` asks for TL;DR,
   Details, Related Artifacts, and Validation. The Validation section is where
   the commands and their results go, including hardware, model, and device-mesh
   configuration for device tests.
-- **One logical change per pull request.** Small pull requests here merge fast
-  and with little friction; large ones stall. Split rather than bundle.
-- **Link the tt-metal counterpart** when the change pairs with one, in both
-  directions.
-- **Branch naming.** `<user>/<short-description>`, dashes not underscores.
+- **One logical change per pull request.** Split independently reviewable
+  changes rather than bundling them.
+- **Link the tt-metal or tt-transformers counterpart** when the change pairs with
+  one, in both directions.
+- **Branch naming.** `<user>/<label>.<short-description>`, dashes not underscores.
+- **Commit messages.** Follow the [contribution guidelines](CONTRIBUTING.md#pull-request-guidelines)
+  for message content and where validation evidence belongs.
 - **Reviewers are assigned by** `.github/CODEOWNERS`.
 
 ### Before opening a pull request
@@ -482,14 +575,14 @@ plugin imports into the fixture body, as `tests/conftest.py` does.
 Check that the work is not already being done:
 
 ```bash
-gh pr list --repo tenstorrent/vllm-tt-plugin --state open --search "<area keywords>"
+gh discussion list --repo tenstorrent/vllm-tt-plugin --state all --search "<area keywords>"
 gh issue view <issue_number> --repo tenstorrent/vllm-tt-plugin --comments
+gh pr list --repo tenstorrent/vllm-tt-plugin --state open --search "<area keywords>"
 ```
 
 If an open pull request already addresses the same thing, do not open another.
-If your approach differs materially, say how in a comment on the existing one
-rather than opening a competing pull request. Two undocumented pull requests
-with the same goal read as low-effort automation and get treated that way.
+Explain a materially different approach to the human submitter so they can
+coordinate on the existing pull request. Posting comments requires authorization.
 
 ## 10. AI-assisted contributions
 
@@ -498,10 +591,11 @@ with the same goal read as low-effort automation and get treated that way.
 - The submitter reviews every changed line and runs the relevant tests.
 - State in the pull request body that AI assistance was used, and record the
   test commands and their results.
-- Add attribution trailers to commits. Example:
+- Add accurate attribution trailers to commits. Use the actual assistant and
+  human signer's identity; do not copy placeholder identities. Example:
 
 ```text
-Co-authored-by: Claude
+Co-authored-by: <assistant used>
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
@@ -514,15 +608,27 @@ in this plugin is in bounds; see section 1.
 
 ## 11. Editing these instructions
 
-This file is the agent source of truth. It wins over `CONTRIBUTING.md` where
-they disagree (including `git rebase -i` / force-push guidance there).
+This file is the repository's agent source of truth. It takes precedence over
+conflicting repository prompts, skills, review instructions, and
+`CONTRIBUTING.md`. Human instructions for the task still apply.
 
-`CLAUDE.md` exists only because Claude Code reads that name and not
-`AGENTS.md`. It is a one-line `@AGENTS.md` import. Put instructions here, never
-there, or the two toolchains drift.
-
-- Keep it lean. Put operator docs in `docs/` and `README.md`; do not duplicate
-  them here.
-- Do not grow this file with review lore or one-off anecdotes.
-- A new hard rule needs a failure mode an agent actually hits, not a preference.
-- Verify every concrete claim against the code in the same change.
+- Keep `CLAUDE.md` as an adapter importing `@AGENTS.md`; do not put independent
+  contribution rules there.
+- Give each rule one canonical home. Link to shared rules from agent adapters,
+  prompts, and skills instead of copying them. Keep operator instructions in
+  `README.md`, runtime and model contracts in `docs/`, and shared contributor
+  guidance in `CONTRIBUTING.md`. Before removing guidance from this file,
+  ensure its destination contains the full procedure and link to it.
+- Give each repository-owned prompt or skill a clear purpose and scope,
+  required inputs, expected output, action boundaries, and applicable validation.
+  Refer to the shared design, docstring, example, and test rules. Task-specific
+  procedures may add necessary detail without weakening or duplicating them.
+- Check that referenced files, commands, tools, and skills exist. State required
+  setup and working directories. Do not make optional skills an undeclared
+  prerequisite or invent commands, results, or tool availability.
+- When changing a rule, check agent adapters, review instructions, prompts, and
+  generated instructions for contradictory copies. Reconcile affected copies
+  within the agreed scope; report remaining conflicts explicitly.
+- Keep rules concise and tied to demonstrated failure modes. Remove obsolete
+  rules and review anecdotes rather than accumulating them. Verify changed
+  concrete claims against the current code and check documentation links.
