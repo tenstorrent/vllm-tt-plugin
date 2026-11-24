@@ -38,6 +38,7 @@ from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
 from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
+from vllm_tt_plugin.kv_layout import default_kv_layout
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
@@ -140,14 +141,27 @@ def worker_connector(monkeypatch, vllm_config):
     return connector
 
 
-def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
+@pytest.mark.parametrize(
+    ("connector_name", "num_blocks"),
+    [("NixlConnector", 4), ("TTNixlPushConnector", 10_000)],
+    ids=["mirror_of_the_pool", "staging_slots"],
+)
+def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(
+    vllm_config, connector_name, num_blocks
+):
     pytest.importorskip("nixl")
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
         NixlConnector,
     )
 
+    from vllm_tt_plugin.nixl_staging import TTNixlPushConnector
+
+    connector_cls = {
+        "NixlConnector": NixlConnector,
+        "TTNixlPushConnector": TTNixlPushConnector,
+    }[connector_name]
     vllm_config.kv_transfer_config = KVTransferConfig(
-        kv_connector="NixlConnector", kv_role="kv_producer", kv_buffer_device="cpu"
+        kv_connector=connector_name, kv_role="kv_producer", kv_buffer_device="cpu"
     )
     model_config = vllm_config.model_config
     spec = FullAttentionSpec(
@@ -157,7 +171,7 @@ def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
         dtype=model_config.dtype,
     )
     kv_cache_config = KVCacheConfig(
-        num_blocks=4,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.self_attn"], spec)],
     )
@@ -165,18 +179,20 @@ def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(vllm_config):
     _install_tt_nixl_single_rank_patch()
 
     k = FakePackedKVTensor(heads=spec.num_kv_heads // CHIPS)
-    kv_tensors = {"model.layers.0.self_attn": (k, FakePackedKVTensor(k.shape[1]))}
+    layout = default_kv_layout([[k, FakePackedKVTensor(k.shape[1])]], kv_cache_config)
 
-    connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+    connector = connector_cls(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
     try:
-        connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, kv_tensors))
+        connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, layout))
 
         # NIXL transfers its own CPU buffer; a block of it holds exactly the
         # packed K and V of that block on every chip, and is the buffer's
-        # memory in block order.
-        (buffer,) = connector.connector_worker.host_xfer_buffers.values()
+        # memory in block order. With staging slots it has a row per slot.
+        worker = connector.connector_worker
+        (buffer,) = worker.host_xfer_buffers.values()
+        rows = worker.slots.num_slots if hasattr(worker, "slots") else num_blocks
         assert buffer.device.type == "cpu"
-        assert buffer.shape[0] == kv_cache_config.num_blocks
+        assert buffer.shape[0] == rows < 10_000
         assert buffer[0].nbytes == 2 * CHIPS * k.block_bytes
         assert kv_transfer._buffer_bytes(buffer).nbytes == buffer.nbytes
     finally:
@@ -320,6 +336,7 @@ def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
         _output_tokens_per_step=1,
         _validate_kv_cache_groups=TTModelRunner._validate_kv_cache_groups,
         _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
+        model=SimpleNamespace(),
     )
     TTModelRunner.initialize_kv_cache(
         runner,
@@ -339,6 +356,7 @@ class FakePackedKVTensor:
     """One layer's bfloat8_b K or V: each chip's buffer as bytes."""
 
     dtype = kv_transfer.ttnn.bfloat8_b
+    layout = kv_transfer.ttnn.TILE_LAYOUT
 
     def __init__(self, heads: int = 1):
         self.shape = (PACKED_BLOCKS, heads, BLOCK_SIZE, 32)
@@ -442,16 +460,16 @@ def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connecto
         assert description.untyped_storage().nbytes() == 1
 
 
-def test_a_connector_refuses_a_kv_cache_that_is_not_bfloat8_b(
+def test_a_connector_refuses_a_kv_cache_it_cannot_describe(
     worker_connector, monkeypatch
 ):
-    monkeypatch.setattr(FakePackedKVTensor, "dtype", "bfloat16")
-    with pytest.raises(ValueError, match="needs a bfloat8_b KV cache.*bfloat16"):
+    monkeypatch.setattr(FakePackedKVTensor, "dtype", "uint32")
+    with pytest.raises(ValueError, match="cannot describe a uint32"):
         _initialize_kv_cache(LAYER_NAMES, _model_kv_caches())
 
 
 def test_a_connector_refuses_kv_it_cannot_map_to_layer_names(worker_connector):
-    with pytest.raises(ValueError, match="one \\[k, v\\] KV cache entry per"):
+    with pytest.raises(ValueError, match="allocated 3 \\[k, v\\] entries for 2"):
         _initialize_kv_cache(LAYER_NAMES, _model_kv_caches(num_layers=3))
 
 

@@ -48,29 +48,67 @@ storage, device execution, and any model-specific state.
 With `--kv-transfer-config`, the single-process path and standard DP (one
 engine process per rank) run vLLM's KV connector lifecycle; lane-DP rejects
 the option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
-`register_kv_caches` once, after the model adapter allocates KV storage. The
-argument is a dictionary keyed by the layer names in `kv_cache_config`. Each
-value is a torch tensor that only describes that layer's KV cache and holds no
-KV. The KV stays in the ttnn tensors the adapter allocated. A layer is
-described as bytes, `(num_blocks, num_kv_heads, block_size, n)` `uint8`, sized
-so that a block is exactly the packed tiles of its K and V on every chip. The
-copy below moves those tiles unchanged, so startup raises unless every layer's
-cache is `bfloat8_b`, and both servers of a transfer need the same total KV
-heads, head size and block size. Their chip counts may differ.
+`register_kv_caches` once, after the model adapter allocates KV storage, and
+then `set_host_xfer_buffer_ops` with the function that copies KV blocks
+between the adapter's ttnn tensors and a connector's CPU buffer. A connector
+that stages KV through such a buffer, like `NixlConnector` or
+`TTNixlPushConnector` with `"kv_buffer_device": "cpu"`, moves KV with it.
+
+### KV transfer layout
+
+Both calls come from the model's KV transfer layout: per layer name in
+`kv_cache_config`, the paged device tensors (parts) that hold a block of that
+layer, the bytes of one block of a part on one chip, and which chips hold which
+shard of it. Block `b` of a part is bytes `[b * block_bytes, (b + 1) *
+block_bytes)` of each chip's buffer. A shard held by several chips is read from
+the first and written to all of them. A transferred block of a layer is its
+parts' blocks in order, each part shard after shard.
+
+A model declares its layout with an optional method:
+
+```python
+def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+    # layer name -> [(device tensor, block_bytes, shards), ...]
+    # shards: per shard, the mesh device indices (row-major) holding it
+    return {
+        "model.layers.0.self_attn": [(k0, k_bytes, [[0], [1]]), (v0, v_bytes, [[0], [1]])],
+        ...
+    }
+```
+
+It must describe every layer name in `kv_cache_config`, including the layers
+of an MTP drafter, and may use any part structure: K and V, one MLA latent,
+recurrent state, heads split or copied over any mesh shape. Without the
+method, the plugin derives the layout of a `[k, v]` pair per attention layer
+(`kv_caches` in layer-index order, layer `model.layers.<idx>...` is entry
+`idx`), each cache `[blocks, heads, block_size, head_dim]` in TILE layout of
+bfloat16, float32, bfloat8_b or bfloat4_b, with the heads either split evenly
+over the chips in mesh order or copied to every chip. Anything else raises at
+startup and needs the method.
+
+The connector's description of a layer is bytes, `(num_blocks, num_kv_heads,
+block_size, n)` `uint8`, sized so that a block is one transferred block. It
+holds no KV; the KV stays in the ttnn tensors. Two servers exchange KV only
+when every layer's transferred block has the same bytes on both: same dtype,
+head size, block size and total heads. Their chip counts may differ when heads
+are split in chip order. The copy moves each chip's share of each block as one
+region with `ttnn.copy_device_to_host_regions` and
+`ttnn.copy_host_to_device_regions`, straight between the chip and its place in
+the buffer.
 
 A model class without a `get_kv_cache_spec` hook gets one layer name per
 attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
 
-The runner then calls `set_host_xfer_buffer_ops` with the function that copies
-KV blocks between the adapter's ttnn tensors and a CPU buffer shaped like
-those descriptions. A connector that stages KV through such a buffer, like
-`NixlConnector` with `"kv_buffer_device": "cpu"`, moves KV with it. Startup
-raises unless the allocator returned one `[k, v]` pair per layer name, each
-name following the `...layers.<idx>...` convention. On a mesh of several chips
-the copy takes each chip's tensor to hold an equal share of the KV heads, in
-chip order. It moves each chip's share of each block as one region with
-`ttnn.copy_device_to_host_regions` and `ttnn.copy_host_to_device_regions`,
-straight between the chip and its place in the buffer.
+### Host staging slots
+
+`TTNixlPushConnector` (vLLM's `NixlPushConnector` with a TT worker) sizes the
+CPU buffer for the requests in flight instead of the whole KV pool: room for
+two requests of `max_model_len` tokens, at most the pool. D hands P staging
+slot numbers instead of block IDs and copies the slots into its chips once
+P's write lands; P copies only the blocks D registered, once the two are
+matched. A D request whose KV does not arrive within
+`push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
+fails instead of waiting forever. P and D must both use it.
 
 ## Minimum implementation
 
