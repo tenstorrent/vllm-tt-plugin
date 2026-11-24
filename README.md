@@ -210,7 +210,7 @@ login()
 
 For the target model, follow any setup instructions in the corresponding
 tt-metal demo. For Llama 3.1, Llama 3.2, and Qwen 2.5 models, follow the
-[tt-transformers demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers)
+[ttt_compat demo instructions](https://github.com/tenstorrent/tt-metal/tree/main/models/ttt_compat)
 for weights and environment variables.
 
 ## Running The Offline Inference Example

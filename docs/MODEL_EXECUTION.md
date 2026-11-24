@@ -364,7 +364,7 @@ schedule included, a padding row with `start_pos=-1`; see the
 handling is in
 [Decode readback and output conversion](#decode-readback-and-output-conversion).
 
-The tt-metal `tt_transformers` adapters follow the lane-DP sketch: the shared
+The tt-metal `ttt_compat` adapters follow the lane-DP sketch: the shared
 `Generator` keeps one model and one KV cache list per sub-mesh, maps a prefill
 slot to `user_id // max_batch_size_per_model`, and splits decode inputs with
 `torch.chunk`. The Llama 3 70B Galaxy adapter divides `tt_data_parallel` by
@@ -375,6 +375,6 @@ lane-local block IDs address storage that no other lane uses.
 
 Sources: `TTLaneInputBatch` in [input_batch.py](../src/vllm_tt_plugin/input_batch.py);
 in [tt-metal](https://github.com/tenstorrent/tt-metal),
-`models/tt_transformers/tt/generator.py`,
-`models/tt_transformers/tt/generator_vllm.py`, and
+`models/ttt_compat/tt/generator.py`,
+`models/ttt_compat/tt/generator_vllm.py`, and
 `models/demos/llama3_70b_galaxy/tt/generator_vllm.py`.

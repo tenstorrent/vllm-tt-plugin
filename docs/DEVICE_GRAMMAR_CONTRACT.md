@@ -213,9 +213,9 @@ device:
 - host-only options (`min_p`, `logit_bias`, `bad_words`, `allowed_token_ids`,
   `min_tokens`, custom logits processors).
 
-## 6. Reusing the tt_transformers implementation
+## 6. Reusing the ttt_compat implementation
 
-An adapter built on `models/tt_transformers/tt/generator.py` `Generator` and the
+An adapter built on `models/ttt_compat/tt/generator.py` `Generator` and the
 shared `models/common/sampling` sampler already implements sections 2–4. To
 opt in, check that:
 
@@ -226,7 +226,7 @@ opt in, check that:
 
 | Piece | Location (tt-metal#55892) |
 | --- | --- |
-| Payload, `enable_device_grammar`, `decode_forward` deferred branch, `sample_deferred_decode`, failure latch | `models/tt_transformers/tt/generator.py` |
+| Payload, `enable_device_grammar`, `decode_forward` deferred branch, `sample_deferred_decode`, failure latch | `models/ttt_compat/tt/generator.py` |
 | Grammar trace key, mask validation, `grammar_bitmask` on `sample`/`capture_trace`/`precompile` | `models/common/sampling/generator.py` |
 | `format_grammar_bitmask`, persistent buffers, on-device unpack and `-inf` mask | `models/common/sampling/tt_sampling.py` |
 | Grammar-on warmup sweep | `models/common/warmup/warmup_utils.py` |
