@@ -27,11 +27,11 @@ from vllm.config import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
     get_kv_cache_configs,
-    get_request_block_hasher,
-    init_none_hash,
 )
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.outputs import ModelRunnerOutput
@@ -125,7 +125,9 @@ class _Harness:
         available = _available_kv_cache_memory_bytes_for_num_blocks(
             config, SPECS, NUM_BLOCKS
         )
-        [kv_cache_config] = get_kv_cache_configs(config, [SPECS], [available])
+        [kv_cache_config] = get_kv_cache_configs(
+            config, [SPECS], [available], get_global_kv_cache_groups(config, [SPECS])
+        )
         assert kv_cache_config.num_blocks == NUM_BLOCKS
         self.scheduler = TTScheduler(
             vllm_config=config,

@@ -374,7 +374,10 @@ def _unresolved_layout_cache_config(block_size: int):
 )
 def test_hybrid_pool_covers_upstream_admission(batch, in_flight, lookahead, expected):
     """Real upstream grouping/planning must admit the unchanged full context."""
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+    from vllm.v1.core.kv_cache_planning import (
+        get_global_kv_cache_groups,
+        get_kv_cache_configs,
+    )
     from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
     from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -386,6 +389,7 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, lookahead, expe
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
             model="hybrid-test",
+            supports_kv_cache_grouping=False,
             max_model_len=1048576,
             original_max_model_len=1048576,
             get_sliding_window=lambda: 513,
@@ -447,7 +451,9 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, lookahead, expe
     cfg.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
     cfg.cache_config.num_gpu_blocks_override = blocks
     available = _available_kv_cache_memory_bytes_for_num_blocks(cfg, specs, blocks)
-    [planned] = get_kv_cache_configs(cfg, [specs], [available])
+    [planned] = get_kv_cache_configs(
+        cfg, [specs], [available], get_global_kv_cache_groups(cfg, [specs])
+    )
     assert planned.num_blocks == blocks
     assert len(planned.kv_cache_groups) == 5
     assert cfg.model_config.max_model_len == 1048576
@@ -459,7 +465,9 @@ def test_hybrid_pool_covers_upstream_admission(batch, in_flight, lookahead, expe
             cfg, specs, 32898
         )
         with pytest.raises(ValueError, match="larger than the available"):
-            get_kv_cache_configs(cfg, [specs], [old_available])
+            get_kv_cache_configs(
+                cfg, [specs], [old_available], get_global_kv_cache_groups(cfg, [specs])
+            )
 
         # Auto-fit retains the original fixed budget; it must not expand to
         # the checkpoint's advertised context before upstream fits it.
@@ -478,6 +486,7 @@ def test_hybrid_pool_floor_skips_a_hook_that_returns_none():
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
             model="hybrid-test",
+            supports_kv_cache_grouping=False,
             max_model_len=8192,
             original_max_model_len=8192,
             get_sliding_window=lambda: None,

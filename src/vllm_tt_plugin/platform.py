@@ -87,10 +87,11 @@ _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
 # must agree on this hardware-fixed value.
 _TT_TOKEN_TILE_SIZE = 32
 # The comparison ``_install_tt_async_spec_method_patch`` acts through, and how
-# many times ``VllmConfig.__post_init__`` makes it: once for an explicitly
-# requested asynchronous scheduling, once for the automatic selection.
+# many times ``VllmConfig.__post_init__`` makes it: once, in the V1 model
+# runner check whose result both an explicitly requested asynchronous
+# scheduling and the automatic selection read.
 _ASYNC_SPEC_GATE_COMPARISON = "not in get_args(EagleModelTypes)"
-_ASYNC_SPEC_GATE_COMPARISONS = 2
+_ASYNC_SPEC_GATE_COMPARISONS = 1
 _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
     "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
     "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
@@ -674,6 +675,19 @@ def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) 
         ModelRegistry.register_model(model_arch, model_path)
 
 
+def _register_model_over_upstream(
+    ModelRegistry, model_arch: str, model_path: str
+) -> None:
+    """Register `model_arch` in place of vLLM's own entry for it.
+
+    An entry from ``TT_MODEL_CLASS_OVERRIDES`` or ``EXTRA_MODELS_DIR`` is
+    registered earlier and stays, as `_register_model_if_missing` keeps it.
+    """
+    entry = ModelRegistry.models.get(model_arch)
+    if entry is None or getattr(entry, "module_name", "").startswith("vllm."):
+        ModelRegistry.register_model(model_arch, model_path)
+
+
 def _tt_model_class_overrides() -> dict[str, str]:
     """Parse ``TT_MODEL_CLASS_OVERRIDES`` into an {architecture: target} map.
 
@@ -938,15 +952,16 @@ def _install_tt_async_spec_method_patch() -> None:
 
     ``VllmConfig.__post_init__`` decides asynchronous scheduling against the
     speculative method name, and it decides before ``check_and_update_config``
-    runs: an explicit ``--async-scheduling`` raises for any method outside
-    EAGLE/MTP/draft_model/NGram GPU/DSpark, and the default path rewrites the
-    setting to False for the same set. TT uses the ``custom_class`` extension
-    category for its model-owned drafter. The ordinary platform validation
-    hook runs too late to admit that category through the upstream check.
+    runs: under the V1 model runner, an explicit ``--async-scheduling`` raises
+    for any method outside EAGLE/MTP/draft_model/NGram GPU/DSpark/DFlash, and
+    the default path rewrites the setting to False for the same set. TT uses
+    the ``custom_class`` extension category for its model-owned drafter. The
+    ordinary platform validation hook runs too late to admit that category
+    through the upstream check.
 
-    Both predicates read one module-level name, ``EagleModelTypes``, which
+    That check reads one module-level name, ``EagleModelTypes``, which
     ``vllm.config.vllm`` imports and uses nowhere else. Rebinding that name to
-    a widened ``Literal`` changes exactly those two conditions, in that module,
+    a widened ``Literal`` changes exactly that condition, in that module,
     and leaves every other consumer of the type alone: each imports it into its
     own namespace. Everything else upstream checks stays in force, including
     the executor's support, ``disable_padded_drafter_batch``, and the
@@ -990,8 +1005,8 @@ def _async_spec_gate_shape_problem(vllm_config_module: Any) -> str | None:
     The rebind has no effect when upstream inlines the method list, renames it,
     or routes the decision through a helper: the name still exists and still
     holds ``custom_class`` while asynchronous scheduling stays disabled for the
-    model-owned drafter. The source is checked for the two comparisons the
-    patch acts through, so that case is reported instead of passing as patched.
+    model-owned drafter. The source is checked for the comparison the patch
+    acts through, so that case is reported instead of passing as patched.
     """
     import inspect
 
@@ -1646,13 +1661,16 @@ def register_tt_models(register_test_models=False) -> None:
     # architecture lookup unless the type is registered in every process
     # (general plugins run in all of them). Upstream resolves the HF name
     # before the TT platform prefixes it, so both spellings are registered.
+    # vLLM maps the bare name to its Transformers backend.
     _register_kolibri1_hf_config()
     _kolibri1_target = (
         "models.autoports.aleph_alpha_kolibri_1_bf16.tt.generator_vllm:"
         "KolibriForCausalLM"
     )
-    for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
-        _register_model_if_missing(ModelRegistry, arch, _kolibri1_target)
+    _register_model_over_upstream(
+        ModelRegistry, "Kolibri1ForCausalLM", _kolibri1_target
+    )
+    _register_model_if_missing(ModelRegistry, "TTKolibri1ForCausalLM", _kolibri1_target)
 
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare

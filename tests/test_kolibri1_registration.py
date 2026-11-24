@@ -38,3 +38,18 @@ def test_kolibri1_architectures_resolve_to_the_tt_autoport():
     for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
         entry = ModelRegistry.models[arch]
         assert f"{entry.module_name}:{entry.class_name}" == KOLIBRI_TARGET
+
+
+def test_an_operator_override_of_the_bare_kolibri1_name_is_kept(monkeypatch):
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+    monkeypatch.setenv(
+        "TT_MODEL_CLASS_OVERRIDES", "Kolibri1ForCausalLM=pkg.mod:OperatorKolibri"
+    )
+
+    tt_platform.register_tt_models()
+
+    for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
+        entry = ModelRegistry.models[arch]
+        assert f"{entry.module_name}:{entry.class_name}" == "pkg.mod:OperatorKolibri"

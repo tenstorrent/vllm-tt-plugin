@@ -21,7 +21,7 @@ from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     set_torch_threads_for_runtime,
 )
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_groups,
     get_uniform_page_size,
 )
@@ -367,7 +367,7 @@ class TTWorker(WorkerBase):
         For the GPU/TPU backends, this method generates the KVCacheSpec by
         parsing the kv cache format from each Attention module in the static
         forward context (compilation_config.static_forward_context).
-        core/kv_cache_utils.py uses the KVCacheSpec along with available
+        core/kv_cache_planning.py uses the KVCacheSpec along with available
         memory info from a profiling run to determine num blocks.
 
         For the TT backend, the static forward context is not populated since
@@ -702,9 +702,10 @@ def _upstream_admission_blocks(
     comparing. The private helpers are imported here, not at module scope,
     so a vLLM rename breaks only this path.
     """
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.core.kv_cache_planning import (
         _max_memory_usage_bytes_from_groups,
-        _pool_bytes_per_block,
+        _pool_bytes_per_block_from_builder,
     )
 
     extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
@@ -722,8 +723,11 @@ def _upstream_admission_blocks(
     )
     if not groups:
         return 0
-    bytes_per_block = _pool_bytes_per_block(sizing_config, groups)
-    one_request_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
+    builder = get_kv_cache_config_builder(sizing_config)
+    bytes_per_block = _pool_bytes_per_block_from_builder(builder, sizing_config, groups)
+    one_request_bytes = _max_memory_usage_bytes_from_groups(
+        builder, sizing_config, groups
+    )
     null_block = 1
     return -(-one_request_bytes // bytes_per_block) + null_block
 
@@ -896,7 +900,7 @@ def _fit_block_output_max_model_len(
     """Fit ``--max-model-len -1`` to the block-output KV pool.
 
     Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
-    (vllm/v1/core/kv_cache_utils.py): the TT pool is a fixed budget
+    (vllm/v1/core/kv_cache_planning.py): the TT pool is a fixed budget
     rather than profiled memory, and the upstream fit would hand the whole
     pool to ``max_model_len``, while a block-output request also needs one
     full output canvas of headroom. The engine snapshots ``max_model_len``

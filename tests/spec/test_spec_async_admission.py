@@ -255,7 +255,9 @@ def test_the_unpatched_gate_refuses_an_explicitly_async_speculating_launch(check
     with pytest.raises(Exception) as excinfo:
         _build_config(checkpoint, async_scheduling=True)
 
-    assert "async scheduling is only supported" in str(excinfo.value)
+    assert "Async scheduling is not supported by the V1 model runner" in str(
+        excinfo.value
+    )
 
 
 def test_the_unpatched_gate_disables_async_for_the_automatic_selection(checkpoint):
@@ -409,7 +411,9 @@ def test_an_unrelated_speculative_method_keeps_upstream_behaviour(checkpoint):
             prompt_lookup_max=4,
         )
 
-    assert "async scheduling is only supported" in str(excinfo.value)
+    assert "Async scheduling is not supported by the V1 model runner" in str(
+        excinfo.value
+    )
 
 
 def test_the_padded_drafter_refusal_still_applies(checkpoint):
