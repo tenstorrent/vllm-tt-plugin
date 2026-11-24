@@ -1,103 +1,230 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
+"""Packs host logprob payloads from device sampling for vLLM.
+
+``build_device_logprobs`` selects model-output rows and dispatches the three
+supported payload forms. ``build_logprobs_from_topk`` packs an already-selected
+candidate set. These functions neither sample tokens nor read from a TT device;
+callers supply host tensors and retain ownership of their unmodified inputs.
+"""
 
 from __future__ import annotations
+
+__all__ = (
+    "build_device_logprobs",
+    "build_logprobs_from_topk",
+)
+
+from typing import Protocol, cast
 
 import torch
 from vllm.v1.outputs import LogprobsTensors
 
 
-def build_logprobs_from_topk(
-    top_k_logprobs: torch.Tensor,
-    top_k_indices: torch.Tensor,
-    sampled_token_ids: torch.Tensor,
-    max_num_logprobs: int,
-) -> LogprobsTensors:
-    """Build LogprobsTensors from device top-K logprobs.
+class RankedLogprobs(Protocol):
+    """Describes a structural payload carrying sampled logprobs and their ranks.
 
-    Device always computes top-32 logprobs sorted descending.
-    This function trims to max_num_logprobs which is in range (0-20) to
-    match the OpenAI API limit, then packs into LogprobsTensors format
-    expected by the downstream vLLM pipeline.
+    Payloads supply the tensor attributes without inheriting from this protocol.
+    Read-only properties allow immutable payloads, including named tuples.
     """
-    sz = top_k_logprobs.shape[0]
-    n = max_num_logprobs
 
-    # Cast both tensors to int64 to avoid uint32/int32 promotion errors.
-    if sampled_token_ids.dim() == 1:
-        sampled_token_ids = sampled_token_ids.unsqueeze(-1)
-    sampled_expanded = sampled_token_ids.to(torch.int64)
-    # ttnn.sampling selects from the same fixed top-32 candidate set returned
-    # here. If that device invariant changes, the sampled logprob can be wrong.
-    match_mask = top_k_indices.to(torch.int64) == sampled_expanded
-    positions = match_mask.int().argmax(dim=-1)
+    @property
+    def sampled_logprobs(self) -> torch.Tensor:
+        """One floating-point sampled logprob per model-output row."""
+        ...
 
-    if positions.dim() < top_k_logprobs.dim():
-        positions = positions.unsqueeze(-1)
-    sampled_logprob = top_k_logprobs.gather(1, positions.long())
-    # vLLM's rank is the number of vocabulary scores at or above the sampled
-    # token's, ties included, so it is 1-based. Every token scoring above the
-    # lowest returned score is in the returned set, which makes the count exact
-    # unless the sampled token ties that lowest score: tokens outside the set can
-    # tie too, and the count is then the number of returned ties, a lower bound.
-    ranks = (top_k_logprobs >= sampled_logprob).sum(dim=-1)
-
-    logprob_token_ids = torch.zeros(sz, n + 1, dtype=torch.int32)
-    logprobs_values = torch.zeros(sz, n + 1, dtype=torch.float32)
-    logprob_token_ids[:, 0] = sampled_token_ids.squeeze(-1)
-    logprobs_values[:, 0] = sampled_logprob.squeeze(-1)
-    logprob_token_ids[:, 1 : n + 1] = top_k_indices[:, :n].to(torch.int32)
-    logprobs_values[:, 1 : n + 1] = top_k_logprobs[:, :n].to(torch.float32)
-
-    selected_token_ranks = ranks.to(torch.int32)
-    return LogprobsTensors(
-        logprob_token_ids,
-        logprobs_values,
-        selected_token_ranks,
-    )
+    @property
+    def selected_token_ranks(self) -> torch.Tensor:
+        """One integer vocabulary rank per model-output row, including ties."""
+        ...
 
 
 def build_device_logprobs(
-    tt_log_probs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    logprobs: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | RankedLogprobs,
     sampled_token_ids: torch.Tensor,
     rows: torch.Tensor,
     max_num_logprobs: int,
 ) -> LogprobsTensors:
-    """Pack logprobs for device-sampled tokens at ``rows``.
+    """Selects payload rows and packs device-sampled logprobs for vLLM.
 
-    ``sampled_token_ids`` is the already-selected ``[n]`` sampled tokens (one
-    per row); ``rows`` indexes the device output's batch dimension. Covers the
-    top-K device path (gpt-oss returns a sorted top-32 set) and the
-    single-sampled-logprob path (one logprob per row).
+    Parameters
+    ----------
+    logprobs : torch.Tensor, tuple of torch.Tensor, or RankedLogprobs
+        Host payload covering the model output's batch rows. A bare floating
+        tensor contains one sampled logprob per row. A pair
+        ``(top_k_logprobs, top_k_indices)`` contains sorted candidate tensors
+        described by ``build_logprobs_from_topk``. An object with tensor
+        attributes ``sampled_logprobs`` and ``selected_token_ranks`` contains
+        one sampled logprob and its model-reported rank per row. Rank is the
+        number of vocabulary scores at or above the sampled score, ties
+        included. The attribute form takes precedence over tuple handling,
+        so a named tuple can carry reported ranks.
+    sampled_token_ids : torch.Tensor
+        Host integer IDs of shape ``[R]`` or ``[R, 1]``, already selected and
+        aligned with ``rows``. These IDs are not indexed again.
+    rows : torch.Tensor
+        Host integer row indices of shape ``[R]`` into the payload's batch
+        dimension. Their order determines the output row order.
+    max_num_logprobs : int
+        Number of top candidates to include for a top-K payload; see
+        ``build_logprobs_from_topk``. Ignored for sampled-logprob payloads.
 
-    A single logprob says nothing about where the token ranks in the
-    vocabulary, so only the model can report that rank. A payload with
-    ``sampled_logprobs`` and ``selected_token_ranks`` attributes (a named tuple
-    works) carries it: the rank is the number of vocabulary scores at or above
-    the sampled token's, ties included. A bare logprob tensor still reports
-    ``-1``, because no correct rank can be derived from it.
+    Returns
+    -------
+    LogprobsTensors
+        Top-K packing follows ``build_logprobs_from_topk``. Sampled-logprob
+        payloads produce int32 token IDs ``[R, 1]``, float32 natural-log
+        probabilities ``[R, 1]``, and int32 ranks ``[R]``. A bare tensor has
+        unknown rank ``-1``; reported ranks are preserved. The token-ID tensor
+        can share storage with ``sampled_token_ids`` when it is already int32.
+
+    Examples
+    --------
+    Select payload rows while supplying sampled IDs in that same order.
+    This example uses only CPU tensors and needs no TT hardware.
+
+    >>> from types import SimpleNamespace
+    >>> import torch
+    >>> from vllm_tt_plugin.logprobs import build_device_logprobs
+    >>> payload = SimpleNamespace(
+    ...     sampled_logprobs=torch.tensor([-0.25, -1.5, -0.75]),
+    ...     selected_token_ranks=torch.tensor([1, 7, 3]),
+    ... )
+    >>> result = build_device_logprobs(
+    ...     payload,
+    ...     torch.tensor([43, 42], dtype=torch.int32),
+    ...     torch.tensor([2, 1]),
+    ...     max_num_logprobs=0,
+    ... )
+    >>> result.logprob_token_ids.tolist()
+    [[43], [42]]
+    >>> result.logprobs.tolist()
+    [[-0.75], [-1.5]]
+    >>> result.selected_token_ranks.tolist()
+    [3, 7]
     """
-    n = sampled_token_ids.shape[0]
-    reported_ranks = getattr(tt_log_probs, "selected_token_ranks", None)
+    num_rows = sampled_token_ids.shape[0]
+
+    reported_ranks: torch.Tensor | None = getattr(
+        logprobs, "selected_token_ranks", None
+    )
     if reported_ranks is not None:
         return LogprobsTensors(
-            logprob_token_ids=sampled_token_ids.reshape(n, 1).to(torch.int32),
-            logprobs=tt_log_probs.sampled_logprobs[rows]
-            .reshape(n, 1)
-            .to(torch.float32),
-            selected_token_ranks=reported_ranks[rows].reshape(n).to(torch.int32),
+            logprob_token_ids=sampled_token_ids.reshape(num_rows, 1).to(torch.int32),
+            logprobs=(
+                cast(RankedLogprobs, logprobs)
+                .sampled_logprobs[rows]
+                .reshape(num_rows, 1)
+                .to(torch.float32)
+            ),
+            selected_token_ranks=reported_ranks[rows].reshape(num_rows).to(torch.int32),
         )
-    if isinstance(tt_log_probs, tuple):
-        top_k_logprobs, top_k_indices = tt_log_probs
+
+    if isinstance(logprobs, tuple):
+        top_k_logprobs, top_k_indices = logprobs
         return build_logprobs_from_topk(
-            top_k_logprobs=top_k_logprobs[rows],
-            top_k_indices=top_k_indices[rows],
+            logprobs=top_k_logprobs[rows],
+            indices=top_k_indices[rows],
             sampled_token_ids=sampled_token_ids,
             max_num_logprobs=max_num_logprobs,
         )
-    sampled_log_probs = tt_log_probs[rows].reshape(n)
+
+    sampled_logprobs = cast(torch.Tensor, logprobs)[rows].reshape(num_rows)
     return LogprobsTensors(
-        logprob_token_ids=sampled_token_ids.reshape(n, 1).to(torch.int32),
-        logprobs=sampled_log_probs.reshape(n, 1).to(torch.float32),
-        selected_token_ranks=torch.full((n,), -1, dtype=torch.int32),
+        logprob_token_ids=sampled_token_ids.reshape(num_rows, 1).to(torch.int32),
+        logprobs=sampled_logprobs.reshape(num_rows, 1).to(torch.float32),
+        selected_token_ranks=torch.full((num_rows,), -1, dtype=torch.int32),
+    )
+
+
+def build_logprobs_from_topk(
+    logprobs: torch.Tensor,
+    indices: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    max_num_logprobs: int,
+) -> LogprobsTensors:
+    """Packs sampled tokens and a prefix of their sorted top-K candidates.
+
+    Parameters
+    ----------
+    logprobs : torch.Tensor
+        The ``K > 0`` highest host floating-point natural-log probabilities
+        per row, of shape ``[B, K]`` and sorted in descending order along
+        the candidate dimension.
+    indices : torch.Tensor
+        Host integer token IDs of shape ``[B, K]``, matching the logprobs.
+        Each row has unique IDs and includes that row's sampled token.
+    sampled_token_ids : torch.Tensor
+        Host integer sampled token IDs of shape ``[B]`` or ``[B, 1]``, in
+        candidate-row order. Unsigned device token IDs are accepted.
+    max_num_logprobs : int
+        Number ``N`` of leading candidates to return, with ``0 <= N <= K``.
+        Zero returns only the sampled token. The caller chooses the request's
+        limit; this function does not impose an API-specific maximum.
+
+    Returns
+    -------
+    LogprobsTensors
+        New int32 token IDs and float32 logprobs of shape ``[B, N + 1]``.
+        Column zero holds the sampled token and its logprob; the remaining
+        columns preserve the first ``N`` candidates, including any duplicate
+        of the sampled token. Int32 ranks have shape ``[B]``. Input row order
+        is preserved and no input tensor is modified.
+
+    Notes
+    -----
+    Rank counts all ``K`` supplied scores at or above the sampled score,
+    including ties, independently of ``N``. This is the exact vocabulary rank
+    unless the sampled score ties the lowest supplied score: omitted vocabulary
+    scores can tie it too, so the returned count is then a lower bound.
+
+    Examples
+    --------
+    The sampled token can also appear among the requested candidates. Its
+    rank includes tied candidates beyond that prefix. No TT hardware is needed.
+
+    >>> import torch
+    >>> from vllm_tt_plugin.logprobs import build_logprobs_from_topk
+    >>> result = build_logprobs_from_topk(
+    ...     torch.tensor([[-1.0, -1.0, -2.0]]),
+    ...     torch.tensor([[11, 12, 13]], dtype=torch.int32),
+    ...     torch.tensor([11], dtype=torch.uint32),
+    ...     max_num_logprobs=1,
+    ... )
+    >>> result.logprob_token_ids.tolist(), result.logprobs.tolist()
+    ([[11, 11]], [[-1.0, -1.0]])
+    >>> result.selected_token_ranks.tolist()
+    [2]
+    """
+    num_rows = logprobs.shape[0]
+
+    if sampled_token_ids.dim() == 1:
+        sampled_token_ids = sampled_token_ids.unsqueeze(-1)
+
+    # Normalize integer dtypes before comparing signed and unsigned IDs.
+    sampled_ids_int64 = sampled_token_ids.to(torch.int64)
+    candidate_matches = indices.to(torch.int64) == sampled_ids_int64
+
+    sampled_positions = candidate_matches.int().argmax(dim=-1)
+    if sampled_positions.dim() < logprobs.dim():
+        sampled_positions = sampled_positions.unsqueeze(-1)
+
+    sampled_logprobs = logprobs.gather(1, sampled_positions.long())
+    selected_token_ranks = (logprobs >= sampled_logprobs).sum(dim=-1)
+
+    logprob_token_ids = torch.zeros(num_rows, max_num_logprobs + 1, dtype=torch.int32)
+    logprobs_values = torch.zeros(num_rows, max_num_logprobs + 1, dtype=torch.float32)
+    logprob_token_ids[:, 0] = sampled_token_ids.squeeze(-1)
+    logprobs_values[:, 0] = sampled_logprobs.squeeze(-1)
+    logprob_token_ids[:, 1 : max_num_logprobs + 1] = indices[:, :max_num_logprobs].to(
+        torch.int32
+    )
+    logprobs_values[:, 1 : max_num_logprobs + 1] = logprobs[:, :max_num_logprobs].to(
+        torch.float32
+    )
+
+    return LogprobsTensors(
+        logprob_token_ids=logprob_token_ids,
+        logprobs=logprobs_values,
+        selected_token_ranks=selected_token_ranks.to(torch.int32),
     )

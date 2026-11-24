@@ -637,7 +637,6 @@ def test_structured_decode_submits_next_forward_before_readback(
             max_num_batched_tokens=MAX_MODEL_LEN,
             vocab_size=VOCAB_SIZE,
             block_sizes=[BLOCK_SIZE],
-            kernel_block_sizes=[BLOCK_SIZE],
         )
         batch.add_request_to_row(request, slot)
     # endregion

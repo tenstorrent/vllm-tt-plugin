@@ -22,6 +22,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 .
 +-- src/vllm_tt_plugin/
 |   +-- entrypoints.py       # vLLM plugin entry points
+|   +-- exceptions.py        # Shared plugin exception categories
 |   +-- platform.py          # TTPlatform and config validation
 |   +-- model_registry.py    # TT model architecture registration
 |   +-- worker.py            # TT worker implementation
@@ -36,6 +37,7 @@ and links to the capability, speculative-decode, and input-reload contracts.
 |   +-- spec_admission.py    # Speculative configuration and model-plan validation
 |   +-- spec_decode.py       # Candidate/verification types and greedy acceptance
 |   +-- spec_accept.py       # Host sampled acceptance for the logits accept mode
+|   +-- parsers/             # Model-output adapters and lazy parser registration
 |   +-- utils/               # Common helpers such as device discovery tools for DP
 +-- docs/                    # TT runtime notes
 +-- examples/                # Offline and OpenAI-server examples
@@ -76,10 +78,29 @@ inside assume:
 source docs/install-vllm-tt.sh
 ```
 
-The script installs vLLM with
-`VLLM_TARGET_DEVICE=empty` because `tt` platform is provided by this plugin
-at runtime. It then installs the plugin with a few dependencies.
-Most dependencies come from the active tt-metal env.
+The script installs vLLM with `VLLM_TARGET_DEVICE=empty` because this plugin
+provides the `tt` platform at runtime. It then installs the plugin and its
+declared dependencies.
+
+### Dependency ownership
+
+The plugin requires a prepared TT environment; its package metadata alone
+does not describe or install the full serving stack.
+
+| Dependencies | Installed by |
+|---|---|
+| `ttnn`, `torch`, and the compatible NumPy build | tt-metal environment; host-only setup substitutes the TTNN stub and installs CPU torch |
+| vLLM, Transformers, and vLLM's common requirements | [install script](docs/install-vllm-tt.sh), subject to [dependency overrides](docs/vllm-overrides.txt) |
+| `torchvision` and `numba` | Install script, at explicit pins |
+| `PyYAML` and `regex` | Plugin runtime requirements in [pyproject.toml](pyproject.toml), also supplied by vLLM's common requirements |
+| `cloudpickle` | vLLM's common requirements; used by the retained MPI launcher, which upstream vLLM 0.32.0 does not hook into |
+| `qwen-vl-utils` | Optional `examples` extra |
+| Test and lint tools | Optional `dev` extra; see the [testing guide](tests/README.md) |
+
+The plugin metadata declares lightweight direct dependencies used by supported
+execution paths: PyYAML reads TT cluster descriptors during standard-DP discovery,
+and `regex` parses layer names in the model runner. The remaining runtime versions
+are coordinated by the environment and installer.
 
 The script also installs vLLM's dependency list itself, fetched from
 `requirements/common.txt` at the pinned vLLM tag, and installs vLLM with
@@ -150,6 +171,23 @@ If `VLLM_PLUGINS` is set, it must allow both TT entry point names:
 ```bash
 export VLLM_PLUGINS=tt,tt_model_registry
 ```
+
+### Model-output parsers
+
+The general plugin entry point also calls
+[`parsers.registration.register_parsers`](src/vllm_tt_plugin/parsers/registration.py).
+It registers missing names lazily and preserves existing upstream or third-party
+registrations. Importing `parsers` itself loads no parser implementations.
+
+| Parser name | Reasoning | Tool calls |
+|---|---|---|
+| `kolibri1` | [Kolibri adapter](src/vllm_tt_plugin/parsers/kolibri1.py) over Qwen3, matching the model's thinking switches and assistant continuations | Upstream Hermes parser alias |
+
+Serve Kolibri with `--reasoning-parser kolibri1 --enable-auto-tool-choice
+--tool-call-parser kolibri1`. Gemma4 uses the parsers provided by upstream vLLM.
+Local adapters belong in `parsers/` while the pinned upstream version lacks
+their required behavior; their module docstrings describe that difference and
+when upstream can replace them.
 
 ## Hugging Face Access
 
@@ -888,11 +926,16 @@ You can also pass `--random-prefix-len <N>` to `vllm bench serve`.
 
 ## Testing
 
+Run commands from the repository root with the intended virtual environment
+active. The [testing guide](tests/README.md#run-tests) lists the unit, integration,
+stubbed-host, real-TTNN host, doctest, and device commands, including how to select
+individual tests. Test commands use the active environment's interpreter directly.
+
 The plugin ships server-facing tests under `tests/tt`. Start a vLLM server with
-a TT model, then run:
+a TT model, use the prepared tt-metal environment without host stubs, then run:
 
 ```bash
-pytest tests/tt -v \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt -v \
   --tt-server-url=http://localhost:8000 \
   --tt-model-name=meta-llama/Llama-3.1-8B-Instruct
 ```
@@ -949,8 +992,9 @@ replace earlier raw-input scores or qualify an untested runtime revision.
 Tests cover request isolation, sampling behavior, penalties, logprobs,
 host-only parameter handling, and TT utility helpers.
 
-Plugin-local unit tests that do not require a running server live directly
-under `tests/`, for example:
+Hardware-free tests include module unit tests under `tests/unit/`, integration
+tests under `tests/integration/`, and legacy tests directly under `tests/` and
+`tests/spec/`. For example, with real `ttnn` installed:
 
 ```bash
 "$VIRTUAL_ENV/bin/python" -m pytest tests/test_lane_scheduler.py
