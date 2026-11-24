@@ -6,6 +6,7 @@ No bytes move here. A fake connector records what the plugin asks of it and
 reports the transfers each test scripts.
 """
 
+import ctypes
 import threading
 from collections import deque
 from functools import partial
@@ -352,30 +353,29 @@ class FakePackedKVTensor:
 
 
 @pytest.fixture
-def fake_chunk_transfers(monkeypatch):
-    """ttnn's chunk transfers, as documented, over ``FakePackedKVTensor``."""
+def fake_region_transfers(monkeypatch):
+    """ttnn's region copies, as documented, over ``FakePackedKVTensor``."""
 
-    def to_host(cache, offset, size, count, dst, dst_offset, chunk_step, chip_step):
-        for chip, data in enumerate(cache.chips):
-            for i in range(count):
-                at = dst_offset + i * chunk_step + chip * chip_step
-                dst[at : at + size] = data[offset + i * size :][:size]
+    def host_bytes(address, size):
+        return np.ctypeslib.as_array((ctypes.c_uint8 * size).from_address(address))
 
-    def to_device(src, src_offset, chunk_step, chip_step, cache, offset, size, count):
-        for chip, data in enumerate(cache.chips):
-            for i in range(count):
-                at = src_offset + i * chunk_step + chip * chip_step
-                data[offset + i * size :][:size] = src[at : at + size]
+    def to_host(cache, regions, blocking=True, cq_id=None):
+        for chip, offset, size, address in np.asarray(regions, dtype=np.uint64):
+            data = cache.chips[int(chip)][int(offset) : int(offset + size)]
+            host_bytes(int(address), int(size))[:] = data
 
-    monkeypatch.setattr(kv_transfer.ttnn, "copy_device_tensor_chunks_to_host", to_host)
-    monkeypatch.setattr(
-        kv_transfer.ttnn, "copy_host_chunks_to_device_tensor", to_device
-    )
+    def to_device(cache, regions, blocking=True, cq_id=None):
+        for chip, offset, size, address in np.asarray(regions, dtype=np.uint64):
+            data = host_bytes(int(address), int(size))
+            cache.chips[int(chip)][int(offset) : int(offset + size)] = data
+
+    monkeypatch.setattr(kv_transfer.ttnn, "copy_device_to_host_regions", to_host)
+    monkeypatch.setattr(kv_transfer.ttnn, "copy_host_to_device_regions", to_device)
 
 
 @pytest.mark.parametrize("one_list_per_submesh", [False, True])
 def test_kv_moves_between_two_servers_through_their_cpu_buffers(
-    worker_connector, fake_chunk_transfers, one_list_per_submesh
+    worker_connector, fake_region_transfers, one_list_per_submesh
 ):
     """KV crosses a sender's and a receiver's CPU buffer as the device's bytes."""
 
@@ -418,13 +418,6 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
                 assert (received_blocks[received_ids] == sent_blocks[sent_ids]).all()
                 # Blocks nothing was sent to stay empty.
                 assert not received_blocks[[1, 2, 3, 7, 8]].any()
-
-
-def test_a_long_stretch_of_blocks_is_copied_in_pieces():
-    ids = list(range(3, 3 + 2 * kv_transfer._MAX_RUN_BLOCKS + 1))
-    runs = list(kv_transfer._runs_of_consecutive_blocks(ids, ids))
-    assert sum(count for _, _, count in runs) == len(ids)
-    assert max(count for _, _, count in runs) == kv_transfer._MAX_RUN_BLOCKS
 
 
 def _model_kv_caches(num_layers: int = 2) -> list:

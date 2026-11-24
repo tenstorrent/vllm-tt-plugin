@@ -13,11 +13,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 # of 16 values.
 _BFLOAT8_TILE_BYTES = 1088
 
-# Longer stretches are copied in pieces of this many blocks. Measured on a
-# 1x2 Blackhole mesh, the rate falls from about 9.5 GB/s to under 7 GB/s
-# between 128 and 512 blocks in one device transfer.
-_MAX_RUN_BLOCKS = 64
-
 
 def _bfloat8_block_bytes(cache) -> int:
     """Bytes one block takes in each chip's buffer of a bfloat8_b KV cache.
@@ -83,7 +78,7 @@ def kv_tensors_by_layer_name(
 
     ``kv_caches`` is what the model's allocator returned: ``[k, v]`` per layer,
     or that list inside a list with one entry per submesh. A KV connector runs
-    without data parallelism, so there is one submesh.
+    with one submesh per engine (no lanes), so there is one submesh.
     """
     per_layer = kv_caches
     if (
@@ -114,14 +109,34 @@ def make_copy_blocks(kv_tensors: dict[str, tuple]) -> CopyBlocksOp:
     The buffer is the connector's own: per layer name, a CPU tensor shaped
     like ``kv_cache_descriptions``. The connector's "device" dict holds those
     descriptions and is ignored; ``kv_tensors`` is the real device side.
+
+    Every layer's transfers are queued without waiting and the last one waits,
+    so the copy returns once all of them have landed: the command queue runs
+    them in order.
     """
 
     def copy_blocks(src, dst, src_block_ids, dst_block_ids, direction) -> None:
         to_host = direction == "d2h"
         buffers = dst if to_host else src
-        runs = list(_runs_of_consecutive_blocks(src_block_ids, dst_block_ids))
-        for name, (k, v) in kv_tensors.items():
-            _copy_packed_blocks(k, v, _buffer_bytes(buffers[name]), runs, to_host)
+        device_ids, host_ids = (
+            (src_block_ids, dst_block_ids)
+            if to_host
+            else (dst_block_ids, src_block_ids)
+        )
+        if not device_ids:
+            return
+        names = list(kv_tensors)
+        for name in names:
+            k, v = kv_tensors[name]
+            _copy_packed_blocks(
+                k,
+                v,
+                _buffer_bytes(buffers[name]),
+                device_ids,
+                host_ids,
+                to_host,
+                wait=name == names[-1],
+            )
 
     return copy_blocks
 
@@ -138,64 +153,84 @@ def _buffer_bytes(buffer: torch.Tensor) -> np.ndarray:
     return buffer.view(-1).numpy()
 
 
-def _copy_packed_blocks(k, v, host: np.ndarray, runs, to_host: bool) -> None:
-    """Move stretches of blocks of one layer's bfloat8_b K and V as packed bytes.
+def _copy_packed_blocks(
+    k,
+    v,
+    host: np.ndarray,
+    device_ids: list[int],
+    host_ids: list[int],
+    to_host: bool,
+    wait: bool,
+) -> None:
+    """Move blocks of one layer's bfloat8_b K and V between chips and host bytes.
 
     A buffer block holds K's tiles from each chip in chip order, then V's. No
-    program runs on the device and nothing is converted on the host.
+    program runs on the device and nothing is converted on the host: each
+    (chip, block) is one region copied straight to or from its place in
+    ``host``.
+
+    Parameters
+    ----------
+    k, v
+        The layer's ttnn K and V caches, each paged ``[blocks, heads, tokens,
+        head_dim]`` with the heads split evenly over the chips.
+    host
+        The layer's buffer as flat bytes; it must stay alive until the copy
+        has landed.
+    device_ids, host_ids
+        Block IDs on the chips and in ``host``, pairwise.
+    to_host
+        Copy chips to ``host`` when true, ``host`` to chips otherwise.
+    wait
+        Return only once V's transfers, and so every earlier one on the queue,
+        have landed.
     """
     chip_bytes = _bfloat8_block_bytes(k)
-    cache_bytes = k.device().get_num_devices() * chip_bytes
+    chips = k.device().get_num_devices()
+    cache_bytes = chips * chip_bytes
     block_bytes = 2 * cache_bytes
-    for src_first, dst_first, count in runs:
-        for i, cache in enumerate((k, v)):
-            if to_host:
-                ttnn.copy_device_tensor_chunks_to_host(
-                    cache,
-                    src_first * chip_bytes,
-                    chip_bytes,
-                    count,
-                    host,
-                    dst_first * block_bytes + i * cache_bytes,
-                    block_bytes,
-                    chip_bytes,
-                )
-            else:
-                ttnn.copy_host_chunks_to_device_tensor(
-                    host,
-                    src_first * block_bytes + i * cache_bytes,
-                    block_bytes,
-                    chip_bytes,
-                    cache,
-                    dst_first * chip_bytes,
-                    chip_bytes,
-                    count,
-                )
+    for i, cache in enumerate((k, v)):
+        regions = _block_regions(
+            device_ids,
+            host_ids,
+            chips,
+            chip_bytes,
+            block_bytes,
+            host.ctypes.data + i * cache_bytes,
+        )
+        blocking = wait and i == 1
+        if to_host:
+            ttnn.copy_device_to_host_regions(cache, regions, blocking=blocking)
+        else:
+            ttnn.copy_host_to_device_regions(cache, regions, blocking=blocking)
 
 
-def _runs_of_consecutive_blocks(src_block_ids: list[int], dst_block_ids: list[int]):
-    """Yield ``(lowest source, lowest destination, count)`` for each stretch of
-    the copy whose source and destination block IDs both count up by one, or
-    both count down by one, cut at ``_MAX_RUN_BLOCKS``.
+def _block_regions(
+    device_ids: list[int],
+    host_ids: list[int],
+    chips: int,
+    chip_bytes: int,
+    block_bytes: int,
+    host_base: int,
+) -> np.ndarray:
+    """Rows of ``(chip, offset on the chip, bytes, host address)`` for a block copy.
 
-    vLLM hands a request the blocks an earlier one freed in descending order,
-    so a stretch that counts down is as common as one that counts up. Either
-    way it is the same set of block pairs, named from its lowest IDs.
+    Chip ``c``'s share of device block ``d`` is bytes ``d * chip_bytes`` of its
+    buffer, and sits at ``host_base + h * block_bytes + c * chip_bytes`` for
+    host block ``h``.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(chips * len(device_ids), 4)`` uint64, chip by chip, in the order of
+        ``device_ids``.
     """
-    first, step = 0, 0
-    for i in range(1, len(src_block_ids) + 1):
-        this_step = 0
-        if i < len(src_block_ids) and i - first < _MAX_RUN_BLOCKS:
-            this_step = src_block_ids[i] - src_block_ids[i - 1]
-            if (
-                this_step not in (1, -1)
-                or dst_block_ids[i] - dst_block_ids[i - 1] != this_step
-                or step not in (0, this_step)
-            ):
-                this_step = 0
-        if this_step:
-            step = this_step
-            continue
-        lowest = first if step >= 0 else i - 1
-        yield src_block_ids[lowest], dst_block_ids[lowest], i - first
-        first, step = i, 0
+    device = np.asarray(device_ids, dtype=np.uint64)
+    host = np.asarray(host_ids, dtype=np.uint64)
+    chip = np.repeat(np.arange(chips, dtype=np.uint64), len(device))
+    regions = np.empty((len(chip), 4), dtype=np.uint64)
+    regions[:, 0] = chip
+    regions[:, 1] = np.tile(device, chips) * chip_bytes
+    regions[:, 2] = chip_bytes
+    regions[:, 3] = host_base + np.tile(host, chips) * block_bytes + chip * chip_bytes
+    return regions

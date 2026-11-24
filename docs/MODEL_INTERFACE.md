@@ -45,9 +45,9 @@ storage, device execution, and any model-specific state.
 
 ## KV connectors
 
-With `--kv-transfer-config`, the single-process path without data parallelism
-runs vLLM's KV connector lifecycle; lane-DP and multi-process DP reject the
-option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
+With `--kv-transfer-config`, the single-process path and standard DP (one
+engine process per rank) run vLLM's KV connector lifecycle; lane-DP rejects
+the option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
 `register_kv_caches` once, after the model adapter allocates KV storage. The
 argument is a dictionary keyed by the layer names in `kv_cache_config`. Each
 value is a torch tensor that only describes that layer's KV cache and holds no
@@ -68,7 +68,9 @@ those descriptions. A connector that stages KV through such a buffer, like
 raises unless the allocator returned one `[k, v]` pair per layer name, each
 name following the `...layers.<idx>...` convention. On a mesh of several chips
 the copy takes each chip's tensor to hold an equal share of the KV heads, in
-chip order.
+chip order. It moves each chip's share of each block as one region with
+`ttnn.copy_device_to_host_regions` and `ttnn.copy_host_to_device_regions`,
+straight between the chip and its place in the buffer.
 
 ## Minimum implementation
 
