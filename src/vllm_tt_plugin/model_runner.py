@@ -3030,110 +3030,122 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
                 self.async_decode.wait_for_all_pending_async_steps()
         self.async_decode.apply_completed_decode_steps_before_build(scheduler_output)
 
+        # Every step carries KV connector metadata built once for all lanes, so
+        # a step that runs no lane still hands it to the connector.
         if not scheduler_output.total_num_scheduled_tokens:
-            return EMPTY_MODEL_RUNNER_OUTPUT
+            return TTModelRunner._kv_connector_only_output(self, scheduler_output)
         scheduled_rows = list(plan.scheduled_rows)
         if not scheduled_rows:
             # Tokens were scheduled but no slot mapped to them; the engine still
             # calls sample_tokens, so enqueue an empty result to keep the
             # forward/sample calls balanced.
-            self._pending_samples.append(lambda _grammar: EMPTY_MODEL_RUNNER_OUTPUT)
+            output = TTModelRunner._kv_connector_only_output(self, scheduler_output)
+            self._pending_samples.append(lambda _grammar: output)
             return None
 
         # Grammar is applied at sample time, so the forward builds without it.
         model_input = lane_batch.build_model_input(self, scheduler_output, None, plan)
-        if plan.is_decode:
-            # ``slot_grammar_bitmask`` reorders against the full decode capacity.
-            lane_total = plan.capacity
-            if model_input.defer_device_sampling and not steady_decode_candidate:
-                self.async_decode.wait_for_all_pending_async_steps()
-            if self.async_decode_scheduling and not model_input.defer_device_sampling:
-                req_ids = [
-                    model_input.grammar_row_req_ids[row] for row in scheduled_rows
-                ]
-                if any(req_id is None for req_id in req_ids):
-                    raise RuntimeError(
-                        "submitted lane row identity is missing scheduled request IDs: "
-                        f"scheduled_rows={scheduled_rows}, row_req_ids={req_ids}"
+        with TTModelRunner._kv_connector_step(self, scheduler_output) as kv_out:
+            if plan.is_decode:
+                # ``slot_grammar_bitmask`` reorders against the full decode capacity.
+                lane_total = plan.capacity
+                if model_input.defer_device_sampling and not steady_decode_candidate:
+                    self.async_decode.wait_for_all_pending_async_steps()
+                if (
+                    self.async_decode_scheduling
+                    and not model_input.defer_device_sampling
+                ):
+                    req_ids = [
+                        model_input.grammar_row_req_ids[row] for row in scheduled_rows
+                    ]
+                    if any(req_id is None for req_id in req_ids):
+                        raise RuntimeError(
+                            "submitted lane row identity is missing scheduled "
+                            f"request IDs: scheduled_rows={scheduled_rows}, "
+                            f"row_req_ids={req_ids}"
+                        )
+                    context = self.async_decode.capture_submitted_step_context(req_ids)
+                    wrapper = self.async_decode.submit_async_lane_decode(
+                        model_input, context, scheduled_rows
                     )
-                context = self.async_decode.capture_submitted_step_context(req_ids)
-                wrapper = self.async_decode.submit_async_lane_decode(
-                    model_input, context, scheduled_rows
-                )
-                self._pending_samples.append(
-                    partial(
-                        self._finish_async_decode,
-                        wrapper=wrapper,
-                        model_input=model_input,
-                        lane_total=lane_total,
+                    wrapper.kv_connector_output = kv_out
+                    self._pending_samples.append(
+                        partial(
+                            self._finish_async_decode,
+                            wrapper=wrapper,
+                            model_input=model_input,
+                            lane_total=lane_total,
+                        )
                     )
+                    return None
+                if model_input.spec_mode is not None:
+                    # A verify answers with its mode's ``[B, 1+K]`` block, which
+                    # the accept walk reads whole, so it takes the front-packed
+                    # verify's own submission and tail: no selective readback of
+                    # the scheduled slots, and the speculative finish rather than
+                    # ``extract_output``. ``_finish_front_packed_sync`` routes a
+                    # ``spec_mode`` step to that tail before touching any
+                    # front-packed assumption.
+                    fwd = self._forward_with_model_input(model_input)
+                    self._pending_samples.append(
+                        partial(self._finish_front_packed_sync, fwd=fwd, kv_out=kv_out)
+                    )
+                    return None
+                submission = self.async_decode.submit_decode(
+                    model_input,
+                    read_from_device=not model_input.defer_device_sampling,
+                    async_read=False,
+                    sampling_rows=scheduled_rows,
                 )
-                return None
-            if model_input.spec_mode is not None:
-                # A verify answers with its mode's ``[B, 1+K]`` block, which
-                # the accept walk reads whole, so it takes the front-packed
-                # verify's own submission and tail: no selective readback of
-                # the scheduled slots, and the speculative finish rather than
-                # ``extract_output``. ``_finish_front_packed_sync`` routes a
-                # ``spec_mode`` step to that tail before touching any
-                # front-packed assumption.
-                fwd = self._forward_with_model_input(model_input)
-                self._pending_samples.append(
-                    partial(self._finish_front_packed_sync, fwd=fwd)
-                )
-                return None
-            submission = self.async_decode.submit_decode(
-                model_input,
-                read_from_device=not model_input.defer_device_sampling,
-                async_read=False,
-                sampling_rows=scheduled_rows,
-            )
-            if model_input.defer_device_sampling:
-                tt_out = submission.tt_out
-                tt_log_probs = None
+                if model_input.defer_device_sampling:
+                    tt_out = submission.tt_out
+                    tt_log_probs = None
+                else:
+                    finalized = self.async_decode.finalize_decode(
+                        submission, sampling_rows=scheduled_rows
+                    )
+                    assert finalized is not None
+                    tt_out = finalized.tt_out
+                    tt_log_probs = finalized.tt_log_probs
+                is_decode = True
             else:
-                finalized = self.async_decode.finalize_decode(
-                    submission, sampling_rows=scheduled_rows
+                submission = None
+                # Prefill reorders against the per-lane request capacity.
+                lane_total = lane_batch.max_num_reqs
+                tt_out = self.submit_prefill(
+                    model_input, model_input.unpadded_batch_size
                 )
-                assert finalized is not None
-                tt_out = finalized.tt_out
-                tt_log_probs = finalized.tt_log_probs
-            is_decode = True
-        else:
-            submission = None
-            # Prefill reorders against the per-lane request capacity.
-            lane_total = lane_batch.max_num_reqs
-            tt_out = self.submit_prefill(model_input, model_input.unpadded_batch_size)
-            tt_log_probs = None
-            assert isinstance(
-                model_input.tt_sampling_params.enable_log_probs, torch.Tensor
-            )
-            if (
-                model_input.perform_device_sampling
-                and model_input.tt_sampling_params.enable_log_probs.any()
-            ):
-                assert isinstance(tt_out, tuple) and len(tt_out) == 2
-                tt_out, tt_log_probs = tt_out
-            elif isinstance(tt_out, tuple):
-                tt_out, _ = tt_out
-            is_decode = False
+                tt_log_probs = None
+                assert isinstance(
+                    model_input.tt_sampling_params.enable_log_probs, torch.Tensor
+                )
+                if (
+                    model_input.perform_device_sampling
+                    and model_input.tt_sampling_params.enable_log_probs.any()
+                ):
+                    assert isinstance(tt_out, tuple) and len(tt_out) == 2
+                    tt_out, tt_log_probs = tt_out
+                elif isinstance(tt_out, tuple):
+                    tt_out, _ = tt_out
+                is_decode = False
 
-        # Forward done; defer the lane sampling tail to ``sample_tokens``.
-        # model_input retains submitted row identities for sampling and any
-        # deferred token readback.
-        self._pending_samples.append(
-            partial(
-                self._finish_lane_sync,
-                tt_out=tt_out,
-                tt_log_probs=tt_log_probs,
-                model_input=model_input,
-                scheduled_rows=scheduled_rows,
-                is_decode=is_decode,
-                lane_total=lane_total,
-                decode_submission=submission,
+            # Forward done; defer the lane sampling tail to ``sample_tokens``.
+            # model_input retains submitted row identities for sampling and any
+            # deferred token readback.
+            self._pending_samples.append(
+                partial(
+                    self._finish_lane_sync,
+                    tt_out=tt_out,
+                    tt_log_probs=tt_log_probs,
+                    model_input=model_input,
+                    scheduled_rows=scheduled_rows,
+                    is_decode=is_decode,
+                    lane_total=lane_total,
+                    decode_submission=submission,
+                    kv_out=kv_out,
+                )
             )
-        )
-        return None
+            return None
 
     def _finish_lane_sync(
         self,
@@ -3146,10 +3158,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         is_decode: bool,
         lane_total: int,
         decode_submission: TTDecodeSubmission | None = None,
+        kv_out: KVConnectorOutput | None = None,
     ) -> ModelRunnerOutput | AsyncTTModelRunnerOutput:
         deferred = bool(getattr(model_input, "defer_device_sampling", False))
         try:
-            return TTModelRunner._finish_lane_sync_impl(
+            output = TTModelRunner._finish_lane_sync_impl(
                 self,
                 grammar_output,
                 tt_out=tt_out,
@@ -3164,6 +3177,9 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             if deferred:
                 self._poison_device_grammar()
             raise
+        if kv_out is not None:
+            output.kv_connector_output = kv_out
+        return output
 
     def _finish_lane_sync_impl(
         self,
@@ -3341,6 +3357,18 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
             partial(self._finish_front_packed_sync, fwd=fwd, kv_out=kv_out)
         )
         return None
+
+    def _kv_connector_only_output(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput:
+        """Run the KV connector for a step that runs no forward.
+
+        Returns ``EMPTY_MODEL_RUNNER_OUTPUT`` without a connector, else the
+        connector's loads, saves and finished transfers for the step.
+        """
+        if not has_kv_transfer_group():
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        return TTModelRunner.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
     @contextmanager
     def _kv_connector_step(

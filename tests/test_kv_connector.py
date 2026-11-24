@@ -639,3 +639,127 @@ def test_a_finished_load_reaches_only_the_lane_that_holds_the_request():
     assert lane1.kv_connector_output.finished_recving == {"B"}
     assert lane1.kv_connector_output.invalid_block_ids == {3}
     assert "B" in coordinator.lanes[1].finished_recving_kv_req_ids
+
+
+def _lane_runner(vllm_config, calls: list[str], *, async_decode: bool):
+    """A runner for ``_execute_lane_step`` whose forward and sampling are doubles."""
+    model_input = _model_input(
+        prompt_lens=None if async_decode else [1],
+        tt_sampling_params=SimpleNamespace(enable_log_probs=torch.zeros(1, dtype=bool)),
+    )
+
+    def forward(*_args, **_kwargs):
+        calls.append("forward")
+        return torch.zeros(1)
+
+    def submit_async_lane_decode(*_args):
+        calls.append("forward")
+        controller = SimpleNamespace(
+            complete_decode_step=lambda **_kwargs: SimpleNamespace(),
+            build_runner_output_from_completed_step=lambda *_a, **_k: _lane_output(),
+            enqueue_completed_decode_step=lambda _done: None,
+        )
+        return AsyncTTModelRunnerOutput(
+            controller, object(), model_input, threading.Event(), object()
+        )
+
+    runner = SimpleNamespace(
+        vllm_config=vllm_config,
+        request_specific_rope=False,
+        model=SimpleNamespace(),
+        requests={},
+        encoder_cache={},
+        lane_batch=SimpleNamespace(
+            apply_step_plan=lambda *_args, **_kwargs: False,
+            build_model_input=lambda *_args: model_input,
+            max_num_reqs=2,
+        ),
+        async_decode=SimpleNamespace(
+            can_attempt_steady_lane_decode_from_scheduler=lambda *_a, **_k: False,
+            must_drain_pending_async_steps=lambda *_args: False,
+            apply_completed_decode_steps_before_build=lambda _output: None,
+            capture_submitted_step_context=lambda _req_ids: object(),
+            submit_async_lane_decode=submit_async_lane_decode,
+        ),
+        async_decode_scheduling=async_decode,
+        _pending_samples=deque(),
+        submit_prefill=forward,
+    )
+    for name in (
+        "_reorder_grammar_bitmask",
+        "_finish_lane_sync",
+        "_finish_async_decode",
+    ):
+        setattr(runner, name, partial(getattr(TTModelRunner, name), runner))
+    return runner
+
+
+def _lane_output() -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=["req-0"],
+        req_id_to_index={"req-0": 0},
+        sampled_token_ids=[[7]],
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+
+def test_a_lane_step_without_tokens_still_runs_the_connector(
+    vllm_config, worker_connector
+):
+    # Both requests wait for remote KV, so the lanes schedule no tokens. The
+    # worker must still bind this step's metadata and start its loads: a push
+    # connector's decode worker sends its block registrations from there.
+    step = _lane_coordinator().schedule()
+    assert step.total_num_scheduled_tokens == 0
+    worker_connector.finished_recving = {"A"}
+    runner = _lane_runner(vllm_config, worker_connector.calls, async_decode=False)
+
+    output = TTModelRunner._execute_lane_step(runner, step)
+
+    assert set(worker_connector.loads_started) == {"A", "B"}
+    assert output.kv_connector_output.finished_recving == {"A"}
+    assert not runner._pending_samples
+
+
+@pytest.mark.parametrize("async_decode", [False, True], ids=["prefill", "async_decode"])
+def test_a_lane_forward_runs_inside_the_connector_step(
+    vllm_config, worker_connector, monkeypatch, async_decode
+):
+    from vllm_tt_plugin.lane_scheduler import TTStepPlan
+
+    monkeypatch.setattr(
+        TTModelRunner, "_finish_lane_sync_impl", lambda *_a, **_k: _lane_output()
+    )
+    worker_connector.finished_recving = {"parked"}
+    plan = TTStepPlan(
+        is_decode=async_decode,
+        capacity=2,
+        scheduled_req_ids=("req-0",),
+        scheduled_rows=(0,),
+        input_rows=(0, 1),
+        req_id_to_row={"req-0": 0},
+        batch_size_per_dp=(1, 1),
+        prefill_empty_slots=None,
+    )
+    step = _scheduler_output()
+    step._tt_step_state = SimpleNamespace(plan=plan)
+    runner = _lane_runner(
+        vllm_config, worker_connector.calls, async_decode=async_decode
+    )
+
+    assert TTModelRunner._execute_lane_step(runner, step) is None
+    output = TTModelRunner.sample_tokens(runner, None)
+    if async_decode:
+        output = output.get_output()
+
+    assert worker_connector.calls == [
+        "bind",
+        "forward",
+        "start_load_kv",
+        "wait_for_save",
+        "get_finished",
+        "clear",
+    ]
+    assert worker_connector.loads_started == {"parked": [3]}
+    assert output.kv_connector_output.finished_recving == {"parked"}
