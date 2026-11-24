@@ -99,10 +99,11 @@ def recorder(monkeypatch):
     return rec
 
 
-def _worker(num_slots: int) -> TTNixlPushConnectorWorker:
+def _worker(num_slots: int, **staging) -> TTNixlPushConnectorWorker:
     """A TT push worker with staging state and vLLM's fields the overrides use."""
     worker = TTNixlPushConnectorWorker.__new__(TTNixlPushConnectorWorker)
-    worker._init_staging(num_slots)
+    worker._init_staging(num_slots, **staging)
+    worker._failed_recv_reqs = queue.Queue()
     worker.copies = []
     worker.copy_blocks = lambda src, dst, src_ids, dst_ids, direction: (
         worker.copies.append((direction, list(src_ids), list(dst_ids)))
@@ -167,6 +168,20 @@ class TestDecodeSide:
 
         assert worker.copies == []
         assert worker.slots.free == 4
+
+    def test_a_receive_that_never_comes_fails_and_its_slots_rest(self, recorder):
+        worker = _worker(num_slots=2, recv_timeout=0.0, quarantine=3600.0)
+        worker.start_load_kv(_metadata({"r": _registration([5, 6])}))
+
+        worker.get_transfer_results()
+        assert worker._failed_recv_reqs.get_nowait() == "r"
+
+        # vLLM reports it failed; P's late write could still land in its slots.
+        recorder.results.failed_recving = {"r"}
+        recorder.results.finished_recving = {"r"}
+        worker.get_transfer_results()
+        assert worker.copies == []
+        assert worker.slots.free == 0
 
 
 class TestPrefillSide:

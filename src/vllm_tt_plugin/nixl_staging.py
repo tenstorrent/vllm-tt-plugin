@@ -27,6 +27,7 @@ import copy
 import dataclasses
 import queue
 import threading
+import time
 from collections import deque
 from typing import Any
 
@@ -144,8 +145,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     -----
     State and threads:
 
-    * ``_recv_slots`` (D) and ``_waiting_registrations`` (D),
-      ``_waiting_stage`` (P) and ``slots`` belong to the model runner thread.
+    * ``_recv_slots``, ``_recv_deadlines``, ``_expired``, ``_quarantined`` and
+      ``_waiting_registrations`` (D), ``_waiting_stage`` (P) and ``slots``
+      belong to the model runner thread.
     * ``_to_stage`` carries matched P requests from the writer thread to the
       model runner thread.
     * ``_send_slots`` and ``_released`` (P) are written by the model runner
@@ -166,7 +168,15 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self.kv_cache_config = dataclasses.replace(
             kv_cache_config, num_blocks=num_slots
         )
-        self._init_staging(num_slots)
+        extra = vllm_config.kv_transfer_config
+        ttl = extra.get_from_extra_config("decoder_kv_blocks_ttl", 480)
+        self._init_staging(
+            num_slots,
+            recv_timeout=float(
+                extra.get_from_extra_config("push_registration_timeout", ttl)
+            ),
+            quarantine=float(extra.get_from_extra_config("kv_lease_duration", 30)),
+        )
         logger.info(
             "NIXL host staging: %d slots instead of a %d-block mirror.",
             num_slots,
@@ -199,6 +209,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 self._waiting_registrations.append((req_id, reg))
                 continue
             self._recv_slots[req_id] = (slots, device)
+            self._recv_deadlines[req_id] = time.perf_counter() + self._recv_timeout
             registrations[req_id] = {**reg, "local_block_ids": slots}
         # The scheduler shares ``metadata``; hand vLLM a copy.
         metadata = copy.copy(metadata)
@@ -212,6 +223,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta) -> None:
         """Copy a received request from its slots into the chips; free the slots."""
         slots, device = self._recv_slots.pop(req_id)
+        self._recv_deadlines.pop(req_id, None)
         flat_slots = _flatten(slots)
         self.copy_blocks(
             self.host_xfer_buffers,
@@ -223,11 +235,35 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self.slots.give_back(flat_slots)
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
-        """Report vLLM's results; free slots of failed receives and done sends."""
+        """Report vLLM's results; free slots of failed receives and done sends.
+
+        A D request whose KV has not arrived by its deadline is reported as a
+        failed receive (vLLM's push path waits for it indefinitely). Its slots
+        rest for ``kv_lease_duration``, since P's write may still land.
+        """
+        now = time.perf_counter()
+        for req_id, deadline in list(self._recv_deadlines.items()):
+            if now > deadline:
+                del self._recv_deadlines[req_id]
+                self._expired.add(req_id)
+                self._failed_recv_reqs.put(req_id)
+                logger.warning(
+                    "No KV arrived for %s within %.0f s; failing its receive.",
+                    req_id,
+                    self._recv_timeout,
+                )
+        while self._quarantined and self._quarantined[0][0] <= now:
+            self.slots.give_back(self._quarantined.popleft()[1])
         results = super().get_transfer_results()
         for req_id in results.failed_recving:
+            self._recv_deadlines.pop(req_id, None)
             entry = self._recv_slots.pop(req_id, None)
-            if entry is not None:
+            if entry is None:
+                continue
+            if req_id in self._expired:
+                self._expired.discard(req_id)
+                self._quarantined.append((now + self._quarantine, _flatten(entry[0])))
+            else:
                 self.slots.give_back(_flatten(entry[0]))
         with self._lock:
             self._released |= results.finished_sending
@@ -242,9 +278,29 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._stage_matched_sends()
         return results
 
-    def _init_staging(self, num_slots: int) -> None:
-        """Create the slot pool and the per-request staging state."""
+    def _init_staging(
+        self, num_slots: int, recv_timeout: float = 480.0, quarantine: float = 30.0
+    ) -> None:
+        """Create the slot pool and the per-request staging state.
+
+        Parameters
+        ----------
+        num_slots
+            Host rows of the pool.
+        recv_timeout
+            Seconds D waits for a registered request's KV before failing it.
+        quarantine
+            Seconds the slots of a failed receive rest before reuse.
+        """
         self.slots = StagingSlots(num_slots)
+        self._recv_timeout = recv_timeout
+        self._quarantine = quarantine
+        # D: deadline per request whose registration went out.
+        self._recv_deadlines: dict[str, float] = {}
+        # D: requests this worker failed at their deadline.
+        self._expired: set[str] = set()
+        # D: (release time, slots) of failed receives, oldest first.
+        self._quarantined: deque[tuple[float, list[int]]] = deque()
         self._lock = threading.Lock()
         # D: slots and device blocks per request whose registration went out.
         self._recv_slots: dict[str, tuple[BlockIds, BlockIds]] = {}
