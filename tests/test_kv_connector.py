@@ -412,3 +412,42 @@ def test_a_request_loads_remote_kv_then_holds_its_blocks_until_sent(
     _run_step(scheduler, runner)
     assert "B" not in scheduler.requests
     assert block_pool.get_num_free_blocks() == free_blocks_while_held + 2
+
+
+class NotifyingFakeKVConnector(FakeKVConnector):
+    """Like NixlConnector: a finished request leaves a notice for the next build."""
+
+    def request_finished_all_groups(self, request, block_ids):
+        self.pending_loads[request.request_id] = []
+        return False, None
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_a_notice_recorded_between_steps_reaches_the_returned_step(async_scheduling):
+    """Work the connector recorded before ``schedule`` reaches the step it returns,
+    also when an async release pass runs first and is then dropped."""
+    scheduler = _real_scheduler(
+        output_width=1,
+        max_num_seqs=1,
+        async_scheduling=async_scheduling,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NotifyingFakeKVConnector",
+            kv_connector_module_path=__name__,
+            kv_role="kv_both",
+        ),
+    )
+    scheduler.add_request(_request(8, request_id="A"))
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, _block_runner_output(prefill, [7]))
+    decode = scheduler.schedule()  # Under async scheduling this step stays held.
+    if not async_scheduling:
+        scheduler.update_from_output(decode, _block_runner_output(decode, [7]))
+    # B cannot be admitted (max_num_seqs=1); C is aborted before admission.
+    scheduler.add_request(_request(8, request_id="B"))
+    scheduler.add_request(_request(8, request_id="C"))
+    scheduler.finish_requests({"C"}, RequestStatus.FINISHED_ABORTED)
+
+    step = scheduler.schedule()
+
+    assert set(step.num_scheduled_tokens) == {"A"}
+    assert step.kv_connector_metadata.loads == {"C": []}

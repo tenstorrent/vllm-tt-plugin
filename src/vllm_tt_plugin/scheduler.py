@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -1019,16 +1020,26 @@ class TTScheduler(AsyncScheduler):
                 )
                 result = self._schedule_decode_only()
                 return self._finalize_scheduler_output(result, is_decode=True)
-            # A held step here is a decode or a verify.
-            release_step = (
-                self._schedule_release_step()
-                if held is not None and self.scheduler_config.async_scheduling
-                else None
-            )
-            with self._skip_kv_connector_meta_for_discarded_prefill(has_running_decode):
+            # A held step here is a decode or a verify. Building KV connector
+            # metadata drains the connector's recorded work, so a pass whose
+            # output may be dropped must not build it: the release pass builds
+            # only once it is known to be returned, and a prefill pass that
+            # schedules nothing beside running decodes leaves it to the decode
+            # pass.
+            release_step = None
+            if held is not None and self.scheduler_config.async_scheduling:
+                with self._skip_kv_connector_meta(lambda _: True):
+                    release_step = self._schedule_release_step()
+            with self._skip_kv_connector_meta(
+                lambda out: out.total_num_scheduled_tokens == 0 and has_running_decode
+            ):
                 prefill_result = self._schedule_prefill_only()
             if release_step is not None:
                 if prefill_result.total_num_scheduled_tokens > 0:
+                    if self.connector is not None:
+                        release_step.kv_connector_metadata = (
+                            self._build_kv_connector_meta(self.connector, release_step)
+                        )
                     self._decode_interleave.record_step(
                         is_decode=False, prefill_pending=True
                     )
@@ -1069,22 +1080,19 @@ class TTScheduler(AsyncScheduler):
         return self._finalize_scheduler_output(result, is_decode=True)
 
     @contextmanager
-    def _skip_kv_connector_meta_for_discarded_prefill(self, has_running_decode: bool):
-        """``schedule`` discards a prefill pass when it schedules no tokens and
-        decodes are running, then runs a decode pass instead. KV connector
-        metadata built for the discarded pass would be lost with it. Skip
-        ``_build_kv_connector_meta`` for that pass; the decode pass builds it.
+    def _skip_kv_connector_meta(self, skip: Callable[[SchedulerOutput], bool]):
+        """Leave ``kv_connector_metadata`` unbuilt for a base pass whose output
+        ``skip`` says may be dropped; the pass whose output is returned builds
+        it instead and carries the work the connector recorded.
         """
         original = self._build_kv_connector_meta
 
-        def build_unless_discarded(connector, scheduler_output):
-            no_prefill_tokens = scheduler_output.total_num_scheduled_tokens == 0
-
-            if no_prefill_tokens and has_running_decode:
+        def build_unless_skipped(connector, scheduler_output):
+            if skip(scheduler_output):
                 return None
             return original(connector, scheduler_output)
 
-        self._build_kv_connector_meta = build_unless_discarded
+        self._build_kv_connector_meta = build_unless_skipped
         try:
             yield
         finally:
