@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.test_block_scheduler import BLOCK_SIZE, _request
@@ -338,6 +338,7 @@ def _initialize_kv_cache(layer_names: list[str], kv_caches: list) -> None:
         _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
         model=SimpleNamespace(),
     )
+    runner._kv_caches_by_lane = partial(TTModelRunner._kv_caches_by_lane, runner)
     TTModelRunner.initialize_kv_cache(
         runner,
         KVCacheConfig(
@@ -565,3 +566,76 @@ def test_a_notice_recorded_between_steps_reaches_the_returned_step(async_schedul
 
     assert set(step.num_scheduled_tokens) == {"A"}
     assert step.kv_connector_metadata.loads == {"C": []}
+
+
+class CountingFakeKVConnector(FakeKVConnector):
+    """Counts how often the scheduler half packs its metadata."""
+
+    builds = 0
+
+    def build_connector_meta(self, scheduler_output):
+        CountingFakeKVConnector.builds += 1
+        return super().build_connector_meta(scheduler_output)
+
+
+def _lane_coordinator():
+    """Two real lanes under a coordinator, sharing one fake connector."""
+    from vllm_tt_plugin.config import store_tt_lane_count
+    from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
+
+    base = _real_scheduler(
+        output_width=1,
+        max_num_seqs=4,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="CountingFakeKVConnector",
+            kv_connector_module_path=__name__,
+            kv_role="kv_both",
+        ),
+    )
+    store_tt_lane_count(base.vllm_config, 2)
+    coordinator = TTLaneCoordinator(
+        base.vllm_config,
+        base.kv_cache_config,
+        base.structured_output_manager,
+        BLOCK_SIZE,
+    )
+    # Both lanes load "A" (lane 0) and "B" (lane 1) from a remote engine.
+    for lane, req_id in enumerate(("A", "B")):
+        coordinator._req_to_lane[req_id] = lane
+        coordinator.connector.external_tokens[req_id] = BLOCK_SIZE
+        coordinator.add_request(
+            _request(1, request_id=req_id, prompt_length=BLOCK_SIZE + 8)
+        )
+    return coordinator
+
+
+def test_lanes_share_one_connector_and_build_its_metadata_once_per_step():
+    coordinator = _lane_coordinator()
+    assert coordinator.get_kv_connector() is coordinator.connector
+    assert all(lane.connector is coordinator.connector for lane in coordinator.lanes)
+    CountingFakeKVConnector.builds = 0
+
+    step = coordinator.schedule()
+
+    assert CountingFakeKVConnector.builds == 1
+    loads = step.kv_connector_metadata.loads
+    assert set(loads) == {"A", "B"}
+    # Lanes number their blocks independently, so the lane rides along.
+    assert step.kv_connector_metadata.tt_lane_of == {"A": 0, "B": 1}
+
+
+def test_a_finished_load_reaches_only_the_lane_that_holds_the_request():
+    coordinator = _lane_coordinator()
+    step = coordinator.schedule()
+    pool = coordinator.lanes[0].kv_cache_config.num_blocks
+    runner_output = ModelRunnerOutput.with_kv_conn_output_only(
+        KVConnectorOutput(finished_recving={"B"}, invalid_block_ids={pool + 3})
+    )
+
+    lane0, lane1 = coordinator._runner_output_per_lane(runner_output)
+    coordinator.update_from_output(step, runner_output)
+
+    assert lane0.kv_connector_output.finished_recving == set()
+    assert lane1.kv_connector_output.finished_recving == {"B"}
+    assert lane1.kv_connector_output.invalid_block_ids == {3}
+    assert "B" in coordinator.lanes[1].finished_recving_kv_req_ids

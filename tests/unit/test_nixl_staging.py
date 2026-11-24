@@ -104,9 +104,10 @@ def _worker(num_slots: int, **staging) -> TTNixlPushConnectorWorker:
     worker = TTNixlPushConnectorWorker.__new__(TTNixlPushConnectorWorker)
     worker._init_staging(num_slots, **staging)
     worker._failed_recv_reqs = queue.Queue()
+    worker._invalid_block_ids = queue.Queue()
     worker.copies = []
-    worker.copy_blocks = lambda src, dst, src_ids, dst_ids, direction: (
-        worker.copies.append((direction, list(src_ids), list(dst_ids)))
+    worker.copy_blocks = lambda src, dst, src_ids, dst_ids, direction, lane=0: (
+        worker.copies.append((direction, list(src_ids), list(dst_ids), lane))
     )
     worker.host_xfer_buffers, worker.device_kv_caches = "host", "device"
     worker._deferred_push_inbox = queue.Queue()
@@ -116,8 +117,12 @@ def _worker(num_slots: int, **staging) -> TTNixlPushConnectorWorker:
     return worker
 
 
-def _metadata(registrations=None):
-    return SimpleNamespace(push_registrations=registrations or {})
+def _metadata(registrations=None, finished=None, lanes=None):
+    return SimpleNamespace(
+        push_registrations=registrations or {},
+        push_finished_blocks=finished or {},
+        tt_lane_of=lanes or {},
+    )
 
 
 def _registration(block_ids):
@@ -143,7 +148,7 @@ class TestDecodeSide:
 
         worker.get_transfer_results()
 
-        assert worker.copies == [("h2d", [0, 1, 2], [17, 4, 92])]
+        assert worker.copies == [("h2d", [0, 1, 2], [17, 4, 92], 0)]
         assert worker.slots.free == 4
 
     def test_a_registration_waits_while_the_pool_is_full(self, recorder):
@@ -184,6 +189,39 @@ class TestDecodeSide:
         assert worker.slots.free == 0
 
 
+class TestLanes:
+    """Lane DP: block IDs repeat across lanes, so each copy names its lane."""
+
+    def test_d_copies_a_received_request_into_its_lane(self, recorder):
+        worker = _worker(num_slots=4)
+        worker.start_load_kv(_metadata({"r": _registration([5, 6])}, lanes={"r": 1}))
+        recorder.results.finished_recving = {"r"}
+
+        worker.get_transfer_results()
+
+        assert worker.copies == [("h2d", [0, 1], [5, 6], 1)]
+
+    def test_a_failed_receive_reports_its_blocks_numbered_by_lane(self, recorder):
+        worker = _worker(num_slots=4, pool_blocks=100)
+        worker.start_load_kv(_metadata({"r": _registration([5, 6])}, lanes={"r": 2}))
+        recorder.results.failed_recving = {"r"}
+        recorder.results.finished_recving = {"r"}
+
+        worker.get_transfer_results()
+
+        assert worker.get_block_ids_with_load_errors() == {205, 206}
+        assert worker.get_block_ids_with_load_errors() == set()
+
+    def test_p_stages_a_matched_request_from_its_lane(self, recorder):
+        worker = _worker(num_slots=4)
+        worker.start_load_kv(_metadata(finished={"p": ([30, 31],)}, lanes={"p": 3}))
+        worker._do_start_push_kv("p", ([30, 31],), _registration([8, 9]))
+
+        worker.get_transfer_results()
+
+        assert worker.copies == [("d2h", [30, 31], [0, 1], 3)]
+
+
 class TestPrefillSide:
     def test_a_match_is_staged_on_the_runner_thread_then_written(self, recorder):
         worker = _worker(num_slots=4)
@@ -193,7 +231,7 @@ class TestPrefillSide:
 
         worker.get_transfer_results()
 
-        assert worker.copies == [("d2h", [31, 32], [0, 1])]
+        assert worker.copies == [("d2h", [31, 32], [0, 1], 0)]
         request_id, slots, registration = worker._deferred_push_inbox.get_nowait()
         worker._do_start_push_kv(request_id, slots, registration)
         assert recorder.pushes == [("p", ([0, 1],))]

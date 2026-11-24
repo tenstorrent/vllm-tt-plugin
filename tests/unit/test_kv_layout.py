@@ -151,7 +151,7 @@ def test_a_copied_shard_is_read_once_and_written_to_every_chip(fake_region_trans
         )
         description = kv_transfer.kv_cache_descriptions(config, layout)[name]
         buffer = {name: torch.zeros(description.shape, dtype=torch.uint8)}
-        return buffer, kv_transfer.make_copy_blocks(layout)
+        return buffer, kv_transfer.make_copy_blocks([layout])
 
     sender_buffer, sender_copy = server(sent)
     receiver_buffer, receiver_copy = server(received)

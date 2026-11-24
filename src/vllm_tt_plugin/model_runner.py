@@ -752,10 +752,37 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
         if has_kv_transfer_group():
             connector = get_kv_transfer_group()
-            layout = kv_transfer_layout(self.model, self.kv_caches, kv_cache_config)
-            connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, layout))
+            layouts = [
+                kv_transfer_layout(self.model, lane_caches, kv_cache_config)
+                for lane_caches in self._kv_caches_by_lane()
+            ]
+            # Lanes hold equal caches, so one description serves all of them.
+            connector.register_kv_caches(
+                kv_cache_descriptions(kv_cache_config, layouts[0])
+            )
             # Only a connector that stages KV through a CPU buffer keeps this.
-            connector.set_host_xfer_buffer_ops(make_copy_blocks(layout))
+            connector.set_host_xfer_buffer_ops(make_copy_blocks(layouts))
+
+    def _kv_caches_by_lane(self) -> list:
+        """The allocator's KV caches, one entry per lane.
+
+        Lane DP allocates one submesh cache per lane, in lane order; every
+        other mode has one engine cache, which the entry holds as allocated.
+
+        Raises
+        ------
+        ValueError
+            When lane DP does not return one cache per lane.
+        """
+        if not self._is_lane_mode:
+            return [self.kv_caches]
+        lanes = self.tt_data_parallel_size
+        if len(self.kv_caches) != lanes:
+            raise ValueError(
+                f"Lane DP with {lanes} lanes needs one KV cache per lane; the "
+                f"model allocated {len(self.kv_caches)}."
+            )
+        return list(self.kv_caches)
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:

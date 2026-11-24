@@ -145,9 +145,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     -----
     State and threads:
 
-    * ``_recv_slots``, ``_recv_deadlines``, ``_expired``, ``_quarantined`` and
-      ``_waiting_registrations`` (D), ``_waiting_stage`` (P) and ``slots``
-      belong to the model runner thread.
+    * ``_recv_slots``, ``_recv_deadlines``, ``_expired``, ``_quarantined``,
+      ``_load_errors`` and ``_waiting_registrations`` (D), ``_waiting_stage``
+      and ``_send_lane`` (P) and ``slots`` belong to the model runner thread.
     * ``_to_stage`` carries matched P requests from the writer thread to the
       model runner thread.
     * ``_send_slots`` and ``_released`` (P) are written by the model runner
@@ -176,6 +176,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 extra.get_from_extra_config("push_registration_timeout", ttl)
             ),
             quarantine=float(extra.get_from_extra_config("kv_lease_duration", 30)),
+            pool_blocks=kv_cache_config.num_blocks,
         )
         logger.info(
             "NIXL host staging: %d slots instead of a %d-block mirror.",
@@ -198,19 +199,33 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         super().register_kv_caches(staged)
 
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
-        """Send D's registrations with slot numbers, and stage P's matched sends."""
-        waiting = list(self._waiting_registrations)
+        """Send D's registrations with slot numbers, and stage P's matched sends.
+
+        Under lane DP, ``metadata.tt_lane_of`` names each request's lane: block
+        IDs are lane-local. Without it every request is on lane 0.
+        """
+        lane_of = getattr(metadata, "tt_lane_of", None) or {}
+        now = time.perf_counter()
+        queued = list(self._waiting_registrations)
         self._waiting_registrations.clear()
+        queued += [
+            (req_id, reg, lane_of.get(req_id, 0))
+            for req_id, reg in (metadata.push_registrations or {}).items()
+        ]
         registrations = {}
-        for req_id, reg in [*waiting, *(metadata.push_registrations or {}).items()]:
+        for req_id, reg, lane in queued:
+            self._recv_deadlines.setdefault(req_id, now + self._recv_timeout)
+            if req_id in self._expired:
+                continue
             device = self._as_grouped_block_ids(reg["local_block_ids"])
             slots = self._take_slots(device)
             if slots is None:
-                self._waiting_registrations.append((req_id, reg))
+                self._waiting_registrations.append((req_id, reg, lane))
                 continue
-            self._recv_slots[req_id] = (slots, device)
-            self._recv_deadlines[req_id] = time.perf_counter() + self._recv_timeout
+            self._recv_slots[req_id] = (slots, device, lane)
             registrations[req_id] = {**reg, "local_block_ids": slots}
+        for req_id in metadata.push_finished_blocks or {}:
+            self._send_lane[req_id] = lane_of.get(req_id, 0)
         # The scheduler shares ``metadata``; hand vLLM a copy.
         metadata = copy.copy(metadata)
         metadata.push_registrations = registrations
@@ -222,7 +237,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta) -> None:
         """Copy a received request from its slots into the chips; free the slots."""
-        slots, device = self._recv_slots.pop(req_id)
+        slots, device, lane = self._recv_slots.pop(req_id)
         self._recv_deadlines.pop(req_id, None)
         flat_slots = _flatten(slots)
         self.copy_blocks(
@@ -231,8 +246,20 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             flat_slots,
             _flatten(device),
             "h2d",
+            lane=lane,
         )
         self.slots.give_back(flat_slots)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Blocks of failed receives, as ``lane * pool blocks + block ID``.
+
+        vLLM's own report lists every block of a failed request without its
+        lane; this one lists the blocks that were to be received, and the lane
+        coordinator splits it by lane. Without lanes the IDs are the blocks.
+        """
+        super().get_block_ids_with_load_errors()
+        errors, self._load_errors = self._load_errors, set()
+        return errors
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Report vLLM's results; free slots of failed receives and done sends.
@@ -247,6 +274,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 del self._recv_deadlines[req_id]
                 self._expired.add(req_id)
                 self._failed_recv_reqs.put(req_id)
+                # One still waiting for slots never registered with P.
+                self._waiting_registrations = deque(
+                    entry for entry in self._waiting_registrations if entry[0] != req_id
+                )
                 logger.warning(
                     "No KV arrived for %s within %.0f s; failing its receive.",
                     req_id,
@@ -257,14 +288,19 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         results = super().get_transfer_results()
         for req_id in results.failed_recving:
             self._recv_deadlines.pop(req_id, None)
+            expired = req_id in self._expired
+            self._expired.discard(req_id)
             entry = self._recv_slots.pop(req_id, None)
             if entry is None:
                 continue
-            if req_id in self._expired:
-                self._expired.discard(req_id)
-                self._quarantined.append((now + self._quarantine, _flatten(entry[0])))
+            slots, device, lane = entry
+            self._load_errors |= {
+                lane * self._pool_blocks + block for block in _flatten(device)
+            }
+            if expired:
+                self._quarantined.append((now + self._quarantine, _flatten(slots)))
             else:
-                self.slots.give_back(_flatten(entry[0]))
+                self.slots.give_back(_flatten(slots))
         with self._lock:
             self._released |= results.finished_sending
         self._release_pending |= results.finished_sending & self._send_slots.keys()
@@ -275,11 +311,17 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             with self._lock:
                 slots = self._send_slots.pop(req_id)
             self.slots.give_back(slots)
+        for req_id in results.finished_sending - self._send_slots.keys():
+            self._send_lane.pop(req_id, None)
         self._stage_matched_sends()
         return results
 
     def _init_staging(
-        self, num_slots: int, recv_timeout: float = 480.0, quarantine: float = 30.0
+        self,
+        num_slots: int,
+        recv_timeout: float = 480.0,
+        quarantine: float = 30.0,
+        pool_blocks: int = 0,
     ) -> None:
         """Create the slot pool and the per-request staging state.
 
@@ -288,11 +330,20 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         num_slots
             Host rows of the pool.
         recv_timeout
-            Seconds D waits for a registered request's KV before failing it.
+            Seconds D waits for a request's KV, from its registration, before
+            failing it.
         quarantine
             Seconds the slots of a failed receive rest before reuse.
+        pool_blocks
+            Blocks in each lane's KV pool; numbers the blocks of failed
+            receives per lane.
         """
         self.slots = StagingSlots(num_slots)
+        self._pool_blocks = pool_blocks
+        # D: lane-numbered blocks of failed receives, for vLLM to recompute.
+        self._load_errors: set[int] = set()
+        # P: lane of each finished request until its send ends.
+        self._send_lane: dict[str, int] = {}
         self._recv_timeout = recv_timeout
         self._quarantine = quarantine
         # D: deadline per request whose registration went out.
@@ -302,10 +353,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         # D: (release time, slots) of failed receives, oldest first.
         self._quarantined: deque[tuple[float, list[int]]] = deque()
         self._lock = threading.Lock()
-        # D: slots and device blocks per request whose registration went out.
-        self._recv_slots: dict[str, tuple[BlockIds, BlockIds]] = {}
-        # D: registrations waiting for free slots, oldest first.
-        self._waiting_registrations: deque[tuple[str, dict[str, Any]]] = deque()
+        # D: slots, device blocks and lane per request whose registration went out.
+        self._recv_slots: dict[str, tuple[BlockIds, BlockIds, int]] = {}
+        # D: (request, registration, lane) waiting for free slots, oldest first.
+        self._waiting_registrations: deque[tuple[str, dict[str, Any], int]] = deque()
         # P: matched requests (device blocks, D's registration) to stage.
         self._to_stage: queue.Queue[tuple[str, BlockIds, dict[str, Any]]] = (
             queue.Queue()
@@ -375,6 +426,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 _flatten(device),
                 flat_slots,
                 "d2h",
+                lane=self._send_lane.get(req_id, 0),
             )
             with self._lock:
                 self._send_slots[req_id] = flat_slots

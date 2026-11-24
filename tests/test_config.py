@@ -191,21 +191,24 @@ def test_supports_device_grammar_rejects_non_boolean(invalid):
         tt_config.store_tt_supports_device_grammar(_vllm_config(), invalid)
 
 
-def test_kv_transfer_config_is_refused_with_lane_dp():
+@pytest.mark.parametrize(
+    ("connector", "accepted"),
+    [("NixlConnector", False), ("TTNixlPushConnector", True)],
+)
+def test_lane_dp_takes_only_a_lane_aware_kv_connector(connector, accepted):
     cfg = _vllm_config(data_parallel_size=1, lane_count=2)
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = SimpleNamespace(kv_connector=connector)
 
-    with pytest.raises(ValueError, match="lane DP"):
+    if accepted:
         tt_config.validate_tt_kv_transfer_config(cfg)
-
-    # Lane DP is fine when no connector is configured.
-    cfg.kv_transfer_config = None
-    tt_config.validate_tt_kv_transfer_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="lane DP.*NixlConnector"):
+            tt_config.validate_tt_kv_transfer_config(cfg)
 
 
 @pytest.mark.parametrize("data_parallel_size", [1, 2], ids=["no_dp", "standard_dp"])
 def test_kv_transfer_config_is_accepted_without_lanes(data_parallel_size):
     cfg = _vllm_config(data_parallel_size=data_parallel_size)
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = SimpleNamespace(kv_connector="NixlConnector")
 
     tt_config.validate_tt_kv_transfer_config(cfg)

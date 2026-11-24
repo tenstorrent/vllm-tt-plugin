@@ -45,9 +45,9 @@ storage, device execution, and any model-specific state.
 
 ## KV connectors
 
-With `--kv-transfer-config`, the single-process path and standard DP (one
-engine process per rank) run vLLM's KV connector lifecycle; lane-DP rejects
-the option. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
+With `--kv-transfer-config`, the single-process path, standard DP (one engine
+process per rank) and lane DP run vLLM's KV connector lifecycle; lane DP
+accepts only `TTNixlPushConnector`. `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
 `register_kv_caches` once, after the model adapter allocates KV storage, and
 then `set_host_xfer_buffer_ops` with the function that copies KV blocks
 between the adapter's ttnn tensors and a connector's CPU buffer. A connector
@@ -109,6 +109,13 @@ P's write lands; P copies only the blocks D registered, once the two are
 matched. A D request whose KV does not arrive within
 `push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
 fails instead of waiting forever. P and D must both use it.
+
+Under lane DP the lanes share the engine's one connector. Block IDs are
+lane-local, so the coordinator builds the connector metadata once per step and
+names each request's lane in it (`tt_lane_of`), the runner keeps one transfer
+layout per lane (`get_kv_transfer_layout` is called with each lane's caches),
+and the worker records each slot's lane. Transfer results go back to the lane
+that holds the request.
 
 ## Minimum implementation
 

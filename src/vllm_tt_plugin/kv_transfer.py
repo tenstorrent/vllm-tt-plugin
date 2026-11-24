@@ -60,19 +60,25 @@ def kv_cache_descriptions(
     return descriptions
 
 
-def make_copy_blocks(layout: KVLayout) -> CopyBlocksOp:
+def make_copy_blocks(layouts: list[KVLayout]) -> CopyBlocksOp:
     """The copy between the model's ttnn KV cache and a connector's CPU buffer.
 
     The buffer is the connector's own: per layer name, a CPU tensor shaped
     like ``kv_cache_descriptions``. The connector's "device" dict holds those
-    descriptions and is ignored; ``layout`` is the real device side.
+    descriptions and is ignored; ``layouts`` is the real device side, one
+    layout per lane (one in total without lane DP). The returned copy takes an
+    extra keyword, ``lane`` (default 0), naming the lane whose blocks the IDs
+    are: lanes number their blocks independently.
 
     Every part's transfers are queued without waiting and the last one waits,
     so the copy returns once all of them have landed: the command queue runs
     them in order.
     """
 
-    def copy_blocks(src, dst, src_block_ids, dst_block_ids, direction) -> None:
+    def copy_blocks(
+        src, dst, src_block_ids, dst_block_ids, direction, lane: int = 0
+    ) -> None:
+        layout = layouts[lane]
         to_host = direction == "d2h"
         buffers = dst if to_host else src
         device_ids, host_ids = (

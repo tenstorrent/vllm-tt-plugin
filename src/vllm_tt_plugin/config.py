@@ -534,20 +534,26 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     )
 
 
+# The one KV connector whose worker knows that block IDs are lane-local.
+_LANE_DP_KV_CONNECTOR = "TTNixlPushConnector"
+
+
 def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
-    """Refuse ``--kv-transfer-config`` with lane DP.
+    """Refuse ``--kv-transfer-config`` with lane DP unless its connector knows lanes.
 
     Standard DP runs one engine process per rank, each with its own connector,
     as vLLM's connectors expect. Lane DP runs several lanes inside one engine,
-    whose coordinator gives vLLM no connector.
+    whose block IDs repeat across lanes; only ``TTNixlPushConnector`` tells
+    them apart.
     """
-    if vllm_config.kv_transfer_config is None:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
         return
     lanes = get_tt_data_parallel_size(vllm_config)
-    if lanes != 1:
+    if lanes != 1 and kv_transfer_config.kv_connector != _LANE_DP_KV_CONNECTOR:
         raise ValueError(
-            "--kv-transfer-config is not supported with TT lane DP; got "
-            f"TT lanes={lanes}. Standard DP (one engine per rank) is supported."
+            f"--kv-transfer-config with TT lane DP ({lanes} lanes) supports only "
+            f"{_LANE_DP_KV_CONNECTOR}; got {kv_transfer_config.kv_connector}."
         )
 
 
