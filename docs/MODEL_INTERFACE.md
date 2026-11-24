@@ -32,7 +32,9 @@ storage, device execution, and any model-specific state.
 
 1. `TTPlatform.check_and_update_config` resolves the TT model class and checks
    class declarations against the requested launch.
-2. `TTWorker.init_device` opens the device mesh and determines the KV budget.
+2. `TTWorker.init_device` opens the device mesh, or acquires it from a
+   registered mesh provider (see the README's Shared Mesh section), and
+   determines the KV budget.
 3. `TTModelLoader.load_model` calls `initialize_vllm_model` to construct the
    model adapter on the open mesh.
 4. `TTModelRunner.initialize_kv_cache` asks the model adapter to allocate KV

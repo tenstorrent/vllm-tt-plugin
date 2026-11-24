@@ -110,7 +110,8 @@ Sources: `_alloc_prefill_state_slots`, `_decode_state_slot_remap`,
    to release model-lifetime captures. The adapter must release device
    resources that require an open mesh here. The runner logs exceptions and
    marks capture release complete rather than retrying capture release.
-3. `TTWorker.shutdown` closes the mesh.
+3. `TTWorker.shutdown` closes the mesh, or releases a mesh acquired from a
+   mesh provider back to that provider, which keeps it open.
 
 The plugin does not call a generic model `shutdown()` hook or guarantee model
 destruction before mesh close. Keep device-dependent capture cleanup in

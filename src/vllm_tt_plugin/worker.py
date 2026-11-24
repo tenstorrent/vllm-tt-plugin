@@ -46,6 +46,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.mesh_provider import MeshProvider, get_mesh_provider
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
@@ -253,6 +254,8 @@ class TTWorker(WorkerBase):
 
         # Initialized by init_device
         self.mesh_device = None
+        # The provider the mesh came from; None when this worker opened it.
+        self._mesh_provider: MeshProvider | None = None
         self._num_tt_blocks: int | None = None
 
         # Whether to use ttnn tracing for model execution
@@ -304,12 +307,26 @@ class TTWorker(WorkerBase):
         )
         model_class, _ = get_model_architecture(self.model_config)
         model_capabilities = getattr(model_class, "model_capabilities", None) or {}
-        self.mesh_device = open_mesh_device(
-            get_tt_config(self.vllm_config),
-            self.trace_mode,
-            local_dp_rank,
-            model_fabric_config=model_capabilities.get("fabric_config"),
-        )
+        tt_config = get_tt_config(self.vllm_config)
+        model_fabric_config = model_capabilities.get("fabric_config")
+        self._mesh_provider = get_mesh_provider()
+        if self._mesh_provider is None:
+            self.mesh_device = open_mesh_device(
+                tt_config,
+                self.trace_mode,
+                local_dp_rank,
+                model_fabric_config=model_fabric_config,
+            )
+        else:
+            self.mesh_device = self._mesh_provider.acquire(
+                tt_config,
+                self.trace_mode,
+                model_fabric_config=model_fabric_config,
+            )
+            logger.info(
+                "Using the mesh from %s instead of opening one",
+                type(self._mesh_provider).__name__,
+            )
         self.device = self.mesh_device
         self.device_config.device = self.mesh_device
         assert self.mesh_device is not None
@@ -587,6 +604,9 @@ class TTWorker(WorkerBase):
         reclaimed whenever the cyclic collector runs. ``__del__`` stays a
         best-effort backstop and deliberately does not call it; see the note
         there.
+
+        A mesh acquired from a registered ``MeshProvider`` is released to that
+        provider at the same point instead of being closed.
         """
         if getattr(self, "model_runner", None) is not None:
             try:
@@ -606,7 +626,7 @@ class TTWorker(WorkerBase):
             device_config.device = None
         mesh_device = getattr(self, "mesh_device", None)
         if mesh_device is not None:
-            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+            self._close_or_release_mesh(mesh_device)
             # Idempotence: __del__ (and a second shutdown call) must not
             # close the mesh again.
             self.mesh_device = None
@@ -637,11 +657,21 @@ class TTWorker(WorkerBase):
 
         with suppress(AttributeError):
             if self.mesh_device:
-                close_mesh_device(self.mesh_device, get_tt_config(self.vllm_config))
+                self._close_or_release_mesh(self.mesh_device)
                 del self.mesh_device
 
         if hasattr(super(), "__del__"):
             super().__del__()  # type: ignore
+
+    def _close_or_release_mesh(self, mesh_device) -> None:
+        # A provided mesh goes back to the provider it came from, even if the
+        # registered provider has changed since: its owner closes it, and this
+        # worker must neither close it nor reset fabric under other workers.
+        provider = getattr(self, "_mesh_provider", None)
+        if provider is None:
+            close_mesh_device(mesh_device, get_tt_config(self.vllm_config))
+        else:
+            provider.release(mesh_device)
 
 
 def kv_cache_spec_from_model_class(
