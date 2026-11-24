@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import regex as re
 import torch
 import ttnn
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -80,6 +80,7 @@ from vllm_tt_plugin.model_input import (
     slice_tt_sampling_params,
 )
 from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.pooling import execute_pooling_step, supported_pooling_tasks
 from vllm_tt_plugin.spec_accept import accept_sampled_drafts, spec_sampling_inputs
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -302,6 +303,8 @@ class TTModelRunner:
         """Set up runner state from the config; ``load_model`` loads the model."""
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
+        # runner="pooling": each request is one prefill whose output is pooled.
+        self.runs_pooling = getattr(self.model_config, "runner_type", None) == "pooling"
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
@@ -580,9 +583,11 @@ class TTModelRunner:
 
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
-        self.model = loader.load_model(
-            vllm_config=self.vllm_config, model_config=self.model_config
-        )
+        # As upstream's loader: a model reads the config when it builds its pooler.
+        with set_current_vllm_config(self.vllm_config):
+            self.model = loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
         if self.supports_device_grammar:
             activate = getattr(self.model, "enable_device_grammar", None)
             if callable(activate):
@@ -628,8 +633,7 @@ class TTModelRunner:
         return ["generate"]
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
-        # TT backend does not support pooling/embedding tasks yet.
-        return []
+        return supported_pooling_tasks(self.model)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks = list[SupportedTask]()
@@ -3235,6 +3239,8 @@ class TTModelRunner:
         DP reaches this entrypoint once per rank, each over its own mesh.
         """
         TTModelRunner._raise_if_device_grammar_poisoned(self)
+        if getattr(self, "runs_pooling", False):
+            return execute_pooling_step(self.model, scheduler_output)
 
         # Single-process lane-DP: the lane scheduler attaches a per-step plan to
         # the scheduler output. When present, the step runs over the merged lane
