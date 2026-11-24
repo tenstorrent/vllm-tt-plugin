@@ -143,7 +143,7 @@ a buffer. A single-group cache gives every attention layer a separate
 When vLLM creates multiple KV groups, `TTModelRunner` expands group page tables
 into `page_tables_per_layer`, ordered by attention-layer index. Prefill and
 decode receive `page_tables_per_layer` in addition to group 0's `page_table`
-(the first attention group's with `MambaSpec` groups).
+(with `MambaSpec` groups, `page_table` is the first attention group's table).
 Each per-layer tensor has shape
 `[tt_max_batch_size, max_num_blocks_per_req]`, with unused rows and columns
 zero-padded. The per-layer row capacity can exceed `tokens.shape[0]` during
@@ -181,7 +181,6 @@ Declaration rules:
 
 Unsupported launches fail at startup. `get_num_available_blocks_tt` runs in `TTWorker.init_device`, before the model loads, and raises `ValueError` for a model with `MambaSpec` layers when:
 
-- the launch has a `speculative_config` and asynchronous scheduling. The scheduler's token counts of a request whose verify is still in flight count its drafts as accepted, so the block the request's next step starts from is known only after the readback. The message tells the operator to launch with `--no-async-scheduling`.
 - the launch runs single-process lane-DP.
 - the model is a block-output model (`output_tokens_per_step > 1`).
 - `mamba_cache_mode` is `all`.
