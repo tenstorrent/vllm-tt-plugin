@@ -107,3 +107,8 @@ GetDefaultDevice = _no_device("GetDefaultDevice")
 ReadDeviceProfiler = _no_device("ReadDeviceProfiler")
 event_synchronize = _no_device("event_synchronize")
 copy_host_to_device_tensor = _no_device("copy_host_to_device_tensor")
+copy_device_tensor_chunks_to_host = _no_device("copy_device_tensor_chunks_to_host")
+copy_host_chunks_to_device_tensor = _no_device("copy_host_chunks_to_device_tensor")
+
+# The plugin only compares a tensor's dtype against this.
+bfloat8_b = "bfloat8_b"
