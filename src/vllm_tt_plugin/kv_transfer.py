@@ -13,6 +13,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 # of 16 values.
 _BFLOAT8_TILE_BYTES = 1088
 
+# Longer stretches are copied in pieces of this many blocks. Measured on a
+# 1x2 Blackhole mesh, the rate falls from about 9.5 GB/s to under 7 GB/s
+# between 128 and 512 blocks in one device transfer.
+_MAX_RUN_BLOCKS = 64
+
 
 def _bfloat8_block_bytes(cache) -> int:
     """Bytes one block takes in each chip's buffer of a bfloat8_b KV cache.
@@ -114,8 +119,7 @@ def make_copy_blocks(kv_tensors: dict[str, tuple]) -> CopyBlocksOp:
     def copy_blocks(src, dst, src_block_ids, dst_block_ids, direction) -> None:
         to_host = direction == "d2h"
         buffers = dst if to_host else src
-        # Each block is its own stretch of one.
-        runs = [(src, dst, 1) for src, dst in zip(src_block_ids, dst_block_ids)]
+        runs = list(_runs_of_consecutive_blocks(src_block_ids, dst_block_ids))
         for name, (k, v) in kv_tensors.items():
             _copy_packed_blocks(k, v, _buffer_bytes(buffers[name]), runs, to_host)
 
@@ -167,3 +171,31 @@ def _copy_packed_blocks(k, v, host: np.ndarray, runs, to_host: bool) -> None:
                     chip_bytes,
                     count,
                 )
+
+
+def _runs_of_consecutive_blocks(src_block_ids: list[int], dst_block_ids: list[int]):
+    """Yield ``(lowest source, lowest destination, count)`` for each stretch of
+    the copy whose source and destination block IDs both count up by one, or
+    both count down by one, cut at ``_MAX_RUN_BLOCKS``.
+
+    vLLM hands a request the blocks an earlier one freed in descending order,
+    so a stretch that counts down is as common as one that counts up. Either
+    way it is the same set of block pairs, named from its lowest IDs.
+    """
+    first, step = 0, 0
+    for i in range(1, len(src_block_ids) + 1):
+        this_step = 0
+        if i < len(src_block_ids) and i - first < _MAX_RUN_BLOCKS:
+            this_step = src_block_ids[i] - src_block_ids[i - 1]
+            if (
+                this_step not in (1, -1)
+                or dst_block_ids[i] - dst_block_ids[i - 1] != this_step
+                or step not in (0, this_step)
+            ):
+                this_step = 0
+        if this_step:
+            step = this_step
+            continue
+        lowest = first if step >= 0 else i - 1
+        yield src_block_ids[lowest], dst_block_ids[lowest], i - first
+        first, step = i, 0

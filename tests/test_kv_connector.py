@@ -400,6 +400,7 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
         for chip in (*k.chips, *v.chips):
             chip[:] = rng.integers(0, 256, chip.size, dtype=np.uint8)
 
+    # A stretch that counts up, one that counts down, and a block on its own.
     sent_ids = [0, 1, 2, 9, 8, 7, 5]
     received_ids = [4, 5, 6, 11, 10, 9, 0]
     sender_copy(None, sender_buffer, sent_ids, sent_ids, "d2h")
@@ -417,6 +418,13 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
                 assert (received_blocks[received_ids] == sent_blocks[sent_ids]).all()
                 # Blocks nothing was sent to stay empty.
                 assert not received_blocks[[1, 2, 3, 7, 8]].any()
+
+
+def test_a_long_stretch_of_blocks_is_copied_in_pieces():
+    ids = list(range(3, 3 + 2 * kv_transfer._MAX_RUN_BLOCKS + 1))
+    runs = list(kv_transfer._runs_of_consecutive_blocks(ids, ids))
+    assert sum(count for _, _, count in runs) == len(ids)
+    assert max(count for _, _, count in runs) == kv_transfer._MAX_RUN_BLOCKS
 
 
 def _model_kv_caches(num_layers: int = 2) -> list:
