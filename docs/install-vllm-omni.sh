@@ -7,7 +7,12 @@
 # --no-deps: Omni's other requirements are CUDA-side or only needed by models the
 # PoCs do not serve; transformers comes from docs/vllm-overrides.txt, whose range
 # is inside Omni's.
-uv pip install --no-deps "vllm-omni==0.32.0"
+# 0.32.0 plus vllm-project/vllm-omni#10609 (Qwen3-ASR transcriptions and forced
+# aligner) and three pooling-output fixes from Omni main, until #10609 is in a
+# release on this vLLM. The git checkout has no tags, so the version is set here.
+VLLM_OMNI_VERSION_OVERRIDE=0.32.0+qwen3asr.poc \
+    uv pip install --no-deps \
+    "vllm-omni @ git+https://github.com/cleonidouTT/vllm-omni.git@72c000388f525debb8187f510a4f7b3c63f0cd43"
 # The PyPI torchaudio is the CUDA build; this is the CPU half of tt-metal's torch pair.
 uv pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
     "torchaudio==2.11.0+cpu"
