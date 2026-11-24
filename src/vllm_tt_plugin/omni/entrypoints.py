@@ -46,4 +46,9 @@ def register() -> None:
         "TTQwen3ASRForConditionalGeneration",
         "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ASRForConditionalGeneration",
     )
+    OmniModelRegistry.register_model(
+        "TTQwen3ASRForcedAlignerForTokenClassification",
+        "models.demos.audio.qwen3_asr.tt.generator_vllm:"
+        "Qwen3ASRForcedAlignerForTokenClassification",
+    )
     register_tt_pipelines()

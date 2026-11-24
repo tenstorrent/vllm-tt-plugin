@@ -140,5 +140,9 @@ def test_the_omni_plugin_registers_the_tt_stages_where_omni_validates_them(
         "TTQwen3ASRForConditionalGeneration": (
             "models.demos.audio.qwen3_asr.tt.generator_vllm:Qwen3ASRForConditionalGeneration"
         ),
+        "TTQwen3ASRForcedAlignerForTokenClassification": (
+            "models.demos.audio.qwen3_asr.tt.generator_vllm:"
+            "Qwen3ASRForcedAlignerForTokenClassification"
+        ),
     }
     assert "tt_qwen3_tts_talker" in pipeline_registry.OMNI_PIPELINES

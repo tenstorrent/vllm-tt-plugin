@@ -1,0 +1,12 @@
+# Qwen3-ForcedAligner-0.6B as stage 1 of vllm-omni#10609's `qwen3_asr` pipeline, on TT:
+#   --forced-aligner-config poc/qwen3-asr-omni/deploy/tt_qwen3_forced_aligner.yaml
+#   --forced-aligner-device 1
+# The TT platform serves the architecture as TTQwen3ASRForcedAlignerForTokenClassification.
+forced_aligner:
+  model: Qwen/Qwen3-ForcedAligner-0.6B
+  runner: pooling
+  architecture: Qwen3ASRForcedAlignerForTokenClassification
+  pooling_task: token_classify
+  dtype: bfloat16
+  max_model_len: 4096
+  trust_remote_code: true

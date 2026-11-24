@@ -1,0 +1,27 @@
+# Qwen3-ASR stage 0 on TT card 0 and the forced aligner (stage 1, added by
+# --forced-aligner-config tt_qwen3_forced_aligner.yaml) on TT card 1. Stage 1's
+# runner settings come from the tt platform section, as the injected stage has none.
+pipeline: qwen3_asr
+model_runner: v1
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_model_len: 2048
+    max_num_seqs: 8
+    block_size: 64
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1024
+
+platforms:
+  tt:
+    stages:
+      - stage_id: 1
+        devices: "1"
+        max_num_seqs: 8
+        block_size: 64
+        enable_prefix_caching: false
