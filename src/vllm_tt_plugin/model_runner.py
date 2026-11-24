@@ -15,6 +15,10 @@ import regex as re
 import torch
 import ttnn
 from vllm.config import VllmConfig
+from vllm.model_executor.models.interfaces import (
+    supports_realtime,
+    supports_transcription,
+)
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -623,9 +627,17 @@ class TTModelRunner:
         )
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
-        # TT backend currently supports text generation only.
-        # (No transcription support yet.)
-        return ["generate"]
+        # As upstream's GPU runner: a model class implementing vLLM's
+        # SupportsTranscription / SupportsRealtime gets those serving tasks.
+        if supports_transcription(self.model):
+            if self.model.supports_transcription_only:
+                return ["transcription"]
+            tasks: list[GenerationTask] = ["generate", "transcription"]
+        else:
+            tasks = ["generate"]
+        if supports_realtime(self.model):
+            tasks.append("realtime")
+        return tasks
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         # TT backend does not support pooling/embedding tasks yet.
