@@ -191,27 +191,21 @@ def test_supports_device_grammar_rejects_non_boolean(invalid):
         tt_config.store_tt_supports_device_grammar(_vllm_config(), invalid)
 
 
-@pytest.mark.parametrize(
-    ("data_parallel_size", "lane_count"),
-    [(2, None), (1, 2)],
-    ids=["standard_dp", "lane_dp"],
-)
-def test_kv_transfer_config_is_refused_with_data_parallelism(
-    data_parallel_size, lane_count
-):
-    cfg = _vllm_config(data_parallel_size=data_parallel_size, lane_count=lane_count)
+def test_kv_transfer_config_is_refused_with_lane_dp():
+    cfg = _vllm_config(data_parallel_size=1, lane_count=2)
     cfg.kv_transfer_config = object()
 
-    with pytest.raises(ValueError, match="kv-transfer-config"):
+    with pytest.raises(ValueError, match="lane DP"):
         tt_config.validate_tt_kv_transfer_config(cfg)
 
-    # The same parallelism is fine when no connector is configured.
+    # Lane DP is fine when no connector is configured.
     cfg.kv_transfer_config = None
     tt_config.validate_tt_kv_transfer_config(cfg)
 
 
-def test_kv_transfer_config_is_accepted_without_data_parallelism():
-    cfg = _vllm_config()
+@pytest.mark.parametrize("data_parallel_size", [1, 2], ids=["no_dp", "standard_dp"])
+def test_kv_transfer_config_is_accepted_without_lanes(data_parallel_size):
+    cfg = _vllm_config(data_parallel_size=data_parallel_size)
     cfg.kv_transfer_config = object()
 
     tt_config.validate_tt_kv_transfer_config(cfg)

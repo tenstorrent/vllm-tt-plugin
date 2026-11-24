@@ -535,20 +535,19 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
 
 
 def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
-    """Validate that vllm server runs without data parallelism when
-    ``--kv-transfer-config`` is set.
+    """Refuse ``--kv-transfer-config`` with lane DP.
 
-    Lane-DP runs with ``data_parallel_size == 1``, so the lane count is checked
-    as well.
+    Standard DP runs one engine process per rank, each with its own connector,
+    as vLLM's connectors expect. Lane DP runs several lanes inside one engine,
+    whose coordinator gives vLLM no connector.
     """
     if vllm_config.kv_transfer_config is None:
         return
-    data_parallel_size = vllm_config.parallel_config.data_parallel_size
     lanes = get_tt_data_parallel_size(vllm_config)
-    if data_parallel_size != 1 or lanes != 1:
+    if lanes != 1:
         raise ValueError(
-            "--kv-transfer-config is supported only without data parallelism on "
-            f"TT; got data_parallel_size={data_parallel_size}, TT lanes={lanes}."
+            "--kv-transfer-config is not supported with TT lane DP; got "
+            f"TT lanes={lanes}. Standard DP (one engine per rank) is supported."
         )
 
 
