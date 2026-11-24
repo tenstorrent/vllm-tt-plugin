@@ -4539,7 +4539,7 @@ class TTModelRunner:
                         )
                     logprobs_per_dp.append(
                         build_device_logprobs(
-                            tt_log_probs=tt_log_probs,
+                            logprobs=tt_log_probs,
                             sampled_token_ids=next_token_ids.reshape(sz),
                             rows=rows,
                             max_num_logprobs=rank_max_num_logprobs or 0,

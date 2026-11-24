@@ -70,6 +70,7 @@ Common to every configuration:
 source /path/to/env.sh                  # TT_METAL_HOME, the venv, HF cache
 export MESH_DEVICE="(1, 1)"             # this model does no device work
 PLUGIN=/path/to/vllm-tt-plugin
+cd "$PLUGIN"                           # all test paths are relative to this checkout
 SPEC='{"method":"custom_class","model":"vllm_tt_plugin.model_owned_drafter","num_speculative_tokens":5}'
 COMMON="--model models/vllm_test_utils/spec_test
         --tokenizer meta-llama/Llama-3.1-8B-Instruct
@@ -77,6 +78,10 @@ COMMON="--model models/vllm_test_utils/spec_test
 ```
 
 Two things about invoking pytest here, both of which fail loudly rather than subtly.
+
+The server commands below run in the foreground. Run their matching test
+commands in another terminal with the same environment and checkout setup.
+Use real TTNN without `tests/host-stubs` on `PYTHONPATH`.
 
 Pass every option in `--name=value` form. These options are registered in `tests/tt/spec/conftest.py`, which pytest loads only after its first pass over the command line, so on that pass `--tt-metal-home /path/to/tt-metal` leaves the path standing as a positional argument: pytest collects that directory, walks it for `conftest.py` files, and dies importing the tt-metal checkout's root conftest before any test runs.
 
@@ -222,11 +227,11 @@ The asynchronous variant is the launch of recipe 6 with this selection and `--tt
 ```bash
 mkdir -p /tmp/spec-run/sampled
 TT_SPEC_TARGET=fixed TT_SPEC_ACCEPT_MODES=argmax_ids,logits TT_SPEC_ACCEPT_DEPTH=-1 \
-python $PLUGIN/examples/server_example_tt.py $COMMON --no-async-scheduling \
+"$VIRTUAL_ENV/bin/python" "$PLUGIN/examples/server_example_tt.py" $COMMON --no-async-scheduling \
     --max_num_seqs 8 --max_model_len 2048 --port 8100 \
     --speculative-config "$SPEC" >/tmp/spec-run/sampled/server.log 2>&1
 
-pytest tests/tt/spec/test_sampled_speculation.py tests/tt/spec/test_sampled_controls.py \
+"$VIRTUAL_ENV/bin/python" -m pytest tests/tt/spec/test_sampled_speculation.py tests/tt/spec/test_sampled_controls.py \
     --tt-server-url=http://localhost:8100 --tt-model-name=models/vllm_test_utils/spec_test \
     --tt-max-num-seqs=8 --tt-spec-k=5 --tt-spec-accept-depth=all \
     --tt-spec-target=fixed --tt-spec-accept-modes=argmax_ids,logits \

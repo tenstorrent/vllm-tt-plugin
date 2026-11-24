@@ -1883,7 +1883,7 @@ class TTLaneInputBatch(InputBatch):
             return None
         assert tt_log_probs is not None, "model should return logprobs when requested"
         return build_device_logprobs(
-            tt_log_probs=tt_log_probs,
+            logprobs=tt_log_probs,
             sampled_token_ids=sampled.reshape(n),
             rows=sel,
             max_num_logprobs=model_input.max_num_logprobs[0] or 0,
