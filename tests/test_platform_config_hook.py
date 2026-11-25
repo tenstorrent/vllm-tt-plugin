@@ -79,13 +79,26 @@ def _kv_transfer_launch(kv_transfer_config: KVTransferConfig) -> VllmConfig:
 
 @pytest.mark.parametrize(
     ("connector", "patched"),
-    [("NixlConnector", True), ("ExampleConnector", False)],
+    [
+        ("NixlConnector", True),
+        ("NixlPushConnector", True),
+        ("TTNixlPushConnector", True),
+        ("ExampleConnector", False),
+    ],
 )
 def test_only_a_nixl_launch_makes_the_nixl_worker_rank_0_of_1(connector, patched):
     from vllm.distributed import parallel_state
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
 
-    _kv_transfer_launch(KVTransferConfig(kv_connector=connector, kv_role="kv_both"))
+    # Plugin load registers TTNixlPushConnector by name; this test names its module.
+    module_path = "vllm_tt_plugin.nixl_staging" if connector.startswith("TT") else None
+    _kv_transfer_launch(
+        KVTransferConfig(
+            kv_connector=connector,
+            kv_role="kv_both",
+            kv_connector_module_path=module_path,
+        )
+    )
 
     for name in (
         "get_tensor_model_parallel_rank",
