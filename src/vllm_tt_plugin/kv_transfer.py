@@ -9,8 +9,16 @@ per vLLM layer name and moves KV between that buffer and the device with a
 layer is the layer's parts' blocks in order, each part shard after shard,
 exactly as the chips hold them.
 
-Principal entry points: ``kv_cache_descriptions`` and ``make_copy_blocks``.
+The copy needs ``ttnn.copy_device_to_host_regions`` and
+``ttnn.copy_host_to_device_regions`` (tt-metal#67057). This module looks them
+up only when a copy runs, so it imports with a ttnn that lacks them;
+``check_region_copies`` tells a launch that needs them at startup.
+
+Principal entry points: ``kv_cache_descriptions``, ``make_copy_blocks`` and
+``check_region_copies``.
 """
+
+from collections.abc import Iterator
 
 import numpy as np
 import torch
@@ -19,6 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_tt_plugin.kv_layout import KVLayout, KVPart
+
+_REGION_COPIES = ("copy_device_to_host_regions", "copy_host_to_device_regions")
 
 
 def kv_cache_descriptions(
@@ -61,23 +71,36 @@ def kv_cache_descriptions(
 
 
 def make_copy_blocks(layouts: list[KVLayout]) -> CopyBlocksOp:
-    """The copy between the model's ttnn KV cache and a connector's CPU buffer.
+    """The copy between the model's ttnn KV tensors and a connector's CPU buffer.
 
-    The buffer is the connector's own: per layer name, a CPU tensor shaped
-    like ``kv_cache_descriptions``. The connector's "device" dict holds those
-    descriptions and is ignored; ``layouts`` is the real device side, one
-    layout per lane (one in total without lane DP). The returned copy takes an
-    extra keyword, ``lane`` (default 0), naming the lane whose blocks the IDs
-    are: lanes number their blocks independently.
+    Parameters
+    ----------
+    layouts
+        The device side: the model's KV transfer layout, one per lane (one in
+        total without lane DP).
 
-    Every part's transfers are queued without waiting and the last one waits,
-    so the copy returns once all of them have landed: the command queue runs
-    them in order.
+    Returns
+    -------
+    CopyBlocksOp
+        ``copy(src, dst, src_block_ids, dst_block_ids, direction, lane=0)``.
+        The CPU side is the connector's own buffer: per layer name, a
+        ``uint8`` CPU tensor shaped like ``kv_cache_descriptions``, in ``dst``
+        for ``"d2h"`` and in ``src`` for ``"h2d"``. The other dict holds the
+        descriptions and is ignored. Block ``src_block_ids[i]`` is copied to
+        ``dst_block_ids[i]``. ``lane`` names the lane whose blocks the device
+        IDs are: lanes number their blocks independently.
+
+    Notes
+    -----
+    Each layer part takes one ttnn region copy for all blocks. The copies are
+    queued without waiting and the last one waits: the command queue runs
+    them in order, so the copy returns once all of them have landed.
     """
 
     def copy_blocks(
         src, dst, src_block_ids, dst_block_ids, direction, lane: int = 0
     ) -> None:
+        """Copy blocks ``src_block_ids`` of ``src`` to ``dst_block_ids``."""
         layout = layouts[lane]
         to_host = direction == "d2h"
         buffers = dst if to_host else src
@@ -116,7 +139,23 @@ def make_copy_blocks(layouts: list[KVLayout]) -> CopyBlocksOp:
     return copy_blocks
 
 
-def _with_offsets(parts: tuple[KVPart, ...]):
+def check_region_copies() -> None:
+    """Check that ttnn has the region copies ``make_copy_blocks`` runs.
+
+    Raises
+    ------
+    RuntimeError
+        Naming each missing ttnn function and tt-metal#67057, which adds them.
+    """
+    if missing := [name for name in _REGION_COPIES if not hasattr(ttnn, name)]:
+        raise RuntimeError(
+            "A KV connector with a CPU buffer (kv_buffer_device='cpu') copies KV "
+            f"with ttnn.{' and ttnn.'.join(missing)}, which this ttnn lacks. "
+            "They come with https://github.com/tenstorrent/tt-metal/pull/67057."
+        )
+
+
+def _with_offsets(parts: tuple[KVPart, ...]) -> Iterator[tuple[int, KVPart]]:
     """Each part with its byte offset inside a transferred block."""
     offset = 0
     for part in parts:
@@ -125,11 +164,16 @@ def _with_offsets(parts: tuple[KVPart, ...]):
 
 
 def _buffer_bytes(buffer: torch.Tensor) -> np.ndarray:
-    """A connector's uint8 buffer for one layer as flat bytes, block after block.
+    """A connector's ``uint8`` buffer for one layer as flat bytes, block by block.
 
-    NixlConnector allocates ``(blocks, tokens, heads, n)`` and hands out the
-    view ``(blocks, heads, tokens, n)``. ``view`` raises if neither is the
-    buffer's memory order.
+    ``NixlConnector`` allocates ``(blocks, tokens, heads, n)`` and hands out
+    the view ``(blocks, heads, tokens, n)``. The result shares the buffer's
+    memory.
+
+    Raises
+    ------
+    RuntimeError
+        From ``view``, when the buffer is in neither memory order.
     """
     if not buffer.is_contiguous():
         buffer = buffer.permute(0, 2, 1, 3)
@@ -146,16 +190,16 @@ def _part_regions(
 ) -> np.ndarray:
     """Rows of ``(chip, offset on the chip, bytes, host address)`` for one part.
 
-    Shard ``i`` of device block ``d`` is bytes ``d * block_bytes`` of each chip
-    holding it, and sits at ``host_base + h * host_block_bytes + i *
+    Shard ``i`` of device block ``d`` is at byte ``d * block_bytes`` of each
+    chip holding it, and at ``host_base + h * host_block_bytes + i *
     block_bytes`` for host block ``h``. A copy to the host reads each shard
     from its first chip; a copy to the device writes it to every chip.
 
     Returns
     -------
     numpy.ndarray
-        ``(chips used * len(device_ids), 4)`` uint64, chip by chip, in the
-        order of ``device_ids``.
+        ``(chips used * len(device_ids), 4)`` ``uint64``, chip by chip, each
+        chip's rows in the order of ``device_ids``.
     """
     targets = [
         (chip, i * part.block_bytes)

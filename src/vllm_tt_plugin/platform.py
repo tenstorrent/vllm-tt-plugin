@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     FlexibleArgumentParser = object
 
@@ -820,12 +822,17 @@ _NIXL_CONNECTORS = frozenset(
 
 
 def _install_tt_nixl_single_rank_patch() -> None:
-    """Tell the NIXL connector worker it is rank 0 of 1.
+    """Tell the NIXL connector worker that it is rank 0 of 1.
 
     The worker reads its tensor-parallel rank and world size through
     ``get_tp_group()``, which TT never creates (see
     ``_install_tt_kv_engine_id_sync_patch``). TT pins tensor parallelism to 1,
     so the answers are fixed.
+
+    Raises
+    ------
+    RuntimeError
+        When vLLM's NIXL ``base_worker`` no longer imports the two functions.
     """
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
 
@@ -1845,14 +1852,25 @@ class TTPlatform(Platform):
 
     @classmethod
     def get_attn_backend_cls(
-        cls, selected_backend, attn_selector_config, num_heads: int | None = None
+        cls,
+        selected_backend: "AttentionBackendEnum | None",
+        attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
+        """Name ``TTAttentionBackend``, whatever backend vLLM selected.
+
+        TT runs no vLLM attention, but code outside the forward pass, such as
+        ``NixlConnector``, still asks for a backend class.
+        """
         return "vllm_tt_plugin.attention_backend.TTAttentionBackend"
 
     @classmethod
     def get_nixl_supported_devices(cls) -> dict[str, tuple[str, ...]]:
-        # NIXL cannot register TT device memory, so KV is staged through a CPU
-        # buffer: run with ``"kv_buffer_device": "cpu"``.
+        """Let NIXL run on TT only with ``"kv_buffer_device": "cpu"``.
+
+        NIXL cannot register TT device memory, so a NIXL connector stages KV
+        through a CPU buffer that the plugin copies to and from the chips.
+        """
         return {"tt": ("cpu",)}
 
     @classmethod
@@ -2697,7 +2715,9 @@ class TTPlatform(Platform):
                 )
         store_tt_spec_plan(vllm_config, spec_plan)
 
-        validate_tt_kv_transfer_config(vllm_config)
+        validate_tt_kv_transfer_config(
+            vllm_config, supports_prefix_caching=supports_prefix_caching
+        )
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
         if (
             getattr(model_config, "is_moe", False)

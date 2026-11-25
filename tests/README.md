@@ -1,8 +1,9 @@
 # Tests
 
-Tests follow the component and boundary they exercise. Logprobs, logging, and
-model-output parsers use this layout; existing tests at the root and under
-`spec/` remain in place until their owning area is reorganized.
+Tests follow the component and boundary they exercise. Logprobs, logging,
+model-output parsers, and KV transfer layouts and copies use this layout;
+existing tests at the root and under `spec/` remain in place until their owning
+area is reorganized.
 
 | Location | Scope |
 |---|---|
@@ -12,6 +13,10 @@ model-output parsers use this layout; existing tests at the root and under
 | [integration/test_parser_registration.py](integration/test_parser_registration.py) | General entry point and vLLM registries: lazy resolution, aliases, repeated setup, and existing-name precedence |
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
+| [unit/test_kv_layout.py](unit/test_kv_layout.py) | Default and model-declared KV transfer layouts, and the caches the default refuses |
+| [unit/test_kv_transfer.py](unit/test_kv_transfer.py) | Byte order of the copy between ttnn KV tensors and a connector's CPU buffer |
+| [unit/test_nixl_staging.py](unit/test_nixl_staging.py) | `TTNixlPushConnector` host staging slots on P and D, receive deadlines, and lanes |
+| [support/kv_cache.py](support/kv_cache.py) | A fake paged KV cache and ttnn region copies over its bytes, shared by the KV tests |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
 
 Engineering and test-design rules live in

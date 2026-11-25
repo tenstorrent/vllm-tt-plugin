@@ -538,13 +538,34 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
 _LANE_DP_KV_CONNECTOR = "TTNixlPushConnector"
 
 
-def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
-    """Refuse ``--kv-transfer-config`` with lane DP unless its connector knows lanes.
+def validate_tt_kv_transfer_config(
+    vllm_config: "VllmConfig", *, supports_prefix_caching: bool
+) -> None:
+    """Check that the launch can run ``--kv-transfer-config``.
 
     Standard DP runs one engine process per rank, each with its own connector,
     as vLLM's connectors expect. Lane DP runs several lanes inside one engine,
     whose block IDs repeat across lanes; only ``TTNixlPushConnector`` tells
     them apart.
+
+    Parameters
+    ----------
+    vllm_config
+        The launch configuration; nothing is checked without a
+        ``kv_transfer_config``.
+    supports_prefix_caching
+        The model's ``model_capabilities['supports_prefix_caching']``. A
+        request that loads KV from a connector resumes its prefill after that
+        KV, as after a prefix-cache hit, so the model must support that resume.
+
+    Raises
+    ------
+    ValueError
+        With lane DP and a connector other than ``TTNixlPushConnector``, or for
+        a model without prefix caching.
+    RuntimeError
+        For a connector with a CPU buffer (``kv_buffer_device == "cpu"``) when
+        ttnn lacks the region copies that move KV through that buffer.
     """
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is None:
@@ -555,6 +576,18 @@ def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
             f"--kv-transfer-config with TT lane DP ({lanes} lanes) supports only "
             f"{_LANE_DP_KV_CONNECTOR}; got {kv_transfer_config.kv_connector}."
         )
+    if not supports_prefix_caching:
+        raise ValueError(
+            "--kv-transfer-config needs a model that declares "
+            "model_capabilities['supports_prefix_caching']=True: a request that "
+            "loads KV from a connector resumes its prefill after that KV, as "
+            "after a prefix-cache hit."
+        )
+    if kv_transfer_config.kv_buffer_device == "cpu":
+        # Deferred: the copy imports ttnn, which this module does not need.
+        from vllm_tt_plugin.kv_transfer import check_region_copies
+
+        check_region_copies()
 
 
 def resolve_tt_scheduler_cls(

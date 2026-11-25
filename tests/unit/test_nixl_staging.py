@@ -12,10 +12,12 @@ import re
 import threading
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
@@ -93,8 +95,25 @@ def recorder(monkeypatch) -> Recorder:
     return record_push_worker(monkeypatch)
 
 
-def _registration(block_ids):
-    return {"request_id": "d-rid", "local_block_ids": (block_ids,)}
+class Clock:
+    """``nixl_staging``'s ``time.perf_counter``, moved by the test."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def perf_counter(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = Clock()
+    monkeypatch.setattr(nixl_staging, "time", fake)
+    return fake
+
+
+def _registration(block_ids, request_id="d-rid"):
+    return {"request_id": request_id, "local_block_ids": (block_ids,)}
 
 
 class TestDecodeSide:
@@ -790,3 +809,124 @@ class TestChunkWrites:
         assert recorder.pushes == [("b", ([5, 6],))]
         assert worker.copies[-1] == ("d2h", [40, 41], [5, 6], 0)
         assert set(threads) == {threading.current_thread().name}
+
+
+class TestReceiveDeadline:
+    """P writes nothing once D may have given the receive's slots away.
+
+    D fails a receive ``recv_timeout`` seconds after registering it, and its
+    slots go to another request once they have rested. D's registration tells
+    P how many seconds are left; P counts them from receipt.
+    """
+
+    @staticmethod
+    def _register(d, recorder) -> bytes:
+        """D registers request ``r`` and sends the registration to P."""
+        d.start_load_kv(push_metadata({"r": _registration([5, 6], request_id="r")}))
+        d._do_send_reg_notif("r", recorder.metadata[-1].push_registrations["r"])
+        return recorder.notifs[-1]
+
+    @staticmethod
+    def _write_staged(p) -> None:
+        """P's runner thread stages the match; P's writer thread writes it."""
+        p.get_transfer_results()
+        while not p._deferred_push_inbox.empty():
+            p._do_start_push_kv(*p._deferred_push_inbox.get_nowait())
+
+    def test_p_finishing_after_ds_deadline_writes_nothing(self, recorder, clock):
+        d = staging_worker(num_slots=4, recv_timeout=60.0)
+        p = staging_worker(num_slots=4)
+        # D registers while P still computes the prompt.
+        p._handle_push_reg_notif(self._register(d, recorder))
+
+        clock.now += 61.0
+        d.get_transfer_results()
+        assert d._failed_recv_reqs.get_nowait() == "r"
+        # P's writer matches the finished request with the waiting registration.
+        p._do_start_push_kv("r", ([30, 31],), p._pop_matching_registration("r"))
+        self._write_staged(p)
+
+        assert recorder.pushes == []
+        assert p.copies == []
+
+    @pytest.mark.parametrize(
+        ("write_after", "written"),
+        [(30.0, True), (61.0, False)],
+        ids=["in_time", "after_the_deadline"],
+    )
+    def test_a_staged_write_is_submitted_only_before_ds_deadline(
+        self, recorder, clock, write_after, written
+    ):
+        d = staging_worker(num_slots=4, recv_timeout=60.0)
+        p = staging_worker(num_slots=4)
+        p._push_finished_blocks["r"] = ([30, 31],)
+        p._handle_push_reg_notif(self._register(d, recorder))
+        p.get_transfer_results()
+
+        # The write waits, for example for P's handshake with D.
+        clock.now += write_after
+        p._do_start_push_kv(*p._deferred_push_inbox.get_nowait())
+
+        assert recorder.pushes == ([("r", ([0, 1],))] if written else [])
+
+    def test_p_stops_a_margin_before_ds_deadline(self, recorder, clock):
+        d = staging_worker(num_slots=4, recv_timeout=60.0)
+        p = staging_worker(num_slots=4)
+        p._push_finished_blocks["r"] = ([30, 31],)
+        p._handle_push_reg_notif(self._register(d, recorder))
+
+        clock.now += 60.0 - nixl_staging._DEADLINE_MARGIN_S + 0.5
+        self._write_staged(p)
+
+        assert recorder.pushes == []
+
+    @pytest.mark.parametrize(
+        ("write_after", "written"),
+        [(5.0, True), (7.0, False)],
+        ids=["before_the_margin", "inside_the_margin"],
+    )
+    def test_a_short_receive_timeout_shrinks_the_margin(
+        self, recorder, clock, write_after, written
+    ):
+        # 8 s left: a quarter of it, 2 s, is the margin.
+        d = staging_worker(num_slots=4, recv_timeout=8.0)
+        p = staging_worker(num_slots=4)
+        p._push_finished_blocks["r"] = ([30, 31],)
+        p._handle_push_reg_notif(self._register(d, recorder))
+
+        clock.now += write_after
+        self._write_staged(p)
+
+        assert recorder.pushes == ([("r", ([0, 1],))] if written else [])
+
+    def test_d_sends_the_seconds_left_when_it_sends(self, recorder, clock):
+        d = staging_worker(num_slots=4, recv_timeout=60.0)
+        d.start_load_kv(push_metadata({"r": _registration([5, 6], request_id="r")}))
+
+        # D's first registration to a P waits for their handshake.
+        clock.now += 5.0
+        d._do_send_reg_notif("r", recorder.metadata[-1].push_registrations["r"])
+
+        (notif,) = recorder.notifs
+        sent = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
+        assert sent[nixl_staging.RECV_SECONDS_LEFT] == 55.0
+        # D's own clock reading stays on D.
+        assert set(sent) == {
+            "request_id",
+            "local_block_ids",
+            nixl_staging.RECV_SECONDS_LEFT,
+        }
+
+    def test_a_registration_without_seconds_left_sets_no_deadline(
+        self, recorder, clock
+    ):
+        # vLLM's own push worker on D sends no deadline.
+        notif = push_reg_notif(_registration([8, 9], request_id="r"))
+        p = staging_worker(num_slots=4)
+        p._push_finished_blocks["r"] = ([30, 31],)
+        p._handle_push_reg_notif(notif)
+
+        clock.now += 10_000.0
+        self._write_staged(p)
+
+        assert recorder.pushes == [("r", ([0, 1],))]
