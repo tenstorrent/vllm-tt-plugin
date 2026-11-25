@@ -1622,6 +1622,14 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.qwen3_vl.tt.generator_vllm:Qwen3VLForConditionalGeneration",
     )
 
+    # Qwen3-ForcedAligner - word timestamps (pooling, token_classify)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTQwen3ASRForcedAlignerForTokenClassification",
+        "models.demos.audio.qwen3_asr.tt.generator_vllm:"
+        "Qwen3ASRForcedAlignerForTokenClassification",
+    )
+
     # Mistral - Text only
     _register_model_if_missing(
         ModelRegistry,
