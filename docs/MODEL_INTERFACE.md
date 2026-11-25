@@ -84,8 +84,11 @@ attention layer (`kv_caches` in layer-index order, layer
 `[num_blocks, heads, block_size, head_size]` per chip, with `num_blocks` from
 `kv_cache_config` and `block_size` and `head_size` from the layer's spec, in
 TILE layout of bfloat16, float32, bfloat8_b or bfloat4_b, with the heads either
-split evenly over the chips in mesh order or copied to every chip. Anything
-else raises at startup and needs the method.
+split evenly over the chips or copied to every chip. A split is taken to put
+heads `[i * heads, (i + 1) * heads)` on chip `i` in row-major mesh order: the
+cache does not record which heads a chip holds, so a model that splits them in
+another order needs the method. Anything else raises at startup and needs the
+method.
 
 The connector's description of a layer is bytes, `(num_blocks, num_kv_heads,
 block_size, n)` `uint8`, sized so that a block is one transferred block. It

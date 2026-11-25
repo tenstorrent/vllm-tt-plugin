@@ -15,7 +15,7 @@ A model declares its layout with an optional ``get_kv_transfer_layout`` method
 (see ``docs/MODEL_INTERFACE.md``). Without it, ``default_kv_layout`` derives
 the layout of the common case: a ``[k, v]`` pair per attention layer, paged
 ``[blocks, heads, block_size, head_dim]`` in TILE layout, heads split evenly
-over the chips in mesh order or copied to every chip.
+over the chips in row-major mesh order or copied to every chip.
 
 Principal entry points: ``kv_transfer_layout`` and ``KVLayout``.
 """
@@ -186,6 +186,17 @@ def _paged_part(name: str, cache: Any, spec: AttentionSpec, num_blocks: int) -> 
     ``heads`` is per chip: a mesh tensor's shape is the shape of each chip's
     shard. The other three dimensions must equal ``num_blocks`` and the spec's,
     or block ``b`` of the cache would not be vLLM's block ``b``.
+
+    Notes
+    -----
+    ``heads`` times the mesh's chips equal to ``spec.num_kv_heads`` is read as
+    a split, one shard per chip; ``heads`` equal to it as a copy on every chip.
+    A cache that holds every head its chip computes matches neither while
+    heads are copied along one mesh axis and split along the other: its chips
+    then hold ``num_kv_heads`` times the copies. The cache does not record
+    which heads a chip holds, so a split is taken to put heads
+    ``[i * heads, (i + 1) * heads)`` on chip ``i`` in row-major mesh order. A
+    model that splits them in another order declares ``get_kv_transfer_layout``.
 
     Raises
     ------
