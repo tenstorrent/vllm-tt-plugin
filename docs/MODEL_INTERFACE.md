@@ -45,24 +45,52 @@ storage, device execution, and any model-specific state.
 
 ## KV connectors
 
-`--kv-transfer-config` is supported without data parallelism, for a model that
-declares `supports_prefix_caching`: a request that loads KV from a connector
-resumes its prefill after that KV, as after a prefix-cache hit, and a model
-without that resume would compute on KV or state that never arrived. With a
-connector, `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
-`register_kv_caches` once, after the model adapter allocates KV storage. The
-plugin does not yet copy KV between the adapter's ttnn tensors and a
-connector's CPU buffer.
+KV connector support on TT is experimental. `--kv-transfer-config` is
+supported without data parallelism, for a model that declares
+`supports_prefix_caching`: a request that loads KV from a connector resumes its
+prefill after that KV, as after a prefix-cache hit, and a model without that
+resume would compute on KV or state that never arrived. With a connector,
+`TTModelRunner.initialize_kv_cache` calls the worker-side connector's
+`register_kv_caches` once, after the model adapter allocates KV storage, and
+then `set_host_xfer_buffer_ops` with the function that copies KV blocks between
+the adapter's ttnn tensors and the connector's CPU buffer. vLLM's base
+connector ignores that function, and `NixlConnector` keeps it only with a CPU
+buffer.
+
+The copy moves each chip's share of each block as one region with
+`ttnn.copy_device_to_host_regions` and `ttnn.copy_host_to_device_regions`,
+straight between the chip and its place in the buffer, one call per layer part.
+Both come with
+[tt-metal#67057](https://github.com/tenstorrent/tt-metal/pull/67057). A launch
+whose connector has a CPU buffer (`"kv_buffer_device": "cpu"`) is refused at
+startup when the installed ttnn lacks them.
+
+### NixlConnector
+
+vLLM's `NixlConnector` moves KV between servers, for example from a prefill
+server to a decode server, with the NIXL transfer library. NIXL cannot register
+TT device memory, so on TT the connector runs only with a CPU buffer:
+
+```bash
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_both", "kv_buffer_device": "cpu"}'
+```
+
+For it, `TTPlatform` names `TTAttentionBackend` as the attention backend (only
+its name, `TT`, is used: two servers compare it), and the config hook tells
+the NIXL worker that it is tensor-parallel rank 0 of 1. The install script does
+not install the `nixl` package; vLLM's `requirements/kv_connectors.txt` pins
+the version its connector needs.
 
 ### KV transfer layout
 
-`register_kv_caches` gets a description built from the model's KV transfer
+`register_kv_caches` and the copy both come from the model's KV transfer
 layout: per layer name in `kv_cache_config`, the paged device tensors (parts)
 that hold a block of that layer, the bytes of one block of a part on one chip,
 and which chips hold which shard of it. Block `b` of a part is bytes
 `[b * block_bytes, (b + 1) * block_bytes)` of each chip's buffer. A shard held
-by several chips is the same bytes on each of them. A transferred block of a
-layer is its parts' blocks in order, each part shard after shard.
+by several chips is the same bytes on each of them: the copy reads it from the
+first and writes it to all of them. A transferred block of a layer is its
+parts' blocks in order, each part shard after shard.
 
 A model declares its layout with an optional method:
 
@@ -94,7 +122,8 @@ The connector's description of a layer is bytes, `(num_blocks, num_kv_heads,
 block_size, n)` `uint8`, sized so that a block is one transferred block. It
 holds no KV; the KV stays in the ttnn tensors. Two servers can exchange KV only
 when every layer's transferred block has the same bytes on both: same dtype,
-head size, block size and total heads.
+head size, block size and total heads. Their chip counts may differ when both
+split heads in chip order.
 
 A model class without a `get_kv_cache_spec` hook gets one layer name per
 attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
