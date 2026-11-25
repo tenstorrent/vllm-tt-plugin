@@ -110,6 +110,8 @@ matched. A D request whose KV does not arrive within
 `push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
 fails instead of waiting forever. P and D must both use it.
 
+`"enable_chunked_push": true` in P's `kv_connector_extra_config` (experimental; vLLM's name for the same setting) moves P's copy into the prefill. After each prefill step, P copies the prompt blocks that the step completed from its chips into staging slots that hold the whole prompt. The copy runs after the step's forward on the model's command queue, so it lengthens the step. Once P's request is matched with D's registration, P writes the slots D asked for without a second copy; the write still starts after the match. A request that finds too few free slots at its first prefill step is copied whole once matched, as without the setting. P refuses the setting at startup when the KV is not one full-attention group (sliding window, GDN, Mamba), when P leaves a prompt tail to D (multi-module MTP lookahead), and under lane DP. D ignores it.
+
 Under lane DP the lanes share the engine's one connector. Block IDs are
 lane-local, so the coordinator builds the connector metadata once per step and
 names each request's lane in it (`tt_lane_of`), the runner keeps one transfer

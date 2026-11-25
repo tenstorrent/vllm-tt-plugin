@@ -84,11 +84,17 @@ def recorder(monkeypatch) -> Recorder:
     return record_push_worker(monkeypatch)
 
 
-def _metadata(registrations=None, finished=None, lanes=None):
+def _metadata(
+    registrations=None, finished=None, lanes=None, jobs=(), preempted=(), aborted=()
+):
+    """The connector metadata fields the TT worker reads."""
     return SimpleNamespace(
         push_registrations=registrations or {},
         push_finished_blocks=finished or {},
         tt_lane_of=lanes or {},
+        push_chunk_jobs=list(jobs),
+        push_chunk_preemptions=set(preempted),
+        reqs_not_processed=set(aborted),
     )
 
 
@@ -485,3 +491,107 @@ def test_with_chunked_push_off_no_job_is_built_and_nothing_is_copied_per_step(
     assert getattr(meta, "push_chunk_jobs", []) == []
     assert worker.copies == []
     assert worker.slots.free == 8
+
+
+def _job(start, end, block_ids, total=5, req_id="p") -> NixlPushChunkJob:
+    return NixlPushChunkJob(
+        request_id=req_id,
+        block_ids=block_ids,
+        start_block=start,
+        end_block=end,
+        total_blocks=total,
+    )
+
+
+class TestChunkStaging:
+    """P copies each prefill step's completed blocks into its request's slots."""
+
+    def test_a_job_is_copied_into_the_slots_of_its_prompt_positions(self):
+        worker = staging_worker(num_slots=8)
+
+        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+        worker.save_kv_to_host(_metadata(jobs=[_job(1, 3, [31, 32])]))
+
+        assert worker.copies == [("d2h", [30], [0], 0), ("d2h", [31, 32], [1, 2], 0)]
+        # The first job took a slot for each of the prompt's five blocks.
+        assert worker.slots.free == 3
+
+    def test_the_first_job_takes_slots_for_the_whole_prompt_or_none(self, recorder):
+        worker = staging_worker(num_slots=6)
+        worker.save_kv_to_host(
+            _metadata(jobs=[_job(0, 1, [30], req_id="a"), _job(0, 1, [40], 3, "b")])
+        )
+        worker.save_kv_to_host(_metadata(jobs=[_job(1, 3, [41, 42], 3, "b")]))
+
+        # One slot was left for b's three blocks: b stages nothing, then or later.
+        assert worker.copies == [("d2h", [30], [0], 0)]
+        assert worker.slots.free == 1
+
+        # Once matched, b is copied from its blocks, as without chunked push.
+        worker._do_start_push_kv("b", ([40, 41, 42],), _registration([8]))
+        worker.get_transfer_results()
+        assert worker.copies[-1] == ("d2h", [42], [5], 0)
+
+    def test_a_matched_request_is_written_from_its_staged_slots_without_a_second_copy(  # noqa: E501
+        self, recorder
+    ):
+        worker = staging_worker(num_slots=8)
+        for job in (_job(0, 1, [30]), _job(1, 3, [31, 32]), _job(3, 5, [33, 34])):
+            worker.save_kv_to_host(_metadata(jobs=[job]))
+        staged = list(worker.copies)
+
+        # D holds the first two blocks of this prompt, so it registers three.
+        worker._do_start_push_kv(
+            "p", ([30, 31, 32, 33, 34],), _registration([8, 9, 10])
+        )
+        worker.get_transfer_results()
+
+        assert worker.copies == staged
+        request_id, slots, registration = worker._deferred_push_inbox.get_nowait()
+        worker._do_start_push_kv(request_id, slots, registration)
+        assert recorder.pushes == [("p", ([2, 3, 4],))]
+        # All of the prompt's slots go back once the send and its writes end.
+        recorder.results.finished_sending = {"p"}
+        worker.get_transfer_results()
+        assert worker.slots.free == 8
+
+    @pytest.mark.parametrize("listed", [True, False], ids=["listed", "not_listed"])
+    def test_a_preempted_request_gets_fresh_slots_and_its_old_slots_go_back(
+        self, recorder, listed
+    ):
+        worker = staging_worker(num_slots=8)
+        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+
+        # The recompute's first job starts at block 0 again; a job there always
+        # begins the request anew, whether or not the preemption was listed.
+        recompute = _metadata(
+            preempted={"p"} if listed else (), jobs=[_job(0, 2, [40, 41])]
+        )
+        worker.start_load_kv(recompute)
+        worker.save_kv_to_host(recompute)
+
+        # Slots 0 to 4 went back behind the free ones; the recompute took 5 on.
+        assert worker.copies[-1] == ("d2h", [40, 41], [5, 6], 0)
+        assert worker.slots.free == 3
+
+    @pytest.mark.parametrize("ending", ["aborted", "lease_expired"])
+    def test_a_request_that_ends_unmatched_gives_its_slots_back(self, recorder, ending):
+        worker = staging_worker(num_slots=8)
+        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+        assert worker.slots.free == 3
+
+        if ending == "aborted":
+            worker.start_load_kv(_metadata(aborted={"p"}))
+        else:
+            # vLLM reports a finished request whose lease expired as sent.
+            recorder.results.finished_sending = {"p"}
+            worker.get_transfer_results()
+
+        assert worker.slots.free == 8
+
+    def test_a_job_that_does_not_continue_the_staged_blocks_is_refused(self):
+        worker = staging_worker(num_slots=8)
+        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+
+        with pytest.raises(RuntimeError, match="block 3"):
+            worker.save_kv_to_host(_metadata(jobs=[_job(3, 5, [33, 34])]))

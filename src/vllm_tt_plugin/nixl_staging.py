@@ -14,6 +14,12 @@ the requests in flight:
 * P (prefill) waits until its finished request is matched with D's
   registration, then takes slots for only the blocks D asked for, copies them
   from its chips, and lets vLLM write the slots to D.
+* With ``"enable_chunked_push": true`` in ``kv_connector_extra_config``
+  (experimental), P instead copies the prompt blocks each prefill step
+  completes into slots for the whole prompt, right after the step, so a
+  matched request is written from its slots without a copy. The write itself
+  still starts after the match. Names follow vLLM's chunked push proposal
+  (``NixlPushChunkJob``, ``_build_chunk_jobs``).
 
 vLLM's scheduler keeps using real block IDs; only the IDs that reach NIXL are
 slot numbers. Copies between chips and slots run on the model runner thread,
@@ -29,6 +35,7 @@ import queue
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -145,7 +152,8 @@ class NixlPushChunkJob:
     prefill step completes.
 
     P's scheduler lists a step's jobs in its connector metadata
-    (``push_chunk_jobs``).
+    (``push_chunk_jobs``); P's worker copies them into staging slots after
+    the step's forward.
 
     Attributes
     ----------
@@ -345,8 +353,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     State and threads:
 
     * ``_recv_slots``, ``_recv_deadlines``, ``_expired``, ``_quarantined``,
-      ``_load_errors`` and ``_waiting_registrations`` (D), ``_waiting_stage``
-      and ``_send_lane`` (P) and ``slots`` belong to the model runner thread.
+      ``_load_errors`` and ``_waiting_registrations`` (D), ``_waiting_stage``,
+      ``_send_lane``, ``_chunk_slots``, ``_chunk_staged`` and
+      ``_chunk_unstaged`` (P) and ``slots`` belong to the model runner thread.
     * ``_to_stage`` carries matched P requests from the writer thread to the
       model runner thread.
     * ``_send_slots`` and ``_released`` (P) are written by the model runner
@@ -401,8 +410,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         """Send D's registrations with slot numbers, and stage P's matched sends.
 
         Under lane DP, ``metadata.tt_lane_of`` names each request's lane: block
-        IDs are lane-local. Without it every request is on lane 0.
+        IDs are lane-local. Without it every request is on lane 0. P first
+        gives back the chunk slots of requests preempted or aborted.
         """
+        self.handle_preemptions(metadata)
         lane_of = getattr(metadata, "tt_lane_of", None) or {}
         now = time.perf_counter()
         queued = list(self._waiting_registrations)
@@ -432,7 +443,24 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._stage_matched_sends()
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> None:
-        """Copy nothing per step: P stages a request once D's blocks are known."""
+        """Copy the step's chunk jobs from the chips into their requests' slots.
+
+        vLLM calls this after the step's forward is enqueued; the copy runs
+        after the forward on the same command queue and returns once the
+        blocks are in the slots. Without chunked push there are no jobs: P
+        stages a request once D's blocks are known.
+        """
+        self._stage_chunk_jobs(getattr(metadata, "push_chunk_jobs", ()))
+
+    def handle_preemptions(self, metadata: NixlConnectorMetadata) -> None:
+        """Give back the chunk slots of preempted and aborted P requests.
+
+        Nothing waits: no write reads chunk slots before the request is
+        matched, and a preempted request's recompute takes new slots.
+        """
+        retired = set(getattr(metadata, "push_chunk_preemptions", ()))
+        for req_id in retired | set(metadata.reqs_not_processed or ()):
+            self._drop_chunk_slots(req_id)
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta) -> None:
         """Copy a received request from its slots into the chips; free the slots."""
@@ -502,6 +530,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 self.slots.give_back(_flatten(slots))
         with self._lock:
             self._released |= results.finished_sending
+        for req_id in results.finished_sending:
+            # Still here only when its lease expired before D registered.
+            self._drop_chunk_slots(req_id)
         self._release_pending |= results.finished_sending & self._send_slots.keys()
         with self._sending_transfers_lock:
             writing = {r for r, handles in self._sending_transfers.items() if handles}
@@ -567,6 +598,14 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._released: set[str] = set()
         # P: finished requests whose slots wait for their last write handle.
         self._release_pending: set[str] = set()
+        # P, chunked push: a slot per prompt block of each staged request, slot
+        # i holding block i, until the request is matched or ends.
+        self._chunk_slots: dict[str, list[int]] = {}
+        # P, chunked push: prompt blocks of each request copied into its slots.
+        self._chunk_staged: dict[str, int] = {}
+        # P, chunked push: requests whose first job found too few free slots;
+        # they are staged whole once matched.
+        self._chunk_unstaged: set[str] = set()
 
     def _do_start_push_kv(
         self,
@@ -596,7 +635,8 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
 
         D registers only blocks it has no prefix-cache hit for, so P stages
         the same number of its last blocks per group, the blocks vLLM's push
-        path would pair with D's.
+        path would pair with D's. A request staged chunk by chunk is written
+        from the last of its slots instead, without a copy.
         """
         pending = list(self._waiting_stage)
         self._waiting_stage.clear()
@@ -610,29 +650,105 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             with self._lock:
                 if req_id in self._released:
                     continue
-            device = _last_blocks(
-                self._as_grouped_block_ids(device_ids),
-                self._as_grouped_block_ids(reg["local_block_ids"]),
-            )
-            slots = self._take_slots(device)
-            if slots is None:
-                self._waiting_stage.append((req_id, device_ids, reg))
-                continue
-            flat_slots = _flatten(slots)
-            self.copy_blocks(
-                self.device_kv_caches,
-                self.host_xfer_buffers,
-                _flatten(device),
-                flat_slots,
-                "d2h",
-                lane=self._send_lane.get(req_id, 0),
-            )
+            remote = self._as_grouped_block_ids(reg["local_block_ids"])
+            flat_slots = self._take_staged_chunks(req_id)
+            if flat_slots is not None:
+                slots = _last_blocks((flat_slots,), remote)
+            else:
+                device = _last_blocks(self._as_grouped_block_ids(device_ids), remote)
+                slots = self._take_slots(device)
+                if slots is None:
+                    self._waiting_stage.append((req_id, device_ids, reg))
+                    continue
+                flat_slots = _flatten(slots)
+                self.copy_blocks(
+                    self.device_kv_caches,
+                    self.host_xfer_buffers,
+                    _flatten(device),
+                    flat_slots,
+                    "d2h",
+                    lane=self._send_lane.get(req_id, 0),
+                )
             with self._lock:
                 self._send_slots[req_id] = flat_slots
             self._deferred_push_inbox.put((req_id, slots, reg))
             queued = True
         if queued:
             self._push_writer_wake.set()
+
+    def _stage_chunk_jobs(self, jobs: Iterable[NixlPushChunkJob]) -> None:
+        """Copy each job's blocks into its request's slots at their prompt positions.
+
+        A job at block 0 begins its request: it takes ``total_blocks`` slots,
+        or none when fewer are free, and then the request is staged whole once
+        matched. Slots the request held from before a preemption go back
+        first, whether or not the preemption was listed.
+
+        Raises
+        ------
+        RuntimeError
+            When a later job does not start where the request's staged blocks
+            end, or counts another number of prompt blocks.
+        """
+        for job in jobs:
+            req_id = job.request_id
+            if job.start_block == 0:
+                self._drop_chunk_slots(req_id)
+                taken = self.slots.take(job.total_blocks)
+                if taken is None:
+                    self._chunk_unstaged.add(req_id)
+                    logger.debug(
+                        "No %d free staging slots for %s; staging it once matched.",
+                        job.total_blocks,
+                        req_id,
+                    )
+                    continue
+                self._chunk_slots[req_id] = taken
+                self._chunk_staged[req_id] = 0
+            elif req_id in self._chunk_unstaged:
+                continue
+            slots = self._chunk_slots.get(req_id, [])
+            staged = self._chunk_staged.get(req_id, 0)
+            if job.start_block != staged or job.total_blocks != len(slots):
+                raise RuntimeError(
+                    f"A chunk job for {req_id} starts at block {job.start_block} "
+                    f"of {job.total_blocks}; its slots hold {staged} staged "
+                    f"blocks of {len(slots)}."
+                )
+            self.copy_blocks(
+                self.device_kv_caches,
+                self.host_xfer_buffers,
+                job.block_ids,
+                slots[job.start_block : job.end_block],
+                "d2h",
+            )
+            self._chunk_staged[req_id] = job.end_block
+
+    def _take_staged_chunks(self, req_id: str) -> list[int] | None:
+        """A matched request's slots for its whole prompt, or None if not staged.
+
+        Raises
+        ------
+        RuntimeError
+            When the request was matched before all its blocks were staged.
+        """
+        self._chunk_unstaged.discard(req_id)
+        slots = self._chunk_slots.pop(req_id, None)
+        staged = self._chunk_staged.pop(req_id, None)
+        if slots is not None and staged != len(slots):
+            raise RuntimeError(
+                f"{req_id} was matched with {staged} of its {len(slots)} prompt "
+                "blocks staged."
+            )
+        return slots
+
+    def _drop_chunk_slots(self, req_id: str) -> None:
+        """Forget ``req_id``'s chunk staging and give its slots back."""
+        self._chunk_unstaged.discard(req_id)
+        self._chunk_staged.pop(req_id, None)
+        slots = self._chunk_slots.pop(req_id, None)
+        if slots is not None:
+            self.slots.give_back(slots)
 
     def _take_slots(self, device: BlockIds) -> BlockIds | None:
         """Slots for ``device``'s blocks, grouped like it, or None when full."""
