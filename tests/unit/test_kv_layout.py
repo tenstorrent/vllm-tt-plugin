@@ -5,6 +5,9 @@
 Fake device tensors hold each chip's buffer as bytes.
 """
 
+import importlib.util
+import sys
+import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -108,3 +111,10 @@ class TestDeclaredLayout:
 
         with pytest.raises(ValueError, match="does not describe layers"):
             kv_transfer_layout(Model(), None, _config(["model.layers.0.attn"], 2))
+
+
+def test_importing_the_module_needs_no_ttnn_dtypes(monkeypatch):
+    # Model test suites import the plugin with their own partial ttnn stubs.
+    monkeypatch.setitem(sys.modules, "ttnn", types.ModuleType("ttnn"))
+    spec = importlib.util.spec_from_file_location("kv_layout_copy", kv_layout.__file__)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))

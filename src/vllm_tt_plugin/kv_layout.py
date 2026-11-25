@@ -28,14 +28,6 @@ from typing import Any
 import ttnn
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-# Bytes of one 32x32 tile per dtype: bfloat8_b and bfloat4_b keep one shared
-# exponent byte per row of 16 values.
-_TILE_BYTES = {
-    ttnn.bfloat16: 2048,
-    ttnn.float32: 4096,
-    ttnn.bfloat8_b: 1088,
-    ttnn.bfloat4_b: 576,
-}
 _TILE = 32
 
 
@@ -176,7 +168,7 @@ def default_kv_layout(kv_caches: Any, kv_cache_config: KVCacheConfig) -> KVLayou
 
 def _paged_part(name: str, cache: Any, num_kv_heads: int) -> KVPart:
     """A ``[blocks, heads, block_size, head_dim]`` TILE cache as one part."""
-    tile_bytes = _TILE_BYTES.get(cache.dtype)
+    tile_bytes = _tile_bytes(cache.dtype)
     _, heads, block_size, head_dim = tuple(cache.shape)
     if (
         tile_bytes is None
@@ -202,6 +194,21 @@ def _paged_part(name: str, cache: Any, num_kv_heads: int) -> KVPart:
         )
     block_bytes = heads * (block_size // _TILE) * (head_dim // _TILE) * tile_bytes
     return KVPart(cache, block_bytes, shards)
+
+
+def _tile_bytes(dtype: Any) -> int | None:
+    """Bytes of one 32x32 tile of ``dtype``, or ``None`` for an unlisted dtype.
+
+    bfloat8_b and bfloat4_b keep one shared exponent byte per row of 16 values.
+    The table is built on call, so importing this module needs no ttnn dtypes.
+    """
+    sizes = {
+        ttnn.bfloat16: 2048,
+        ttnn.float32: 4096,
+        ttnn.bfloat8_b: 1088,
+        ttnn.bfloat4_b: 576,
+    }
+    return sizes.get(dtype)
 
 
 def _check_covers(layers: Mapping[str, Any], kv_cache_config: KVCacheConfig) -> None:
