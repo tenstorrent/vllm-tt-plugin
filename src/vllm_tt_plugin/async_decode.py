@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import ttnn
-from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsLists, ModelRunnerOutput
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 
 from vllm_tt_plugin.input_batch import SEED_NONE_SENTINEL
 from vllm_tt_plugin.logger import init_tt_logger
@@ -287,6 +292,11 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> Any:
         return self.ensure_finalized()
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # The executor asks for this after ``get_output`` raised, to salvage KV
+        # connector state. TT steps run no KV connector, so there is none.
+        return None
 
     def _get_output_impl(self) -> Any:
         raise NotImplementedError

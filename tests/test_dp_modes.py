@@ -746,6 +746,7 @@ def _dp_client(
         lb_engines=[list(c) for c in (counts or [[0, 0, 0.0]] * num_engines)],
         engine_inflight=Counter(),
         reqs_in_flight={},
+        streaming_reqs=set(),
         client_count=1,
         client_index=0,
         eng_start_index=0,
@@ -797,6 +798,7 @@ def _dp_request(
         pooling_params=None,
         cache_salt=cache_salt,
         data_parallel_rank=data_parallel_rank,
+        resumable=False,
     )
 
 

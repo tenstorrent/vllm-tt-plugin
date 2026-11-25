@@ -1070,16 +1070,26 @@ of tokens it was published. A prefix the length cap shortened publishes fewer
 rows (`TTModelRunner.spec_committed_logprobs`).
 
 **Structured output.** On a speculating launch vLLM's
-`StructuredOutputManager.grammar_bitmask` writes each structured request
-`1 + len(scheduled_spec_decode_tokens[req])` consecutive bitmask rows: row `j`
-is the grammar after the request's first `j` scheduled drafts, the last row is
-the bonus, and the grammar is rolled back afterwards.
+`StructuredOutputManager.grammar_bitmask` gives each structured request a
+fixed block of `num_speculative_tokens + 1` consecutive bitmask rows
+(`vllm_tt_plugin.structured_output.grammar_mask_stride`), so request `i`
+starts at row `i * (num_speculative_tokens + 1)`. vLLM fills the first
+`1 + len(scheduled_spec_decode_tokens[req])` rows of the block: row `j` is the
+grammar after the request's first `j` scheduled drafts, the last filled row is
+the bonus, and the grammar is rolled back afterwards. vLLM does not write the
+rest of the block on that step, and the plugin never reads it.
 `vllm_tt_plugin.structured_output.spec_grammar_bitmask_for_tt_batch` unpacks
-that into `[B, 1+K, W]`, column `j` from row `j`, using the per-request row
-counts `TTModelRunner._prepare_model_inputs` recorded in
+the bitmask into `[B, 1+K, W]`, column `j` from row `j` of the request's
+block, and sets every column past the filled rows to all ones. It reads the
+filled row counts that `TTModelRunner._prepare_model_inputs` recorded in
 `TTModelInput.grammar_rows_per_request` from the step's scheduler output. It
-raises if those counts do not account for the bitmask exactly, because one
-wrong count shifts every later request's mask. Every step of a speculating
+raises if the bitmask is not `num_speculative_tokens + 1` rows per structured
+request, or if a request records more filled rows than its block holds,
+because either means the scheduler and the step disagree about the layout. A
+launch that reads one token per row, such as prefill or a lane-DP step, reads
+row 0 of each block (`reorder_grammar_bitmask_for_tt_batch` with
+`mask_stride`). vLLM 0.32.0 and earlier packed the rows instead, with no
+unfilled rows between requests. Every step of a speculating
 launch reads its bitmask this way, prefill and ordinary decode included,
 because an asynchronous scheduler reserves `[-1] * K` for every scheduled
 request; a step that commits one token per row reads each request's row 0.

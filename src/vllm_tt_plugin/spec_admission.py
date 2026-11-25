@@ -94,10 +94,6 @@ def _build_method_requirements() -> dict[str, tuple[str, ...]]:
             SPEC_REQUIREMENT_DEVICE_PROPOSE,
             SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE,
         ),
-        # Device drafters that read the target's hidden state but are not in
-        # vLLM's EagleModelTypes grouping.
-        "medusa": _DEVICE_DRAFTER,
-        "mlp_speculator": _DEVICE_DRAFTER,
         # The model's own drafter, proposing on device through
         # ``propose_draft_tokens``. It proposes, and that is all this method
         # can demand: what its drafter reads is the model's own business. An

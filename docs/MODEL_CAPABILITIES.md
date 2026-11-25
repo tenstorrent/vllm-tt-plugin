@@ -176,7 +176,7 @@ declarations when the launch has no `speculative_config`.
 | `custom_class` | `device_propose` | Model-owned `propose_draft_tokens`. The `model` setting must be exactly `vllm_tt_plugin.model_owned_drafter`; this value is a dispatch marker, not a class the plugin imports. A model that consumes target hidden state must also declare `hidden_feed` and `spec_hidden_handoff`. |
 | `suffix` | None | Recognized, but rejected because the runner has no suffix proposer. |
 | `draft_model` | `device_propose`, `paged_drafter_cache` | Rejected because the plugin does not allocate a scheduler-owned drafter cache. |
-| `medusa`, `mlp_speculator`, and vLLM `EagleModelTypes` values | `device_propose`, `hidden_feed` | Recognized, but rejected because the runner has no proposer for these method names. A model-owned implementation uses `custom_class` instead. |
+| vLLM `EagleModelTypes` values | `device_propose`, `hidden_feed` | Recognized, but rejected because the runner has no proposer for these method names. A model-owned implementation uses `custom_class` instead. |
 
 `TTPlatform.check_and_update_config` rejects generic speculative decoding with
 block-output execution. Single-process lane-DP is admitted, and its plan is
