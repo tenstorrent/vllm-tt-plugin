@@ -130,6 +130,8 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
             kv_cache_layout=KVCacheLayout.LBNHC.name,
             prefix_cache_retention_interval=0,
             mamba_cache_mode=mamba_cache_mode,
+            # As vLLM resolves it for an architecture with Mamba layers.
+            mamba_block_size=64 if mamba_cache_mode != "none" else MAX_MODEL_LEN,
             enable_prefix_caching=mamba_cache_mode != "none",
             prefix_match_unit=None,
         ),

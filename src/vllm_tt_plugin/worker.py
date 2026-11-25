@@ -884,8 +884,15 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     max_batch = get_tt_per_lane_max_num_seqs(vllm_config)
     output_tokens_per_step = get_tt_output_tokens_per_step(vllm_config)
     auto_fit = getattr(model_config, "original_max_model_len", None) == -1
-    model_specs = kv_cache_spec_from_model_class(model_class, vllm_config)
-    # A model with MambaSpec layers is sized from bytes, not tokens.
+    # A model with MambaSpec layers is sized from bytes, not tokens. vLLM
+    # resolves mamba_block_size only for an architecture with Mamba layers,
+    # the same field _declares_mamba_spec reads at config time; no other
+    # class's hook runs here unless the hybrid floor below needs it.
+    model_specs = (
+        kv_cache_spec_from_model_class(model_class, vllm_config)
+        if getattr(cache_config, "mamba_block_size", None) is not None
+        else None
+    )
     if model_specs is not None and any(
         isinstance(spec, MambaSpec) for spec in model_specs.values()
     ):
@@ -934,7 +941,11 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig, num_devices: int = 1) -
     # Raise the pool to upstream's admission requirement plus the output
     # reservation. Auto-fit (-1) keeps the model budget: vLLM fits the length
     # to it instead.
-    specs = model_specs if hybrid_kv_cache_groups_enabled and not auto_fit else None
+    specs = (
+        kv_cache_spec_from_model_class(model_class, vllm_config)
+        if hybrid_kv_cache_groups_enabled and not auto_fit
+        else None
+    )
     if specs:
         output_reservation_blocks = (
             math.ceil(per_user_output_reservation / cache_config.block_size) * max_batch

@@ -107,6 +107,40 @@ def test_default_branch_no_sliding(cfg):
     assert n == 2080
 
 
+def test_sizing_leaves_the_hook_of_a_model_without_mamba_layers_alone(cfg):
+    """Sizing calls ``get_kv_cache_spec`` for the hybrid admission floor, and
+    for the ``MambaSpec`` pool only when vLLM resolved a Mamba cache config
+    (``cache_config.mamba_block_size``), the field the platform's
+    ``MambaSpec`` detection reads too. The hook of any other class runs
+    later, in ``TTWorker.get_kv_cache_spec``."""
+    from vllm_tt_plugin.worker import get_num_available_blocks_tt
+
+    cfg.cache_config.mamba_block_size = None
+
+    class ModelWithHook:
+        _HYBRID_KV_CACHE_GROUPS_ENABLED = False
+
+        @staticmethod
+        def get_max_tokens_all_users(**kwargs):
+            return 131_072
+
+        @staticmethod
+        def get_kv_cache_spec(config):
+            raise AssertionError("sizing called get_kv_cache_spec")
+
+    with (
+        patch("vllm_tt_plugin.worker.ttnn.get_arch_name", return_value="wormhole_b0"),
+        patch(
+            "vllm_tt_plugin.worker.get_model_architecture",
+            return_value=(ModelWithHook, "arch"),
+        ),
+    ):
+        n = get_num_available_blocks_tt(cfg, cfg.device_config.num_devices)
+
+    # The budget plus one 64-token block of output reservation per request.
+    assert n == (131_072 + 64 * 32) // 64
+
+
 def test_lane_mode_kv_shape_matches_per_lane_standard_dp(cfg):
     """Enabling single-process lanes must not change ``num_blocks``.
 
