@@ -1541,7 +1541,7 @@ def register_tt_models(register_test_models=False) -> None:
         return
 
     llama_text_version = os.getenv("TT_LLAMA_TEXT_VER", "ttt_compat")
-    if llama_text_version in ("ttt_compat", "tt_transformers"):
+    if llama_text_version == "ttt_compat":
         path_llama_text = "models.ttt_compat.tt.generator_vllm:LlamaForCausalLM"
     elif llama_text_version == "llama3_70b_galaxy":
         path_llama_text = (
@@ -1558,7 +1558,7 @@ def register_tt_models(register_test_models=False) -> None:
     else:
         raise ValueError(
             f"Unsupported TT Llama version: {llama_text_version}, "
-            "pick one of [ttt_compat, tt_transformers, llama3_70b_galaxy, "
+            "pick one of [ttt_compat, llama3_70b_galaxy, "
             "llama2_70b, llama31_8b_qb2]"
         )
 
@@ -1578,7 +1578,7 @@ def register_tt_models(register_test_models=False) -> None:
 
     # Qwen3 - Text
     qwen3_text_version = os.getenv("TT_QWEN3_TEXT_VER", "ttt_compat")
-    if qwen3_text_version in ("ttt_compat", "tt_transformers"):
+    if qwen3_text_version == "ttt_compat":
         path_qwen3_text = "models.ttt_compat.tt.generator_vllm:QwenForCausalLM"
     elif qwen3_text_version == "qwen3_32b_galaxy":
         path_qwen3_text = (
@@ -1587,8 +1587,7 @@ def register_tt_models(register_test_models=False) -> None:
     else:
         raise ValueError(
             f"Unsupported TT Qwen3 version: {qwen3_text_version}, "
-            "pick one of [ttt_compat, tt_transformers, "
-            "qwen3_32b_galaxy]"
+            "pick one of [ttt_compat, qwen3_32b_galaxy]"
         )
 
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
