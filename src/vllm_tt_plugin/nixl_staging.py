@@ -505,14 +505,15 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
     NIXL does not order notifications, so ``CANCEL`` waits for ``REG_ACK``:
     P reads a ``CANCEL`` only after it has recorded the registration, and no
     copy of the registration can reach P afterwards. P submits writes only on
-    its writer thread, and each submission point (``_do_start_push_kv``)
-    checks the mark there. Any write into the slots was therefore submitted
-    before P read ``CANCEL`` and ended before P sent ``CANCEL_ACK``, which is
-    before D frees the slots. A write ends when vLLM releases its handle, after
-    NIXL reports it done or failed; as vLLM's own release of P's blocks, this
-    takes NIXL's word that a done write has landed. A P that never answers
-    leaves the slots reserved: D loses capacity, never data. TT engines run
-    one NIXL agent each; the acknowledgement counts allow several.
+    its writer thread, and each submission point (``_do_start_push_kv``, and
+    ``_chunk_path_supported`` before a chunk WRITE) checks the mark there. Any
+    write into the slots was therefore submitted before P read ``CANCEL`` and
+    ended before P sent ``CANCEL_ACK``, which is before D frees the slots. A
+    write ends when vLLM releases its handle, after NIXL reports it done or
+    failed; as vLLM's own release of P's blocks, this takes NIXL's word that
+    a done write has landed. A P that never answers leaves the slots
+    reserved: D loses capacity, never data. TT engines run one NIXL agent
+    each; the acknowledgement counts allow several.
 
     State and threads:
 
@@ -921,6 +922,38 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             with self._lock:
                 send.submitting = False
 
+    def _chunk_path_supported(
+        self, job: NixlPushChunkJob, reg_data: dict[str, Any]
+    ) -> bool:
+        """Whether the job may be written alone, which is never once D cancelled.
+
+        Runs on the writer thread, right before the job's WRITE is submitted.
+        A job of a cancelled registration (see ``_on_cancel``) is refused: it
+        sends no WRITE, the request's last WRITE then carries no completion
+        notification, and ``_do_start_push_kv`` drops the whole-request push
+        that follows.
+        """
+        if reg_data.get(_CANCELLED):
+            logger.debug(
+                "Not writing blocks %d to %d of %s: D cancelled %s.",
+                job.start_block,
+                job.end_block - 1,
+                job.request_id,
+                reg_data["request_id"],
+            )
+            return False
+        return super()._chunk_path_supported(job, reg_data)
+
+    def _poll_chunk_transfers(self) -> None:
+        """Finish chunk WRITEs as vLLM's chunk writer does, then settle cancels.
+
+        Runs on the writer thread, which polls while a chunk WRITE is in
+        flight, so a cancellation waiting for one is acknowledged once it ends.
+        """
+        super()._poll_chunk_transfers()
+        if self._cancel_waits:
+            self._settle_cancels()
+
     def _stage_matched_sends(self) -> None:
         """Copy matched P requests from the chips into slots and queue their writes.
 
@@ -1171,14 +1204,21 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
     def _on_cancel(self, message: dict[str, Any]) -> None:
         """P: write nothing more for D's cancelled registration.
 
-        Drops a pending registration and marks a matched one, which every
-        submission point checks; ``_settle_cancels`` then acknowledges the
-        cancellation once the matched requests' writes have ended.
+        Drops a pending registration and marks a matched one, whether a
+        finished request or a request with chunk jobs holds it; every
+        submission point checks the mark. ``_settle_cancels`` then acknowledges
+        the cancellation once the matched requests' writes have ended.
         """
         req_id = message["request_id"]
         self._pending_d_registrations.pop(req_id, None)
         writing = []
         with self._lock:
+            for state in self._chunk_states.values():
+                if (
+                    state.reg_data is not None
+                    and state.reg_data["request_id"] == req_id
+                ):
+                    state.reg_data[_CANCELLED] = True
             for p_req_id, send in self._sends.items():
                 if send.reg is not None and send.reg["request_id"] == req_id:
                     send.reg[_CANCELLED] = True
@@ -1190,14 +1230,24 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         """P: send ``CANCEL_ACK`` for each cancellation with no write in flight.
 
         Runs on the writer thread, the only thread that submits writes, so no
-        write of a cancelled registration starts while this looks.
+        write of a cancelled registration starts while this looks. A chunk
+        WRITE counts by its registration, also once its request's chunk record
+        has been dropped.
         """
+        chunk_writes = {
+            task.state.reg_data["request_id"]
+            for task in self._chunk_transfer_tasks.values()
+            if task.state.reg_data is not None
+        }
         due = []
         with self._lock, self._sending_transfers_lock:
             for req_id, (message, writing) in list(self._cancel_waits.items()):
-                if not any(self._sending_transfers.get(p) for p in writing):
-                    del self._cancel_waits[req_id]
-                    due.append(message)
+                if req_id in chunk_writes or any(
+                    self._sending_transfers.get(p) for p in writing
+                ):
+                    continue
+                del self._cancel_waits[req_id]
+                due.append(message)
         for message in due:
             self._send_tt_notif(CANCEL_ACK, message)
 

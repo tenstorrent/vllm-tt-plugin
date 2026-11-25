@@ -1121,3 +1121,58 @@ class TestCancellation:
         handshake.set_result(({(0, 0): f"{P_ENGINE}-agent"}, 0.0))
         _writer_pass(d)
         assert d.nixl_wrapper.sent == []
+
+
+class TestChunkCancellation:
+    """Once D cancels a registration, P writes no chunk for it and acknowledges
+    the cancel only after the chunk WRITEs in flight have ended."""
+
+    @pytest.mark.parametrize(
+        ("cancel_at_step", "written"),
+        [
+            (None, [Write(1, [2], [100], b""), Write(2, [3, 4], [101, 102], b"p:1")]),
+            (2, [Write(1, [2], [100], b"")]),
+            (1, []),
+        ],
+        ids=["not_cancelled", "cancelled_before_the_last_chunk", "cancelled_early"],
+    )
+    def test_p_writes_no_chunk_after_a_cancel(self, recorder, cancel_at_step, written):
+        # D holds the prompt's first two blocks and registers the other three;
+        # P prefills the prompt in three steps.
+        worker = _p_worker()
+        worker.nixl_wrapper.notifs = {
+            "d": [push_reg_notif(push_registration([100, 101, 102]))]
+        }
+
+        for step, job in enumerate(CHUNK_JOBS):
+            if step == cancel_at_step:
+                worker.nixl_wrapper.notifs = {"d": [_tt_notif(CANCEL, "p")]}
+            _run_step(worker, jobs=[job])
+            worker._push_writer_pass()
+            worker.nixl_wrapper.finish()
+        _finish(worker, "p", PROMPT_BLOCKS)
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+        worker._push_writer_pass()
+
+        # A cancelled chunk leaves the notification out, so D never decodes on
+        # partial KV, and the whole-request push that follows is dropped.
+        assert worker.nixl_wrapper.writes == written
+        assert recorder.pushes == []
+        acks = [REG_ACK] if cancel_at_step is None else [REG_ACK, CANCEL_ACK]
+        assert _kinds(worker) == acks
+
+    def test_p_acknowledges_a_cancel_once_its_chunk_writes_have_ended(self, recorder):
+        worker = _p_worker()
+        worker.nixl_wrapper.notifs = {"d": [push_reg_notif(push_registration([100]))]}
+        _run_step(worker, jobs=[_job(0, 5, PROMPT_BLOCKS)])
+        worker._push_writer_pass()
+        assert len(worker.nixl_wrapper.writes) == 1
+
+        worker.nixl_wrapper.notifs = {"d": [_tt_notif(CANCEL, "p")]}
+        worker._push_writer_pass()
+        assert _kinds(worker) == [REG_ACK]
+
+        worker.nixl_wrapper.finish()
+        worker._push_writer_pass()
+        assert _kinds(worker) == [REG_ACK, CANCEL_ACK]
