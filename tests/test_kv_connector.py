@@ -22,6 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -29,6 +34,7 @@ from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
+from vllm_tt_plugin import kv_layout
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.model_runner import TTModelRunner
 
@@ -59,6 +65,9 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
         self.delay_free = False
 
     # Worker half.
+
+    def register_kv_caches(self, kv_caches):
+        self.kv_caches = kv_caches
 
     def bind_connector_metadata(self, connector_metadata):
         self.calls.append("bind")
@@ -238,6 +247,99 @@ def test_a_step_without_a_connector_reports_no_connector_output(vllm_config):
     output = TTModelRunner.sample_tokens(runner, None)
 
     assert output.kv_connector_output is None
+
+
+CHIPS = 2
+NUM_BLOCKS = 12
+LAYER_NAMES = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
+
+
+class FakeKVTensor:
+    """One layer's bfloat8_b K or V on a 2-chip mesh, one head per chip."""
+
+    dtype = kv_layout.ttnn.bfloat8_b
+    layout = kv_layout.ttnn.TILE_LAYOUT
+    shape = (NUM_BLOCKS, 1, BLOCK_SIZE, 32)
+    block_bytes = (BLOCK_SIZE // 32) * 1088
+
+    def device(self):
+        return SimpleNamespace(get_num_devices=lambda: CHIPS)
+
+
+def _initialize_kv_cache(kv_caches: list, model=None) -> None:
+    """``TTModelRunner.initialize_kv_cache`` over a model holding ``kv_caches``."""
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=CHIPS, head_size=32, dtype=torch.float32
+    )
+    runner = SimpleNamespace(
+        tt_max_batch_size=2,
+        model_config=SimpleNamespace(max_model_len=BLOCK_SIZE),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=BLOCK_SIZE),
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
+        vocab_size=8,
+        _is_lane_mode=False,
+        _host_logitsprocs=None,
+        _is_block_output_model=False,
+        _output_tokens_per_step=1,
+        _validate_kv_cache_groups=TTModelRunner._validate_kv_cache_groups,
+        _allocate_kv_caches=lambda _kv_cache_config: kv_caches,
+        model=model if model is not None else SimpleNamespace(),
+    )
+    TTModelRunner.initialize_kv_cache(
+        runner,
+        KVCacheConfig(
+            num_blocks=NUM_BLOCKS,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(LAYER_NAMES, spec)],
+        ),
+    )
+
+
+def _kv_caches(num_layers: int = 2) -> list:
+    return [[FakeKVTensor(), FakeKVTensor()] for _ in range(num_layers)]
+
+
+def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
+    _initialize_kv_cache(_kv_caches())
+
+    assert list(worker_connector.kv_caches) == LAYER_NAMES
+    for description in worker_connector.kv_caches.values():
+        assert description.shape[:3] == (NUM_BLOCKS, CHIPS, BLOCK_SIZE)
+        assert description.dtype == torch.uint8
+        # A block is the K and V of that block on every chip.
+        assert description[0].nbytes == 2 * CHIPS * FakeKVTensor.block_bytes
+        # One element stands in for the whole shape.
+        assert description.untyped_storage().nbytes() == 1
+
+
+def test_a_connector_refuses_a_kv_cache_it_cannot_describe(
+    worker_connector, monkeypatch
+):
+    monkeypatch.setattr(FakeKVTensor, "dtype", "uint32")
+    with pytest.raises(ValueError, match="cannot describe a uint32"):
+        _initialize_kv_cache(_kv_caches())
+
+
+def test_a_connector_refuses_kv_it_cannot_map_to_layer_names(worker_connector):
+    with pytest.raises(ValueError, match="allocated 3 \\[k, v\\] entries for 2"):
+        _initialize_kv_cache(_kv_caches(num_layers=3))
+
+
+def test_a_model_layout_replaces_the_default_one(worker_connector):
+    class Model:
+        def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+            # One latent per layer instead of a K and V pair.
+            return {name: [(kv_caches[0][0], 4096, [[0, 1]])] for name in LAYER_NAMES}
+
+    _initialize_kv_cache(_kv_caches(), Model())
+
+    for description in worker_connector.kv_caches.values():
+        assert description[0].nbytes == 4096
+
+
+def test_no_connector_is_handed_kv_without_a_transfer_group(vllm_config):
+    # Without --kv-transfer-config the model's KV caches are not inspected.
+    _initialize_kv_cache([["not", "a", "kv", "cache"]])
 
 
 def _scheduler_with_running_decode():

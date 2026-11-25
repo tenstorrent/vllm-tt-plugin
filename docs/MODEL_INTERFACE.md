@@ -43,6 +43,58 @@ storage, device execution, and any model-specific state.
    releases to optional model hooks. `TTWorker.shutdown` releases persistent
    captures before mesh close.
 
+## KV connectors
+
+`--kv-transfer-config` is supported without data parallelism, for a model that
+declares `supports_prefix_caching`: a request that loads KV from a connector
+resumes its prefill after that KV, as after a prefix-cache hit, and a model
+without that resume would compute on KV or state that never arrived. With a
+connector, `TTModelRunner.initialize_kv_cache` calls the worker-side connector's
+`register_kv_caches` once, after the model adapter allocates KV storage. The
+plugin does not yet copy KV between the adapter's ttnn tensors and a
+connector's CPU buffer.
+
+### KV transfer layout
+
+`register_kv_caches` gets a description built from the model's KV transfer
+layout: per layer name in `kv_cache_config`, the paged device tensors (parts)
+that hold a block of that layer, the bytes of one block of a part on one chip,
+and which chips hold which shard of it. Block `b` of a part is bytes
+`[b * block_bytes, (b + 1) * block_bytes)` of each chip's buffer. A shard held
+by several chips is the same bytes on each of them. A transferred block of a
+layer is its parts' blocks in order, each part shard after shard.
+
+A model declares its layout with an optional method:
+
+```python
+def get_kv_transfer_layout(self, kv_caches, kv_cache_config):
+    # layer name -> [(device tensor, block_bytes, shards), ...]
+    # shards: per shard, the mesh device indices (row-major) holding it
+    return {
+        "model.layers.0.self_attn": [(k0, k_bytes, [[0], [1]]), (v0, v_bytes, [[0], [1]])],
+        ...
+    }
+```
+
+It must describe every layer name in `kv_cache_config` and may use any part
+structure: K and V, one MLA latent, heads split or copied over any mesh shape.
+Without the method, the plugin derives the layout of a `[k, v]` pair per
+attention layer (`kv_caches` in layer-index order, layer
+`model.layers.<idx>...` is entry `idx`), each cache
+`[blocks, heads, block_size, head_dim]` in TILE layout of bfloat16, float32,
+bfloat8_b or bfloat4_b, with the heads either split evenly over the chips in
+mesh order or copied to every chip. Anything else raises at startup and needs
+the method.
+
+The connector's description of a layer is bytes, `(num_blocks, num_kv_heads,
+block_size, n)` `uint8`, sized so that a block is one transferred block. It
+holds no KV; the KV stays in the ttnn tensors. Two servers can exchange KV only
+when every layer's transferred block has the same bytes on both: same dtype,
+head size, block size and total heads.
+
+A model class without a `get_kv_cache_spec` hook gets one layer name per
+attention layer, `model.layers.<idx>.self_attn`, all with the default spec.
+
 ## Minimum implementation
 
 An ordinary text adapter needs `initialize_vllm_model`, `prefill_forward`,

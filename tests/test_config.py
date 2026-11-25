@@ -203,15 +203,29 @@ def test_kv_transfer_config_is_refused_with_data_parallelism(
     cfg.kv_transfer_config = object()
 
     with pytest.raises(ValueError, match="kv-transfer-config"):
-        tt_config.validate_tt_kv_transfer_config(cfg)
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
     # The same parallelism is fine when no connector is configured.
     cfg.kv_transfer_config = None
-    tt_config.validate_tt_kv_transfer_config(cfg)
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
 
 def test_kv_transfer_config_is_accepted_without_data_parallelism():
     cfg = _vllm_config()
     cfg.kv_transfer_config = object()
 
-    tt_config.validate_tt_kv_transfer_config(cfg)
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+
+def test_kv_transfer_config_needs_a_model_that_resumes_a_prefill():
+    # A request that loads KV from a connector resumes its prefill after that
+    # KV, as after a prefix-cache hit. A model without prefix caching would
+    # compute on KV or state that never arrived.
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = object()
+
+    with pytest.raises(ValueError, match="supports_prefix_caching"):
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)
+
+    cfg.kv_transfer_config = None
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)

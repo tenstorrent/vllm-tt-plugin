@@ -102,6 +102,7 @@ def _worker(monkeypatch: pytest.MonkeyPatch, worker_cls: type[TTWorker]):
         use_mla=False,
         get_num_kv_heads=lambda _parallel_config: 8,
         get_head_size=lambda: 64,
+        get_num_layers_by_block_type=lambda _parallel_config, _block_type: 2,
         get_sliding_window=lambda: None,
     )
     vllm_config = SimpleNamespace(
@@ -252,8 +253,19 @@ def test_a_worker_owns_the_worker_side_kv_connector(monkeypatch, handshake_metad
     assert not has_kv_transfer_group()
     assert worker_instance.get_kv_connector_handshake_metadata() is None
 
+    kv_cache_config = _engine_kv_cache_config(worker_instance)
+    # A connector names each layer's KV; equal specs still share one group.
+    (group,) = kv_cache_config.kv_cache_groups
+    num_layers = worker_instance.model_config.get_num_layers_by_block_type(
+        worker_instance.parallel_config, "attention"
+    )
+    assert group.layer_names == [
+        f"model.layers.{i}.self_attn" for i in range(num_layers)
+    ]
+    assert kv_cache_config.num_blocks == NUM_TT_BLOCKS
+
     # initialize_from_config creates the connector.
-    worker_instance.initialize_from_config(_engine_kv_cache_config(worker_instance))
+    worker_instance.initialize_from_config(kv_cache_config)
     connector = get_kv_transfer_group()
     assert isinstance(connector, FakeKVConnector)
 
