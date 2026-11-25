@@ -47,11 +47,18 @@ class Write:
     notif: bytes
 
 
+class nixlRemoteDisconnectError(Exception):  # noqa: N801
+    """Stands in for the exception NIXL's bindings raise when the UCX endpoint to
+    the remote agent has failed; the TT worker recognizes it by its name."""
+
+
 class FakeNixl:
     """The NIXL agent calls of P's push writer.
 
     Attributes
     ----------
+    name
+        The agent's name, as its peer knows it.
     writes
         Each WRITE in submission order.
     states
@@ -61,13 +68,18 @@ class FakeNixl:
         What ``get_new_notifs`` returns next, by agent name.
     sent
         Each notification sent with ``send_notif``, until a test delivers it.
+    disconnected
+        Every ``send_notif`` raises ``nixlRemoteDisconnectError`` and delivers
+        nothing, as NIXL does once the endpoint to a dead peer has failed.
     """
 
-    def __init__(self):
+    def __init__(self, name: str = ""):
+        self.name = name
         self.writes: list[Write] = []
         self.states: dict[int, str] = {}
         self.notifs: dict[str, list[bytes]] = {}
         self.sent: list[bytes] = []
+        self.disconnected = False
 
     def make_prepped_xfer(
         self, operation, local_side, local_ids, remote_side, remote_ids, notif_msg
@@ -92,6 +104,8 @@ class FakeNixl:
         pass
 
     def send_notif(self, agent_name: str, notif_msg: bytes) -> None:
+        if self.disconnected:
+            raise nixlRemoteDisconnectError(agent_name)
         self.sent.append(notif_msg)
 
     def get_new_notifs(self) -> dict[str, list[bytes]]:
@@ -146,7 +160,7 @@ def push_writer(worker):
     worker._handshake_lock = threading.Lock()
     worker._log_failure = lambda **kwargs: None
     worker.xfer_stats = MagicMock()
-    worker.nixl_wrapper = FakeNixl()
+    worker.nixl_wrapper = FakeNixl(f"{P_ENGINE}-agent")
     worker.engine_id = P_ENGINE
     worker.world_size = 1
     worker.transfer_topo = SimpleNamespace(

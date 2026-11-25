@@ -102,9 +102,10 @@ TT_NOTIF_PREFIX = PUSH_REG_NOTIF_PREFIX + b"tt:"
 
 They start like a ``PUSH_REG``, so that vLLM's writer loop hands them to
 ``_handle_push_reg_notif`` on the writer thread, which owns the registrations
-they concern. The rest is a msgpack map: ``kind`` (``REG_ACK``, ``CANCEL`` or
-``CANCEL_ACK``), ``request_id`` (D's request ID) and, in a ``CANCEL``, D's
-``decode_*`` address fields from the registration."""
+they concern. The rest is a msgpack map: ``kind`` (``REG_ACK``, ``CANCEL``,
+``CANCEL_ACK`` or ``PROBE``), ``request_id`` (D's request ID), in a ``CANCEL``
+D's ``decode_*`` address fields from the registration, and in an acknowledgement
+the name of P's NIXL agent (``agent``)."""
 
 REG_ACK = "reg-ack"
 """P to D: P has recorded D's registration; a later ``CANCEL`` finds it."""
@@ -113,21 +114,48 @@ CANCEL = "cancel"
 CANCEL_ACK = "cancel-ack"
 """P to D: no write into the cancelled receive's slots is in flight or will be
 submitted; D may give them to another request."""
+PROBE = "probe"
+"""D to P, while a cancellation waits: tells D whether P's agent is still
+reachable. P ignores it."""
+
+# NIXL's bindings raise these, by status, when a send was refused before
+# anything was posted: the UCX endpoint to the agent has failed, which is
+# sticky (NIXL_ERR_REMOTE_DISCONNECT), or NIXL knows no such agent
+# (NIXL_ERR_NOT_FOUND). The bindings module differs per build, so match names.
+_DISCONNECTED = "nixlRemoteDisconnectError"
+_NOT_DELIVERED = frozenset({_DISCONNECTED, "nixlNotFoundError"})
+
+# Seconds between D's probes of the P agents a cancellation waits for.
+_PROBE_INTERVAL_S = 1.0
+# Seconds D keeps the slots after NIXL first reports the endpoint to a P agent
+# failed, before it treats that agent as gone. D's writer thread drives NIXL's
+# progress on every pass meanwhile, so that data of a WRITE that reached D's
+# host before the disconnect is applied before the slots change hands.
+_GONE_GRACE_S = 10.0
 
 # The address fields of D, from a registration, that P needs to answer.
 _DECODE_ADDRESS = ("decode_engine_id", "decode_host", "decode_port", "decode_tp_size")
 
 # Keys TT adds to registration dicts on their own side; none is ever sent.
-# D: the number of P agents the registration went to.
+# D: the names of the P agents the registration may have reached.
 _SENT_TO = "tt_sent_to"
 # D: the receive failed before the registration was sent; never send it.
 _WITHDRAWN = "tt_withdrawn"
 # P: D cancelled the registration; write nothing for it.
 _CANCELLED = "tt_cancelled"
 # Kinds of queued ``_WriterTask`` besides the notifications. D: the receive
-# succeeded, so it is never cancelled. P: send the cancel acknowledgements due.
+# succeeded, so it is never cancelled; probe P and free what is due. P: send
+# the cancel acknowledgements due.
 _RECEIVED = "received"
+_CHECK_CANCELS = "check-cancels"
 _SETTLE = "settle"
+
+# Why D's model runner thread gives back a cancelled receive's slots.
+_FREED_WHY = {
+    _WITHDRAWN: "its registration never reached P",
+    CANCEL_ACK: "P acknowledged the cancel",
+    _DISCONNECTED: "NIXL reports P's agent disconnected",
+}
 
 
 def register_kv_connectors() -> None:
@@ -397,25 +425,37 @@ class _Receive:
 class _Unacked:
     """D's record of a sent registration that awaits P's acknowledgements.
 
-    It lives on the writer thread from the send until every P agent the
-    registration went to has sent ``REG_ACK`` or the receive has succeeded,
-    and, once cancelled, until every one has sent ``CANCEL_ACK``.
+    It lives on the writer thread from the send until every P agent in
+    ``reg[_SENT_TO]`` has sent ``REG_ACK`` or the receive has succeeded, and,
+    once cancelled, until every one has sent ``CANCEL_ACK`` or is gone.
 
     Attributes
     ----------
     reg
-        The registration; ``reg[_SENT_TO]`` acknowledgements of each kind are
-        awaited.
+        The registration; ``reg[_SENT_TO]`` names the P agents it may have
+        reached.
     reg_acks, cancel_acks
-        ``REG_ACK`` and ``CANCEL_ACK`` notifications received.
+        The P agents that sent ``REG_ACK`` and ``CANCEL_ACK``.
     cancelled
-        D failed the receive. ``CANCEL`` goes out once every ``REG_ACK`` is in.
+        D failed the receive. ``CANCEL`` goes out once every agent has sent
+        ``REG_ACK`` or is disconnected.
+    cancel_sent
+        ``CANCEL`` went out.
+    disconnected
+        P agents a send to which NIXL refused as disconnected, with the
+        ``time.perf_counter`` of the first refusal. An agent is gone
+        ``_GONE_GRACE_S`` after it.
+    probed
+        ``time.perf_counter`` of the last ``PROBE``.
     """
 
     reg: dict[str, Any]
-    reg_acks: int = 0
+    reg_acks: set[str] = dataclasses.field(default_factory=set)
     cancelled: bool = False
-    cancel_acks: int = 0
+    cancel_sent: bool = False
+    cancel_acks: set[str] = dataclasses.field(default_factory=set)
+    disconnected: dict[str, float] = dataclasses.field(default_factory=dict)
+    probed: float = float("-inf")
 
 
 @dataclasses.dataclass
@@ -458,12 +498,14 @@ class _WriterTask:
     ----------
     kind
         ``CANCEL``: D withdraws or cancels ``reg``. ``_RECEIVED``: D's receive
-        succeeded; D awaits no acknowledgement of it. ``REG_ACK`` or
-        ``CANCEL_ACK``: P sends it for ``reg`` now that its handshake with D is
-        done. ``_SETTLE``: P sends the cancel acknowledgements now due.
+        succeeded; D awaits no acknowledgement of it. ``_CHECK_CANCELS``: D
+        probes the P agents its cancellations wait for and frees what is due.
+        ``REG_ACK`` or ``CANCEL_ACK``: P sends it for ``reg`` now that its
+        handshake with D is done. ``_SETTLE``: P sends the cancel
+        acknowledgements now due.
     reg
         The registration, or for ``CANCEL_ACK`` D's ``CANCEL``; empty for
-        ``_RECEIVED`` and ``_SETTLE``.
+        ``_RECEIVED``, ``_CHECK_CANCELS`` and ``_SETTLE``.
     """
 
     kind: str
@@ -489,18 +531,31 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
     write in flight. D therefore gives the slots to another request only on
     P's word, given in these notifications (``TT_NOTIF_PREFIX``):
 
-    1. D's writer thread sends the registration, ``PUSH_REG``, as vLLM does.
+    1. D's writer thread sends the registration, ``PUSH_REG``, as vLLM does,
+       and records the P agents it may have reached: NIXL refuses a send to an
+       agent whose endpoint has failed, or that it does not know, before it
+       posts anything.
     2. P's writer thread records it, matched or pending, then sends
        ``REG_ACK``.
     3. D's model runner thread fails the receive and queues its cancellation
-       to D's writer thread. A registration not yet sent is withdrawn, and
-       the slots are free at once. For a sent one, D's writer thread sends
-       ``CANCEL`` once every ``REG_ACK`` is in.
+       to D's writer thread. A registration that reached no P agent (not yet
+       sent, or refused) is withdrawn, and the slots are free at once. For a
+       sent one, D's writer thread sends ``CANCEL`` once every agent has sent
+       ``REG_ACK`` or is disconnected.
     4. P's writer thread marks the registration cancelled, or drops it if it
        is pending, and sends ``CANCEL_ACK`` once no write of the P requests
        matched with it has a handle in flight.
-    5. Once every ``CANCEL_ACK`` is in, D's writer thread hands the receive
-       back to D's model runner thread, which frees its slots.
+    5. Once every agent has sent ``CANCEL_ACK`` or is gone, D's writer thread
+       hands the receive back to D's model runner thread, which frees its
+       slots.
+
+    While a cancellation waits, D's writer thread sends the agents it waits
+    for a ``PROBE`` every ``_PROBE_INTERVAL_S``. NIXL refuses a send to an
+    agent whose UCX endpoint has failed (the peer process died, the connection
+    was reset, or keepalive timed out), and that state is sticky. D counts the
+    agent gone ``_GONE_GRACE_S`` after the first refusal; meanwhile its writer
+    thread keeps driving NIXL's progress, so that WRITE data that reached D's
+    host before the disconnect is applied before the slots change hands.
 
     NIXL does not order notifications, so ``CANCEL`` waits for ``REG_ACK``:
     P reads a ``CANCEL`` only after it has recorded the registration, and no
@@ -511,16 +566,21 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
     ended before P sent ``CANCEL_ACK``, which is before D frees the slots. A
     write ends when vLLM releases its handle, after NIXL reports it done or
     failed; as vLLM's own release of P's blocks, this takes NIXL's word that
-    a done write has landed. A P that never answers leaves the slots
-    reserved: D loses capacity, never data. TT engines run one NIXL agent
-    each; the acknowledgement counts allow several.
+    a done write has landed. A P that is alive but never answers leaves the
+    slots reserved: D loses capacity, never data. A gone P is the exception:
+    D frees without its word, on NIXL's report that the endpoint failed. That
+    P's own endpoint to D has failed then too, or that P's process is gone,
+    NIXL does not tell D. D cannot tell P's chunk WRITEs from its
+    whole-request WRITEs, so the same holds for both. TT engines run one NIXL
+    agent each; the acknowledgements name the agent, so several are allowed.
 
     State and threads:
 
-    * ``_receives``, ``_recv_deadlines``, ``_cancelling``, ``_load_errors``
-      and ``_waiting_registrations`` (D), ``_waiting_stage``,
-      ``_chunk_slots``, ``_chunk_staged``, ``_chunk_unstaged`` and
-      ``_chunk_retiring`` (P) and ``slots`` belong to the model runner thread.
+    * ``_receives``, ``_recv_deadlines``, ``_cancelling``,
+      ``_cancels_checked``, ``_load_errors`` and ``_waiting_registrations``
+      (D), ``_waiting_stage``, ``_chunk_slots``, ``_chunk_staged``,
+      ``_chunk_unstaged`` and ``_chunk_retiring`` (P) and ``slots`` belong to
+      the model runner thread.
     * A chunk WRITE may read a request's slots from the moment
       ``finish_chunk_step`` queues its first job. From then on, the model
       runner thread gives the slots back only once the writer thread has
@@ -707,9 +767,10 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
 
         A D request whose KV has not arrived by its deadline is reported as a
         failed receive (vLLM's push path waits for it indefinitely). The slots
-        of a failed receive go back once P has acknowledged its cancellation
-        (Notes). A P request reported sent keeps its slots while the writer
-        thread is submitting its write or a write handle is in flight.
+        of a failed receive go back once P has acknowledged its cancellation,
+        or once P is gone (Notes). A P request reported sent keeps its slots
+        while the writer thread is submitting its write or a write handle is in
+        flight.
         """
         now = time.perf_counter()
         for req_id, deadline in list(self._recv_deadlines.items()):
@@ -787,8 +848,11 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         self._waiting_registrations: deque[tuple[str, dict[str, Any], int]] = deque()
         # D: slots of failed receives, until their cancellation settles.
         self._cancelling: dict[str, list[int]] = {}
-        # D: requests whose cancellation the writer thread has settled.
-        self._cancel_done: queue.Queue[str] = queue.Queue()
+        # D: (request, why) of cancellations the writer thread has settled;
+        # why is a key of _FREED_WHY.
+        self._cancel_done: queue.Queue[tuple[str, str]] = queue.Queue()
+        # D: when this thread last queued _CHECK_CANCELS.
+        self._cancels_checked = float("-inf")
         # D, writer thread: sent registrations that await P's acknowledgements.
         self._unacked: dict[str, _Unacked] = {}
         # P: matched requests (device blocks, D's registration) to stage.
@@ -829,6 +893,8 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             self._cancel_registration(req_id, reg_data.reg)
         elif reg_data.kind == _RECEIVED:
             self._unacked.pop(req_id, None)
+        elif reg_data.kind == _CHECK_CANCELS:
+            self._check_cancels()
         elif reg_data.kind == _SETTLE:
             self._settle_cancels()
         else:
@@ -838,18 +904,26 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         """Send D's registration to P's agents and await a ``REG_ACK`` from each.
 
         Runs on the writer thread once the handshake with P is done. It
-        replaces vLLM's method, which sends to the same agents, to learn how
-        many acknowledgements to await.
+        replaces vLLM's method, which sends to the same agents, to learn which
+        agents it may have reached. A registration that reached none fails its
+        receive at once, as vLLM's method does for an engine without agents.
         """
         engine_id = reg_data["remote_engine_id"]
+        agents = self._engine_agents(engine_id)
         notif = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
-        sent_to = self._notify_engine(engine_id, notif, req_id, "push_reg_notif_failed")
+        refused = self._notify_agents(agents, notif, req_id, "push_reg_notif_failed")
+        sent_to = [
+            agent for agent in agents if refused.get(agent) not in _NOT_DELIVERED
+        ]
         if not sent_to:
             logger.error(
-                "No remote agents for engine %s; cannot send registration for %s",
-                engine_id,
+                "The registration of %s reached no NIXL agent of engine %s; "
+                "failing its receive.",
                 req_id,
+                engine_id,
             )
+            if not agents:
+                self.xfer_stats.record_failed_notification()
             self._failed_recv_reqs.put(req_id)
             return
         reg_data[_SENT_TO] = sent_to
@@ -1137,39 +1211,105 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         self.slots.give_back(freed)
 
     def _give_back_cancelled(self) -> None:
-        """Free the slots of D's receives whose cancellation has settled."""
+        """Free the slots of D's receives whose cancellation has settled.
+
+        While cancellations wait, also has the writer thread check them every
+        ``_PROBE_INTERVAL_S``.
+        """
         while True:
             try:
-                req_id = self._cancel_done.get_nowait()
+                req_id, why = self._cancel_done.get_nowait()
             except queue.Empty:
-                return
-            self.slots.give_back(self._cancelling.pop(req_id))
+                break
+            slots = self._cancelling.pop(req_id)
+            self.slots.give_back(slots)
+            logger.info(
+                "Freed the %d staging slots of %s: %s.",
+                len(slots),
+                req_id,
+                _FREED_WHY[why],
+            )
+        now = time.perf_counter()
+        if self._cancelling and now - self._cancels_checked >= _PROBE_INTERVAL_S:
+            self._cancels_checked = now
+            self._reg_send_inbox.put(("", _WriterTask(_CHECK_CANCELS)))
+            self._push_writer_wake.set()
 
     def _cancel_registration(self, req_id: str, reg: dict[str, Any]) -> None:
         """Withdraw D's registration of a failed receive, or cancel it at P.
 
-        Runs on the writer thread. A registration not yet sent is never sent,
-        and the receive's slots are free at once. A sent one is cancelled once
-        P has acknowledged it; the slots stay reserved until P acknowledges
-        the cancellation. Running again, as after a handshake, sends what is
-        due.
+        Runs on the writer thread. A registration that reached no P agent is
+        never sent, and the receive's slots are free at once. A sent one is
+        cancelled as ``_advance_cancel`` describes. Running again, as after a
+        handshake, sends what is due.
         """
         sent_to = reg.get(_SENT_TO)
         if sent_to is None:
             reg[_WITHDRAWN] = True
-            self._cancel_done.put(req_id)
+            self._cancel_done.put((req_id, _WITHDRAWN))
             return
-        unacked = self._unacked.setdefault(req_id, _Unacked(reg, reg_acks=sent_to))
-        if not unacked.cancelled:
-            unacked.cancelled = True
-            logger.warning(
-                "The receive of %s failed after its registration went to P; its "
-                "staging slots stay reserved until P confirms it writes no more "
-                "into them.",
+        unacked = self._unacked.setdefault(req_id, _Unacked(reg, reg_acks=set(sent_to)))
+        unacked.cancelled = True
+        self._advance_cancel(req_id, unacked)
+
+    def _advance_cancel(self, req_id: str, unacked: _Unacked) -> None:
+        """D: send ``CANCEL`` and settle the cancellation when they are due.
+
+        Runs on the writer thread. ``CANCEL`` goes out once every P agent has
+        sent ``REG_ACK`` or is disconnected. The receive goes back to the
+        model runner thread once every agent has sent ``CANCEL_ACK`` or has
+        been disconnected for ``_GONE_GRACE_S``.
+        """
+        sent_to = set(unacked.reg[_SENT_TO])
+        now = time.perf_counter()
+        if not unacked.cancel_sent and sent_to <= (
+            unacked.reg_acks | unacked.disconnected.keys()
+        ):
+            refused = self._send_tt_notif(CANCEL, unacked.reg)
+            if refused is None:
+                # Queued again once the handshake with P is done.
+                return
+            unacked.cancel_sent = True
+            self._note_disconnects(unacked, refused, now)
+            logger.info(
+                "Sent the cancel of %s to P; its %d staging slots stay reserved "
+                "until P acknowledges it.",
                 req_id,
+                len(_flatten(unacked.reg["local_block_ids"])),
             )
-        if unacked.reg_acks >= sent_to:
-            self._send_tt_notif(CANCEL, reg)
+        gone = {
+            agent
+            for agent, since in unacked.disconnected.items()
+            if now - since >= _GONE_GRACE_S
+        }
+        if sent_to <= unacked.cancel_acks | gone:
+            del self._unacked[req_id]
+            why = CANCEL_ACK if sent_to <= unacked.cancel_acks else _DISCONNECTED
+            self._cancel_done.put((req_id, why))
+
+    def _check_cancels(self) -> None:
+        """D: probe the P agents that cancellations wait for; settle what is due.
+
+        Runs on the writer thread, queued by the model runner thread every
+        ``_PROBE_INTERVAL_S`` while a cancellation waits.
+        """
+        now = time.perf_counter()
+        for req_id, unacked in list(self._unacked.items()):
+            if not unacked.cancelled:
+                continue
+            waiting = (
+                set(unacked.reg[_SENT_TO])
+                - unacked.cancel_acks
+                - unacked.disconnected.keys()
+            )
+            if waiting and now - unacked.probed >= _PROBE_INTERVAL_S:
+                unacked.probed = now
+                probe = TT_NOTIF_PREFIX + msgspec.msgpack.encode(
+                    {"kind": PROBE, "request_id": req_id}
+                )
+                refused = self._notify_agents(waiting, probe, req_id, "tt_probe_failed")
+                self._note_disconnects(unacked, refused, now)
+            self._advance_cancel(req_id, unacked)
 
     def _handle_tt_notif(self, notif: bytes) -> None:
         """Act on a TT notification from the peer engine, on the writer thread."""
@@ -1180,25 +1320,23 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             logger.exception("Failed to decode a TT NIXL notification; dropping it")
             return
         if kind == REG_ACK:
-            self._on_reg_ack(req_id)
+            self._on_reg_ack(req_id, message.get("agent"))
         elif kind == CANCEL:
             self._on_cancel(message)
         elif kind == CANCEL_ACK:
-            self._on_cancel_ack(req_id)
-        else:
+            self._on_cancel_ack(req_id, message.get("agent"))
+        elif kind != PROBE:
             logger.warning("Dropping TT NIXL notification %r for %s.", kind, req_id)
 
-    def _on_reg_ack(self, req_id: str) -> None:
-        """D: count P's acknowledgement; cancel a failed receive once all are in."""
+    def _on_reg_ack(self, req_id: str, agent: str | None) -> None:
+        """D: record P's acknowledgement; cancel a failed receive once all are in."""
         unacked = self._unacked.get(req_id)
-        if unacked is None:
+        if unacked is None or agent not in unacked.reg[_SENT_TO]:
             return
-        unacked.reg_acks += 1
-        if unacked.reg_acks < unacked.reg[_SENT_TO]:
-            return
+        unacked.reg_acks.add(agent)
         if unacked.cancelled:
-            self._send_tt_notif(CANCEL, unacked.reg)
-        else:
+            self._advance_cancel(req_id, unacked)
+        elif unacked.reg_acks >= set(unacked.reg[_SENT_TO]):
             del self._unacked[req_id]
 
     def _on_cancel(self, message: dict[str, Any]) -> None:
@@ -1251,25 +1389,26 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         for message in due:
             self._send_tt_notif(CANCEL_ACK, message)
 
-    def _on_cancel_ack(self, req_id: str) -> None:
-        """D: count P's acknowledgement; free the slots once all are in."""
+    def _on_cancel_ack(self, req_id: str, agent: str | None) -> None:
+        """D: record P's acknowledgement; free the slots once all are in."""
         unacked = self._unacked.get(req_id)
-        if unacked is None or not unacked.cancelled:
+        if (
+            unacked is None
+            or not unacked.cancelled
+            or agent not in unacked.reg[_SENT_TO]
+        ):
             return
-        unacked.cancel_acks += 1
-        if unacked.cancel_acks < unacked.reg[_SENT_TO]:
-            return
-        del self._unacked[req_id]
-        self._cancel_done.put(req_id)
+        unacked.cancel_acks.add(agent)
+        self._advance_cancel(req_id, unacked)
 
-    def _send_tt_notif(self, kind: str, reg: dict[str, Any]) -> None:
+    def _send_tt_notif(self, kind: str, reg: dict[str, Any]) -> dict[str, str] | None:
         """Send the peer engine a TT notification about ``reg``, after any handshake.
 
         Runs on the writer thread. ``CANCEL`` goes from D to P, over the
         notification-only handshake vLLM uses for ``PUSH_REG``; ``REG_ACK``
-        and ``CANCEL_ACK`` go from P to D, over the handshake P's writes use.
-        While a handshake runs, the notification is queued again for when it
-        is done.
+        and ``CANCEL_ACK`` go from P to D, over the handshake P's writes use,
+        and name P's agent. While a handshake runs, the notification is queued
+        again for when it is done.
 
         Parameters
         ----------
@@ -1278,6 +1417,11 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         reg
             The registration; for ``CANCEL_ACK``, D's ``CANCEL``. Either names
             D's request and the address of the peer engine.
+
+        Returns
+        -------
+        dict[str, str] or None
+            None while the handshake runs; else ``_notify_agents``'s refusals.
         """
         req_id = reg["request_id"]
         if kind == CANCEL:
@@ -1296,17 +1440,18 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             handshake = self._ensure_handshake(
                 engine_id, reg["decode_host"], reg["decode_port"], reg["decode_tp_size"]
             )
-            message = {}
+            message = {"agent": self.nixl_wrapper.name}
         if handshake is not None:
             handshake.add_done_callback(
                 functools.partial(
                     self._queue_after_handshake, req_id, _WriterTask(kind, reg)
                 )
             )
-            return
+            return None
         message.update(kind=kind, request_id=req_id)
         notif = TT_NOTIF_PREFIX + msgspec.msgpack.encode(message)
-        if not self._notify_engine(engine_id, notif, req_id, "tt_notif_failed"):
+        agents = self._engine_agents(engine_id)
+        if not agents:
             logger.warning(
                 "No NIXL agent of engine %s for the %s of %s; the request's "
                 "staging slots stay reserved on D.",
@@ -1314,6 +1459,7 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
                 kind,
                 req_id,
             )
+        return self._notify_agents(agents, notif, req_id, "tt_notif_failed")
 
     def _queue_after_handshake(
         self, req_id: str, task: _WriterTask, handshake: Future
@@ -1334,35 +1480,36 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         self._reg_send_inbox.put((req_id, task))
         self._push_writer_wake.set()
 
-    def _notify_engine(
-        self, engine_id: str, notif: bytes, req_id: str, failure_type: str
-    ) -> int:
-        """Send ``notif`` to each NIXL agent of ``engine_id``.
+    def _engine_agents(self, engine_id: str) -> list[str]:
+        """The names of ``engine_id``'s NIXL agents, as D or P knows them now."""
+        # _remote_agents is mutated on other threads; snapshot under the lock.
+        with self._handshake_lock:
+            return list((self._remote_agents.get(engine_id) or {}).values())
+
+    def _notify_agents(
+        self, agents: Iterable[str], notif: bytes, req_id: str, failure_type: str
+    ) -> dict[str, str]:
+        """Send ``notif`` to each of ``agents``.
 
         Returns
         -------
-        int
-            The number of agents, each either sent ``notif`` or logged under
-            ``failure_type``; 0 when the engine has none. A failed send may
-            still deliver, so it counts.
+        dict[str, str]
+            The agents whose send raised, with the name of the exception's
+            class; each is also logged under ``failure_type``. A name in
+            ``_NOT_DELIVERED`` means NIXL posted nothing; any other failed
+            send may still have been delivered.
         """
-        # _remote_agents is mutated on other threads; snapshot under the lock.
-        with self._handshake_lock:
-            agents = dict(self._remote_agents.get(engine_id) or {})
-        if not agents:
-            self.xfer_stats.record_failed_notification()
-        for rank, agent_name in agents.items():
+        refused = {}
+        for agent in agents:
             try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif)
+                self.nixl_wrapper.send_notif(agent, notif_msg=notif)
             except Exception as e:
+                refused[agent] = type(e).__name__
                 self._log_failure(
-                    failure_type=failure_type,
-                    req_id=req_id,
-                    error=e,
-                    remote_rank=rank,
+                    failure_type=failure_type, req_id=req_id, error=e, agent=agent
                 )
                 self.xfer_stats.record_failed_notification()
-        return len(agents)
+        return refused
 
     def _take_slots(self, device: BlockIds) -> BlockIds | None:
         """Slots for ``device``'s blocks, grouped like it, or None when full."""
@@ -1374,6 +1521,15 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             grouped.append(flat[start : start + len(group)])
             start += len(group)
         return tuple(grouped)
+
+    @staticmethod
+    def _note_disconnects(
+        unacked: _Unacked, refused: dict[str, str], now: float
+    ) -> None:
+        """Record the first time NIXL refused a send to each agent as disconnected."""
+        for agent, error in refused.items():
+            if error == _DISCONNECTED:
+                unacked.disconnected.setdefault(agent, now)
 
 
 class TTNixlPushConnector(NixlPushConnector):
