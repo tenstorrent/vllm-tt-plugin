@@ -42,6 +42,7 @@ steps group the positions.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 from collections import deque
 from types import SimpleNamespace
@@ -1405,6 +1406,31 @@ def test_a_build_that_samples_on_the_host_refuses_a_chained_sampled_row():
     runner.build_model_input = build_model_input
     runner._decode_device_sampled = decide_in_build
     with pytest.raises(RuntimeError, match="not certifiable by the id walk"):
+        h.run()
+
+
+def test_a_chained_step_built_for_another_path_raises():
+    """Only the asynchronous decode path completes a chained verify
+    (``complete_chain``). ``plan_chain`` drains each step that would build for
+    another path, such as a structured-output step, which defers device
+    sampling. Here the build defers device sampling once verifies chain, while
+    ``plan_chain`` chained the step: it raises instead of dropping the
+    predecessor's commit."""
+    h = _AsyncHarness(48, mode="none", asynchronous=True, chained=True)
+    _scenario(h)
+    runner = h.runner
+    build = runner.build_model_input
+
+    def build_model_input(*args, **kwargs):
+        model_input = build(*args, **kwargs)
+        if kwargs.get("chain") is not None and h.device.chained >= 3:
+            return dataclasses.replace(
+                model_input, perform_device_sampling=True, defer_device_sampling=True
+            )
+        return model_input
+
+    runner.build_model_input = build_model_input
+    with pytest.raises(RuntimeError, match="complete_chain"):
         h.run()
 
 

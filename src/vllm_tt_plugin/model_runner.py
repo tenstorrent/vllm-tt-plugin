@@ -3495,13 +3495,23 @@ class TTModelRunner:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         is_decode = model_input.prompt_lens is None
-        if model_input.defer_device_sampling and not steady_decode_candidate:
-            self.async_decode.wait_for_all_pending_async_steps()
-        if (
+        async_decode = (
             self.async_decode_scheduling
             and is_decode
             and not model_input.defer_device_sampling
-        ):
+        )
+        if chain is not None and not async_decode:
+            # Only the asynchronous decode path calls complete_chain, which
+            # commits the predecessor verify into the chained rows.
+            raise RuntimeError(
+                "plan_chain chained a step that builds for a path without "
+                f"complete_chain: async_decode_scheduling="
+                f"{self.async_decode_scheduling}, is_decode={is_decode}, "
+                f"defer_device_sampling={model_input.defer_device_sampling}"
+            )
+        if model_input.defer_device_sampling and not steady_decode_candidate:
+            self.async_decode.wait_for_all_pending_async_steps()
+        if async_decode:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(
                 model_input
             )
