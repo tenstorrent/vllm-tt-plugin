@@ -1271,12 +1271,23 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
                 return
             unacked.cancel_sent = True
             self._note_disconnects(unacked, refused, now)
-            logger.info(
-                "Sent the cancel of %s to P; its %d staging slots stay reserved "
-                "until P acknowledges it.",
-                req_id,
-                len(_flatten(unacked.reg["local_block_ids"])),
-            )
+            num_slots = len(_flatten(unacked.reg["local_block_ids"]))
+            if refused:
+                logger.info(
+                    "The cancel of %s did not reach every NIXL agent of P (%s); "
+                    "its %d staging slots stay reserved until P acknowledges it "
+                    "or is gone.",
+                    req_id,
+                    ", ".join(sorted(set(refused.values()))),
+                    num_slots,
+                )
+            else:
+                logger.info(
+                    "Sent the cancel of %s to P; its %d staging slots stay "
+                    "reserved until P acknowledges it.",
+                    req_id,
+                    num_slots,
+                )
         gone = {
             agent
             for agent, since in unacked.disconnected.items()
