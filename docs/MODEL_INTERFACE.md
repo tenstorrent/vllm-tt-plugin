@@ -70,10 +70,15 @@ startup when the installed ttnn lacks them.
 
 vLLM's `NixlConnector` moves KV between servers, for example from a prefill
 server to a decode server, with the NIXL transfer library. NIXL cannot register
-TT device memory, so on TT the connector runs only with a CPU buffer:
+TT device memory, so on TT the connector runs only with a CPU buffer. The
+prefill server is the producer and the decode server the consumer (vLLM 0.33
+deprecates `kv_both` for this connector):
 
 ```bash
---kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_both", "kv_buffer_device": "cpu"}'
+# prefill server
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu"}'
+# decode server
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"}'
 ```
 
 For it, `TTPlatform` names `TTAttentionBackend` as the attention backend (only
