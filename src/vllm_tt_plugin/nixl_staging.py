@@ -151,6 +151,30 @@ class StagingSlots:
         self._free.extend(slots)
 
 
+@dataclasses.dataclass
+class _Send:
+    """P's record of a finished request, from its finish until its slots are free.
+
+    Attributes
+    ----------
+    lane
+        The lane whose chips hold the request's KV.
+    slots
+        The staging slots the request was copied into, once staged.
+    submitting
+        The writer thread is submitting the request's write: the slots stay,
+        even if the send ends meanwhile.
+    ended
+        vLLM reported the send finished, written or past its lease. The slots
+        go back once no write reads them.
+    """
+
+    lane: int
+    slots: list[int] | None = None
+    submitting: bool = False
+    ended: bool = False
+
+
 class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     """vLLM's push worker with its host buffer cut down to staging slots.
 
@@ -165,14 +189,16 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
 
     * ``_recv_slots``, ``_recv_deadlines``, ``_expired``, ``_quarantined``,
       ``_load_errors`` and ``_waiting_registrations`` (D), ``_waiting_stage``
-      and ``_send_lane`` (P) and ``slots`` belong to the model runner thread.
+      (P) and ``slots`` belong to the model runner thread.
     * ``_to_stage`` carries matched P requests from the writer thread to the
       model runner thread.
-    * ``_send_slots`` and ``_released`` (P) are written by the model runner
-      thread and read by the writer thread, under ``_lock``. The writer thread
-      adds a staged request to ``_submitting`` under the same lock before it
-      submits the write, and removes it once vLLM has published the write's
-      handles; the model runner thread frees the slots of neither.
+    * ``_sends`` (P) holds a ``_Send`` per finished request, under ``_lock``.
+      The model runner thread adds it when the request finishes, stages the
+      request, marks it ended and removes it; the writer thread marks it
+      submitting while vLLM submits its write. The model runner thread removes
+      it, and frees its slots, once it has ended, is not being submitted and
+      has no write handle in flight. A request finishes once, so work that
+      finds no record belongs to a send that is over and is dropped.
     * D's registration carries ``_RECV_DEADLINE`` from the model runner thread
       to the writer thread; P's carries ``_WRITE_DEADLINE`` from the writer
       thread through staging and back.
@@ -254,8 +280,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 "local_block_ids": slots,
                 _RECV_DEADLINE: self._recv_deadlines[req_id],
             }
-        for req_id in metadata.push_finished_blocks or {}:
-            self._send_lane[req_id] = lane_of.get(req_id, 0)
+        with self._lock:
+            for req_id in metadata.push_finished_blocks or {}:
+                self._sends[req_id] = _Send(lane_of.get(req_id, 0))
         # The scheduler shares ``metadata``; hand vLLM a copy.
         metadata = copy.copy(metadata)
         metadata.push_registrations = registrations
@@ -333,23 +360,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 self._quarantined.append((now + self._quarantine, _flatten(slots)))
             else:
                 self.slots.give_back(_flatten(slots))
-        freed = []
-        with self._lock:
-            self._released |= results.finished_sending
-            self._release_pending |= results.finished_sending & self._send_slots.keys()
-            # Under ``_lock``, so that the writer either sees the slots gone or
-            # has marked its submission before this looks.
-            with self._sending_transfers_lock:
-                for req_id in list(self._release_pending):
-                    if req_id in self._submitting or self._sending_transfers.get(
-                        req_id
-                    ):
-                        continue
-                    self._release_pending.discard(req_id)
-                    freed += self._send_slots.pop(req_id)
-        self.slots.give_back(freed)
-        for req_id in results.finished_sending - self._send_slots.keys():
-            self._send_lane.pop(req_id, None)
+        self._end_sends(results.finished_sending)
         self._stage_matched_sends()
         return results
 
@@ -379,8 +390,6 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._pool_blocks = pool_blocks
         # D: lane-numbered blocks of failed receives, for vLLM to recompute.
         self._load_errors: set[int] = set()
-        # P: lane of each finished request until its send ends.
-        self._send_lane: dict[str, int] = {}
         self._recv_timeout = recv_timeout
         self._quarantine = quarantine
         # D: deadline per request whose registration went out.
@@ -399,14 +408,8 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             queue.Queue()
         )
         self._waiting_stage: deque[tuple[str, BlockIds, dict[str, Any]]] = deque()
-        # P: slots of requests staged for, or being written to, D.
-        self._send_slots: dict[str, list[int]] = {}
-        # P: requests whose send finished or expired; never staged again.
-        self._released: set[str] = set()
-        # P: finished requests whose slots wait for their last write handle.
-        self._release_pending: set[str] = set()
-        # P: staged requests whose write the writer thread is submitting.
-        self._submitting: set[str] = set()
+        # P: each finished request until its send has ended and its slots are free.
+        self._sends: dict[str, _Send] = {}
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         """Send D's registration with the seconds left until D fails the receive.
@@ -475,8 +478,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         Past the registration's write deadline it drops the push: D may have
         given the slots to another request. A dropped staged push keeps its
         slots until vLLM reports the send finished, at the end of P's lease.
-        While vLLM's method submits the write, the request is in
-        ``_submitting``, so that ``get_transfer_results`` keeps its slots.
+        A request without a ``_sends`` record, or whose send has ended, is
+        dropped. While vLLM's method submits the write, the request's record
+        is marked submitting, so that ``get_transfer_results`` keeps its slots.
         """
         deadline = registration_data.get(_WRITE_DEADLINE)
         if deadline is not None and time.perf_counter() > deadline:
@@ -487,12 +491,12 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             )
             return
         with self._lock:
-            staged = request_id in self._send_slots
-            if staged:
-                self._submitting.add(request_id)
-            elif request_id in self._released:
+            send = self._sends.get(request_id)
+            if send is None or send.ended:
                 logger.debug("Dropping push of %s: its send already ended.", request_id)
                 return
+            staged = send.slots is not None
+            send.submitting = staged
         if not staged:
             self._to_stage.put((request_id, local_block_ids, registration_data))
             return
@@ -500,7 +504,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             super()._do_start_push_kv(request_id, local_block_ids, registration_data)
         finally:
             with self._lock:
-                self._submitting.discard(request_id)
+                send.submitting = False
 
     def _stage_matched_sends(self) -> None:
         """Copy matched P requests from the chips into slots and queue their writes.
@@ -519,8 +523,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         queued = False
         for req_id, device_ids, reg in pending:
             with self._lock:
-                if req_id in self._released:
-                    continue
+                send = self._sends.get(req_id)
+            # Only this thread ends a send or stages it.
+            if send is None or send.ended or send.slots is not None:
+                continue
             device = _last_blocks(
                 self._as_grouped_block_ids(device_ids),
                 self._as_grouped_block_ids(reg["local_block_ids"]),
@@ -536,14 +542,42 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 _flatten(device),
                 flat_slots,
                 "d2h",
-                lane=self._send_lane.get(req_id, 0),
+                lane=send.lane,
             )
             with self._lock:
-                self._send_slots[req_id] = flat_slots
+                send.slots = flat_slots
             self._deferred_push_inbox.put((req_id, slots, reg))
             queued = True
         if queued:
             self._push_writer_wake.set()
+
+    def _end_sends(self, finished: set[str]) -> None:
+        """Mark P's sends vLLM reports finished; free those no write reads.
+
+        Parameters
+        ----------
+        finished
+            vLLM's ``finished_sending``: requests whose write completed or
+            whose lease expired. A request may still have a write being
+            submitted or in flight; its record stays until neither holds.
+        """
+        freed = []
+        with self._lock:
+            for req_id in finished:
+                if (send := self._sends.get(req_id)) is not None:
+                    send.ended = True
+            # Under ``_lock``: the writer thread either finds the record gone
+            # or has marked it submitting before this looks.
+            with self._sending_transfers_lock:
+                for req_id, send in list(self._sends.items()):
+                    if (
+                        send.ended
+                        and not send.submitting
+                        and not self._sending_transfers.get(req_id)
+                    ):
+                        del self._sends[req_id]
+                        freed += send.slots or []
+        self.slots.give_back(freed)
 
     def _take_slots(self, device: BlockIds) -> BlockIds | None:
         """Slots for ``device``'s blocks, grouped like it, or None when full."""

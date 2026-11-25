@@ -9,7 +9,7 @@ test sees which IDs reach vLLM and which copies the overrides make.
 
 import queue
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import msgspec
@@ -159,6 +159,21 @@ def _metadata(registrations=None, finished=None, lanes=None):
     )
 
 
+def _held_entries(worker) -> dict[str, int]:
+    """Entries per container and queue of ``worker`` that holds any."""
+    held = {}
+    for name, value in vars(worker).items():
+        if isinstance(value, queue.Queue):
+            size = value.qsize()
+        elif isinstance(value, (dict, set, list, deque)) and name != "copies":
+            size = len(value)
+        else:
+            continue
+        if size:
+            held[name] = size
+    return held
+
+
 def _registration(block_ids, request_id="d-rid"):
     return {"request_id": request_id, "local_block_ids": (block_ids,)}
 
@@ -259,6 +274,7 @@ class TestLanes:
 class TestPrefillSide:
     def test_a_match_is_staged_on_the_runner_thread_then_written(self, recorder):
         worker = _worker(num_slots=4)
+        worker.start_load_kv(_metadata(finished={"p": ([30, 31, 32],)}))
         # D already holds the first block of this prompt, so it registers two.
         worker._do_start_push_kv("p", ([30, 31, 32],), _registration([8, 9]))
         assert recorder.pushes == []
@@ -272,6 +288,7 @@ class TestPrefillSide:
 
     def test_slots_are_freed_after_the_send_and_its_last_write(self, recorder):
         worker = _worker(num_slots=2)
+        worker.start_load_kv(_metadata(finished={"p": ([30, 31],)}))
         worker._do_start_push_kv("p", ([30, 31],), _registration([8, 9]))
         worker.get_transfer_results()
         worker._sending_transfers["p"] = ["handle"]
@@ -286,6 +303,7 @@ class TestPrefillSide:
 
     def test_a_send_that_already_ended_is_never_staged(self, recorder):
         worker = _worker(num_slots=2)
+        worker.start_load_kv(_metadata(finished={"p": ([30, 31],)}))
         recorder.results.finished_sending = {"p"}
         worker.get_transfer_results()
 
@@ -353,6 +371,21 @@ class TestSendSlotLifetime:
         assert free_while_writing == 0
         assert p.slots.free == 2
 
+    def test_completed_sends_leave_no_state(self, recorder):
+        p = _worker(num_slots=2)
+        for i in range(10_000):
+            req_id = f"p{i}"
+            p.start_load_kv(_metadata(finished={req_id: ([30, 31],)}))
+            p._do_start_push_kv(req_id, ([30, 31],), _registration([8, 9]))
+            p.get_transfer_results()
+            p._do_start_push_kv(*p._deferred_push_inbox.get_nowait())
+            recorder.results.finished_sending = {req_id}
+            p.get_transfer_results()
+
+        assert len(recorder.pushes) == 10_000
+        assert _held_entries(p) == {}
+        assert p.slots.free == 2
+
 
 class TestReceiveDeadline:
     """P writes nothing once D may have given the receive's slots away.
@@ -385,6 +418,7 @@ class TestReceiveDeadline:
         d.get_transfer_results()
         assert d._failed_recv_reqs.get_nowait() == "r"
         # P's writer matches the finished request with the waiting registration.
+        p.start_load_kv(_metadata(finished={"r": ([30, 31],)}))
         p._do_start_push_kv("r", ([30, 31],), p._pop_matching_registration("r"))
         self._write_staged(p)
 
@@ -400,6 +434,7 @@ class TestReceiveDeadline:
         self, recorder, clock, write_after, written
     ):
         d, p = _worker(num_slots=4, recv_timeout=60.0), _worker(num_slots=4)
+        p.start_load_kv(_metadata(finished={"r": ([30, 31],)}))
         p._push_finished_blocks["r"] = ([30, 31],)
         p._handle_push_reg_notif(self._register(d, recorder))
         p.get_transfer_results()
@@ -412,6 +447,7 @@ class TestReceiveDeadline:
 
     def test_p_stops_a_margin_before_ds_deadline(self, recorder, clock):
         d, p = _worker(num_slots=4, recv_timeout=60.0), _worker(num_slots=4)
+        p.start_load_kv(_metadata(finished={"r": ([30, 31],)}))
         p._push_finished_blocks["r"] = ([30, 31],)
         p._handle_push_reg_notif(self._register(d, recorder))
 
@@ -430,6 +466,7 @@ class TestReceiveDeadline:
     ):
         # 8 s left: a quarter of it, 2 s, is the margin.
         d, p = _worker(num_slots=4, recv_timeout=8.0), _worker(num_slots=4)
+        p.start_load_kv(_metadata(finished={"r": ([30, 31],)}))
         p._push_finished_blocks["r"] = ([30, 31],)
         p._handle_push_reg_notif(self._register(d, recorder))
 
@@ -464,6 +501,7 @@ class TestReceiveDeadline:
             _registration([8, 9], request_id="r")
         )
         p = _worker(num_slots=4)
+        p.start_load_kv(_metadata(finished={"r": ([30, 31],)}))
         p._push_finished_blocks["r"] = ([30, 31],)
         p._handle_push_reg_notif(notif)
 
