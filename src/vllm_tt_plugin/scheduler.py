@@ -280,6 +280,14 @@ def multimodal_prefill_limit(vllm_config) -> tuple[int, str]:
     replayed after preemption carries its output tokens and can outgrow one
     step, and its first chunk then ends on a KV block boundary at or after the
     end of its last multimodal item, within one step.
+
+    ``cache_config.block_size`` is the attention block size when a request
+    arrives, also for a model with ``MambaSpec`` groups: ``EngineCore`` sets
+    it to the smallest block size of the KV cache groups, and a ``MambaSpec``
+    group's block size is the attention block size (mode ``align``) or at
+    least ``max_model_len`` (mode ``none``, ``check_mamba_launch``). The
+    frontend takes it from the engine's ready response before it serves a
+    request.
     """
     scheduler_config = vllm_config.scheduler_config
     batched = int(scheduler_config.max_num_batched_tokens)
@@ -690,7 +698,12 @@ class TTScheduler(AsyncScheduler):
         and vLLM's ``strip_covered_mm_data`` drops the pixels of an item a
         prefix-cache hit covers. vLLM still caches the request's blocks: their
         hashes carry the item identifiers from the first item on, so only the
-        text before the first item can match another request.
+        text before the first item can match another request. Its first
+        prefill chunk keeps the state at one block boundary only, the prefill
+        checkpoint at the prompt's last cacheable position
+        (``_multimodal_prefill_grant`` does not end the chunk on earlier
+        boundaries), so another request reuses that text only when the first
+        item starts after the checkpoint.
         """
         if getattr(self, "_multimodal_prefill_block_size", 0) and request.mm_features:
             # Request.__init__ derives the flag from the sampling parameters;

@@ -240,7 +240,14 @@ only for it:
   `strip_covered_mm_data` would also drop the pixels of an item a hit
   covers.) vLLM still caches its blocks. Their hashes carry the item
   identifiers from the first item on, so only the text before the first item
-  can match another request, and the model writes that state like any other.
+  can match another request. A hit also needs the state at its block
+  boundary, and the first prefill chunk keeps that state at one boundary
+  only: the prompt's last cacheable position, its
+  [prefill checkpoint](MODEL_EXECUTION.md#prefill-checkpoints). vLLM's
+  `_mamba_block_aligned_split`, which ends a chunk on a block boundary and so
+  keeps the state there, does not shorten this chunk. So another request
+  reuses the text before the first item only when that item starts after
+  the checkpoint.
 - `TTScheduler._multimodal_prefill_grant` gives the first prefill chunk of
   such a request every multimodal item: the whole prompt when it fits what is
   left of the step, past `long_prefill_token_threshold`. When it fits an empty
