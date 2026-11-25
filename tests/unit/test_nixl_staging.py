@@ -172,10 +172,15 @@ def _registration(block_ids, request_id="d-rid"):
 
 
 def _linked(worker, engine_id: str, peer_engine: str) -> TTNixlPushConnectorWorker:
-    """Give ``worker`` a NIXL agent with a done handshake to ``peer_engine``."""
+    """Give ``worker`` a NIXL agent with a done handshake to ``peer_engine``.
+
+    NIXL's ``add_remote_agent`` returns the peer's name as bytes, while the
+    peer's own agent names itself with a str, so the peer agent is recorded as
+    bytes, as vLLM records it.
+    """
     worker.engine_id = engine_id
     worker.nixl_wrapper = FakeNixl(f"{engine_id}-agent")
-    worker._remote_agents = {peer_engine: {(0, 0): f"{peer_engine}-agent"}}
+    worker._remote_agents = {peer_engine: {(0, 0): f"{peer_engine}-agent".encode()}}
     worker._handshake_lock = threading.Lock()
     worker._ensure_handshake = lambda *args, **kwargs: None
     worker.xfer_stats = MagicMock()

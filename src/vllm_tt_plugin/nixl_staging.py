@@ -1330,12 +1330,15 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         except Exception:
             logger.exception("Failed to decode a TT NIXL notification; dropping it")
             return
+        agent = message.get("agent")
+        if agent is not None:
+            agent = _agent_name(agent)
         if kind == REG_ACK:
-            self._on_reg_ack(req_id, message.get("agent"))
+            self._on_reg_ack(req_id, agent)
         elif kind == CANCEL:
             self._on_cancel(message)
         elif kind == CANCEL_ACK:
-            self._on_cancel_ack(req_id, message.get("agent"))
+            self._on_cancel_ack(req_id, agent)
         elif kind != PROBE:
             logger.warning("Dropping TT NIXL notification %r for %s.", kind, req_id)
 
@@ -1451,7 +1454,7 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             handshake = self._ensure_handshake(
                 engine_id, reg["decode_host"], reg["decode_port"], reg["decode_tp_size"]
             )
-            message = {"agent": self.nixl_wrapper.name}
+            message = {"agent": _agent_name(self.nixl_wrapper.name)}
         if handshake is not None:
             handshake.add_done_callback(
                 functools.partial(
@@ -1495,7 +1498,8 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
         """The names of ``engine_id``'s NIXL agents, as D or P knows them now."""
         # _remote_agents is mutated on other threads; snapshot under the lock.
         with self._handshake_lock:
-            return list((self._remote_agents.get(engine_id) or {}).values())
+            agents = list((self._remote_agents.get(engine_id) or {}).values())
+        return [_agent_name(agent) for agent in agents]
 
     def _notify_agents(
         self, agents: Iterable[str], notif: bytes, req_id: str, failure_type: str
@@ -1582,6 +1586,21 @@ class TTNixlPushConnector(NixlPushConnector):
         """
         super().wait_for_save()
         self.connector_worker.finish_chunk_step(self._connector_metadata)
+
+
+def _agent_name(name: str | bytes) -> str:
+    """A NIXL agent's name as str.
+
+    NIXL's ``add_remote_agent`` returns the peer's name as bytes, which vLLM
+    keeps in ``_remote_agents``; an agent names itself with a str. NIXL sends
+    to either form.
+
+    Examples
+    --------
+    >>> _agent_name(b"p-agent") == _agent_name("p-agent") == "p-agent"
+    True
+    """
+    return name.decode() if isinstance(name, bytes) else name
 
 
 def _flatten(grouped: BlockIds) -> list[int]:

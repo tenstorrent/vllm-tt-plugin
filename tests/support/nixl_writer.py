@@ -156,7 +156,8 @@ def push_writer(worker):
     worker._send_failures = set()
     worker._engine_last_active = {}
     worker._ensure_handshake = lambda *args, **kwargs: None
-    worker._remote_agents = {D_ENGINE: {(0, 0): f"{D_ENGINE}-agent"}}
+    # NIXL's add_remote_agent returns the peer's name as bytes.
+    worker._remote_agents = {D_ENGINE: {(0, 0): f"{D_ENGINE}-agent".encode()}}
     worker._handshake_lock = threading.Lock()
     worker._log_failure = lambda **kwargs: None
     worker.xfer_stats = MagicMock()
