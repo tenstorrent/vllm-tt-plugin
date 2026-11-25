@@ -150,3 +150,27 @@ def test_reorder_grammar_bitmask_rejects_expected_id_absent_from_snapshot():
             batch_length=2,
             expected_structured_output_request_ids={"req-0"},
         )
+
+
+def test_reorder_grammar_bitmask_reads_the_first_row_of_each_block():
+    # A speculating launch gives each structured request a block of
+    # num_speculative_tokens + 1 rows; row 0 is the committed-output grammar.
+    bitmask = torch.tensor([[10], [11], [12], [20], [21], [22]], dtype=torch.int32)
+
+    reordered = reorder_grammar_bitmask_for_tt_batch(
+        bitmask=bitmask,
+        structured_output_request_ids=["req-0", "req-1"],
+        row_req_ids=["req-1", "req-0"],
+        batch_length=2,
+        mask_stride=3,
+    )
+
+    assert reordered[:, 0].tolist() == [20, 10]
+    with pytest.raises(ValueError, match="rows per request=2"):
+        reorder_grammar_bitmask_for_tt_batch(
+            bitmask=bitmask,
+            structured_output_request_ids=["req-0", "req-1"],
+            row_req_ids=["req-1", "req-0"],
+            batch_length=2,
+            mask_stride=2,
+        )

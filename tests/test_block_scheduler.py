@@ -1081,7 +1081,9 @@ def test_a_stage_output_model_counts_sliding_groups_by_their_window(max_num_seqs
         model_config=SimpleNamespace(max_model_len=max_model_len),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         cache_config=SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         attention_config=SimpleNamespace(hisparse_config=None),
@@ -1281,14 +1283,14 @@ def test_diffusion_checkpoint_books_exactly_one_canvas():
     assert request.num_output_placeholders == CANVAS
     assert request.num_computed_tokens == 32
 
-    cache_calls = []
-    scheduler.kv_cache_manager.cache_blocks = lambda *args: cache_calls.append(args)
+    # vLLM calls cache_blocks for a request with output placeholders. Block
+    # output runs with prefix caching off, so that call caches nothing.
+    assert scheduler.kv_cache_manager.enable_caching is False
     outputs = scheduler.update_from_output(
         prefill, _runner_output(prefill, list(range(CANVAS)))
     )
     assert outputs[0].outputs[0].new_token_ids == list(range(CANVAS))
     assert request.num_output_placeholders == 0
-    assert cache_calls == []
 
     decode = scheduler.schedule()
     assert decode.num_scheduled_tokens == {"req-0": CANVAS}
@@ -1298,7 +1300,6 @@ def test_diffusion_checkpoint_books_exactly_one_canvas():
 
     scheduler.update_from_output(decode, _runner_output(decode, list(range(CANVAS))))
     assert request.num_output_placeholders == 0
-    assert cache_calls == []
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
 
