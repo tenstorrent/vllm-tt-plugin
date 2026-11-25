@@ -64,6 +64,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, is_full_attention_spec
 
 from vllm_tt_plugin.config import get_tt_data_parallel_size
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.nixl_chunk_push import NixlPushChunkJob
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -152,34 +153,6 @@ class StagingSlots:
     def give_back(self, slots: list[int]) -> None:
         """Return slots taken earlier."""
         self._free.extend(slots)
-
-
-@dataclasses.dataclass(frozen=True)
-class NixlPushChunkJob:
-    """Prompt blocks ``[start_block, end_block)`` of a P request that one
-    prefill step completes.
-
-    P's scheduler lists a step's jobs in its connector metadata
-    (``push_chunk_jobs``); P's worker copies them into staging slots after
-    the step's forward.
-
-    Attributes
-    ----------
-    request_id
-        P's request ID.
-    block_ids
-        P's device block IDs of the job's blocks, in prompt order.
-    start_block, end_block
-        Positions of the blocks in the prompt.
-    total_blocks
-        Blocks of the whole prompt. The job that ends there is the last one.
-    """
-
-    request_id: str
-    block_ids: list[int]
-    start_block: int
-    end_block: int
-    total_blocks: int
 
 
 @dataclasses.dataclass
