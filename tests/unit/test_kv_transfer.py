@@ -101,6 +101,21 @@ def test_a_copied_shard_is_read_once_and_written_to_every_chip():
         np.testing.assert_array_equal(received.blocks_on(chip)[1], sent.blocks_on(0)[4])
 
 
+def test_a_lane_copy_reads_the_blocks_of_its_own_lane():
+    # Under lane DP every lane numbers its blocks from 0, in its own caches.
+    lanes = [_cache(seed=0), _cache(seed=1)]
+    layouts = [
+        KVLayout({NAME: (KVPart(cache, cache.block_bytes, ((0,), (1,))),)})
+        for cache in lanes
+    ]
+    buffer = _buffer(layouts[0], num_kv_heads=2)
+
+    make_copy_blocks(layouts)(None, buffer, [2], [0], "d2h", lane=1)
+
+    expected = np.concatenate([lanes[1].blocks_on(chip)[2] for chip in (0, 1)])
+    np.testing.assert_array_equal(buffer[NAME][0].reshape(-1).numpy(), expected)
+
+
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
 def test_a_copy_returns_once_its_last_transfer_landed(blocking_calls, direction):
     # The connector sends or reads its buffer right after the copy returns.
