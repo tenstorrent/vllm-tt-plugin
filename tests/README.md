@@ -9,9 +9,14 @@ model-output parsers use this layout; existing tests at the root and under
 | [unit/test_logprobs.py](unit/test_logprobs.py) | Public packing helpers, deterministic tensor inputs, shapes, ranks, and ownership |
 | [unit/test_logger.py](unit/test_logger.py) | Logger setup, warning deduplication, record context, and stdlib-only startup |
 | [unit/parsers/test_kolibri1.py](unit/parsers/test_kolibri1.py) | Kolibri thinking switches, reasoning/content extraction, streaming, and input ownership |
+| [unit/parsers/test_qwen3_arguments.py](unit/parsers/test_qwen3_arguments.py) | Qwen3 tool-call arguments: unclosed last parameter, literal tags in values, call boundaries, streamed versus complete output, and the streaming fast path |
+| [unit/parsers/test_tool_schema.py](unit/parsers/test_tool_schema.py) | Tool-call argument types from `$ref` and `allOf` schemas and string unions |
 | [integration/test_parser_registration.py](integration/test_parser_registration.py) | General entry point and vLLM registries: lazy resolution, aliases, repeated setup, and existing-name precedence |
 | [integration/test_decode_logprobs.py](integration/test_decode_logprobs.py) | Decode controller and runner cooperating on host logprob payloads |
+| [integration/test_tool_call_patches.py](integration/test_tool_call_patches.py) | TT platform hook installing the tool-call parser patches |
 | [support/logprobs.py](support/logprobs.py) | Ranked-payload test data shared by those two modules |
+| [support/tool_calls.py](support/tool_calls.py) | Character tokenizer and one-shot and streamed `qwen3_coder` parsing for the tool-call tests |
+| [support/parser_patches.py](support/parser_patches.py) | Restore of the vLLM parser attributes that the tool-call patches replace |
 | [tt/test_logprobs.py](tt/test_logprobs.py) | Logprobs returned by a live server on TT hardware |
 
 Engineering and test-design rules live in

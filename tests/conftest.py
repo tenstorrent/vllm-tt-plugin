@@ -32,7 +32,11 @@ def reset_tt_platform_class_state():
     from vllm.v1.structured_output import backend_xgrammar
 
     import vllm_tt_plugin.scheduler as tt_scheduler
+    from tests.support import parser_patches
     from vllm_tt_plugin.platform import TTPlatform
+
+    # `TTPlatform.pre_register_and_update` installs the tool-call parser patches.
+    restore_parser_patches = parser_patches.snapshot()
 
     saved_lifespan = server_utils.lifespan
     saved_lifespan_aliases = {
@@ -90,6 +94,7 @@ def reset_tt_platform_class_state():
 
     yield
 
+    restore_parser_patches()
     for name, value in saved_dp_client_methods.items():
         if value is unset:
             if name in dp_client.__dict__:
