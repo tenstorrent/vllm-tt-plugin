@@ -36,7 +36,10 @@ from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
 from vllm_tt_plugin import kv_layout
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
+from vllm_tt_plugin.kv_layout import default_kv_layout
+from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
 from vllm_tt_plugin.model_runner import TTModelRunner
+from vllm_tt_plugin.platform import _install_tt_nixl_single_rank_patch
 
 
 class FakeKVMetadata(KVConnectorMetadata):
@@ -340,6 +343,77 @@ def test_a_model_layout_replaces_the_default_one(worker_connector):
 def test_no_connector_is_handed_kv_without_a_transfer_group(vllm_config):
     # Without --kv-transfer-config the model's KV caches are not inspected.
     _initialize_kv_cache([["not", "a", "kv", "cache"]])
+
+
+class TestNixlConnectorOnTT:
+    """What vLLM's NixlConnector worker asks of TT when it starts."""
+
+    def test_nixl_accepts_tt_with_a_cpu_buffer_only(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+            _NIXL_SUPPORTED_DEVICE,
+        )
+        from vllm.platforms import current_platform
+
+        # NIXL cannot register TT device memory.
+        assert _NIXL_SUPPORTED_DEVICE[current_platform.device_type] == ("cpu",)
+
+    def test_nixl_finds_tt_attention_and_keeps_the_block_size(self, vllm_config):
+        from vllm.distributed.kv_transfer.kv_connector.utils import (
+            get_current_attn_backends,
+        )
+        from vllm.v1.worker.utils import select_common_block_size
+
+        # TT runs no vLLM attention layer, so NIXL asks the platform. Two
+        # servers compare the backend name; a kernel block size other than the
+        # block size would split each block.
+        (backend,) = get_current_attn_backends(vllm_config)
+        assert backend.get_name() == "TT"
+        assert select_common_block_size(BLOCK_SIZE, [backend]) == BLOCK_SIZE
+
+    def test_the_nixl_worker_is_rank_0_of_1(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+
+        # TT creates no tensor-parallel group to ask.
+        _install_tt_nixl_single_rank_patch()
+
+        assert base_worker.get_tensor_model_parallel_rank() == 0
+        assert base_worker.get_tensor_model_parallel_world_size() == 1
+
+    def test_the_nixl_connector_stages_tt_kv_through_a_cpu_buffer(self, vllm_config):
+        pytest.importorskip("nixl")
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+            NixlConnector,
+        )
+
+        vllm_config.kv_transfer_config = KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+            kv_buffer_device="cpu",
+        )
+        spec = FullAttentionSpec(
+            block_size=BLOCK_SIZE, num_kv_heads=CHIPS, head_size=32, dtype=torch.float32
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=NUM_BLOCKS,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(LAYER_NAMES, spec)],
+        )
+        layout = default_kv_layout(_kv_caches(), kv_cache_config)
+        # The platform config hook installs this in a server.
+        _install_tt_nixl_single_rank_patch()
+
+        connector = NixlConnector(vllm_config, KVConnectorRole.WORKER, kv_cache_config)
+        try:
+            connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, layout))
+
+            # NIXL transfers its own CPU buffer, one transferred block per block:
+            # the K and V of that block on every chip.
+            for buffer in connector.connector_worker.host_xfer_buffers.values():
+                assert buffer.device.type == "cpu"
+                assert buffer.shape[0] == NUM_BLOCKS
+                assert buffer[0].nbytes == 2 * CHIPS * FakeKVTensor.block_bytes
+        finally:
+            connector.shutdown()
 
 
 def _scheduler_with_running_decode():
