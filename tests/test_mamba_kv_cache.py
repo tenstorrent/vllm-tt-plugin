@@ -20,9 +20,12 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_planning import (
+    get_global_kv_cache_groups,
+    get_kv_cache_configs,
+)
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
-    get_kv_cache_configs,
     resolve_cache_hit_alignment_tokens,
     resolve_kv_cache_block_sizes,
 )
@@ -93,6 +96,7 @@ def _vllm_config(mamba_cache_mode: str = "none") -> SimpleNamespace:
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="hybrid-mamba-test",
+            supports_kv_cache_grouping=False,
             max_model_len=MAX_MODEL_LEN,
             original_max_model_len=MAX_MODEL_LEN,
             get_sliding_window=lambda: None,
@@ -165,7 +169,9 @@ def _kv_cache_config(cfg, specs: dict, num_blocks: int):
     config to the workers."""
     cfg.cache_config.num_gpu_blocks_override = num_blocks
     available = _available_kv_cache_memory_bytes_for_num_blocks(cfg, specs, num_blocks)
-    [kv_cache_config] = get_kv_cache_configs(cfg, [specs], [available])
+    [kv_cache_config] = get_kv_cache_configs(
+        cfg, [specs], [available], get_global_kv_cache_groups(cfg, [specs])
+    )
     assert kv_cache_config.num_blocks == num_blocks
     scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
         kv_cache_config, cfg
