@@ -358,6 +358,24 @@ class TestReceiveDeadline:
 
         assert recorder.pushes == []
 
+    @pytest.mark.parametrize(
+        ("write_after", "written"),
+        [(5.0, True), (7.0, False)],
+        ids=["before_the_margin", "inside_the_margin"],
+    )
+    def test_a_short_receive_timeout_shrinks_the_margin(
+        self, recorder, clock, write_after, written
+    ):
+        # 8 s left: a quarter of it, 2 s, is the margin.
+        d, p = _worker(num_slots=4, recv_timeout=8.0), _worker(num_slots=4)
+        p._push_finished_blocks["r"] = ([30, 31],)
+        p._handle_push_reg_notif(self._register(d, recorder))
+
+        clock.now += write_after
+        self._write_staged(p)
+
+        assert recorder.pushes == ([("r", ([0, 1],))] if written else [])
+
     def test_d_sends_the_seconds_left_when_it_sends(self, recorder, clock):
         d = _worker(num_slots=4, recv_timeout=60.0)
         d.start_load_kv(_metadata({"r": _registration([5, 6], request_id="r")}))

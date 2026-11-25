@@ -77,8 +77,8 @@ the receive. Only ``TTNixlPushConnectorWorker`` sends and reads it."""
 _RECV_DEADLINE = "tt_recv_deadline"
 _WRITE_DEADLINE = "tt_write_deadline"
 
-# P stops writing this many seconds before D's deadline. P's writer thread reads
-# D's registration up to one engine step after it arrives.
+# Longest margin, in seconds, by which P stops writing before D's deadline; see
+# ``TTNixlPushConnectorWorker._handle_push_reg_notif``.
 _DEADLINE_MARGIN_S = 10.0
 
 
@@ -411,10 +411,21 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         """Set P's write deadline on D's registration, then match it as vLLM does.
 
         Runs on the writer thread. P counts D's ``RECV_SECONDS_LEFT`` from now
-        on its own clock, less ``_DEADLINE_MARGIN_S``. A registration without
-        it, from vLLM's own push worker, gets no deadline. Apart from the
-        deadline this is vLLM's method, which decodes the registration inside
-        and so leaves no hook at receipt.
+        on its own clock and stops writing a margin before they run out:
+        ``_DEADLINE_MARGIN_S``, or a quarter of the seconds left when that is
+        shorter, so that a short ``push_registration_timeout`` still leaves P
+        most of it. A registration without ``RECV_SECONDS_LEFT``, from vLLM's
+        own push worker, gets no deadline. Apart from the deadline this is
+        vLLM's method, which decodes the registration inside and so leaves no
+        hook at receipt.
+
+        Notes
+        -----
+        The margin covers the time from D's send to P's receipt, including P's
+        writer thread reading the notification up to one engine step late: it
+        reads NIXL notifications once per step unless it is polling for
+        unmatched finished requests. D's quarantine of ``kv_lease_duration``
+        covers WRITEs still in flight at D's deadline.
         """
         received = time.perf_counter()
         try:
@@ -428,7 +439,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             return
         left = reg.get(RECV_SECONDS_LEFT)
         if left is not None:
-            reg[_WRITE_DEADLINE] = received + float(left) - _DEADLINE_MARGIN_S
+            left = float(left)
+            margin = min(_DEADLINE_MARGIN_S, left / 4)
+            reg[_WRITE_DEADLINE] = received + left - margin
         match = self._pop_matching_finished_blocks(rid)
         if match is None:
             self._pending_d_registrations[rid] = reg
@@ -460,11 +473,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         deadline = registration_data.get(_WRITE_DEADLINE)
         if deadline is not None and time.perf_counter() > deadline:
             logger.warning(
-                "Dropping push of %s: D's receive deadline for %s is under %.0f s "
-                "away or past.",
+                "Dropping push of %s: D's receive deadline for %s is near or past.",
                 request_id,
                 registration_data["request_id"],
-                _DEADLINE_MARGIN_S,
             )
             return
         if not staged:
