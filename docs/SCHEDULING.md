@@ -849,11 +849,10 @@ independent TT servers behind vLLM's DP request routing.
 
 On a single host, the plugin discovers TT device groups at startup and assigns
 one group to each rank through `TT_VISIBLE_DEVICES`. Discovery splits only the
-chips that the server's own `TT_VISIBLE_DEVICES` selects, and each group names
-them by the same host-wide ids, so two DP servers on disjoint chip lists of one
-host do not share chips. Where every chip is on PCIe, that value must list
-integer ids, not PCI addresses. Request routing binds each request to one rank;
-requests do not migrate between ranks.
+chips that the server's own `TT_VISIBLE_DEVICES` selects, in any form that
+tt-metal accepts, and each group names its chips by PCI address, so two DP
+servers on disjoint chip lists of one host do not share chips. Request routing
+binds each request to one rank; requests do not migrate between ranks.
 
 Each rank is a separate tt-metal process, so the worker also separates their
 diagnostics before the first device open, using tt-metal's own variables

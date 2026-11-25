@@ -13,8 +13,7 @@ __all__ = (
 
 import ast
 import logging
-import os
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import suppress
 
 import yaml
@@ -183,15 +182,19 @@ def _discover_standard_dp_visible_device_groups(
 
     Notes
     -----
-    This helper requires a live TT runtime and submesh creation support. It runs
-    under the launcher's ``TT_VISIBLE_DEVICES``, and each group names its chips
-    the way that value does (see ``_host_chip_ids``), so a worker bound to the
-    group opens the same chips.
+    This helper requires a live TT runtime and submesh creation support.
+
+    Every group names its chips by PCI address. Chip ids are local to this
+    process, which runs under the launcher's ``TT_VISIBLE_DEVICES``: under
+    ``"2,3"``, chips 0 and 1 are the host's third and fourth cards, while a
+    worker given ``"0"`` would open the host's first. A PCI address names the
+    same card in every process, whatever form the launcher's selection takes.
 
     Examples
     --------
-    >>> _discover_standard_dp_visible_device_groups("T3K", 4)
-    [("0,1,2,3,4,5,6,7", (1, 8)), ...]
+    >>> # 8x P150 host, launched with TT_VISIBLE_DEVICES="2,3".
+    >>> _discover_standard_dp_visible_device_groups("P150", 2)
+    [('0000:41:00.0', (1, 1)), ('0000:61:00.0', (1, 1))]
     """
     import ttnn
 
@@ -211,7 +214,7 @@ def _discover_standard_dp_visible_device_groups(
                 [f"{visible}@{shape}" for visible, shape in card_groups],
             )
             return card_groups
-        host_chip_ids = _host_chip_ids(num_devices_available)
+        pci_address_of_chip = _pci_address_by_chip(range(num_devices_available))
         mesh_grid = _resolve_parent_mesh_grid(mesh_device_env, num_devices_available)
         mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*mesh_grid))
         submeshes = create_dp_submeshes(mesh_device, data_parallel_size)
@@ -229,7 +232,7 @@ def _discover_standard_dp_visible_device_groups(
             device_groups.append(
                 (
                     format_tt_visible_devices(
-                        [host_chip_ids[device_id] for device_id in device_ids]
+                        [pci_address_of_chip[device_id] for device_id in device_ids]
                     ),
                     tuple(int(dim) for dim in submesh.shape),
                 )
@@ -272,12 +275,8 @@ def _card_aligned_device_groups(
     parent mesh, which pairs chips of neighbouring cards, has no
     ``TT_VISIBLE_DEVICES`` value that selects it. The only groups a rank can
     open are whole cards. Returns None when every chip is on PCIe, where each
-    chip has its own visible id and the submesh split applies.
-
-    Each card is named by its PCI address, not by its chip id. Chip ids are
-    local to this process: under an operator's ``TT_VISIBLE_DEVICES="2,3"``,
-    chips 0 and 1 are the host's third and fourth cards, while a worker given
-    ``"0"`` would open the host's first.
+    chip has its own visible id and the submesh split applies. Each card is
+    named by its PCI address.
 
     Examples
     --------
@@ -300,84 +299,46 @@ def _card_aligned_device_groups(
             "ethernet-attached chips cannot be named in TT_VISIBLE_DEVICES, so no "
             "other split can be opened."
         )
-    pci_address_of_chip = _pci_address_by_chip()
-    missing = [card for card in cards if card not in pci_address_of_chip]
-    if missing:
-        raise RuntimeError(
-            f"The TT cluster descriptor has no PCI address for PCIe chips {missing}"
-        )
+    pci_address_of_chip = _pci_address_by_chip(cards)
     return [(pci_address_of_chip[card], (1, chips_per_card)) for card in cards]
 
 
-def _pci_address_by_chip() -> dict[int, str]:
-    """Maps each PCIe chip id of this process to its card's PCI address."""
+def _pci_address_by_chip(chips: Iterable[int]) -> dict[int, str]:
+    """Maps PCIe chip ids of this process to their cards' PCI addresses.
+
+    Parameters
+    ----------
+    chips : Iterable[int]
+        PCIe chip ids of this process to map.
+
+    Returns
+    -------
+    dict[int, str]
+        Full PCI address, such as ``"0000:41:00.0"``, of each chip in ``chips``,
+        read from the TT cluster descriptor. ``TT_VISIBLE_DEVICES`` accepts it.
+
+    Raises
+    ------
+    RuntimeError
+        If the cluster descriptor has no address for one of ``chips``.
+    """
     import ttnn
 
     with open(ttnn.cluster.serialize_cluster_descriptor()) as f:
         # BaseLoader keeps every value a string: YAML 1.1 reads an all-digit
         # address such as 0000:31:00.0 as a base-60 float.
         descriptor = yaml.load(f, Loader=yaml.BaseLoader)
-    return {
+    addresses = {
         int(chip): address
         for chip, address in descriptor.get("chip_pci_bdfs", {}).items()
     }
-
-
-def _host_chip_ids(num_devices: int) -> list[int]:
-    """Maps each chip id of this process to its ``TT_VISIBLE_DEVICES`` id.
-
-    Chip ids are local to this process. UMD numbers the PCIe chips that the
-    inherited ``TT_VISIBLE_DEVICES`` selects 0 to n-1 in PCI address order,
-    which is the order of the host-wide integer ids, not the order in which the
-    value lists them: under ``"3,1"``, chip 0 is the host's chip 1. A worker
-    resolves its own ``TT_VISIBLE_DEVICES`` against the whole host, so it must
-    receive host-wide ids.
-
-    Parameters
-    ----------
-    num_devices : int
-        Number of chips this process sees, ``ttnn.get_num_devices()``. Every
-        chip must be on PCIe.
-
-    Returns
-    -------
-    list[int]
-        Entry ``i`` is the host-wide id of chip ``i``. Without an inherited
-        ``TT_VISIBLE_DEVICES``, chip ids are host-wide and this is
-        ``range(num_devices)``.
-
-    Raises
-    ------
-    ValueError
-        If the inherited ``TT_VISIBLE_DEVICES`` holds an entry that is not an
-        integer id, such as a PCI address.
-    RuntimeError
-        If it does not select exactly ``num_devices`` chips.
-
-    Examples
-    --------
-    >>> from unittest import mock
-    >>> with mock.patch.dict(os.environ, {"TT_VISIBLE_DEVICES": "3,1"}):
-    ...     _host_chip_ids(2)
-    [1, 3]
-    """
-    visible = os.environ.get("TT_VISIBLE_DEVICES")
-    if visible is None:
-        return list(range(num_devices))
-    tokens = [token.strip() for token in visible.split(",") if token.strip()]
-    if not all(token.isdecimal() for token in tokens):
-        raise ValueError(
-            f"Standard data parallelism on PCIe chips needs integer device ids in "
-            f"TT_VISIBLE_DEVICES to name each rank's chips, got {visible!r}"
-        )
-    host_ids = sorted({int(token) for token in tokens})
-    if len(host_ids) != num_devices:
+    chips = list(chips)
+    missing = [chip for chip in chips if chip not in addresses]
+    if missing:
         raise RuntimeError(
-            f"TT_VISIBLE_DEVICES={visible!r} selects chips {host_ids}, but this "
-            f"process sees {num_devices}, so its chip ids cannot be mapped back "
-            "to host-wide ids"
+            f"The TT cluster descriptor has no PCI address for PCIe chips {missing}"
         )
-    return host_ids
+    return {chip: addresses[chip] for chip in chips}
 
 
 def format_tt_visible_devices(device_ids: Sequence[int | str]) -> str:
