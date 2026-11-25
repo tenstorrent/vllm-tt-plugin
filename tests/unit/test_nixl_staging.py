@@ -9,6 +9,7 @@ test sees which IDs reach vLLM and which copies the overrides make.
 
 import queue
 import threading
+from collections import defaultdict
 from types import SimpleNamespace
 
 import msgspec
@@ -25,6 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
 
 from vllm_tt_plugin import nixl_staging
 from vllm_tt_plugin.nixl_staging import StagingSlots, TTNixlPushConnectorWorker
+
+# vLLM's WRITE submission, which ``recorder`` replaces.
+_SUBMIT_PUSH = NixlPushConnectorWorker._do_start_push_kv
 
 
 class TestStagingSlots:
@@ -290,6 +294,64 @@ class TestPrefillSide:
 
         assert worker.copies == []
         assert worker.slots.free == 2
+
+
+class TestSendSlotLifetime:
+    """P's slots stay with a request while its write is being submitted or runs."""
+
+    def test_a_lease_that_expires_during_submission_keeps_the_slots(
+        self, recorder, monkeypatch
+    ):
+        p = _worker(num_slots=2)
+        registration = {
+            **_registration([8, 9]),
+            "decode_engine_id": "d-engine",
+            "decode_host": "d-host",
+            "decode_port": 1,
+            "decode_tp_size": 1,
+        }
+        p.start_load_kv(_metadata(finished={"p": ([30, 31],)}))
+        p._do_start_push_kv("p", ([30, 31],), registration)
+        p.get_transfer_results()
+        pushed = p._deferred_push_inbox.get_nowait()
+        # vLLM's own submission, paused where it waits for P's handshake with
+        # D, after the TT override has let it use the slots.
+        monkeypatch.setattr(NixlPushConnectorWorker, "_do_start_push_kv", _SUBMIT_PUSH)
+        p.world_size = 1
+        p._physical_blocks_per_logical_kv_block = 1
+        p._engine_last_active = {}
+        p._sending_transfers = defaultdict(list)
+        paused, resume = threading.Event(), threading.Event()
+        submitted = []
+
+        def handshake(*args):
+            paused.set()
+            resume.wait(5)
+
+        def write(req_id, meta):
+            submitted.append((req_id, meta.local_block_ids, p.slots.free))
+            p._sending_transfers[req_id].append("handle")
+
+        p._ensure_handshake = handshake
+        p._xfer_blocks_for_req = write
+        writer = threading.Thread(target=p._do_start_push_kv, args=pushed)
+        writer.start()
+        assert paused.wait(5)
+
+        recorder.results.finished_sending = {"p"}
+        p.get_transfer_results()
+        free_during_submission = p.slots.free
+        resume.set()
+        writer.join(5)
+        p.get_transfer_results()
+        free_while_writing = p.slots.free
+        del p._sending_transfers["p"]
+        p.get_transfer_results()
+
+        assert free_during_submission == 0
+        assert submitted == [("p", ([0, 1],), 0)]
+        assert free_while_writing == 0
+        assert p.slots.free == 2
 
 
 class TestReceiveDeadline:

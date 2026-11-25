@@ -169,7 +169,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     * ``_to_stage`` carries matched P requests from the writer thread to the
       model runner thread.
     * ``_send_slots`` and ``_released`` (P) are written by the model runner
-      thread and read by the writer thread, under ``_lock``.
+      thread and read by the writer thread, under ``_lock``. The writer thread
+      adds a staged request to ``_submitting`` under the same lock before it
+      submits the write, and removes it once vLLM has published the write's
+      handles; the model runner thread frees the slots of neither.
     * D's registration carries ``_RECV_DEADLINE`` from the model runner thread
       to the writer thread; P's carries ``_WRITE_DEADLINE`` from the writer
       thread through staging and back.
@@ -293,7 +296,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
 
         A D request whose KV has not arrived by its deadline is reported as a
         failed receive (vLLM's push path waits for it indefinitely). Its slots
-        rest for ``kv_lease_duration``, since P's write may still land.
+        rest for ``kv_lease_duration``, since P's write may still land. A P
+        request reported sent keeps its slots while the writer thread is
+        submitting its write or a write handle is in flight.
         """
         now = time.perf_counter()
         for req_id, deadline in list(self._recv_deadlines.items()):
@@ -328,16 +333,21 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 self._quarantined.append((now + self._quarantine, _flatten(slots)))
             else:
                 self.slots.give_back(_flatten(slots))
+        freed = []
         with self._lock:
             self._released |= results.finished_sending
-        self._release_pending |= results.finished_sending & self._send_slots.keys()
-        with self._sending_transfers_lock:
-            writing = {r for r, handles in self._sending_transfers.items() if handles}
-        for req_id in list(self._release_pending - writing):
-            self._release_pending.discard(req_id)
-            with self._lock:
-                slots = self._send_slots.pop(req_id)
-            self.slots.give_back(slots)
+            self._release_pending |= results.finished_sending & self._send_slots.keys()
+            # Under ``_lock``, so that the writer either sees the slots gone or
+            # has marked its submission before this looks.
+            with self._sending_transfers_lock:
+                for req_id in list(self._release_pending):
+                    if req_id in self._submitting or self._sending_transfers.get(
+                        req_id
+                    ):
+                        continue
+                    self._release_pending.discard(req_id)
+                    freed += self._send_slots.pop(req_id)
+        self.slots.give_back(freed)
         for req_id in results.finished_sending - self._send_slots.keys():
             self._send_lane.pop(req_id, None)
         self._stage_matched_sends()
@@ -395,6 +405,8 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._released: set[str] = set()
         # P: finished requests whose slots wait for their last write handle.
         self._release_pending: set[str] = set()
+        # P: staged requests whose write the writer thread is submitting.
+        self._submitting: set[str] = set()
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         """Send D's registration with the seconds left until D fails the receive.
@@ -463,13 +475,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         Past the registration's write deadline it drops the push: D may have
         given the slots to another request. A dropped staged push keeps its
         slots until vLLM reports the send finished, at the end of P's lease.
+        While vLLM's method submits the write, the request is in
+        ``_submitting``, so that ``get_transfer_results`` keeps its slots.
         """
-        with self._lock:
-            released = request_id in self._released
-            staged = request_id in self._send_slots
-        if released and not staged:
-            logger.debug("Dropping push of %s: its send already ended.", request_id)
-            return
         deadline = registration_data.get(_WRITE_DEADLINE)
         if deadline is not None and time.perf_counter() > deadline:
             logger.warning(
@@ -478,10 +486,21 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 registration_data["request_id"],
             )
             return
+        with self._lock:
+            staged = request_id in self._send_slots
+            if staged:
+                self._submitting.add(request_id)
+            elif request_id in self._released:
+                logger.debug("Dropping push of %s: its send already ended.", request_id)
+                return
         if not staged:
             self._to_stage.put((request_id, local_block_ids, registration_data))
             return
-        super()._do_start_push_kv(request_id, local_block_ids, registration_data)
+        try:
+            super()._do_start_push_kv(request_id, local_block_ids, registration_data)
+        finally:
+            with self._lock:
+                self._submitting.discard(request_id)
 
     def _stage_matched_sends(self) -> None:
         """Copy matched P requests from the chips into slots and queue their writes.
