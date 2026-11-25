@@ -14,13 +14,16 @@ the requests in flight:
 * P (prefill) waits until its finished request is matched with D's
   registration, then takes slots for only the blocks D asked for, copies them
   from its chips, and lets vLLM write the slots to D.
-* D fails a receive whose KV has not arrived by its deadline, and later gives
-  its slots to another request. D's registration tells P the seconds left, and
-  P writes nothing once they have run out.
+* D fails a receive whose KV has not arrived within
+  ``push_registration_timeout``. It gives the receive's slots to another
+  request only once P has confirmed that it writes nothing more into them
+  (``TTNixlPushConnectorWorker``, Notes).
 
 vLLM's scheduler keeps using real block IDs; only the IDs that reach NIXL are
 slot numbers. Copies between chips and slots run on the model runner thread,
-the only thread that may touch the device.
+the only thread that may touch the device. P and D must both run
+``TTNixlPushConnector``: they exchange notifications that vLLM's push worker
+does not send or understand.
 
 Principal entry points: ``TTNixlPushConnector`` (selected with
 ``"kv_connector": "TTNixlPushConnector"``) and ``register_kv_connectors``.
@@ -28,10 +31,12 @@ Principal entry points: ``TTNixlPushConnector`` (selected with
 
 import copy
 import dataclasses
+import functools
 import queue
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from typing import Any
 
 import msgspec
@@ -68,18 +73,37 @@ CONNECTOR_NAME = "TTNixlPushConnector"
 # A request in flight on each side while the next one is being staged.
 _REQUESTS_PER_POOL = 2
 
-RECV_SECONDS_LEFT = "tt_recv_seconds_left"
-"""PUSH_REG field: seconds left, when D sends the registration, until D fails
-the receive. Only ``TTNixlPushConnectorWorker`` sends and reads it."""
+TT_NOTIF_PREFIX = PUSH_REG_NOTIF_PREFIX + b"tt:"
+"""Prefix of the notifications that only ``TTNixlPushConnectorWorker`` sends.
 
-# Registration fields that never leave their side: D's receive deadline and
-# P's write deadline, each on its own side's ``time.perf_counter`` clock.
-_RECV_DEADLINE = "tt_recv_deadline"
-_WRITE_DEADLINE = "tt_write_deadline"
+They start like a ``PUSH_REG``, so that vLLM's writer loop hands them to
+``_handle_push_reg_notif`` on the writer thread, which owns the registrations
+they concern. The rest is a msgpack map: ``kind`` (``REG_ACK``, ``CANCEL`` or
+``CANCEL_ACK``), ``request_id`` (D's request ID) and, in a ``CANCEL``, D's
+``decode_*`` address fields from the registration."""
 
-# Longest margin, in seconds, by which P stops writing before D's deadline; see
-# ``TTNixlPushConnectorWorker._handle_push_reg_notif``.
-_DEADLINE_MARGIN_S = 10.0
+REG_ACK = "reg-ack"
+"""P to D: P has recorded D's registration; a later ``CANCEL`` finds it."""
+CANCEL = "cancel"
+"""D to P: D failed the receive; P must write nothing more into its slots."""
+CANCEL_ACK = "cancel-ack"
+"""P to D: no write into the cancelled receive's slots is in flight or will be
+submitted; D may give them to another request."""
+
+# The address fields of D, from a registration, that P needs to answer.
+_DECODE_ADDRESS = ("decode_engine_id", "decode_host", "decode_port", "decode_tp_size")
+
+# Keys TT adds to registration dicts on their own side; none is ever sent.
+# D: the number of P agents the registration went to.
+_SENT_TO = "tt_sent_to"
+# D: the receive failed before the registration was sent; never send it.
+_WITHDRAWN = "tt_withdrawn"
+# P: D cancelled the registration; write nothing for it.
+_CANCELLED = "tt_cancelled"
+# Kinds of queued ``_WriterTask`` besides the notifications. D: the receive
+# succeeded, so it is never cancelled. P: send the cancel acknowledgements due.
+_RECEIVED = "received"
+_SETTLE = "settle"
 
 
 def register_kv_connectors() -> None:
@@ -152,6 +176,54 @@ class StagingSlots:
 
 
 @dataclasses.dataclass
+class _Receive:
+    """D's record of a request whose registration holds staging slots.
+
+    Attributes
+    ----------
+    slots
+        The staging slots, grouped like ``device``.
+    device
+        D's blocks that the slots are copied into.
+    lane
+        The lane whose chips hold ``device``.
+    reg
+        The registration with slot numbers, as handed to vLLM. vLLM's writer
+        thread sends this dict, and TT's writer thread marks it.
+    """
+
+    slots: BlockIds
+    device: BlockIds
+    lane: int
+    reg: dict[str, Any]
+
+
+@dataclasses.dataclass
+class _Unacked:
+    """D's record of a sent registration that awaits P's acknowledgements.
+
+    It lives on the writer thread from the send until every P agent the
+    registration went to has sent ``REG_ACK`` or the receive has succeeded,
+    and, once cancelled, until every one has sent ``CANCEL_ACK``.
+
+    Attributes
+    ----------
+    reg
+        The registration; ``reg[_SENT_TO]`` acknowledgements of each kind are
+        awaited.
+    reg_acks, cancel_acks
+        ``REG_ACK`` and ``CANCEL_ACK`` notifications received.
+    cancelled
+        D failed the receive. ``CANCEL`` goes out once every ``REG_ACK`` is in.
+    """
+
+    reg: dict[str, Any]
+    reg_acks: int = 0
+    cancelled: bool = False
+    cancel_acks: int = 0
+
+
+@dataclasses.dataclass
 class _Send:
     """P's record of a finished request, from its finish until its slots are free.
 
@@ -159,6 +231,9 @@ class _Send:
     ----------
     lane
         The lane whose chips hold the request's KV.
+    reg
+        D's registration, once the writer thread has matched the request with
+        it.
     slots
         The staging slots the request was copied into, once staged.
     submitting
@@ -170,9 +245,34 @@ class _Send:
     """
 
     lane: int
+    reg: dict[str, Any] | None = None
     slots: list[int] | None = None
     submitting: bool = False
     ended: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _WriterTask:
+    """Work for the writer thread, queued on vLLM's ``_reg_send_inbox``.
+
+    vLLM's writer loop hands each item of ``_reg_send_inbox`` to
+    ``_send_registration_to_p``, which runs a task instead of sending a
+    registration.
+
+    Attributes
+    ----------
+    kind
+        ``CANCEL``: D withdraws or cancels ``reg``. ``_RECEIVED``: D's receive
+        succeeded; D awaits no acknowledgement of it. ``REG_ACK`` or
+        ``CANCEL_ACK``: P sends it for ``reg`` now that its handshake with D is
+        done. ``_SETTLE``: P sends the cancel acknowledgements now due.
+    reg
+        The registration, or for ``CANCEL_ACK`` D's ``CANCEL``; empty for
+        ``_RECEIVED`` and ``_SETTLE``.
+    """
+
+    kind: str
+    reg: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
@@ -185,23 +285,60 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
 
     Notes
     -----
+    D's receive of a request fails when no KV arrives within
+    ``push_registration_timeout``, or when vLLM reports it failed. P may still
+    write into its slots then: P can read the registration late, or have a
+    write in flight. D therefore gives the slots to another request only on
+    P's word, given in these notifications (``TT_NOTIF_PREFIX``):
+
+    1. D's writer thread sends the registration, ``PUSH_REG``, as vLLM does.
+    2. P's writer thread records it, matched or pending, then sends
+       ``REG_ACK``.
+    3. D's model runner thread fails the receive and queues its cancellation
+       to D's writer thread. A registration not yet sent is withdrawn, and
+       the slots are free at once. For a sent one, D's writer thread sends
+       ``CANCEL`` once every ``REG_ACK`` is in.
+    4. P's writer thread marks the registration cancelled, or drops it if it
+       is pending, and sends ``CANCEL_ACK`` once no write of the P requests
+       matched with it has a handle in flight.
+    5. Once every ``CANCEL_ACK`` is in, D's writer thread hands the receive
+       back to D's model runner thread, which frees its slots.
+
+    NIXL does not order notifications, so ``CANCEL`` waits for ``REG_ACK``:
+    P reads a ``CANCEL`` only after it has recorded the registration, and no
+    copy of the registration can reach P afterwards. P submits writes only on
+    its writer thread, and each submission point (``_do_start_push_kv``)
+    checks the mark there. Any write into the slots was therefore submitted
+    before P read ``CANCEL`` and ended before P sent ``CANCEL_ACK``, which is
+    before D frees the slots. A write ends when vLLM releases its handle, after
+    NIXL reports it done or failed; as vLLM's own release of P's blocks, this
+    takes NIXL's word that a done write has landed. A P that never answers
+    leaves the slots reserved: D loses capacity, never data. TT engines run
+    one NIXL agent each; the acknowledgement counts allow several.
+
     State and threads:
 
-    * ``_recv_slots``, ``_recv_deadlines``, ``_expired``, ``_quarantined``,
-      ``_load_errors`` and ``_waiting_registrations`` (D), ``_waiting_stage``
-      (P) and ``slots`` belong to the model runner thread.
+    * ``_receives``, ``_recv_deadlines``, ``_cancelling``, ``_load_errors``
+      and ``_waiting_registrations`` (D), ``_waiting_stage`` (P) and ``slots``
+      belong to the model runner thread.
+    * ``_unacked`` (D) belongs to the writer thread. ``_cancel_done`` carries
+      settled cancellations from the writer thread to the model runner
+      thread; ``_reg_send_inbox`` carries ``_WriterTask`` items to the writer
+      thread. D's model runner thread does not touch a registration after
+      handing it to vLLM; the writer thread marks it.
     * ``_to_stage`` carries matched P requests from the writer thread to the
       model runner thread.
     * ``_sends`` (P) holds a ``_Send`` per finished request, under ``_lock``.
       The model runner thread adds it when the request finishes, stages the
-      request, marks it ended and removes it; the writer thread marks it
-      submitting while vLLM submits its write. The model runner thread removes
-      it, and frees its slots, once it has ended, is not being submitted and
-      has no write handle in flight. A request finishes once, so work that
-      finds no record belongs to a send that is over and is dropped.
-    * D's registration carries ``_RECV_DEADLINE`` from the model runner thread
-      to the writer thread; P's carries ``_WRITE_DEADLINE`` from the writer
-      thread through staging and back.
+      request, marks it ended and removes it; the writer thread sets its
+      registration when it matches the request and marks it submitting while
+      vLLM submits its write. The model runner thread removes it, and frees
+      its slots, once it has ended, is not being submitted and has no write
+      handle in flight. A request finishes once, so work that finds no record
+      belongs to a send that is over and is dropped.
+    * ``_cancel_waits`` (P), and the ``_CANCELLED`` mark on P's registrations,
+      are written by the writer thread under ``_lock``. The model runner
+      thread reads them, under the same lock, only to skip work.
     """
 
     def __init__(self, vllm_config, engine_id: str, kv_cache_config):
@@ -225,7 +362,6 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
             recv_timeout=float(
                 extra.get_from_extra_config("push_registration_timeout", ttl)
             ),
-            quarantine=float(extra.get_from_extra_config("kv_lease_duration", 30)),
             pool_blocks=kv_cache_config.num_blocks,
         )
         logger.info(
@@ -251,8 +387,7 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Send D's registrations with slot numbers, and stage P's matched sends.
 
-        Each registration also carries D's receive deadline, which
-        ``_do_send_reg_notif`` turns into the seconds left. Under lane DP,
+        A registration waits until enough slots are free. Under lane DP,
         ``metadata.tt_lane_of`` names each request's lane: block IDs are
         lane-local. Without it every request is on lane 0.
         """
@@ -267,19 +402,15 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         registrations = {}
         for req_id, reg, lane in queued:
             self._recv_deadlines.setdefault(req_id, now + self._recv_timeout)
-            if req_id in self._expired:
-                continue
             device = self._as_grouped_block_ids(reg["local_block_ids"])
             slots = self._take_slots(device)
             if slots is None:
                 self._waiting_registrations.append((req_id, reg, lane))
                 continue
-            self._recv_slots[req_id] = (slots, device, lane)
-            registrations[req_id] = {
-                **reg,
-                "local_block_ids": slots,
-                _RECV_DEADLINE: self._recv_deadlines[req_id],
-            }
+            registrations[req_id] = {**reg, "local_block_ids": slots}
+            self._receives[req_id] = _Receive(
+                slots, device, lane, registrations[req_id]
+            )
         with self._lock:
             for req_id in metadata.push_finished_blocks or {}:
                 self._sends[req_id] = _Send(lane_of.get(req_id, 0))
@@ -293,19 +424,24 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         """Copy nothing per step: P stages a request once D's blocks are known."""
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta) -> None:
-        """Copy a received request from its slots into the chips; free the slots."""
-        slots, device, lane = self._recv_slots.pop(req_id)
+        """Copy a received request from its slots into the chips; free the slots.
+
+        P has written the request, so D no longer awaits P's acknowledgement
+        of its registration.
+        """
+        receive = self._receives.pop(req_id)
         self._recv_deadlines.pop(req_id, None)
-        flat_slots = _flatten(slots)
+        flat_slots = _flatten(receive.slots)
         self.copy_blocks(
             self.host_xfer_buffers,
             self.device_kv_caches,
             flat_slots,
-            _flatten(device),
+            _flatten(receive.device),
             "h2d",
-            lane=lane,
+            lane=receive.lane,
         )
         self.slots.give_back(flat_slots)
+        self._reg_send_inbox.put((req_id, _WriterTask(_RECEIVED)))
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Blocks of failed receives, as ``lane * pool blocks + block ID``.
@@ -319,19 +455,18 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         return errors
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
-        """Report vLLM's results; free slots of failed receives and done sends.
+        """Report vLLM's results; free slots of done sends and cancelled receives.
 
         A D request whose KV has not arrived by its deadline is reported as a
-        failed receive (vLLM's push path waits for it indefinitely). Its slots
-        rest for ``kv_lease_duration``, since P's write may still land. A P
-        request reported sent keeps its slots while the writer thread is
-        submitting its write or a write handle is in flight.
+        failed receive (vLLM's push path waits for it indefinitely). The slots
+        of a failed receive go back once P has acknowledged its cancellation
+        (Notes). A P request reported sent keeps its slots while the writer
+        thread is submitting its write or a write handle is in flight.
         """
         now = time.perf_counter()
         for req_id, deadline in list(self._recv_deadlines.items()):
             if now > deadline:
                 del self._recv_deadlines[req_id]
-                self._expired.add(req_id)
                 self._failed_recv_reqs.put(req_id)
                 # One still waiting for slots never registered with P.
                 self._waiting_registrations = deque(
@@ -342,25 +477,27 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                     req_id,
                     self._recv_timeout,
                 )
-        while self._quarantined and self._quarantined[0][0] <= now:
-            self.slots.give_back(self._quarantined.popleft()[1])
+        self._give_back_cancelled()
         results = super().get_transfer_results()
         for req_id in results.failed_recving:
             self._recv_deadlines.pop(req_id, None)
-            expired = req_id in self._expired
-            self._expired.discard(req_id)
-            entry = self._recv_slots.pop(req_id, None)
-            if entry is None:
+            receive = self._receives.pop(req_id, None)
+            if receive is None:
                 continue
-            slots, device, lane = entry
             self._load_errors |= {
-                lane * self._pool_blocks + block for block in _flatten(device)
+                receive.lane * self._pool_blocks + block
+                for block in _flatten(receive.device)
             }
-            if expired:
-                self._quarantined.append((now + self._quarantine, _flatten(slots)))
-            else:
-                self.slots.give_back(_flatten(slots))
+            self._cancelling[req_id] = _flatten(receive.slots)
+            self._reg_send_inbox.put((req_id, _WriterTask(CANCEL, receive.reg)))
+            self._push_writer_wake.set()
         self._end_sends(results.finished_sending)
+        with self._lock:
+            settle = bool(self._cancel_waits)
+        if settle:
+            # vLLM has just released the handles of writes that ended.
+            self._reg_send_inbox.put(("", _WriterTask(_SETTLE)))
+            self._push_writer_wake.set()
         self._stage_matched_sends()
         return results
 
@@ -368,7 +505,6 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self,
         num_slots: int,
         recv_timeout: float = 480.0,
-        quarantine: float = 30.0,
         pool_blocks: int = 0,
     ) -> None:
         """Create the slot pool and the per-request staging state.
@@ -378,31 +514,30 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         num_slots
             Host rows of the pool.
         recv_timeout
-            Seconds D waits for a request's KV, from its registration, before
-            failing it.
-        quarantine
-            Seconds the slots of a failed receive rest before reuse.
+            Seconds D waits for a request's KV, from its first registration,
+            before failing it.
         pool_blocks
             Blocks in each lane's KV pool; numbers the blocks of failed
             receives per lane.
         """
         self.slots = StagingSlots(num_slots)
         self._pool_blocks = pool_blocks
+        self._recv_timeout = recv_timeout
+        self._lock = threading.Lock()
         # D: lane-numbered blocks of failed receives, for vLLM to recompute.
         self._load_errors: set[int] = set()
-        self._recv_timeout = recv_timeout
-        self._quarantine = quarantine
-        # D: deadline per request whose registration went out.
+        # D: deadline per request, set when D first tries to register it.
         self._recv_deadlines: dict[str, float] = {}
-        # D: requests this worker failed at their deadline.
-        self._expired: set[str] = set()
-        # D: (release time, slots) of failed receives, oldest first.
-        self._quarantined: deque[tuple[float, list[int]]] = deque()
-        self._lock = threading.Lock()
-        # D: slots, device blocks and lane per request whose registration went out.
-        self._recv_slots: dict[str, tuple[BlockIds, BlockIds, int]] = {}
+        # D: each request whose registration holds slots.
+        self._receives: dict[str, _Receive] = {}
         # D: (request, registration, lane) waiting for free slots, oldest first.
         self._waiting_registrations: deque[tuple[str, dict[str, Any], int]] = deque()
+        # D: slots of failed receives, until their cancellation settles.
+        self._cancelling: dict[str, list[int]] = {}
+        # D: requests whose cancellation the writer thread has settled.
+        self._cancel_done: queue.Queue[str] = queue.Queue()
+        # D, writer thread: sent registrations that await P's acknowledgements.
+        self._unacked: dict[str, _Unacked] = {}
         # P: matched requests (device blocks, D's registration) to stage.
         self._to_stage: queue.Queue[tuple[str, BlockIds, dict[str, Any]]] = (
             queue.Queue()
@@ -410,39 +545,64 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         self._waiting_stage: deque[tuple[str, BlockIds, dict[str, Any]]] = deque()
         # P: each finished request until its send has ended and its slots are free.
         self._sends: dict[str, _Send] = {}
+        # P: per request ID of D that D cancelled, D's CANCEL and the P requests
+        # matched with it, whose writes must end before P acknowledges it.
+        self._cancel_waits: dict[str, tuple[dict[str, Any], list[str]]] = {}
+
+    def _send_registration_to_p(
+        self, req_id: str, reg_data: dict[str, Any] | _WriterTask
+    ) -> None:
+        """Send D's registration, or run a ``_WriterTask``.
+
+        Runs on the writer thread for each item of ``_reg_send_inbox``. A
+        withdrawn registration, queued again by vLLM once its handshake with P
+        is done, is not sent.
+        """
+        if not isinstance(reg_data, _WriterTask):
+            if not reg_data.get(_WITHDRAWN):
+                super()._send_registration_to_p(req_id, reg_data)
+        elif reg_data.kind == CANCEL:
+            self._cancel_registration(req_id, reg_data.reg)
+        elif reg_data.kind == _RECEIVED:
+            self._unacked.pop(req_id, None)
+        elif reg_data.kind == _SETTLE:
+            self._settle_cancels()
+        else:
+            self._send_tt_notif(reg_data.kind, reg_data.reg)
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
-        """Send D's registration with the seconds left until D fails the receive.
+        """Send D's registration to P's agents and await a ``REG_ACK`` from each.
 
-        Runs on the writer thread, after any handshake with P, so the seconds
-        left do not include the handshake.
+        Runs on the writer thread once the handshake with P is done. It
+        replaces vLLM's method, which sends to the same agents, to learn how
+        many acknowledgements to await.
         """
-        sent = dict(reg_data)
-        deadline = sent.pop(_RECV_DEADLINE)
-        sent[RECV_SECONDS_LEFT] = deadline - time.perf_counter()
-        super()._do_send_reg_notif(req_id, sent)
+        engine_id = reg_data["remote_engine_id"]
+        notif = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
+        sent_to = self._notify_engine(engine_id, notif, req_id, "push_reg_notif_failed")
+        if not sent_to:
+            logger.error(
+                "No remote agents for engine %s; cannot send registration for %s",
+                engine_id,
+                req_id,
+            )
+            self._failed_recv_reqs.put(req_id)
+            return
+        reg_data[_SENT_TO] = sent_to
+        self._unacked[req_id] = _Unacked(reg_data)
 
     def _handle_push_reg_notif(self, notif: bytes) -> None:
-        """Set P's write deadline on D's registration, then match it as vLLM does.
+        """Record D's registration as vLLM does and acknowledge it; or read a TT
+        notification.
 
-        Runs on the writer thread. P counts D's ``RECV_SECONDS_LEFT`` from now
-        on its own clock and stops writing a margin before they run out:
-        ``_DEADLINE_MARGIN_S``, or a quarter of the seconds left when that is
-        shorter, so that a short ``push_registration_timeout`` still leaves P
-        most of it. A registration without ``RECV_SECONDS_LEFT``, from vLLM's
-        own push worker, gets no deadline. Apart from the deadline this is
+        Runs on the writer thread for each notification with the ``PUSH_REG``
+        prefix. Apart from the TT notifications and the ``REG_ACK``, this is
         vLLM's method, which decodes the registration inside and so leaves no
-        hook at receipt.
-
-        Notes
-        -----
-        The margin covers the time from D's send to P's receipt, including P's
-        writer thread reading the notification up to one engine step late: it
-        reads NIXL notifications once per step unless it is polling for
-        unmatched finished requests. D's quarantine of ``kv_lease_duration``
-        covers WRITEs still in flight at D's deadline.
+        hook after it.
         """
-        received = time.perf_counter()
+        if notif.startswith(TT_NOTIF_PREFIX):
+            self._handle_tt_notif(notif)
+            return
         try:
             reg = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
         except Exception:
@@ -452,17 +612,13 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         if not isinstance(rid, str):
             logger.warning("PUSH_REG notif missing request_id; dropping")
             return
-        left = reg.get(RECV_SECONDS_LEFT)
-        if left is not None:
-            left = float(left)
-            margin = min(_DEADLINE_MARGIN_S, left / 4)
-            reg[_WRITE_DEADLINE] = received + left - margin
         match = self._pop_matching_finished_blocks(rid)
         if match is None:
             self._pending_d_registrations[rid] = reg
-            return
-        fin_id, blocks = match
-        self._do_start_push_kv(fin_id, blocks, reg)
+        else:
+            fin_id, blocks = match
+            self._do_start_push_kv(fin_id, blocks, reg)
+        self._send_tt_notif(REG_ACK, reg)
 
     def _do_start_push_kv(
         self,
@@ -475,28 +631,24 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         Runs on the writer thread, once a finished P request meets D's
         registration (``local_block_ids`` are device blocks) and again once
         ``_stage_matched_sends`` has staged it (``local_block_ids`` are slots).
-        Past the registration's write deadline it drops the push: D may have
-        given the slots to another request. A dropped staged push keeps its
+        A request without a ``_sends`` record, whose send has ended, or whose
+        registration D cancelled is dropped; a dropped staged request keeps its
         slots until vLLM reports the send finished, at the end of P's lease.
-        A request without a ``_sends`` record, or whose send has ended, is
-        dropped. While vLLM's method submits the write, the request's record
-        is marked submitting, so that ``get_transfer_results`` keeps its slots.
+        While vLLM's method submits the write, the request's record is marked
+        submitting, so that ``get_transfer_results`` keeps its slots.
         """
-        deadline = registration_data.get(_WRITE_DEADLINE)
-        if deadline is not None and time.perf_counter() > deadline:
-            logger.warning(
-                "Dropping push of %s: D's receive deadline for %s is near or past.",
-                request_id,
-                registration_data["request_id"],
-            )
-            return
         with self._lock:
             send = self._sends.get(request_id)
-            if send is None or send.ended:
-                logger.debug("Dropping push of %s: its send already ended.", request_id)
+            if send is None or send.ended or registration_data.get(_CANCELLED):
+                logger.debug(
+                    "Dropping push of %s: its send ended or D cancelled it.",
+                    request_id,
+                )
                 return
             staged = send.slots is not None
             send.submitting = staged
+            if not staged:
+                send.reg = registration_data
         if not staged:
             self._to_stage.put((request_id, local_block_ids, registration_data))
             return
@@ -524,8 +676,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         for req_id, device_ids, reg in pending:
             with self._lock:
                 send = self._sends.get(req_id)
+                cancelled = reg.get(_CANCELLED)
             # Only this thread ends a send or stages it.
-            if send is None or send.ended or send.slots is not None:
+            if send is None or send.ended or send.slots is not None or cancelled:
                 continue
             device = _last_blocks(
                 self._as_grouped_block_ids(device_ids),
@@ -578,6 +731,217 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                         del self._sends[req_id]
                         freed += send.slots or []
         self.slots.give_back(freed)
+
+    def _give_back_cancelled(self) -> None:
+        """Free the slots of D's receives whose cancellation has settled."""
+        while True:
+            try:
+                req_id = self._cancel_done.get_nowait()
+            except queue.Empty:
+                return
+            self.slots.give_back(self._cancelling.pop(req_id))
+
+    def _cancel_registration(self, req_id: str, reg: dict[str, Any]) -> None:
+        """Withdraw D's registration of a failed receive, or cancel it at P.
+
+        Runs on the writer thread. A registration not yet sent is never sent,
+        and the receive's slots are free at once. A sent one is cancelled once
+        P has acknowledged it; the slots stay reserved until P acknowledges
+        the cancellation. Running again, as after a handshake, sends what is
+        due.
+        """
+        sent_to = reg.get(_SENT_TO)
+        if sent_to is None:
+            reg[_WITHDRAWN] = True
+            self._cancel_done.put(req_id)
+            return
+        unacked = self._unacked.setdefault(req_id, _Unacked(reg, reg_acks=sent_to))
+        if not unacked.cancelled:
+            unacked.cancelled = True
+            logger.warning(
+                "The receive of %s failed after its registration went to P; its "
+                "staging slots stay reserved until P confirms it writes no more "
+                "into them.",
+                req_id,
+            )
+        if unacked.reg_acks >= sent_to:
+            self._send_tt_notif(CANCEL, reg)
+
+    def _handle_tt_notif(self, notif: bytes) -> None:
+        """Act on a TT notification from the peer engine, on the writer thread."""
+        try:
+            message = msgspec.msgpack.decode(notif[len(TT_NOTIF_PREFIX) :])
+            kind, req_id = message["kind"], message["request_id"]
+        except Exception:
+            logger.exception("Failed to decode a TT NIXL notification; dropping it")
+            return
+        if kind == REG_ACK:
+            self._on_reg_ack(req_id)
+        elif kind == CANCEL:
+            self._on_cancel(message)
+        elif kind == CANCEL_ACK:
+            self._on_cancel_ack(req_id)
+        else:
+            logger.warning("Dropping TT NIXL notification %r for %s.", kind, req_id)
+
+    def _on_reg_ack(self, req_id: str) -> None:
+        """D: count P's acknowledgement; cancel a failed receive once all are in."""
+        unacked = self._unacked.get(req_id)
+        if unacked is None:
+            return
+        unacked.reg_acks += 1
+        if unacked.reg_acks < unacked.reg[_SENT_TO]:
+            return
+        if unacked.cancelled:
+            self._send_tt_notif(CANCEL, unacked.reg)
+        else:
+            del self._unacked[req_id]
+
+    def _on_cancel(self, message: dict[str, Any]) -> None:
+        """P: write nothing more for D's cancelled registration.
+
+        Drops a pending registration and marks a matched one, which every
+        submission point checks; ``_settle_cancels`` then acknowledges the
+        cancellation once the matched requests' writes have ended.
+        """
+        req_id = message["request_id"]
+        self._pending_d_registrations.pop(req_id, None)
+        writing = []
+        with self._lock:
+            for p_req_id, send in self._sends.items():
+                if send.reg is not None and send.reg["request_id"] == req_id:
+                    send.reg[_CANCELLED] = True
+                    writing.append(p_req_id)
+            self._cancel_waits[req_id] = (message, writing)
+        self._settle_cancels()
+
+    def _settle_cancels(self) -> None:
+        """P: send ``CANCEL_ACK`` for each cancellation with no write in flight.
+
+        Runs on the writer thread, the only thread that submits writes, so no
+        write of a cancelled registration starts while this looks.
+        """
+        due = []
+        with self._lock, self._sending_transfers_lock:
+            for req_id, (message, writing) in list(self._cancel_waits.items()):
+                if not any(self._sending_transfers.get(p) for p in writing):
+                    del self._cancel_waits[req_id]
+                    due.append(message)
+        for message in due:
+            self._send_tt_notif(CANCEL_ACK, message)
+
+    def _on_cancel_ack(self, req_id: str) -> None:
+        """D: count P's acknowledgement; free the slots once all are in."""
+        unacked = self._unacked.get(req_id)
+        if unacked is None or not unacked.cancelled:
+            return
+        unacked.cancel_acks += 1
+        if unacked.cancel_acks < unacked.reg[_SENT_TO]:
+            return
+        del self._unacked[req_id]
+        self._cancel_done.put(req_id)
+
+    def _send_tt_notif(self, kind: str, reg: dict[str, Any]) -> None:
+        """Send the peer engine a TT notification about ``reg``, after any handshake.
+
+        Runs on the writer thread. ``CANCEL`` goes from D to P, over the
+        notification-only handshake vLLM uses for ``PUSH_REG``; ``REG_ACK``
+        and ``CANCEL_ACK`` go from P to D, over the handshake P's writes use.
+        While a handshake runs, the notification is queued again for when it
+        is done.
+
+        Parameters
+        ----------
+        kind
+            ``REG_ACK``, ``CANCEL`` or ``CANCEL_ACK``.
+        reg
+            The registration; for ``CANCEL_ACK``, D's ``CANCEL``. Either names
+            D's request and the address of the peer engine.
+        """
+        req_id = reg["request_id"]
+        if kind == CANCEL:
+            engine_id = reg["remote_engine_id"]
+            handshake = self._ensure_handshake(
+                engine_id,
+                reg["remote_host"],
+                reg["remote_port"],
+                reg["remote_tp_size"],
+                pp_size=reg.get("remote_pp_size", 1),
+                notif_agents_only=True,
+            )
+            message = {key: reg[key] for key in _DECODE_ADDRESS}
+        else:
+            engine_id = reg["decode_engine_id"]
+            handshake = self._ensure_handshake(
+                engine_id, reg["decode_host"], reg["decode_port"], reg["decode_tp_size"]
+            )
+            message = {}
+        if handshake is not None:
+            handshake.add_done_callback(
+                functools.partial(
+                    self._queue_after_handshake, req_id, _WriterTask(kind, reg)
+                )
+            )
+            return
+        message.update(kind=kind, request_id=req_id)
+        notif = TT_NOTIF_PREFIX + msgspec.msgpack.encode(message)
+        if not self._notify_engine(engine_id, notif, req_id, "tt_notif_failed"):
+            logger.warning(
+                "No NIXL agent of engine %s for the %s of %s; the request's "
+                "staging slots stay reserved on D.",
+                engine_id,
+                kind,
+                req_id,
+            )
+
+    def _queue_after_handshake(
+        self, req_id: str, task: _WriterTask, handshake: Future
+    ) -> None:
+        """Queue ``task`` for the writer thread once its handshake has succeeded.
+
+        Runs on the thread that completes the handshake.
+        """
+        if (error := handshake.exception()) is not None:
+            logger.warning(
+                "Cannot send the %s of %s: the NIXL handshake failed (%s). The "
+                "request's staging slots stay reserved on D.",
+                task.kind,
+                req_id,
+                error,
+            )
+            return
+        self._reg_send_inbox.put((req_id, task))
+        self._push_writer_wake.set()
+
+    def _notify_engine(
+        self, engine_id: str, notif: bytes, req_id: str, failure_type: str
+    ) -> int:
+        """Send ``notif`` to each NIXL agent of ``engine_id``.
+
+        Returns
+        -------
+        int
+            The number of agents, each either sent ``notif`` or logged under
+            ``failure_type``; 0 when the engine has none. A failed send may
+            still deliver, so it counts.
+        """
+        # _remote_agents is mutated on other threads; snapshot under the lock.
+        with self._handshake_lock:
+            agents = dict(self._remote_agents.get(engine_id) or {})
+        if not agents:
+            self.xfer_stats.record_failed_notification()
+        for rank, agent_name in agents.items():
+            try:
+                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif)
+            except Exception as e:
+                self._log_failure(
+                    failure_type=failure_type,
+                    req_id=req_id,
+                    error=e,
+                    remote_rank=rank,
+                )
+                self.xfer_stats.record_failed_notification()
+        return len(agents)
 
     def _take_slots(self, device: BlockIds) -> BlockIds | None:
         """Slots for ``device``'s blocks, grouped like it, or None when full."""

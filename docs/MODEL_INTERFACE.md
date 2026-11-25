@@ -143,11 +143,14 @@ slot numbers instead of block IDs and copies the slots into its chips once
 P's write lands; P copies only the blocks D registered, once the two are
 matched. A D request whose KV does not arrive within
 `push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
-fails instead of waiting forever, and its slots go to another request after
-`kv_lease_duration`. D's registration therefore tells P the seconds left
-(`tt_recv_seconds_left`), and P submits no write later than a margin before
-they run out, counted from when P reads the registration: 10 s, or a quarter
-of the seconds left when that is shorter. P and D must both use it.
+fails instead of waiting forever. P may still write into its slots then, so D
+gives them to another request only once P has confirmed that it writes no more
+into them: P acknowledges each registration it records, D sends a cancel for a
+failed receive once P has acknowledged its registration, and P acknowledges
+the cancel once no write into those slots is in flight and drops any later
+one. A P that never answers keeps the slots reserved on D. These notifications
+are not part of vLLM's push protocol, so P and D must both use
+`TTNixlPushConnector`.
 
 Under lane DP the lanes share the engine's one connector. Block IDs are
 lane-local, so the coordinator builds the connector metadata once per step and
