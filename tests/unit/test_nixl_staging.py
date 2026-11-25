@@ -5,12 +5,19 @@
 The worker tests run the TT overrides on a worker built without NIXL: vLLM's
 push worker methods the overrides call are replaced by recorders, so each
 test sees which IDs reach vLLM and which copies the overrides make. The
-scheduler tests do the same with vLLM's push scheduler.
+scheduler tests do the same with vLLM's push scheduler. The cancellation tests
+link a D worker and a P worker through ``FakeNixl`` agents and run their
+writer threads' steps by hand, so each test picks the order in which
+notifications arrive.
 """
 
+import queue
 import re
 import threading
+from collections import defaultdict, deque
+from concurrent.futures import Future
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import msgspec
 import pytest
@@ -22,6 +29,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
     NixlPushConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
+    NixlPushConnectorWorker,
 )
 from vllm.v1.core.sched.output import KVConnectorBlockState
 from vllm.v1.kv_cache_interface import (
@@ -38,14 +48,29 @@ from tests.support.nixl_staging import (
     record_push_worker,
     staging_worker,
 )
-from tests.support.nixl_writer import Write, push_reg_notif, push_writer
+from tests.support.nixl_writer import (
+    D_ENGINE,
+    P_ENGINE,
+    FakeNixl,
+    Write,
+    push_reg_notif,
+    push_writer,
+)
 from tests.support.nixl_writer import registration as push_registration
 from vllm_tt_plugin import nixl_staging
 from vllm_tt_plugin.nixl_staging import (
+    CANCEL,
+    CANCEL_ACK,
+    REG_ACK,
+    TT_NOTIF_PREFIX,
     NixlPushChunkJob,
     StagingSlots,
     TTNixlPushConnectorScheduler,
+    TTNixlPushConnectorWorker,
 )
+
+# vLLM's WRITE submission, which ``recorder`` replaces.
+_SUBMIT_PUSH = NixlPushConnectorWorker._do_start_push_kv
 
 
 class TestStagingSlots:
@@ -112,8 +137,88 @@ def clock(monkeypatch):
     return fake
 
 
+def _held_entries(worker) -> dict[str, int]:
+    """Entries per container and queue of ``worker`` that holds any, apart from
+    the test's record of copies and the peer agents ``_linked`` gives it."""
+    held = {}
+    for name, value in vars(worker).items():
+        if name in ("copies", "_remote_agents"):
+            continue
+        if isinstance(value, queue.Queue):
+            size = value.qsize()
+        elif isinstance(value, (dict, set, list, deque)):
+            size = len(value)
+        else:
+            continue
+        if size:
+            held[name] = size
+    return held
+
+
 def _registration(block_ids, request_id="d-rid"):
-    return {"request_id": request_id, "local_block_ids": (block_ids,)}
+    """D's registration of ``block_ids``, as vLLM's push scheduler on D builds it."""
+    return {
+        "request_id": request_id,
+        "decode_engine_id": D_ENGINE,
+        "decode_host": "d-host",
+        "decode_port": 1,
+        "decode_tp_size": 1,
+        "local_block_ids": (block_ids,),
+        "remote_engine_id": P_ENGINE,
+        "remote_host": "p-host",
+        "remote_port": 2,
+        "remote_tp_size": 1,
+    }
+
+
+def _linked(worker, engine_id: str, peer_engine: str) -> TTNixlPushConnectorWorker:
+    """Give ``worker`` a NIXL agent with a done handshake to ``peer_engine``."""
+    worker.engine_id = engine_id
+    worker.nixl_wrapper = FakeNixl()
+    worker._remote_agents = {peer_engine: {(0, 0): f"{peer_engine}-agent"}}
+    worker._handshake_lock = threading.Lock()
+    worker._ensure_handshake = lambda *args, **kwargs: None
+    worker.xfer_stats = MagicMock()
+    worker._log_failure = lambda **kwargs: None
+    return worker
+
+
+def _writer_pass(worker) -> None:
+    """vLLM's writer loop steps before it reads notifications: the queued
+    registrations and TT tasks, then the queued staged pushes."""
+    while not worker._reg_send_inbox.empty():
+        worker._send_registration_to_p(*worker._reg_send_inbox.get_nowait())
+    while not worker._deferred_push_inbox.empty():
+        worker._do_start_push_kv(*worker._deferred_push_inbox.get_nowait())
+
+
+def _deliver(sender, receiver) -> None:
+    """Hand ``receiver``'s writer thread what ``sender`` has sent, as vLLM's
+    writer loop routes a notification with the ``PUSH_REG`` prefix."""
+    notifs, sender.nixl_wrapper.sent = sender.nixl_wrapper.sent, []
+    for notif in notifs:
+        receiver._handle_push_reg_notif(notif)
+
+
+def _kinds(worker) -> list[str]:
+    """What ``worker`` has sent and not yet delivered: ``PUSH_REG`` or the TT kind."""
+    return [
+        msgspec.msgpack.decode(notif[len(TT_NOTIF_PREFIX) :])["kind"]
+        if notif.startswith(TT_NOTIF_PREFIX)
+        else "PUSH_REG"
+        for notif in worker.nixl_wrapper.sent
+    ]
+
+
+def _tt_notif(kind: str, request_id: str) -> bytes:
+    """A TT notification from D about ``request_id``."""
+    message = {
+        key: value
+        for key, value in _registration([], request_id).items()
+        if key.startswith("decode_")
+    }
+    message.update(kind=kind, request_id=request_id)
+    return TT_NOTIF_PREFIX + msgspec.msgpack.encode(message)
 
 
 class TestDecodeSide:
@@ -149,31 +254,6 @@ class TestDecodeSide:
         worker.start_load_kv(push_metadata())
 
         assert list(recorder.metadata[-1].push_registrations) == ["b"]
-
-    def test_a_failed_receive_frees_its_slots_without_a_copy(self, recorder):
-        worker = staging_worker(num_slots=4)
-        worker.start_load_kv(push_metadata({"r": _registration([5, 6])}))
-        recorder.results.failed_recving = {"r"}
-        recorder.results.finished_recving = {"r"}
-
-        worker.get_transfer_results()
-
-        assert worker.copies == []
-        assert worker.slots.free == 4
-
-    def test_a_receive_that_never_comes_fails_and_its_slots_rest(self, recorder):
-        worker = staging_worker(num_slots=2, recv_timeout=0.0, quarantine=3600.0)
-        worker.start_load_kv(push_metadata({"r": _registration([5, 6])}))
-
-        worker.get_transfer_results()
-        assert worker._failed_recv_reqs.get_nowait() == "r"
-
-        # vLLM reports it failed; P's late write could still land in its slots.
-        recorder.results.failed_recving = {"r"}
-        recorder.results.finished_recving = {"r"}
-        worker.get_transfer_results()
-        assert worker.copies == []
-        assert worker.slots.free == 0
 
 
 class TestLanes:
@@ -216,6 +296,7 @@ class TestLanes:
 class TestPrefillSide:
     def test_a_match_is_staged_on_the_runner_thread_then_written(self, recorder):
         worker = staging_worker(num_slots=4)
+        worker.start_load_kv(push_metadata(finished={"p": ([30, 31, 32],)}))
         # D already holds the first block of this prompt, so it registers two.
         worker._do_start_push_kv("p", ([30, 31, 32],), _registration([8, 9]))
         assert recorder.pushes == []
@@ -229,6 +310,7 @@ class TestPrefillSide:
 
     def test_slots_are_freed_after_the_send_and_its_last_write(self, recorder):
         worker = staging_worker(num_slots=2)
+        worker.start_load_kv(push_metadata(finished={"p": ([30, 31],)}))
         worker._do_start_push_kv("p", ([30, 31],), _registration([8, 9]))
         worker.get_transfer_results()
         worker._sending_transfers["p"] = ["handle"]
@@ -243,6 +325,7 @@ class TestPrefillSide:
 
     def test_a_send_that_already_ended_is_never_staged(self, recorder):
         worker = staging_worker(num_slots=2)
+        worker.start_load_kv(push_metadata(finished={"p": ([30, 31],)}))
         recorder.results.finished_sending = {"p"}
         worker.get_transfer_results()
 
@@ -557,6 +640,7 @@ class TestChunkStaging:
         assert worker.slots.free == 1
 
         # Once matched, b is copied from its blocks, as without chunked push.
+        worker.start_load_kv(push_metadata(finished={"b": ([40, 41, 42],)}))
         worker._do_start_push_kv("b", ([40, 41, 42],), _registration([8]))
         worker.get_transfer_results()
         assert worker.copies[-1] == ("d2h", [42], [5], 0)
@@ -570,6 +654,7 @@ class TestChunkStaging:
         staged = list(worker.copies)
 
         # D holds the first two blocks of this prompt, so it registers three.
+        worker.start_load_kv(push_metadata(finished={"p": ([30, 31, 32, 33, 34],)}))
         worker._do_start_push_kv(
             "p", ([30, 31, 32, 33, 34],), _registration([8, 9, 10])
         )
@@ -651,6 +736,13 @@ def _run_step(worker, jobs=(), **fields) -> None:
     worker.get_transfer_results()
 
 
+def _finish(worker, req_id: str, blocks: list[int]) -> None:
+    """P's request finishes: vLLM's ``start_load_kv`` also hands its blocks to
+    the writer thread."""
+    worker.start_load_kv(push_metadata(finished={req_id: (blocks,)}))
+    worker._finished_blocks_inbox.put((req_id, (blocks,)))
+
+
 def _on_writer_thread(worker) -> None:
     """Run one writer pass on another thread, as the writer thread does."""
     thread = threading.Thread(target=worker._push_writer_pass, name="writer")
@@ -698,8 +790,7 @@ class TestChunkWrites:
         worker.nixl_wrapper.finish()
         staged = list(worker.copies)
 
-        # vLLM's start_load_kv hands the finished request to the writer.
-        worker._finished_blocks_inbox.put(("p", (PROMPT_BLOCKS,)))
+        _finish(worker, "p", PROMPT_BLOCKS)
         worker._push_writer_pass()
         if cause == "late_registration":
             worker.nixl_wrapper.notifs = {"d": [push_reg_notif(reg)]}
@@ -719,7 +810,7 @@ class TestChunkWrites:
         _run_step(worker, jobs=[_job(0, 5, PROMPT_BLOCKS)])
         worker._push_writer_pass()
         worker.nixl_wrapper.finish()
-        worker._finished_blocks_inbox.put(("p", (PROMPT_BLOCKS,)))
+        _finish(worker, "p", PROMPT_BLOCKS)
         worker._push_writer_pass()
         assert worker._sending_transfers["p"] == []
 
@@ -794,7 +885,7 @@ class TestChunkWrites:
         _run_step(worker, jobs=[_job(0, 5, PROMPT_BLOCKS, req_id="a")])
         _on_writer_thread(worker)
         for req_id, blocks in (("a", PROMPT_BLOCKS), ("b", [40, 41])):
-            worker._finished_blocks_inbox.put((req_id, (blocks,)))
+            _finish(worker, req_id, blocks)
         worker.nixl_wrapper.notifs = {
             "d": [
                 push_reg_notif(push_registration(PROMPT_BLOCKS, request_id="a")),
@@ -811,156 +902,222 @@ class TestChunkWrites:
         assert set(threads) == {threading.current_thread().name}
 
 
-class TestReceiveDeadline:
-    """P writes nothing once D may have given the receive's slots away.
+class TestSendSlotLifetime:
+    """P's slots stay with a request while its write is being submitted or runs."""
 
-    D fails a receive ``recv_timeout`` seconds after registering it, and its
-    slots go to another request once they have rested. D's registration tells
-    P how many seconds are left; P counts them from receipt.
-    """
-
-    @staticmethod
-    def _register(d, recorder) -> bytes:
-        """D registers request ``r`` and sends the registration to P."""
-        d.start_load_kv(push_metadata({"r": _registration([5, 6], request_id="r")}))
-        d._do_send_reg_notif("r", recorder.metadata[-1].push_registrations["r"])
-        return recorder.notifs[-1]
-
-    @staticmethod
-    def _write_staged(p) -> None:
-        """P's runner thread stages the match; P's writer thread writes it."""
+    def test_a_lease_that_expires_during_submission_keeps_the_slots(
+        self, recorder, monkeypatch
+    ):
+        p = staging_worker(num_slots=2)
+        registration = {
+            **_registration([8, 9]),
+            "decode_engine_id": "d-engine",
+            "decode_host": "d-host",
+            "decode_port": 1,
+            "decode_tp_size": 1,
+        }
+        p.start_load_kv(push_metadata(finished={"p": ([30, 31],)}))
+        p._do_start_push_kv("p", ([30, 31],), registration)
         p.get_transfer_results()
-        while not p._deferred_push_inbox.empty():
+        pushed = p._deferred_push_inbox.get_nowait()
+        # vLLM's own submission, paused where it waits for P's handshake with
+        # D, after the TT override has let it use the slots.
+        monkeypatch.setattr(NixlPushConnectorWorker, "_do_start_push_kv", _SUBMIT_PUSH)
+        p.world_size = 1
+        p._physical_blocks_per_logical_kv_block = 1
+        p._engine_last_active = {}
+        p._sending_transfers = defaultdict(list)
+        paused, resume = threading.Event(), threading.Event()
+        submitted = []
+
+        def handshake(*args):
+            paused.set()
+            resume.wait(5)
+
+        def write(req_id, meta):
+            submitted.append((req_id, meta.local_block_ids, p.slots.free))
+            p._sending_transfers[req_id].append("handle")
+
+        p._ensure_handshake = handshake
+        p._xfer_blocks_for_req = write
+        writer = threading.Thread(target=p._do_start_push_kv, args=pushed)
+        writer.start()
+        assert paused.wait(5)
+
+        recorder.results.finished_sending = {"p"}
+        p.get_transfer_results()
+        free_during_submission = p.slots.free
+        resume.set()
+        writer.join(5)
+        p.get_transfer_results()
+        free_while_writing = p.slots.free
+        del p._sending_transfers["p"]
+        p.get_transfer_results()
+
+        assert free_during_submission == 0
+        assert submitted == [("p", ([0, 1],), 0)]
+        assert free_while_writing == 0
+        assert p.slots.free == 2
+
+    def test_completed_sends_leave_no_state(self, recorder):
+        p = staging_worker(num_slots=2)
+        for i in range(10_000):
+            req_id = f"p{i}"
+            p.start_load_kv(push_metadata(finished={req_id: ([30, 31],)}))
+            p._do_start_push_kv(req_id, ([30, 31],), _registration([8, 9]))
+            p.get_transfer_results()
             p._do_start_push_kv(*p._deferred_push_inbox.get_nowait())
+            recorder.results.finished_sending = {req_id}
+            p.get_transfer_results()
 
-    def test_p_finishing_after_ds_deadline_writes_nothing(self, recorder, clock):
-        d = staging_worker(num_slots=4, recv_timeout=60.0)
-        p = staging_worker(num_slots=4)
-        # D registers while P still computes the prompt.
-        p._handle_push_reg_notif(self._register(d, recorder))
+        assert len(recorder.pushes) == 10_000
+        assert _held_entries(p) == {}
+        assert p.slots.free == 2
 
+
+class TestCancellation:
+    """D gives a failed receive's slots to another request only once P has
+    confirmed that it writes no more into them."""
+
+    @pytest.fixture
+    def d(self):
+        return _linked(
+            staging_worker(num_slots=2, recv_timeout=60.0), D_ENGINE, P_ENGINE
+        )
+
+    @pytest.fixture
+    def p(self):
+        return _linked(staging_worker(num_slots=2), P_ENGINE, D_ENGINE)
+
+    def test_a_registration_p_reads_late_never_lands_in_reused_slots(
+        self, recorder, clock, d, p
+    ):
+        d.start_load_kv(push_metadata({"old": _registration([5, 6], "old")}))
+        _writer_pass(d)
+        # P's writer thread waits for a wake that its idle engine never gives,
+        # so the registration stays unread on P.
         clock.now += 61.0
         d.get_transfer_results()
-        assert d._failed_recv_reqs.get_nowait() == "r"
-        # P's writer matches the finished request with the waiting registration.
-        p._do_start_push_kv("r", ([30, 31],), p._pop_matching_registration("r"))
-        self._write_staged(p)
+        recorder.results.failed_recving = recorder.results.finished_recving = {"old"}
+        d.get_transfer_results()
+        _writer_pass(d)
+        clock.now += 10_000.0
+        d.get_transfer_results()
+
+        d.start_load_kv(push_metadata({"new": _registration([7, 8], "new")}))
+        assert recorder.metadata[-1].push_registrations == {}
+
+        # P finishes "old", then reads the registration and later the cancel.
+        p.start_load_kv(push_metadata(finished={"old": ([30, 31],)}))
+        p._push_finished_blocks["old"] = ([30, 31],)
+        _deliver(d, p)
+        _deliver(p, d)
+        _deliver(d, p)
+        p.get_transfer_results()
+        _writer_pass(p)
+        _deliver(p, d)
+        d.get_transfer_results()
+        d.start_load_kv(push_metadata())
 
         assert recorder.pushes == []
         assert p.copies == []
+        new = recorder.metadata[-1].push_registrations["new"]
+        assert new["local_block_ids"] == ([0, 1],)
 
-    @pytest.mark.parametrize(
-        ("write_after", "written"),
-        [(30.0, True), (61.0, False)],
-        ids=["in_time", "after_the_deadline"],
-    )
-    def test_a_staged_write_is_submitted_only_before_ds_deadline(
-        self, recorder, clock, write_after, written
-    ):
-        d = staging_worker(num_slots=4, recv_timeout=60.0)
-        p = staging_worker(num_slots=4)
+    def test_d_cancels_only_a_registration_p_has_acknowledged(self, recorder, d, p):
+        d.start_load_kv(push_metadata({"r": _registration([5, 6], "r")}))
+        _writer_pass(d)
+        recorder.results.failed_recving = recorder.results.finished_recving = {"r"}
+        d.get_transfer_results()
+        _writer_pass(d)
+        # NIXL does not order notifications: a cancel sent now could reach P
+        # before the registration.
+        assert _kinds(d) == ["PUSH_REG"]
+
+        _deliver(d, p)
+        assert _kinds(p) == [REG_ACK]
+        _deliver(p, d)
+        assert _kinds(d) == [CANCEL]
+
+    def test_p_acknowledges_a_cancel_once_its_write_has_ended(self, recorder, p):
+        p.start_load_kv(push_metadata(finished={"r": ([30, 31],)}))
         p._push_finished_blocks["r"] = ([30, 31],)
-        p._handle_push_reg_notif(self._register(d, recorder))
+        p._handle_push_reg_notif(
+            PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(_registration([8, 9], "r"))
+        )
         p.get_transfer_results()
-
-        # The write waits, for example for P's handshake with D.
-        clock.now += write_after
-        p._do_start_push_kv(*p._deferred_push_inbox.get_nowait())
-
-        assert recorder.pushes == ([("r", ([0, 1],))] if written else [])
-
-    def test_p_stops_a_margin_before_ds_deadline(self, recorder, clock):
-        d = staging_worker(num_slots=4, recv_timeout=60.0)
-        p = staging_worker(num_slots=4)
-        p._push_finished_blocks["r"] = ([30, 31],)
-        p._handle_push_reg_notif(self._register(d, recorder))
-
-        clock.now += 60.0 - nixl_staging._DEADLINE_MARGIN_S + 0.5
-        self._write_staged(p)
-
-        assert recorder.pushes == []
-
-    @pytest.mark.parametrize(
-        ("write_after", "written"),
-        [(5.0, True), (7.0, False)],
-        ids=["before_the_margin", "inside_the_margin"],
-    )
-    def test_a_short_receive_timeout_shrinks_the_margin(
-        self, recorder, clock, write_after, written
-    ):
-        # 8 s left: a quarter of it, 2 s, is the margin.
-        d = staging_worker(num_slots=4, recv_timeout=8.0)
-        p = staging_worker(num_slots=4)
-        p._push_finished_blocks["r"] = ([30, 31],)
-        p._handle_push_reg_notif(self._register(d, recorder))
-
-        clock.now += write_after
-        self._write_staged(p)
-
-        assert recorder.pushes == ([("r", ([0, 1],))] if written else [])
-
-    def test_d_sends_the_seconds_left_when_it_sends(self, recorder, clock):
-        d = staging_worker(num_slots=4, recv_timeout=60.0)
-        d.start_load_kv(push_metadata({"r": _registration([5, 6], request_id="r")}))
-
-        # D's first registration to a P waits for their handshake.
-        clock.now += 5.0
-        d._do_send_reg_notif("r", recorder.metadata[-1].push_registrations["r"])
-
-        (notif,) = recorder.notifs
-        sent = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
-        assert sent[nixl_staging.RECV_SECONDS_LEFT] == 55.0
-        # D's own clock reading stays on D.
-        assert set(sent) == {
-            "request_id",
-            "local_block_ids",
-            nixl_staging.RECV_SECONDS_LEFT,
-        }
-
-    def test_a_registration_without_seconds_left_sets_no_deadline(
-        self, recorder, clock
-    ):
-        # vLLM's own push worker on D sends no deadline.
-        notif = push_reg_notif(_registration([8, 9], request_id="r"))
-        p = staging_worker(num_slots=4)
-        p._push_finished_blocks["r"] = ([30, 31],)
-        p._handle_push_reg_notif(notif)
-
-        clock.now += 10_000.0
-        self._write_staged(p)
-
+        _writer_pass(p)
         assert recorder.pushes == [("r", ([0, 1],))]
+        p._sending_transfers["r"] = ["handle"]
 
-    @pytest.mark.parametrize(
-        ("late_from_step", "written"),
-        [
-            (None, [Write(1, [2], [100], b""), Write(2, [3, 4], [101, 102], b"p:1")]),
-            (2, [Write(1, [2], [100], b"")]),
-            (1, []),
-        ],
-        ids=["in_time", "last_chunk_late", "every_written_chunk_late"],
-    )
-    def test_p_writes_no_chunk_after_ds_deadline(
-        self, recorder, clock, late_from_step, written
-    ):
-        # D holds the prompt's first two blocks and registers the other three,
-        # with 60 s left; P prefills the prompt in three steps.
-        reg = {**push_registration([100, 101, 102]), nixl_staging.RECV_SECONDS_LEFT: 60}
-        worker = _p_worker()
-        worker.nixl_wrapper.notifs = {"d": [push_reg_notif(reg)]}
+        p._handle_push_reg_notif(_tt_notif(CANCEL, "r"))
+        p.get_transfer_results()
+        _writer_pass(p)
+        assert _kinds(p) == [REG_ACK]
 
-        for step, job in enumerate(CHUNK_JOBS):
-            if step == late_from_step:
-                clock.now += 60.0 - nixl_staging._DEADLINE_MARGIN_S + 0.5
-            _run_step(worker, jobs=[job])
-            worker._push_writer_pass()
-            worker.nixl_wrapper.finish()
-        worker._finished_blocks_inbox.put(("p", (PROMPT_BLOCKS,)))
-        worker._push_writer_pass()
-        worker.get_transfer_results()
-        worker._push_writer_pass()
+        del p._sending_transfers["r"]
+        p.get_transfer_results()
+        _writer_pass(p)
+        assert _kinds(p) == [REG_ACK, CANCEL_ACK]
 
-        # A late chunk leaves the notification out, so D never decodes on
-        # partial KV, and the whole-request push that follows is dropped.
-        assert worker.nixl_wrapper.writes == written
+    @pytest.mark.parametrize("staged", [False, True], ids=["matched", "staged"])
+    def test_p_writes_nothing_after_a_cancel(self, recorder, p, staged):
+        p.start_load_kv(push_metadata(finished={"r": ([30, 31],)}))
+        p._push_finished_blocks["r"] = ([30, 31],)
+        p._handle_push_reg_notif(
+            PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(_registration([8, 9], "r"))
+        )
+        if staged:
+            p.get_transfer_results()
+
+        p._handle_push_reg_notif(_tt_notif(CANCEL, "r"))
+        p.get_transfer_results()
+        _writer_pass(p)
+
         assert recorder.pushes == []
+        assert len(p.copies) == int(staged)
+        assert _kinds(p) == [REG_ACK, CANCEL_ACK]
+        recorder.results.finished_sending = {"r"}
+        p.get_transfer_results()
+        assert p.slots.free == 2
+
+    def test_a_cancel_drops_a_pending_registration(self, recorder, p):
+        p._handle_push_reg_notif(
+            PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(_registration([8, 9], "r"))
+        )
+
+        p._handle_push_reg_notif(_tt_notif(CANCEL, "r"))
+
+        # P's request finishes later and finds no registration to match.
+        assert p._pop_matching_registration("r") is None
+        assert _kinds(p) == [REG_ACK, CANCEL_ACK]
+
+    def test_a_received_request_leaves_no_state(self, recorder, d):
+        d.start_load_kv(push_metadata({"r": _registration([5, 6], "r")}))
+        _writer_pass(d)
+        # P's acknowledgement of the registration never arrives.
+        recorder.results.finished_recving = {"r"}
+
+        d.get_transfer_results()
+        _writer_pass(d)
+
+        assert _held_entries(d) == {}
+        assert d.slots.free == 2
+
+    def test_a_registration_not_yet_sent_is_withdrawn(self, recorder, d):
+        handshake = Future()
+        d._ensure_handshake = lambda *args, **kwargs: handshake
+        d.start_load_kv(push_metadata({"r": _registration([5, 6], "r")}))
+        _writer_pass(d)
+
+        recorder.results.failed_recving = recorder.results.finished_recving = {"r"}
+        d.get_transfer_results()
+        _writer_pass(d)
+        d.get_transfer_results()
+        assert d.slots.free == 2
+        assert d.copies == []
+
+        # vLLM queues the registration again once the handshake is done.
+        handshake.set_result(({(0, 0): f"{P_ENGINE}-agent"}, 0.0))
+        _writer_pass(d)
+        assert d.nixl_wrapper.sent == []

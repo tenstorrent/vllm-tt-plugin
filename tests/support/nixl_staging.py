@@ -13,12 +13,8 @@ import queue
 import threading
 from types import SimpleNamespace
 
-import msgspec
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
-    PUSH_REG_NOTIF_PREFIX,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
@@ -36,8 +32,6 @@ class Recorder:
         Each metadata passed to vLLM's ``start_load_kv``, in call order.
     pushes
         ``(request ID, block IDs)`` of each write vLLM was asked to start.
-    notifs
-        Each registration vLLM was asked to send to P, as P receives it.
     results
         What vLLM's ``get_transfer_results`` reports next; reset after each call.
     """
@@ -45,7 +39,6 @@ class Recorder:
     def __init__(self):
         self.metadata = []
         self.pushes = []
-        self.notifs = []
         self.results = KVConnectorTransferResults()
 
 
@@ -55,6 +48,9 @@ def record_push_worker(monkeypatch) -> Recorder:
 
     def start_load_kv(self, metadata):
         rec.metadata.append(metadata)
+        # vLLM queues D's registrations for the writer thread.
+        for req_id, reg in metadata.push_registrations.items():
+            self._reg_send_inbox.put((req_id, reg))
 
     def get_transfer_results(self):
         # vLLM's own results also run D's copy into the chips.
@@ -66,17 +62,11 @@ def record_push_worker(monkeypatch) -> Recorder:
     def do_start_push_kv(self, request_id, local_block_ids, registration_data):
         rec.pushes.append((request_id, local_block_ids))
 
-    def do_send_reg_notif(self, req_id, reg_data):
-        rec.notifs.append(PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data))
-
     monkeypatch.setattr(NixlPushConnectorWorker, "start_load_kv", start_load_kv)
     monkeypatch.setattr(
         NixlPushConnectorWorker, "get_transfer_results", get_transfer_results
     )
     monkeypatch.setattr(NixlPushConnectorWorker, "_do_start_push_kv", do_start_push_kv)
-    monkeypatch.setattr(
-        NixlPushConnectorWorker, "_do_send_reg_notif", do_send_reg_notif
-    )
     return rec
 
 
@@ -99,6 +89,7 @@ def staging_worker(
     )
     worker.host_xfer_buffers, worker.device_kv_caches = "host", "device"
     worker._deferred_push_inbox = queue.Queue()
+    worker._reg_send_inbox = queue.Queue()
     worker._push_writer_wake = threading.Event()
     worker._sending_transfers = {}
     worker._sending_transfers_lock = threading.Lock()

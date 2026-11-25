@@ -59,12 +59,15 @@ class FakeNixl:
         ``"ERR"``.
     notifs
         What ``get_new_notifs`` returns next, by agent name.
+    sent
+        Each notification sent with ``send_notif``, until a test delivers it.
     """
 
     def __init__(self):
         self.writes: list[Write] = []
         self.states: dict[int, str] = {}
         self.notifs: dict[str, list[bytes]] = {}
+        self.sent: list[bytes] = []
 
     def make_prepped_xfer(
         self, operation, local_side, local_ids, remote_side, remote_ids, notif_msg
@@ -87,6 +90,9 @@ class FakeNixl:
 
     def release_xfer_handle(self, handle: int) -> None:
         pass
+
+    def send_notif(self, agent_name: str, notif_msg: bytes) -> None:
+        self.sent.append(notif_msg)
 
     def get_new_notifs(self) -> dict[str, list[bytes]]:
         notifs, self.notifs = self.notifs, {}
@@ -119,8 +125,8 @@ def push_reg_notif(reg: dict) -> bytes:
 def push_writer(worker):
     """Give ``worker`` what P's writer pass reads; return it.
 
-    The P-to-D handshake is done and D's TP equals P's. ``worker.nixl_wrapper``
-    is a ``FakeNixl``.
+    The P-to-D handshake is done, D runs one NIXL agent and D's TP equals
+    P's. ``worker.nixl_wrapper`` is a ``FakeNixl``.
     """
     worker._push_finished_blocks = {}
     worker._pending_d_registrations = {}
@@ -136,6 +142,8 @@ def push_writer(worker):
     worker._send_failures = set()
     worker._engine_last_active = {}
     worker._ensure_handshake = lambda *args, **kwargs: None
+    worker._remote_agents = {D_ENGINE: {(0, 0): f"{D_ENGINE}-agent"}}
+    worker._handshake_lock = threading.Lock()
     worker._log_failure = lambda **kwargs: None
     worker.xfer_stats = MagicMock()
     worker.nixl_wrapper = FakeNixl()

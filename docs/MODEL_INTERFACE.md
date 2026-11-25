@@ -70,10 +70,15 @@ startup when the installed ttnn lacks them.
 
 vLLM's `NixlConnector` moves KV between servers, for example from a prefill
 server to a decode server, with the NIXL transfer library. NIXL cannot register
-TT device memory, so on TT the connector runs only with a CPU buffer:
+TT device memory, so on TT the connector runs only with a CPU buffer. The
+prefill server is the producer and the decode server the consumer (vLLM 0.33
+deprecates `kv_both` for this connector):
 
 ```bash
---kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_both", "kv_buffer_device": "cpu"}'
+# prefill server
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu"}'
+# decode server
+--kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu"}'
 ```
 
 For it, `TTPlatform` names `TTAttentionBackend` as the attention backend (only
@@ -138,13 +143,16 @@ slot numbers instead of block IDs and copies the slots into its chips once
 P's write lands; P copies only the blocks D registered, once the two are
 matched. A D request whose KV does not arrive within
 `push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
-fails instead of waiting forever, and its slots go to another request after
-`kv_lease_duration`. D's registration therefore tells P the seconds left
-(`tt_recv_seconds_left`), and P submits no write later than a margin before
-they run out, counted from when P reads the registration: 10 s, or a quarter
-of the seconds left when that is shorter. P and D must both use it.
+fails instead of waiting forever. P may still write into its slots then, so D
+gives them to another request only once P has confirmed that it writes no more
+into them: P acknowledges each registration it records, D sends a cancel for a
+failed receive once P has acknowledged its registration, and P acknowledges
+the cancel once no write into those slots is in flight and drops any later
+one. A P that never answers keeps the slots reserved on D. These notifications
+are not part of vLLM's push protocol, so P and D must both use
+`TTNixlPushConnector`.
 
-`"enable_chunked_push": true` in P's `kv_connector_extra_config` (experimental; vLLM's name for the same setting) moves P's copy into the prefill. After each prefill step, P copies the prompt blocks that the step completed from its chips into staging slots that hold the whole prompt. The copy runs after the step's forward on the model's command queue, so it lengthens the step. Without chunked prefill (a model that does not declare `supports_chunked_prefill`, or `--no-enable-chunked-prefill`), the prompt's one prefill step copies the whole prompt. P's writer thread writes each step's blocks from those slots into the blocks D registered as soon as D's registration has arrived, without a completion notification, so the transfer overlaps P's later prefill steps; blocks staged before the registration arrives are written when it arrives. The write of the prompt's last blocks carries the completion notification and starts only after every earlier write of the request has completed, so D, which is unchanged, copies its slots into its chips only once all of the KV has landed. D registers only after it has received its own request, so the writes overlap P's prefill only behind a proxy that sends the request to P and D at the same time. Behind vLLM 0.33's `toy_proxy_server.py`, which waits for P's answer before it calls D, P writes the whole request after it finishes, from its slots without a second copy. P also writes the whole request from its slots when a chunk write or the handshake with D fails, or when D's tensor parallel size differs from P's. Past the write margin before D's deadline, P writes no chunk either: the request's last write then carries no notification, and its whole-request write is dropped. A preempted or aborted request keeps its slots until no write reads them; a recompute takes new slots, and its writes reach D after the old ones. A request that finds too few free slots at its first prefill step is copied whole once matched, as without the setting. P refuses the setting at startup when the KV is not one full-attention group (sliding window, GDN, Mamba), when P leaves a prompt tail to D (multi-module MTP lookahead), and under lane DP. D ignores it. Both refuse a value other than `true` or `false` at startup.
+`"enable_chunked_push": true` in P's `kv_connector_extra_config` (experimental; vLLM's name for the same setting) moves P's copy into the prefill. After each prefill step, P copies the prompt blocks that the step completed from its chips into staging slots that hold the whole prompt. The copy runs after the step's forward on the model's command queue, so it lengthens the step. Without chunked prefill (a model that does not declare `supports_chunked_prefill`, or `--no-enable-chunked-prefill`), the prompt's one prefill step copies the whole prompt. P's writer thread writes each step's blocks from those slots into the blocks D registered as soon as D's registration has arrived, without a completion notification, so the transfer overlaps P's later prefill steps; blocks staged before the registration arrives are written when it arrives. The write of the prompt's last blocks carries the completion notification and starts only after every earlier write of the request has completed, so D, which is unchanged, copies its slots into its chips only once all of the KV has landed. D registers only after it has received its own request, so the writes overlap P's prefill only behind a proxy that sends the request to P and D at the same time. Behind vLLM 0.33's `toy_proxy_server.py`, which waits for P's answer before it calls D, P writes the whole request after it finishes, from its slots without a second copy. P also writes the whole request from its slots when a chunk write or the handshake with D fails, or when D's tensor parallel size differs from P's. A preempted or aborted request keeps its slots until no write reads them; a recompute takes new slots, and its writes reach D after the old ones. A request that finds too few free slots at its first prefill step is copied whole once matched, as without the setting. P refuses the setting at startup when the KV is not one full-attention group (sliding window, GDN, Mamba), when P leaves a prompt tail to D (multi-module MTP lookahead), and under lane DP. D ignores it. Both refuse a value other than `true` or `false` at startup.
 
 Under lane DP the lanes share the engine's one connector. Block IDs are
 lane-local, so the coordinator builds the connector metadata once per step and
