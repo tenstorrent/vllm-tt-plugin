@@ -202,10 +202,10 @@ class TTNixlPushConnectorScheduler(NixlPushConnectorScheduler):
     Raises
     ------
     ValueError
-        When ``enable_chunked_push`` is on for a producer whose KV is not one
-        full-attention group, whose prompt tail is left to D (a prefill
-        backoff, for a Mamba state or a multi-module MTP lookahead), or that
-        runs TT lane DP.
+        When ``enable_chunked_push`` is not a boolean, on either side, and
+        when it is on for a producer whose KV is not one full-attention group,
+        whose prompt tail is left to D (a prefill backoff, for a Mamba state
+        or a multi-module MTP lookahead), or that runs TT lane DP.
 
     Notes
     -----
@@ -215,12 +215,15 @@ class TTNixlPushConnectorScheduler(NixlPushConnectorScheduler):
     """
 
     def __init__(self, vllm_config, engine_id: str, kv_cache_config: KVCacheConfig):
-        super().__init__(vllm_config, engine_id, kv_cache_config)
         transfer_config = vllm_config.kv_transfer_config
-        self._chunked_push = (
-            bool(transfer_config.get_from_extra_config("enable_chunked_push", False))
-            and transfer_config.kv_role == "kv_producer"
-        )
+        enabled = transfer_config.get_from_extra_config("enable_chunked_push", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                "enable_chunked_push in kv_connector_extra_config must be true or "
+                f"false; got {enabled!r}."
+            )
+        super().__init__(vllm_config, engine_id, kv_cache_config)
+        self._chunked_push = enabled and transfer_config.kv_role == "kv_producer"
         self._chunk_trackers: dict[str, _ChunkPushTracker] = {}
         if self._chunked_push:
             self._refuse_unsupported_chunked_push(vllm_config, kv_cache_config)

@@ -8,6 +8,7 @@ test sees which IDs reach vLLM and which copies the overrides make. The
 scheduler tests do the same with vLLM's push scheduler.
 """
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -469,6 +470,17 @@ def test_chunked_push_is_refused_for_a_sliding_window_gdn_or_mtp_model(
     )
     with pytest.raises(ValueError, match="enable_chunked_push"):
         push_scheduler(*specs)
+
+
+@pytest.mark.parametrize(
+    ("value", "role"),
+    [("false", "kv_producer"), (1, "kv_producer"), ("true", "kv_consumer")],
+    ids=["string_on_p", "integer_on_p", "string_on_d"],
+)
+def test_a_non_boolean_enable_chunked_push_is_refused(push_scheduler, value, role):
+    # Read as a truth value, the JSON string "false" would turn the setting on.
+    with pytest.raises(ValueError, match=re.escape(f"got {value!r}")):
+        push_scheduler(chunked=value, role=role)
 
 
 @pytest.mark.parametrize(
