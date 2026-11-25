@@ -16,7 +16,7 @@ higher. The gain is largest with random
 sampling (temperature, top-k, top-p), many concurrent requests and smaller
 models, where CPU sampling used to dominate each step. It is smaller with
 greedy decoding, few concurrent requests, or larger models and long contexts,
-where the model's own compute dominates. Models on the shared tt_transformers
+where the model's own compute dominates. Models on the shared ttt_compat
 code opt in with one flag; others implement a small "run the forward now,
 sample later" interface. It is opt-in and decode-only. Ineligible steps fall
 back to the CPU path before forward submission; unsupported launch combinations
@@ -27,7 +27,7 @@ may instead be rejected, and failures after deferred submission are terminal.
 | Side | State |
 | --- | --- |
 | Plugin | Merged in tenstorrent/vllm-tt-plugin#123. |
-| tt-metal reference implementation | Merged in tenstorrent/tt-metal#55892: tt_transformers `LlamaForCausalLM`, `QwenForCausalLM`, `MistralForCausalLM`. |
+| tt-metal reference implementation | Merged in tenstorrent/tt-metal#55892: ttt_compat `LlamaForCausalLM`, `QwenForCausalLM`, `MistralForCausalLM`. |
 | Scope | Decode only, one sampler per data-parallel replica, no logprobs. |
 | Follow-up work | tenstorrent/tt-metal#60370. |
 
