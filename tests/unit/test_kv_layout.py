@@ -81,6 +81,44 @@ class TestDefaultLayout:
         with pytest.raises(ValueError, match="get_kv_transfer_layout"):
             default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
 
+    @pytest.mark.parametrize(
+        ("shape", "found"),
+        [
+            pytest.param(
+                (BLOCKS + 1, 2, BLOCK_SIZE, HEAD_DIM), "num_blocks=7", id="blocks"
+            ),
+            pytest.param(
+                (BLOCKS, 2, 2 * BLOCK_SIZE, HEAD_DIM), "block_size=64", id="block_size"
+            ),
+            pytest.param(
+                (BLOCKS, 2, BLOCK_SIZE, 2 * HEAD_DIM), "head_size=64", id="head_size"
+            ),
+            pytest.param((BLOCKS, 2, BLOCK_SIZE * HEAD_DIM), "not", id="not_4d"),
+        ],
+    )
+    def test_a_cache_the_kv_cache_config_does_not_describe_is_refused(
+        self, shape, found
+    ):
+        # The copy takes block b of the cache to be vLLM's block b, holding the
+        # spec's block_size tokens of head_size values per head.
+        k, v = FakeCache(heads=2, chips=4), FakeCache(heads=2, chips=4)
+        k.shape = shape
+        with pytest.raises(ValueError, match=f"{found}.*get_kv_transfer_layout"):
+            default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param(lambda k, v: [k], id="one_cache_in_a_list"),
+            pytest.param(lambda k, v: k, id="a_bare_cache"),
+            pytest.param(lambda k, v: [k, v, k], id="three_caches"),
+        ],
+    )
+    def test_an_entry_that_is_not_a_k_v_pair_is_refused(self, entry):
+        k, v = FakeCache(heads=2, chips=4), FakeCache(heads=2, chips=4)
+        with pytest.raises(ValueError, match="not a \\[k, v\\] pair"):
+            default_kv_layout([entry(k, v)], _config(["model.layers.0.attn"], 8))
+
 
 class TestDeclaredLayout:
     def test_a_model_declares_extra_parts_and_layers(self):

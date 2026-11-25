@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import ttnn
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 
 _TILE = 32
 
@@ -124,14 +124,16 @@ def default_kv_layout(kv_caches: Any, kv_cache_config: KVCacheConfig) -> KVLayou
 
     ``kv_caches`` is ``[k, v]`` per layer in layer-index order, or that list
     inside a one-entry list (one submesh). Layer ``model.layers.<i>...`` is
-    entry ``i``.
+    entry ``i``. Each cache is ``[num_blocks, heads, block_size, head_size]``
+    on every chip, with ``num_blocks`` from ``kv_cache_config`` and
+    ``block_size`` and ``head_size`` from the layer's spec.
 
     Raises
     ------
     ValueError
-        When the entries do not match the layer names, or a cache's shape,
-        layout or dtype cannot be described here; such a model declares
-        ``get_kv_transfer_layout``.
+        When the entries do not match the layer names, an entry is not a
+        ``[k, v]`` pair, or a cache's shape, layout or dtype cannot be
+        described here; such a model declares ``get_kv_transfer_layout``.
     """
     per_layer = kv_caches
     if (
@@ -152,10 +154,22 @@ def default_kv_layout(kv_caches: Any, kv_cache_config: KVCacheConfig) -> KVLayou
                     f"No [k, v] KV cache entry for layer {name}; the model "
                     "can declare its layout with get_kv_transfer_layout."
                 )
-            k, v = per_layer[index]
+            entry = per_layer[index]
+            if not isinstance(entry, Sequence) or len(entry) != 2:
+                found = (
+                    f"{len(entry)} entries"
+                    if isinstance(entry, Sequence)
+                    else type(entry).__name__
+                )
+                raise ValueError(
+                    f"Layer {name}: KV cache entry {index} is not a [k, v] pair "
+                    f"but {found}; the model can declare its layout with "
+                    "get_kv_transfer_layout."
+                )
+            k, v = entry
             layers[name] = (
-                _paged_part(name, k, spec.num_kv_heads),
-                _paged_part(name, v, spec.num_kv_heads),
+                _paged_part(name, k, spec, kv_cache_config.num_blocks),
+                _paged_part(name, v, spec, kv_cache_config.num_blocks),
             )
     if isinstance(per_layer, Sequence) and len(per_layer) != len(layers):
         raise ValueError(
@@ -166,10 +180,40 @@ def default_kv_layout(kv_caches: Any, kv_cache_config: KVCacheConfig) -> KVLayou
     return KVLayout(layers)
 
 
-def _paged_part(name: str, cache: Any, num_kv_heads: int) -> KVPart:
-    """A ``[blocks, heads, block_size, head_dim]`` TILE cache as one part."""
+def _paged_part(name: str, cache: Any, spec: AttentionSpec, num_blocks: int) -> KVPart:
+    """A ``[num_blocks, heads, block_size, head_size]`` TILE cache as one part.
+
+    ``heads`` is per chip: a mesh tensor's shape is the shape of each chip's
+    shard. The other three dimensions must equal ``num_blocks`` and the spec's,
+    or block ``b`` of the cache would not be vLLM's block ``b``.
+
+    Raises
+    ------
+    ValueError
+        When the cache is not 4-D, a dimension differs from ``num_blocks`` or
+        ``spec``, or its dtype, layout or head split cannot be described here.
+    """
+    shape = tuple(cache.shape)
+    if len(shape) != 4:
+        raise ValueError(
+            f"Layer {name}: a KV cache of shape {shape} is not [num_blocks, "
+            "heads, block_size, head_size]; the model can declare its layout "
+            "with get_kv_transfer_layout."
+        )
+    blocks, heads, block_size, head_dim = shape
+    for field, found, expected in zip(
+        ("num_blocks", "block_size", "head_size"),
+        (blocks, block_size, head_dim),
+        (num_blocks, spec.block_size, spec.head_size),
+    ):
+        if found != expected:
+            raise ValueError(
+                f"Layer {name}: the KV cache of shape {shape} has "
+                f"{field}={found}, but kv_cache_config has {field}={expected}; "
+                "the model can declare its layout with get_kv_transfer_layout."
+            )
+    num_kv_heads = spec.num_kv_heads
     tile_bytes = _tile_bytes(cache.dtype)
-    _, heads, block_size, head_dim = tuple(cache.shape)
     if (
         tile_bytes is None
         or cache.layout != ttnn.TILE_LAYOUT
@@ -178,7 +222,7 @@ def _paged_part(name: str, cache: Any, num_kv_heads: int) -> KVPart:
     ):
         raise ValueError(
             f"Layer {name}: cannot describe a {cache.dtype} {cache.layout} cache "
-            f"of shape {tuple(cache.shape)}; the model can declare its layout "
+            f"of shape {shape}; the model can declare its layout "
             "with get_kv_transfer_layout."
         )
     chips = cache.device().get_num_devices()
