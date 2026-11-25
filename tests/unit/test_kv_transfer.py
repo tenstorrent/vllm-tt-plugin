@@ -6,9 +6,12 @@
 stands in for ttnn's region copies over those bytes.
 """
 
+import importlib.util
+
 import numpy as np
 import pytest
 import torch
+import ttnn
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -16,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from tests.support.kv_cache import FakeKVCache, fake_region_copies
+from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.kv_layout import KVLayout, KVPart
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions, make_copy_blocks
 
@@ -110,3 +114,13 @@ def test_a_copy_returns_once_its_last_transfer_landed(blocking_calls, direction)
     make_copy_blocks(layout)(src, dst, [0, 1], [2, 3], direction)
 
     assert blocking_calls[-1] is True
+
+
+def test_importing_the_module_needs_no_region_copies(monkeypatch):
+    # A released ttnn lacks them; the plugin must still import with it.
+    for name in ("copy_device_to_host_regions", "copy_host_to_device_regions"):
+        monkeypatch.delattr(ttnn, name)
+    spec = importlib.util.spec_from_file_location(
+        "kv_transfer_copy", kv_transfer.__file__
+    )
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))

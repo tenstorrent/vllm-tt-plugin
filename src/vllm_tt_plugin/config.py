@@ -554,6 +554,9 @@ def validate_tt_kv_transfer_config(
     ValueError
         With data parallelism (standard DP, or lanes, which run with
         ``data_parallel_size == 1``), or for a model without prefix caching.
+    RuntimeError
+        For a connector with a CPU buffer (``kv_buffer_device == "cpu"``) when
+        ttnn lacks the region copies that move KV through that buffer.
     """
     if vllm_config.kv_transfer_config is None:
         return
@@ -571,6 +574,11 @@ def validate_tt_kv_transfer_config(
             "loads KV from a connector resumes its prefill after that KV, as "
             "after a prefix-cache hit."
         )
+    if vllm_config.kv_transfer_config.kv_buffer_device == "cpu":
+        # Deferred: the copy imports ttnn, which this module does not need.
+        from vllm_tt_plugin.kv_transfer import check_region_copies
+
+        check_region_copies()
 
 
 def resolve_tt_scheduler_cls(

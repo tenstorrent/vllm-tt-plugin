@@ -191,6 +191,10 @@ def test_supports_device_grammar_rejects_non_boolean(invalid):
         tt_config.store_tt_supports_device_grammar(_vllm_config(), invalid)
 
 
+# A connector config without a CPU buffer: vLLM's default kv_buffer_device on TT.
+_DEVICE_KV_BUFFER = SimpleNamespace(kv_buffer_device="tt")
+
+
 @pytest.mark.parametrize(
     ("data_parallel_size", "lane_count"),
     [(2, None), (1, 2)],
@@ -200,7 +204,7 @@ def test_kv_transfer_config_is_refused_with_data_parallelism(
     data_parallel_size, lane_count
 ):
     cfg = _vllm_config(data_parallel_size=data_parallel_size, lane_count=lane_count)
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = _DEVICE_KV_BUFFER
 
     with pytest.raises(ValueError, match="kv-transfer-config"):
         tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
@@ -212,7 +216,7 @@ def test_kv_transfer_config_is_refused_with_data_parallelism(
 
 def test_kv_transfer_config_is_accepted_without_data_parallelism():
     cfg = _vllm_config()
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = _DEVICE_KV_BUFFER
 
     tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
 
@@ -222,10 +226,44 @@ def test_kv_transfer_config_needs_a_model_that_resumes_a_prefill():
     # KV, as after a prefix-cache hit. A model without prefix caching would
     # compute on KV or state that never arrived.
     cfg = _vllm_config()
-    cfg.kv_transfer_config = object()
+    cfg.kv_transfer_config = _DEVICE_KV_BUFFER
 
     with pytest.raises(ValueError, match="supports_prefix_caching"):
         tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)
 
     cfg.kv_transfer_config = None
     tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=False)
+
+
+_REGION_COPIES = ("copy_device_to_host_regions", "copy_host_to_device_regions")
+
+
+@pytest.mark.parametrize("missing", _REGION_COPIES)
+def test_a_cpu_kv_buffer_needs_ttnn_region_copies(monkeypatch, missing):
+    # A released ttnn without tt-metal#67057 could start a server whose first
+    # KV transfer fails.
+    import ttnn
+
+    for name in _REGION_COPIES:
+        monkeypatch.setattr(ttnn, name, lambda *_args, **_kwargs: None, raising=False)
+    monkeypatch.delattr(ttnn, missing)
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = SimpleNamespace(kv_buffer_device="cpu")
+
+    with pytest.raises(RuntimeError, match=f"{missing}.*tt-metal/pull/67057"):
+        tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+    # A connector without a CPU buffer never runs the region copies.
+    cfg.kv_transfer_config = _DEVICE_KV_BUFFER
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)
+
+
+def test_a_cpu_kv_buffer_is_accepted_with_ttnn_region_copies(monkeypatch):
+    import ttnn
+
+    for name in _REGION_COPIES:
+        monkeypatch.setattr(ttnn, name, lambda *_args, **_kwargs: None, raising=False)
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = SimpleNamespace(kv_buffer_device="cpu")
+
+    tt_config.validate_tt_kv_transfer_config(cfg, supports_prefix_caching=True)

@@ -10,10 +10,12 @@ layer is the layer's parts' blocks in order, each part shard after shard,
 exactly as the chips hold them.
 
 The copy needs ``ttnn.copy_device_to_host_regions`` and
-``ttnn.copy_host_to_device_regions`` (tt-metal#67057). This module only looks
-them up when a copy runs, so it imports with a ttnn that lacks them.
+``ttnn.copy_host_to_device_regions`` (tt-metal#67057). This module looks them
+up only when a copy runs, so it imports with a ttnn that lacks them;
+``check_region_copies`` tells a launch that needs them at startup.
 
-Principal entry points: ``kv_cache_descriptions`` and ``make_copy_blocks``.
+Principal entry points: ``kv_cache_descriptions``, ``make_copy_blocks`` and
+``check_region_copies``.
 """
 
 from collections.abc import Iterator
@@ -25,6 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_tt_plugin.kv_layout import KVLayout, KVPart
+
+_REGION_COPIES = ("copy_device_to_host_regions", "copy_host_to_device_regions")
 
 
 def kv_cache_descriptions(
@@ -128,6 +132,22 @@ def make_copy_blocks(layout: KVLayout) -> CopyBlocksOp:
                 )
 
     return copy_blocks
+
+
+def check_region_copies() -> None:
+    """Check that ttnn has the region copies ``make_copy_blocks`` runs.
+
+    Raises
+    ------
+    RuntimeError
+        Naming each missing ttnn function and tt-metal#67057, which adds them.
+    """
+    if missing := [name for name in _REGION_COPIES if not hasattr(ttnn, name)]:
+        raise RuntimeError(
+            "A KV connector with a CPU buffer (kv_buffer_device='cpu') copies KV "
+            f"with ttnn.{' and ttnn.'.join(missing)}, which this ttnn lacks. "
+            "They come with https://github.com/tenstorrent/tt-metal/pull/67057."
+        )
 
 
 def _with_offsets(parts: tuple[KVPart, ...]) -> Iterator[tuple[int, KVPart]]:
