@@ -73,7 +73,7 @@ from vllm_tt_plugin.input_batch import (
     log_prefill_chunks,
 )
 from vllm_tt_plugin.kv_layout import kv_transfer_layout
-from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
+from vllm_tt_plugin.kv_transfer import kv_cache_descriptions, make_copy_blocks
 from vllm_tt_plugin.lane_scheduler import get_tt_step_plan
 from vllm_tt_plugin.loader import TTModelLoader
 from vllm_tt_plugin.logger import init_tt_logger
@@ -752,10 +752,11 @@ class TTModelRunner(KVConnectorModelRunnerMixin):
 
         self.kv_caches = self._allocate_kv_caches(kv_cache_config)
         if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
             layout = kv_transfer_layout(self.model, self.kv_caches, kv_cache_config)
-            get_kv_transfer_group().register_kv_caches(
-                kv_cache_descriptions(kv_cache_config, layout)
-            )
+            connector.register_kv_caches(kv_cache_descriptions(kv_cache_config, layout))
+            # Only a connector that stages KV through a CPU buffer keeps this.
+            connector.set_host_xfer_buffer_ops(make_copy_blocks(layout))
 
     @staticmethod
     def _validate_kv_cache_groups(kv_cache_groups: list) -> None:

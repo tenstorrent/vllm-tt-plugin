@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 """The KV connector lifecycle on the single-process TT path.
 
-No bytes move here. A fake connector records what the plugin asks of it and
-reports the transfers each test scripts.
+A fake connector records what the plugin asks of it and reports the transfers
+each test scripts. KV bytes move only between fake chips and CPU buffers.
 """
 
 import threading
@@ -11,6 +11,7 @@ from collections import deque
 from functools import partial
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.config.kv_transfer import KVTransferConfig
@@ -30,11 +31,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
+from tests.support.kv_cache import FakeKVCache, fake_region_copies
 from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
 from tests.test_sample_time_grammar import _model_input, _sync_forward
-from vllm_tt_plugin import kv_layout
+from vllm_tt_plugin import kv_transfer
 from vllm_tt_plugin.async_decode import AsyncTTModelRunnerOutput
 from vllm_tt_plugin.kv_layout import default_kv_layout
 from vllm_tt_plugin.kv_transfer import kv_cache_descriptions
@@ -71,6 +73,9 @@ class FakeKVConnector(KVConnectorBase_V1, SupportsHMA):
 
     def register_kv_caches(self, kv_caches):
         self.kv_caches = kv_caches
+
+    def set_host_xfer_buffer_ops(self, copy_operation):
+        self.copy_blocks = copy_operation
 
     def bind_connector_metadata(self, connector_metadata):
         self.calls.append("bind")
@@ -257,18 +262,6 @@ NUM_BLOCKS = 12
 LAYER_NAMES = ["model.layers.1.self_attn", "model.layers.0.self_attn"]
 
 
-class FakeKVTensor:
-    """One layer's bfloat8_b K or V on a 2-chip mesh, one head per chip."""
-
-    dtype = kv_layout.ttnn.bfloat8_b
-    layout = kv_layout.ttnn.TILE_LAYOUT
-    shape = (NUM_BLOCKS, 1, BLOCK_SIZE, 32)
-    block_bytes = (BLOCK_SIZE // 32) * 1088
-
-    def device(self):
-        return SimpleNamespace(get_num_devices=lambda: CHIPS)
-
-
 def _initialize_kv_cache(kv_caches: list, model=None) -> None:
     """``TTModelRunner.initialize_kv_cache`` over a model holding ``kv_caches``."""
     spec = FullAttentionSpec(
@@ -299,7 +292,18 @@ def _initialize_kv_cache(kv_caches: list, model=None) -> None:
 
 
 def _kv_caches(num_layers: int = 2) -> list:
-    return [[FakeKVTensor(), FakeKVTensor()] for _ in range(num_layers)]
+    """A bfloat8_b K and V per layer, one head on each chip."""
+    return [
+        [
+            FakeKVCache(blocks=NUM_BLOCKS, heads=1, chips=CHIPS, block_size=BLOCK_SIZE)
+            for _ in "kv"
+        ]
+        for _ in range(num_layers)
+    ]
+
+
+# Bytes of one block of one K or V on one chip.
+BLOCK_BYTES = _kv_caches(num_layers=1)[0][0].block_bytes
 
 
 def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connector):
@@ -310,7 +314,7 @@ def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connecto
         assert description.shape[:3] == (NUM_BLOCKS, CHIPS, BLOCK_SIZE)
         assert description.dtype == torch.uint8
         # A block is the K and V of that block on every chip.
-        assert description[0].nbytes == 2 * CHIPS * FakeKVTensor.block_bytes
+        assert description[0].nbytes == 2 * CHIPS * BLOCK_BYTES
         # One element stands in for the whole shape.
         assert description.untyped_storage().nbytes() == 1
 
@@ -318,7 +322,7 @@ def test_the_connector_is_handed_a_description_of_each_layers_kv(worker_connecto
 def test_a_connector_refuses_a_kv_cache_it_cannot_describe(
     worker_connector, monkeypatch
 ):
-    monkeypatch.setattr(FakeKVTensor, "dtype", "uint32")
+    monkeypatch.setattr(FakeKVCache, "dtype", "uint32")
     with pytest.raises(ValueError, match="cannot describe a uint32"):
         _initialize_kv_cache(_kv_caches())
 
@@ -343,6 +347,51 @@ def test_a_model_layout_replaces_the_default_one(worker_connector):
 def test_no_connector_is_handed_kv_without_a_transfer_group(vllm_config):
     # Without --kv-transfer-config the model's KV caches are not inspected.
     _initialize_kv_cache([["not", "a", "kv", "cache"]])
+
+
+@pytest.mark.parametrize("one_list_per_submesh", [False, True])
+def test_kv_moves_between_two_servers_through_their_cpu_buffers(
+    worker_connector, monkeypatch, one_list_per_submesh
+):
+    """KV crosses a sender's and a receiver's CPU buffer as the chips' bytes."""
+    fake_region_copies(monkeypatch)
+
+    def server():
+        kv_caches = _kv_caches()
+        _initialize_kv_cache([kv_caches] if one_list_per_submesh else kv_caches)
+        # NixlConnector's buffer: tokens before heads in memory, viewed as
+        # (blocks, heads, tokens, n) like the description.
+        cpu_buffer = {
+            name: torch.zeros(
+                (d.shape[0], d.shape[2], d.shape[1], d.shape[3]), dtype=d.dtype
+            ).permute(0, 2, 1, 3)
+            for name, d in worker_connector.kv_caches.items()
+        }
+        return kv_caches, cpu_buffer, worker_connector.copy_blocks
+
+    sent, sender_buffer, sender_copy = server()
+    received, receiver_buffer, receiver_copy = server()
+    rng = np.random.default_rng(0)
+    for cache in (cache for layer in sent for cache in layer):
+        for chip in cache.chips:
+            chip[:] = rng.integers(0, 256, chip.size, dtype=np.uint8)
+
+    sent_ids = [0, 1, 2, 9, 8, 7, 5]
+    received_ids = [4, 5, 6, 11, 10, 9, 0]
+    sender_copy(None, sender_buffer, sent_ids, sent_ids, "d2h")
+    # The connector moves buffer blocks between servers; block IDs differ there.
+    for name in LAYER_NAMES:
+        receiver_buffer[name][received_ids] = sender_buffer[name][sent_ids]
+    receiver_copy(receiver_buffer, None, received_ids, received_ids, "h2d")
+
+    for sent_layer, received_layer in zip(sent, received):
+        for sent_cache, received_cache in zip(sent_layer, received_layer):
+            for chip in range(CHIPS):
+                sent_blocks = sent_cache.blocks_on(chip)
+                received_blocks = received_cache.blocks_on(chip)
+                assert (received_blocks[received_ids] == sent_blocks[sent_ids]).all()
+                # Blocks nothing was sent to stay empty.
+                assert not received_blocks[[1, 2, 3, 7, 8]].any()
 
 
 class TestNixlConnectorOnTT:
@@ -411,7 +460,9 @@ class TestNixlConnectorOnTT:
             for buffer in connector.connector_worker.host_xfer_buffers.values():
                 assert buffer.device.type == "cpu"
                 assert buffer.shape[0] == NUM_BLOCKS
-                assert buffer[0].nbytes == 2 * CHIPS * FakeKVTensor.block_bytes
+                assert buffer[0].nbytes == 2 * CHIPS * BLOCK_BYTES
+                # The copy reads it as one block after another.
+                assert kv_transfer._buffer_bytes(buffer).nbytes == buffer.nbytes
         finally:
             connector.shutdown()
 

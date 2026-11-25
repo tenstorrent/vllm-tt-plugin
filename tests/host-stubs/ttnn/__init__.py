@@ -107,6 +107,8 @@ GetDefaultDevice = _no_device("GetDefaultDevice")
 ReadDeviceProfiler = _no_device("ReadDeviceProfiler")
 event_synchronize = _no_device("event_synchronize")
 copy_host_to_device_tensor = _no_device("copy_host_to_device_tensor")
+copy_device_to_host_regions = _no_device("copy_device_to_host_regions")
+copy_host_to_device_regions = _no_device("copy_host_to_device_regions")
 
 # The plugin only compares a tensor's dtype and layout against these.
 bfloat8_b = "bfloat8_b"
