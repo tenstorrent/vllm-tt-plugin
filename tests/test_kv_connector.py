@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -914,6 +915,36 @@ def test_a_prompt_prefilled_in_one_step_is_staged_by_one_job():
     assert step.kv_connector_metadata.push_chunk_jobs == [
         NixlPushChunkJob("B", table[:5], start_block=0, end_block=5, total_blocks=5)
     ]
+
+
+def test_a_preemption_the_release_pass_drained_reaches_the_connector():
+    # B is part way through its prefill, behind A's held decode. A keep pause
+    # with a cache reset (what EngineCore.pause_scheduler(mode="keep",
+    # clear_cache=True) does) preempts both between two schedule() calls. The
+    # next call's release pass drains the preemptions and its prefill pass
+    # schedules nothing, so the call returns the prefill pass's step with the
+    # release pass's cleanup added. P's worker gives B's staging slots back at
+    # the step whose metadata lists B.
+    scheduler = _chunked_push_scheduler()
+    request = _push_request(prompt_length=600)
+
+    def done() -> bool:
+        held = scheduler._unreleased_step
+        return (
+            held is not None
+            and "A" in held.num_scheduled_tokens
+            and request.num_computed_tokens > 0
+        )
+
+    _serve_behind_a_decode(scheduler, request, done)
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    step = scheduler.schedule()
+
+    assert step.total_num_scheduled_tokens == 0
+    assert step.preempted_req_ids == {"A", "B"}
+    assert step.kv_connector_metadata.push_chunk_preemptions == {"B"}
 
 
 def test_a_step_that_runs_no_forward_copies_nothing(vllm_config, staging_connector):

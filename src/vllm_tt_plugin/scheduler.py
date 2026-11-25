@@ -349,7 +349,10 @@ def _carry_cleanup(earlier: SchedulerOutput, later: SchedulerOutput) -> None:
     encoder cache entries, and the requests preempted since the previous pass,
     even a pass that schedules nothing. When one ``TTScheduler.schedule()`` call
     runs several passes and returns only ``later``, the runner must still
-    receive what ``earlier`` drained.
+    receive what ``earlier`` drained. So must the KV connector: build
+    ``later``'s ``kv_connector_metadata`` after this call, since a connector
+    can read ``preempted_req_ids`` (``TTNixlPushConnectorScheduler`` lists
+    them so that P's worker frees their staging slots).
     """
     later.finished_req_ids |= earlier.finished_req_ids
     later.free_encoder_mm_hashes = (
@@ -1023,15 +1026,17 @@ class TTScheduler(AsyncScheduler):
             # A held step here is a decode or a verify. Building KV connector
             # metadata drains the connector's recorded work, so a pass whose
             # output may be dropped must not build it: the release pass builds
-            # only once it is known to be returned, and a prefill pass that
-            # schedules nothing beside running decodes leaves it to the decode
-            # pass.
+            # only once it is known to be returned. A prefill pass that
+            # schedules nothing leaves it to the decode pass beside running
+            # decodes, and otherwise, after a release pass, builds it once
+            # ``_carry_cleanup`` has added that pass's cleanup.
             release_step = None
             if held is not None and self.scheduler_config.async_scheduling:
                 with self._skip_kv_connector_meta(lambda _: True):
                     release_step = self._schedule_release_step()
             with self._skip_kv_connector_meta(
-                lambda out: out.total_num_scheduled_tokens == 0 and has_running_decode
+                lambda out: out.total_num_scheduled_tokens == 0
+                and (has_running_decode or release_step is not None)
             ):
                 prefill_result = self._schedule_prefill_only()
             if release_step is not None:
@@ -1071,6 +1076,11 @@ class TTScheduler(AsyncScheduler):
                     + result.free_encoder_mm_hashes
                 )
                 return self._finalize_scheduler_output(result, is_decode=True)
+            if release_step is not None and self.connector is not None:
+                # The pass scheduled nothing, so nothing it read has moved.
+                prefill_result.kv_connector_metadata = self._build_kv_connector_meta(
+                    self.connector, prefill_result
+                )
             self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result, is_decode=False)
 
