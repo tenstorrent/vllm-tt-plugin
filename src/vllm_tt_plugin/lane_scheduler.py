@@ -965,6 +965,9 @@ class TTLaneCoordinator(SchedulerInterface):
     # SchedulerInterface: queries / lifecycle
     # ------------------------------------------------------------------
 
+    def has_request(self, request_id: str) -> bool:
+        return any(sched.has_request(request_id) for sched in self.lanes)
+
     def get_num_unfinished_requests(self) -> int:
         return sum(sched.get_num_unfinished_requests() for sched in self.lanes)
 

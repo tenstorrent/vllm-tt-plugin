@@ -289,6 +289,12 @@ class DeferredDecodeOutput(AsyncModelRunnerOutput):
     def get_output(self) -> Any:
         return self.ensure_finalized()
 
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # The executor asks for this after ``get_output`` raised, to salvage KV
+        # connector state. The connector step ran at submission, so its output
+        # is valid even when the readback failed.
+        return self.kv_connector_output
+
     def _get_output_impl(self) -> Any:
         raise NotImplementedError
 

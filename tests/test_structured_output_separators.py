@@ -49,7 +49,9 @@ def accepts(disable_any_whitespace: bool, text: str) -> bool:
             model_config=None,
             speculative_config=None,
         ),
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(
+            get_vocab=lambda: {token: index for index, token in enumerate(VOCAB)}
+        ),
         vocab_size=len(VOCAB),
     )
     grammar = backend.compile_grammar(StructuredOutputOptions.JSON, SCHEMA)
