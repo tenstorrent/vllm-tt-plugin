@@ -63,8 +63,14 @@ class _StubModel:
     output_tokens_per_step=1; tests inject the block width afterwards."""
 
 
+class _ResumingStubModel(_StubModel):
+    """Declares the prefill resume that a KV connector needs."""
+
+    model_capabilities = {"supports_prefix_caching": True}
+
+
 @contextmanager
-def _stub_model_resolution():
+def _stub_model_resolution(model: type = _StubModel):
     """Resolve the stub instead of tt-metal's TTQwen2ForCausalLM while the
     platform hook runs inside VllmConfig.__post_init__ (mirrors
     test_block_request_validation._patch_model_resolution)."""
@@ -83,7 +89,7 @@ def _stub_model_resolution():
         ),
         patch(
             "vllm.model_executor.model_loader.utils.get_model_architecture",
-            return_value=(_StubModel, None),
+            return_value=(model, None),
         ),
     ):
         yield
@@ -123,7 +129,8 @@ def _scheduler(
         cache_dtype="auto",
         enable_prefix_caching=False,
     )
-    with _stub_model_resolution():
+    stub = _StubModel if kv_transfer_config is None else _ResumingStubModel
+    with _stub_model_resolution(stub):
         config = VllmConfig(
             scheduler_config=scheduler_config,
             model_config=model_config,

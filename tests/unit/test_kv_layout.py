@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""KV layouts for connectors, and the copy they drive.
+"""KV transfer layouts: the default one and the one a model declares."""
 
-Fake device tensors hold each chip's buffer as bytes; the region copies are
-replaced by their documented behaviour over those bytes.
-"""
+import importlib.util
+import sys
+import types
 
-import ctypes
-from types import SimpleNamespace
-
-import numpy as np
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -18,28 +14,22 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 
-from vllm_tt_plugin import kv_layout, kv_transfer
+from tests.support.kv_cache import TILE_BYTES, FakeKVCache
+from vllm_tt_plugin import kv_layout
 from vllm_tt_plugin.kv_layout import KVPart, default_kv_layout, kv_transfer_layout
 
 BLOCKS, BLOCK_SIZE, HEAD_DIM = 6, 32, 32
-TILE_BYTES = 1088  # bfloat8_b
 
 
-class FakeCache:
-    """A paged ``[blocks, heads, block_size, head_dim]`` bfloat8_b cache on a mesh."""
-
-    dtype = kv_layout.ttnn.bfloat8_b
-    layout = kv_layout.ttnn.TILE_LAYOUT
-
-    def __init__(self, heads: int, chips: int):
-        self.shape = (BLOCKS, heads, BLOCK_SIZE, HEAD_DIM)
-        self.block_bytes = heads * TILE_BYTES
-        self.chips = [
-            np.zeros(BLOCKS * self.block_bytes, dtype=np.uint8) for _ in range(chips)
-        ]
-
-    def device(self):
-        return SimpleNamespace(get_num_devices=lambda: len(self.chips))
+def _cache(heads: int, chips: int) -> FakeKVCache:
+    """A ``[BLOCKS, heads, BLOCK_SIZE, HEAD_DIM]`` bfloat8_b cache on ``chips``."""
+    return FakeKVCache(
+        blocks=BLOCKS,
+        heads=heads,
+        chips=chips,
+        block_size=BLOCK_SIZE,
+        head_dim=HEAD_DIM,
+    )
 
 
 def _config(names: list[str], num_kv_heads: int) -> KVCacheConfig:
@@ -58,7 +48,7 @@ def _config(names: list[str], num_kv_heads: int) -> KVCacheConfig:
 
 class TestDefaultLayout:
     def test_heads_split_over_the_chips_are_one_shard_per_chip(self):
-        k, v = FakeCache(heads=2, chips=4), FakeCache(heads=2, chips=4)
+        k, v = _cache(heads=2, chips=4), _cache(heads=2, chips=4)
         layout = default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
 
         part_k, part_v = layout.layers["model.layers.0.attn"]
@@ -67,7 +57,7 @@ class TestDefaultLayout:
         assert layout.block_bytes("model.layers.0.attn") == 2 * 4 * 2 * TILE_BYTES
 
     def test_heads_copied_to_every_chip_are_one_shard_on_all(self):
-        k, v = FakeCache(heads=8, chips=4), FakeCache(heads=8, chips=4)
+        k, v = _cache(heads=8, chips=4), _cache(heads=8, chips=4)
         layout = default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
 
         part_k, _ = layout.layers["model.layers.0.attn"]
@@ -76,16 +66,54 @@ class TestDefaultLayout:
 
     def test_a_partial_split_must_be_declared_by_the_model(self):
         # 8 heads on an 8-chip mesh split 4 ways and copied 2 ways.
-        k, v = FakeCache(heads=2, chips=8), FakeCache(heads=2, chips=8)
+        k, v = _cache(heads=2, chips=8), _cache(heads=2, chips=8)
         with pytest.raises(ValueError, match="get_kv_transfer_layout"):
             default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+    @pytest.mark.parametrize(
+        ("shape", "found"),
+        [
+            pytest.param(
+                (BLOCKS + 1, 2, BLOCK_SIZE, HEAD_DIM), "num_blocks=7", id="blocks"
+            ),
+            pytest.param(
+                (BLOCKS, 2, 2 * BLOCK_SIZE, HEAD_DIM), "block_size=64", id="block_size"
+            ),
+            pytest.param(
+                (BLOCKS, 2, BLOCK_SIZE, 2 * HEAD_DIM), "head_size=64", id="head_size"
+            ),
+            pytest.param((BLOCKS, 2, BLOCK_SIZE * HEAD_DIM), "not", id="not_4d"),
+        ],
+    )
+    def test_a_cache_the_kv_cache_config_does_not_describe_is_refused(
+        self, shape, found
+    ):
+        # The copy takes block b of the cache to be vLLM's block b, holding the
+        # spec's block_size tokens of head_size values per head.
+        k, v = _cache(heads=2, chips=4), _cache(heads=2, chips=4)
+        k.shape = shape
+        with pytest.raises(ValueError, match=f"{found}.*get_kv_transfer_layout"):
+            default_kv_layout([[k, v]], _config(["model.layers.0.attn"], 8))
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param(lambda k, v: [k], id="one_cache_in_a_list"),
+            pytest.param(lambda k, v: k, id="a_bare_cache"),
+            pytest.param(lambda k, v: [k, v, k], id="three_caches"),
+        ],
+    )
+    def test_an_entry_that_is_not_a_k_v_pair_is_refused(self, entry):
+        k, v = _cache(heads=2, chips=4), _cache(heads=2, chips=4)
+        with pytest.raises(ValueError, match="not a \\[k, v\\] pair"):
+            default_kv_layout([entry(k, v)], _config(["model.layers.0.attn"], 8))
 
 
 class TestDeclaredLayout:
     def test_a_model_declares_extra_parts_and_layers(self):
         """An MLA latent copied to all chips, and an MTP drafter's own layer."""
-        latent = FakeCache(heads=1, chips=2)
-        drafter_k, drafter_v = FakeCache(heads=1, chips=2), FakeCache(heads=1, chips=2)
+        latent = _cache(heads=1, chips=2)
+        drafter_k, drafter_v = _cache(heads=1, chips=2), _cache(heads=1, chips=2)
         names = ["model.layers.0.attn", "drafter.layers.0.attn"]
 
         class Model:
@@ -112,54 +140,8 @@ class TestDeclaredLayout:
             kv_transfer_layout(Model(), None, _config(["model.layers.0.attn"], 2))
 
 
-@pytest.fixture
-def fake_region_transfers(monkeypatch):
-    def host_bytes(address, size):
-        return np.ctypeslib.as_array((ctypes.c_uint8 * size).from_address(address))
-
-    def to_host(cache, regions, blocking=True, cq_id=None):
-        for chip, offset, size, address in regions:
-            data = cache.chips[int(chip)][int(offset) : int(offset + size)]
-            host_bytes(int(address), int(size))[:] = data
-
-    def to_device(cache, regions, blocking=True, cq_id=None):
-        for chip, offset, size, address in regions:
-            data = host_bytes(int(address), int(size))
-            cache.chips[int(chip)][int(offset) : int(offset + size)] = data
-
-    monkeypatch.setattr(kv_transfer.ttnn, "copy_device_to_host_regions", to_host)
-    monkeypatch.setattr(kv_transfer.ttnn, "copy_host_to_device_regions", to_device)
-
-
-def test_a_copied_shard_is_read_once_and_written_to_every_chip(fake_region_transfers):
-    """A latent copied to both chips crosses the host once and lands on both."""
-    name = "model.layers.0.attn"
-    config = _config([name], 1)
-    sent, received = FakeCache(heads=1, chips=2), FakeCache(heads=1, chips=2)
-    sent.chips[0][:] = np.arange(sent.chips[0].size, dtype=np.uint8)
-    sent.chips[1][:] = 255  # a replica a correct copy never reads
-
-    def server(cache):
-        layout = kv_transfer_layout(
-            SimpleNamespace(
-                get_kv_transfer_layout=lambda *_: {
-                    name: [(cache, cache.block_bytes, [[0, 1]])]
-                }
-            ),
-            None,
-            config,
-        )
-        description = kv_transfer.kv_cache_descriptions(config, layout)[name]
-        buffer = {name: torch.zeros(description.shape, dtype=torch.uint8)}
-        return buffer, kv_transfer.make_copy_blocks([layout])
-
-    sender_buffer, sender_copy = server(sent)
-    receiver_buffer, receiver_copy = server(received)
-    sender_copy(None, sender_buffer, [4], [0], "d2h")
-    receiver_buffer[name][2] = sender_buffer[name][0]
-    receiver_copy(receiver_buffer, None, [2], [1], "h2d")
-
-    block = slice(4 * sent.block_bytes, 5 * sent.block_bytes)
-    target = slice(1 * sent.block_bytes, 2 * sent.block_bytes)
-    for chip in received.chips:
-        np.testing.assert_array_equal(chip[target], sent.chips[0][block])
+def test_importing_the_module_needs_no_ttnn_dtypes(monkeypatch):
+    # Model test suites import the plugin with their own partial ttnn stubs.
+    monkeypatch.setitem(sys.modules, "ttnn", types.ModuleType("ttnn"))
+    spec = importlib.util.spec_from_file_location("kv_layout_copy", kv_layout.__file__)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))

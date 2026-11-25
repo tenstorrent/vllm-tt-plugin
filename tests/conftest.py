@@ -108,7 +108,7 @@ def reset_tt_platform_class_state():
                 module.lifespan = saved_lifespan
     torch.accelerator.empty_cache = saved_empty_cache
     kv_transfer_state._sync_engine_id_across_tp = saved_sync_engine_id
-    # Only loaded once a test has built a NIXL connector or installed the patch.
+    # Loaded only once a test has built a NIXL connector or installed the patch.
     nixl_worker = sys.modules.get(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
     )
