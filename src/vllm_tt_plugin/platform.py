@@ -457,7 +457,7 @@ def _resolve_standard_dp_visible_device_groups(
     Examples
     --------
     >>> _resolve_standard_dp_visible_device_groups(vllm_config)
-    [('0000:01:00.0,0000:25:00.0', (1, 2)), ...]
+    [("0,1,2,3", (1, 4)), ...]
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.data_parallel_size <= 1 or _uses_explicit_tt_mpi_launch(
