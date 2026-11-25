@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import (
@@ -504,8 +510,25 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank. Without a token KV cache
         the config has no KV groups.
+
+        The worker-side KV connector is created first, when one is configured,
+        so it exists by the time the runner allocates the KV cache.
         """
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(self) -> dict[tuple[int, int], Any] | None:
+        """This worker's connector handshake metadata, keyed ``(pp_rank, tp_rank)``.
+
+        ``EngineCore`` calls this whenever a connector is configured and hands
+        the result to the scheduler-side connector. TT runs one worker, so the
+        key is always ``(0, 0)``.
+        """
+        # No KV connector is configured.
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        return {(0, 0): metadata} if metadata else None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -588,6 +611,12 @@ class TTWorker(WorkerBase):
         best-effort backstop and deliberately does not call it; see the note
         there.
         """
+        try:
+            # The connector may hold the model's KV tensors, so it lets go
+            # before the model and the mesh do.
+            ensure_kv_transfer_shutdown()
+        except Exception:
+            logger.exception("KV connector shutdown failed; closing the mesh anyway")
         if getattr(self, "model_runner", None) is not None:
             try:
                 self.model_runner.shutdown()

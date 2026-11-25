@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import sys
+from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -1024,7 +1025,8 @@ class TTScheduler(AsyncScheduler):
                 if held is not None and self.scheduler_config.async_scheduling
                 else None
             )
-            prefill_result = self._schedule_prefill_only()
+            with self._skip_kv_connector_meta_for_discarded_prefill(has_running_decode):
+                prefill_result = self._schedule_prefill_only()
             if release_step is not None:
                 if prefill_result.total_num_scheduled_tokens > 0:
                     self._decode_interleave.record_step(
@@ -1045,8 +1047,18 @@ class TTScheduler(AsyncScheduler):
                 self._decode_interleave.record_step(
                     is_decode=True, prefill_pending=True
                 )
+                self.finished_req_ids |= prefill_result.finished_req_ids
+                self.reset_preempted_req_ids |= (
+                    prefill_result.preempted_req_ids or set()
+                )
                 result = self._schedule_decode_only()
-                _carry_cleanup(prefill_result, result)
+                # The decode pass already carries the finished and preempted
+                # request IDs given back above; the freed encoder cache
+                # entries still have to be added.
+                result.free_encoder_mm_hashes = (
+                    prefill_result.free_encoder_mm_hashes
+                    + result.free_encoder_mm_hashes
+                )
                 return self._finalize_scheduler_output(result, is_decode=True)
             self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result, is_decode=False)
@@ -1055,6 +1067,28 @@ class TTScheduler(AsyncScheduler):
         self._decode_interleave.record_step(is_decode=True, prefill_pending=False)
         result = super().schedule()
         return self._finalize_scheduler_output(result, is_decode=True)
+
+    @contextmanager
+    def _skip_kv_connector_meta_for_discarded_prefill(self, has_running_decode: bool):
+        """``schedule`` discards a prefill pass when it schedules no tokens and
+        decodes are running, then runs a decode pass instead. KV connector
+        metadata built for the discarded pass would be lost with it. Skip
+        ``_build_kv_connector_meta`` for that pass; the decode pass builds it.
+        """
+        original = self._build_kv_connector_meta
+
+        def build_unless_discarded(connector, scheduler_output):
+            no_prefill_tokens = scheduler_output.total_num_scheduled_tokens == 0
+
+            if no_prefill_tokens and has_running_decode:
+                return None
+            return original(connector, scheduler_output)
+
+        self._build_kv_connector_meta = build_unless_discarded
+        try:
+            yield
+        finally:
+            self._build_kv_connector_meta = original
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool

@@ -17,6 +17,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -99,6 +100,7 @@ def _scheduler(
     kv_extent: int = 0,
     stage_outputs: bool = False,
     num_blocks: int | None = None,
+    kv_transfer_config: KVTransferConfig | None = None,
 ) -> TTScheduler:
     model_config = ModelConfig(
         model=str(LOCAL_MODEL_CONFIG),
@@ -128,6 +130,7 @@ def _scheduler(
             cache_config=cache_config,
             parallel_config=ParallelConfig(),
             device_config=DeviceConfig(device="cpu"),
+            kv_transfer_config=kv_transfer_config,
         )
     config.scheduler_config.async_scheduling = async_scheduling
     # EngineCore resolves the KV cache layout before it builds the scheduler.
