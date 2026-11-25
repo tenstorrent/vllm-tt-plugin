@@ -891,12 +891,15 @@ def test_a_lane_forward_runs_inside_the_connector_step(
 CHUNK_TOKENS = 200
 
 
-def _chunked_push_scheduler(chunked_prefill: bool = True):
+def _chunked_push_scheduler(monkeypatch, chunked_prefill: bool = True):
     """A prefill server's TT scheduler with chunked push, under async scheduling.
 
     It holds two requests. With ``chunked_prefill`` it prefills at most
     ``CHUNK_TOKENS`` tokens a step; without, a whole prompt in one step.
+    ``monkeypatch`` installs fake ttnn region copies, which a CPU KV buffer
+    requires at startup and a released ttnn may lack.
     """
+    fake_region_copies(monkeypatch)
     scheduler = _real_scheduler(
         output_width=1,
         max_num_seqs=2,
@@ -965,8 +968,8 @@ def _serve_behind_a_decode(scheduler, push_request, done) -> list[SchedulerOutpu
     raise AssertionError("the engine loop did not reach its end condition")
 
 
-def test_jobs_are_built_before_the_scheduler_advances_num_computed_tokens():
-    scheduler = _chunked_push_scheduler()
+def test_jobs_are_built_before_the_scheduler_advances_num_computed_tokens(monkeypatch):
+    scheduler = _chunked_push_scheduler(monkeypatch)
     request = _push_request(prompt_length=600)  # Five blocks, the last partial.
     kept: set[int] = set()
 
@@ -998,10 +1001,10 @@ def test_jobs_are_built_before_the_scheduler_advances_num_computed_tokens():
     assert any(id(step) in kept for step in executed)
 
 
-def test_a_prompt_prefilled_in_one_step_is_staged_by_one_job():
+def test_a_prompt_prefilled_in_one_step_is_staged_by_one_job(monkeypatch):
     # Without chunked prefill (a model that does not declare it, or
     # --no-enable-chunked-prefill) the one prefill step completes every block.
-    scheduler = _chunked_push_scheduler(chunked_prefill=False)
+    scheduler = _chunked_push_scheduler(monkeypatch, chunked_prefill=False)
     scheduler.add_request(_push_request(prompt_length=600))
 
     step = scheduler.schedule()
@@ -1013,7 +1016,7 @@ def test_a_prompt_prefilled_in_one_step_is_staged_by_one_job():
     ]
 
 
-def test_a_preemption_the_release_pass_drained_reaches_the_connector():
+def test_a_preemption_the_release_pass_drained_reaches_the_connector(monkeypatch):
     # B is part way through its prefill, behind A's held decode. A keep pause
     # with a cache reset (what EngineCore.pause_scheduler(mode="keep",
     # clear_cache=True) does) preempts both between two schedule() calls. The
@@ -1021,7 +1024,7 @@ def test_a_preemption_the_release_pass_drained_reaches_the_connector():
     # schedules nothing, so the call returns the prefill pass's step with the
     # release pass's cleanup added. P's worker gives B's staging slots back at
     # the step whose metadata lists B.
-    scheduler = _chunked_push_scheduler()
+    scheduler = _chunked_push_scheduler(monkeypatch)
     request = _push_request(prompt_length=600)
 
     def done() -> bool:
@@ -1043,10 +1046,12 @@ def test_a_preemption_the_release_pass_drained_reaches_the_connector():
     assert step.kv_connector_metadata.push_chunk_preemptions == {"B"}
 
 
-def test_a_step_that_runs_no_forward_copies_nothing(vllm_config, staging_connector):
+def test_a_step_that_runs_no_forward_copies_nothing(
+    vllm_config, staging_connector, monkeypatch
+):
     # The release step that goes ahead of B's kept prefill schedules nothing.
     # Its metadata is built after that prefill's, once B has advanced.
-    scheduler = _chunked_push_scheduler()
+    scheduler = _chunked_push_scheduler(monkeypatch)
     request = _push_request(prompt_length=600)
     *_, release = _serve_behind_a_decode(
         scheduler, request, lambda: scheduler._deferred_prefill is not None
@@ -1060,11 +1065,11 @@ def test_a_step_that_runs_no_forward_copies_nothing(vllm_config, staging_connect
     assert staging_connector.calls == ["start_load_kv", "get_transfer_results"]
 
 
-def test_chunked_push_is_refused_under_lane_dp():
+def test_chunked_push_is_refused_under_lane_dp(monkeypatch):
     from vllm_tt_plugin.config import store_tt_lane_count
     from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
 
-    base = _chunked_push_scheduler()
+    base = _chunked_push_scheduler(monkeypatch)
     store_tt_lane_count(base.vllm_config, 2)
 
     with pytest.raises(ValueError, match="lane"):
