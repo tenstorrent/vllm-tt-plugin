@@ -746,6 +746,29 @@ class TTNixlPushConnectorWorker(ChunkedPushWorker):
             return
         super()._do_start_push_kv(request_id, local_block_ids, registration_data)
 
+    def _chunk_path_supported(
+        self, job: NixlPushChunkJob, reg_data: dict[str, Any]
+    ) -> bool:
+        """Whether the job may be written alone, which is never past its deadline.
+
+        Runs on the writer thread. Past the registration's write deadline (see
+        ``_handle_push_reg_notif``) the job is refused: it sends no WRITE, the
+        request's last WRITE then carries no completion notification, and
+        ``_do_start_push_kv`` drops the whole-request push that follows.
+        """
+        deadline = reg_data.get(_WRITE_DEADLINE)
+        if deadline is not None and time.perf_counter() > deadline:
+            logger.debug(
+                "Not writing blocks %d to %d of %s: D's receive deadline for %s "
+                "is near or past.",
+                job.start_block,
+                job.end_block - 1,
+                job.request_id,
+                reg_data["request_id"],
+            )
+            return False
+        return super()._chunk_path_supported(job, reg_data)
+
     def _stage_matched_sends(self) -> None:
         """Copy matched P requests from the chips into slots and queue their writes.
 

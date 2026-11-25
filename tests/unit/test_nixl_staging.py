@@ -930,3 +930,37 @@ class TestReceiveDeadline:
         self._write_staged(p)
 
         assert recorder.pushes == [("r", ([0, 1],))]
+
+    @pytest.mark.parametrize(
+        ("late_from_step", "written"),
+        [
+            (None, [Write(1, [2], [100], b""), Write(2, [3, 4], [101, 102], b"p:1")]),
+            (2, [Write(1, [2], [100], b"")]),
+            (1, []),
+        ],
+        ids=["in_time", "last_chunk_late", "every_written_chunk_late"],
+    )
+    def test_p_writes_no_chunk_after_ds_deadline(
+        self, recorder, clock, late_from_step, written
+    ):
+        # D holds the prompt's first two blocks and registers the other three,
+        # with 60 s left; P prefills the prompt in three steps.
+        reg = {**push_registration([100, 101, 102]), nixl_staging.RECV_SECONDS_LEFT: 60}
+        worker = _p_worker()
+        worker.nixl_wrapper.notifs = {"d": [push_reg_notif(reg)]}
+
+        for step, job in enumerate(CHUNK_JOBS):
+            if step == late_from_step:
+                clock.now += 60.0 - nixl_staging._DEADLINE_MARGIN_S + 0.5
+            _run_step(worker, jobs=[job])
+            worker._push_writer_pass()
+            worker.nixl_wrapper.finish()
+        worker._finished_blocks_inbox.put(("p", (PROMPT_BLOCKS,)))
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+        worker._push_writer_pass()
+
+        # A late chunk leaves the notification out, so D never decodes on
+        # partial KV, and the whole-request push that follows is dropped.
+        assert worker.nixl_wrapper.writes == written
+        assert recorder.pushes == []
