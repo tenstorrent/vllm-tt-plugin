@@ -210,20 +210,38 @@ def _registration(block_ids, request_id="d-rid"):
     }
 
 
-class Wire:
-    """A NIXL agent's ``send_notif``: notifications wait in ``sent`` until delivered."""
+class nixlRemoteDisconnectError(Exception):  # noqa: N801
+    """Stands in for the exception NIXL's bindings raise when the UCX endpoint to
+    the remote agent has failed; the worker recognizes it by its name."""
 
-    def __init__(self):
+
+class Wire:
+    """A NIXL agent's ``send_notif``: notifications wait in ``sent`` until delivered.
+
+    Attributes
+    ----------
+    name
+        The agent's name, as its peer knows it.
+    disconnected
+        Every send raises ``nixlRemoteDisconnectError`` and delivers nothing, as
+        NIXL does once the endpoint to a dead peer has failed.
+    """
+
+    def __init__(self, name: str = ""):
+        self.name = name
         self.sent: list[bytes] = []
+        self.disconnected = False
 
     def send_notif(self, agent_name, notif_msg):
+        if self.disconnected:
+            raise nixlRemoteDisconnectError(agent_name)
         self.sent.append(notif_msg)
 
 
 def _linked(worker, engine_id: str, peer_engine: str) -> TTNixlPushConnectorWorker:
     """Give ``worker`` a NIXL agent with a done handshake to ``peer_engine``."""
     worker.engine_id = engine_id
-    worker.nixl_wrapper = Wire()
+    worker.nixl_wrapper = Wire(f"{engine_id}-agent")
     worker._remote_agents = {peer_engine: {(0, 0): f"{peer_engine}-agent"}}
     worker._handshake_lock = threading.Lock()
     worker._ensure_handshake = lambda *args, **kwargs: None
@@ -580,6 +598,74 @@ class TestCancellation:
 
         assert _held_entries(d) == {}
         assert d.slots.free == 2
+
+    def test_a_registration_that_never_reached_p_frees_its_slots(
+        self, recorder, clock, d
+    ):
+        # P stopped while D still holds its agent: NIXL refuses the send.
+        d.nixl_wrapper.disconnected = True
+        d.start_load_kv(_metadata({"r": _registration([5, 6], "r")}))
+        _writer_pass(d)
+
+        clock.now += 61.0
+        d.get_transfer_results()
+        recorder.results.failed_recving = recorder.results.finished_recving = {"r"}
+        d.get_transfer_results()
+        _writer_pass(d)
+        d.get_transfer_results()
+
+        assert d.slots.free == 2
+
+    @pytest.mark.parametrize(
+        "dies", ["before_the_cancel", "after_the_cancel"], ids=lambda dies: dies
+    )
+    def test_slots_of_a_cancel_p_can_no_longer_answer_are_freed(
+        self, recorder, clock, d, p, dies
+    ):
+        d.start_load_kv(_metadata({"r": _registration([5, 6], "r")}))
+        _writer_pass(d)
+        _deliver(d, p)
+        _deliver(p, d)
+        if dies == "before_the_cancel":
+            d.nixl_wrapper.disconnected = True
+
+        recorder.results.failed_recving = recorder.results.finished_recving = {"r"}
+        d.get_transfer_results()
+        _writer_pass(d)
+        d.nixl_wrapper.disconnected = True
+        for _ in range(3):
+            clock.now += 1.0
+            d.get_transfer_results()
+            _writer_pass(d)
+        # NIXL reported the disconnect; a WRITE P posted before may still land.
+        assert d.slots.free == 0
+
+        for _ in range(12):
+            clock.now += 1.0
+            d.get_transfer_results()
+            _writer_pass(d)
+
+        d.get_block_ids_with_load_errors()  # vLLM reads them each step
+        assert d.slots.free == 2
+        assert _held_entries(d) == {}
+
+    def test_a_silent_p_that_is_alive_keeps_the_slots(self, recorder, clock, d, p):
+        d.start_load_kv(_metadata({"r": _registration([5, 6], "r")}))
+        _writer_pass(d)
+        _deliver(d, p)
+        _deliver(p, d)
+        recorder.results.failed_recving = recorder.results.finished_recving = {"r"}
+        d.get_transfer_results()
+        _writer_pass(d)
+
+        # P never answers the cancel, but D's notifications still reach it.
+        for _ in range(100):
+            clock.now += 10.0
+            d.get_transfer_results()
+            _writer_pass(d)
+
+        assert "probe" in _kinds(d)
+        assert d.slots.free == 0
 
     def test_a_registration_not_yet_sent_is_withdrawn(self, recorder, d):
         handshake = Future()

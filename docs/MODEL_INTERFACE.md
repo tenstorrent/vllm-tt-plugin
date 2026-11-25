@@ -148,9 +148,12 @@ gives them to another request only once P has confirmed that it writes no more
 into them: P acknowledges each registration it records, D sends a cancel for a
 failed receive once P has acknowledged its registration, and P acknowledges
 the cancel once no write into those slots is in flight and drops any later
-one. A P that never answers keeps the slots reserved on D. These notifications
-are not part of vLLM's push protocol, so P and D must both use
-`TTNixlPushConnector`.
+one. A P that is alive but never answers keeps the slots reserved on D. A P
+that is gone does not: while a cancel waits, D probes P's NIXL agent every
+second, and once NIXL refuses a send to it as disconnected (or refused the
+registration itself), D frees the slots, after 10 s in the probe case. D logs
+each cancel it sends and each freeing at INFO. These notifications are not part
+of vLLM's push protocol, so P and D must both use `TTNixlPushConnector`.
 
 Under lane DP the lanes share the engine's one connector. Block IDs are
 lane-local, so the coordinator builds the connector metadata once per step and
