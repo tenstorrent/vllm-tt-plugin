@@ -6,10 +6,12 @@
 overrides call with recorders, so a test sees which IDs reach vLLM.
 ``staging_worker`` builds a TT worker with only the state the overrides use;
 it records each copy between chips and slots instead of making it.
+``push_metadata`` builds the connector metadata fields the TT worker reads.
 """
 
 import queue
 import threading
+from types import SimpleNamespace
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
@@ -65,13 +67,16 @@ def record_push_worker(monkeypatch) -> Recorder:
     return rec
 
 
-def staging_worker(num_slots: int, **staging) -> TTNixlPushConnectorWorker:
+def staging_worker(
+    num_slots: int, chunked: bool = False, **staging
+) -> TTNixlPushConnectorWorker:
     """A TT push worker with staging state and vLLM's fields the overrides use.
 
-    ``worker.copies`` lists each copy as ``(direction, source IDs, destination
-    IDs, lane)``.
+    ``chunked`` is ``enable_chunked_push`` on P. ``worker.copies`` lists each
+    copy as ``(direction, source IDs, destination IDs, lane)``.
     """
     worker = TTNixlPushConnectorWorker.__new__(TTNixlPushConnectorWorker)
+    worker._init_chunk_push(chunked)
     worker._init_staging(num_slots, **staging)
     worker._failed_recv_reqs = queue.Queue()
     worker._invalid_block_ids = queue.Queue()
@@ -85,3 +90,17 @@ def staging_worker(num_slots: int, **staging) -> TTNixlPushConnectorWorker:
     worker._sending_transfers = {}
     worker._sending_transfers_lock = threading.Lock()
     return worker
+
+
+def push_metadata(
+    registrations=None, finished=None, lanes=None, jobs=(), preempted=(), aborted=()
+) -> SimpleNamespace:
+    """The connector metadata fields the TT worker reads."""
+    return SimpleNamespace(
+        push_registrations=registrations or {},
+        push_finished_blocks=finished or {},
+        tt_lane_of=lanes or {},
+        push_chunk_jobs=list(jobs),
+        push_chunk_preemptions=set(preempted),
+        reqs_not_processed=set(aborted),
+    )

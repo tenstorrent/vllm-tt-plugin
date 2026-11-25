@@ -9,6 +9,7 @@ scheduler tests do the same with vLLM's push scheduler.
 """
 
 import re
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +30,14 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from tests.support.nixl_staging import Recorder, record_push_worker, staging_worker
+from tests.support.nixl_staging import (
+    Recorder,
+    push_metadata,
+    record_push_worker,
+    staging_worker,
+)
+from tests.support.nixl_writer import Write, push_reg_notif, push_writer
+from tests.support.nixl_writer import registration as push_registration
 from vllm_tt_plugin import nixl_staging
 from vllm_tt_plugin.nixl_staging import (
     NixlPushChunkJob,
@@ -85,20 +93,6 @@ def recorder(monkeypatch) -> Recorder:
     return record_push_worker(monkeypatch)
 
 
-def _metadata(
-    registrations=None, finished=None, lanes=None, jobs=(), preempted=(), aborted=()
-):
-    """The connector metadata fields the TT worker reads."""
-    return SimpleNamespace(
-        push_registrations=registrations or {},
-        push_finished_blocks=finished or {},
-        tt_lane_of=lanes or {},
-        push_chunk_jobs=list(jobs),
-        push_chunk_preemptions=set(preempted),
-        reqs_not_processed=set(aborted),
-    )
-
-
 def _registration(block_ids):
     return {"request_id": "d-rid", "local_block_ids": (block_ids,)}
 
@@ -106,7 +100,7 @@ def _registration(block_ids):
 class TestDecodeSide:
     def test_registration_carries_slots_and_the_blocks_wait_for_them(self, recorder):
         worker = staging_worker(num_slots=4)
-        original = _metadata({"r": _registration([17, 4, 92])})
+        original = push_metadata({"r": _registration([17, 4, 92])})
 
         worker.start_load_kv(original)
 
@@ -117,7 +111,7 @@ class TestDecodeSide:
 
     def test_a_received_request_lands_in_its_blocks_and_frees_its_slots(self, recorder):
         worker = staging_worker(num_slots=4)
-        worker.start_load_kv(_metadata({"r": _registration([17, 4, 92])}))
+        worker.start_load_kv(push_metadata({"r": _registration([17, 4, 92])}))
         recorder.results.finished_recving = {"r"}
 
         worker.get_transfer_results()
@@ -127,19 +121,19 @@ class TestDecodeSide:
 
     def test_a_registration_waits_while_the_pool_is_full(self, recorder):
         worker = staging_worker(num_slots=3)
-        worker.start_load_kv(_metadata({"a": _registration([1, 2])}))
-        worker.start_load_kv(_metadata({"b": _registration([3, 4])}))
+        worker.start_load_kv(push_metadata({"a": _registration([1, 2])}))
+        worker.start_load_kv(push_metadata({"b": _registration([3, 4])}))
         assert recorder.metadata[-1].push_registrations == {}
 
         recorder.results.finished_recving = {"a"}
         worker.get_transfer_results()
-        worker.start_load_kv(_metadata())
+        worker.start_load_kv(push_metadata())
 
         assert list(recorder.metadata[-1].push_registrations) == ["b"]
 
     def test_a_failed_receive_frees_its_slots_without_a_copy(self, recorder):
         worker = staging_worker(num_slots=4)
-        worker.start_load_kv(_metadata({"r": _registration([5, 6])}))
+        worker.start_load_kv(push_metadata({"r": _registration([5, 6])}))
         recorder.results.failed_recving = {"r"}
         recorder.results.finished_recving = {"r"}
 
@@ -150,7 +144,7 @@ class TestDecodeSide:
 
     def test_a_receive_that_never_comes_fails_and_its_slots_rest(self, recorder):
         worker = staging_worker(num_slots=2, recv_timeout=0.0, quarantine=3600.0)
-        worker.start_load_kv(_metadata({"r": _registration([5, 6])}))
+        worker.start_load_kv(push_metadata({"r": _registration([5, 6])}))
 
         worker.get_transfer_results()
         assert worker._failed_recv_reqs.get_nowait() == "r"
@@ -168,7 +162,9 @@ class TestLanes:
 
     def test_d_copies_a_received_request_into_its_lane(self, recorder):
         worker = staging_worker(num_slots=4)
-        worker.start_load_kv(_metadata({"r": _registration([5, 6])}, lanes={"r": 1}))
+        worker.start_load_kv(
+            push_metadata({"r": _registration([5, 6])}, lanes={"r": 1})
+        )
         recorder.results.finished_recving = {"r"}
 
         worker.get_transfer_results()
@@ -177,7 +173,9 @@ class TestLanes:
 
     def test_a_failed_receive_reports_its_blocks_numbered_by_lane(self, recorder):
         worker = staging_worker(num_slots=4, pool_blocks=100)
-        worker.start_load_kv(_metadata({"r": _registration([5, 6])}, lanes={"r": 2}))
+        worker.start_load_kv(
+            push_metadata({"r": _registration([5, 6])}, lanes={"r": 2})
+        )
         recorder.results.failed_recving = {"r"}
         recorder.results.finished_recving = {"r"}
 
@@ -188,7 +186,7 @@ class TestLanes:
 
     def test_p_stages_a_matched_request_from_its_lane(self, recorder):
         worker = staging_worker(num_slots=4)
-        worker.start_load_kv(_metadata(finished={"p": ([30, 31],)}, lanes={"p": 3}))
+        worker.start_load_kv(push_metadata(finished={"p": ([30, 31],)}, lanes={"p": 3}))
         worker._do_start_push_kv("p", ([30, 31],), _registration([8, 9]))
 
         worker.get_transfer_results()
@@ -521,8 +519,8 @@ class TestChunkStaging:
     def test_a_job_is_copied_into_the_slots_of_its_prompt_positions(self):
         worker = staging_worker(num_slots=8)
 
-        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
-        worker.save_kv_to_host(_metadata(jobs=[_job(1, 3, [31, 32])]))
+        worker.save_kv_to_host(push_metadata(jobs=[_job(0, 1, [30])]))
+        worker.save_kv_to_host(push_metadata(jobs=[_job(1, 3, [31, 32])]))
 
         assert worker.copies == [("d2h", [30], [0], 0), ("d2h", [31, 32], [1, 2], 0)]
         # The first job took a slot for each of the prompt's five blocks.
@@ -531,9 +529,9 @@ class TestChunkStaging:
     def test_the_first_job_takes_slots_for_the_whole_prompt_or_none(self, recorder):
         worker = staging_worker(num_slots=6)
         worker.save_kv_to_host(
-            _metadata(jobs=[_job(0, 1, [30], req_id="a"), _job(0, 1, [40], 3, "b")])
+            push_metadata(jobs=[_job(0, 1, [30], req_id="a"), _job(0, 1, [40], 3, "b")])
         )
-        worker.save_kv_to_host(_metadata(jobs=[_job(1, 3, [41, 42], 3, "b")]))
+        worker.save_kv_to_host(push_metadata(jobs=[_job(1, 3, [41, 42], 3, "b")]))
 
         # One slot was left for b's three blocks: b stages nothing, then or later.
         assert worker.copies == [("d2h", [30], [0], 0)]
@@ -549,7 +547,7 @@ class TestChunkStaging:
     ):
         worker = staging_worker(num_slots=8)
         for job in (_job(0, 1, [30]), _job(1, 3, [31, 32]), _job(3, 5, [33, 34])):
-            worker.save_kv_to_host(_metadata(jobs=[job]))
+            worker.save_kv_to_host(push_metadata(jobs=[job]))
         staged = list(worker.copies)
 
         # D holds the first two blocks of this prompt, so it registers three.
@@ -571,39 +569,224 @@ class TestChunkStaging:
     def test_a_preempted_request_gets_fresh_slots_and_its_old_slots_go_back(
         self, recorder, listed
     ):
-        worker = staging_worker(num_slots=8)
-        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+        worker = push_writer(staging_worker(num_slots=16, chunked=True))
+        worker.save_kv_to_host(push_metadata(jobs=[_job(0, 1, [30])]))
 
         # The recompute's first job starts at block 0 again; a job there always
         # begins the request anew, whether or not the preemption was listed.
-        recompute = _metadata(
+        recompute = push_metadata(
             preempted={"p"} if listed else (), jobs=[_job(0, 2, [40, 41])]
         )
         worker.start_load_kv(recompute)
         worker.save_kv_to_host(recompute)
-
-        # Slots 0 to 4 went back behind the free ones; the recompute took 5 on.
         assert worker.copies[-1] == ("d2h", [40, 41], [5, 6], 0)
-        assert worker.slots.free == 3
+        assert worker.slots.free == 6
+
+        # Slots 0 to 4 go back once the writer thread has seen the preemption.
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+        assert worker.slots.free == 11
 
     @pytest.mark.parametrize("ending", ["aborted", "lease_expired"])
     def test_a_request_that_ends_unmatched_gives_its_slots_back(self, recorder, ending):
-        worker = staging_worker(num_slots=8)
-        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+        worker = push_writer(staging_worker(num_slots=8, chunked=True))
+        worker.save_kv_to_host(push_metadata(jobs=[_job(0, 1, [30])]))
         assert worker.slots.free == 3
 
         if ending == "aborted":
-            worker.start_load_kv(_metadata(aborted={"p"}))
+            worker.start_load_kv(push_metadata(aborted={"p"}))
         else:
             # vLLM reports a finished request whose lease expired as sent.
             recorder.results.finished_sending = {"p"}
-            worker.get_transfer_results()
+        worker.get_transfer_results()
+        worker._push_writer_pass()
+        worker.get_transfer_results()
 
         assert worker.slots.free == 8
 
     def test_a_job_that_does_not_continue_the_staged_blocks_is_refused(self):
         worker = staging_worker(num_slots=8)
-        worker.save_kv_to_host(_metadata(jobs=[_job(0, 1, [30])]))
+        worker.save_kv_to_host(push_metadata(jobs=[_job(0, 1, [30])]))
 
         with pytest.raises(RuntimeError, match="block 3"):
-            worker.save_kv_to_host(_metadata(jobs=[_job(3, 5, [33, 34])]))
+            worker.save_kv_to_host(push_metadata(jobs=[_job(3, 5, [33, 34])]))
+
+
+# P's device blocks of a 300-token prompt in blocks of 64.
+PROMPT_BLOCKS = [30, 31, 32, 33, 34]
+# Its prefill in chunks of 100 tokens: the jobs of three steps.
+CHUNK_JOBS = (_job(0, 1, [30]), _job(1, 3, [31, 32]), _job(3, 5, [33, 34]))
+
+
+def _p_worker(num_slots: int = 8):
+    """P's worker with chunked push and a writer whose passes the test runs."""
+    return push_writer(staging_worker(num_slots, chunked=True))
+
+
+def _run_step(worker, jobs=(), **fields) -> None:
+    """One step on P's model runner thread, in the order vLLM calls the worker."""
+    meta = push_metadata(jobs=jobs, **fields)
+    worker.start_load_kv(meta)
+    worker.save_kv_to_host(meta)
+    worker.finish_chunk_step(meta)
+    worker.get_transfer_results()
+
+
+def _on_writer_thread(worker) -> None:
+    """Run one writer pass on another thread, as the writer thread does."""
+    thread = threading.Thread(target=worker._push_writer_pass, name="writer")
+    thread.start()
+    thread.join(timeout=5)
+
+
+class TestChunkWrites:
+    """P writes each prefill step's chunk from its slots while it prefills."""
+
+    def test_a_chunk_is_written_from_the_slots_it_was_staged_into(self, recorder):
+        worker = _p_worker()
+        # D holds the prompt's first two blocks, so it registers three.
+        worker._pending_d_registrations["p"] = push_registration([100, 101, 102])
+
+        for job in CHUNK_JOBS:
+            _run_step(worker, jobs=[job])
+            worker._push_writer_pass()
+            worker.nixl_wrapper.finish()
+        worker._push_writer_pass()
+
+        assert worker.copies == [
+            ("d2h", [30], [0], 0),
+            ("d2h", [31, 32], [1, 2], 0),
+            ("d2h", [33, 34], [3, 4], 0),
+        ]
+        assert worker.nixl_wrapper.writes == [
+            Write(1, [2], [100], b""),
+            Write(2, [3, 4], [101, 102], b"p:1"),
+        ]
+
+    @pytest.mark.parametrize("cause", ["late_registration", "failed_write"])
+    def test_a_request_written_whole_is_written_from_its_slots_without_a_copy(
+        self, recorder, cause
+    ):
+        worker = _p_worker()
+        reg = push_registration([100, 101, 102])
+        if cause == "failed_write":
+            worker._pending_d_registrations["p"] = reg
+        for job in CHUNK_JOBS:
+            _run_step(worker, jobs=[job])
+            worker._push_writer_pass()
+            worker.nixl_wrapper.finish("ERR")
+        worker._push_writer_pass()
+        worker.nixl_wrapper.finish()
+        staged = list(worker.copies)
+
+        # vLLM's start_load_kv hands the finished request to the writer.
+        worker._finished_blocks_inbox.put(("p", (PROMPT_BLOCKS,)))
+        worker._push_writer_pass()
+        if cause == "late_registration":
+            worker.nixl_wrapper.notifs = {"d": [push_reg_notif(reg)]}
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+        worker._push_writer_pass()
+
+        assert all(write.notif == b"" for write in worker.nixl_wrapper.writes)
+        assert recorder.pushes == [("p", ([2, 3, 4],))]
+        assert worker.copies == staged
+
+    def test_a_handed_off_request_gives_its_slots_back_once_reported_sent(
+        self, recorder
+    ):
+        worker = _p_worker()
+        worker._pending_d_registrations["p"] = push_registration(PROMPT_BLOCKS)
+        _run_step(worker, jobs=[_job(0, 5, PROMPT_BLOCKS)])
+        worker._push_writer_pass()
+        worker.nixl_wrapper.finish()
+        worker._finished_blocks_inbox.put(("p", (PROMPT_BLOCKS,)))
+        worker._push_writer_pass()
+        assert worker._sending_transfers["p"] == []
+
+        # vLLM reports the request sent once the empty handle list is polled.
+        recorder.results.finished_sending = {"p"}
+        worker.get_transfer_results()
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+
+        assert worker.slots.free == 8
+        assert recorder.pushes == []
+
+    @pytest.mark.parametrize("ending", ["preempted", "aborted", "lease_expired"])
+    def test_slots_go_back_only_after_every_write_of_the_request_ended(
+        self, recorder, ending
+    ):
+        worker = _p_worker()
+        worker._pending_d_registrations["p"] = push_registration(PROMPT_BLOCKS)
+        _run_step(worker, jobs=[_job(0, 2, [30, 31])])
+        worker._push_writer_pass()
+        assert worker.slots.free == 3
+
+        if ending == "preempted":
+            _run_step(worker, preempted={"p"})
+        elif ending == "aborted":
+            _run_step(worker, aborted={"p"})
+        else:
+            # vLLM reports a finished request whose lease expired as sent.
+            recorder.results.finished_sending = {"p"}
+            worker.get_transfer_results()
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+        # The WRITE of slots 0 and 1 may still be reading them.
+        assert worker.slots.free == 3
+
+        worker.nixl_wrapper.finish()
+        worker._push_writer_pass()
+        worker.get_transfer_results()
+        assert worker.slots.free == 8
+
+    def test_handle_preemptions_never_blocks_the_model_runner_thread(self, recorder):
+        worker = _p_worker(num_slots=16)
+        worker._pending_d_registrations["p"] = push_registration(PROMPT_BLOCKS)
+        _run_step(worker, jobs=[_job(0, 2, [30, 31])])
+        # This WRITE never completes.
+        worker._push_writer_pass()
+
+        step = threading.Thread(
+            target=_run_step, args=(worker,), kwargs={"preempted": {"p"}}
+        )
+        step.start()
+        step.join(timeout=1)
+        assert not step.is_alive()
+
+        # The recompute stages into fresh slots; the writer holds its chunk
+        # until the old WRITE has ended.
+        _run_step(worker, jobs=[_job(0, 2, [40, 41])])
+        worker._push_writer_pass()
+        assert worker.copies[-1] == ("d2h", [40, 41], [5, 6], 0)
+        assert len(worker.nixl_wrapper.writes) == 1
+
+    def test_the_writer_thread_never_touches_the_device(self, recorder):
+        worker = _p_worker()
+        copy, threads = worker.copy_blocks, []
+
+        def copy_blocks(*args, **kwargs):
+            threads.append(threading.current_thread().name)
+            copy(*args, **kwargs)
+
+        worker.copy_blocks = copy_blocks
+        # Request a is staged by chunks; b found no slots and is copied whole.
+        _run_step(worker, jobs=[_job(0, 5, PROMPT_BLOCKS, req_id="a")])
+        _on_writer_thread(worker)
+        for req_id, blocks in (("a", PROMPT_BLOCKS), ("b", [40, 41])):
+            worker._finished_blocks_inbox.put((req_id, (blocks,)))
+        worker.nixl_wrapper.notifs = {
+            "d": [
+                push_reg_notif(push_registration(PROMPT_BLOCKS, request_id="a")),
+                push_reg_notif(push_registration([8, 9], request_id="b")),
+            ]
+        }
+        _on_writer_thread(worker)
+        worker.get_transfer_results()
+        _on_writer_thread(worker)
+
+        assert len(worker.nixl_wrapper.writes) == 1
+        assert recorder.pushes == [("b", ([5, 6],))]
+        assert worker.copies[-1] == ("d2h", [40, 41], [5, 6], 0)
+        assert set(threads) == {threading.current_thread().name}

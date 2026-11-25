@@ -41,7 +41,13 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
-from tests.support.nixl_staging import staging_worker
+from tests.support.nixl_staging import (
+    push_metadata,
+    record_push_worker,
+    staging_worker,
+)
+from tests.support.nixl_writer import push_writer
+from tests.support.nixl_writer import registration as push_registration
 from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _runner_output as _block_runner_output
 from tests.test_block_scheduler import _scheduler as _real_scheduler
@@ -462,6 +468,82 @@ def test_kv_moves_between_two_servers_through_their_cpu_buffers(
                 assert (received_blocks[received_ids] == sent_blocks[sent_ids]).all()
                 # Blocks nothing was sent to stay empty.
                 assert not received_blocks[[1, 2, 3, 7, 8]].any()
+
+
+def test_kv_moves_between_two_servers_chunk_by_chunk(
+    worker_connector, fake_region_transfers, monkeypatch
+):
+    """P writes each prefill step's chunk from its slots into D's slots; D
+    copies them into its chips on the one notification, as the device's bytes.
+    """
+    recorder = record_push_worker(monkeypatch)
+
+    def server():
+        kv_caches = _model_kv_caches()
+        _initialize_kv_cache(LAYER_NAMES, kv_caches)
+        worker = push_writer(staging_worker(num_slots=PACKED_BLOCKS, chunked=True))
+        worker.copy_blocks = worker_connector.copy_blocks
+        worker.device_kv_caches = None
+        worker.host_xfer_buffers = {
+            name: torch.zeros(
+                (d.shape[0], d.shape[2], d.shape[1], d.shape[3]), dtype=d.dtype
+            ).permute(0, 2, 1, 3)
+            for name, d in worker_connector.kv_caches.items()
+        }
+        return kv_caches, worker
+
+    (sent, p), (received, d) = server(), server()
+    rng = np.random.default_rng(0)
+    for k, v in sent:
+        for chip in (*k.chips, *v.chips):
+            chip[:] = rng.integers(0, 256, chip.size, dtype=np.uint8)
+
+    def write(handle):
+        # NIXL moves P's slot rows into D's; one region, so descriptors are rows.
+        landed = p.nixl_wrapper.writes[handle - 1]
+        for name in LAYER_NAMES:
+            d.host_xfer_buffers[name][landed.remote] = p.host_xfer_buffers[name][
+                landed.local
+            ]
+
+    p.nixl_wrapper.transfer = write
+
+    # D holds the prompt's first two blocks and registers the other three.
+    d.start_load_kv(
+        push_metadata({"p": {"request_id": "p", "local_block_ids": ([9, 4, 7],)}})
+    )
+    d_slots = recorder.metadata[-1].push_registrations["p"]["local_block_ids"][0]
+    p._pending_d_registrations["p"] = push_registration(d_slots)
+    # P's five prompt blocks, prefilled in three steps.
+    sent_ids = [3, 8, 0, 11, 5]
+    for start, end in ((0, 1), (1, 3), (3, 5)):
+        step = push_metadata(
+            jobs=[NixlPushChunkJob("p", sent_ids[start:end], start, end, len(sent_ids))]
+        )
+        p.save_kv_to_host(step)
+        p.finish_chunk_step(step)
+        p._push_writer_pass()
+        p.nixl_wrapper.finish()
+    p._push_writer_pass()
+    assert [landed.notif for landed in p.nixl_wrapper.writes] == [b"", b"p:1"]
+
+    # D copies its slots into its chips only on the notification.
+    assert not any(chip.any() for k, v in received for chip in (*k.chips, *v.chips))
+    recorder.results.finished_recving = {"p"}
+    d.get_transfer_results()
+
+    received_ids = [9, 4, 7]
+    for sent_layer, received_layer in zip(sent, received):
+        for sent_cache, received_cache in zip(sent_layer, received_layer):
+            size = sent_cache.block_bytes
+            for sent_chip, received_chip in zip(sent_cache.chips, received_cache.chips):
+                sent_blocks = sent_chip.reshape(PACKED_BLOCKS, size)
+                received_blocks = received_chip.reshape(PACKED_BLOCKS, size)
+                assert (
+                    received_blocks[received_ids] == sent_blocks[sent_ids[2:]]
+                ).all()
+                others = [b for b in range(PACKED_BLOCKS) if b not in received_ids]
+                assert not received_blocks[others].any()
 
 
 def _model_kv_caches(num_layers: int = 2) -> list:
@@ -986,7 +1068,7 @@ def staging_connector(monkeypatch):
 
     It is installed where ``TTWorker`` would put it. ``connector.calls``
     records vLLM's push worker calls and the TT worker's copies, each made on
-    the test's thread.
+    the test's thread; ``connector.record`` adds a call.
     """
     calls: list[str] = []
     thread = threading.get_ident()
@@ -1025,6 +1107,7 @@ def staging_connector(monkeypatch):
         kv_connector="TTNixlPushConnector", kv_role="kv_producer"
     )
     connector.calls = calls
+    connector.record = record
     monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", connector)
     return connector
 
@@ -1038,6 +1121,12 @@ def test_a_chunk_copy_runs_after_the_prefill_forward_inside_the_connector_step(
         NixlPushChunkJob("req-0", [30], start_block=0, end_block=1, total_blocks=3)
     ]
     runner = _runner(vllm_config, staging_connector.calls, async_decode=False)
+    # The writer thread gets the job, as slot numbers, once its copy is done.
+    staging_connector.connector_worker._queue_chunk_jobs = lambda jobs: (
+        staging_connector.record(
+            f"queue {[(job.request_id, job.block_ids) for job in jobs]}"
+        )
+    )
 
     assert TTModelRunner.execute_model(runner, step) is None
     TTModelRunner.sample_tokens(runner, None)
@@ -1046,5 +1135,6 @@ def test_a_chunk_copy_runs_after_the_prefill_forward_inside_the_connector_step(
         "forward",
         "start_load_kv",
         "copy d2h [30] to [0]",
+        "queue [('req-0', [0])]",
         "get_transfer_results",
     ]
