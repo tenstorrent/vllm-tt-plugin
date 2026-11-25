@@ -14,6 +14,9 @@ the requests in flight:
 * P (prefill) waits until its finished request is matched with D's
   registration, then takes slots for only the blocks D asked for, copies them
   from its chips, and lets vLLM write the slots to D.
+* D fails a receive whose KV has not arrived by its deadline, and later gives
+  its slots to another request. D's registration tells P the seconds left, and
+  P writes nothing once they have run out.
 
 vLLM's scheduler keeps using real block IDs; only the IDs that reach NIXL are
 slot numbers. Copies between chips and slots run on the model runner thread,
@@ -31,6 +34,7 @@ import time
 from collections import deque
 from typing import Any
 
+import msgspec
 import torch
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -43,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
     NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
     ReqMeta,
 )
@@ -62,6 +67,19 @@ CONNECTOR_NAME = "TTNixlPushConnector"
 
 # A request in flight on each side while the next one is being staged.
 _REQUESTS_PER_POOL = 2
+
+RECV_SECONDS_LEFT = "tt_recv_seconds_left"
+"""PUSH_REG field: seconds left, when D sends the registration, until D fails
+the receive. Only ``TTNixlPushConnectorWorker`` sends and reads it."""
+
+# Registration fields that never leave their side: D's receive deadline and
+# P's write deadline, each on its own side's ``time.perf_counter`` clock.
+_RECV_DEADLINE = "tt_recv_deadline"
+_WRITE_DEADLINE = "tt_write_deadline"
+
+# P stops writing this many seconds before D's deadline. P's writer thread reads
+# D's registration up to one engine step after it arrives.
+_DEADLINE_MARGIN_S = 10.0
 
 
 def register_kv_connectors() -> None:
@@ -152,6 +170,9 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
       model runner thread.
     * ``_send_slots`` and ``_released`` (P) are written by the model runner
       thread and read by the writer thread, under ``_lock``.
+    * D's registration carries ``_RECV_DEADLINE`` from the model runner thread
+      to the writer thread; P's carries ``_WRITE_DEADLINE`` from the writer
+      thread through staging and back.
     """
 
     def __init__(self, vllm_config, engine_id: str, kv_cache_config):
@@ -201,8 +222,10 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
     def start_load_kv(self, metadata: NixlConnectorMetadata) -> None:
         """Send D's registrations with slot numbers, and stage P's matched sends.
 
-        Under lane DP, ``metadata.tt_lane_of`` names each request's lane: block
-        IDs are lane-local. Without it every request is on lane 0.
+        Each registration also carries D's receive deadline, which
+        ``_do_send_reg_notif`` turns into the seconds left. Under lane DP,
+        ``metadata.tt_lane_of`` names each request's lane: block IDs are
+        lane-local. Without it every request is on lane 0.
         """
         lane_of = getattr(metadata, "tt_lane_of", None) or {}
         now = time.perf_counter()
@@ -223,7 +246,11 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
                 self._waiting_registrations.append((req_id, reg, lane))
                 continue
             self._recv_slots[req_id] = (slots, device, lane)
-            registrations[req_id] = {**reg, "local_block_ids": slots}
+            registrations[req_id] = {
+                **reg,
+                "local_block_ids": slots,
+                _RECV_DEADLINE: self._recv_deadlines[req_id],
+            }
         for req_id in metadata.push_finished_blocks or {}:
             self._send_lane[req_id] = lane_of.get(req_id, 0)
         # The scheduler shares ``metadata``; hand vLLM a copy.
@@ -369,6 +396,46 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         # P: finished requests whose slots wait for their last write handle.
         self._release_pending: set[str] = set()
 
+    def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
+        """Send D's registration with the seconds left until D fails the receive.
+
+        Runs on the writer thread, after any handshake with P, so the seconds
+        left do not include the handshake.
+        """
+        sent = dict(reg_data)
+        deadline = sent.pop(_RECV_DEADLINE)
+        sent[RECV_SECONDS_LEFT] = deadline - time.perf_counter()
+        super()._do_send_reg_notif(req_id, sent)
+
+    def _handle_push_reg_notif(self, notif: bytes) -> None:
+        """Set P's write deadline on D's registration, then match it as vLLM does.
+
+        Runs on the writer thread. P counts D's ``RECV_SECONDS_LEFT`` from now
+        on its own clock, less ``_DEADLINE_MARGIN_S``. A registration without
+        it, from vLLM's own push worker, gets no deadline. Apart from the
+        deadline this is vLLM's method, which decodes the registration inside
+        and so leaves no hook at receipt.
+        """
+        received = time.perf_counter()
+        try:
+            reg = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
+        except Exception:
+            logger.exception("Failed to decode PUSH_REG notification payload")
+            return
+        rid = reg.get("request_id") if isinstance(reg, dict) else None
+        if not isinstance(rid, str):
+            logger.warning("PUSH_REG notif missing request_id; dropping")
+            return
+        left = reg.get(RECV_SECONDS_LEFT)
+        if left is not None:
+            reg[_WRITE_DEADLINE] = received + float(left) - _DEADLINE_MARGIN_S
+        match = self._pop_matching_finished_blocks(rid)
+        if match is None:
+            self._pending_d_registrations[rid] = reg
+            return
+        fin_id, blocks = match
+        self._do_start_push_kv(fin_id, blocks, reg)
+
     def _do_start_push_kv(
         self,
         request_id: str,
@@ -380,12 +447,25 @@ class TTNixlPushConnectorWorker(NixlPushConnectorWorker):
         Runs on the writer thread, once a finished P request meets D's
         registration (``local_block_ids`` are device blocks) and again once
         ``_stage_matched_sends`` has staged it (``local_block_ids`` are slots).
+        Past the registration's write deadline it drops the push: D may have
+        given the slots to another request. A dropped staged push keeps its
+        slots until vLLM reports the send finished, at the end of P's lease.
         """
         with self._lock:
             released = request_id in self._released
             staged = request_id in self._send_slots
         if released and not staged:
             logger.debug("Dropping push of %s: its send already ended.", request_id)
+            return
+        deadline = registration_data.get(_WRITE_DEADLINE)
+        if deadline is not None and time.perf_counter() > deadline:
+            logger.warning(
+                "Dropping push of %s: D's receive deadline for %s is under %.0f s "
+                "away or past.",
+                request_id,
+                registration_data["request_id"],
+                _DEADLINE_MARGIN_S,
+            )
             return
         if not staged:
             self._to_stage.put((request_id, local_block_ids, registration_data))

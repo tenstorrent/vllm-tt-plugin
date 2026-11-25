@@ -108,7 +108,10 @@ slot numbers instead of block IDs and copies the slots into its chips once
 P's write lands; P copies only the blocks D registered, once the two are
 matched. A D request whose KV does not arrive within
 `push_registration_timeout` (vLLM's setting, default `decoder_kv_blocks_ttl`)
-fails instead of waiting forever. P and D must both use it.
+fails instead of waiting forever, and its slots go to another request after
+`kv_lease_duration`. D's registration therefore tells P the seconds left
+(`tt_recv_seconds_left`), and P submits no write later than 10 s before they
+run out, counted from when P reads the registration. P and D must both use it.
 
 Under lane DP the lanes share the engine's one connector. Block IDs are
 lane-local, so the coordinator builds the connector metadata once per step and
