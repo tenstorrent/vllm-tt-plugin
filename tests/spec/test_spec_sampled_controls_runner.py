@@ -43,7 +43,10 @@ from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_LOGITS,
     PLACEHOLDER_TOKEN_ID,
 )
-from vllm_tt_plugin.structured_output import spec_grammar_bitmask_for_tt_batch
+from vllm_tt_plugin.structured_output import (
+    grammar_mask_stride,
+    spec_grammar_bitmask_for_tt_batch,
+)
 
 from . import sampled_async_harness as async_sampled
 from . import sampled_sync_harness as sync_harness
@@ -91,12 +94,16 @@ def _validated(history: list[int], drafts: list[int]) -> list[int]:
     return valid
 
 
-def _scheduler_rows(history: list[int], scheduled: list[int]) -> torch.Tensor:
-    """The rows ``StructuredOutputManager.grammar_bitmask`` writes for a request.
+def _scheduler_rows(
+    history: list[int], scheduled: list[int], mask_stride: int
+) -> torch.Tensor:
+    """The block ``StructuredOutputManager.grammar_bitmask`` gives a request.
 
     One row per scheduled token and one for the bonus. The row at a ``-1`` is
     still filled from the current state, and every row after it is all ones
     except the bonus, which is filled from the state the valid tokens reached.
+    The block is ``mask_stride`` rows; vLLM does not write the rows past the
+    bonus, so they hold all-forbidding rows here.
     """
     rows = []
     state = list(history)
@@ -110,6 +117,7 @@ def _scheduler_rows(history: list[int], scheduled: list[int]) -> torch.Tensor:
         elif constrained:
             state.append(token)
     rows.append(_allowlist(state))
+    rows.extend(torch.zeros(SAMPLED_VOCAB_SIZE) for _ in range(mask_stride - len(rows)))
     return _pack(torch.stack(rows).bool())
 
 
@@ -124,7 +132,9 @@ def _grammar_output(runner, scheduled: dict[str, list[int]]) -> GrammarOutput | 
         return None
     rows = [
         _scheduler_rows(
-            list(runner.requests[req_id].output_token_ids), scheduled.get(req_id, [])
+            list(runner.requests[req_id].output_token_ids),
+            scheduled.get(req_id, []),
+            grammar_mask_stride(runner._num_speculative_tokens),
         )
         for req_id in structured
     ]
@@ -507,12 +517,13 @@ def test_the_published_logprobs_follow_a_length_capped_prefix():
 
 
 def test_the_bitmask_rows_are_located_per_request_and_per_column():
-    """Each structured request owns ``1 + scheduled drafts`` consecutive rows."""
+    """Each structured request owns a block of ``mask_stride`` rows and fills
+    ``1 + scheduled drafts`` of them."""
     words = 2
-    bitmask = torch.arange(1, 8, dtype=torch.int32).unsqueeze(1).repeat(1, words)
+    bitmask = torch.arange(1, 10, dtype=torch.int32).unsqueeze(1).repeat(1, words)
     rows_per_request = {"a": 3, "plain": 1, "b": 1, "c": 3}
     # "plain" is scheduled but not structured, and "c" is structured but not in
-    # this batch; its rows still count towards the offsets after it.
+    # this batch. "b" fills one row of its block; rows 5 and 6 are not read.
     ids = ["a", "b", "c"]
 
     per_column = spec_grammar_bitmask_for_tt_batch(
@@ -522,6 +533,7 @@ def test_the_bitmask_rows_are_located_per_request_and_per_column():
         row_req_ids=["b", "plain", "a"],
         batch_length=4,
         width=4,
+        mask_stride=3,
     )
     assert per_column[:, :, 0].tolist() == [
         [4, -1, -1, -1],
@@ -537,32 +549,40 @@ def test_the_bitmask_rows_are_located_per_request_and_per_column():
         row_req_ids=["b", "plain", "a"],
         batch_length=4,
         width=None,
+        mask_stride=3,
     )
     assert first_rows[:, 0].tolist() == [4, -1, 1, -1]
 
 
 @pytest.mark.parametrize(
-    "rows_per_request, match",
-    [({"a": 2, "b": 1, "c": 3}, "has 7 rows"), ({"a": 3, "b": 1}, "recorded None")],
-    ids=["short", "missing"],
+    "bitmask_rows, rows_per_request, match",
+    [
+        (7, {"a": 3, "b": 1, "c": 3}, "has 7 rows"),
+        (9, {"a": 3, "b": 1}, "recorded None"),
+        (9, {"a": 4, "b": 1, "c": 3}, "recorded 4"),
+    ],
+    ids=["short", "missing", "overfull"],
 )
-def test_a_bitmask_the_step_cannot_account_for_is_refused(rows_per_request, match):
-    """A wrong row count shifts the mask of every later request, silently."""
+def test_a_bitmask_the_step_cannot_account_for_is_refused(
+    bitmask_rows, rows_per_request, match
+):
+    """A wrong layout shifts the mask of every later request, silently."""
     with pytest.raises(RuntimeError, match=match):
         spec_grammar_bitmask_for_tt_batch(
-            bitmask=torch.zeros(7, 1, dtype=torch.int32),
+            bitmask=torch.zeros(bitmask_rows, 1, dtype=torch.int32),
             structured_output_request_ids=["a", "b", "c"],
             rows_per_request=rows_per_request,
             row_req_ids=["a"],
             batch_length=1,
             width=None,
+            mask_stride=3,
         )
 
 
 def test_an_ordinary_decode_on_a_speculating_launch_reads_each_request_s_row_0():
     """An asynchronous launch reserves drafts on every step, plain ones too.
 
-    So the scheduler writes ``1 + K`` rows per structured request even when
+    So the scheduler fills ``1 + K`` rows per structured request even when
     the runner verifies nothing, and a plain decode that read one row per
     request would hand the second request the first one's bonus row.
     """

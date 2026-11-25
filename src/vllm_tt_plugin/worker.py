@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import ttnn
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.model_executor.model_loader import get_model_architecture
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import (
@@ -21,7 +27,7 @@ from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     set_torch_threads_for_runtime,
 )
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_groups,
     get_uniform_page_size,
 )
@@ -367,7 +373,7 @@ class TTWorker(WorkerBase):
         For the GPU/TPU backends, this method generates the KVCacheSpec by
         parsing the kv cache format from each Attention module in the static
         forward context (compilation_config.static_forward_context).
-        core/kv_cache_utils.py uses the KVCacheSpec along with available
+        core/kv_cache_planning.py uses the KVCacheSpec along with available
         memory info from a profiling run to determine num blocks.
 
         For the TT backend, the static forward context is not populated since
@@ -504,8 +510,25 @@ class TTWorker(WorkerBase):
         Every standard-DP rank owns its own TT mesh/KV cache, while
         single-process lane mode has only one rank. Without a token KV cache
         the config has no KV groups.
+
+        The worker-side KV connector is created first, when one is configured,
+        so it exists by the time the runner allocates the KV cache.
         """
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def get_kv_connector_handshake_metadata(self) -> dict[tuple[int, int], Any] | None:
+        """This worker's connector handshake metadata, keyed ``(pp_rank, tp_rank)``.
+
+        ``EngineCore`` calls this whenever a connector is configured and hands
+        the result to the scheduler-side connector. TT runs one worker, so the
+        key is always ``(0, 0)``.
+        """
+        # No KV connector is configured.
+        if not has_kv_transfer_group():
+            return None
+        metadata = get_kv_transfer_group().get_handshake_metadata()
+        return {(0, 0): metadata} if metadata else None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         # The engine calls this via collective_rpc when --max-model-len -1
@@ -588,6 +611,12 @@ class TTWorker(WorkerBase):
         best-effort backstop and deliberately does not call it; see the note
         there.
         """
+        try:
+            # The connector may hold the model's KV tensors, so it lets go
+            # before the model and the mesh do.
+            ensure_kv_transfer_shutdown()
+        except Exception:
+            logger.exception("KV connector shutdown failed; closing the mesh anyway")
         if getattr(self, "model_runner", None) is not None:
             try:
                 self.model_runner.shutdown()
@@ -702,9 +731,10 @@ def _upstream_admission_blocks(
     comparing. The private helpers are imported here, not at module scope,
     so a vLLM rename breaks only this path.
     """
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.core.kv_cache_planning import (
         _max_memory_usage_bytes_from_groups,
-        _pool_bytes_per_block,
+        _pool_bytes_per_block_from_builder,
     )
 
     extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
@@ -722,8 +752,11 @@ def _upstream_admission_blocks(
     )
     if not groups:
         return 0
-    bytes_per_block = _pool_bytes_per_block(sizing_config, groups)
-    one_request_bytes = _max_memory_usage_bytes_from_groups(sizing_config, groups)
+    builder = get_kv_cache_config_builder(sizing_config)
+    bytes_per_block = _pool_bytes_per_block_from_builder(builder, sizing_config, groups)
+    one_request_bytes = _max_memory_usage_bytes_from_groups(
+        builder, sizing_config, groups
+    )
     null_block = 1
     return -(-one_request_bytes // bytes_per_block) + null_block
 
@@ -896,7 +929,7 @@ def _fit_block_output_max_model_len(
     """Fit ``--max-model-len -1`` to the block-output KV pool.
 
     Deliberately pre-empts vLLM's ``_auto_fit_max_model_len``
-    (vllm/v1/core/kv_cache_utils.py): the TT pool is a fixed budget
+    (vllm/v1/core/kv_cache_planning.py): the TT pool is a fixed budget
     rather than profiled memory, and the upstream fit would hand the whole
     pool to ``max_model_len``, while a block-output request also needs one
     full output canvas of headroom. The engine snapshots ``max_model_len``

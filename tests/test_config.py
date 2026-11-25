@@ -189,3 +189,29 @@ def test_device_grammar_runtime_requires_warmup_only_for_tracing(
 def test_supports_device_grammar_rejects_non_boolean(invalid):
     with pytest.raises(ValueError, match="must be a boolean"):
         tt_config.store_tt_supports_device_grammar(_vllm_config(), invalid)
+
+
+@pytest.mark.parametrize(
+    ("data_parallel_size", "lane_count"),
+    [(2, None), (1, 2)],
+    ids=["standard_dp", "lane_dp"],
+)
+def test_kv_transfer_config_is_refused_with_data_parallelism(
+    data_parallel_size, lane_count
+):
+    cfg = _vllm_config(data_parallel_size=data_parallel_size, lane_count=lane_count)
+    cfg.kv_transfer_config = object()
+
+    with pytest.raises(ValueError, match="kv-transfer-config"):
+        tt_config.validate_tt_kv_transfer_config(cfg)
+
+    # The same parallelism is fine when no connector is configured.
+    cfg.kv_transfer_config = None
+    tt_config.validate_tt_kv_transfer_config(cfg)
+
+
+def test_kv_transfer_config_is_accepted_without_data_parallelism():
+    cfg = _vllm_config()
+    cfg.kv_transfer_config = object()
+
+    tt_config.validate_tt_kv_transfer_config(cfg)

@@ -42,6 +42,8 @@ def _scheduler(*, running=(), waiting=0, kv_holding_waiting=0, mode):
     scheduler.running = list(running)
     scheduler.max_num_running_reqs = 8
     scheduler.max_num_active_reqs = 8
+    scheduler.finished_req_ids = set()
+    scheduler.reset_preempted_req_ids = set()
     scheduler._forced_mode = mode
     # Production defaults; the decode-interleave cadence itself is covered in
     # tests/test_decode_interleave.py.
@@ -68,37 +70,36 @@ def test_forced_prefill_does_not_fallback_to_decode_per_lane(monkeypatch):
     assert output.total_num_scheduled_tokens == 0
 
 
-@pytest.mark.parametrize(
-    ("prefill_preemptions", "decode_preemptions"),
-    [(None, None), ({"prefill"}, None), (None, {"decode"}), ({"prefill"}, {"decode"})],
-)
+@pytest.mark.parametrize("prefill_preemptions", [None, {"preempted"}])
 def test_decode_fallback_preserves_cleanup_from_both_outputs(
-    monkeypatch, prefill_preemptions, decode_preemptions
+    monkeypatch, prefill_preemptions
 ):
     scheduler = _scheduler(
         running=[_running()], waiting=1, mode=TTSchedulingMode.DEFAULT
     )
     prefill = SchedulerOutput.make_empty()
-    prefill.finished_req_ids = {"finished-prefill", "shared"}
+    prefill.finished_req_ids = {"finished"}
     prefill.preempted_req_ids = prefill_preemptions
     prefill.free_encoder_mm_hashes = ["image-prefill"]
-    decode = SchedulerOutput.make_empty()
-    decode.num_scheduled_tokens = {"running": 1}
-    decode.total_num_scheduled_tokens = 1
-    decode.finished_req_ids = {"finished-decode", "shared"}
-    decode.preempted_req_ids = decode_preemptions
-    decode.free_encoder_mm_hashes = ["image-decode"]
+
+    def decode_pass():
+        # Like the base scheduler, report the IDs pending on the scheduler.
+        decode = SchedulerOutput.make_empty()
+        decode.num_scheduled_tokens = {"running": 1}
+        decode.total_num_scheduled_tokens = 1
+        decode.finished_req_ids = scheduler.finished_req_ids
+        decode.preempted_req_ids = scheduler.reset_preempted_req_ids
+        decode.free_encoder_mm_hashes = ["image-decode"]
+        return decode
+
     monkeypatch.setattr(scheduler, "_schedule_prefill_only", lambda: prefill)
-    monkeypatch.setattr(scheduler, "_schedule_decode_only", lambda: decode)
+    monkeypatch.setattr(scheduler, "_schedule_decode_only", decode_pass)
 
     result = scheduler.schedule()
 
     assert result.num_scheduled_tokens == {"running": 1}
-    assert result.total_num_scheduled_tokens == 1
-    assert result.finished_req_ids == {"finished-prefill", "finished-decode", "shared"}
-    assert (result.preempted_req_ids or set()) == (prefill_preemptions or set()) | (
-        decode_preemptions or set()
-    )
+    assert result.finished_req_ids == {"finished"}
+    assert result.preempted_req_ids == (prefill_preemptions or set())
     assert result.free_encoder_mm_hashes == ["image-prefill", "image-decode"]
 
 

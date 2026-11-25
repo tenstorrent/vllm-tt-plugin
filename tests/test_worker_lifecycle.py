@@ -10,16 +10,25 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.core.kv_cache_utils import (
+from vllm.config.kv_transfer import KVTransferConfig
+from vllm.distributed.kv_transfer import (
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from tests.test_kv_connector import FakeKVConnector
 from vllm_tt_plugin import worker
 from vllm_tt_plugin.model_runner import TTModelRunner
-from vllm_tt_plugin.platform import TTPlatform
+from vllm_tt_plugin.platform import (
+    TTPlatform,
+    _install_tt_kv_engine_id_sync_patch,
+)
 from vllm_tt_plugin.worker import TTWorker
 
 NUM_TT_BLOCKS = 7
@@ -76,6 +85,8 @@ def _worker(monkeypatch: pytest.MonkeyPatch, worker_cls: type[TTWorker]):
     mesh_device = SimpleNamespace(get_num_devices=lambda: 1)
     parallel_config = SimpleNamespace(
         data_parallel_size=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
         data_parallel_rank_local=0,
         data_parallel_index=0,
         assigned_physical_gpu_ids=None,
@@ -100,6 +111,8 @@ def _worker(monkeypatch: pytest.MonkeyPatch, worker_cls: type[TTWorker]):
         model_config=model_config,
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         attention_config=SimpleNamespace(hisparse_config=None),
+        kv_transfer_config=None,
+        adjust_dcp_kv_cache_interleave_size=lambda _: None,
     )
 
     worker_instance = worker_cls.__new__(worker_cls)
@@ -210,3 +223,47 @@ def test_a_worker_without_token_kv_refuses_an_ar_runner(monkeypatch):
         worker_instance.initialize_from_config(_engine_kv_cache_config(worker_instance))
 
     worker_instance.shutdown()
+
+
+@pytest.mark.parametrize("handshake_metadata", [None, object()])
+def test_a_worker_owns_the_worker_side_kv_connector(monkeypatch, handshake_metadata):
+    worker_instance, steps = _worker(monkeypatch, _ARWorker)
+
+    # Configure a connector; vLLM loads the class by name from its module.
+    worker_instance.vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="FakeKVConnector",
+        kv_connector_module_path=FakeKVConnector.__module__,
+        kv_role="kv_both",
+    )
+    monkeypatch.setattr(
+        FakeKVConnector, "get_handshake_metadata", lambda _self: handshake_metadata
+    )
+
+    # Record the connector's shutdown so its order can be checked below.
+    monkeypatch.setattr(
+        FakeKVConnector, "shutdown", lambda _self: steps.append("connector shutdown")
+    )
+
+    # The platform config hook, stubbed out above, installs this in a server.
+    _install_tt_kv_engine_id_sync_patch()
+
+    # Before initialize_from_config there is no connector and no handshake.
+    worker_instance.init_device()
+    assert not has_kv_transfer_group()
+    assert worker_instance.get_kv_connector_handshake_metadata() is None
+
+    # initialize_from_config creates the connector.
+    worker_instance.initialize_from_config(_engine_kv_cache_config(worker_instance))
+    connector = get_kv_transfer_group()
+    assert isinstance(connector, FakeKVConnector)
+
+    # The handshake is None without metadata, otherwise keyed by rank (0, 0).
+    expected = None if handshake_metadata is None else {(0, 0): handshake_metadata}
+    assert worker_instance.get_kv_connector_handshake_metadata() == expected
+
+    # shutdown removes the connector.
+    worker_instance.shutdown()
+    assert not has_kv_transfer_group()
+
+    # The connector goes before the mesh it may hold tensors on.
+    assert steps[-2:] == ["connector shutdown", "close mesh"]

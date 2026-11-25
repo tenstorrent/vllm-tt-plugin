@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 import sys
+from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -9,7 +10,6 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
@@ -296,9 +296,10 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
     Every request is charged the whole in-flight budget, an over-count when
     several share it.
     """
-    from vllm.v1.core.kv_cache_utils import (
+    from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+    from vllm.v1.core.kv_cache_planning import (
         _max_memory_usage_bytes_from_groups,
-        _pool_bytes_per_block,
+        _pool_bytes_per_block_from_builder,
     )
 
     groups = kv_cache_config.kv_cache_groups
@@ -307,9 +308,10 @@ def _require_kv_for_every_sequence(vllm_config, kv_cache_config) -> None:
         return
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
     max_model_len = vllm_config.model_config.max_model_len
+    builder = get_kv_cache_config_builder(vllm_config)
     per_request = -(
-        -_max_memory_usage_bytes_from_groups(vllm_config, groups)
-        // _pool_bytes_per_block(vllm_config, groups)
+        -_max_memory_usage_bytes_from_groups(builder, vllm_config, groups)
+        // _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
     )
     needed = max_num_seqs * per_request
     # Block 0 is vLLM's null block, never handed to a request.
@@ -525,9 +527,8 @@ class TTScheduler(AsyncScheduler):
                 "one sampled-token placeholder"
             )
             assert not self.kv_cache_manager.enable_caching, (
-                "Block-output models bypass the kv_cache_manager.cache_blocks "
-                "call made by AsyncScheduler._update_request_with_output and "
-                "must disable prefix caching"
+                "Block-output models must run with prefix caching disabled; "
+                "TTPlatform validation disables it"
             )
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
@@ -1024,7 +1025,8 @@ class TTScheduler(AsyncScheduler):
                 if held is not None and self.scheduler_config.async_scheduling
                 else None
             )
-            prefill_result = self._schedule_prefill_only()
+            with self._skip_kv_connector_meta_for_discarded_prefill(has_running_decode):
+                prefill_result = self._schedule_prefill_only()
             if release_step is not None:
                 if prefill_result.total_num_scheduled_tokens > 0:
                     self._decode_interleave.record_step(
@@ -1045,8 +1047,18 @@ class TTScheduler(AsyncScheduler):
                 self._decode_interleave.record_step(
                     is_decode=True, prefill_pending=True
                 )
+                self.finished_req_ids |= prefill_result.finished_req_ids
+                self.reset_preempted_req_ids |= (
+                    prefill_result.preempted_req_ids or set()
+                )
                 result = self._schedule_decode_only()
-                _carry_cleanup(prefill_result, result)
+                # The decode pass already carries the finished and preempted
+                # request IDs given back above; the freed encoder cache
+                # entries still have to be added.
+                result.free_encoder_mm_hashes = (
+                    prefill_result.free_encoder_mm_hashes
+                    + result.free_encoder_mm_hashes
+                )
                 return self._finalize_scheduler_output(result, is_decode=True)
             self._decode_interleave.record_step(is_decode=False, prefill_pending=True)
             return self._finalize_scheduler_output(prefill_result, is_decode=False)
@@ -1055,6 +1067,28 @@ class TTScheduler(AsyncScheduler):
         self._decode_interleave.record_step(is_decode=True, prefill_pending=False)
         result = super().schedule()
         return self._finalize_scheduler_output(result, is_decode=True)
+
+    @contextmanager
+    def _skip_kv_connector_meta_for_discarded_prefill(self, has_running_decode: bool):
+        """``schedule`` discards a prefill pass when it schedules no tokens and
+        decodes are running, then runs a decode pass instead. KV connector
+        metadata built for the discarded pass would be lost with it. Skip
+        ``_build_kv_connector_meta`` for that pass; the decode pass builds it.
+        """
+        original = self._build_kv_connector_meta
+
+        def build_unless_discarded(connector, scheduler_output):
+            no_prefill_tokens = scheduler_output.total_num_scheduled_tokens == 0
+
+            if no_prefill_tokens and has_running_decode:
+                return None
+            return original(connector, scheduler_output)
+
+        self._build_kv_connector_meta = build_unless_discarded
+        try:
+            yield
+        finally:
+            self._build_kv_connector_meta = original
 
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool
@@ -1598,17 +1632,11 @@ class TTScheduler(AsyncScheduler):
             )
 
         # Scheduler appends token-by-token and trims at EOS, stop tokens,
-        # max_tokens, or max_model_len. The reservation is physical, so consume
-        # all K placeholders even when the client-visible block is trimmed.
-        # Calling Scheduler directly intentionally skips AsyncScheduler's
-        # cache_blocks hook. Platform validation disables prefix caching for
-        # block-output models, and __init__ asserts that invariant.
-        new_token_ids, stopped = Scheduler._update_request_with_output(
-            self, request, new_token_ids
-        )
-        request.num_output_placeholders -= self._output_tokens_per_step
-        if request.num_output_placeholders < 0:
+        # max_tokens, or max_model_len. It resolves one placeholder per returned
+        # token, counted before the trim, so all K placeholders of the physical
+        # reservation are consumed even when the client-visible block is trimmed.
+        if request.num_output_placeholders < self._output_tokens_per_step:
             raise RuntimeError(
                 "Output placeholders underflowed after block-output reconciliation"
             )
-        return new_token_ids, stopped
+        return super()._update_request_with_output(request, new_token_ids)

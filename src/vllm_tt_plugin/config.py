@@ -534,6 +534,24 @@ def uses_tt_lane_coordinator(vllm_config: "VllmConfig") -> bool:
     )
 
 
+def validate_tt_kv_transfer_config(vllm_config: "VllmConfig") -> None:
+    """Validate that vllm server runs without data parallelism when
+    ``--kv-transfer-config`` is set.
+
+    Lane-DP runs with ``data_parallel_size == 1``, so the lane count is checked
+    as well.
+    """
+    if vllm_config.kv_transfer_config is None:
+        return
+    data_parallel_size = vllm_config.parallel_config.data_parallel_size
+    lanes = get_tt_data_parallel_size(vllm_config)
+    if data_parallel_size != 1 or lanes != 1:
+        raise ValueError(
+            "--kv-transfer-config is supported only without data parallelism on "
+            f"TT; got data_parallel_size={data_parallel_size}, TT lanes={lanes}."
+        )
+
+
 def resolve_tt_scheduler_cls(
     requested: "str | type | None",
     worker_cls: "str | type",
